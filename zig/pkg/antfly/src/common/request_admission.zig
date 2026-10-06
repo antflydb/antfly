@@ -15,77 +15,10 @@ pub const PrometheusClass = enum {
     inference,
 };
 
-/// Process-local, fail-fast admission for one foreground request class.
-/// A zero capacity disables the limit while retaining accounting.
-pub const RequestAdmission = struct {
-    capacity: usize,
-    in_flight: std.atomic.Value(usize) = .init(0),
-    rejected_total: std.atomic.Value(u64) = .init(0),
-    peak_in_flight: std.atomic.Value(usize) = .init(0),
-
-    pub fn init(capacity: usize) RequestAdmission {
-        return .{ .capacity = capacity };
-    }
-
-    pub fn tryAcquire(self: *RequestAdmission) bool {
-        var observed = self.in_flight.load(.acquire);
-        while (self.capacity == 0 or observed < self.capacity) {
-            if (self.in_flight.cmpxchgWeak(observed, observed + 1, .acq_rel, .acquire) == null) {
-                const admitted = observed + 1;
-                var peak = self.peak_in_flight.load(.acquire);
-                while (peak < admitted) {
-                    if (self.peak_in_flight.cmpxchgWeak(peak, admitted, .acq_rel, .acquire) == null) break;
-                    peak = self.peak_in_flight.load(.acquire);
-                }
-                return true;
-            }
-            observed = self.in_flight.load(.acquire);
-        }
-        _ = self.rejected_total.fetchAdd(1, .monotonic);
-        return false;
-    }
-
-    /// An admitted request whose ownership is explicit and single-release.
-    /// Prefer this at callback and provider boundaries so every error path
-    /// returns capacity to the shared admission controller.
-    pub const Lease = struct {
-        admission: *RequestAdmission,
-        active: bool = true,
-
-        pub fn release(self: *Lease) void {
-            if (!self.active) return;
-            self.admission.release();
-            self.active = false;
-        }
-    };
-
-    /// Acquires an RAII-style lease so admission can cover setup performed by
-    /// the caller before the core operation begins.
-    pub fn tryAcquireLease(self: *RequestAdmission) ?Lease {
-        if (!self.tryAcquire()) return null;
-        return .{ .admission = self };
-    }
-
-    pub fn release(self: *RequestAdmission) void {
-        _ = self.in_flight.fetchSub(1, .acq_rel);
-    }
-
-    pub const Stats = struct {
-        capacity: usize,
-        in_flight: usize,
-        peak_in_flight: usize,
-        rejected_total: u64,
-    };
-
-    pub fn stats(self: *const RequestAdmission) Stats {
-        return .{
-            .capacity = self.capacity,
-            .in_flight = self.in_flight.load(.acquire),
-            .peak_in_flight = self.peak_in_flight.load(.acquire),
-            .rejected_total = self.rejected_total.load(.acquire),
-        };
-    }
-};
+/// Shared operation owner. Legacy calls remain fail-fast; contextual query
+/// calls can opt into fixed, bounded waiting.
+pub const bounded_admission = @import("bounded_admission.zig");
+pub const RequestAdmission = bounded_admission.Controller;
 
 /// Emit the stable process-level metrics for a foreground admission class.
 /// Keeping names here prevents runtime-specific health endpoints from drifting.
@@ -130,6 +63,29 @@ pub fn appendPrometheusMetrics(
     try prometheus.appendPromMetric(writer, names.in_flight, "gauge", names.in_flight_help, stats.in_flight);
     try prometheus.appendPromMetric(writer, names.peak_in_flight, "gauge", names.peak_help, stats.peak_in_flight);
     try prometheus.appendPromMetric(writer, names.rejected_total, "counter", names.rejected_help, stats.rejected_total);
+    const prefix = "antfly_admission_" ++ @tagName(class);
+    if (stats.sql_waiting_enabled) |enabled| {
+        try prometheus.appendPromMetric(writer, prefix ++ "_sql_waiting_enabled", "gauge", "Dedicated bounded SQL waiting executor available", @intFromBool(enabled));
+    }
+    try prometheus.appendPromMetric(writer, prefix ++ "_queued_requests", "gauge", "Operations waiting for admission", stats.queued);
+    try prometheus.appendPromMetric(writer, prefix ++ "_queued_input_bytes", "gauge", "Owned input bytes charged to waiting operations", stats.queued_bytes);
+    try prometheus.appendPromMetric(writer, prefix ++ "_queue_capacity_requests", "gauge", "Maximum admission waiters", stats.waiting.max_queued_requests);
+    try prometheus.appendPromMetric(writer, prefix ++ "_queue_capacity_bytes", "gauge", "Maximum queued input bytes", stats.waiting.max_queued_bytes);
+    try prometheus.appendPromMetric(writer, prefix ++ "_wait_ceiling_milliseconds", "gauge", "Maximum admission wait; zero is fail fast", stats.waiting.max_wait_ms);
+    try prometheus.appendPromMetric(writer, prefix ++ "_waited_requests_total", "counter", "Operations entering admission waiting", stats.waited_total);
+    try prometheus.appendPromMetric(writer, prefix ++ "_wait_nanoseconds_total", "counter", "Aggregate admission queue residence time", stats.wait_ns_total);
+    try prometheus.appendPromMetric(writer, prefix ++ "_expired_requests_total", "counter", "Waiters retired on wait or request deadline", stats.expired_total);
+    try prometheus.appendPromMetric(writer, prefix ++ "_cancelled_requests_total", "counter", "Waiters retired on cancellation", stats.cancelled_total);
+    try prometheus.appendPromMetric(writer, prefix ++ "_draining", "gauge", "Admission closed to new work", @intFromBool(stats.draining));
+    const histogram = prefix ++ "_wait_seconds";
+    try prometheus.appendPromMetricHeader(writer, histogram, "histogram", "Admission queue residence time");
+    inline for (bounded_admission.wait_bucket_seconds, 0..) |bound, index| {
+        try writer.print("{s}_bucket{{le=\"{s}\"}} {d}\n", .{ histogram, bound, stats.wait_buckets[index] });
+    }
+    try writer.print("{s}_sum {d}\n{s}_count {d}\n", .{
+        histogram, @as(f64, @floatFromInt(stats.wait_ns_total)) / std.time.ns_per_s,
+        histogram, stats.wait_completed_total,
+    });
 }
 
 test "request admission bounds positive capacity and preserves unlimited mode" {

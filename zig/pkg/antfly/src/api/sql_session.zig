@@ -19,7 +19,7 @@ pub const Coordinator = struct {
     pub fn commit(ptr: *anyopaque, _: sql.Scope, id: sql.Id) !sql.CommitResult {
         const self: *Coordinator = @ptrCast(@alignCast(ptr));
         const server = self.server;
-        const alloc = server.alloc;
+        const alloc = server.controlAllocator();
         try self.context.ensureActive();
         const lease = server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
         defer lease.release();

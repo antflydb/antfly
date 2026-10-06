@@ -1378,6 +1378,29 @@ pub fn create(b: *std.Build) ?Artifacts {
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
+    if (target.result.os.tag == .macos or (target.result.os.tag == .linux and target.result.abi.isGnu())) {
+        const signal_stack_mod = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true });
+        signal_stack_mod.addCSourceFile(.{ .file = b.path("lib/platform/src/native_signal_stack.c"), .flags = &.{ "-std=c11", "-pthread", "-DANTFLY_SIGNAL_STACK_TEST" } });
+        if (target.result.os.tag == .linux) signal_stack_mod.linkSystemLibrary("dl", .{});
+        const signal_stack_test = b.addExecutable(.{ .name = "shared-signal-stack-test", .root_module = signal_stack_mod });
+        b.step("shared-signal-stack-test", "Verify a native worker overflow uses the shared full-size signal stack").dependOn(&b.addRunArtifact(signal_stack_test).step);
+    }
+
+    const protected_dispatch_mod = b.createModule(.{
+        .root_source_file = b.path("lib/httpx/src/protected_dispatch_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    protected_dispatch_mod.addImport("antfly-json", json_mod);
+    const protected_dispatch_tests = b.addTest(.{
+        .name = "httpx-protected-dispatch-tests",
+        .root_module = protected_dispatch_mod,
+        .filters = &.{ "protected dispatch", "HTTP runtime reserves", "HTTP runtime observer startup failure", "HTTP application memory" },
+    });
+    b.step("lib-httpx-protected-dispatch-test", "Run protected HTTP dispatch and executor reservation contracts")
+        .dependOn(&b.addRunArtifact(protected_dispatch_tests).step);
+
     const httpx_client_lifecycle_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("lib/httpx/src/client_test_root.zig"),
@@ -1385,7 +1408,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .optimize = optimize,
             .link_libc = true,
         }),
-        .filters = &.{ "request gate", "request watchdog", "request task admission", "request cancellation before socket publication", "successful H1 requests do not wait" },
+        .filters = &.{ "request gate", "request watchdog", "request task admission", "request cancellation before socket publication", "successful H1 requests do not wait", "outbound admission", "outbound pool", "H2StreamReader", "H2 entry lease", "pooled H2 stream", "H2 stream response", "H2 stream cleanup", "HTTPS client round trip" },
     });
     const run_httpx_client_lifecycle_tests = b.addRunArtifact(httpx_client_lifecycle_tests);
     b.step("lib-httpx-client-lifecycle-test", "Run HTTP client admission, release, and shutdown contracts").dependOn(&run_httpx_client_lifecycle_tests.step);

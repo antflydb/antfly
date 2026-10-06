@@ -27,6 +27,9 @@ pub const Identity = struct {
 };
 
 pub const Request = struct {
+    /// Listener-owned flag only for draining an existing WITH HOLD cursor
+    /// before COMMIT. It never admits a new statement or stream.
+    completion_drain: bool = false,
     statement: []const u8,
     parameters: []const std.json.Value = &.{},
     parameter_types: []const Type = &.{},

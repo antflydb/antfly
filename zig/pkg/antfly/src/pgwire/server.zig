@@ -16,6 +16,7 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const backend = @import("backend.zig");
 const Budget = @import("budget.zig").Budget;
+const SharedBudget = @import("budget.zig").Shared;
 
 pub const Config = struct {
     io: std.Io,
@@ -23,6 +24,9 @@ pub const Config = struct {
     bind_host: []const u8 = "127.0.0.1",
     bind_port: u16 = 5432,
     max_connections: u16 = 32,
+    /// Zero preserves the sum of per-connection ceilings.
+    max_session_bytes: u64 = 0,
+    max_retained_bytes: u64 = 0,
     limits: protocol.Limits = .{},
     // There is no built-in TLS termination yet. A remote bind must explicitly
     // acknowledge that TLS/authenticated private-network protection is supplied
@@ -32,6 +36,31 @@ pub const Config = struct {
 
 pub const Server = struct {
     state: ?*State,
+
+    pub const Stats = struct {
+        connections: u32,
+        deadline_entries: usize,
+        deadline_tasks: u32 = 1,
+        expired_connections: u64,
+        session_bytes: usize,
+        retained_bytes: usize,
+    };
+
+    pub fn stats(self: Server) Stats {
+        const state = self.state.?;
+        state.deadline_mutex.lockUncancelable(state.config.io);
+        defer state.deadline_mutex.unlock(state.config.io);
+        var count: usize = 0;
+        var entry = state.deadline_head;
+        while (entry) |value| : (entry = value.next) count += 1;
+        return .{
+            .connections = state.active.load(.acquire),
+            .deadline_entries = count,
+            .expired_connections = state.expired.load(.acquire),
+            .session_bytes = state.memory.used.load(.acquire),
+            .retained_bytes = state.retained.used.load(.acquire),
+        };
+    }
 
     pub fn address(self: Server) std.Io.net.IpAddress {
         return self.state.?.listener.socket.address;
@@ -47,6 +76,9 @@ pub const Server = struct {
         state.listener.deinit(state.config.io);
         std.debug.assert(state.active.load(.acquire) == 0);
         std.debug.assert(state.sessions.count() == 0);
+        std.debug.assert(state.memory.used.load(.acquire) == 0);
+        std.debug.assert(state.retained.used.load(.acquire) == 0);
+        std.debug.assert(state.deadline_head == null);
         state.sessions.deinit(state.alloc);
         state.alloc.destroy(state);
     }
@@ -58,9 +90,74 @@ const State = struct {
     listener: std.Io.net.Server,
     tasks: std.Io.Group = .init,
     active: std.atomic.Value(u32) = .init(0),
+    expired: std.atomic.Value(u64) = .init(0),
     mutex: std.Io.Mutex = .init,
     next_pid: u32 = 0,
     sessions: std.AutoHashMapUnmanaged(i32, *protocol.Session) = .empty,
+    memory: SharedBudget,
+    retained: SharedBudget,
+    deadline_mutex: std.Io.Mutex = .init,
+    deadline_wakeup: std.Io.Event = .unset,
+    deadline_head: ?*DeadlineEntry = null,
+
+    const DeadlineEntry = struct {
+        next: ?*DeadlineEntry = null,
+        session: *protocol.Session,
+        stream: std.Io.net.Stream,
+        expired: bool = false,
+    };
+
+    /// One deadline task for the listener, including unauthenticated sockets.
+    /// The list borrows stack entries only while their connection tasks live.
+    fn deadlines(self: *State) void {
+        const io = self.config.io;
+        while (true) {
+            self.deadline_wakeup.reset();
+            var next: i96 = std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s;
+            self.deadline_mutex.lock(io) catch return;
+            var entry = self.deadline_head;
+            while (entry) |value| : (entry = value.next) {
+                if (value.expired) continue;
+                const deadline = value.session.deadline_ns.load(.acquire);
+                if (deadline <= std.Io.Clock.awake.now(io).nanoseconds) {
+                    value.expired = true;
+                    _ = self.expired.fetchAdd(1, .monotonic);
+                    value.session.cancel_requested.store(true, .release);
+                    // Shutdown wakes socket readers/writers without closing or
+                    // reusing the descriptor. Its connection owner still joins
+                    // backend completion and alone performs close/destruction.
+                    value.stream.shutdown(io, .both) catch {};
+                } else next = @min(next, deadline);
+            }
+            self.deadline_mutex.unlock(io);
+            self.deadline_wakeup.waitTimeout(io, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = next } } }) catch |err| switch (err) {
+                error.Canceled => return,
+                error.Timeout => {},
+            };
+        }
+    }
+
+    fn addDeadline(self: *State, entry: *DeadlineEntry) void {
+        self.deadline_mutex.lockUncancelable(self.config.io);
+        entry.next = self.deadline_head;
+        self.deadline_head = entry;
+        self.deadline_mutex.unlock(self.config.io);
+        self.deadline_wakeup.set(self.config.io);
+    }
+
+    fn removeDeadline(self: *State, entry: *DeadlineEntry) void {
+        self.deadline_mutex.lockUncancelable(self.config.io);
+        defer self.deadline_mutex.unlock(self.config.io);
+        var link = &self.deadline_head;
+        while (link.*) |value| {
+            if (value == entry) {
+                link.* = value.next;
+                return;
+            }
+            link = &value.next;
+        }
+        unreachable;
+    }
 
     fn acceptLoop(self: *State) void {
         const io = self.config.io;
@@ -132,14 +229,27 @@ pub fn start(alloc: std.mem.Allocator, config: Config) !Server {
         config.limits.parameters > std.math.maxInt(i16) or config.limits.columns > std.math.maxInt(i16) or
         config.limits.connection_bytes < config.limits.frame_bytes or
         config.limits.startup_timeout_ms == 0 or config.limits.idle_timeout_ms == 0 or
-        config.limits.statement_timeout_ms == 0 or config.limits.result_rows == 0)
+        config.limits.statement_timeout_ms == 0 or config.limits.result_rows == 0 or
+        config.limits.retained_bytes == 0 or config.limits.retained_bytes > config.limits.connection_bytes or
+        config.limits.idle_transaction_timeout_ms == 0)
         return error.InvalidPgwireConfig;
     const address = try std.Io.net.IpAddress.resolve(config.io, config.bind_host, config.bind_port);
     if (!config.allow_insecure_non_loopback and !isLoopback(address)) return error.PgwireRequiresProtectedTransport;
     const self = try alloc.create(State);
     errdefer alloc.destroy(self);
-    self.* = .{ .alloc = alloc, .config = config, .listener = try address.listen(config.io, .{ .reuse_address = true }) };
+    const session_bytes = if (config.max_session_bytes == 0)
+        std.math.mul(usize, config.max_connections, config.limits.connection_bytes) catch return error.InvalidPgwireConfig
+    else
+        std.math.cast(usize, config.max_session_bytes) orelse return error.InvalidPgwireConfig;
+    if (session_bytes < config.limits.frame_bytes) return error.InvalidPgwireConfig;
+    const retained_bytes = if (config.max_retained_bytes == 0)
+        std.math.mul(usize, config.max_connections, config.limits.retained_bytes) catch return error.InvalidPgwireConfig
+    else
+        std.math.cast(usize, config.max_retained_bytes) orelse return error.InvalidPgwireConfig;
+    self.* = .{ .alloc = alloc, .config = config, .retained = .{ .child = alloc, .limit = @min(retained_bytes, session_bytes) }, .listener = try address.listen(config.io, .{ .reuse_address = true }), .memory = .{ .child = alloc, .limit = session_bytes } };
     errdefer self.listener.deinit(config.io);
+    errdefer self.tasks.cancel(config.io);
+    try self.tasks.concurrent(config.io, State.deadlines, .{self});
     try self.tasks.concurrent(config.io, State.acceptLoop, .{self});
     return .{ .state = self };
 }
@@ -155,7 +265,7 @@ fn serveConnection(state: *State, stream: std.Io.net.Stream) void {
     const io = state.config.io;
     defer _ = state.active.fetchSub(1, .release);
     defer stream.close(io);
-    var budget = Budget{ .child = state.alloc, .limit = state.config.limits.connection_bytes };
+    var budget = Budget{ .child = state.memory.allocator(), .limit = state.config.limits.connection_bytes };
     var read_buffer: [8192]u8 = undefined;
     var write_buffer: [8192]u8 = undefined;
     var reader = stream.reader(io, &read_buffer);
@@ -167,29 +277,17 @@ fn serveConnection(state: *State, stream: std.Io.net.Stream) void {
         .reader = &reader.interface,
         .writer = &writer.interface,
         .limits = state.config.limits,
+        .retained_shared = &state.retained,
+        .deadline_wakeup = &state.deadline_wakeup,
         .hooks = .{ .context = state, .register = State.register, .unregister = State.unregister, .cancel = State.cancel },
     };
     defer session.deinit();
     session.setDeadline(session.limits.startup_timeout_ms);
-    const Outcome = union(enum) { session: anyerror!void, deadline: std.Io.Cancelable!void };
-    var outcomes: [2]Outcome = undefined;
-    var select = std.Io.Select(Outcome).init(io, &outcomes);
-    defer {
-        // Also wake request-owned native checkpoints. A storage mutation job
-        // may deliberately join uncancelably after durable admission instead
-        // of abandoning its response/identity memory when a socket closes.
-        session.cancel_requested.store(true, .release);
-        select.cancelDiscard();
-    }
-    select.concurrent(.session, protocol.Session.run, .{&session}) catch return;
-    select.concurrent(.deadline, watchDeadline, .{&session}) catch return;
-    const outcome = select.await() catch return;
-    switch (outcome) {
-        .session => |result| result catch {},
-        // Closing a timed-out connection communicates an uncertain outcome for
-        // in-flight mutations; never fabricate a retry-safe backend error.
-        .deadline => {},
-    }
+    var deadline_entry: State.DeadlineEntry = .{ .session = &session, .stream = stream };
+    state.addDeadline(&deadline_entry);
+    defer state.removeDeadline(&deadline_entry);
+    defer session.cancel_requested.store(true, .release);
+    session.run() catch {};
 }
 
 fn watchDeadline(session: *protocol.Session) std.Io.Cancelable!void {
@@ -264,4 +362,53 @@ test "pgwire shortening an idle deadline wakes its owner IO watchdog" {
     const result = try select.await();
     try std.testing.expect(result == .watchdog);
     try result.watchdog;
+}
+
+test "pgwire shared session budget rejects impossible aggregate limits" {
+    try std.testing.expectError(error.InvalidPgwireConfig, start(std.testing.allocator, .{
+        .io = std.testing.io,
+        .backend = undefined,
+        .bind_port = 0,
+        .max_session_bytes = 8,
+    }));
+}
+
+test "pgwire idle sockets share one deadline owner and join under saturation" {
+    const io = std.testing.io;
+    var listener = try start(std.testing.allocator, .{
+        .io = io,
+        .backend = undefined,
+        .bind_port = 0,
+        .max_connections = 16,
+        .limits = .{ .startup_timeout_ms = 30_000 },
+    });
+    defer listener.deinit();
+    var streams: [16]std.Io.net.Stream = undefined;
+    var opened: usize = 0;
+    defer for (streams[0..opened]) |stream| stream.close(io);
+    for (&streams) |*stream| {
+        stream.* = try listener.address().connect(io, .{ .mode = .stream });
+        opened += 1;
+    }
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+    while (listener.stats().deadline_entries != streams.len) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.ConnectionsDidNotStart;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    const stats = listener.stats();
+    try std.testing.expectEqual(@as(u32, 16), stats.connections);
+    try std.testing.expectEqual(@as(u32, 1), stats.deadline_tasks);
+    try std.testing.expectEqual(@as(usize, 0), stats.session_bytes);
+    try std.testing.expectEqual(@as(usize, 0), stats.retained_bytes);
+    // Shortening a live connection deadline must wake the one shared owner.
+    const state = listener.state.?;
+    state.deadline_mutex.lockUncancelable(io);
+    state.deadline_head.?.session.setDeadline(1);
+    state.deadline_mutex.unlock(io);
+    while (listener.stats().connections == streams.len) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.DeadlineDidNotWake;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqual(@as(u64, 1), listener.stats().expired_connections);
+    listener.deinit();
 }

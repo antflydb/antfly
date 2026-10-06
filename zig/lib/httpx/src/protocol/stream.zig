@@ -87,6 +87,7 @@ pub const Stream = struct {
     headers_flags: u8 = 0,
     /// Accumulated DATA frame payloads for this stream.
     data_buf: std.ArrayListUnmanaged(u8) = .empty,
+    protected_body_deadline_ms: ?i64 = null,
     /// Error from RST_STREAM or connection error, set by the receive loop.
     stream_error: ?anyerror = null,
     /// True once the receive loop has delivered HEADERS for this stream.

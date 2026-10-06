@@ -110,12 +110,32 @@ TLS itself.
 
 `start(allocator, Config)` borrows the owner's `std.Io` and backend. The owner
 must call `Server.deinit()` before releasing either. Structured `std.Io.Group`
-cancellation joins accept, protocol workers, and deadline watchers before
+cancellation joins accept, protocol workers, and the listener deadline owner before
 freeing their state; there are no detached threads or shutdown-time state leaks.
 
 Each connection has a total allocation cap shared by packets, prepared state,
 bound parameters, and backend result arenas, in addition to frame/count/row
 limits. Closed/replaced statements and portals reclaim their own arenas.
+`pgwire.max_session_bytes` additionally bounds allocations through these budgets
+across all connections on the listener. Zero preserves the sum of per-connection
+ceilings. `retained_bytes_per_connection` (default 8 MiB) and
+`max_retained_bytes` independently bound prepared/portal/cursor arenas and maps,
+cursor spools, savepoints, and session overlays. Retained bytes also count against
+connection/session limits; transient frames and result pages use only those outer
+limits. Zero aggregate retained bytes uses the sum of per-connection retained
+ceilings, capped by `max_session_bytes`. Backend allocations outside the supplied
+allocator and global caches retain their own budgets.
+
+`idle_transaction_timeout_ms` defaults to 30 seconds and applies to active and
+failed transactions, capped by the ordinary 60-second connection idle timeout.
+Expiry disconnects the owner and joins normal cleanup; started durable decisions
+remain recoverable. Global backend caches retain their own limits. Native read operations
+can share opt-in `admission.query.waiting` with HTTP SQL when a bounded,
+dedicated foreground executor is available; see [the implementation guide](../../../../WORKLOAD_POOLING_IMPLEMENTATION.md)
+for configuration, runtime restrictions, and qualification scope. Transaction
+completion uses bounded control capacity independent of fresh SQL, including
+COMMIT materialization of already-owned WITH HOLD cursors and disconnect cleanup.
+Queued CancelRequest returns SQLSTATE 57014 and preserves the connection.
 Native streaming cursors retain their original statement deadline as a hard
 snapshot lifetime; subsequent Execute messages do not extend it. Pages recheck
 credentials, current read grants and row-filter policy. Errors and disconnects
@@ -123,7 +143,10 @@ close snapshots before releasing credentials. Explicit SQL LIMIT is distinct
 from page size; scan/work/memory exhaustion returns an error, never a truncated
 successful SELECT.
 Authentication, idle, and statement deadlines use the owner's monotonic clock;
-an event wakes the watchdog when a shorter deadline replaces an idle deadline.
+one event wakes the shared listener deadline owner when deadlines change.
+Each accepted connection has one session task; the native API listener reserves
+a separate bounded worker lane for sessions, accept, deadlines and CancelRequest
+so idle clients cannot consume the shared outbound network lane.
 Timeout while a mutation is in flight closes the connection rather than
 inventing a retry-safe outcome. Backends must call `Request.check()` at bounded
 work/IO boundaries and propagate the request deadline to downstream operations.

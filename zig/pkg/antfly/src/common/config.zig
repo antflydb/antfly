@@ -90,9 +90,12 @@ pub const Config = struct {
         /// Zero disables this foreground admission class. Transport safeguards
         /// and inference admission remain independent.
         max_concurrent_requests: u32,
+        waiting: @import("bounded_admission.zig").Waiting = .{},
     };
 
     pub const AdmissionConfig = struct {
+        max_request_memory_bytes: u64 = 256 << 20,
+        max_retained_memory_bytes: u64 = 256 << 20,
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
         write: RequestAdmissionConfig = .{ .max_concurrent_requests = default_write_max_concurrent_requests },
         inference: RequestAdmissionConfig = .{ .max_concurrent_requests = default_inference_max_concurrent_requests },
@@ -108,6 +111,10 @@ pub const Config = struct {
         bind_host: ?[]const u8 = null,
         bind_port: u16 = 5432,
         max_connections: u16 = 32,
+        max_session_bytes: u64 = 0,
+        max_retained_bytes: u64 = 0,
+        retained_bytes_per_connection: u32 = 8 << 20,
+        idle_transaction_timeout_ms: u32 = 30_000,
         externally_protected_transport: bool = false,
     };
 
@@ -735,14 +742,35 @@ pub const Config = struct {
             else => return error.InvalidConfig,
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
+        var query_waiting: @import("bounded_admission.zig").Waiting = .{};
+        var max_request_memory_bytes: u64 = 256 << 20;
+        var max_retained_memory_bytes: u64 = 256 << 20;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "max_request_memory_bytes", "max_retained_memory_bytes" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
             };
+            max_request_memory_bytes = try optionalU64Field(admission_object, "max_request_memory_bytes") orelse 256 << 20;
+            max_retained_memory_bytes = try optionalU64Field(admission_object, "max_retained_memory_bytes") orelse 256 << 20;
+            if (max_retained_memory_bytes < 1 << 20 or max_retained_memory_bytes > std.math.maxInt(usize)) return error.InvalidConfig;
+            if (max_request_memory_bytes < 1 << 20 or max_request_memory_bytes > std.math.maxInt(usize)) return error.InvalidConfig;
             if (admission_object.get("query") != null) {
-                try validateObjectMemberFields(admission_object, "query", &.{"max_concurrent_requests"});
+                try validateObjectMemberFields(admission_object, "query", &.{ "max_concurrent_requests", "waiting" });
+                const query_object = admission_object.get("query").?.object;
+                if (query_object.get("waiting")) |waiting_value| {
+                    try validateObjectMemberFields(query_object, "waiting", &.{ "max_queued_requests", "max_queued_bytes", "max_wait_ms" });
+                    const waiting_object = switch (waiting_value) {
+                        .object => |object| object,
+                        else => return error.InvalidConfig,
+                    };
+                    query_waiting = .{
+                        .max_queued_requests = try optionalU32Field(waiting_object, "max_queued_requests") orelse 0,
+                        .max_queued_bytes = try optionalU64Field(waiting_object, "max_queued_bytes") orelse 0,
+                        .max_wait_ms = try optionalU32Field(waiting_object, "max_wait_ms") orelse 0,
+                    };
+                    try query_waiting.validate();
+                }
             }
             if (admission_object.get("write") != null) {
                 try validateObjectMemberFields(admission_object, "write", &.{"max_concurrent_requests"});
@@ -847,7 +875,7 @@ pub const Config = struct {
         errdefer kernel_jit.deinit(alloc);
         var pgwire: ?PgwireConfig = null;
         if (root.get("pgwire")) |value| {
-            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "externally_protected_transport" });
+            try validateObjectMemberFields(root, "pgwire", &.{ "enabled", "bind_host", "bind_port", "max_connections", "max_session_bytes", "max_retained_bytes", "retained_bytes_per_connection", "idle_transaction_timeout_ms", "externally_protected_transport" });
             const object = switch (value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
@@ -860,10 +888,17 @@ pub const Config = struct {
                 else => return error.InvalidConfig,
             } else null;
             if (host) |name| if (name.len == 0 or name.len > 253) return error.InvalidConfig;
+            const retained_bytes = try optionalU32Field(object, "retained_bytes_per_connection") orelse (8 << 20);
+            const idle_transaction_timeout = try optionalU32Field(object, "idle_transaction_timeout_ms") orelse 30_000;
+            if (retained_bytes == 0 or retained_bytes > 16 << 20 or idle_transaction_timeout == 0) return error.InvalidConfig;
             pgwire = .{
                 .enabled = try optionalBoolField(object, "enabled") orelse false,
                 .bind_port = @intCast(port),
                 .max_connections = @intCast(connections_count),
+                .max_session_bytes = try optionalU64Field(object, "max_session_bytes") orelse 0,
+                .max_retained_bytes = try optionalU64Field(object, "max_retained_bytes") orelse 0,
+                .retained_bytes_per_connection = retained_bytes,
+                .idle_transaction_timeout_ms = idle_transaction_timeout,
                 .externally_protected_transport = try optionalBoolField(object, "externally_protected_transport") orelse false,
                 .bind_host = if (host) |name| try alloc.dupe(u8, name) else null,
             };
@@ -889,6 +924,8 @@ pub const Config = struct {
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
             .admission = .{
+                .max_request_memory_bytes = max_request_memory_bytes,
+                .max_retained_memory_bytes = max_retained_memory_bytes,
                 .query = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
                     if (admission.query) |query|
                         if (query.max_concurrent_requests) |value|
@@ -898,7 +935,7 @@ pub const Config = struct {
                     else
                         default_query_max_concurrent_requests
                 else
-                    default_query_max_concurrent_requests },
+                    default_query_max_concurrent_requests, .waiting = query_waiting },
                 .write = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
                     if (admission.write) |write|
                         if (write.max_concurrent_requests) |value|
@@ -3780,4 +3817,71 @@ test "common config bootstraps named secret sources before resolving credentials
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings("credential", resolved);
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"secrets\":{\"environment\":\"false\"}}"));
+}
+
+test "config query waiting validates complete bounds and keeps legacy defaults" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"admission":{"query":{"max_concurrent_requests":4,"waiting":{"max_queued_requests":8,"max_queued_bytes":1048576,"max_wait_ms":100}}}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 4), cfg.admission.query.max_concurrent_requests);
+    try std.testing.expectEqual(@as(u32, 8), cfg.admission.query.waiting.max_queued_requests);
+    try std.testing.expectEqual(@as(u64, 1048576), cfg.admission.query.waiting.max_queued_bytes);
+    try std.testing.expectEqual(@as(u32, 100), cfg.admission.query.waiting.max_wait_ms);
+    var legacy = try Config.parseFromSlice(std.testing.allocator, "{}");
+    defer legacy.deinit();
+    try std.testing.expectEqual(@as(u32, 0), legacy.admission.query.waiting.max_wait_ms);
+    for ([_][]const u8{
+        \\{"admission":{"query":{"waiting":{"max_wait_ms":1}}}}
+        ,
+        \\{"admission":{"query":{"waiting":{"max_queued_requests":1,"max_queued_bytes":1,"max_wait_ms":0}}}}
+        ,
+        \\{"admission":{"query":{"waiting":{"max_queued_requests":1,"max_queued_bytes":1,"max_wait_ms":60001}}}}
+        ,
+        \\{"admission":{"query":{"waiting":{"max_queue_requests":1}}}}
+        ,
+        \\{"admission":{"write":{"waiting":{"max_wait_ms":1}}}}
+        ,
+    }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, body));
+}
+
+test "config query waiting pgwire aggregate memory round trips" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"pgwire":{"max_connections":64,"max_session_bytes":67108864}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u16, 64), cfg.pgwire.?.max_connections);
+    try std.testing.expectEqual(@as(u64, 67108864), cfg.pgwire.?.max_session_bytes);
+}
+
+test "config query waiting retained pgwire policy validates independent budgets" {
+    var cfg = try Config.parseFromSlice(std.testing.allocator,
+        \\{"pgwire":{"max_session_bytes":67108864,"max_retained_bytes":16777216,"retained_bytes_per_connection":1048576,"idle_transaction_timeout_ms":5000}}
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u64, 16777216), cfg.pgwire.?.max_retained_bytes);
+    try std.testing.expectEqual(@as(u32, 1048576), cfg.pgwire.?.retained_bytes_per_connection);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.pgwire.?.idle_transaction_timeout_ms);
+    for ([_][]const u8{
+        \\{"pgwire":{"retained_bytes_per_connection":0}}
+        ,
+        \\{"pgwire":{"retained_bytes_per_connection":16777217}}
+        ,
+        \\{"pgwire":{"idle_transaction_timeout_ms":0}}
+        ,
+    }) |body| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, body));
+}
+
+test "config workload envelope validates finite allocation limits" {
+    var config = try Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_request_memory_bytes\":1048576}}");
+    defer config.deinit();
+    try std.testing.expectEqual(@as(u64, 1048576), config.admission.max_request_memory_bytes);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_request_memory_bytes\":0}}"));
+}
+
+test "config workload envelope validates retained allocation limits" {
+    var config = try Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_retained_memory_bytes\":1048576}}");
+    defer config.deinit();
+    try std.testing.expectEqual(@as(u64, 1048576), config.admission.max_retained_memory_bytes);
+    try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(std.testing.allocator, "{\"admission\":{\"max_retained_memory_bytes\":0}}"));
 }

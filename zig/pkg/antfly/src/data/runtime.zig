@@ -160,7 +160,8 @@ const embedding_activity_protocol_version = antfly.metadata.table_manager.embedd
 const StoreStatusReportKind = enum { none, heartbeat, full };
 const metadata_head_cache_ttl_ms: u64 = std.time.ms_per_s;
 const metadata_snapshot_cache_ttl_ms: u64 = std.time.ms_per_s;
-const remote_metadata_http_executor_pool_size: usize = 4;
+// One service-owned concurrent pool keeps endpoint limits authoritative.
+const remote_metadata_http_executor_pool_size: usize = 1;
 // Ordinary catalog callbacks do not carry a request context through their ABI.
 // Give them the same finite envelope as linearizable metadata reads so cache
 // generation churn can retry without either escaping early or waiting forever.
@@ -969,7 +970,7 @@ const DataPublicHttpRuntime = struct {
             .api_server = api_server,
             .handler = try antfly.public_api.kernel_bridge.createHandler(api_server),
             .server = blk: {
-                var server_cfg = publicApiHttpxConfig(cfg, http_runtime);
+                var server_cfg = api_server.configurePublicHttpTransport(publicApiHttpxConfig(cfg, http_runtime));
                 if (!http_runtime.supportsH1DisconnectCancellation()) {
                     if (h1_disconnect_probe) |probe| {
                         server_cfg.h1_disconnect_probe = probe;
@@ -5808,6 +5809,8 @@ pub const DataServer = struct {
     listener: ?*DataPublicHttpRuntime = null,
     query_io_impl: ?std.Io.Threaded = null,
     distributed_read_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
+    raft_forward_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
+    raft_forward_http_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_future: ?std.Io.Future(void) = null,
     dense_publication_future: ?std.Io.Future(void) = null,
@@ -5862,6 +5865,7 @@ pub const DataServer = struct {
     fn hotStandbyStandbyReplicationHTTPExecutorConfig() antfly.common.http.StdHttpExecutorConfig {
         return .{
             .max_response_bytes = hot_standby_replication_default_max_response_bytes,
+            .keep_alive = false,
             .resolve_before_connect = true,
             // DNS and connect are part of the failover transport. Bound that
             // phase without imposing an absolute deadline on a replication
@@ -9362,6 +9366,11 @@ pub const DataServer = struct {
         self.lsm_maintenance_stop.store(true, .release);
         self.lsm_maintenance_wake.store(true, .release);
         if (self.distributed_read_http_executor) |executor| executor.beginShutdown();
+        {
+            platform_sync.lockYielding(&self.raft_forward_http_mutex);
+            defer self.raft_forward_http_mutex.unlock();
+            if (self.raft_forward_http_executor) |executor| executor.beginShutdown();
+        }
         if (self.kernel_owner_source) |source| source.beginApplyControlShutdown();
         self.write_source.beginTeardown();
         if (self.data_raft_apply) |apply_sm| apply_sm.write_source.beginTeardown();
@@ -9552,6 +9561,11 @@ pub const DataServer = struct {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
         }
+        if (self.raft_forward_http_executor) |executor| {
+            executor.deinit();
+            self.alloc.destroy(executor);
+            self.raft_forward_http_executor = null;
+        }
         if (self.distributed_read_http_executor) |executor| {
             executor.deinit();
             self.alloc.destroy(executor);
@@ -9586,7 +9600,7 @@ pub const DataServer = struct {
         if (self.owned_http_runtime) |runtime| return runtime;
         const runtime = try self.alloc.create(httpx.HttpRuntime);
         errdefer self.alloc.destroy(runtime);
-        const listener_config = publicApiHttpxConfig(self.listener_cfg, null);
+        const listener_config = if (self.http_server) |*api| api.configurePublicHttpTransport(publicApiHttpxConfig(self.listener_cfg, null)) else publicApiHttpxConfig(self.listener_cfg, null);
         const borrowed_io: ?httpx.HttpRuntime.BorrowedIo = if (self.backend_runtime) |backend_runtime|
             if (backend_runtime.usesBorrowedIo()) .{
                 .listener = backend_runtime.controlIo() orelse backend_runtime.apiIo() orelse return error.BackendRuntimeUnavailable,
@@ -12544,6 +12558,23 @@ pub const DataServer = struct {
         }
     }
 
+    /// Reuse a service-owned forwarding transport while the caller retains its
+    /// existing lane reservation. The public-read pool remains an independent
+    /// owner; a foreign/replay Io can never silently replace Raft authority.
+    fn raftForwardTransport(self: *DataServer, io: std.Io) !antfly.common.http.RequestExecutor {
+        platform_sync.lockYielding(&self.raft_forward_http_mutex);
+        defer self.raft_forward_http_mutex.unlock();
+        if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
+        if (self.raft_forward_http_executor == null) {
+            const executor = try self.alloc.create(antfly.common.http.IoHttpExecutor);
+            executor.* = antfly.common.http.IoHttpExecutor.init(self.alloc, io, .{});
+            self.raft_forward_http_executor = executor;
+        }
+        const executor = self.raft_forward_http_executor.?;
+        if (executor.io.userdata != io.userdata or executor.io.vtable != io.vtable) return error.ForwardTransportAuthorityChanged;
+        return executor.executor();
+    }
+
     fn distributedReadExecutor(self: *DataServer) !antfly.common.http.RequestExecutor {
         if (self.distributed_read_http_executor == null) {
             const runtime = self.backend_runtime orelse return error.BackendRuntimeUnavailable;
@@ -13365,15 +13396,9 @@ pub const DataServer = struct {
                                 // the Raft process that selected the route.
                                 var forward_lane = try self.acquireDataRaftForwardLaneUntil(group_id, deadline_ns, route);
                                 defer forward_lane.release();
-                                var executor = antfly.common.http.IoHttpExecutor.init(
-                                    alloc,
-                                    forward_lane.io(),
-                                    .{},
-                                );
-                                defer executor.deinit();
                                 var client = antfly.public_api.ApiHttpClient.init(
                                     alloc,
-                                    executor.executor(),
+                                    try self.raftForwardTransport(forward_lane.io()),
                                 );
                                 _ = client.withInternalServiceAuth(
                                     self.api_server_cfg.internal_service_secret,
@@ -13591,13 +13616,7 @@ pub const DataServer = struct {
 
         var forward_lane = try self.acquireDataRaftForwardLaneUntil(group_id, deadline_ns, route);
         defer forward_lane.release();
-        var executor = antfly.common.http.IoHttpExecutor.init(
-            alloc,
-            forward_lane.io(),
-            .{},
-        );
-        defer executor.deinit();
-        var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+        var client = antfly.public_api.ApiHttpClient.init(alloc, try self.raftForwardTransport(forward_lane.io()));
         _ = client.withInternalServiceAuth(
             self.api_server_cfg.internal_service_secret,
             self.api_server_cfg.internal_service_issuer,
@@ -15354,9 +15373,7 @@ pub const DataServer = struct {
                     // different Io backend (notably during replay/simulation).
                     var lane = try self.acquireDataRaftForwardLane();
                     defer lane.release();
-                    var executor = antfly.common.http.IoHttpExecutor.init(alloc, lane.io(), .{});
-                    defer executor.deinit();
-                    var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+                    var client = antfly.public_api.ApiHttpClient.init(alloc, try self.raftForwardTransport(lane.io()));
                     _ = client.withInternalServiceAuth(self.api_server_cfg.internal_service_secret, self.api_server_cfg.internal_service_issuer);
                     if (scoped.mode == .merge_copy_receipt) {
                         // This private read ships with the complete v10 native
@@ -30943,6 +30960,9 @@ pub fn runFromIterator(
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .request_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_request_memory_bytes) else 256 << 20,
+            .retained_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_retained_memory_bytes) else 256 << 20,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
@@ -34736,9 +34756,13 @@ fn consumerTests() type {
             defer serving.cancel(std.testing.io) catch {};
             var forward_lane = try server.acquireDataRaftForwardLane();
             defer forward_lane.release();
-            var executor = antfly.common.http.IoHttpExecutor.init(alloc, forward_lane.io(), .{});
-            defer executor.deinit();
-            var client = antfly.public_api.ApiHttpClient.init(alloc, executor.executor());
+            const transport = try server.raftForwardTransport(forward_lane.io());
+            const reused = try server.raftForwardTransport(forward_lane.io());
+            try std.testing.expect(transport.ptr == reused.ptr);
+            try std.testing.expect(server.raft_forward_http_executor != server.distributed_read_http_executor);
+            var foreign_vtable = forward_lane.io().vtable.*;
+            try std.testing.expectError(error.ForwardTransportAuthorityChanged, server.raftForwardTransport(.{ .userdata = forward_lane.io().userdata, .vtable = &foreign_vtable }));
+            var client = antfly.public_api.ApiHttpClient.init(alloc, transport);
             var response = try client.fetchGroupBatchWithForwarding(
                 peer.baseUrl(),
                 7,

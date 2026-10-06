@@ -5154,6 +5154,9 @@ pub fn runFromIterator(
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+            .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .request_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_request_memory_bytes) else 256 << 20,
+            .retained_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_retained_memory_bytes) else 256 << 20,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
             .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
             .inference_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.inference.max_concurrent_requests else antfly.common.config.default_inference_max_concurrent_requests,
@@ -5392,7 +5395,7 @@ pub fn runFromIterator(
     var unified_api_ready = std.atomic.Value(bool).init(false);
 
     var unified_lifecycle = UnifiedServerLifecycle.init(control_io);
-    const public_http_config = publicHttpServerConfig(bind_host, bind_port);
+    const public_http_config = api_server.configurePublicHttpTransport(publicHttpServerConfig(bind_host, bind_port));
     var http_observer_lease = try node_backend_runtime.ptr().acquireWorkers(.{});
     defer http_observer_lease.release();
     var http_runtime = httpx.HttpRuntime.init(alloc, .{

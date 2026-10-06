@@ -65,6 +65,40 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const test_imports = @import("test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
+    const pooling_filters = [_][]const u8{
+        "bounded admission",
+        "workload envelope",
+        "workload deadline",
+        "config workload envelope",
+        "pgwire retained budget",
+        "pgwire shared session budget",
+        "request admission bounds",
+        "request admission lease",
+        "request admission metrics",
+        "config query waiting",
+        "httpx query waiting",
+        "SQL query waiting",
+        "httpx query admission",
+        "httpx write admission",
+        "SQL execution admission",
+        "SQL protected executor",
+        "SQL protected control",
+        "httpx stable transaction commit",
+        "httpx SQL executes one relational page",
+        "httpx SQL connection routes",
+        "httpx SQL durable session settings",
+        "SQL pgwire credential snapshot",
+    };
+    const pooling_tests = b.addTest(.{
+        .name = "default-workload-pooling-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &pooling_filters,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-workload-pooling-test", "Run bounded waiting and shared HTTP/SQL admission contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, pooling_tests, &pooling_filters).step);
+
     const public_api_parity_default_filters = [_][]const u8{
         "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",

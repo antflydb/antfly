@@ -33,6 +33,8 @@ pub const Limits = struct {
     result_rows: u32 = 4096,
     cursor_rows: u32 = 65536,
     cursor_bytes: usize = 8 << 20,
+    retained_bytes: usize = 8 << 20,
+    idle_transaction_timeout_ms: u32 = 30_000,
     startup_timeout_ms: u32 = 5000,
     idle_timeout_ms: u32 = 60000,
     statement_timeout_ms: u32 = 30000,
@@ -46,7 +48,7 @@ pub const CancelHooks = struct {
 };
 
 const Prepared = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
     statement: []const u8,
     parameter_oids: []const u32,
     description: backend.Description,
@@ -55,7 +57,7 @@ const Prepared = struct {
 };
 
 const Portal = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
     statement: []const u8,
     parameters: []const std.json.Value,
     types: []const backend.Type,
@@ -72,7 +74,7 @@ const Portal = struct {
 };
 
 const SqlCursor = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
     statement: []const u8,
     description: backend.Description,
     stream: ?backend.ReadStream,
@@ -102,10 +104,13 @@ pub const Session = struct {
     namespace: ?[]u8 = null,
     session_id: ?[]u8 = null,
     status: backend.TransactionStatus = .idle,
+    completion_drain: bool = false,
     prepared: std.StringHashMapUnmanaged(Prepared) = .empty,
     portals: std.StringHashMapUnmanaged(Portal) = .empty,
     sql_cursors: std.StringHashMapUnmanaged(SqlCursor) = .empty,
     cursor_budget: ?*Budget = null,
+    retained_shared: ?*@import("budget.zig").Shared = null,
+    retained_budget: ?*Budget = null,
     cursor_epoch: u64 = 0,
     statement_timeout: ?u32 = null,
     application_name: commands.ApplicationName = .{},
@@ -124,6 +129,8 @@ pub const Session = struct {
     // Listener watchdog uses the same owner clock as backend requests.
     deadline_ns: std.atomic.Value(i64) = .init(0),
     deadline_changed: std.Io.Event = .unset,
+    /// Listener-owned deadline service; borrowed until joined session cleanup.
+    deadline_wakeup: ?*std.Io.Event = null,
     diagnostic: backend.Diagnostic = .{},
     mutation_ack_pending: bool = false,
     discard_after_reply: bool = false,
@@ -135,26 +142,62 @@ pub const Session = struct {
         self.clearPortals();
         self.clearSqlCursors();
         self.clearCursorSavepoints();
-        self.savepoints.deinit(self.alloc);
+        self.savepoints.deinit(self.retainedAlloc());
         if (self.catalog_settings) |*state| state.deinit();
         if (self.cursor_budget) |budget| self.alloc.destroy(budget);
         if (self.identity) |identity| {
             self.source.vtable.disconnect(self.source.context, identity, self.session_id);
             identity.release(identity.context, self.alloc);
         }
-        self.portals.deinit(self.alloc);
-        self.sql_cursors.deinit(self.alloc);
+        self.portals.deinit(self.retainedAlloc());
+        self.sql_cursors.deinit(self.retainedAlloc());
         self.clearPrepared();
-        self.prepared.deinit(self.alloc);
+        self.prepared.deinit(self.retainedAlloc());
         if (self.database) |value| self.alloc.free(value);
         if (self.namespace) |value| self.alloc.free(value);
         if (self.session_id) |value| self.alloc.free(value);
+        if (self.retained_budget) |budget| {
+            std.debug.assert(budget.used == 0);
+            self.alloc.destroy(budget);
+        }
+    }
+
+    fn retainedAllocator(self: *Session) !std.mem.Allocator {
+        if (self.retained_budget == null) {
+            const budget = try self.alloc.create(Budget);
+            budget.* = .{ .child = self.alloc, .limit = self.limits.retained_bytes, .shared = self.retained_shared };
+            self.retained_budget = budget;
+        }
+        return self.retainedAlloc();
+    }
+
+    fn newRetainedArena(self: *Session) !*std.heap.ArenaAllocator {
+        const child = try self.retainedAllocator();
+        // Readers may retain allocator contexts. Map growth and declaration
+        // return must never move the arena that those contexts reference.
+        const arena = try self.alloc.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(child);
+        return arena;
+    }
+
+    fn destroyRetainedArena(self: *Session, arena: *std.heap.ArenaAllocator) void {
+        arena.deinit();
+        self.alloc.destroy(arena);
+    }
+
+    fn retainedAlloc(self: *Session) std.mem.Allocator {
+        return if (self.retained_budget) |budget| budget.allocator() else self.alloc;
+    }
+
+    pub fn idleTimeoutMs(self: *const Session) u32 {
+        return if (self.status != .idle) @min(self.limits.idle_timeout_ms, self.limits.idle_transaction_timeout_ms) else self.limits.idle_timeout_ms;
     }
 
     pub fn setDeadline(self: *Session, ms: u32) void {
         const now: i64 = @intCast(std.Io.Clock.awake.now(self.io).nanoseconds);
         self.deadline_ns.store(now +| @as(i64, ms) * std.time.ns_per_ms, .release);
         self.deadline_changed.set(self.io);
+        if (self.deadline_wakeup) |event| event.set(self.io);
     }
 
     pub fn run(self: *Session) !void {
@@ -167,7 +210,7 @@ pub const Session = struct {
         };
         if (!started) return;
         while (true) {
-            self.setDeadline(self.limits.idle_timeout_ms);
+            self.setDeadline(self.idleTimeoutMs());
             const tag = self.reader.takeByte() catch |err| switch (err) {
                 error.EndOfStream => return,
                 else => return err,
@@ -322,6 +365,7 @@ pub const Session = struct {
     fn request(self: *Session, statement: []const u8, parameters: []const std.json.Value, types: []const backend.Type) backend.Request {
         return .{
             .statement = statement,
+            .completion_drain = self.completion_drain,
             .parameters = parameters,
             .parameter_types = types,
             .database = self.database,
@@ -383,11 +427,11 @@ pub const Session = struct {
         try req.check();
         const control = try commands.control(alloc, statement);
         var savepoint_name: ?[]const u8 = null;
-        defer if (savepoint_name) |name| self.alloc.free(name);
+        defer if (savepoint_name) |name| self.retainedAlloc().free(name);
         if (control) |value| if (value == .savepoint) {
             if (self.savepoints.items.len >= 64) return error.ProgramLimitExceeded;
-            savepoint_name = try self.alloc.dupe(u8, value.savepoint);
-            try self.savepoints.ensureUnusedCapacity(self.alloc, 1);
+            savepoint_name = try (try self.retainedAllocator()).dupe(u8, value.savepoint);
+            try self.savepoints.ensureUnusedCapacity(try self.retainedAllocator(), 1);
         };
         if (commands.isCommit(statement)) try self.materializeHeldCursors();
         const previous_status = self.status;
@@ -407,7 +451,7 @@ pub const Session = struct {
         self.session_id = session;
         self.status = result.transaction_status;
         if (previous_status == .idle and self.status == .in_transaction) {
-            try self.settingsState().begin();
+            try (try self.settingsState()).begin();
             self.timeout_transaction = .{ .before = self.statement_timeout, .committed = self.statement_timeout, .namespace_before = self.namespace_setting, .namespace_committed = self.namespace_setting, .application_before = self.application_name, .application_committed = self.application_name };
             self.transaction_namespace = try commands.Namespace.init(req.namespace orelse "public");
         }
@@ -435,8 +479,8 @@ pub const Session = struct {
                         }
                         const keep = index + @as(usize, if (value == .rollback_to) 1 else 0);
                         for (self.savepoints.items[keep..]) |*point| {
-                            self.alloc.free(point.name);
-                            if (point.catalog) |*snapshot| snapshot.deinit(self.alloc);
+                            self.retainedAlloc().free(point.name);
+                            if (point.catalog) |*snapshot| snapshot.deinit(self.retainedAlloc());
                         }
                         self.savepoints.shrinkRetainingCapacity(keep);
                         break;
@@ -552,8 +596,8 @@ pub const Session = struct {
         return result;
     }
 
-    fn settingsState(self: *Session) *settings_catalog.OverlayState {
-        if (self.catalog_settings == null) self.catalog_settings = settings_catalog.OverlayState.init(self.alloc);
+    fn settingsState(self: *Session) !*settings_catalog.OverlayState {
+        if (self.catalog_settings == null) self.catalog_settings = settings_catalog.OverlayState.init(try self.retainedAllocator());
         return &self.catalog_settings.?;
     }
 
@@ -571,7 +615,7 @@ pub const Session = struct {
         };
         var captured = raw;
         const owner: settings_catalog.Owner = .{ .ptr = &captured, .load = snapshot.read };
-        const state = self.settingsState();
+        const state = try self.settingsState();
         switch (setting) {
             .set => |value| {
                 try state.set(owner, raw.scope, value.name, value.value, value.local);
@@ -687,9 +731,9 @@ pub const Session = struct {
                 if (count > self.limits.parameters) return error.ProgramLimitExceeded;
                 if (name.len != 0 and self.prepared.contains(name)) return error.DuplicatePreparedStatement;
                 if (!self.prepared.contains(name) and self.prepared.count() >= self.limits.prepared_statements) return error.ProgramLimitExceeded;
-                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                const arena = try self.newRetainedArena();
                 var transferred = false;
-                errdefer if (!transferred) arena.deinit();
+                errdefer if (!transferred) self.destroyRetainedArena(arena);
                 const a = arena.allocator();
                 const declared = try a.alloc(u32, count);
                 const types = try a.alloc(backend.Type, count);
@@ -705,12 +749,12 @@ pub const Session = struct {
                     oid.* = if (index < declared.len and declared[index] != 0) declared[index] else values.oid(kind);
                 }
                 const owned_statement = try a.dupe(u8, statement);
-                const owned_name = try self.alloc.dupe(u8, name);
-                errdefer if (!transferred) self.alloc.free(owned_name);
+                const owned_name = try (try self.retainedAllocator()).dupe(u8, name);
+                errdefer if (!transferred) self.retainedAlloc().free(owned_name);
                 self.removePrepared(name);
                 if (name.len == 0) self.removePortal("");
                 const namespace = try a.dupe(u8, self.request_namespace orelse self.effectiveNamespace());
-                try self.prepared.put(self.alloc, owned_name, .{ .arena = arena, .statement = owned_statement, .parameter_oids = oids, .description = description, .namespace = namespace, .search_path = self.effectiveSearchPath() });
+                try self.prepared.put(try self.retainedAllocator(), owned_name, .{ .arena = arena, .statement = owned_statement, .parameter_oids = oids, .description = description, .namespace = namespace, .search_path = self.effectiveSearchPath() });
                 transferred = true;
                 try self.message('1', "");
             },
@@ -720,9 +764,9 @@ pub const Session = struct {
                 const statement = self.prepared.get(statement_name) orelse return error.InvalidStatementName;
                 if (name.len != 0 and self.portals.contains(name)) return error.DuplicatePortal;
                 if (!self.portals.contains(name) and self.portals.count() >= self.limits.portals) return error.ProgramLimitExceeded;
-                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                const arena = try self.newRetainedArena();
                 var transferred = false;
-                errdefer if (!transferred) arena.deinit();
+                errdefer if (!transferred) self.destroyRetainedArena(arena);
                 const a = arena.allocator();
                 const format_count = try cursor.int(u16);
                 if (format_count > self.limits.parameters) return error.ProgramLimitExceeded;
@@ -760,11 +804,11 @@ pub const Session = struct {
                     .binding_guard = if (statement.description.binding_guard) |guard| try a.dupe(u8, guard) else null,
                     .setting_epoch = statement.description.setting_epoch,
                 };
-                const owned_name = try self.alloc.dupe(u8, name);
-                errdefer if (!transferred) self.alloc.free(owned_name);
+                const owned_name = try (try self.retainedAllocator()).dupe(u8, name);
+                errdefer if (!transferred) self.retainedAlloc().free(owned_name);
                 self.removePortal(name);
                 const namespace = try a.dupe(u8, statement.namespace);
-                try self.portals.put(self.alloc, owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path });
+                try self.portals.put(try self.retainedAllocator(), owned_name, .{ .arena = arena, .statement = text, .parameters = parameters, .types = types, .formats = result_formats, .description = description, .namespace = namespace, .search_path = statement.search_path });
                 transferred = true;
                 try self.message('2', "");
             },
@@ -878,18 +922,18 @@ pub const Session = struct {
             .prepare => |prepare| {
                 if (self.prepared.contains(prepare.name)) return error.DuplicatePreparedStatement;
                 if (self.prepared.count() >= self.limits.prepared_statements) return error.ProgramLimitExceeded;
-                var arena = std.heap.ArenaAllocator.init(self.alloc);
-                errdefer arena.deinit();
+                const arena = try self.newRetainedArena();
+                errdefer self.destroyRetainedArena(arena);
                 const a = arena.allocator();
                 const description = try self.describe(a, prepare.statement, prepare.types);
                 if (prepare.types.len > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
                 for (oids, description.parameter_types) |*oid, kind| oid.* = values.oid(kind);
                 const sql = try a.dupe(u8, prepare.statement);
-                const name = try self.alloc.dupe(u8, prepare.name);
-                errdefer self.alloc.free(name);
+                const name = try (try self.retainedAllocator()).dupe(u8, prepare.name);
+                errdefer self.retainedAlloc().free(name);
                 const namespace = try a.dupe(u8, self.request_namespace orelse self.effectiveNamespace());
-                try self.prepared.put(self.alloc, name, .{ .arena = arena, .statement = sql, .parameter_oids = oids, .description = description, .namespace = namespace, .search_path = self.effectiveSearchPath() });
+                try self.prepared.put(try self.retainedAllocator(), name, .{ .arena = arena, .statement = sql, .parameter_oids = oids, .description = description, .namespace = namespace, .search_path = self.effectiveSearchPath() });
                 // Map ownership has transferred before writing an acknowledgement.
                 // A failed socket is handled by connection cleanup, never replay.
             },
@@ -900,8 +944,8 @@ pub const Session = struct {
                 } else {
                     var iterator = self.prepared.iterator();
                     while (iterator.next()) |entry| {
-                        self.alloc.free(entry.key_ptr.*);
-                        entry.value_ptr.arena.deinit();
+                        self.retainedAlloc().free(entry.key_ptr.*);
+                        self.destroyRetainedArena(entry.value_ptr.arena);
                     }
                     self.prepared.clearRetainingCapacity();
                 }
@@ -965,9 +1009,9 @@ pub const Session = struct {
         if (!hold and (self.status != .in_transaction or self.session_id == null)) return error.CursorMustBeInTransaction;
         if (self.sql_cursors.contains(name)) return error.DuplicateCursorName;
         if (self.sql_cursors.count() >= self.limits.portals) return error.ProgramLimitExceeded;
-        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        const arena = try self.newRetainedArena();
         var arena_moved = false;
-        defer if (!arena_moved) arena.deinit();
+        defer if (!arena_moved) self.destroyRetainedArena(arena);
         const description = try self.describe(arena.allocator(), statement, &.{});
         if (description.parameter_types.len != 0) return error.InvalidParameter;
         self.cancel_requested.store(false, .release);
@@ -991,7 +1035,7 @@ pub const Session = struct {
         if (stream == null or scroll or hold) {
             if (self.cursor_budget == null) {
                 const budget = try self.alloc.create(Budget);
-                budget.* = .{ .child = self.alloc, .limit = @min(self.limits.cursor_bytes, self.limits.connection_bytes) };
+                budget.* = .{ .child = try self.retainedAllocator(), .limit = @min(self.limits.cursor_bytes, self.limits.retained_bytes) };
                 self.cursor_budget = budget;
             }
             spool = Spool.init(self.cursor_budget.?);
@@ -1013,13 +1057,13 @@ pub const Session = struct {
         }
         const owned_statement = try arena.allocator().dupe(u8, statement);
         const session_id = try arena.allocator().dupe(u8, self.session_id orelse "");
-        const key = try self.alloc.dupe(u8, name);
+        const key = try (try self.retainedAllocator()).dupe(u8, name);
         var key_moved = false;
-        defer if (!key_moved) self.alloc.free(key);
+        defer if (!key_moved) self.retainedAlloc().free(key);
         const database = if (self.database) |value| try arena.allocator().dupe(u8, value) else null;
         const namespace = try arena.allocator().dupe(u8, self.request_namespace orelse self.effectiveNamespace());
         self.cursor_epoch = std.math.add(u64, self.cursor_epoch, 1) catch return error.ProgramLimitExceeded;
-        try self.sql_cursors.put(self.alloc, key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
+        try self.sql_cursors.put(try self.retainedAllocator(), key, .{ .arena = arena, .statement = owned_statement, .description = description, .stream = stream, .session_id = session_id, .scroll = scroll, .hold = hold, .committed = hold and self.status == .idle, .spool = spool, .exhausted = stream == null, .database = database, .namespace = namespace, .search_path = self.effectiveSearchPath(), .creation_epoch = self.cursor_epoch });
         key_moved = true;
         arena_moved = true;
         stream_moved = true;
@@ -1138,6 +1182,8 @@ pub const Session = struct {
 
     fn materializeHeldCursors(self: *Session) !void {
         if (self.status != .in_transaction) return;
+        self.completion_drain = true;
+        defer self.completion_drain = false;
         var iterator = self.sql_cursors.valueIterator();
         while (iterator.next()) |cursor| if (cursor.hold and !cursor.committed) try self.fillCursor(cursor, std.math.maxInt(usize));
     }
@@ -1210,8 +1256,8 @@ pub const Session = struct {
 
     fn clearCursorSavepoints(self: *Session) void {
         for (self.savepoints.items) |*point| {
-            self.alloc.free(point.name);
-            if (point.catalog) |*snapshot| snapshot.deinit(self.alloc);
+            self.retainedAlloc().free(point.name);
+            if (point.catalog) |*snapshot| snapshot.deinit(self.retainedAlloc());
         }
         self.savepoints.clearRetainingCapacity();
     }
@@ -1228,59 +1274,59 @@ pub const Session = struct {
 
     fn removeSqlCursor(self: *Session, name: []const u8) void {
         if (self.sql_cursors.fetchRemove(name)) |entry| {
-            self.alloc.free(entry.key);
+            self.retainedAlloc().free(entry.key);
             var cursor = entry.value;
             if (cursor.stream) |stream| stream.close(stream.context);
             if (cursor.spool) |*spool| spool.deinit();
-            cursor.arena.deinit();
+            self.destroyRetainedArena(cursor.arena);
         }
     }
 
     fn clearSqlCursors(self: *Session) void {
         var iterator = self.sql_cursors.iterator();
         while (iterator.next()) |entry| {
-            self.alloc.free(entry.key_ptr.*);
+            self.retainedAlloc().free(entry.key_ptr.*);
             if (entry.value_ptr.stream) |stream| stream.close(stream.context);
             if (entry.value_ptr.spool) |*spool| spool.deinit();
-            entry.value_ptr.arena.deinit();
+            self.destroyRetainedArena(entry.value_ptr.arena);
         }
         self.sql_cursors.clearRetainingCapacity();
     }
 
     fn removePrepared(self: *Session, name: []const u8) void {
         if (self.prepared.fetchRemove(name)) |entry| {
-            self.alloc.free(entry.key);
-            var value = entry.value;
-            value.arena.deinit();
+            self.retainedAlloc().free(entry.key);
+            const value = entry.value;
+            self.destroyRetainedArena(value.arena);
         }
     }
 
     fn clearPrepared(self: *Session) void {
         var it = self.prepared.iterator();
         while (it.next()) |entry| {
-            self.alloc.free(entry.key_ptr.*);
-            entry.value_ptr.arena.deinit();
+            self.retainedAlloc().free(entry.key_ptr.*);
+            self.destroyRetainedArena(entry.value_ptr.arena);
         }
         self.prepared.clearRetainingCapacity();
     }
 
     fn removePortal(self: *Session, name: []const u8) void {
         if (self.portals.fetchRemove(name)) |entry| {
-            self.alloc.free(entry.key);
+            self.retainedAlloc().free(entry.key);
             var value = entry.value;
             if (value.stream) |stream| stream.close(stream.context);
             if (value.result) |*result| result.deinit();
-            value.arena.deinit();
+            self.destroyRetainedArena(value.arena);
         }
     }
 
     fn clearPortals(self: *Session) void {
         var it = self.portals.iterator();
         while (it.next()) |entry| {
-            self.alloc.free(entry.key_ptr.*);
+            self.retainedAlloc().free(entry.key_ptr.*);
             if (entry.value_ptr.stream) |stream| stream.close(stream.context);
             if (entry.value_ptr.result) |*result| result.deinit();
-            entry.value_ptr.arena.deinit();
+            self.destroyRetainedArena(entry.value_ptr.arena);
         }
         self.portals.clearRetainingCapacity();
     }
@@ -1339,8 +1385,9 @@ pub const Session = struct {
         req.binding_guard = binding_guard;
         req.setting_epoch = setting_epoch;
         const stream = (try open(self.source.context, self.alloc, self.identity orelse return error.AuthenticationFailed, req)) orelse return false;
+        var local_arena = std.heap.ArenaAllocator.init(self.alloc);
         var portal = Portal{
-            .arena = std.heap.ArenaAllocator.init(self.alloc),
+            .arena = &local_arena,
             .statement = statement,
             .parameters = parameters,
             .types = types,
@@ -1560,4 +1607,15 @@ fn sqlstate(err: anyerror) []const u8 {
         error.UnsupportedParameterType, error.UnsupportedParameterFormat, error.UnsupportedResultFormat, error.UnsupportedProtocolMessage, error.UnsupportedContinuation, error.UnsupportedResultPrecision, error.UnsupportedStatement, error.ResultShapeChanged => "0A000",
         else => "XX000",
     };
+}
+
+test "pgwire retained session idle transaction deadline covers failed owners" {
+    var session: Session = .{ .alloc = std.testing.allocator, .io = std.testing.io, .source = undefined, .reader = undefined, .writer = undefined, .limits = .{ .idle_timeout_ms = 1000, .idle_transaction_timeout_ms = 100 } };
+    try std.testing.expectEqual(@as(u32, 1000), session.idleTimeoutMs());
+    session.status = .in_transaction;
+    try std.testing.expectEqual(@as(u32, 100), session.idleTimeoutMs());
+    session.status = .failed;
+    try std.testing.expectEqual(@as(u32, 100), session.idleTimeoutMs());
+    session.limits.idle_transaction_timeout_ms = 2000;
+    try std.testing.expectEqual(@as(u32, 1000), session.idleTimeoutMs());
 }

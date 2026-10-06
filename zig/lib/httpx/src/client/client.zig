@@ -91,7 +91,14 @@ fn parsedResponseReusable(parser: *const Parser, req_method: types.Method) bool 
 }
 
 /// HTTP client configuration.
+pub const OutboundAdmission = @import("admission.zig").Admission;
+pub const OutboundAdmissionConfig = @import("admission.zig").Config;
+
 pub const ClientConfig = struct {
+    /// One operation envelope across TCP, TLS, H2 and streaming attempts.
+    outbound: OutboundAdmissionConfig = .{},
+    /// Optional service-owned envelope shared by multiple clients. Must outlive joined requests.
+    outbound_admission: ?*OutboundAdmission = null,
     attempt_observer: ?AttemptObserver = null,
     base_url: ?[]const u8 = null,
     timeouts: types.Timeouts = .{},
@@ -123,6 +130,7 @@ pub const ClientConfig = struct {
     keep_alive: bool = true,
     pool_max_connections: u32 = 20,
     pool_max_per_host: u32 = 5,
+    pool_max_requests_per_connection: u32 = 1000,
     max_cookies: usize = 1000,
     /// Disable cookie persistence for credentialed or policy-constrained
     /// transports where ambient state must not cross requests.
@@ -639,6 +647,7 @@ const H2PoolEntry = struct {
     /// Existing request leases keep it alive until they release.
     retired: bool = false,
     active_requests: u32 = 0,
+    owns_socket_slot: bool = false,
     /// Owned map key retained after retirement so the final lease can free it.
     retired_key: ?[]const u8 = null,
     /// Tracks the background receive-loop fiber (if spawned).
@@ -870,9 +879,14 @@ pub const Client = struct {
     /// Protects h2_conns from concurrent fiber access during connection
     /// creation (getOrCreateH2Conn yields on DNS, connect, TLS handshake).
     h2_mutex: Io.Mutex = Io.Mutex.init,
+    h2_opening: std.StringHashMapUnmanaged(void) = .empty,
+    h2_changed: Io.Condition = .init,
+    h2_waiting: usize = 0,
     resolved_addresses: std.StringHashMapUnmanaged(Address) = .{},
     resolved_addresses_mutex: Io.Mutex = Io.Mutex.init,
     request_gate: RequestGate = .{},
+    outbound: OutboundAdmission,
+    connection_slots: @import("pool.zig").ConnectionSlots,
 
     const Self = @This();
 
@@ -900,11 +914,14 @@ pub const Client = struct {
         const pool_cfg = @import("pool.zig").PoolConfig{
             .max_connections = config.pool_max_connections,
             .max_per_host = config.pool_max_per_host,
+            .max_requests_per_connection = if (config.pool_max_requests_per_connection == 0) std.math.maxInt(u32) else config.pool_max_requests_per_connection,
         };
         return .{
             .allocator = allocator,
             .io = io,
             .config = config,
+            .outbound = OutboundAdmission.init(allocator, io, config.outbound),
+            .connection_slots = .{ .limit = config.pool_max_connections },
             .pool = ConnectionPool.initWithConfig(allocator, io, pool_cfg, {}),
             .tls_pool = TlsPool.initWithConfig(allocator, io, pool_cfg, .{
                 .verify_ssl = config.verify_ssl,
@@ -929,6 +946,7 @@ pub const Client = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.cookies.deinit(self.allocator);
+        self.outbound.deinit();
         self.pool.deinit();
         self.tls_pool.deinit();
         var address_it = self.resolved_addresses.iterator();
@@ -950,10 +968,14 @@ pub const Client = struct {
             e.ping_group.await(self.io) catch {};
             e.h2.deinit();
             e.session.deinit();
+            if (e.owns_socket_slot) self.connection_slots.release();
             self.allocator.destroy(e);
             self.allocator.free(entry.key_ptr.*);
         }
         self.h2_conns.deinit(self.allocator);
+        std.debug.assert(self.h2_opening.count() == 0 and self.h2_waiting == 0);
+        self.h2_opening.deinit(self.allocator);
+        std.debug.assert(self.connection_slots.used.load(.acquire) == 0);
     }
 
     /// Closes request admission and waits until all admitted requests return.
@@ -968,6 +990,9 @@ pub const Client = struct {
     /// avoiding dependency cycles between nested HTTP requests.
     pub fn beginShutdown(self: *Self) void {
         self.request_gate.close(self.io);
+        self.outbound.close();
+        self.pool.close();
+        self.tls_pool.close();
     }
 
     /// Wait for all request leases after shutdown has been published.
@@ -1871,6 +1896,42 @@ pub const Client = struct {
         return response;
     }
 
+    fn outboundRetainedBytes(req: *const Request) usize {
+        var bytes = @sizeOf(Request) +| @sizeOf(RequestInterrupt) +| req.uri.raw.len;
+        bytes +|= if (req.body_allocation) |allocation| allocation.len else req.bodyLen();
+        bytes +|= req.headers.entries.capacity *| @sizeOf(@TypeOf(req.headers.entries.items[0]));
+        for (req.headers.iterator()) |header| bytes +|= header.name.len +| header.value.len;
+        if (req.body_segments) |segments| bytes +|= segments.len *| @sizeOf([]const u8);
+        if (req.uri.query) |query| bytes +|= query.len;
+        return bytes;
+    }
+
+    fn acquireOutbound(self: *Self, req: *Request, deadline_ms: ?i64, interrupt: *RequestInterrupt) !OutboundAdmission.Lease {
+        const Context = struct {
+            client: *Self,
+            interrupt: *RequestInterrupt,
+            fn cancelled(raw: *const anyopaque) bool {
+                const context: *const @This() = @ptrCast(@alignCast(raw));
+                return context.client.request_gate.isClosed() or context.interrupt.isCancellationRequested();
+            }
+        };
+        const context: Context = .{ .client = self, .interrupt = interrupt };
+        self.pool.bindSlots(&self.connection_slots);
+        self.tls_pool.bindSlots(&self.connection_slots);
+        // Idle sockets from the other transport must not monopolize the shared envelope.
+        if (self.connection_slots.used.load(.acquire) >= self.connection_slots.limit) {
+            if (req.uri.isTls()) self.pool.retireIdle() else self.tls_pool.retireIdle();
+            if (!shouldUseHttp2(self.config)) self.retireUnusedH2(false);
+        }
+        const owner = self.config.outbound_admission orelse &self.outbound;
+        return owner.acquire(req.uri.host orelse return error.InvalidUri, req.uri.effectivePort(), .{
+            .deadline_ms = deadline_ms,
+            .retained_bytes = outboundRetainedBytes(req),
+            .context = &context,
+            .cancelled = Context.cancelled,
+        });
+    }
+
     fn attemptCancelled(ptr: *const anyopaque) bool {
         const interrupt: *const RequestInterrupt = @ptrCast(@alignCast(ptr));
         return @constCast(interrupt).isCancellationRequested();
@@ -1879,6 +1940,8 @@ pub const Client = struct {
     fn executeRequestOnceUnobserved(self: *Self, req: *Request, timeout_override_ms: ?u64, deadline_ms: ?i64, interrupt: *RequestInterrupt) !Response {
         try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
+        var outbound_lease = try self.acquireOutbound(req, deadline_ms, interrupt);
+        defer outbound_lease.release();
         const port = req.uri.effectivePort();
         // Use request_ms as a fallback ceiling for socket timeouts when the
         // specific read/write timeouts are not set via per-request override.
@@ -1895,7 +1958,7 @@ pub const Client = struct {
         // Reuses a pooled connection per host when available.
         if (shouldUseHttp2(self.config)) {
             const is_tls = req.uri.isTls();
-            var lease = try self.getOrCreateH2Conn(host, port, is_tls);
+            var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, interrupt);
             defer lease.release();
             const entry = lease.entry;
             const result = self.executeH2OnPooled(entry, req, interrupt) catch |err| {
@@ -1920,9 +1983,12 @@ pub const Client = struct {
             return result;
         }
 
+        const direct_socket = !self.config.keep_alive or self.config.address_filter != null;
+        if (direct_socket and !self.connection_slots.acquire()) return error.PoolExhausted;
+        defer if (direct_socket) self.connection_slots.release();
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try self.tls_pool.getConnection(host, port);
+                var tls_conn = try self.tls_pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
@@ -1946,7 +2012,7 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try self.pool.getConnection(host, port);
+            var conn = try self.pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
@@ -2004,6 +2070,7 @@ pub const Client = struct {
         progress_ctx: ?*anyopaque,
         interrupt: *RequestInterrupt,
     ) !Response {
+        try ensureRequestDeadline(self.io, deadline_ms);
         const host = req.uri.host orelse return error.InvalidUri;
         const port = req.uri.effectivePort();
         const timeout_ms = timeout_override_ms orelse blk: {
@@ -2023,9 +2090,14 @@ pub const Client = struct {
             return res;
         }
 
+        var outbound_lease = try self.acquireOutbound(req, deadline_ms, interrupt);
+        defer outbound_lease.release();
+        const direct_socket = !self.config.keep_alive or self.config.address_filter != null;
+        if (direct_socket and !self.connection_slots.acquire()) return error.PoolExhausted;
+        defer if (direct_socket) self.connection_slots.release();
         if (req.uri.isTls()) {
             if (self.config.keep_alive and self.config.address_filter == null) {
-                var tls_conn = try self.tls_pool.getConnection(host, port);
+                var tls_conn = try self.tls_pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
                 var ok = false;
                 defer {
                     if (ok) self.tls_pool.releaseConnection(tls_conn) else self.tls_pool.evictConnection(tls_conn);
@@ -2048,7 +2120,7 @@ pub const Client = struct {
         }
 
         if (self.config.keep_alive and self.config.address_filter == null) {
-            var conn = try self.pool.getConnection(host, port);
+            var conn = try self.pool.getConnectionWait(host, port, .{ .deadline_ms = deadline_ms, .context = interrupt, .cancelled = attemptCancelled }, self.config.outbound.max_waiters, self.config.outbound.max_wait_ms);
             var ok = false;
             defer {
                 if (ok) self.pool.releaseConnection(conn) else self.pool.evictConnection(conn);
@@ -2189,6 +2261,26 @@ pub const Client = struct {
         return self.executeOnTlsToWriter(&session, req, writer, progress_cb, progress_ctx, null);
     }
 
+    fn retireUnusedH2(self: *Self, broken_only: bool) void {
+        while (true) {
+            self.h2_mutex.lockUncancelable(self.io);
+            var candidate: ?[]const u8 = null;
+            var it = self.h2_conns.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.*.active_requests == 0 and (!broken_only or entry.value_ptr.*.broken or entry.value_ptr.*.h2.goaway_received)) {
+                    candidate = entry.key_ptr.*;
+                    break;
+                }
+            }
+            const removed = if (candidate) |key| self.h2_conns.fetchRemove(key) else null;
+            self.h2_mutex.unlock(self.io);
+            if (removed) |item| {
+                self.destroyH2Entry(item.value);
+                self.allocator.free(item.key);
+            } else return;
+        }
+    }
+
     /// Gets or creates a pooled HTTP/2 connection for the given host:port.
     /// The connection preface and SETTINGS exchange happen once on creation;
     /// subsequent requests reuse the same TCP/TLS + H2Connection state.
@@ -2197,15 +2289,26 @@ pub const Client = struct {
     /// blocking I/O (DNS, TCP connect, TLS handshake, SETTINGS exchange).
     /// If two fibers race to create the same host:port, the loser discards
     /// its connection and uses the winner's.
-    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool) !H2Lease {
+    fn getOrCreateH2Conn(self: *Self, host: []const u8, port: u16, is_tls: bool, deadline_ms: ?i64, interrupt: *RequestInterrupt) !H2Lease {
         var key_buf: [280]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "{s}:{d}", .{ host, port }) catch return error.InvalidUri;
+        const key = std.fmt.bufPrint(&key_buf, "{s}:{s}:{d}", .{ if (is_tls) "https" else "http", host, port }) catch return error.InvalidUri;
 
-        // --- Phase 1: Check map under lock ---
-        {
+        const wait_deadline = @min(deadline_ms orelse std.math.maxInt(i64), common.milliTimestamp(self.io) +| self.config.outbound.max_wait_ms);
+        var waiting = false;
+        defer if (waiting) {
+            self.h2_mutex.lockUncancelable(self.io);
+            self.h2_waiting -= 1;
+            self.h2_mutex.unlock(self.io);
+        };
+        // One handshake owner per endpoint. Followers wait within the same
+        // operation/deadline envelope instead of opening redundant sockets.
+        while (true) {
             self.h2_mutex.lockUncancelable(self.io);
             defer self.h2_mutex.unlock(self.io);
-
+            if (self.request_gate.isClosed()) return error.ClientClosed;
+            if (interrupt.isCancellationRequested()) return error.Cancelled;
+            try ensureRequestDeadline(self.io, deadline_ms);
+            if (waiting and common.milliTimestamp(self.io) >= wait_deadline) return error.Timeout;
             if (self.h2_conns.get(key)) |entry| {
                 if (!entry.retired and !entry.broken and !entry.h2.goaway_received) {
                     entry.active_requests += 1;
@@ -2213,7 +2316,38 @@ pub const Client = struct {
                 }
                 if (entry.h2.goaway_received) entry.broken = true;
             }
+            if (!self.h2_opening.contains(key)) {
+                const owned = try self.allocator.dupe(u8, key);
+                errdefer self.allocator.free(owned);
+                try self.h2_opening.put(self.allocator, owned, {});
+                break;
+            }
+            if (!waiting) {
+                if (self.h2_waiting >= self.config.outbound.max_waiters or self.config.outbound.max_wait_ms == 0) return error.PoolExhaustedForHost;
+                waiting = true;
+                self.h2_waiting += 1;
+            }
+            const wake_ns = @as(i128, @min(wait_deadline, common.milliTimestamp(self.io) +| 25)) * std.time.ns_per_ms;
+            self.h2_changed.waitTimeout(self.io, &self.h2_mutex, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = @intCast(wake_ns) } } }) catch |err| switch (err) {
+                error.Timeout => {},
+                error.Canceled => return error.Canceled,
+            };
         }
+        defer {
+            self.h2_mutex.lockUncancelable(self.io);
+            defer self.h2_mutex.unlock(self.io);
+            const removed = self.h2_opening.fetchRemove(key).?;
+            self.allocator.free(removed.key);
+            self.h2_changed.broadcast(self.io);
+        }
+        self.retireUnusedH2(true);
+        if (!self.connection_slots.acquire()) {
+            self.pool.retireIdle();
+            self.tls_pool.retireIdle();
+            self.retireUnusedH2(false);
+            if (!self.connection_slots.acquire()) return error.PoolExhausted;
+        }
+        errdefer self.connection_slots.release();
 
         // --- Phase 2: Create connection without lock (blocking I/O) ---
         const entry = try self.allocator.create(H2PoolEntry);
@@ -2222,10 +2356,11 @@ pub const Client = struct {
             .session = undefined,
             .h2 = undefined,
             .is_tls = is_tls,
+            .owns_socket_slot = true,
         };
         errdefer self.allocator.destroy(entry);
 
-        entry.socket = try self.connectHost(host, port, null);
+        entry.socket = try self.connectHost(host, port, deadline_ms);
         // Guard socket close only until fibers take ownership (recv_running).
         // After fibers start, the errdefer at line ~521 handles shutdown.
         errdefer if (!entry.recv_running) entry.socket.close();
@@ -2312,7 +2447,7 @@ pub const Client = struct {
                     if (stale.active_requests == 0) stale_to_destroy = stale;
                 }
 
-                const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ host, port });
+                const owned_key = try std.fmt.allocPrint(self.allocator, "{s}:{s}:{d}", .{ if (is_tls) "https" else "http", host, port });
                 errdefer self.allocator.free(owned_key);
                 try self.h2_conns.put(self.allocator, owned_key, entry);
                 entry.active_requests = 1;
@@ -2344,6 +2479,7 @@ pub const Client = struct {
         }
         entry.h2.deinit();
         entry.session.deinit();
+        if (entry.owns_socket_slot) self.connection_slots.release();
         self.allocator.destroy(entry);
     }
 
@@ -2681,6 +2817,9 @@ pub const Client = struct {
         data_event: *Io.Event,
         allocator: Allocator,
         lease: ?H2Lease = null,
+        request_lease: ?RequestLease = null,
+        outbound_lease: ?OutboundAdmission.Lease = null,
+        closed: bool = false,
         read_timeout: Io.Timeout = .none,
 
         /// Reads up to `buf.len` bytes. Blocks until data is available.
@@ -2738,6 +2877,8 @@ pub const Client = struct {
         /// Releases the stream. Sends RST_STREAM(CANCEL) if the stream
         /// hasn't completed, telling the server to stop sending DATA frames.
         pub fn close(self: *H2StreamReader) void {
+            if (self.closed) return;
+            self.closed = true;
             Client.cleanupH2Stream(
                 self.entry,
                 self.stream.id,
@@ -2747,6 +2888,8 @@ pub const Client = struct {
                 self.allocator,
             );
             if (self.lease) |*lease| lease.release();
+            if (self.outbound_lease) |*lease| lease.release();
+            if (self.request_lease) |*lease| lease.deinit();
         }
     };
 
@@ -2821,10 +2964,17 @@ pub const Client = struct {
     /// body reader. The caller reads DATA frames as they arrive without
     /// waiting for END_STREAM. Requires multiplexed mode (recv_running=true).
     pub fn requestStream(self: *Self, req: *Request) !H2StreamResponse {
+        var request_lease = try self.request_gate.tryAcquire(self.io);
+        var owners_transferred = false;
+        defer if (!owners_transferred) request_lease.deinit();
+        const deadline_ms = requestDeadlineMs(self.io, self.config.timeouts.request_ms);
+        var interrupt: RequestInterrupt = .{ .external_cancellation = self.config.request_cancellation };
+        var outbound_lease = try self.acquireOutbound(req, deadline_ms, &interrupt);
+        defer if (!owners_transferred) outbound_lease.release();
         const host = req.uri.host orelse return error.InvalidUri;
         const is_tls = req.uri.isTls();
         const port = req.uri.effectivePort();
-        var lease = try self.getOrCreateH2Conn(host, port, is_tls);
+        var lease = try self.getOrCreateH2Conn(host, port, is_tls, deadline_ms, &interrupt);
         var lease_transferred = false;
         defer if (!lease_transferred) lease.release();
         const entry = lease.entry;
@@ -2956,6 +3106,7 @@ pub const Client = struct {
         }
 
         const code = try transferStreamLeaseAfterStatus(&lease_transferred, status_code);
+        owners_transferred = true;
         return .{
             .status_code = code,
             .headers = response_headers,
@@ -2967,6 +3118,8 @@ pub const Client = struct {
                 .data_event = data_event.?,
                 .allocator = self.allocator,
                 .lease = lease,
+                .request_lease = request_lease,
+                .outbound_lease = outbound_lease,
             },
         };
     }
@@ -5365,7 +5518,7 @@ test "request cancellation before socket publication prevents sending" {
             } else |err| {
                 try std.testing.expectEqual(error.Cancelled, err);
             }
-            try serving.await(fixture_io);
+            _ = serving.cancel(fixture_io) catch {};
             try std.testing.expectEqual(@as(usize, 0), server.routeHitCount(0));
             try std.testing.expectEqual(@as(usize, 0), client.pool.stats().total);
             try std.testing.expectEqual(@as(usize, 0), bytes.items.len);
@@ -6400,4 +6553,29 @@ test "client body replay preserves method safety after truncation" {
             try std.testing.expectEqualSlices(usize, &.{ 1, 0 }, server.route_hits);
         }
     }
+}
+
+test "outbound admission includes retained headers before transmission" {
+    var client = Client.initWithConfig(std.testing.allocator, std.testing.io, .{
+        .outbound = .{ .max_active = 1, .max_per_endpoint = 1, .max_waiters = 1, .max_wait_bytes = 1024 },
+        .retry_policy = .{ .max_retries = 0 },
+    });
+    defer client.deinit();
+    var held = try client.outbound.acquire("held", 80, .{});
+    defer held.release();
+    const large_header: [4096]u8 = @splat('x');
+    var sends: std.atomic.Value(usize) = .init(0);
+    const Observer = struct {
+        fn send(raw: *anyopaque) void {
+            _ = @as(*std.atomic.Value(usize), @ptrCast(@alignCast(raw))).fetchAdd(1, .acq_rel);
+        }
+    };
+    try std.testing.expectError(error.OutboundCapacityUnavailable, client.post("http://127.0.0.1:1/never-sent", .{
+        .headers = &.{.{ "X-Large", &large_header }},
+        .timeout_ms = 1000,
+        .delivery_observer = .{ .context = &sends, .before_send = Observer.send },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), sends.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), client.outbound.snapshot().waiting);
+    try std.testing.expectEqual(@as(usize, 0), client.connection_slots.used.load(.acquire));
 }

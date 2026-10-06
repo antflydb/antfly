@@ -15,12 +15,18 @@ const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
 /// Node-local foreground database request admission settings.
 pub const AdmissionConfig = struct {
+    /// Aggregate API-owned durable session and job storage, protocol sessions, provider state and catalogue/cache allocations. Shared across persistent owners and independent of request, transport, storage-engine and model envelopes.
+    max_retained_memory_bytes: ?u64 = null,
+    /// Aggregate API request, response, SQL plan, and in-memory transaction allocation envelope. One eighth, capped at 16 MiB, is reserved for verified SQL control work. Storage, inference, transport, and durable completion retain separate envelopes.
+    max_request_memory_bytes: ?u64 = null,
     query: ?QueryAdmissionConfig = null,
     write: ?WriteAdmissionConfig = null,
     inference: ?InferenceAdmissionConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "max_retained_memory_bytes", "max_retained_memory_bytes", true },
+        .{ "max_request_memory_bytes", "max_request_memory_bytes", true },
         .{ "query", "query", true },
         .{ "write", "write", true },
         .{ "inference", "inference", true },
@@ -36,6 +42,14 @@ pub const AdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.max_retained_memory_bytes) |value| {
+            try jw.objectField("max_retained_memory_bytes");
+            try jw.write(value);
+        }
+        if (self.max_request_memory_bytes) |value| {
+            try jw.objectField("max_request_memory_bytes");
+            try jw.write(value);
+        }
         if (self.query) |value| {
             try jw.objectField("query");
             try jw.write(value);
@@ -2039,11 +2053,19 @@ pub const ObjectStorageLocation = struct {
     }
 };
 
-/// Optional PostgreSQL wire listener. Requires authentication. Transactions remain unsupported. Remote bindings require externally protected transport.
+/// Optional PostgreSQL wire listener. Requires authentication. Supports native transactions. Remote bindings require externally protected transport.
 pub const PgwireConfig = struct {
     enabled: ?bool = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?i64 = null,
+    /// Aggregate bytes allocated through pgwire connection budgets, covering protocol messages, prepared state, portals, and caller-owned response arenas. Zero preserves the sum of the per-connection ceilings. This is separate from global backend plan/cache and process memory budgets.
+    max_session_bytes: ?i64 = null,
+    /// Aggregate pgwire retained-state allocation ceiling for prepared plans, portals, cursor state/spools, and settings. Charged within max_session_bytes. Zero uses the sum of per-connection retained ceilings.
+    max_retained_bytes: ?i64 = null,
+    /// Per-connection retained-state allocation ceiling, separate from transient frames and response pages.
+    retained_bytes_per_connection: ?i64 = null,
+    /// Maximum wait for the next message in an active or failed transaction, capped by the ordinary connection idle timeout. Expiry disconnects the owner and runs normal cleanup; durable decisions remain recoverable.
+    idle_transaction_timeout_ms: ?i64 = null,
     max_connections: ?i64 = null,
     /// Acknowledges that a TLS proxy or authenticated private transport protects a non-loopback listener. Does not enable native TLS.
     externally_protected_transport: ?bool = null,
@@ -2053,6 +2075,10 @@ pub const PgwireConfig = struct {
         .{ "enabled", "enabled", true },
         .{ "bind_host", "bind_host", true },
         .{ "bind_port", "bind_port", true },
+        .{ "max_session_bytes", "max_session_bytes", true },
+        .{ "max_retained_bytes", "max_retained_bytes", true },
+        .{ "retained_bytes_per_connection", "retained_bytes_per_connection", true },
+        .{ "idle_transaction_timeout_ms", "idle_transaction_timeout_ms", true },
         .{ "max_connections", "max_connections", true },
         .{ "externally_protected_transport", "externally_protected_transport", true },
     };
@@ -2079,6 +2105,22 @@ pub const PgwireConfig = struct {
             try jw.objectField("bind_port");
             try jw.write(value);
         }
+        if (self.max_session_bytes) |value| {
+            try jw.objectField("max_session_bytes");
+            try jw.write(value);
+        }
+        if (self.max_retained_bytes) |value| {
+            try jw.objectField("max_retained_bytes");
+            try jw.write(value);
+        }
+        if (self.retained_bytes_per_connection) |value| {
+            try jw.objectField("retained_bytes_per_connection");
+            try jw.write(value);
+        }
+        if (self.idle_transaction_timeout_ms) |value| {
+            try jw.objectField("idle_transaction_timeout_ms");
+            try jw.write(value);
+        }
         if (self.max_connections) |value| {
             try jw.objectField("max_connections");
             try jw.write(value);
@@ -2092,11 +2134,13 @@ pub const PgwireConfig = struct {
 };
 
 pub const QueryAdmissionConfig = struct {
-    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Excess work is not queued. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
+    waiting: ?QueryAdmissionWaiting = null,
+    /// Maximum concurrent query, search, and retrieval requests in this process. The default is 32. The budget is shared by REST, MCP, retrieval-agent, A2A, and direct API-kernel execution. Full-text, vector, hybrid, graph, aggregation, federated searches, and document scans consume it. Point lookups and operational/control-plane reads remain outside it. Excess HTTP work is rejected immediately with HTTP 429 and Retry-After: 1; asynchronous protocols use their native failure response. Contextual REST and native SQL reads can opt into bounded waiting using admission.query.waiting. Set to 0 to disable query admission. This budget is independent of transport safeguards, write admission, and admission.inference.max_concurrent_requests.
     max_concurrent_requests: ?i64 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "waiting", "waiting", true },
         .{ "max_concurrent_requests", "max_concurrent_requests", true },
     };
 
@@ -2110,8 +2154,51 @@ pub const QueryAdmissionConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.waiting) |value| {
+            try jw.objectField("waiting");
+            try jw.write(value);
+        }
         if (self.max_concurrent_requests) |value| {
             try jw.objectField("max_concurrent_requests");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opt-in bounded waiting for contextual REST and native SQL reads. Waiting retains a runtime task and owned input; existing executor and transport bounds still apply. Write, inference, MCP, and legacy direct calls remain fail-fast. All three limits must be positive to enable waiting, or all zero to disable it. These are queued input limits, not total heap limits.
+pub const QueryAdmissionWaiting = struct {
+    max_queued_requests: ?i64 = null,
+    max_queued_bytes: ?i64 = null,
+    max_wait_ms: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "max_queued_requests", "max_queued_requests", true },
+        .{ "max_queued_bytes", "max_queued_bytes", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.max_queued_requests) |value| {
+            try jw.objectField("max_queued_requests");
+            try jw.write(value);
+        }
+        if (self.max_queued_bytes) |value| {
+            try jw.objectField("max_queued_bytes");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
             try jw.write(value);
         }
         try jw.endObject();

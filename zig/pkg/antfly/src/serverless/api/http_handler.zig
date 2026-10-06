@@ -93,12 +93,17 @@ const SyncWaitCancellation = struct {
     deadline_ns: u64,
 
     fn token(self: *const @This()) CancellationToken {
-        return .{ .ptr = self, .is_cancelled_fn = isCancelled };
+        return .{ .ptr = self, .is_cancelled_fn = isCancelled, .check_fn = check };
     }
 
     fn isCancelled(ptr: *const anyopaque) bool {
+        check(ptr) catch return true;
+        return false;
+    }
+    fn check(ptr: *const anyopaque) !void {
         const state: *const @This() = @ptrCast(@alignCast(ptr));
-        return state.upstream.isCancelled() or platform_time.monotonicNs() >= state.deadline_ns;
+        try state.upstream.check();
+        if (platform_time.monotonicNs() >= state.deadline_ns) return error.DeadlineExceeded;
     }
 };
 const json_helpers = @import("../../api/json_helpers.zig");
@@ -275,7 +280,12 @@ pub const HttpHandler = struct {
         self.graph_execution_limits = limits;
     }
 
-    pub fn handle(self: *HttpHandler, req: HttpRequest) !HttpResponse {
+    pub fn handle(self: *HttpHandler, input: HttpRequest) !HttpResponse {
+        try input.ensureActive();
+        // Borrowed for this synchronous operation and its joined child work.
+        const deadline_cancellation: SyncWaitCancellation = .{ .upstream = input.cancellation, .deadline_ns = input.deadline_ns orelse std.math.maxInt(u64) };
+        var req = input;
+        req.cancellation = deadline_cancellation.token();
         try req.ensureActive();
         const route = http_routes.match(req.method, req.path) orelse return try textResponse(self.alloc, 404, "not found");
         const admission: ?*RequestAdmission = switch (http_routes.admissionClass(route)) {
@@ -352,7 +362,7 @@ pub const HttpHandler = struct {
             .query_version_artifact => |value| try self.handleQueryVersionArtifact(value.namespace, value.version.?, value.artifact_index, req.cancellation),
         };
         errdefer response.deinit(self.alloc);
-        try req.ensureActive();
+        if (http_routes.admissionClass(route) != .write) try req.ensureActive();
         return response;
     }
 
@@ -13673,6 +13683,7 @@ test "serverless sync wait cancellation combines request cancellation and deadli
         .deadline_ns = 0,
     };
     try std.testing.expect(expired.token().isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, expired.token().check());
 
     const upstream_only = SyncWaitCancellation{
         .upstream = CancellationToken.fromAtomic(&upstream_signal),

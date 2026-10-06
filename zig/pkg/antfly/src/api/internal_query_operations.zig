@@ -115,9 +115,26 @@ pub const Context = struct {
         table_name: []const u8,
         body: []const u8,
     ) !query_api.OwnedQueryRequest {
-        var semantic_resolver = SemanticStatusResolver{ .planning = self.queryPlanning() };
-        var request = try query_api.parseQueryRequest(alloc, semantic_resolver.iface(), table_name, body);
+        return self.planQueryWithContext(alloc, table_name, body, .{});
+    }
+
+    pub fn planQueryWithContext(self: Context, alloc: std.mem.Allocator, table_name: []const u8, body: []const u8, request_context: @import("operation.zig").RequestContext) !query_api.OwnedQueryRequest {
+        const context = try request_context.platformDeadline();
+        try context.ensureActive();
+        const body_deadline = try query_contract.queryExecutionDeadlineNsFromBody(alloc, body);
+        const deadline = if (context.deadline_ns) |outer| if (body_deadline) |inner| @min(outer, inner) else outer else body_deadline;
+        var planning = self.queryPlanning();
+        if (planning) |*value| {
+            value.query_embedding_deadline_ns = deadline;
+            value.query_cancellation = context.cancellation;
+        }
+        var semantic_resolver = SemanticStatusResolver{ .planning = planning };
+        var request = try query_contract.parseQueryRequestWithDeadline(alloc, semantic_resolver.iface(), table_name, body, deadline);
+        request.req.execution_deadline_ns = deadline;
+        request.req.cancellation = context.cancellation;
         request.req.graph_execution_limits = self.graph_execution_limits;
+        errdefer request.deinit(alloc);
+        try context.ensureActive();
         return request;
     }
 

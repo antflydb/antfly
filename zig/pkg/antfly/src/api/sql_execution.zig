@@ -167,6 +167,7 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("../sql/compiler.zig").Compiled, parameters: []const std.json.Value, limits: @import("../sql/runtime.zig").Limits, guarded_backend: ?catalog.Backend) !@import("../sql/runtime.zig").Result {
+        const state_alloc = if (@import("sql_control.zig").isControl(compiled.statement)) self.server.controlAllocator() else self.server.alloc;
         var zig017_return_error: ?anyerror = null;
         var decision_runtime: ?@import("../functions/runtime.zig").Runtime = null;
         const previous_provider = self.decision_provider;
@@ -181,8 +182,8 @@ pub const Adapter = struct {
         defer {
             var proofs = &self.policy_proofs.?;
             var values = proofs.valueIterator();
-            while (values.next()) |value| if (value.*) |token| self.server.alloc.free(token);
-            proofs.deinit(self.server.alloc);
+            while (values.next()) |value| if (value.*) |token| state_alloc.free(token);
+            proofs.deinit(state_alloc);
             self.policy_proofs = null;
         }
         const session_api = @import("sql_session.zig");
@@ -195,21 +196,21 @@ pub const Adapter = struct {
             self.database = previous_database;
             self.namespace = previous_namespace;
             self.setting_overlay = previous_setting_overlay;
-            if (inherited) |*state| state.deinit(self.server.alloc);
+            if (inherited) |*state| state.deinit(state_alloc);
         }
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
-            if ((self.server.txn_sessions.principalAccess(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*)) catch |zig017_err| {
+            if ((self.server.txn_sessions.principalAccess(state_alloc, id, http_server.transactionPrincipal(self.identity.*)) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             }) != .allowed) return zig017_failure: {
                 zig017_return_error = error.SqlTransactionNotActive;
                 break :zig017_failure error.SqlTransactionNotActive;
             };
-            inherited = ((self.server.txn_sessions.getSqlState(self.server.alloc, id) catch |zig017_err| {
+            inherited = ((self.server.txn_sessions.getSqlState(state_alloc, id) catch |zig017_err| {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             })) orelse return zig017_failure: {
@@ -228,7 +229,7 @@ pub const Adapter = struct {
             });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
-        var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
+        var owner = session_api.Adapter{ .alloc = state_alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (self.session_id) |encoded| {
             const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
@@ -377,9 +378,9 @@ pub const Adapter = struct {
                 // execution lease. Refresh the overlay while holding the
                 // same lease that serializes session setting mutations.
                 var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
-                defer if (leased_settings) |*state| state.deinit(self.server.alloc);
+                defer if (leased_settings) |*state| state.deinit(state_alloc);
                 if (self.session_id != null and compiled.uses_current_setting) {
-                    self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
+                    self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, state_alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     });
@@ -397,7 +398,7 @@ pub const Adapter = struct {
                 });
                 defer staged.deinit(alloc);
                 var read_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
-                defer read_guards.deinit(self.server.alloc);
+                defer read_guards.deinit(state_alloc);
                 self.range_reads = if (transaction.isolation != .read_committed) &read_guards else null;
                 self.ranges_staged = false;
                 self.active_transaction = id;
@@ -467,7 +468,7 @@ pub const Adapter = struct {
                 });
                 errdefer output.deinit();
                 if (!self.ranges_staged and read_guards.tables.len != 0) {
-                    _ = ((self.server.txn_sessions.stage(self.server.alloc, id, &read_guards) catch |zig017_err| {
+                    _ = ((self.server.txn_sessions.stage(state_alloc, id, &read_guards) catch |zig017_err| {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     })) orelse return zig017_failure: {

@@ -963,8 +963,8 @@ pub const AntflyApiHandler = struct {
         if (try self.authorizeRequest(ctx, &identity)) |response| return response;
         const authenticated = identity orelse return next.call(ctx);
 
-        const cached = try self.api_server.alloc.create(CachedAuthenticatedIdentity);
-        cached.* = .{ .alloc = self.api_server.alloc, .identity = authenticated };
+        const cached = try self.authenticationAllocator(ctx).create(CachedAuthenticatedIdentity);
+        cached.* = .{ .alloc = self.authenticationAllocator(ctx), .identity = authenticated };
         identity = null;
         ctx.setData(authenticated_identity_context_key, cached, CachedAuthenticatedIdentity.destroy) catch |err| {
             CachedAuthenticatedIdentity.destroy(cached);
@@ -1798,12 +1798,13 @@ pub const AntflyApiHandler = struct {
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
         if (try self.authorizeRequest(ctx, &authenticated_identity)) |response| return response;
         const body = (try ctx.body()) orelse "";
-        var response = try protocol_adapters.executeA2aRequest(
+        var response = try protocol_adapters.executeA2aRequestWithContext(
             self.api_server,
             ctx.header("authorization"),
             body,
             ApiHttpServer.queryEmbeddingSecurityScope(authenticated_identity),
             authenticated_identity,
+            operationContext(ctx, authenticated_identity),
         );
         defer response.deinit(self.api_server.alloc);
         _ = ctx.status(response.status);
@@ -1842,6 +1843,7 @@ pub const AntflyApiHandler = struct {
             .session_id = ctx.header(mcp.session_id_header),
             .last_event_id = ctx.header(mcp.last_event_id_header),
             .body = body,
+            .context = operationContext(ctx, authenticated_identity),
         };
         var response = if (extension_name) |name|
             try protocol_adapters.executeExtensionMcpRequest(self.api_server, request, authenticated_identity, name)
@@ -1915,8 +1917,16 @@ pub const AntflyApiHandler = struct {
         };
     }
 
+    fn nativeRequestDeadline(ctx: *const httpx.Context) ?u64 {
+        const deadline = ctx.application_deadline_ns orelse return null;
+        const clock_io = ctx.application_deadline_io orelse return deadline;
+        const now: u64 = @intCast(@max(0, std.Io.Clock.now(.awake, clock_io).nanoseconds));
+        return platform_time.monotonicNs() +| (deadline -| now);
+    }
+
     fn requestCancellation(ctx: *const httpx.Context) http_common.RequestCancellation {
         return .{
+            .execution_deadline_ns = nativeRequestDeadline(ctx),
             .borrowed = ctx.cancellation,
             .borrowed_context = if (ctx.cancellation_probe != null) ctx else null,
             .borrowed_is_cancelled = if (ctx.cancellation_probe != null) struct {
@@ -3279,7 +3289,7 @@ pub const AntflyApiHandler = struct {
         defer params.deinit(ctx.allocator);
         const body = (try ctx.body()) orelse "";
         const query_context = self.internalQueryContext(ctx);
-        var query_request = query_context.planQuery(ctx.allocator, params.table_name, body) catch |err|
+        var query_request = query_context.planQueryWithContext(ctx.allocator, params.table_name, body, operationContext(ctx, null)) catch |err|
             return internalQueryPlanningErrorResponse(ctx, err);
         defer query_request.deinit(ctx.allocator);
         query_request.req.cancellation = operationContext(ctx, null).cancellation;
@@ -3327,7 +3337,7 @@ pub const AntflyApiHandler = struct {
         const preflight = try parseInternalQueryPreflight(ctx.allocator, body);
         defer ctx.allocator.free(preflight.query_request_body);
         const query_context = self.internalQueryContext(ctx);
-        var query_request = query_context.planQuery(ctx.allocator, params.table_name, preflight.query_request_body) catch |err|
+        var query_request = query_context.planQueryWithContext(ctx.allocator, params.table_name, preflight.query_request_body, operationContext(ctx, null)) catch |err|
             return internalQueryPlanningErrorResponse(ctx, err);
         defer query_request.deinit(ctx.allocator);
         query_request.req.cancellation = operationContext(ctx, null).cancellation;
@@ -3777,9 +3787,16 @@ pub const AntflyApiHandler = struct {
     // Authentication helper
     // ---------------------------------------------------------------
 
+    fn authenticationAllocator(self: *AntflyApiHandler, ctx: *const httpx.Context) std.mem.Allocator {
+        return if (http_server_mod.isProtectedHttpControl(ctx.request.method, ctx.request.uri.path, ctx.request.body orelse ""))
+            self.api_server.controlAllocator()
+        else
+            self.api_server.alloc;
+    }
+
     fn authenticate(self: *AntflyApiHandler, ctx: *httpx.Context) !?AuthenticatedIdentity {
         if (!self.api_server.cfg.auth_enabled and self.api_server.cfg.trusted_principal_secret == null) return null;
-        return self.api_server.authenticateRequest(.{
+        return self.api_server.authenticateRequestWithAllocator(self.authenticationAllocator(ctx), .{
             .authorization = ctx.header("authorization"),
             .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
         }) catch |err| switch (err) {
@@ -3882,9 +3899,20 @@ pub const AntflyApiHandler = struct {
     ) !?httpx.Response {
         const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
             @compileError("public operation is missing an admission policy: " ++ operation_id);
-        const acquired = switch (class) {
+        try operationContext(ctx, null).ensureActive();
+        const acquired = if (comptime std.mem.eql(u8, operation_id, "commitTransactionSession")) self.api_server.sql_control_admission.tryAcquire() else switch (class) {
             .none => @compileError("operation does not use foreground admission: " ++ operation_id),
-            .query => self.api_server.tryAcquireQuery(),
+            .query => if (self.api_server.cfg.query_waiting.max_wait_ms == 0 or isNdjsonContentType(ctx.header("content-type"))) self.api_server.tryAcquireQuery() else query: {
+                establishQueryAdmissionDeadline(ctx);
+                const options = queryAdmissionOptions(ctx);
+                _ = self.api_server.query_admission.acquire(options) catch |err| switch (err) {
+                    error.Canceled => return err,
+                    error.DeadlineExceeded => return try admissionFailureResponse(ctx, 504, "deadline_exceeded"),
+                    error.AdmissionClosed => return try admissionFailureResponse(ctx, 503, "draining"),
+                    else => return try admissionFailureResponse(ctx, 429, admissionFailureReason(err)),
+                };
+                break :query true;
+            },
             .write => self.api_server.tryAcquireWrite(),
             .inference => self.api_server.tryAcquireInference(),
         };
@@ -3901,7 +3929,67 @@ pub const AntflyApiHandler = struct {
         return null;
     }
 
+    fn establishQueryAdmissionDeadline(ctx: *httpx.Context) void {
+        const body = ctx.request.body orelse return;
+        const declared = query_contract.queryExecutionDeadlineNsFromBody(ctx.allocator, body) catch return;
+        const deadline = declared orelse return;
+        const context = operationContext(ctx, null).platformDeadline() catch return;
+        ctx.application_deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        ctx.application_deadline_io = null;
+    }
+
+    fn retainedRequestBytes(ctx: *const httpx.Context) u64 {
+        var bytes: u64 = @sizeOf(httpx.Context) + @sizeOf(httpx.Request);
+        bytes +|= if (ctx.request.body_allocation) |body| body.len else if (ctx.request.body) |body| body.len else 0;
+        bytes +|= ctx.request.uri.path.len;
+        bytes +|= @as(u64, ctx.request.headers.entries.capacity) *| @sizeOf(@TypeOf(ctx.request.headers.entries.items[0]));
+        for (ctx.request.headers.iterator()) |header| bytes +|= @as(u64, header.name.len) +| header.value.len;
+        return bytes;
+    }
+
+    fn queryAdmissionOptions(ctx: *httpx.Context) @import("../common/bounded_admission.zig").Options {
+        return .{
+            .io = ctx.io,
+            .deadline_ns = ctx.application_deadline_ns,
+            .clock_io = ctx.application_deadline_io,
+            .native_now_ns = if (ctx.application_deadline_io == null) platform_time.monotonicNs else null,
+            .cancellation = .{ .ptr = ctx, .requested = struct {
+                fn call(raw: *const anyopaque) bool {
+                    const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                    return context.isCancellationRequested();
+                }
+            }.call },
+            .retained_bytes = retainedRequestBytes(ctx),
+        };
+    }
+
+    fn admissionFailureReason(err: anyerror) []const u8 {
+        return switch (err) {
+            error.AdmissionFull => "execution_capacity",
+            error.AdmissionQueueFull => "queue_count",
+            error.AdmissionBytesExhausted => "queue_bytes",
+            error.AdmissionRequestTooLarge => "request_bytes",
+            error.AdmissionWaitTimeout => "wait_timeout",
+            else => "capacity_unavailable",
+        };
+    }
+
+    fn admissionFailureResponse(ctx: *httpx.Context, status: u16, reason: []const u8) !httpx.Response {
+        if (status == 429) try ctx.setHeader("Retry-After", "1");
+        if (ctx.h1_sock != null) try ctx.setHeader("Connection", "close");
+        return ctx.status(status).json(.{
+            .@"error" = if (status == 429) "instance_busy" else if (status == 503) "draining" else "deadline_exceeded",
+            .reason = reason,
+            .stage = "admission",
+            .execution_started = false,
+        });
+    }
+
     fn releasePublicOperation(self: *AntflyApiHandler, comptime operation_id: []const u8) void {
+        if (comptime std.mem.eql(u8, operation_id, "commitTransactionSession")) {
+            self.api_server.sql_control_admission.release();
+            return;
+        }
         const class = comptime request_admission_policy.publicOperationClass(operation_id) orelse
             @compileError("public operation is missing an admission policy: " ++ operation_id);
         switch (class) {
@@ -3943,7 +4031,7 @@ pub const AntflyApiHandler = struct {
             identity.* = cached.identity;
             cached.identity = null;
         } else {
-            identity.* = self.api_server.authenticateRequest(.{
+            identity.* = self.api_server.authenticateRequestWithAllocator(self.authenticationAllocator(ctx), .{
                 .authorization = ctx.header("authorization"),
                 .trusted_principal = ctx.header(http_server_mod.trusted_principal_header),
             }) catch |err| switch (err) {
@@ -5439,12 +5527,33 @@ pub const AntflyApiHandler = struct {
         execution_entered: bool = false,
         is_write: bool = false,
         preparation: *RequestAdmission.Lease,
+        protected_control: bool = false,
         prepared_mode: SQLPreparedMode = .statement,
         prepared_id: ?[]const u8 = null,
         prepared_response: ?[]const u8 = null,
         prepared_response_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 16 << 20 },
         connection_owned: ?@import("sql_connections.zig").Owned = null,
         connection_session_hex: [32]u8 = undefined,
+
+        fn workAllocator(self: *@This()) std.mem.Allocator {
+            return if (self.protected_control) self.adapter.server.controlAllocator() else self.adapter.server.alloc;
+        }
+
+        fn admissionOptions(self: *@This()) !@import("../common/bounded_admission.zig").Options {
+            const context = try self.adapter.context.platformDeadline();
+            return .{
+                .io = self.completion_io,
+                .deadline_ns = context.deadline_ns,
+                .native_now_ns = platform_time.monotonicNs,
+                .cancellation = .{ .ptr = &self.adapter.context.cancellation, .requested = struct {
+                    fn call(raw: *const anyopaque) bool {
+                        const token: *const operation_contract.CancellationToken = @ptrCast(@alignCast(raw));
+                        return token.isCancelled();
+                    }
+                }.call },
+                .retained_bytes = @as(u64, self.statement.len) +| @import("../common/bounded_admission.zig").parameterBytes(self.parameters) +| 1024,
+            };
+        }
 
         fn run(self: *@This()) void {
             // Wake on the executor that owns the request waiter, not the
@@ -5466,7 +5575,7 @@ pub const AntflyApiHandler = struct {
             const resource_principal = http_server_mod.transactionPrincipal(self.adapter.identity.*) orelse "";
             if (self.adapter.connection_id) |connection_id| {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlConnectionUnavailable;
-                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, std.heap.page_allocator, connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms);
+                self.connection_owned = try @import("sql_connections.zig").loadReconciled(store, &self.adapter.server.txn_sessions, self.workAllocator(), connection_id, resource_principal, self.adapter.server.localSessionNodeId(), now_ms);
                 const connection = self.connection_owned.?.value;
                 if (connection.state == .beginning or connection.state == .uncertain) return error.SqlConnectionBusy;
                 if ((!self.adapter.inherit_session_database and !std.mem.eql(u8, self.adapter.database, connection.database)) or
@@ -5493,6 +5602,8 @@ pub const AntflyApiHandler = struct {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;
                 const owner = self.adapter.server.localSessionNodeId();
                 if (self.prepared_mode == .close) {
+                    var control = try self.adapter.server.acquireSqlControl();
+                    defer control.release();
                     self.prepared_response = try self.prepared_response_budget.allocator().dupe(u8, "{}");
                     errdefer {
                         self.prepared_response_budget.allocator().free(self.prepared_response.?);
@@ -5505,7 +5616,7 @@ pub const AntflyApiHandler = struct {
                     return;
                 }
                 if (self.prepared_mode == .execute) {
-                    resource = try prepared.loadForConnection(store, std.heap.page_allocator, self.prepared_id.?, resource_principal, owner, now_ms, self.adapter.connection_id);
+                    resource = try prepared.loadForConnection(store, self.workAllocator(), self.prepared_id.?, resource_principal, owner, now_ms, self.adapter.connection_id);
                     const value = resource.?.value;
                     try value.verifyExecutionSession(self.adapter.session_id);
                     self.statement = value.statement;
@@ -5537,11 +5648,11 @@ pub const AntflyApiHandler = struct {
                         .catalog => |catalog_setting| catalog_setting != .show,
                         .reset_all, .discard_all => true,
                     };
-                    var execution = try self.adapter.server.acquireSqlExecution(self.is_write);
-                    defer execution.release();
                     self.preparation.release();
+                    var execution = try self.adapter.server.acquireSqlExecutionWithOptions(self.is_write, try self.admissionOptions());
+                    defer execution.release();
                     self.execution_entered = true;
-                    self.result = try @import("sql_http_settings.zig").execute(std.heap.page_allocator, &self.adapter, command, self.parameters);
+                    self.result = try @import("sql_http_settings.zig").execute(self.workAllocator(), &self.adapter, command, self.parameters);
                     return;
                 }
             }
@@ -5580,12 +5691,12 @@ pub const AntflyApiHandler = struct {
                 self.adapter.namespace = self.namespace;
                 self.adapter.setting_overlay = state.setting_active.items;
             }
-            var lease = self.cache.acquire(self.cache_io, .{
+            var lease = @import("sql_control.zig").Plan.acquire(self.workAllocator(), self.cache, self.cache_io, .{
                 .statement = self.statement,
                 .principal = self.principal,
                 .database = self.database,
                 .namespace = self.namespace,
-            }, &self.diagnostic) catch |err| {
+            }, &self.diagnostic, self.protected_control) catch |err| {
                 self.compile_diagnostic_valid = err != error.SqlPlanCacheBusy and err != error.InvalidSqlPlanCacheConfig;
                 self.failure = err;
                 return;
@@ -5601,7 +5712,7 @@ pub const AntflyApiHandler = struct {
                 var bindings: std.ArrayListUnmanaged(prepared.Binding) = .empty;
                 self.adapter.collect_prepared_bindings = &bindings;
                 defer self.adapter.collect_prepared_bindings = null;
-                var binding_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 32 << 20 };
+                var binding_budget: SQLMemoryBudget = .{ .backing = self.workAllocator(), .limit = 32 << 20 };
                 var describe_backend = self.adapter.backend();
                 if (compiled.uses_current_setting) describe_backend.setting_capture = self.adapter.settingCapture();
                 var description = @import("../sql/describe.zig").describe(binding_budget.allocator(), describe_backend, compiled, &.{}) catch |err| return if (binding_budget.exhausted) error.SqlProgramLimitExceeded else err;
@@ -5627,14 +5738,14 @@ pub const AntflyApiHandler = struct {
                 .select, .explain => false,
                 .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
             };
-            var execution = self.adapter.server.acquireSqlExecution(self.is_write) catch |err| {
+            self.preparation.release();
+            var execution = (if (self.protected_control) self.adapter.server.acquireSqlControl() else self.adapter.server.acquireSqlExecutionWithOptions(self.is_write, try self.admissionOptions())) catch |err| {
                 self.failure = err;
                 return;
             };
             defer execution.release();
-            self.preparation.release();
             self.execution_entered = true;
-            self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, null) catch |err| {
+            self.result = self.adapter.execute(self.workAllocator(), compiled, self.parameters, .{ .result_rows = self.limit }, null) catch |err| {
                 self.failure = err;
                 return;
             };
@@ -5738,7 +5849,9 @@ pub const AntflyApiHandler = struct {
             break :body (try ctx.body()) orelse return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "22023", .message = "missing SQL request body" });
         };
         if (body.len > @import("http_routes.zig").sql_max_request_body_bytes) return ctx.status(400).json(sql_wire.SQLDiagnostic{ .code = "54000", .message = "SQL request body exceeds 4 MiB" });
-        var preparation = self.api_server.sql_preparation_admission.tryAcquireLease() orelse return sqlOverloadedResponse(ctx);
+        const protected_control = mode == .close or (mode == .statement and @import("sql_control.zig").classifyBody(body));
+        const preparation_owner = if (protected_control) &self.api_server.sql_control_preparation else &self.api_server.sql_preparation_admission;
+        var preparation = preparation_owner.tryAcquireLease() orelse return sqlOverloadedResponse(ctx);
         defer preparation.release();
         var preparation_budget: SQLMemoryBudget = .{ .backing = ctx.allocator, .limit = 8 << 20 };
         const preparation_alloc = preparation_budget.allocator();
@@ -5783,7 +5896,7 @@ pub const AntflyApiHandler = struct {
 
         // Never run a blocking catalog/row operation on the network executor,
         // including when the backend executor is absent or saturated.
-        const runtime = self.api_server.cfg.backend_runtime orelse {
+        _ = self.api_server.cfg.backend_runtime orelse {
             if (mode != .statement) return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
             // A missing execution lane is a capacity failure for supported
             // statements, but preserve the useful 501 syntax/shape contract
@@ -5802,7 +5915,7 @@ pub const AntflyApiHandler = struct {
                 else => ctx.status(501).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "SQL statement is not supported by this endpoint" }),
             };
         };
-        var runtime_io = runtime.io() orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
+        var runtime_io = (if (protected_control) self.api_server.sqlControlIo() else self.api_server.sqlExecutionIo()) catch return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
         var job = SQLJob{
             .adapter = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
@@ -5817,6 +5930,8 @@ pub const AntflyApiHandler = struct {
             .cache_io = self.api_server.sqlPlanCacheIo(),
             .cache = self.api_server.sqlPlanCache(),
             .preparation = &preparation,
+            .protected_control = protected_control,
+            .prepared_response_budget = .{ .backing = if (protected_control) self.api_server.controlAllocator() else self.api_server.alloc, .limit = 16 << 20 },
         };
         var future = runtime_io.concurrent(SQLJob.run, .{&job}) catch
             return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
@@ -7267,7 +7382,7 @@ pub const AntflyApiHandler = struct {
         const local_create_handled = local_outcome == .applied;
         if (local_create_handled) {
             std.log.info("public create table wait projected presence table={s}", .{decoded_table_name});
-            self.api_server.waitForProjectedTablePresence(decoded_table_name) catch |err| switch (err) {
+            self.api_server.waitForProjectedTablePresenceWithContext(decoded_table_name, operationContext(ctx, null)) catch |err| switch (err) {
                 error.TableVisibilityTimeout => {
                     std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
                     return committedMutationOutcomeResponse(ctx, .visibility_pending);
@@ -7290,7 +7405,7 @@ pub const AntflyApiHandler = struct {
             };
             if (!metadata_wait_handled) {
                 std.log.info("public create table wait metadata visibility table={s}", .{decoded_table_name});
-                self.api_server.waitForTableVisibility(decoded_table_name, .present) catch |err| switch (err) {
+                self.api_server.waitForTableVisibilityWithContext(decoded_table_name, .present, operationContext(ctx, null)) catch |err| switch (err) {
                     error.TableVisibilityTimeout => {
                         std.log.warn("public create table committed before metadata visibility converged table={s}", .{decoded_table_name});
                         return committedMutationOutcomeResponse(ctx, .visibility_pending);
@@ -7324,7 +7439,7 @@ pub const AntflyApiHandler = struct {
         var drop_result: metadata_table_topology_mutations.DropResult = undefined;
         while (true) {
             metadata_drop_attempts += 1;
-            drop_result = self.api_server.source.dropTableExact(alloc, decoded_table_name) catch |err| switch (err) {
+            drop_result = self.api_server.source.dropTableExactWithContext(alloc, operationContext(ctx, null), decoded_table_name) catch |err| switch (err) {
                 error.VectorMigrationActive => return textResponse(ctx, 409, "table storage migration is active"),
                 error.TableNotFound => {
                     _ = ctx.status(404);
@@ -7384,7 +7499,7 @@ pub const AntflyApiHandler = struct {
         // follower projection. Metadata is already committed, so every wait
         // failure is reported as convergence debt rather than a replayable DDL
         // failure.
-        self.api_server.waitForTableVisibility(decoded_table_name, .absent) catch |err| {
+        self.api_server.waitForTableVisibilityWithContext(decoded_table_name, .absent, operationContext(ctx, null)) catch |err| {
             repair_required = true;
             std.log.warn(
                 "public drop table committed before local absence became observable table={s} err={s}",
@@ -9394,7 +9509,18 @@ const HttpxE2eServer = struct {
         query_capacity: usize,
         max_connections: u32,
     ) !void {
-        api_server.query_admission = RequestAdmission.init(query_capacity);
+        return self.initWithTransportLimits(allocator, api_server, query_capacity, max_connections, 0);
+    }
+
+    fn initWithTransportLimits(
+        self: *HttpxE2eServer,
+        allocator: std.mem.Allocator,
+        api_server: *ApiHttpServer,
+        query_capacity: usize,
+        max_connections: u32,
+        max_request_tasks: u32,
+    ) !void {
+        api_server.query_admission = try RequestAdmission.initConfigured(query_capacity, api_server.cfg.query_waiting);
         self.* = .{
             .allocator = allocator,
             .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{}),
@@ -9410,14 +9536,15 @@ const HttpxE2eServer = struct {
         try self.handler.initRuntime(allocator);
         errdefer self.handler.deinitRuntime();
 
-        self.server = httpx.Server.initWithConfig(allocator, self.io_impl.io(), .{
+        self.server = httpx.Server.initWithConfig(allocator, self.io_impl.io(), api_server.configurePublicHttpTransport(.{
             .host = "127.0.0.1",
             .port = 0,
             .header_read_timeout_ms = 30_000,
             .body_read_timeout_ms = 30_000,
             .response_write_timeout_ms = 30_000,
             .max_connections = max_connections,
-        });
+            .max_request_tasks = max_request_tasks,
+        }));
         errdefer self.server.deinit();
 
         try self.handler.registerRoutes(&self.server);
@@ -10724,6 +10851,10 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     defer alloc.free(commit_url);
     const commit_body = "{\"read_set\":[],\"tables\":{\"docs\":{\"inserts\":{\"counter\":{\"value\":1}}}}}";
 
+    // A fresh-write burst must not block durable completion or recovery ACKs.
+    api_server.write_admission.capacity = 1;
+    var occupied_write = api_server.write_admission.tryAcquireLease().?;
+    defer occupied_write.release();
     var first = try requestWithRetry(&client, client_io.io(), .POST, commit_url, commit_body, &headers, 20);
     defer first.deinit();
     try std.testing.expectEqual(@as(u16, 202), first.status.code);
@@ -12464,7 +12595,16 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
     var session_store = try storage.runtimeStore(alloc, .{ .name = "http-sql-settings-test" });
     defer session_store.deinit();
     var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &session_store);
-    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .backend_runtime = backend_runtime.ptr(),
+        .session_store = &durable,
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 2,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
+    }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
     defer server.deinit();
     const begun = try server.txn_sessions.beginForPrincipal(alloc, .{ .sql = .{ .database = "default", .namespace = "public", .isolation = .read_committed, .mode = .read_write } }, server.localSessionNodeId(), "settings_user");
     const session_id = std.fmt.bytesToHex(begun.txn_id, .lower);
@@ -12660,7 +12800,16 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
     // A new API instance has no cached session or prepared directory state;
     // it must rehydrate both from the durable store before execution.
     {
-        var restarted = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+        var restarted = ApiHttpServer.init(alloc, .{
+            .auth_enabled = true,
+            .user_manager = &auth.manager,
+            .backend_runtime = backend_runtime.ptr(),
+            .session_store = &durable,
+            .query_max_concurrent_requests = 1,
+            .write_max_concurrent_requests = 1,
+            .sql_max_concurrent_preparations = 2,
+            .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
+        }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
         defer restarted.deinit();
         var restarted_handler = AntflyApiHandler{ .api_server = &restarted };
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql/prepared/id/execute");
@@ -12734,7 +12883,16 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     var native = try storage.runtimeStore(alloc, .{ .name = "http-sql-connection-routes-test" });
     defer native.deinit();
     var durable = transactions_api.DurableSessionStore.initRuntime(alloc, &native);
-    var server = ApiHttpServer.init(alloc, .{ .auth_enabled = true, .user_manager = &auth.manager, .backend_runtime = backend_runtime.ptr(), .session_store = &durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
+    var server = ApiHttpServer.init(alloc, .{
+        .auth_enabled = true,
+        .user_manager = &auth.manager,
+        .backend_runtime = backend_runtime.ptr(),
+        .session_store = &durable,
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 2,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
+    }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog } }, null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
     const Route = struct {
@@ -12867,6 +13025,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         schema: []const u8 = schema_json,
         records: [1]@import("../common/topology_records.zig").TableRecord = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema_json }},
         calls: usize = 0,
+        calls_mutex: std.atomic.Mutex = .unlocked,
         replace_after_open: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 1, .metrics = .{} };
@@ -12874,9 +13033,13 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
+            while (!self.calls_mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.calls_mutex.unlock();
             // This fixture has no row-policy publication. The production
             // admission path treats that absence as an unprotected table.
             if (input == .policy_publication_status) return a.dupe(u8, "null");
+            if (input == .setting_snapshot) return std.json.Stringify.valueAlloc(a, .{ .scope = input.setting_snapshot, .epoch = @as(u64, 1), .definitions = &.{} }, .{});
+            if (input == .read and input.read.kind == .namespace) return a.dupe(u8, "{}");
             self.calls += 1;
             if (self.replace_after_open and self.calls == 3) return error.CatalogGenerationChanged;
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = self.schema }, .{});
@@ -12924,9 +13087,147 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     defer prepared_store.deinit();
     var prepared_durable = transactions_api.DurableSessionStore.initRuntime(alloc, &prepared_store);
     var source: Source = .{};
-    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
+    var server = try ApiHttpServer.initWithConfig(alloc, .{
+        .request_memory_bytes = 4 << 20,
+        .backend_runtime = backend_runtime.ptr(),
+        .session_store = &prepared_durable,
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 2,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
+    }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
+    {
+        // Real native rows through both adapters, sharing one queue owner.
+        var auth = try initTestAuthManager(alloc);
+        defer auth.store.deinit();
+        defer auth.policy_store.deinit();
+        try bindTestAuthManager(alloc, &auth);
+        defer auth.manager.deinit();
+        var permission = try usermgr.Permission.initOwned(alloc, .table, "usage_records", .read);
+        defer permission.deinit(alloc);
+        var namespace_permission = try usermgr.Permission.initOwned(alloc, .namespace, "*", .read);
+        defer namespace_permission.deinit(alloc);
+        var user = try auth.manager.createUser("pool-reader", "secret", &.{ permission, namespace_permission });
+        defer user.deinit(alloc);
+        server.cfg.user_manager = &auth.manager;
+        defer server.cfg.user_manager = null;
+        var pg = @import("sql_pgwire.zig").Adapter{ .server = &server };
+        const wire = @import("../pgwire/backend.zig");
+        const backend = pg.backend();
+        const identity = try backend.vtable.authenticate(backend.context, alloc, "pool-reader", "secret");
+        defer identity.release(identity.context, alloc);
+        var cancel: std.atomic.Value(bool) = .init(false);
+        const statement = "SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1";
+        const wire_request: wire.Request = .{
+            .statement = statement,
+            .parameters = &.{.{ .integer = 9007199254740993 }},
+            .parameter_types = &.{.integer},
+            .limit = 1,
+            .io = std.testing.io,
+            .cancel_requested = &cancel,
+            .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 10 * std.time.ns_per_s } },
+        };
+        _ = try server.sqlExecutionIo();
+        try std.testing.expect(server.sqlQueryWaitingEnabled());
+        const MixedJob = struct {
+            http_handler: *AntflyApiHandler,
+            backend: wire.Backend,
+            identity: wire.Identity,
+            request: wire.Request,
+            use_http: bool,
+            err: ?anyerror = null,
+            fn run(self: *@This()) void {
+                self.check() catch |err| {
+                    self.err = err;
+                };
+            }
+            fn check(self: *@This()) !void {
+                var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+                defer arena.deinit();
+                const allocator = arena.allocator();
+                if (self.use_http) {
+                    var request = try httpx.Request.init(allocator, .POST, "http://127.0.0.1/db/v1/sql");
+                    defer request.deinit();
+                    request.body = "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}";
+                    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+                    defer ctx.deinit();
+                    var response = try self.http_handler.executeSQL(&ctx);
+                    defer response.deinit();
+                    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+                    const result = try std.json.parseFromSliceLeaky(sql_wire.SQLResponse, allocator, response.body.?, .{});
+                    try std.testing.expectEqualStrings("9007199254740993", result.rows[0][0].string);
+                    try std.testing.expectEqualStrings("exact", result.rows[0][1].string);
+                } else {
+                    var result = try self.backend.vtable.execute(self.backend.context, allocator, self.identity, self.request);
+                    defer result.deinit();
+                    try std.testing.expectEqualStrings("9007199254740993", result.rows[0][0].string);
+                    try std.testing.expectEqual(wire.Type.integer, result.columns[0].type);
+                    try std.testing.expectEqualStrings("exact", result.rows[0][1].string);
+                    try std.testing.expectEqual(wire.TransactionStatus.idle, result.transaction_status);
+                }
+            }
+        };
+        var held = server.query_admission.tryAcquireLease().?;
+        defer held.release();
+        var jobs = [_]MixedJob{
+            .{ .http_handler = &handler, .backend = backend, .identity = identity, .request = wire_request, .use_http = true },
+            .{ .http_handler = &handler, .backend = backend, .identity = identity, .request = wire_request, .use_http = false },
+        };
+        var group: std.Io.Group = .init;
+        defer group.cancel(std.testing.io);
+        for (&jobs) |*job| try group.concurrent(std.testing.io, MixedJob.run, .{job});
+        const until = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+        while (server.queryAdmissionStats().queued != jobs.len) {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        // Cancel an actual queued native pgwire operation before grant.
+        var cancel_queued: std.atomic.Value(bool) = .init(false);
+        var cancelled = jobs[1];
+        cancelled.request.cancel_requested = &cancel_queued;
+        var cancelled_future = try std.testing.io.concurrent(MixedJob.run, .{&cancelled});
+        defer cancelled_future.cancel(std.testing.io);
+        while (server.queryAdmissionStats().queued != 3) {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        cancel_queued.store(true, .release);
+        cancelled_future.await(std.testing.io);
+        try std.testing.expectEqual(error.QueryCanceled, cancelled.err.?);
+        try std.testing.expectEqualStrings("57014", sql_execution.sqlState(cancelled.err.?));
+        try std.testing.expectEqual(@as(usize, 2), server.queryAdmissionStats().queued);
+        try std.testing.expectEqual(@as(u64, 1), server.queryAdmissionStats().cancelled_total);
+        // Both waiters have relinquished preparation capacity.
+        try std.testing.expectEqual(@as(usize, 0), server.sql_preparation_admission.stats().in_flight);
+        // Completion on the general backend remains startable during waiting.
+        var completion = try backend_runtime.ptr().io().?.concurrent(struct {
+            fn call(lease: *RequestAdmission.Lease) void {
+                lease.release();
+            }
+        }.call, .{&held});
+        completion.await(backend_runtime.ptr().io().?);
+        try group.await(std.testing.io);
+        for (jobs) |job| if (job.err) |err| return err;
+        try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+        try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().queued);
+        try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().peak_in_flight);
+        try @import("sql_pgwire_socket_test.zig").qualify(&server);
+        try qualifyNativeH2Waiting(&server);
+        // Live native streams retain coarse admission until actual close.
+        const stream = (try backend.vtable.open_stream.?(backend.context, alloc, identity, wire_request)).?;
+        defer stream.close(stream.context);
+        try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+        var page = try stream.next(stream.context, alloc, wire_request, 1);
+        defer page.result.deinit();
+        try std.testing.expectEqualStrings("exact", page.result.rows[0][1].string);
+        cancel.store(true, .release);
+        try std.testing.expectError(error.QueryCanceled, stream.next(stream.context, alloc, wire_request, 1));
+        try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+    }
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+
     for ([_][]const u8{
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}",
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE _id = $1\",\"parameters\":[\"a\"]}",
@@ -13255,7 +13556,15 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var execute_context = httpx.Context.init(alloc, std.testing.io, &execute_request);
             defer execute_context.deinit();
             execute_context.params = &params;
+            var held_query = if (!closed) server.query_admission.tryAcquireLease() else null;
+            defer if (held_query) |*lease| lease.release();
+            var grant: ?std.Io.Future(anyerror!void) = if (held_query) |*lease|
+                try backend_runtime.ptr().io().?.concurrent(releaseQueryWhenQueued, .{ &server, lease, backend_runtime.ptr().io().? })
+            else
+                null;
+            defer if (grant) |*future| future.cancel(backend_runtime.ptr().io().?) catch {};
             var executed = try handler.executePreparedSQL(&execute_context, id);
+            if (grant) |*future| try future.await(backend_runtime.ptr().io().?);
             defer executed.deinit();
             try std.testing.expectEqual(@as(u16, if (closed) 400 else 200), executed.status.code);
             if (!closed) {
@@ -15392,4 +15701,333 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "httpx query waiting expires before execution and preserves original timeout" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .query_waiting = .{ .max_queued_requests = 1, .max_queued_bytes = 4096, .max_wait_ms = 10 },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    var held = server.query_admission.tryAcquireLease().?;
+    defer held.release();
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
+    defer request.deinit();
+    request.body = "{\"timeout_ms\":1}";
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = (try handler.acquirePublicOperation(&ctx, "queryTable")).?;
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 504), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "execution_started\":false") != null);
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().queued);
+    const cancellation = AntflyApiHandler.requestCancellation(&ctx);
+    try std.testing.expectEqual(ctx.application_deadline_ns, cancellation.execution_deadline_ns);
+    try std.testing.expect(cancellation.execution_deadline_ns.? <= platform_time.monotonicNs());
+    // Transaction controls retain their independent, immediate write owner.
+    var write = try server.acquireSqlExecution(true);
+    write.release();
+}
+
+test "SQL query waiting shares HTTP owner and retains fail fast writes" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .query_waiting = .{ .max_queued_requests = 1, .max_queued_bytes = 4096, .max_wait_ms = 1 },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    var read = server.query_admission.tryAcquireLease().?;
+    defer read.release();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, server.acquireSqlExecutionWithOptions(false, .{ .io = std.testing.io, .retained_bytes = 1 }));
+    var write = try server.acquireSqlExecutionWithOptions(true, .{ .io = std.testing.io });
+    defer write.release();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, server.acquireSqlExecutionWithOptions(true, .{ .io = std.testing.io }));
+    try std.testing.expectError(error.DeadlineExceeded, server.acquireSqlExecutionWithOptions(false, .{ .io = std.testing.io, .deadline_ns = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().queued);
+}
+
+test "httpx query waiting real sockets absorb burst and keep status responsive" {
+    for ([_]struct { connections: u32, tasks: u32, expected: u16 }{
+        .{ .connections = 16, .tasks = 0, .expected = 429 },
+        // Two ordinary handler slots, four reserved control slots.
+        .{ .connections = 6, .tasks = 1, .expected = 503 },
+    }) |profile| {
+        const alloc = std.testing.allocator;
+        var source = AuthStatusSource{};
+        var api = ApiHttpServer.init(alloc, .{
+            .query_max_concurrent_requests = 1,
+            .query_waiting = .{ .max_queued_requests = 2, .max_queued_bytes = 16384, .max_wait_ms = 5000 },
+        }, source.iface(), null, null);
+        defer api.deinit();
+        var listener: HttpxE2eServer = undefined;
+        try listener.initWithTransportLimits(alloc, &api, 1, profile.connections, profile.tasks);
+        defer listener.deinit();
+        const base = try listener.baseUrl(alloc);
+        defer alloc.free(base);
+        const query_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/docs/query", .{base});
+        defer alloc.free(query_url);
+        const status_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/status", .{base});
+        defer alloc.free(status_url);
+        var client_runtime = std.Io.Threaded.init(alloc, .{});
+        defer client_runtime.deinit();
+        const io = client_runtime.io();
+        var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+        defer client.deinit();
+        // Establish the fixture's ordinary response before testing waiting.
+        var baseline = try requestWithRetry(&client, io, .POST, query_url, "{}", null, 20);
+        defer baseline.deinit();
+        try std.testing.expectEqual(@as(u16, 404), baseline.status.code);
+        var held = api.query_admission.tryAcquireLease().?;
+        defer held.release();
+        const Job = struct {
+            alloc: std.mem.Allocator,
+            io: std.Io,
+            url: []const u8,
+            status: u16 = 0,
+            err: ?anyerror = null,
+            fn run(self: *@This()) void {
+                var owned_client = httpx.Client.initWithConfig(self.alloc, self.io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+                defer owned_client.deinit();
+                var response = requestWithRetry(&owned_client, self.io, .POST, self.url, "{}", null, 20) catch |err| {
+                    self.err = err;
+                    return;
+                };
+                defer response.deinit();
+                self.status = response.status.code;
+            }
+        };
+        var jobs = [_]Job{
+            .{ .alloc = alloc, .io = io, .url = query_url },
+            .{ .alloc = alloc, .io = io, .url = query_url },
+        };
+        var group: std.Io.Group = .init;
+        defer group.cancel(io);
+        for (&jobs) |*job| try group.concurrent(io, Job.run, .{job});
+        const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(3));
+        while (api.queryAdmissionStats().queued != jobs.len) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        var status = try getWithRetry(&client, io, status_url, null, 20);
+        defer status.deinit();
+        try std.testing.expectEqual(@as(u16, 200), status.status.code);
+        var excess = try requestWithRetry(&client, io, .POST, query_url, "{}", null, 20);
+        defer excess.deinit();
+        try std.testing.expectEqual(profile.expected, excess.status.code);
+        if (profile.expected == 429) try std.testing.expect(std.mem.indexOf(u8, excess.body.?, "queue_count") != null);
+        held.release();
+        try group.await(io);
+        for (jobs) |job| {
+            try std.testing.expect(job.err == null);
+            try std.testing.expectEqual(baseline.status.code, job.status);
+        }
+        try std.testing.expectEqual(@as(usize, 0), api.queryAdmissionStats().queued);
+        try std.testing.expectEqual(@as(u64, 0), api.queryAdmissionStats().queued_bytes);
+        try std.testing.expectEqual(@as(usize, 0), api.queryAdmissionStats().in_flight);
+        try std.testing.expectEqual(@as(usize, 1), api.queryAdmissionStats().peak_in_flight);
+    }
+}
+
+test "SQL protected executor reserves bounded workers and rolls back exhaustion" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .io_threaded,
+        .lane_limits = .{ .worker_capacity = 32 },
+    });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+        .query_max_concurrent_requests = 1,
+        .write_max_concurrent_requests = 1,
+        .sql_max_concurrent_preparations = 1,
+        .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 4096, .max_wait_ms = 100 },
+    }, source.iface(), null, null);
+    var api_closed = false;
+    defer if (!api_closed) api.deinit();
+    const transport = api.configurePublicHttpTransport(.{ .max_connections = 6, .max_request_tasks = 1 });
+    try std.testing.expectEqual(@as(u32, 6), transport.max_request_tasks);
+    try std.testing.expectEqual(@as(u32, 6), transport.h2_max_concurrent_streams);
+    const limited = api.configurePublicHttpTransport(.{ .max_connections = 6, .max_request_tasks = 1, .h2_max_concurrent_streams = 1 });
+    try std.testing.expectEqual(@as(u32, 1), limited.h2_max_concurrent_streams);
+    var occupied = try runtime.ptr().acquireWorkers(.{ .capacity = 32 });
+    defer occupied.release();
+    try std.testing.expectError(error.SqlWriteCapacityUnavailable, api.sqlExecutionIo());
+    try std.testing.expect(!api.sqlQueryWaitingEnabled());
+    try std.testing.expectEqual(@as(usize, 32), runtime.ptr().laneStats().reserved_workers);
+    occupied.release();
+    const io = try api.sqlExecutionIo();
+    try std.testing.expect(io.userdata != runtime.ptr().io().?.userdata);
+    try std.testing.expect(api.sqlQueryWaitingEnabled());
+    try std.testing.expectEqual(@as(usize, 16), runtime.ptr().laneStats().reserved_workers);
+    _ = try api.sqlExecutionIo();
+    try std.testing.expectEqual(@as(usize, 16), runtime.ptr().laneStats().reserved_workers);
+    api.deinit();
+    api_closed = true;
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+}
+
+fn releaseQueryWhenQueued(server: *ApiHttpServer, lease: *RequestAdmission.Lease, io: std.Io) anyerror!void {
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (server.queryAdmissionStats().queued == 0) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    lease.release();
+}
+
+fn qualifyNativeH2Waiting(api: *ApiHttpServer) !void {
+    const alloc = std.testing.allocator;
+    var fixture: HttpxE2eServer = undefined;
+    try fixture.initWithTransportLimits(alloc, api, 1, 6, 1);
+    defer fixture.deinit();
+    const rollback_id = try beginSqlQualificationSession(&fixture.handler);
+    const commit_id = try beginSqlQualificationSession(&fixture.handler);
+    const rollback = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "ROLLBACK", .session_id = @as([]const u8, &rollback_id) }, .{});
+    defer alloc.free(rollback);
+    const io = fixture.io_impl.io();
+    var socket = try httpx.Socket.connect(fixture.server.boundAddress().?, io);
+    defer socket.close();
+    try socket.setRecvTimeout(5000);
+    var peer = httpx.H2Connection.initClient(alloc, io);
+    defer peer.deinit();
+    try peer.sendClientPreface(&socket);
+    var held = api.query_admission.tryAcquireLease().?;
+    defer held.release();
+    const query_body = "{\"statement\":\"SELECT id, name FROM usage_records WHERE _id = 'a'\"}";
+    var queued: [2]u31 = undefined;
+    for (&queued, 0..) |*sid, index| {
+        const stream = try peer.stream_manager.createStream();
+        sid.* = stream.id;
+        const headers = try httpx.H2Connection.buildRequestHeaders("POST", "/db/v1/sql", "http", "localhost", &.{.{ .name = "content-type", .value = "application/json" }}, alloc);
+        defer alloc.free(headers);
+        try peer.sendHeaders(&socket, stream.id, headers, false);
+        try peer.writeData(&socket, stream.id, query_body, true);
+        const queued_until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+        while (api.queryAdmissionStats().queued != index + 1) {
+            if (std.Io.Clock.awake.now(io).nanoseconds >= queued_until.nanoseconds) return error.H2QueriesDidNotQueue;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    const until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (api.queryAdmissionStats().queued != 2) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= until.nanoseconds) return error.H2QueriesDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    var preparations: [2]RequestAdmission.Lease = undefined;
+    for (&preparations) |*lease| lease.* = api.sql_preparation_admission.tryAcquireLease().?;
+    defer for (&preparations) |*lease| lease.release();
+    var write = api.write_admission.tryAcquireLease().?;
+    defer write.release();
+    const base = try fixture.baseUrl(alloc);
+    defer alloc.free(base);
+    const sql_url = try std.fmt.allocPrint(alloc, "{s}/db/v1/sql", .{base});
+    defer alloc.free(sql_url);
+    const commit = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "COMMIT", .session_id = @as([]const u8, &commit_id) }, .{});
+    defer alloc.free(commit);
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false, .retry_policy = .{ .max_retries = 0 } });
+    defer client.deinit();
+    var committed = try requestWithRetry(&client, io, .POST, sql_url, commit, null, 1);
+    defer committed.deinit();
+    try std.testing.expectEqual(@as(u16, 200), committed.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, committed.body.?, "COMMIT") != null);
+    const rejected = try peer.stream_manager.createStream();
+    const control = try peer.stream_manager.createStream();
+    const status = try peer.stream_manager.createStream();
+    for ([_]u31{ rejected.id, control.id }) |sid| {
+        const headers = try httpx.H2Connection.buildRequestHeaders("POST", "/db/v1/sql", "http", "localhost", &.{.{ .name = "content-type", .value = "application/json" }}, alloc);
+        defer alloc.free(headers);
+        try peer.sendHeaders(&socket, sid, headers, false);
+    }
+    try peer.writeData(&socket, rejected.id, query_body, true);
+    try peer.writeData(&socket, control.id, rollback[0..5], false);
+    try peer.writeData(&socket, control.id, rollback[5..], true);
+    const headers = try httpx.H2Connection.buildRequestHeaders("GET", "/db/v1/status", "http", "localhost", &.{}, alloc);
+    defer alloc.free(headers);
+    try peer.sendHeaders(&socket, status.id, headers, true);
+    while (rejected.stream_error == null or !control.completed or !status.completed)
+        _ = try peer.processOneFrame(&socket, &socket);
+    try std.testing.expect(std.mem.indexOf(u8, control.data_buf.items, "ROLLBACK") != null);
+    try std.testing.expect(status.data_buf.items.len != 0);
+    try std.testing.expectEqual(@as(usize, 2), api.queryAdmissionStats().queued);
+    try peer.sendRstStream(&socket, queued[0], .cancel);
+    const cancelled_until = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+    while (api.queryAdmissionStats().queued != 1) {
+        if (std.Io.Clock.awake.now(io).nanoseconds >= cancelled_until.nanoseconds) return error.H2ResetDidNotCancelWaiter;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    held.release();
+    const completed = peer.stream_manager.getStream(queued[1]).?;
+    while (!completed.completed) _ = try peer.processOneFrame(&socket, &socket);
+    try std.testing.expect(std.mem.indexOf(u8, completed.data_buf.items, "9007199254740993") != null);
+    try std.testing.expectEqual(@as(usize, 0), api.queryAdmissionStats().queued);
+    try std.testing.expectEqual(@as(usize, 0), api.queryAdmissionStats().in_flight);
+}
+
+fn beginSqlQualificationSession(handler: *AntflyApiHandler) ![32]u8 {
+    const alloc = std.testing.allocator;
+    var request = try httpx.Request.init(alloc, .POST, "/db/v1/sql");
+    defer request.deinit();
+    request.body = "{\"statement\":\"BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY\"}";
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var begun = try handler.executeSQL(&context);
+    defer begun.deinit();
+    try std.testing.expectEqual(@as(u16, 200), begun.status.code);
+    var result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, begun.body.?, .{});
+    defer result.deinit();
+    var id: [32]u8 = undefined;
+    @memcpy(&id, result.value.session_id.?);
+    return id;
+}
+
+test "SQL protected executor preserves an explicitly disabled dedicated worker budget" {
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded, .lane_limits = .{ .worker_capacity = 0 } });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, source.iface(), null, null);
+    defer api.deinit();
+    const foreground = try api.sqlExecutionIo();
+    try std.testing.expect(foreground.userdata == runtime.ptr().io().?.userdata);
+    const control = try api.sqlControlIo();
+    try std.testing.expect(control.userdata == runtime.ptr().controlIo().?.userdata);
+    try std.testing.expectEqual(@as(usize, 0), runtime.ptr().laneStats().reserved_workers);
+    try std.testing.expect(!api.sqlQueryWaitingEnabled());
+}
+
+test "SQL protected control transport validates typed paths before granting reserve" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(alloc, .{ .query_waiting = .{ .max_queued_requests = 2, .max_queued_bytes = 4096, .max_wait_ms = 100 } }, source.iface(), null, null);
+    defer api.deinit();
+    const transport = api.configurePublicHttpTransport(.{ .max_connections = 8, .max_request_tasks = 1 });
+    const classify = transport.is_protected_request.?;
+    const id = "00000000000000000000000000000001";
+    for ([_][]const u8{
+        "/db/v1/transactions/" ++ id ++ "/commit",
+        "/db/v1/transactions/" ++ id ++ "/abort",
+        "/db/v1/transactions/" ++ id ++ "/savepoints/7/rollback",
+    }) |path| try std.testing.expect(classify(.POST, path));
+    for ([_][]const u8{
+        "/db/v1/transactions/begin",
+        "/db/v1/transactions/commit",
+        "/db/v1/transactions/" ++ id ++ "/savepoints/rollback",
+        "/db/v1/transactions/" ++ id ++ "/savepoints//rollback",
+        "/db/v1/transactions/" ++ id ++ "/savepoints/7/rollback/extra",
+        "/db/v1/sql?priority=control",
+    }) |path| try std.testing.expect(!classify(.POST, path));
+    for ([_][]const u8{
+        "/db/v1/sql/prepared/" ++ id,
+        "/db/v1/sql/connections/" ++ id,
+    }) |path| {
+        try std.testing.expect(classify(.DELETE, path));
+        try std.testing.expect(!classify(.POST, path));
+    }
+    try std.testing.expect(!classify(.DELETE, "/db/v1/sql/prepared/not-hex"));
 }

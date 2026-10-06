@@ -28,6 +28,23 @@ pub const PoolError = error{
     PoolExhaustedForHost,
 };
 
+/// One physical socket envelope across TCP, TLS and H2, including connections
+/// currently opening. The stable client owner outlives every entry.
+pub const ConnectionSlots = struct {
+    limit: usize,
+    used: std.atomic.Value(usize) = .init(0),
+    pub fn acquire(self: *ConnectionSlots) bool {
+        var count = self.used.load(.acquire);
+        while (count < self.limit) {
+            if (self.used.cmpxchgWeak(count, count + 1, .acq_rel, .acquire)) |next| count = next else return true;
+        }
+        return false;
+    }
+    pub fn release(self: *ConnectionSlots) void {
+        std.debug.assert(self.used.fetchSub(1, .acq_rel) > 0);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Connection entry types
 // ---------------------------------------------------------------------------
@@ -43,7 +60,7 @@ fn ConnectionMixin(comptime Self: type) type {
         pub fn release(self: *Self, now: i64) void {
             self.in_use = false;
             self.last_used = now;
-            self.requests_made += 1;
+            self.requests_made +|= 1;
         }
 
         pub fn markBroken(self: *Self) void {
@@ -150,6 +167,7 @@ pub const TlsConnection = struct {
     }
 
     pub fn shouldEvict(self: *const TlsConnection, idle_timeout_ms: i64, max_requests: u32, now: i64) bool {
+        if (self.in_use) return false;
         if (!self.session.connected) return true;
         return mixin.baseShouldEvict(self, idle_timeout_ms, max_requests, now);
     }
@@ -213,6 +231,7 @@ pub const PoolStats = struct {
     total: usize,
     active: usize,
     idle: usize,
+    connecting: usize = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -240,10 +259,16 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         context: Context,
         /// Connections indexed by "host:port" key.
         host_map: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(*Entry)) = .{},
+        connecting: std.StringHashMapUnmanaged(usize) = .{},
+        connecting_count: usize = 0,
+        slots: ?*ConnectionSlots = null,
         total_count: usize = 0,
         active_count: usize = 0,
         mutex: Io.Mutex = Io.Mutex.init,
         last_cleanup: i64 = 0,
+        changed: Io.Condition = .init,
+        waiters: usize = 0,
+        closed: bool = false,
 
         const Self = @This();
 
@@ -267,14 +292,14 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             var it = self.host_map.iterator();
             while (it.next()) |map_entry| {
                 for (map_entry.value_ptr.items) |entry| {
-                    entry.close();
-                    self.allocator.free(entry.host);
-                    self.allocator.destroy(entry);
+                    self.destroyEntry(entry);
                 }
                 map_entry.value_ptr.deinit(self.allocator);
                 self.allocator.free(map_entry.key_ptr.*);
             }
             self.host_map.deinit(self.allocator);
+            std.debug.assert(self.connecting_count == 0 and self.waiters == 0);
+            self.connecting.deinit(self.allocator);
         }
 
         /// Format a "host:port" lookup key into a stack buffer.
@@ -285,6 +310,87 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
         /// Allocate a heap-owned "host:port" key for map insertion.
         fn allocHostKey(allocator: Allocator, host: []const u8, port: u16) ![]u8 {
             return std.fmt.allocPrint(allocator, "{s}:{d}", .{ host, port });
+        }
+
+        pub fn bindSlots(self: *Self, slots: *ConnectionSlots) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.slots) |bound| {
+                std.debug.assert(bound == slots);
+            } else {
+                std.debug.assert(self.total_count == 0 and self.connecting_count == 0);
+                self.slots = slots;
+            }
+        }
+
+        fn destroyEntry(self: *Self, entry: *Entry) void {
+            entry.close();
+            self.allocator.free(entry.host);
+            self.allocator.destroy(entry);
+            if (self.slots) |slots| slots.release();
+        }
+
+        /// Retire unused sockets to make room for another protocol/endpoint.
+        pub fn retireIdle(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            var it = self.host_map.iterator();
+            while (it.next()) |bucket| {
+                var i: usize = 0;
+                while (i < bucket.value_ptr.items.len) {
+                    const entry = bucket.value_ptr.items[i];
+                    if (!entry.in_use) {
+                        self.destroyEntry(entry);
+                        _ = bucket.value_ptr.swapRemove(i);
+                        self.total_count -= 1;
+                    } else i += 1;
+                }
+            }
+            self.cleanupLocked(milliTimestamp(self.io));
+            self.changed.broadcast(self.io);
+        }
+
+        pub fn close(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.closed = true;
+            self.changed.broadcast(self.io);
+        }
+
+        pub fn getConnectionWait(self: *Self, host: []const u8, port: u16, options: @import("admission.zig").Options, max_waiters: u16, max_wait_ms: u32) !*Entry {
+            const now = milliTimestamp(self.io);
+            const deadline = @min(options.deadline_ms orelse std.math.maxInt(i64), now +| max_wait_ms);
+            var queued = false;
+            defer if (queued) {
+                self.mutex.lockUncancelable(self.io);
+                self.waiters -= 1;
+                self.mutex.unlock(self.io);
+            };
+            while (true) {
+                if (options.isCancelled()) return error.Cancelled;
+                const current = milliTimestamp(self.io);
+                if (options.deadline_ms) |original| if (current >= original) return error.Timeout;
+                if (queued and current >= deadline) return error.Timeout;
+                return self.getConnection(host, port) catch |err| switch (err) {
+                    error.PoolExhausted, error.PoolExhaustedForHost => {
+                        self.mutex.lockUncancelable(self.io);
+                        defer self.mutex.unlock(self.io);
+                        if (self.closed) return error.ClientClosed;
+                        if (!queued) {
+                            if (self.waiters >= max_waiters or max_wait_ms == 0) return err;
+                            self.waiters += 1;
+                            queued = true;
+                        }
+                        const wake_ns = @as(i128, @min(deadline, current +| 25)) * std.time.ns_per_ms;
+                        self.changed.waitTimeout(self.io, &self.mutex, .{ .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = @intCast(wake_ns) } } }) catch |wait_err| switch (wait_err) {
+                            error.Timeout => {},
+                            error.Canceled => return error.Canceled,
+                        };
+                        continue;
+                    },
+                    else => return err,
+                };
+            }
         }
 
         /// Gets an idle connection for `(host, port)`, or creates a new one.
@@ -299,6 +405,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 self.mutex.lockUncancelable(self.io);
                 defer self.mutex.unlock(self.io);
 
+                if (self.closed) return error.ClientClosed;
                 // Periodic cleanup: evict stale/broken connections.
                 const now = milliTimestamp(self.io);
                 if (now - self.last_cleanup > self.config.health_check_interval_ms) {
@@ -320,9 +427,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                         // Evict stale/broken connections inline so they don't
                         // count against max_per_host.
                         if (entry.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection, now)) {
-                            entry.close();
-                            self.allocator.free(entry.host);
-                            self.allocator.destroy(entry);
+                            self.destroyEntry(entry);
                             _ = list.swapRemove(i);
                             self.total_count -|= 1;
                         } else {
@@ -330,14 +435,60 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                         }
                     }
 
-                    if (list.items.len >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
+                    if (list.items.len + (self.connecting.get(key) orelse 0) >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
                 }
 
-                if (self.total_count >= self.config.max_connections) return PoolError.PoolExhausted;
+                if ((self.connecting.get(key) orelse 0) >= self.config.max_per_host) return PoolError.PoolExhaustedForHost;
+                if (self.total_count + self.connecting_count >= self.config.max_connections) {
+                    var idle_it = self.host_map.iterator();
+                    outer: while (idle_it.next()) |bucket| {
+                        for (bucket.value_ptr.items, 0..) |entry, i| {
+                            if (!entry.in_use) {
+                                self.destroyEntry(entry);
+                                _ = bucket.value_ptr.swapRemove(i);
+                                self.total_count -= 1;
+                                break :outer;
+                            }
+                        }
+                    }
+                }
+                if (self.total_count + self.connecting_count >= self.config.max_connections) return PoolError.PoolExhausted;
+                const reservation = try self.connecting.getOrPut(self.allocator, key);
+                if (!reservation.found_existing) {
+                    reservation.key_ptr.* = self.allocator.dupe(u8, key) catch |err| {
+                        _ = self.connecting.remove(key);
+                        return err;
+                    };
+                    reservation.value_ptr.* = 0;
+                }
+                if (self.slots) |slots| if (!slots.acquire()) {
+                    if (reservation.value_ptr.* == 0) {
+                        const removed = self.connecting.fetchRemove(key).?;
+                        self.allocator.free(removed.key);
+                    }
+                    return PoolError.PoolExhausted;
+                };
+                reservation.value_ptr.* += 1;
+                self.connecting_count += 1;
             }
 
-            // Create outside the mutex — DNS, TCP connect (and TLS handshake) may block.
-            return self.createConnection(host, port);
+            // Reserve BEFORE DNS/connect so concurrent creators cannot exceed socket limits.
+            defer {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                self.connecting_count -= 1;
+                self.changed.broadcast(self.io);
+                const count = self.connecting.getPtr(key).?;
+                count.* -= 1;
+                if (count.* == 0) {
+                    const removed = self.connecting.fetchRemove(key).?;
+                    self.allocator.free(removed.key);
+                }
+            }
+            return self.createConnection(host, port) catch |err| {
+                if (self.slots) |slots| slots.release();
+                return err;
+            };
         }
 
         /// Creates a new connection via `Entry.createNew`, then inserts it
@@ -393,6 +544,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
             defer self.mutex.unlock(self.io);
             const now = milliTimestamp(self.io);
             entry.release(now);
+            self.changed.broadcast(self.io);
             self.active_count -|= 1;
             // Opportunistic cleanup on release.
             if (now - self.last_cleanup > self.config.health_check_interval_ms) {
@@ -409,9 +561,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 // Fallback: can't format key, just free the entry.
                 if (entry.in_use) self.active_count -|= 1;
                 self.total_count -|= 1;
-                entry.close();
-                self.allocator.free(entry.host);
-                self.allocator.destroy(entry);
+                self.destroyEntry(entry);
                 return;
             };
 
@@ -437,10 +587,9 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
 
             if (entry.in_use) self.active_count -|= 1;
             self.total_count -|= 1;
+            self.changed.broadcast(self.io);
 
-            entry.close();
-            self.allocator.free(entry.host);
-            self.allocator.destroy(entry);
+            self.destroyEntry(entry);
         }
 
         /// Removes idle/broken connections that should be evicted.
@@ -458,9 +607,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 while (i < list.items.len) {
                     const entry = list.items[i];
                     if (entry.shouldEvict(self.config.idle_timeout_ms, self.config.max_requests_per_connection, now)) {
-                        entry.close();
-                        self.allocator.free(entry.host);
-                        self.allocator.destroy(entry);
+                        self.destroyEntry(entry);
                         _ = list.swapRemove(i);
                         self.total_count -|= 1;
                     } else {
@@ -535,6 +682,7 @@ pub fn GenericPool(comptime Entry: type, comptime Context: type) type {
                 .total = self.total_count,
                 .active = self.active_count,
                 .idle = self.total_count - self.active_count,
+                .connecting = self.connecting_count,
             };
         }
     };
@@ -681,4 +829,114 @@ test "TlsPool cleanup on empty pool" {
     // Should not panic on an empty pool.
     tls_pool.cleanup();
     try std.testing.expectEqual(@as(usize, 0), tls_pool.totalCount());
+}
+
+const PoolTestContext = struct {
+    io: Io,
+    entered: Io.Event = .unset,
+    resume_event: Io.Event = .unset,
+    block: bool = false,
+    fail: bool = false,
+    calls: std.atomic.Value(usize) = .init(0),
+};
+const PoolTestEntry = struct {
+    last_used: i64 = 0,
+    host: []const u8,
+    port: u16,
+    in_use: bool = true,
+    requests_made: u32 = 0,
+    const mixin = ConnectionMixin(@This());
+    pub const acquire = mixin.acquire;
+    pub fn release(self: *@This(), _: i64) void {
+        self.in_use = false;
+        self.requests_made += 1;
+    }
+    pub fn isHealthy(self: *const @This(), _: i64, _: i64) bool {
+        return !self.in_use;
+    }
+    pub fn shouldEvict(_: *const @This(), _: i64, _: u32, _: i64) bool {
+        return false;
+    }
+    pub fn close(_: *@This()) void {}
+    pub fn createNew(alloc: Allocator, _: Io, host: []const u8, port: u16, context: *PoolTestContext) !*@This() {
+        _ = context.calls.fetchAdd(1, .acq_rel);
+        context.entered.set(context.io);
+        if (context.block) try context.resume_event.waitTimeout(context.io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(3) } });
+        if (context.fail) return error.TestConnectFailed;
+        const owned_host = try alloc.dupe(u8, host);
+        errdefer alloc.free(owned_host);
+        const entry = try alloc.create(@This());
+        entry.* = .{ .host = owned_host, .port = port };
+        return entry;
+    }
+};
+const TestPool = GenericPool(PoolTestEntry, *PoolTestContext);
+
+test "outbound pool reserves pending connections before connect and reuses release" {
+    const io = std.testing.io;
+    var context: PoolTestContext = .{ .io = io, .block = true };
+    var slots: ConnectionSlots = .{ .limit = 1 };
+    var pool_inst = TestPool.initWithConfig(std.testing.allocator, io, .{ .max_connections = 1, .max_per_host = 1 }, &context);
+    defer pool_inst.deinit();
+    pool_inst.bindSlots(&slots);
+    const Task = struct {
+        fn run(pool: *TestPool) !*PoolTestEntry {
+            return pool.getConnection("a", 80);
+        }
+    };
+    var running = try io.concurrent(Task.run, .{&pool_inst});
+    defer if (running.cancel(io)) |_| {} else |_| {};
+    try context.entered.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(3) } });
+    try std.testing.expectEqual(@as(usize, 1), pool_inst.stats().connecting);
+    try std.testing.expectEqual(@as(usize, 1), slots.used.load(.acquire));
+    try std.testing.expectError(error.PoolExhaustedForHost, pool_inst.getConnection("a", 80));
+    try std.testing.expectError(error.PoolExhausted, pool_inst.getConnection("b", 80));
+    try std.testing.expectEqual(@as(usize, 1), context.calls.load(.acquire));
+    context.resume_event.set(io);
+    const first = try running.await(io);
+    pool_inst.releaseConnection(first);
+    const second = try pool_inst.getConnection("a", 80);
+    try std.testing.expect(first == second);
+    pool_inst.releaseConnection(second);
+    pool_inst.retireIdle();
+    try std.testing.expectEqual(@as(usize, 0), slots.used.load(.acquire));
+    pool_inst.close();
+    try std.testing.expectError(error.ClientClosed, pool_inst.getConnection("a", 80));
+}
+
+test "outbound pool shared socket ceiling spans transports and failed creates reclaim reservations" {
+    const io = std.testing.io;
+    var context: PoolTestContext = .{ .io = io };
+    var slots: ConnectionSlots = .{ .limit = 1 };
+    var a = TestPool.init(std.testing.allocator, io, &context);
+    defer a.deinit();
+    var b = TestPool.init(std.testing.allocator, io, &context);
+    defer b.deinit();
+    a.bindSlots(&slots);
+    b.bindSlots(&slots);
+    const first = try a.getConnection("a", 80);
+    try std.testing.expectError(error.PoolExhausted, b.getConnection("b", 443));
+    a.releaseConnection(first);
+    a.retireIdle();
+    context.fail = true;
+    try std.testing.expectError(error.TestConnectFailed, b.getConnection("b", 443));
+    try std.testing.expectEqual(@as(usize, 0), b.stats().connecting);
+    try std.testing.expectEqual(@as(usize, 0), slots.used.load(.acquire));
+    context.fail = false;
+    const second = try b.getConnection("b", 443);
+    b.releaseConnection(second);
+    b.retireIdle();
+    try std.testing.expectEqual(@as(usize, 0), slots.used.load(.acquire));
+}
+
+test "outbound pool wait preserves original deadline without starting a connection" {
+    const io = std.testing.io;
+    var context: PoolTestContext = .{ .io = io };
+    var pool_inst = TestPool.initWithConfig(std.testing.allocator, io, .{ .max_connections = 1, .max_per_host = 1 }, &context);
+    defer pool_inst.deinit();
+    const held = try pool_inst.getConnection("a", 80);
+    defer pool_inst.releaseConnection(held);
+    try std.testing.expectError(error.Timeout, pool_inst.getConnectionWait("a", 80, .{ .deadline_ms = milliTimestamp(io) + 10 }, 1, 1000));
+    try std.testing.expectEqual(@as(usize, 1), context.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), pool_inst.waiters);
 }

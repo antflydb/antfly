@@ -949,6 +949,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = embedded_db_mod,
         .filters = &.{
             "embedded custom storage owns its physical namespace",
+            "embedded workload deadline rejects work before DB handoff and preserves cancellation",
             "embedded db openLite persists documents in aflite file",
             "embedded db openLite close syncs unsynced batch before readonly reopen",
             "embedded db openLite propagates no_sync to aflite backend",

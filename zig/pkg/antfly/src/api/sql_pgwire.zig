@@ -38,21 +38,33 @@ pub const Listener = struct {
     alloc: std.mem.Allocator,
     adapter: Adapter,
     server: @import("../pgwire/server.zig").Server,
+    transport_io: std.Io.Threaded,
 
     pub fn start(api: *http.ApiHttpServer, config: @import("../common/config.zig").Config.PgwireConfig) !*Listener {
         if (api.cfg.user_manager == null) return error.PgwireRequiresAuthentication;
         if (api.cfg.backend_runtime == null) return error.PgwireRequiresBackendRuntime;
-        const io = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
+        _ = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
         const self = try api.owner_alloc.create(Listener);
         errdefer api.owner_alloc.destroy(self);
         self.alloc = api.owner_alloc;
         self.adapter = .{ .server = api };
+        // Long-lived idle sessions must not consume the shared outbound lane.
+        // One session task per connection plus accept, deadline and cancel slots.
+        self.transport_io = std.Io.Threaded.init(self.alloc, .{
+            .async_limit = .nothing,
+            .concurrent_limit = .limited(@as(usize, config.max_connections) + 6),
+        });
+        errdefer self.transport_io.deinit();
+        const io = self.transport_io.io();
         self.server = try @import("../pgwire/server.zig").start(self.alloc, .{
             .io = io,
             .backend = self.adapter.backend(),
             .bind_host = config.bind_host orelse "127.0.0.1",
             .bind_port = config.bind_port,
             .max_connections = config.max_connections,
+            .max_session_bytes = config.max_session_bytes,
+            .max_retained_bytes = config.max_retained_bytes,
+            .limits = .{ .retained_bytes = config.retained_bytes_per_connection, .idle_transaction_timeout_ms = config.idle_transaction_timeout_ms },
             .allow_insecure_non_loopback = config.externally_protected_transport,
         });
         return self;
@@ -60,6 +72,7 @@ pub const Listener = struct {
 
     pub fn deinit(self: *Listener) void {
         self.server.deinit();
+        self.transport_io.deinit();
         self.alloc.destroy(self);
     }
 };
@@ -198,6 +211,9 @@ pub const Adapter = struct {
     }
 
     fn openStream(raw: *anyopaque, alloc: std.mem.Allocator, identity: wire.Identity, request: wire.Request) !?wire.ReadStream {
+        // Protocol probes streams before execute, including for COMMIT. A
+        // control must reach its protected execution path without fresh slots.
+        if (@import("sql_control.zig").classify(request.statement)) return null;
         const self: *Adapter = @ptrCast(@alignCast(raw));
         var job = StreamJob{ .adapter = self, .alloc = alloc, .credential = @ptrCast(@alignCast(identity.context)), .request = request };
         try job.dispatch();
@@ -238,8 +254,13 @@ pub const Adapter = struct {
         const self: *Adapter = @ptrCast(@alignCast(raw));
         const id = @import("distributed_txn.zig").parseTxnIdHex(session_id orelse return) catch return;
         const credential: *Credential = @ptrCast(@alignCast(identity.context));
-        const runtime = self.server.cfg.backend_runtime orelse return;
-        var io = runtime.io() orelse return;
+        var io = self.server.sqlControlIo() catch {
+            // Cleanup is local owner release, never durable mutation replay.
+            // Scheduling exhaustion must not silently abandon an idle session.
+            const access = self.server.txn_sessions.principalAccess(self.server.alloc, id, credential.sessionPrincipal()) catch return;
+            if (access == .allowed) _ = self.server.txn_sessions.removeBeforeExecution(self.server.alloc, id);
+            return;
+        };
         const network_io = self.server.sharedApiNetworkIo() orelse return;
         const Cleanup = struct {
             server: *http.ApiHttpServer,
@@ -258,7 +279,10 @@ pub const Adapter = struct {
             }
         };
         var job = Cleanup{ .server = self.server, .principal = credential.sessionPrincipal(), .id = id, .completion_io = network_io };
-        var future = io.concurrent(Cleanup.run, .{&job}) catch return;
+        var future = io.concurrent(Cleanup.run, .{&job}) catch {
+            Cleanup.run(&job);
+            return;
+        };
         job.done.waitUncancelable(network_io);
         _ = future.await(io);
     }
@@ -266,17 +290,27 @@ pub const Adapter = struct {
     fn dispatch(self: *Adapter, job: *Job) !void {
         try validateRequest(job.request);
         if (self.server.cfg.user_manager != job.credential.manager) return error.Unauthorized;
-        const runtime = self.server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        var io = runtime.io() orelse return error.SqlWriteCapacityUnavailable;
+        const protected = @import("sql_control.zig").classify(job.request.statement);
+        var io = if (protected) try self.server.sqlControlIo() else try self.server.sqlExecutionIo();
         var future = io.concurrent(Job.run, .{job}) catch return error.SqlWriteCapacityUnavailable;
         // Keep borrowed request storage alive through a durable decision. The
         // listener sets cancellation/deadline on shutdown, native checkpoints
         // observe it, and this adapter joins rather than abandoning the job.
         job.done.waitUncancelable(job.request.io);
         _ = future.await(io);
-        if (job.failure) |err| return err;
+        if (job.failure) |err| return wireFailure(job.request, err);
     }
 };
+
+// Admission's external cancellation retires the waiter with Canceled. That
+// must become a statement error, not the protocol's transport shutdown signal.
+fn wireFailure(request: wire.Request, failure: anyerror) anyerror {
+    if (failure == error.Canceled and request.cancel_requested.load(.acquire)) {
+        request.io.checkCancel() catch return error.Canceled;
+        return error.QueryCanceled;
+    }
+    return failure;
+}
 
 const Pull = @import("../sql/read_stream.zig");
 
@@ -287,6 +321,20 @@ fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("../sq
         if (entry.value == .string) out.value = .{ .string = try alloc.dupe(u8, entry.value.string) };
     }
     return result;
+}
+
+fn admissionOptions(request: wire.Request) @import("../common/bounded_admission.zig").Options {
+    return .{
+        .io = request.io,
+        .deadline_ns = @intCast(@max(0, request.deadline.raw.nanoseconds)),
+        .cancellation = .{ .ptr = request.cancel_requested, .requested = struct {
+            fn call(raw: *const anyopaque) bool {
+                const signal: *const std.atomic.Value(bool) = @ptrCast(@alignCast(raw));
+                return signal.load(.acquire);
+            }
+        }.call },
+        .retained_bytes = @as(u64, request.statement.len) +| @import("../common/bounded_admission.zig").parameterBytes(request.parameters) +| 1024,
+    };
 }
 
 /// The portal owns this entire capsule. No cursor retains Job.runInner's stack
@@ -320,7 +368,8 @@ const OwnedRead = struct {
         var moved = false;
         defer if (!moved) plan.release(server.sqlPlanCacheIo());
         if (plan.compiled().statement != .select) return null;
-        var admission = try server.acquireSqlExecution(false);
+        preparation.release();
+        var admission = try server.acquireSqlExecutionWithOptions(false, admissionOptions(request));
         defer if (!moved) admission.release();
         const self = try alloc.create(OwnedRead);
         errdefer alloc.destroy(self);
@@ -425,7 +474,7 @@ const OwnedRead = struct {
     fn validateCursor(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request) !void {
         try request.check();
         try self.authority.credential.validate();
-        var admission: ?http.RequestAdmission.Lease = if (self.detached) try self.adapter.server.acquireSqlExecution(false) else null;
+        var admission: ?http.RequestAdmission.Lease = if (self.detached and !request.completion_drain) try self.adapter.server.acquireSqlExecutionWithOptions(false, admissionOptions(request)) else null;
         defer if (admission) |*lease| lease.release();
         const original = self.authority.request;
         if (!std.mem.eql(u8, original.database.?, request.database orelse "default") or !std.mem.eql(u8, original.namespace.?, request.namespace orelse "public") or
@@ -454,6 +503,7 @@ const OwnedRead = struct {
     }
 
     fn pull(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
+        const state_alloc = if (request.completion_drain) self.adapter.server.controlAllocator() else self.adapter.server.alloc;
         if (self.detached) return error.InvalidSqlBackendResponse;
         try request.check();
         // Retained snapshots have a hard initial statement deadline, even if
@@ -462,9 +512,9 @@ const OwnedRead = struct {
         try self.authority.credential.validate();
         if (self.session_id) |id_hex| {
             const id = try @import("distributed_txn.zig").parseTxnIdHex(id_hex);
-            if (try self.adapter.server.txn_sessions.principalAccess(self.adapter.server.alloc, id, self.authority.credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
-            var state = (try self.adapter.server.txn_sessions.getSqlState(self.adapter.server.alloc, id)) orelse return error.SqlTransactionNotActive;
-            defer state.deinit(self.adapter.server.alloc);
+            if (try self.adapter.server.txn_sessions.principalAccess(state_alloc, id, self.authority.credential.sessionPrincipal()) != .allowed) return error.SqlTransactionNotActive;
+            var state = (try self.adapter.server.txn_sessions.getSqlState(state_alloc, id)) orelse return error.SqlTransactionNotActive;
+            defer state.deinit(state_alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
         }
         var fresh = try self.authority.credential.identity(alloc);
@@ -548,12 +598,11 @@ const StreamJob = struct {
     fn dispatch(self: *StreamJob) !void {
         try validateRequest(self.request);
         if (self.adapter.server.cfg.user_manager != self.credential.manager) return error.Unauthorized;
-        const backend_runtime = self.adapter.server.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        const io = backend_runtime.io() orelse return error.SqlWriteCapacityUnavailable;
+        const io = if (self.owner != null and self.request.completion_drain) try self.adapter.server.sqlControlIo() else try self.adapter.server.sqlExecutionIo();
         var future = io.concurrent(run, .{self}) catch return error.SqlWriteCapacityUnavailable;
         self.done.waitUncancelable(self.request.io);
         _ = future.await(io);
-        if (self.failure) |err| return err;
+        if (self.failure) |err| return wireFailure(self.request, err);
     }
     fn run(self: *StreamJob) void {
         defer self.done.set(self.request.io);
@@ -567,6 +616,8 @@ const StreamJob = struct {
         };
     }
     fn runInner(self: *StreamJob) !void {
+        var control = if (self.owner != null and self.request.completion_drain) try self.adapter.server.acquireSqlControl() else @as(?http.RequestAdmission.Lease, null);
+        defer if (control) |*lease| lease.release();
         if (self.namespace_only) {
             const server = self.adapter.server;
             const domain = @import("../system_catalog/domain.zig");
@@ -579,11 +630,11 @@ const StreamJob = struct {
             const resource = try @import("../system_catalog/routes.zig").resourceNameAlloc(self.alloc, .{ .kind = .namespace, .database = database, .name = namespace });
             defer self.alloc.free(resource);
             if (!http.permissionsAllow(identity.?.permissions, .namespace, resource, .read)) return error.Forbidden;
-            var admission = try server.acquireSqlExecution(false);
+            var admission = try server.acquireSqlExecutionWithOptions(false, admissionOptions(self.request));
             defer admission.release();
             var authority: Authority = .{ .credential = self.credential, .identity = &identity, .request = self.request };
-            const call = server.source.vtable.system_catalog orelse return error.UnsupportedSqlExecution;
-            const response = try call(server.source.ptr, self.alloc, try authority.context(), .{ .read = .{ .kind = .namespace, .database = database, .name = namespace } });
+            if (server.source.vtable.system_catalog == null) return error.UnsupportedSqlExecution;
+            const response = try server.source.systemCatalog(self.alloc, try authority.context(), .{ .read = .{ .kind = .namespace, .database = database, .name = namespace } });
             self.alloc.free(response);
             return;
         }
@@ -722,14 +773,16 @@ const Job = struct {
 
     fn runInner(self: *Job) !void {
         try validateRequest(self.request);
-        var preparation = self.adapter.server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
+        const protected = @import("sql_control.zig").classify(self.request.statement);
+        const preparation_owner = if (protected) &self.adapter.server.sql_control_preparation else &self.adapter.server.sql_preparation_admission;
+        var preparation = preparation_owner.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
-        var lease = self.adapter.server.sqlPlanCache().acquire(self.adapter.server.sqlPlanCacheIo(), .{
+        var lease = @import("sql_control.zig").Plan.acquire(self.alloc, self.adapter.server.sqlPlanCache(), self.adapter.server.sqlPlanCacheIo(), .{
             .statement = self.request.statement,
             .principal = self.credential.principal,
             .database = self.request.database orelse "default",
             .namespace = self.request.namespace orelse "public",
-        }, &self.compile_diagnostic) catch |err| {
+        }, &self.compile_diagnostic, protected) catch |err| {
             self.compile_diagnostic_valid = err != error.SqlPlanCacheBusy and err != error.InvalidSqlPlanCacheConfig;
             return err;
         };
@@ -740,11 +793,12 @@ const Job = struct {
             .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
         };
         const server = self.adapter.server;
-        var admission = try server.acquireSqlExecution(write);
-        defer admission.release();
         preparation.release();
-        var identity: ?http.AuthenticatedIdentity = try self.credential.identity(server.alloc);
-        defer identity.?.deinit(server.alloc);
+        var admission = if (protected) try server.acquireSqlControl() else try server.acquireSqlExecutionWithOptions(write, admissionOptions(self.request));
+        defer admission.release();
+        const identity_alloc = if (protected) server.controlAllocator() else server.alloc;
+        var identity: ?http.AuthenticatedIdentity = try self.credential.identity(identity_alloc);
+        defer identity.?.deinit(identity_alloc);
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
         const context = try authority.context();
         var native_adapter = execution.Adapter{
@@ -927,19 +981,14 @@ const Authority = struct {
     fn context(self: *Authority) !operation.RequestContext {
         try self.checkpoint();
         try self.credential.validate();
-        return .{
-            .deadline_ns = std.math.cast(u64, self.request.deadline.raw.nanoseconds) orelse return error.DeadlineExceeded,
-            .deadline_io = io_abi.Borrow.init(&self.request.io),
-            .fanout_io = io_abi.Borrow.init(&self.request.io),
-            .cancellation = operation.CancellationToken.fromAtomic(self.request.cancel_requested),
-            .principal = .{ .kind = .user, .subject = self.identity.*.?.username },
-            .destination_authorization_principal = self.credential.principal,
-            // The authenticated, credential-fenced identity is borrowed for
-            // this statement only; owner write proofs are minted before the
-            // durable transaction plan is sealed.
-            .row_policy_credential = self.identity,
-            .table_write_authorization = .{ .ptr = self, .allows = allowsWrite },
-        };
+        var result = try nativeRequestContext(&self.request);
+        result.principal = .{ .kind = .user, .subject = self.identity.*.?.username };
+        result.destination_authorization_principal = self.credential.principal;
+        // The identity is borrowed only for this statement. Owner write proofs
+        // are minted before a durable transaction plan is sealed.
+        result.row_policy_credential = self.identity;
+        result.table_write_authorization = .{ .ptr = self, .allows = allowsWrite };
+        return result;
     }
 
     fn allowsWrite(raw: *const anyopaque, table: []const u8) bool {
@@ -1520,4 +1569,50 @@ test "SQL pgwire binary datetime parameters cross native coercion without precis
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 1, too_precise));
     try std.testing.expectError(error.UnsupportedResultPrecision, wire_values.encode(alloc, .datetime, 0, too_precise));
     try std.testing.expectError(error.InvalidSqlBackendResponse, datetimeResult(alloc, .{ .string = "1969-01-01T00:00:00Z" }));
+}
+
+test "SQL query waiting pgwire preserves deadline cancellation and typed parameters" {
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const request: wire.Request = .{
+        .statement = "select $1",
+        .parameters = &.{ .{ .string = "value" }, .{ .integer = 42 } },
+        .limit = 1,
+        .io = std.testing.io,
+        .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + std.time.ns_per_s } },
+        .cancel_requested = &cancel,
+    };
+    const options = admissionOptions(request);
+    try std.testing.expectEqual(@as(u64, @intCast(request.deadline.raw.nanoseconds)), options.deadline_ns.?);
+    try std.testing.expect(options.retained_bytes >= request.statement.len + 5 + 2 * @sizeOf(std.json.Value));
+    try options.check();
+    cancel.store(true, .release);
+    try std.testing.expectError(error.Canceled, options.check());
+}
+
+/// Normalize once at pgwire ingress. Native metadata/storage owners consume
+/// platform monotonic deadlines; Io awake has a different epoch on macOS.
+fn nativeRequestContext(request: *const wire.Request) !operation.RequestContext {
+    try request.check();
+    const context: operation.RequestContext = .{
+        .deadline_ns = std.math.cast(u64, request.deadline.raw.nanoseconds) orelse return error.DeadlineExceeded,
+        .deadline_io = io_abi.Borrow.init(&request.io),
+        .fanout_io = io_abi.Borrow.init(&request.io),
+        .cancellation = operation.CancellationToken.fromAtomic(request.cancel_requested),
+    };
+    return context.platformDeadline();
+}
+
+test "workload deadline normalizes pgwire clock before native metadata handoff" {
+    var canceled = std.atomic.Value(bool).init(false);
+    var request: wire.Request = .{ .statement = "SELECT 1", .limit = 1, .io = std.testing.io, .deadline = .{ .clock = .awake, .raw = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(1)) }, .cancel_requested = &canceled };
+    const before = @import("antfly_platform").time.monotonicNs();
+    const context = try nativeRequestContext(&request);
+    const after = @import("antfly_platform").time.monotonicNs();
+    try std.testing.expect(context.deadline_io == null);
+    try std.testing.expect(context.fanout_io != null);
+    try std.testing.expect(context.deadline_ns.? <= after + std.time.ns_per_s);
+    try std.testing.expect(context.deadline_ns.? >= before);
+    try context.ensureActive();
+    canceled.store(true, .release);
+    try std.testing.expectError(error.Canceled, context.ensureActive());
 }

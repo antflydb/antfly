@@ -46,6 +46,8 @@ pub const Method = enum {
 /// must never outlive the request that supplied it.
 pub const RequestCancellation = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
+    /// Original platform-clock deadline, including admission wait.
+    execution_deadline_ns: ?u64 = null,
     /// Optional listener-owned signal (for example an H2 RST_STREAM). It is
     /// borrowed for the request lifetime and complements local cancellation.
     borrowed: ?*const std.atomic.Value(bool) = null,

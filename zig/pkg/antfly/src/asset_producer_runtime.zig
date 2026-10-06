@@ -396,6 +396,7 @@ pub const Runtime = struct {
         // supplied explicitly per request.
         var client_config = httpx.ClientConfig{
             .keep_alive = true,
+            .outbound = .{ .max_active = 20, .max_per_endpoint = 5, .max_waiters = 20 },
             .cookies_enabled = false,
             .cache_resolved_addresses = true,
         };
