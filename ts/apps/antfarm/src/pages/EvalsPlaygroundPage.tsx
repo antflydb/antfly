@@ -103,7 +103,10 @@ const SAMPLE_EVAL_SET = {
 
 const EvalsPlaygroundPage: React.FC = () => {
   const apiClient = useApi();
-  const { dashboardGenerator } = useGeneratorPreference();
+  const { dashboardGenerator: savedDashboardGenerator } = useGeneratorPreference();
+  // A personal plan preference applies to interactive Chat and RAG only.
+  const dashboardGenerator =
+    savedDashboardGenerator?.provider === "chatgpt" ? null : savedDashboardGenerator;
   const {
     evalSets,
     createEvalSet,

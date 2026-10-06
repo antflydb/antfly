@@ -32,6 +32,11 @@ function loadStoredGenerator(): GeneratorConfig | null {
       typeof parsed.provider === "string" &&
       (parsed.provider === "apple" ? !("model" in parsed) : typeof parsed.model === "string")
     ) {
+      if (parsed.provider === "chatgpt") {
+        return typeof parsed.connection_id === "string"
+          ? { provider: "chatgpt", model: parsed.model, connection_id: parsed.connection_id }
+          : null;
+      }
       return parsed as GeneratorConfig;
     }
   } catch {
@@ -51,6 +56,9 @@ export function GeneratorPreferenceProvider({ children }: { children: ReactNode 
   );
 
   const setDashboardGenerator = useCallback((value: GeneratorConfig | null) => {
+    if (value?.provider === "chatgpt") {
+      value = { provider: "chatgpt", model: value.model, connection_id: value.connection_id };
+    }
     setDashboardGeneratorState(value);
 
     const storage = getStorage();

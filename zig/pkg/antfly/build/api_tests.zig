@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -543,7 +544,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     api_storage_authority_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
     const lib_api_storage_authority_tests = b.addTest(.{
         .root_module = api_storage_authority_test_mod,
-        .filters = &.{
+        .filters = selectTestFilters(b, &.{
+            "portable backup manifest rejects partial per-shard accepted generation proof",
             "public table backup and restore require named connections",
             "public table backup handler rejects an existing backup id",
             "public table backup handler exposes non-retryable fenced outcomes",
@@ -625,7 +627,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "remote backup staging keeps native filesystem io separate from repository transport",
             "owned restore verifies declared artifact identity instead of accepting staged bytes",
             "cluster restore repository errors preserve operational failure semantics",
-        },
+        }),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,
@@ -2115,7 +2117,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configureConsumer(b, sql_primary_key_rewrite_test_mod);
-    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, sql_primary_key_rewrite_test_mod, options.lmdb_engine, true);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, sql_primary_key_rewrite_test_mod, options.lmdb_engine, true);
     sql_primary_key_rewrite_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
     sql_primary_key_rewrite_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
     sql_primary_key_rewrite_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
@@ -2141,7 +2143,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .strip = false,
     });
     test_imports.configureConsumer(b, hosted_initial_fk_test_mod);
-    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, hosted_initial_fk_test_mod, options.lmdb_engine, true);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, hosted_initial_fk_test_mod, options.lmdb_engine, true);
     hosted_initial_fk_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
     hosted_initial_fk_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
     hosted_initial_fk_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
@@ -2196,7 +2198,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .strip = false,
     });
     test_imports.configureConsumer(b, hosted_fk_drop_test_mod);
-    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, hosted_fk_drop_test_mod, options.lmdb_engine, true);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, hosted_fk_drop_test_mod, options.lmdb_engine, true);
     hosted_fk_drop_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
     hosted_fk_drop_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
     hosted_fk_drop_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
@@ -2238,7 +2240,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .strip = false,
     });
     test_imports.configureConsumer(b, hosted_self_fk_test_mod);
-    @import("../../antfly-embedded/build/storage.zig").configureLmdb(b, hosted_self_fk_test_mod, options.lmdb_engine, true);
+    @import("../../../build_support/embedded/storage.zig").configureLmdb(b, hosted_self_fk_test_mod, options.lmdb_engine, true);
     hosted_self_fk_test_mod.addImport("antfly_admin_openapi", antfly_imports.admin_openapi);
     hosted_self_fk_test_mod.addImport("antfly_internal_openapi", antfly_imports.internal_openapi);
     hosted_self_fk_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);

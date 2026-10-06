@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -251,4 +252,78 @@ test "list indexes response timeout bounds readiness preflight" {
     try std.testing.expect(timed_out.load(.acquire));
     try std.testing.expect(!unexpected.load(.acquire));
     try std.testing.expect(!succeeded.load(.acquire));
+}
+
+test "personal connections polling accommodates slow status and explicit deadlines" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        var test_io: std.Io = undefined;
+        var delay_ms: i64 = 0;
+        fn request(_: httpx.testing_mod.RequestInfo) !void {
+            try test_io.sleep(.fromMilliseconds(delay_ms), .awake);
+        }
+    };
+    Assert.test_io = io;
+    for ([_]i64{ 16_000, 200 }) |delay| {
+        Assert.delay_ms = delay;
+        var server = try httpx.TestServer.start(a, io, &.{.{
+            .method = .GET,
+            .path = "/db/v1/connections/chatgpt/attempts/attempt-1",
+            .respond = .{ .body = "{\"status\":\"connected\",\"connection_id\":\"one\"}" },
+            .assert_request = Assert.request,
+        }});
+        defer server.deinit();
+        var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var http = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer http.deinit();
+        var client = try AntflyClient.init(a, &http, server.baseUrl());
+        defer client.deinit();
+        if (delay == 16_000) {
+            var response = try client.getChatGPTAttempt("attempt-1");
+            defer response.deinit();
+            try std.testing.expectEqualStrings("connected", response.data.?.value.status);
+            try serving.await(io);
+        } else {
+            try std.testing.expectError(error.Timeout, client.getChatGPTAttemptWithTimeout("attempt-1", 50));
+        }
+        try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+    }
+}
+
+test "personal connections preserve owner auth and forbid replay" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        fn request(info: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Basic dXNlcjpwYXNz", info.header("Authorization").?);
+            try std.testing.expectEqualStrings("{\"connection_id\":\"account-1\"}", info.body);
+        }
+    };
+    for ([_]u16{ 200, 503 }) |status| {
+        var server = try httpx.TestServer.start(alloc, io, &.{.{
+            .method = .POST,
+            .path = "/db/v1/connections/chatgpt/authorize",
+            .respond = .{ .status = status, .body = "{\"attempt_id\":\"attempt-1\",\"authorization_url\":\"https://auth.openai.com/api/accounts/authorize?state=test\",\"expires_at\":123}" },
+            .assert_request = Assert.request,
+        }});
+        defer server.deinit();
+        var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var http = httpx.Client.initWithConfig(alloc, io, .{ .retry_policy = .{ .retry_only_idempotent = false, .max_retries = 3, .initial_delay_ms = 0 }, .timeouts = .{ .request_ms = 1000 } });
+        defer http.deinit();
+        var client = try AntflyClient.init(alloc, &http, server.baseUrl());
+        defer client.deinit();
+        try client.setBearer("previous-owner");
+        try client.setBasicAuth("user", "pass");
+        var response = try client.authorizeChatGPT(.{ .connection_id = "account-1" });
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status_code);
+        if (status == 200) try std.testing.expectEqualStrings("attempt-1", response.data.?.value.attempt_id);
+        try serving.await(io);
+        try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+        try std.testing.expectError(error.InvalidConnectionId, client.getChatGPTAttempt("../other"));
+        try std.testing.expectError(error.InvalidConnectionId, client.disconnectChatGPT("account?redirect=other"));
+    }
 }

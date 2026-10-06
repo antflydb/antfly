@@ -42,6 +42,17 @@ installs:
 
 <DownloadLink version={ANTFLY_VERSION} baseUrl={RELEASES_BASE_URL} />
 
+For the Apache-2.0 embedded database and inference runtime, download the matching
+Embedded archive (for example, `antfly-embedded_{ANTFLY_VERSION}_Linux_x86_64_gnu.tar.gz`
+or `antfly-embedded_{ANTFLY_VERSION}_Darwin_arm64.tar.gz`). It contains
+`antfly-lite`, `antfly-inference`, `libantfly`, `include/antfly.h`, the private
+inference worker, runtime files, and license notices.
+
+Run `./antfly-lite help` for database commands or `./antfly-inference --help`
+for inference commands. Python and npm bindings use the same native library and
+private worker without installing public CLI commands; Go and Rust consumers
+link the library from this archive or a local build.
+
 <PlatformTabs defaultValue="macos-manual" macos="macos-manual" linux="linux" windows="windows">
   <TabsList>
     <TabsTrigger value="macos-manual">macOS</TabsTrigger>

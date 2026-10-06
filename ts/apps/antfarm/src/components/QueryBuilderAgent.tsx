@@ -41,7 +41,10 @@ const QueryBuilderAgent: React.FC<QueryBuilderAgentProps> = ({
   onQueryGenerated,
 }) => {
   const client = useApi();
-  const { dashboardGenerator } = useGeneratorPreference();
+  const { dashboardGenerator: savedDashboardGenerator } = useGeneratorPreference();
+  // A personal plan preference applies to interactive Chat and RAG only.
+  const dashboardGenerator =
+    savedDashboardGenerator?.provider === "chatgpt" ? null : savedDashboardGenerator;
   const [intent, setIntent] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

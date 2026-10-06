@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +19,7 @@
     .version = "0.1.0",
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .product_licenses = .{ .path = "../../lib/product_licenses" },
         .translate_c = .{
             .url = "git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56",
             .hash = "translate_c-2.0.0-Q_BUWltOBwBYABF84EUL208pIFeUIwbBs29FmVBaafN5",
@@ -45,6 +47,8 @@
         },
     },
     .paths = .{
+        "LICENSE",
+        "licenses",
         "build.zig",
         "build.zig.zon",
         "build",

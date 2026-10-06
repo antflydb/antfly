@@ -1498,6 +1498,62 @@ pub const Client = struct {
         return ApiResponse(types.ConnectionsResponse).fromResponse(self.allocator, &resp);
     }
 
+    /// listChatGPTAccounts
+    /// GET /db/v1/connections/chatgpt/accounts
+    pub fn listChatGPTAccounts(self: *@This()) !ApiResponse(types.ChatGPTAccounts) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/connections/chatgpt/accounts", .{self.base_url});
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ChatGPTAccounts).fromResponse(self.allocator, &resp);
+    }
+
+    /// getChatGPTAttempt
+    /// GET /db/v1/connections/chatgpt/attempts/{attempt_id}
+    pub fn getChatGPTAttempt(self: *@This(), attempt_id: []const u8) !ApiResponse(types.ChatGPTOutcome) {
+        const encoded_attempt_id = try httpx.PercentEncoding.encode(self.allocator, attempt_id);
+        defer self.allocator.free(encoded_attempt_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/connections/chatgpt/attempts/{s}", .{ self.base_url, encoded_attempt_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ChatGPTOutcome).fromResponse(self.allocator, &resp);
+    }
+
+    /// authorizeChatGPT
+    /// POST /db/v1/connections/chatgpt/authorize
+    pub fn authorizeChatGPT(self: *@This(), body: ?types.ChatGPTAuthorize) !ApiResponse(types.ChatGPTBegin) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/connections/chatgpt/authorize", .{self.base_url});
+        defer self.allocator.free(url);
+        const json_body = if (body) |value| try httpx.json.Json.stringifyRequest(self.allocator, value) else null;
+        defer if (json_body) |value| self.allocator.free(value);
+        var resp = if (json_body) |value|
+            try self.http.post(url, .{ .json = value, .headers = self.authHeaders() })
+        else
+            try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ChatGPTBegin).fromResponse(self.allocator, &resp);
+    }
+
+    /// disconnectChatGPT
+    /// POST /db/v1/connections/{connection_id}/chatgpt/disconnect
+    pub fn disconnectChatGPT(self: *@This(), connection_id: []const u8) !ApiResponse(types.ChatGPTDisconnect) {
+        const encoded_connection_id = try httpx.PercentEncoding.encode(self.allocator, connection_id);
+        defer self.allocator.free(encoded_connection_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/connections/{s}/chatgpt/disconnect", .{ self.base_url, encoded_connection_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.ChatGPTDisconnect).fromResponse(self.allocator, &resp);
+    }
+
+    /// listChatGPTModels
+    /// GET /db/v1/connections/{connection_id}/chatgpt/models
+    pub fn listChatGPTModels(self: *@This(), connection_id: []const u8) !ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const encoded_connection_id = try httpx.PercentEncoding.encode(self.allocator, connection_id);
+        defer self.allocator.free(encoded_connection_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/connections/{s}/chatgpt/models", .{ self.base_url, encoded_connection_id });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(std.json.ArrayHashMap(std.json.Value)).fromResponse(self.allocator, &resp);
+    }
+
     /// Invoke an Antfly-compatible inference connection
     /// POST /db/v1/connections/{connection_id}/inference/{operation}
     pub fn invokeInferenceConnection(self: *@This(), connection_id: []const u8, operation: []const u8, body: std.json.ArrayHashMap(std.json.Value)) !RawResponse {

@@ -407,7 +407,19 @@ export type CdcConnection = components["schemas"]["CdcConnection"];
 export type EmbedderConfig = components["schemas"]["EmbedderConfig"];
 export type IndexEmbedderConfig = components["schemas"]["IndexEmbedderConfig"];
 export type RerankerConfig = components["schemas"]["RerankerConfig"];
-export type GeneratorConfig = components["schemas"]["GeneratorConfig"];
+/** Personal plan configuration cannot carry API credentials or sampling settings. */
+export type GeneratorConfig =
+  | Exclude<components["schemas"]["GeneratorConfig"], { provider: "chatgpt" }>
+  | (Extract<components["schemas"]["GeneratorConfig"], { provider: "chatgpt" }> & {
+      api_key?: never;
+      url?: never;
+      temperature?: never;
+      max_tokens?: never;
+      top_p?: never;
+      top_k?: never;
+      frequency_penalty?: never;
+      presence_penalty?: never;
+    });
 export type EmbedderProvider = components["schemas"]["EmbedderProvider"];
 export type IndexEmbedderProvider = NonNullable<IndexEmbedderConfig["provider"]>;
 export const embedderProviderCapabilities = {
@@ -431,6 +443,7 @@ export const generatorProviderCapabilities = {
   gemini: {},
   ollama: {},
   openai: {},
+  chatgpt: {},
   openrouter: {},
   vertex: {},
 } as const satisfies Record<GeneratorProvider, object>;
@@ -694,3 +707,7 @@ export type CreateTablespaceRequest = components["schemas"]["CreateTablespaceReq
 export type CatalogTablespaceBindingRequest =
   components["schemas"]["CatalogTablespaceBindingRequest"];
 export type RenameCatalogResourceRequest = components["schemas"]["RenameCatalogResourceRequest"];
+
+export type ChatGPTAccount = components["schemas"]["ChatGPTAccount"];
+export type ChatGPTBegin = components["schemas"]["ChatGPTBegin"];
+export type ChatGPTOutcome = components["schemas"]["ChatGPTOutcome"];

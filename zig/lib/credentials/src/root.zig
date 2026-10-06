@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -145,3 +146,5 @@ test "credential source identities preserve type locator and presence boundaries
 
 /// AWS discovery requires native synchronous HTTP and filesystem access.
 pub const aws = if (@import("builtin").os.tag == .freestanding) struct {} else @import("aws.zig");
+
+pub const cloud = @import("cloud.zig");
