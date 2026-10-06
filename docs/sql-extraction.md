@@ -286,13 +286,77 @@ pipelines. Current scalar and spill fallbacks preserve supported SQL semantics.
 
 `EXPLAIN` identifies `Lake Scan`; verbose plans include the source format and
 configured snapshot selector without opening the source. Unsupported Parquet
-encodings fail through the existing lake engine. Source attachments reject native write constraints, indexes, defaults,
+encodings fail through the existing lake engine. Source attachments reject native write constraints, relational schema indexes, defaults,
 generated columns and TTL. SQL mutations and public batches reject writes;
 existing native tables cannot acquire or remove an attachment through a schema
 update. External scans reject native serializable range-proof requests and
 active row policies or row filters. Public secondary-index cursors and explicit
 collations are unsupported. Lake sidecar and operational engine APIs remain the
 existing standalone interfaces.
+
+### Native lake aggregate publication and reuse
+
+External tables accept opt-in indexes. Public aggregate recipes can be included
+in the table's `indexes` at creation or added through the existing index endpoint:
+
+```json
+{
+  "type": "algebraic",
+  "derive_from_schema": true,
+  "aggregates": [
+    {"name": "rows", "op": "count"},
+    {"name": "amount_total", "op": "sum", "measure": "amount"}
+  ]
+}
+```
+
+HTTP and MCP creation infer the schema first, then expand and persist the same
+canonical index definition used by installation and publication. Public recipes
+remain catalog provenance; the storage engine receives its strict runtime
+configuration. Each index accepts at most 64 recipes, and external-table admission
+checks the shared 4,096-declaration directory ceiling before committing definitions.
+
+Native metadata protocol 23 stores a checksum, length and immutable artifact
+reference for the publication directory, rather than embedding every declaration
+in the 256 KiB catalog record. The directory is bounded to 16 MiB; legacy inline
+catalogs remain readable. Directory and inventory bytes use the shared verified
+memory/disk cache after fresh source, credential and store validation. Source
+object checks run in batches of up to eight through the shared scheduler; cached
+payloads do not replace fresh provider evidence.
+
+Builds renew their five-minute ownership lease with a separate heartbeat. A lost
+or ambiguous metadata CAS is terminal and is never replayed. Provider cancellation
+callbacks perform no metadata writes. Upload completion takes an owned snapshot of
+the latest fence and publishes through an exact table-definition CAS. The build
+request has a separate 24-hour deadline, and closing joins the heartbeat and all
+speculative reads before releasing their owners.
+
+Compatible recipes share a scan and typed blocks. SQL readers authenticate each
+logical root, then decode matching cohort blocks once and map their states into
+requested reducer slots. Independently ordered materializations retain sparse
+composition. Exact integer/count/boolean lake aggregation can also use row-group
+workers; floating sums and averages retain their ordered reductions.
+
+Unchanged aggregate roots survive definition-only updates when the complete
+source/schema, credentials, store and recipe proofs match. Exact mergeable recipes
+also persist per-file contributions inside the directory. A changed-source build
+merges authenticated states for unchanged versioned files and scans only new or
+changed files. File proofs include source/schema identity, URI, provider versions,
+byte length and exact typed recipe. Contributions are retained only for live files
+and desired recipes, with at most 16,384 entries. Deletion-bearing sources,
+floating keys/extrema and non-associative floating reductions use the complete
+scan; they do not inherit contributions under a weaker proof. The real PyArrow
+E2E regression covers 320 inline recipes, append rebuilds, unchanged contribution
+identities, HTTP/pgwire results, selected-artifact corruption and cold restart.
+
+Published and queryable remain separate states. Native exact aggregates are
+queryable after current source proof and reader-contract verification. Native
+remote search/row-index consumers and durable superseded/abandoned artifact
+collection still require implementation. Collection must retain all descendants
+of live roots and per-file contributions and coordinate retirement with active
+readers and builders; deleting old attempt namespaces alone is unsafe. Constant-
+time Iceberg coverage also requires an explicit immutable-object proof, rather
+than trusting a snapshot label or a TTL.
 
 ### Pre-merge activation work
 

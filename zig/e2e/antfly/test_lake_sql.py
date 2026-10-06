@@ -92,13 +92,28 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             assert response.ok, (
                 response.text + "\n" + server.log_path.read_text()[-8000:]
             )
+            if method == "POST" and path == "/tables/lake_events":
+                assert response.status_code == 200, response.text + server.debug_logs()
             return response.json() if response.content else {}
 
+        aggregate_config = {
+            "type": "algebraic",
+            "derive_from_schema": True,
+            "aggregates": [
+                {"name": "amount_total", "op": "sum", "measure": "amount"},
+                {"name": "exact_min", "op": "min", "measure": "exact"},
+                {"name": "row_count", "op": "count"},
+                {"name": "non_null_count", "op": "count", "measure": "exact"},
+                {"name": "measure_mean", "op": "avg", "measure": "measure"},
+                {"name": "counts_by_amount", "op": "count", "group_by": ["amount"]},
+            ],
+        }
         request(
             "POST",
             "/tables/lake_events",
             {
                 "num_shards": 1,
+                "indexes": {"exact_stats": aggregate_config},
                 "schema": {
                     "storage_mode": "relational",
                     "base_source": {
@@ -148,24 +163,9 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         published_generation = await_publication()
         artifact_root = server.root / "artifacts" / "buckets" / "native-lake-indexes"
         assert artifact_root.exists()
-        request(
-            "POST",
-            "/tables/lake_events/indexes/exact_stats",
-            {
-                "type": "algebraic",
-                "derive_from_schema": True,
-                "aggregates": [
-                    {"name": "amount_total", "op": "sum", "measure": "amount"},
-                    {"name": "exact_min", "op": "min", "measure": "exact"},
-                    {"name": "row_count", "op": "count"},
-                    {"name": "non_null_count", "op": "count", "measure": "exact"},
-                    {"name": "measure_mean", "op": "avg", "measure": "measure"},
-                    {"name": "counts_by_amount", "op": "count", "group_by": ["amount"]},
-                ],
-            },
-        )
         aggregate_generation = await_publication("exact_stats")
-        assert request("GET", "/tables/lake_events/indexes/exact_stats")["status"]["readiness"]["queryable"]
+        stats_resource = request("GET", "/tables/lake_events/indexes/exact_stats")
+        assert stats_resource["status"]["readiness"]["queryable"], json.dumps(stats_resource) + "\n" + server.debug_logs()
         listed = request("GET", "/tables/lake_events/indexes")
         assert next(item for item in listed if item["config"]["name"] == "exact_stats")["status"]["readiness"]["queryable"]
         # Adding an index publishes the entire desired definition atomically.
@@ -617,6 +617,119 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         )
         assert response.status_code >= 400
         assert response.json()["code"] == "25006"
+        failed = False
+    finally:
+        server.stop(test_failed=failed)
+
+
+def test_inline_aggregate_catalog_exceeds_legacy_declaration_limit(tmp_path):
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+    binary = resolve_binary_path(os.environ.get("ANTFLY_BIN", str(DEFAULT_ANTFLY_BIN)))
+    if not Path(binary).exists():
+        pytest.skip(f"Antfly binary not found: {binary}")
+    lake = tmp_path / "lake"
+    objects = lake / "buckets" / "antfly" / "objects"
+    objects.mkdir(parents=True)
+    pq.write_table(pa.table({"amount": [1, 2, 3]}), tmp_path / "input.parquet")
+    payload = (tmp_path / "input.parquet").read_bytes()
+    (objects / "part.parquet").write_bytes(
+        b"AFOBJ001" + struct.pack("<QI", len(payload), 0)
+        + hashlib.sha256(payload).hexdigest().encode() + payload
+    )
+    server = StandaloneAntflyServer(binary, "127.0.0.1", 0)
+    failed = True
+    try:
+        auth = ("admin", AUTH_BOOTSTRAP_PASSWORD)
+        indexes = {
+            f"stats{i}": {
+                "type": "algebraic", "derive_from_schema": True,
+                "aggregates": [{"name": f"count{j}", "op": "count"} for j in range(64)],
+            }
+            for i in range(5)
+        }
+        response = requests.post(
+            server.api_url + "/tables/capacity_lake", auth=auth, timeout=60,
+            json={"num_shards": 1, "indexes": indexes, "schema": {
+                "storage_mode": "relational", "base_source": {
+                    "kind": "external", "table_id": "capacity-lake",
+                    "format": "parquet", "uri": lake.as_uri(),
+                },
+            }},
+        )
+        assert response.status_code == 200, response.text + server.debug_logs()
+        deadline = time.monotonic() + 60
+        while True:
+            response = requests.get(server.api_url + "/tables/capacity_lake/indexes", auth=auth, timeout=60)
+            assert response.ok, response.text
+            resources = response.json()
+            assert all(item["status"]["readiness"]["state"] != "failed" for item in resources), str(resources) + server.debug_logs()
+            if len(resources) == 5 and all(item["status"]["readiness"]["queryable"] for item in resources):
+                break
+            assert time.monotonic() < deadline, str(resources) + server.debug_logs()
+            time.sleep(0.1)
+        response = requests.post(server.api_url + "/sql", auth=auth, timeout=60,
+                                 json={"statement": "SELECT COUNT(*) FROM capacity_lake"})
+        assert response.ok, response.text
+        assert response.json()["rows"] == [["3"]]
+        directory_found = False
+        old_contribution_ids = set()
+        for path in (server.root / "artifacts").rglob("*"):
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            marker = data.find(b'"format":"native-lake-index-directory-v1"')
+            if marker >= 0:
+                document = json.loads(data[marker - 1:])
+                if len(document["declarations"]) == 320:
+                    directory_found = True
+                    old_contribution_ids = {item["artifact"]["artifact_id"] for item in document["file_contributions"]}
+                    break
+        assert directory_found, "320 declarations were not published through an immutable directory"
+        assert len(old_contribution_ids) == 320
+        pq.write_table(pa.table({"amount": [4, 5]}), tmp_path / "append.parquet")
+        appended = (tmp_path / "append.parquet").read_bytes()
+        (objects / "part2.parquet").write_bytes(
+            b"AFOBJ001" + struct.pack("<QI", len(appended), 0)
+            + hashlib.sha256(appended).hexdigest().encode() + appended
+        )
+        deadline = time.monotonic() + 60
+        while True:
+            response = requests.post(server.api_url + "/tables/capacity_lake/indexes/extra", auth=auth, timeout=60,
+                                     json={"type": "algebraic", "derive_from_schema": True,
+                                           "aggregates": [{"name": "rows", "op": "count"}]})
+            if response.status_code != 409:
+                break
+            assert time.monotonic() < deadline, response.text
+            time.sleep(0.1)
+        assert response.status_code == 201, response.text
+        while True:
+            response = requests.get(server.api_url + "/tables/capacity_lake/indexes", auth=auth, timeout=60)
+            assert response.ok, response.text
+            resources = response.json()
+            assert all(item["status"]["readiness"]["state"] != "failed" for item in resources), str(resources) + server.debug_logs()
+            if len(resources) == 6 and all(item["status"]["readiness"]["queryable"] for item in resources):
+                break
+            assert time.monotonic() < deadline, str(resources) + server.debug_logs()
+            time.sleep(0.1)
+        response = requests.post(server.api_url + "/sql", auth=auth, timeout=60,
+                                 json={"statement": "SELECT COUNT(*) FROM capacity_lake"})
+        assert response.ok, response.text
+        assert response.json()["rows"] == [["5"]]
+        reused = False
+        for path in (server.root / "artifacts").rglob("*"):
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            marker = data.find(b'"format":"native-lake-index-directory-v1"')
+            if marker >= 0:
+                document = json.loads(data[marker - 1:])
+                if len(document["declarations"]) == 321:
+                    ids = {item["artifact"]["artifact_id"] for item in document["file_contributions"]}
+                    assert old_contribution_ids <= ids
+                    reused = True
+                    break
+        assert reused, "Append rebuild did not retain unchanged file contributions"
         failed = False
     finally:
         server.stop(test_failed=failed)

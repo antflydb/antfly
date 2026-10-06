@@ -817,6 +817,7 @@ pub const Adapter = struct {
         recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe,
         read_context: @import("antfly_local_sources").serverless_query_lake_read_context.Context,
         child: catalog.AggregatePartialCursor,
+        fused: [256]bool = @splat(false),
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             self.adapter.context.ensureActive() catch return true;
@@ -847,6 +848,18 @@ pub const Adapter = struct {
             try self.adapter.verify(self.a, self.table);
             const recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot .. slot + 1] };
             const reader = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), self.artifacts[slot], recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+            errdefer reader.cursor().close(reader);
+            if (self.recipe.inputs.len > 1) {
+                try reader.setOutputSlot(@intCast(slot));
+                self.fused[slot] = true;
+                for (self.artifacts[slot + 1 ..], slot + 1..) |artifact, index| {
+                    if (self.fused[index]) continue;
+                    const input_recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[index .. index + 1] };
+                    const candidate = try @import("lake_index_aggregate_artifact.zig").Reader.openWithCache(self.a, self.store.artifactStore(), artifact, input_recipe, .{ .ptr = self, .is_cancelled_fn = canceled }, .{ .cache = &self.adapter.server.lake_read_cache, .scope = self.store.identity, .context = self.read_context });
+                    defer candidate.cursor().close(candidate);
+                    if (try reader.fuse(candidate, @intCast(index))) self.fused[index] = true;
+                }
+            }
             return reader.cursor();
         }
     };
@@ -870,7 +883,7 @@ pub const Adapter = struct {
             } else false;
             if (!present) break false;
         } else true;
-        if (!eligible) return null;
+        if (!eligible and publication.directory == null) return null;
         try self.verify(sa, table);
         try self.checkLakeRead(sa, table);
         try self.server.prepareLakeCache();
@@ -891,14 +904,14 @@ pub const Adapter = struct {
         };
         var keep_store = false;
         defer if (!keep_store) owner.store.deinit();
-        var selected = (try @import("lake_index_selection.zig").select(sa, table, &source, &owner.store, context, .automatic)) orelse return null;
+        var selected = (try @import("lake_index_selection.zig").selectCached(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache)) orelse return null;
         defer selected.deinit();
         const owned = owner.arena.allocator();
         const references = try owned.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, identities.len);
         for (references, identities) |*reference, identity| {
             const declaration = for (selected.publication().declarations) |decl| {
                 if (decl.artifact.kind == .algebraic_segment and artifact_api.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity)) break decl;
-            } else return error.InvalidNativeAggregateArtifact;
+            } else return null;
             reference.* = declaration.artifact;
             reference.name = try owned.dupe(u8, reference.name);
             reference.artifact_id = try owned.dupe(u8, reference.artifact_id);
@@ -907,6 +920,7 @@ pub const Adapter = struct {
         try self.verify(sa, table);
         // From this point errors propagate: selected immutable state cannot be
         // replaced with a fresh scan halfway through consumption.
+        owner.fused = @splat(false);
         owner.a = a;
         owner.adapter = self;
         owner.table = table;

@@ -16,7 +16,7 @@ pub const CachedRead = struct {
     context: local.serverless_query_lake_read_context.Context,
 };
 
-fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
+pub fn readArtifact(a: A, store: stores.ArtifactStore, ref: ChunkRef, cancellation: Cancellation, cached: ?CachedRead) ![]u8 {
     var loader = struct {
         store: stores.ArtifactStore,
         ref: ChunkRef,
@@ -38,7 +38,7 @@ pub fn supportsMetadataVersion(version: u16) bool {
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_block_bytes = 4 * 1024 * 1024;
 pub const max_blocks = 8192;
-const ChunkRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64 };
+pub const ChunkRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64 };
 const Block = struct { artifact: ChunkRef, rows: u16 };
 const Root = struct {
     format: []const u8 = "native-sql-aggregate-v2",
@@ -129,6 +129,8 @@ pub const Reader = struct {
     block_index: usize = 0,
     position: usize = 0,
     emitted: u64 = 0,
+    output_slots: ?[]const u16 = null,
+    state_slots: ?[]const u16 = null,
 
     /// The caller selects an authorized publication first. Errors after that
     /// selection abort the query, never combine partials with a fresh scan.
@@ -162,6 +164,32 @@ pub const Reader = struct {
         self.* = .{ .a = a, .store = store, .cancellation = cancellation, .cached = cached, .control = control, .page = .init(a), .root = root };
         return self;
     }
+    /// Roots may fuse only when authenticated state recipes and the entire
+    /// block directory agree. Independent materializations remain independent.
+    pub fn setOutputSlot(self: *Reader, slot: u16) !void {
+        self.output_slots = try self.control.allocator().dupe(u16, &.{slot});
+        self.state_slots = try self.control.allocator().dupe(u16, &.{self.root.state_slot orelse 0});
+    }
+    pub fn fuse(self: *Reader, other: *const Reader, output_slot: u16) !bool {
+        const state = self.root.state_recipe orelse return false;
+        const incoming = other.root.state_recipe orelse return false;
+        if (!state.eql(incoming) or self.root.groups != other.root.groups or self.root.blocks.len != other.root.blocks.len) return false;
+        for (self.root.blocks, other.root.blocks) |left, right| {
+            if (left.rows != right.rows or left.artifact.byte_len != right.artifact.byte_len or !std.mem.eql(u8, left.artifact.artifact_id, right.artifact.artifact_id) or !std.mem.eql(u8, left.artifact.checksum, right.artifact.checksum)) return false;
+        }
+        const output = self.output_slots orelse return error.InvalidNativeAggregateArtifact;
+        const physical = self.state_slots orelse return error.InvalidNativeAggregateArtifact;
+        const a = self.control.allocator();
+        const slots = try a.alloc(u16, output.len + 1);
+        const states = try a.alloc(u16, physical.len + 1);
+        @memcpy(slots[0..output.len], output);
+        @memcpy(states[0..physical.len], physical);
+        slots[output.len] = output_slot;
+        states[physical.len] = other.root.state_slot.?;
+        self.output_slots = slots;
+        self.state_slots = states;
+        return true;
+    }
     pub fn cursor(self: *Reader) local.sql_catalog.AggregatePartialCursor {
         return .{ .ptr = self, .next = next, .close = close };
     }
@@ -192,9 +220,9 @@ pub const Reader = struct {
         for (result) |*row| {
             const keys = try a.alloc(local.sql_scalar.Datum, block.keys.len);
             for (keys, 0..) |*key, column| key.* = try block.keyCell(self.position, column);
-            const cells = try a.alloc(local.sql_scalar.Datum, self.root.recipe.inputs.len);
-            for (cells, 0..) |*cell, column| cell.* = try block.cell(self.position, if (self.root.state_slot) |slot| @as(usize, slot) else column);
-            row.* = .{ .keys = keys, .aggregates = cells, .ordinal = block.ordinals[self.position] };
+            const cells = try a.alloc(local.sql_scalar.Datum, if (self.state_slots) |slots| slots.len else self.root.recipe.inputs.len);
+            for (cells, 0..) |*cell, column| cell.* = try block.cell(self.position, if (self.state_slots) |slots| slots[column] else if (self.root.state_slot) |slot| @as(usize, slot) else column);
+            row.* = .{ .keys = keys, .aggregates = cells, .ordinal = block.ordinals[self.position], .aggregate_slots = self.output_slots };
             self.position += 1;
             self.emitted += 1;
         }
@@ -325,4 +353,46 @@ test "external lake native aggregate readers unwind every allocation failure" {
     defer a.free(ref.artifact_id);
     defer a.free(ref.checksum);
     try std.testing.checkAllAllocationFailures(a, readFailureScenario, .{ store, ref, recipe });
+}
+
+test "external lake cohort readers decode shared keys and all selected slots once" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-aggregate-fusion");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .sum, .input_type = .integer }, .{ .kind = .count } };
+    const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{ .{ .spec = specs[0], .column = .{ .path = "amount", .type = .integer, .nullable = false } }, .{ .spec = specs[1], .column = null } } };
+    const group = try operators.Grouped.create(a, &specs, .{});
+    defer group.deinit();
+    try group.add(&.{}, &.{ local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }), local.sql_scalar.Datum.fromJson(.{ .integer = 1 }) });
+    const refs = try publishCohort(a, a, &store, &.{ "stats.sum", "stats.count" }, group, recipe, .none);
+    defer {
+        for (refs) |ref| {
+            a.free(ref.artifact_id);
+            a.free(ref.checksum);
+        }
+        a.free(refs);
+    }
+    const left = try Reader.open(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none);
+    defer left.cursor().close(left);
+    const right = try Reader.open(a, store, refs[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none);
+    defer right.cursor().close(right);
+    try left.setOutputSlot(1);
+    try std.testing.expect(try left.fuse(right, 0));
+    var page = std.heap.ArenaAllocator.init(a);
+    defer page.deinit();
+    const rows = (try left.cursor().next(left, page.allocator(), 1)).?;
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualSlices(u16, &.{ 1, 0 }, rows[0].aggregate_slots.?);
+    const imported = try operators.Grouped.create(a, &.{ specs[1], specs[0] }, .{});
+    defer imported.deinit();
+    try imported.importPartialMapped(rows[0].keys, rows[0].aggregates, rows[0].aggregate_slots, rows[0].ordinal);
+    const result = (try imported.nextResult(page.allocator())).?;
+    try std.testing.expectEqual(@as(i64, 1), result.aggregates[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), result.aggregates[1].value.integer);
+    try std.testing.expect(try left.cursor().next(left, page.allocator(), 1) == null);
+    try std.testing.expectEqual(@as(usize, 1), left.block_index);
+    try std.testing.expectEqual(@as(usize, 0), right.block_index);
 }

@@ -17,6 +17,7 @@ pub const Provider = struct {
     context: Context,
     limits: stream_api.Limits = .{},
     expected_delete_objects: ?[32]u8 = null,
+    only_file: ?usize = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     pub fn provider(self: *Provider) @import("../serverless/build/lake_rebuild.zig").RowSourceProvider {
         return .{ .ptr = self, .open_fn = open, .open_with_cancellation_fn = openCanceled };
@@ -53,6 +54,8 @@ pub const Provider = struct {
         const state = try a.create(Cursor);
         errdefer a.destroy(state);
         state.* = .{ .stream = try stream_api.Stream.init(a, self.source, columns, &.{}, self.context, self.limits), .source_columns = columns, .expected_delete_objects = self.expected_delete_objects, .scratch = .init(a), .cancellation = cancellation };
+        errdefer state.stream.deinit();
+        if (self.only_file) |index| try state.stream.restrictFile(index);
         state.stream.schema_contract = if (self.source.iceberg_schema) |selected| selected.columns else self.schema_contract;
         return .{ .kind = kind, .ctx = state, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
     }

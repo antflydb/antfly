@@ -23,6 +23,7 @@ pub const Composition = struct {
     width: usize,
     child: ?Cursor = null,
     slot: usize = 0,
+    consumed: [256]bool = @splat(false),
 
     pub fn create(a: A, recipe: Recipe, factory: Factory) !*Composition {
         if (recipe.inputs.len == 0 or recipe.inputs.len > 256) return error.InvalidSqlBackendResponse;
@@ -40,7 +41,13 @@ pub const Composition = struct {
         const self: *Composition = @ptrCast(@alignCast(raw));
         if (maximum == 0) return error.InvalidSqlLimit;
         while (self.slot < self.width) {
-            if (self.child == null) self.child = try self.factory.open(self.factory.ptr, self.slot);
+            if (self.child == null) {
+                if (self.consumed[self.slot]) {
+                    self.slot += 1;
+                    continue;
+                }
+                self.child = try self.factory.open(self.factory.ptr, self.slot);
+            }
             const child = self.child.?;
             const page = (try child.next(child.ptr, a, maximum)) orelse {
                 child.close(child.ptr);
@@ -52,8 +59,17 @@ pub const Composition = struct {
             const rows = try a.alloc(GroupResult, page.len);
             const slots = try a.dupe(u16, &.{@intCast(self.slot)});
             for (rows, page) |*row, input| {
-                if (input.aggregates.len != 1 or input.aggregate_slots != null) return error.InvalidSqlBackendResponse;
-                row.* = .{ .keys = input.keys, .aggregates = input.aggregates, .ordinal = input.ordinal, .aggregate_slots = slots };
+                const mapping = input.aggregate_slots orelse slots;
+                if (input.aggregates.len != mapping.len or mapping.len == 0) return error.InvalidSqlBackendResponse;
+                var has_current = false;
+                for (mapping, 0..) |slot, i| {
+                    if (slot >= self.width) return error.InvalidSqlBackendResponse;
+                    for (mapping[0..i]) |previous| if (previous == slot) return error.InvalidSqlBackendResponse;
+                    has_current = has_current or slot == self.slot;
+                    self.consumed[slot] = true;
+                }
+                if (!has_current) return error.InvalidSqlBackendResponse;
+                row.* = .{ .keys = input.keys, .aggregates = input.aggregates, .ordinal = input.ordinal, .aggregate_slots = mapping };
             }
             return rows;
         }

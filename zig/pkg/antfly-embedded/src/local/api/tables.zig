@@ -259,3 +259,59 @@ pub fn parseJsonValueAlloc(alloc: std.mem.Allocator, body: []const u8) !std.json
 pub fn cloneJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     return try json_helpers.cloneJsonValue(alloc, value);
 }
+
+/// Admission and publication share a table-wide declaration ceiling. Public
+/// recipes must not commit definitions that can never fit their artifact directory.
+pub fn validateLakeIndexCapacity(a: std.mem.Allocator, schema_json: []const u8, indexes_json: []const u8) !void {
+    var schema = try std.json.parseFromSlice(std.json.Value, a, schema_json, .{});
+    defer schema.deinit();
+    if (schema.value != .object) return;
+    const base_source = schema.value.object.get("base_source") orelse return;
+    if (base_source != .object) return;
+    const kind = base_source.object.get("kind") orelse return;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "external")) return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, indexes_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCreateTableRequest;
+    var count: usize = 0;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        const config = entry.value_ptr.*;
+        if (config != .object) return error.InvalidCreateTableRequest;
+        const index_kind = config.object.get("type") orelse continue;
+        if (index_kind != .string) return error.InvalidCreateTableRequest;
+        if (std.mem.eql(u8, index_kind.string, "algebraic")) {
+            const recipes = config.object.get("materializations") orelse config.object.get("aggregates") orelse continue;
+            if (recipes != .array) return error.InvalidCreateTableRequest;
+            count += recipes.array.items.len;
+        } else {
+            count += 1;
+            if (config.object.get("metrics")) |metrics| {
+                if (metrics == .object) count += metrics.object.count();
+            }
+        }
+        if (count > @import("../metadata/lake_index_catalog.zig").max_directory_artifacts) return error.InvalidCreateTableRequest;
+    }
+}
+
+test "lake catalog admission bounds recipes across indexes before commit" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var configs = std.json.ObjectMap.empty;
+    var recipes: std.json.Array = .init(aa);
+    for (0..64) |_| try recipes.append(.null);
+    for (0..65) |index| {
+        var config = std.json.ObjectMap.empty;
+        try config.put(aa, "type", .{ .string = "algebraic" });
+        try config.put(aa, "materializations", .{ .array = recipes });
+        try configs.put(aa, try std.fmt.allocPrint(aa, "index{d}", .{index}), .{ .object = config });
+    }
+    const schema = "{\"base_source\":{\"kind\":\"external\"}}";
+    const too_many = try std.json.Stringify.valueAlloc(aa, std.json.Value{ .object = configs }, .{});
+    try std.testing.expectError(error.InvalidCreateTableRequest, validateLakeIndexCapacity(a, schema, too_many));
+    _ = configs.orderedRemove("index64");
+    const accepted = try std.json.Stringify.valueAlloc(aa, std.json.Value{ .object = configs }, .{});
+    try validateLakeIndexCapacity(a, schema, accepted);
+}

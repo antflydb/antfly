@@ -7200,6 +7200,10 @@ pub const AntflyApiHandler = struct {
             self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, fk_schema, "", operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
         if (create_req.schema_json) |old| alloc.free(old);
         create_req.schema_json = supported_schema;
+        const derived_indexes_json = tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, decoded_table_name, create_req.indexes_json orelse tables_api.default_indexes_json, supported_schema) catch return jsonErrorResponse(ctx, 400, "invalid schema-derived index configuration");
+        if (create_req.indexes_json) |old| alloc.free(old);
+        create_req.indexes_json = derived_indexes_json;
+        @import("antfly_local_sources").api_local_tables.validateLakeIndexCapacity(alloc, supported_schema, derived_indexes_json) catch return jsonErrorResponse(ctx, 400, "lake index declaration limit exceeded");
         if (has_initial_fk) {
             const request_context = operationContext(ctx, authenticated_identity);
             var plan_arena = std.heap.ArenaAllocator.init(alloc);

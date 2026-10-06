@@ -15979,7 +15979,7 @@ pub const ApiHttpServer = struct {
         const cancel: @import("antfly_cancellation").CancellationToken = .{ .ptr = self, .is_cancelled_fn = Hooks.canceled };
         const context: local.serverless_query_lake_read_context.Context = .{
             .io = self.embedding_provider_runtime.io,
-            .deadline_ns = platform_time.monotonicNs() +| lease_ms * std.time.ns_per_ms,
+            .deadline_ns = platform_time.monotonicNs() +| 24 * 60 * 60 * std.time.ns_per_s,
             .cancellation = local.storage_object_storage.CancellationToken.fromCallback(cancel.ptr, cancel.is_cancelled_fn),
         };
         var store = try @import("lake_index_store.zig").Store.openNative(a, config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
@@ -16166,6 +16166,7 @@ pub const ApiHttpServer = struct {
             else => return error.InvalidIndexRequest,
         };
         defer alloc.free(expected_indexes_json);
+        @import("antfly_local_sources").api_local_tables.validateLakeIndexCapacity(alloc, table_before.schema_json, expected_indexes_json) catch return error.InvalidIndexRequest;
         table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
             alloc,
             expected_indexes_json,
@@ -20592,7 +20593,11 @@ pub const ApiHttpServer = struct {
         if (request.tablespace_name) |name| if (identity) |value| {
             if (!permissionsAllow(value.permissions, .tablespace, name, .read)) return error.Forbidden;
         };
-        const body = try tables_api.encodeStoredCreateTableRequestAlloc(self.alloc, request);
+        const expanded = try tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(self.alloc, physical_name, request.indexes_json orelse tables_api.default_indexes_json, tables_api.effectiveSchemaJson(request.schema_json));
+        defer self.alloc.free(expanded);
+        var prepared = request;
+        prepared.indexes_json = expanded;
+        const body = try tables_api.encodeStoredCreateTableRequestAlloc(self.alloc, prepared);
         defer self.alloc.free(body);
         const result = try self.source.systemCatalog(self.alloc, .{}, .{ .mutate = .{
             .mutation = .{ .action = .create, .kind = .table, .database = target.database, .namespace = target.namespace, .name = target.table, .tablespace = request.tablespace_name },
@@ -20728,6 +20733,10 @@ pub const ApiHttpServer = struct {
         const supported_schema = self.preparePartialWitnessSchema(self.alloc, table_name, tables_api.effectiveSchemaJson(request.schema_json), "", .{}) catch |err| return contextualWitnessDDLError(self.alloc, err);
         if (request.schema_json) |old| self.alloc.free(old);
         request.schema_json = supported_schema;
+        const derived_indexes_json = tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(self.alloc, table_name, request.indexes_json orelse tables_api.default_indexes_json, supported_schema) catch return contextualJsonErrorResponse(self.alloc, 400, "invalid schema-derived index configuration");
+        if (request.indexes_json) |old| self.alloc.free(old);
+        request.indexes_json = derived_indexes_json;
+        @import("antfly_local_sources").api_local_tables.validateLakeIndexCapacity(self.alloc, supported_schema, derived_indexes_json) catch return contextualJsonErrorResponse(self.alloc, 400, "lake index declaration limit exceeded");
         self.createNativeOrLegacyTable(logical_name, table_name, request, authenticated_identity) catch |err| return switch (err) {
             error.ForeignKeyPartialSupportIndexRequired, error.ForeignKeyPartialSupportIndexConflict => contextualWitnessDDLError(self.alloc, err),
             error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.InvalidCatalogName, error.InvalidCatalogMutation, error.CatalogCommandTooLarge, error.Forbidden => try contextualJsonErrorResponse(self.alloc, system_catalog.httpStatus(err), @errorName(err)),

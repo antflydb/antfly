@@ -18,7 +18,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     const eligible = for (publication.declarations) |declaration| {
         if (declaration.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(declaration.artifact.metadata_version)) break true;
     } else false;
-    if (!eligible) return &.{};
+    if (!eligible and publication.directory == null) return &.{};
     const normalized = try request.platformDeadline();
     const context: local.serverless_query_lake_read_context.Context = .{ .io = server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
     var sql_table = try server.sql_schema_cache.resolve(server.embedding_provider_runtime.io, sa, table.schema_json, table.table_id, table.name);
@@ -29,7 +29,7 @@ pub fn names(a: A, server: *@import("http_server.zig").ApiHttpServer, table: loc
     defer source.deinit();
     var store = try @import("lake_index_store.zig").Store.openNative(a, server.cfg.node_config, server.cfg.secret_store, true, server.cfg.deployment_mode, server.cfg.native_lake_artifact_base_dir);
     defer store.deinit();
-    var selected = (try @import("lake_index_selection.zig").select(sa, sql_table, &source, &store, context, .automatic)) orelse return &.{};
+    var selected = (try @import("lake_index_selection.zig").selectCached(sa, sql_table, &source, &store, context, .automatic, &server.lake_read_cache)) orelse return &.{};
     defer selected.deinit();
     const definitions = try std.json.parseFromSliceLeaky(std.json.Value, sa, table.indexes_json, .{});
     if (definitions != .object) return error.InvalidTableIndexMetadata;

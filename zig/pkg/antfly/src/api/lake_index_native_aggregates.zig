@@ -71,6 +71,14 @@ pub fn recipeIdentity(a: A, recipe: recipes.Recipe) ![]const u8 {
 /// The publication arena owns declarations; each reducer and output chunk
 /// owns only its bounded transient memory. Physical input dictionaries survive.
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken) ![]const Declared {
+    return buildWithReuse(a, out, table, source, store, provider, cancellation, &.{});
+}
+pub fn buildWithReuse(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken, reusable: []const Declared) ![]const Declared {
+    return (try buildIncremental(a, out, table, source, store, provider, cancellation, reusable, &.{})).declarations;
+}
+pub const BuildResult = struct { declarations: []const Declared, contributions: []const local.metadata_lake_index_catalog.FileContribution };
+pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: @import("antfly_cancellation").CancellationToken, reusable: []const Declared, old_contributions: []const local.metadata_lake_index_catalog.FileContribution) !BuildResult {
+    var contributions: std.ArrayList(local.metadata_lake_index_catalog.FileContribution) = .empty;
     var config_arena = std.heap.ArenaAllocator.init(a);
     defer config_arena.deinit();
     const ca = config_arena.allocator();
@@ -81,7 +89,7 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
             if (kind == .string and std.mem.eql(u8, kind.string, "algebraic")) break true;
         };
     } else false;
-    if (!has_algebraic) return &.{};
+    if (!has_algebraic) return .{ .declarations = &.{}, .contributions = &.{} };
     const io = provider.context.io orelse return error.UnsupportedSqlExecution;
     var schemas = @import("sql_schema_cache.zig").Cache.init(a);
     defer schemas.deinit();
@@ -116,7 +124,25 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
             const recipe = (try recipeFor(ca, sql_table, config, mat)) orelse continue;
             const name = mat.object.get("name") orelse return error.InvalidAlgebraicConfig;
             if (name != .string or name.string.len == 0) return error.InvalidAlgebraicConfig;
-            try requests.append(ca, .{ .recipe = recipe, .name = try @import("lake_index_names.zig").materialization(out, entry.key_ptr.*, name.string) });
+            const identity = try recipeIdentity(ca, recipe);
+            const logical_name = try @import("lake_index_names.zig").materialization(out, entry.key_ptr.*, name.string);
+            for (old_contributions) |contribution| {
+                if (!std.mem.eql(u8, contribution.name, logical_name) or !std.mem.eql(u8, &contribution.recipe, &recipe.fingerprint())) continue;
+                const live = for (source.inventory.files) |file| {
+                    if (std.mem.eql(u8, &contribution.file, &fileIdentity(source, file))) break true;
+                } else false;
+                if (live) try contributions.append(out, contribution);
+            }
+            const previous = for (reusable) |decl| {
+                if (decl.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity) and try @import("lake_index_names.zig").matches(ca, decl.name, entry.key_ptr.*, name.string, decl.artifact.metadata_version)) break decl;
+            } else null;
+            if (previous) |decl| {
+                // The coordinator proves complete source/schema/credential/store
+                // equivalence before offering reusable immutable roots.
+                try declarations.append(out, decl);
+            } else {
+                try requests.append(ca, .{ .recipe = recipe, .name = logical_name });
+            }
         }
     }
     const consumed = try ca.alloc(bool, requests.items.len);
@@ -129,7 +155,7 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
         for (requests.items[first..], first..) |candidate, index| {
             if (consumed[index]) continue;
             const key_recipe: recipes.Recipe = .{ .keys = request.recipe.keys, .inputs = &.{} };
-            if (!key_recipe.eql(.{ .keys = candidate.recipe.keys, .inputs = &.{} })) continue;
+            if (!key_recipe.eql(.{ .keys = candidate.recipe.keys, .inputs = &.{} }) or incrementalRecipe(request.recipe) != incrementalRecipe(candidate.recipe)) continue;
             consumed[index] = true;
             try cohort.append(ca, index);
             if (cohort.items.len == 64) break;
@@ -183,35 +209,63 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
             const group = try operators.Grouped.create(a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = &spill });
             defer group.deinit();
             if (recipe.keys.len == 0) try group.ensureGlobalGroup();
-            if (metadata_count) {
+            var budget = try @import("../serverless/build/lake_build_limits.zig").Budget.init(.{});
+            const contribution_limit = std.math.mul(usize, source.inventory.files.len, requests.items.len) catch std.math.maxInt(usize);
+            const incremental = incrementalRecipe(recipe) and contribution_limit <= 16384 and source.inventory.deleted_row_groups.len == 0 and (if (source.scanner.iceberg_delete_plan) |plan| plan.files.len == 0 else true);
+            if (incremental) {
+                for (source.inventory.files, 0..) |file, file_index| {
+                    try cancellation.check();
+                    try provider.context.ensureActive();
+                    const file_key = fileIdentity(source, file);
+                    const previous = try ca.alloc(?local.metadata_lake_index_catalog.FileContribution, cohort.items.len);
+                    @memset(previous, null);
+                    var all_present = true;
+                    for (cohort.items, 0..) |request_index, slot| {
+                        const single_recipe = requests.items[request_index].recipe;
+                        for (old_contributions) |contribution| {
+                            if (std.mem.eql(u8, &contribution.file, &file_key) and std.mem.eql(u8, &contribution.recipe, &single_recipe.fingerprint()) and std.mem.eql(u8, contribution.name, names[slot])) {
+                                previous[slot] = contribution;
+                                break;
+                            }
+                        }
+                        all_present = all_present and previous[slot] != null;
+                    }
+                    if (all_present) {
+                        for (previous, 0..) |contribution, slot| try importContribution(a, store, contribution.?.artifact, requests.items[cohort.items[slot]].recipe, @intCast(slot), group, cancellation);
+                        continue;
+                    }
+                    const partial = try operators.Grouped.create(a, specs, .{ .groups = 2_000_000, .bytes = 8 * 1024 * 1024, .spill = &spill });
+                    defer partial.deinit();
+                    if (recipe.keys.len == 0) try partial.ensureGlobalGroup();
+                    native_provider.only_file = file_index;
+                    if (metadata_count) {
+                        var stream = try local.serverless_query_lake_stream.Stream.init(a, source, columns, &.{}, provider.context, provider.limits);
+                        defer stream.deinit();
+                        try stream.restrictFile(file_index);
+                        stream.schema_contract = native_provider.schema_contract;
+                        stream.identity_only = true;
+                        try partial.addGlobalCount((try stream.countAll()) orelse return error.UnsupportedExternalLakeIndex);
+                    } else try consumeCohort(a, &native_provider, binding, recipe, partial, &budget, cancellation);
+                    const refs = try artifacts.publishCohort(a, out, store, names, partial, recipe, cancellation);
+                    for (refs, cohort.items, 0..) |ref, request_index, slot| {
+                        try importContribution(a, store, ref, requests.items[request_index].recipe, @intCast(slot), group, cancellation);
+                        // Replace obsolete slots for this file/cohort, retaining only live evidence.
+                        var position: usize = 0;
+                        while (position < contributions.items.len) {
+                            const old = contributions.items[position];
+                            if (std.mem.eql(u8, &old.file, &file_key) and std.mem.eql(u8, old.name, names[slot])) _ = contributions.swapRemove(position) else position += 1;
+                        }
+                        try contributions.append(out, .{ .file = file_key, .recipe = requests.items[request_index].recipe.fingerprint(), .name = names[slot], .artifact = ref });
+                    }
+                }
+                native_provider.only_file = null;
+            } else if (metadata_count) {
                 var stream = try local.serverless_query_lake_stream.Stream.init(a, source, columns, &.{}, provider.context, provider.limits);
                 defer stream.deinit();
                 stream.schema_contract = native_provider.schema_contract;
                 stream.identity_only = true;
                 try group.addGlobalCount((try stream.countAll()) orelse return error.UnsupportedExternalLakeIndex);
-            } else {
-                var rows = try native_provider.provider().open(a, binding);
-                defer rows.deinit(a);
-                var budget = try @import("../serverless/build/lake_build_limits.zig").Budget.init(.{});
-                while (try rows.next(a)) |batch| {
-                    try cancellation.check();
-                    try budget.admitBatch(batch);
-                    var page = std.heap.ArenaAllocator.init(a);
-                    defer page.deinit();
-                    const pa = page.allocator();
-                    const selection = try pa.alloc(usize, batch.rowCount());
-                    for (selection, 0..) |*selected, i| selected.* = i;
-                    const keys = try pa.alloc(local.sql_execution_batch.Batch, recipe.keys.len);
-                    for (keys, recipe.keys) |*key, definition| key.* = .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = definition.path, .type = definition.type, .nullable = definition.nullable }}) } };
-                    const input_batches = try pa.alloc(local.sql_execution_batch.Batch, recipe.inputs.len);
-                    for (input_batches, recipe.inputs) |*input, definition| input.* = if (definition.column) |column| .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = column.path, .type = column.type, .nullable = column.nullable }}) } } else constant: {
-                        const ids = try pa.alloc(u32, batch.rowCount());
-                        @memset(ids, 0);
-                        break :constant .{ .dictionary = .{ .values = &.{local.sql_scalar.Datum.fromJson(.{ .integer = 1 })}, .indices = ids } };
-                    };
-                    try group.addEncodedColumns(keys, input_batches, batch.rowCount());
-                }
-            }
+            } else try consumeCohort(a, &native_provider, binding, recipe, group, &budget, cancellation);
             const published = try artifacts.publishCohort(a, out, store, names, group, recipe, cancellation);
             for (published, names, cohort.items) |artifact, name, index| {
                 var slot_binding = binding;
@@ -220,7 +274,60 @@ pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, sou
             }
         }
     }
-    return declarations.toOwnedSlice(out);
+    return .{ .declarations = try declarations.toOwnedSlice(out), .contributions = try contributions.toOwnedSlice(out) };
+}
+
+fn incrementalRecipe(recipe: recipes.Recipe) bool {
+    for (recipe.keys) |key| if (key.type == .number) return false;
+    for (recipe.inputs) |input| if (input.spec.distinct or !(input.spec.kind == .count or input.spec.kind == .bool_and or input.spec.kind == .bool_or or (input.spec.kind == .sum and input.spec.input_type == .integer) or ((input.spec.kind == .min or input.spec.kind == .max) and input.spec.input_type != .number))) return false;
+    return true;
+}
+fn fileIdentity(source: *local.serverless_query_lake_serving.ServingSource, file: local.serverless_external_source_types.FileEntry) [32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update("native-file-contribution-v1");
+    for ([_][]const u8{ source.inventory.source_id, source.inventory.schema_fingerprint, file.file_id, file.object_uri, file.etag, file.version_id }) |bytes| {
+        var length: [8]u8 = undefined;
+        std.mem.writeInt(u64, &length, bytes.len, .little);
+        hash.update(&length);
+        hash.update(bytes);
+    }
+    var size: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size, file.byte_len, .little);
+    hash.update(&size);
+    return hash.finalResult();
+}
+fn importContribution(a: A, store: *stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, recipe: recipes.Recipe, slot: u16, group: *operators.Grouped, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+    const reader = try artifacts.Reader.open(a, store.*, ref, recipe, cancellation);
+    defer reader.cursor().close(reader);
+    try reader.setOutputSlot(slot);
+    while (true) {
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        const rows = (try reader.cursor().next(reader, page.allocator(), 256)) orelse break;
+        for (rows) |row| try group.importPartialMapped(row.keys, row.aggregates, row.aggregate_slots, row.ordinal);
+    }
+}
+fn consumeCohort(a: A, provider: *@import("lake_index_row_source.zig").Provider, binding: local.serverless_segment_source_binding.Binding, recipe: recipes.Recipe, group: *operators.Grouped, budget: *@import("../serverless/build/lake_build_limits.zig").Budget, cancellation: @import("antfly_cancellation").CancellationToken) !void {
+    var rows = try provider.provider().open(a, binding);
+    defer rows.deinit(a);
+    while (try rows.next(a)) |batch| {
+        try cancellation.check();
+        try budget.admitBatch(batch);
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        const pa = page.allocator();
+        const selection = try pa.alloc(usize, batch.rowCount());
+        for (selection, 0..) |*selected, i| selected.* = i;
+        const keys = try pa.alloc(local.sql_execution_batch.Batch, recipe.keys.len);
+        for (keys, recipe.keys) |*key, definition| key.* = .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = definition.path, .type = definition.type, .nullable = definition.nullable }}) } };
+        const input_batches = try pa.alloc(local.sql_execution_batch.Batch, recipe.inputs.len);
+        for (input_batches, recipe.inputs) |*input, definition| input.* = if (definition.column) |column| .{ .columns = .{ .page = .{ .batch = batch, .selection = selection }, .definitions = try pa.dupe(local.sql_scalar.Column, &.{.{ .name = column.path, .type = column.type, .nullable = column.nullable }}) } } else constant: {
+            const ids = try pa.alloc(u32, batch.rowCount());
+            @memset(ids, 0);
+            break :constant .{ .dictionary = .{ .values = &.{local.sql_scalar.Datum.fromJson(.{ .integer = 1 })}, .indices = ids } };
+        };
+        try group.addEncodedColumns(keys, input_batches, batch.rowCount());
+    }
 }
 
 test "external lake native algebraic recipes preserve aliases and SQL NULL identities" {
@@ -273,7 +380,9 @@ test "external lake native algebraic publication reads real Parquet into exact S
     const table: local.common_topology_records.TableRecord = .{ .table_id = 1, .name = "lake", .schema_json = schema, .indexes_json = "{\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"total\",\"op\":\"sum\",\"measure\":\"amount\"},{\"name\":\"rows\",\"op\":\"count\"}]}}" };
     var output = std.heap.ArenaAllocator.init(a);
     defer output.deinit();
-    const declarations = try build(a, output.allocator(), table, &source, &store, &provider, .none);
+    const built = try buildIncremental(a, output.allocator(), table, &source, &store, &provider, .none, &.{}, &.{});
+    const declarations = built.declarations;
+    try std.testing.expectEqual(@as(usize, 2), built.contributions.len);
     try std.testing.expectEqual(@as(usize, 2), declarations.len);
     const spec: operators.AggregateSpec = .{ .kind = .sum, .input_type = .integer };
     const recipe: recipes.Recipe = .{ .keys = &.{}, .inputs = &.{.{ .spec = spec, .column = .{ .path = "amount", .type = .integer, .nullable = true } }} };
@@ -306,4 +415,15 @@ test "external lake native algebraic publication reads real Parquet into exact S
     var exact = try local.sql_aggregate_partial.decode(page.allocator(), counts[0].aggregates[0], .{ .kind = .count });
     defer exact.deinit();
     try std.testing.expectEqual(@as(u64, 3), exact.count);
+    var denied = source.scanner.object_reader.client.vtable.*;
+    const Denied = struct {
+        fn get(_: *anyopaque, _: A, _: []const u8, _: []const u8, _: local.storage_object_storage.GetOptions) anyerror!local.storage_object_storage.GetResult {
+            return error.UnexpectedParquetRead;
+        }
+    };
+    denied.get_object = Denied.get;
+    source.scanner.object_reader.client.vtable = &denied;
+    const rebuilt = try buildIncremental(a, output.allocator(), table, &source, &store, &provider, .none, &.{}, built.contributions);
+    try std.testing.expectEqual(@as(usize, 2), rebuilt.declarations.len);
+    try std.testing.expectEqualStrings(declarations[0].artifact.checksum, rebuilt.declarations[0].artifact.checksum);
 }

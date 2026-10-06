@@ -25,15 +25,18 @@ pub const Selected = struct {
 };
 
 pub fn select(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, policy: Policy) !?Selected {
+    return selectCached(a, table, source, store, context, policy, null);
+}
+pub fn selectCached(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, policy: Policy, cache: ?*local.serverless_query_lake_serving_cache.Cache) !?Selected {
     try context.ensureActive();
-    return selectVerified(a, table, source, store, context) catch |err| {
+    return selectVerified(a, table, source, store, context, cache) catch |err| {
         try context.ensureActive();
         if (err == error.OutOfMemory) return err;
         if (policy == .required) return err;
         return null;
     };
 }
-fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context) !Selected {
+fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_serving.ServingSource, store: *Store, context: Context, cache: ?*local.serverless_query_lake_serving_cache.Cache) !Selected {
     const definitions = table.external_indexes orelse return error.ExternalLakeIndexUnavailable;
     var state = try catalog.parse(a, definitions.catalog_json);
     errdefer state.deinit();
@@ -47,7 +50,8 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
     var artifacts = store.artifactStore();
     artifacts.allocator = a;
     const normalized: @import("antfly_cancellation").CancellationToken = if (context.cancellation) |token| .{ .ptr = token.ptr, .is_cancelled_fn = token.is_cancelled_fn } else .none;
-    const bytes = try artifacts.getVerifiedAllocWithCancellation(published.inventory.artifact_id, published.inventory.byte_len, published.inventory.checksum, normalized);
+    const cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead = if (cache) |shared| .{ .cache = shared, .scope = store.identity, .context = context } else null;
+    const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, artifacts, .{ .artifact_id = published.inventory.artifact_id, .byte_len = published.inventory.byte_len, .checksum = published.inventory.checksum }, normalized, cached);
     defer a.free(bytes);
     var inventory = try local.serverless_external_source_mod.decodeInventoryAlloc(a, bytes);
     defer inventory.deinit(a);
@@ -67,5 +71,6 @@ fn selectVerified(a: A, table: sql.Table, source: *local.serverless_query_lake_s
             stored.byte_len != current.byte_len or stored.row_count != current.row_count) return error.InvalidExternalLakeIndexCoverage;
     }
     try context.ensureActive();
+    try @import("lake_index_directory.zig").hydrate(state.arena.allocator(), artifacts, &state.value.published.?, normalized, cached);
     return .{ .state = state, .delete_objects = pinned.delete_objects };
 }

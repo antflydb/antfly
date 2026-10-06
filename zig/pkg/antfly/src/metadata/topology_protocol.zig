@@ -46,8 +46,9 @@ const std = @import("std");
 /// one command. Earlier voters understand the union but reject its DROP arm.
 /// Version 22 pins and persists native external-lake index generations in table
 /// records and query definitions; earlier decoders reject the extension.
-pub const current_version: u16 = 22;
-pub const lake_index_catalog_version: u16 = 22;
+/// Version 23 moves lake artifact declarations into verified durable directories.
+pub const current_version: u16 = 23;
+pub const lake_index_catalog_version: u16 = 23;
 pub const durable_activation_version: u16 = 9;
 pub const store_report_update_version: u16 = 8;
 // Preflight and final append require the same complete decoder capability.

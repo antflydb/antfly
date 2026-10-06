@@ -48,6 +48,10 @@ pub fn begin(a: A, io: std.Io, table: records.TableRecord, source: *serving.Serv
 /// its lease through the end of upload and use that exact record for the final
 /// CAS. All source reads, including deletion preparation, share its coverage.
 pub fn build(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock) ![]u8 {
+    return buildWithLease(a, artifact_store, table, source, store_identity, context, cancellation, clock, null);
+}
+pub const Lease = struct { ptr: *anyopaque, snapshot: *const fn (*anyopaque, A) anyerror!local.common_topology_records.TableRecord };
+pub fn buildWithLease(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRecord, source: *serving.ServingSource, store_identity: catalog.Digest, context: Context, cancellation: Cancellation, clock: Clock, lease: ?Lease) ![]u8 {
     try context.ensureActive();
     try cancellation.check();
     var current = try catalog.parse(a, table.lake_index_catalog_json);
@@ -75,6 +79,11 @@ pub fn build(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRe
     var provider: @import("lake_index_row_source.zig").Provider = .{ .source = source, .context = context, .expected_delete_objects = pinned.delete_objects };
     // Same-label source replacements and credential/store changes prohibit
     // reuse even if a legacy sidecar's binding happens to look identical.
+    if (current.value.published) |*previous| {
+        if (std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) {
+            try @import("lake_index_directory.zig").hydrate(current.arena.allocator(), scoped, previous, cancellation, null);
+        }
+    }
     const reusable: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact = if (current.value.published) |published|
         if (std.mem.eql(u8, &published.signature.source, &signature.source) and
             std.mem.eql(u8, &published.signature.credentials, &signature.credentials) and
@@ -97,17 +106,27 @@ pub fn build(a: A, artifact_store: *stores.ArtifactStore, table: records.TableRe
     const legacy_json = try std.json.Stringify.valueAlloc(na, legacy_indexes, .{});
     var manifest = try rebuild.reconcileResolvedExternalSourceSidecarsWithRuntimeAlloc(a, &scoped, provider.provider(), base_source, source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .read_schema_json = table.read_schema_json, .indexes_json = legacy_json }, reusable, cancellation, .{ .published_generation = attempt.generation, .edge_generation = attempt.generation, .computed_at_ms = started }, .{}, scope);
     defer manifest.deinit(a);
-    const native_declarations = try @import("lake_index_native_aggregates.zig").build(a, na, table, source, &scoped, &provider, cancellation);
+    const previous_contributions = if (current.value.published) |previous| if (std.mem.eql(u8, &previous.signature.credentials, &signature.credentials) and std.mem.eql(u8, &previous.signature.store, &signature.store)) previous.file_contributions else &.{} else &.{};
+    const native = try @import("lake_index_native_aggregates.zig").buildIncremental(a, na, table, source, &scoped, &provider, cancellation, reusable, previous_contributions);
+    const native_declarations = native.declarations;
     const declarations = try na.alloc(local.serverless_segment_sidecar_manifest.DeclaredArtifact, manifest.artifacts.len + native_declarations.len);
     @memcpy(declarations[0..manifest.artifacts.len], manifest.artifacts);
     @memcpy(declarations[manifest.artifacts.len..], native_declarations);
     try cancellation.check();
     const verified = try coverage.pin(source, context);
     if (!std.meta.eql(pinned, verified)) return error.ExternalLakeIndexSourceChanged;
-    const completed = try clock.now_ms(clock.ptr);
     try context.ensureActive();
-    const publication: catalog.Publication = .{ .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .declarations = declarations };
-    return catalog.encode(a, try current.value.publish(publication, completed));
+    const directory = try @import("lake_index_directory.zig").publishWithContributions(a, &scoped, declarations, native.contributions, cancellation);
+    defer a.free(directory.artifact_id);
+    defer a.free(directory.checksum);
+    try context.ensureActive();
+    const completed = try clock.now_ms(clock.ptr);
+    const publication: catalog.Publication = .{ .generation = attempt.generation, .token = attempt.token, .signature = signature, .published_at_ms = completed, .base_source = base_source, .inventory = inventory, .directory = directory };
+    const latest = if (lease) |owner| try owner.snapshot(owner.ptr, a) else table;
+    defer if (lease != null) a.free(latest.lake_index_catalog_json);
+    var final_state = try catalog.parse(a, latest.lake_index_catalog_json);
+    defer final_state.deinit();
+    return catalog.encode(a, try final_state.value.publish(publication, completed));
 }
 
 test "external lake native publication builds scoped text artifacts and fences expired completion" {
@@ -156,6 +175,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     try std.testing.expect(try catalog.transitionAllowed(a, pending, published));
     var parsed = try catalog.parse(a, published_bytes);
     defer parsed.deinit();
+    try @import("lake_index_directory.zig").hydrate(parsed.arena.allocator(), artifact_store, &parsed.value.published.?, .none, null);
     const publication = parsed.value.published.?;
     try std.testing.expect(parsed.value.pending == null);
     try std.testing.expect(publication.declarations.len > 0);

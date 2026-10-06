@@ -260,6 +260,14 @@ pub const Stream = struct {
         }.less);
         return .{ .alloc = alloc, .source = source, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .schema_contract = if (source.iceberg_schema) |schema| schema.columns else &.{} };
     }
+    /// A contribution scan keeps the parent snapshot and delete applicability,
+    /// but schedules only one pinned object. All footer offsets remain file-local.
+    pub fn restrictFile(self: *Stream, index: usize) !void {
+        if (index >= self.source.inventory.files.len or self.file_index != 0 or self.discovered != null) return error.InvalidExternalLakeIndexCoverage;
+        const files = try self.alloc.dupe(usize, &.{index});
+        self.alloc.free(self.files);
+        self.files = files;
+    }
     pub fn partitionCount(self: *Stream, maximum: usize) !usize {
         if (self.files.len == 0 or maximum < 2 or self.source.scanner.shared_reader == null) return 1;
         if (self.work) |work| return @min(maximum, work.units.len);

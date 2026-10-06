@@ -2283,7 +2283,10 @@ test "external lake public contract admits typed aggregate recipes and SDK optio
     const expanded = try @import("tables.zig").expandSchemaDerivedAlgebraicIndexAlloc(a, "lake", normalized, schema);
     defer a.free(expanded);
     const config_api = @import("antfly_local_sources").storage_db_algebraic_index_config;
-    var config = try std.json.parseFromSlice(config_api.Config, a, expanded, .{ .ignore_unknown_fields = true });
+    const runtime_config = try @import("antfly_local_sources").api_table_index_config.parseIndexConfig(a, "stats", expanded);
+    defer a.free(runtime_config.name);
+    defer a.free(runtime_config.config_json);
+    var config = try std.json.parseFromSlice(config_api.Config, a, runtime_config.config_json, .{});
     defer config.deinit();
     try std.testing.expectEqual(@as(u32, 0), config.value.schema_version);
     try config_api.validateConfig(config.value);

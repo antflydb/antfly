@@ -43,31 +43,117 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     // No upload is allowed until this exact attempt has durable authority.
     try authority.replace(authority.ptr, table, pending);
 
+    var lease: Renewal = .{ .a = a, .io = io, .record = pending, .authority = authority, .clock = clock, .lease_ms = options.lease_ms };
+    defer if (lease.owned) |bytes| a.free(bytes);
+    var build_context = context;
+    build_context.checkpoint = .{ .ptr = &lease, .check = Renewal.check };
+    // Provider callbacks share the renewing fence, including speculative I/O.
+    const old_source_context = source.scanner.shared_reader;
+    if (old_source_context) |reader| reader.context = build_context;
+    defer {
+        if (old_source_context) |reader| reader.context = context;
+    }
+    if (source.context_store) |context_store| context_store.context = build_context;
+    defer {
+        if (source.context_store) |context_store| context_store.context = context;
+    }
+    var heartbeat = try io.concurrent(Renewal.run, .{&lease});
+    var heartbeat_active = true;
+    defer if (heartbeat_active) heartbeat.cancel(io);
     var working = try limits.WorkingSetAllocator.init(a, options.build_limits);
     const build_alloc = working.allocator();
     var handle = store.artifactStore();
-    const published_bytes = publication.build(build_alloc, &handle, pending, source, store.identity, context, cancellation, clock) catch |build_error| {
+    const published_bytes = publication.buildWithLease(build_alloc, &handle, pending, source, store.identity, build_context, cancellation, clock, .{ .ptr = &lease, .snapshot = Renewal.snapshot }) catch |build_error| {
+        heartbeat.cancel(io);
+        heartbeat_active = false;
         const failure_time = clock.now_ms(clock.ptr) catch return build_error;
-        var admitted = try catalog.parse(a, pending_bytes);
+        var admitted = try catalog.parse(a, lease.record.lake_index_catalog_json);
         defer admitted.deinit();
         const retry_at = std.math.add(u64, failure_time, options.retry_ms) catch std.math.maxInt(u64);
         const failed_bytes = try catalog.encode(a, try admitted.value.fail(admitted.value.pending.?.token, if (working.limit_exceeded) "LakeSidecarBuildLimitExceeded" else @errorName(build_error), retry_at));
         defer a.free(failed_bytes);
-        var failed = pending;
+        var failed = lease.record;
         failed.lake_index_catalog_json = failed_bytes;
-        // A changed definition or replacement lease wins over this failure.
-        // Never overwrite another worker's state or retry an ambiguous CAS.
-        try authority.replace(authority.ptr, pending, failed);
+        try authority.replace(authority.ptr, lease.record, failed);
         if (working.limit_exceeded) return error.LakeSidecarBuildLimitExceeded;
         return build_error;
     };
     defer build_alloc.free(published_bytes);
-    try context.ensureActive();
+    heartbeat.cancel(io);
+    heartbeat_active = false;
+    try build_context.ensureActive();
     try cancellation.check();
-    var ready = pending;
+    var ready = lease.record;
     ready.lake_index_catalog_json = published_bytes;
-    try authority.replace(authority.ptr, pending, ready);
+    try authority.replace(authority.ptr, lease.record, ready);
 }
+
+const Renewal = struct {
+    a: A,
+    io: std.Io,
+    record: local.common_topology_records.TableRecord,
+    authority: Authority,
+    clock: publication.Clock,
+    lease_ms: u64,
+    owned: ?[]u8 = null,
+    mutex: std.Io.Mutex = .init,
+    terminal_error: ?anyerror = null,
+    expires_ms: u64 = 0,
+    failed: std.atomic.Value(bool) = .init(false),
+    fn snapshot(raw: *anyopaque, a: A) !local.common_topology_records.TableRecord {
+        const self: *Renewal = @ptrCast(@alignCast(raw));
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.terminal_error) |err| return err;
+        var record = self.record;
+        record.lake_index_catalog_json = try a.dupe(u8, record.lake_index_catalog_json);
+        return record;
+    }
+    // Provider cancellation callbacks must remain free of metadata I/O.
+    fn check(raw: *anyopaque) !void {
+        const self: *Renewal = @ptrCast(@alignCast(raw));
+        if (self.failed.load(.acquire)) return error.LakeIndexPublicationFenceChanged;
+    }
+    fn run(self: *Renewal) void {
+        while (true) {
+            self.io.sleep(.fromMilliseconds(@intCast(@max(1, self.lease_ms / 3))), .awake) catch return;
+            self.pulse() catch return;
+        }
+    }
+    fn pulse(self: *Renewal) !void {
+        try self.mutex.lock(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.terminal_error) |err| return err;
+        return self.renew() catch |err| {
+            // An ambiguous CAS reply is terminal; the heartbeat never replays it.
+            self.terminal_error = err;
+            self.failed.store(true, .release);
+            return err;
+        };
+    }
+    fn renew(self: *Renewal) !void {
+        const now = try self.clock.now_ms(self.clock.ptr);
+        if (self.expires_ms != 0) {
+            if (now >= self.expires_ms) return error.LakeIndexPublicationFenceChanged;
+            if (self.expires_ms - now > @max(1, self.lease_ms / 2)) return;
+        }
+        var state = try catalog.parse(self.a, self.record.lake_index_catalog_json);
+        defer state.deinit();
+        const attempt = state.value.pending orelse return error.LakeIndexPublicationFenceChanged;
+        self.expires_ms = attempt.lease_expires_at_ms;
+        if (now >= attempt.lease_expires_at_ms) return error.LakeIndexPublicationFenceChanged;
+        if (attempt.lease_expires_at_ms - now > @max(1, self.lease_ms / 2)) return;
+        const bytes = try catalog.encode(self.a, try state.value.renew(attempt.token, now, self.lease_ms));
+        errdefer self.a.free(bytes);
+        var renewed = self.record;
+        renewed.lake_index_catalog_json = bytes;
+        try self.authority.replace(self.authority.ptr, self.record, renewed);
+        if (self.owned) |old| self.a.free(old);
+        self.owned = bytes;
+        self.record = renewed;
+        self.expires_ms = now + self.lease_ms;
+    }
+};
 
 test "external lake native coordinator fences ambiguous admission and reuses durable publication" {
     const a = std.testing.allocator;
@@ -152,4 +238,50 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     query_table.external_indexes.?.desired = @splat(9);
     try std.testing.expect((try selection.select(a, query_table, &source, &store, .{}, .automatic)) == null);
     try std.testing.expectError(error.ExternalLakeIndexUnavailable, selection.select(a, query_table, &source, &store, .{}, .required));
+}
+
+test "external lake lease renewal extends a live fence and never replays an ambiguous CAS" {
+    const a = std.testing.allocator;
+    const signature: catalog.Signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) };
+    const initial = try catalog.encode(a, try (catalog.State{}).begin(signature, @splat(1), 100, 10));
+    defer a.free(initial);
+    const Mock = struct {
+        now: u64 = 107,
+        calls: usize = 0,
+        ambiguous: bool = false,
+        fn time(raw: *const anyopaque) !u64 {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.now;
+        }
+        fn replace(raw: *anyopaque, old: local.common_topology_records.TableRecord, new: local.common_topology_records.TableRecord) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var before = try catalog.parse(std.testing.allocator, old.lake_index_catalog_json);
+            defer before.deinit();
+            var after = try catalog.parse(std.testing.allocator, new.lake_index_catalog_json);
+            defer after.deinit();
+            try std.testing.expectEqual(before.value.pending.?.token, after.value.pending.?.token);
+            try std.testing.expect(after.value.pending.?.lease_expires_at_ms > before.value.pending.?.lease_expires_at_ms);
+            self.calls += 1;
+            if (self.ambiguous) return error.MetadataMutationOutcomeUnknown;
+        }
+    };
+    var mock: Mock = .{};
+    var renewal: Renewal = .{ .a = a, .io = std.testing.io, .record = .{ .table_id = 1, .name = "lake", .lake_index_catalog_json = initial }, .authority = .{ .ptr = &mock, .replace = Mock.replace }, .clock = .{ .ptr = &mock, .now_ms = Mock.time }, .lease_ms = 10 };
+    defer if (renewal.owned) |bytes| a.free(bytes);
+    try renewal.pulse();
+    try std.testing.expectEqual(@as(u64, 117), renewal.expires_ms);
+    mock.now = 114;
+    const snapshot = try Renewal.snapshot(&renewal, a);
+    defer a.free(snapshot.lake_index_catalog_json);
+    try renewal.pulse();
+    try std.testing.expectEqual(@as(u64, 124), renewal.expires_ms);
+    var old_snapshot = try catalog.parse(a, snapshot.lake_index_catalog_json);
+    defer old_snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 117), old_snapshot.value.pending.?.lease_expires_at_ms);
+    mock.now = 121;
+    mock.ambiguous = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, renewal.pulse());
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, renewal.pulse());
+    try std.testing.expectError(error.LakeIndexPublicationFenceChanged, Renewal.check(&renewal));
+    try std.testing.expectEqual(@as(usize, 3), mock.calls);
 }

@@ -11,6 +11,9 @@ pub const max_json_bytes: usize = 256 * 1024;
 pub const max_artifacts: usize = 256;
 pub const Digest = [32]u8;
 pub const Token = [16]u8;
+pub const DirectoryRef = struct { artifact_id: []const u8, checksum: []const u8, byte_len: u64, count: u32 };
+pub const max_directory_artifacts: usize = 4096;
+pub const max_directory_bytes: usize = 16 * 1024 * 1024;
 pub const Signature = struct {
     desired: Digest,
     source: Digest,
@@ -31,6 +34,12 @@ pub const Attempt = struct {
         if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.lease_expires_at_ms <= self.started_at_ms) return error.InvalidLakeIndexCatalog;
     }
 };
+pub const FileContribution = struct {
+    file: Digest,
+    recipe: Digest,
+    name: []const u8,
+    artifact: artifacts.ArtifactRef,
+};
 pub const Publication = struct {
     generation: u64,
     token: Token,
@@ -38,9 +47,27 @@ pub const Publication = struct {
     published_at_ms: u64,
     base_source: base.BaseSourceDescriptor,
     inventory: artifacts.ArtifactRef,
-    declarations: []const manifest.DeclaredArtifact,
+    declarations: []const manifest.DeclaredArtifact = &.{},
+    directory: ?DirectoryRef = null,
+    file_contributions: []const FileContribution = &.{},
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        if (self.directory) |directory| {
+            try writer.write(.{ .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .directory = directory });
+        } else {
+            try writer.write(.{ .generation = self.generation, .token = self.token, .signature = self.signature, .published_at_ms = self.published_at_ms, .base_source = self.base_source, .inventory = self.inventory, .declarations = self.declarations });
+        }
+    }
     pub fn validate(self: Publication) !void {
-        if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.declarations.len > max_artifacts) return error.InvalidLakeIndexCatalog;
+        if (self.generation == 0 or std.mem.allEqual(u8, &self.token, 0) or self.declarations.len > (if (self.directory != null) max_directory_artifacts else max_artifacts)) return error.InvalidLakeIndexCatalog;
+        if (self.directory) |directory| {
+            if (directory.count > max_directory_artifacts or directory.byte_len > max_directory_bytes or (self.declarations.len != 0 and self.declarations.len != directory.count)) return error.InvalidLakeIndexCatalog;
+            try artifactValid(.{ .kind = .doc_values, .artifact_id = directory.artifact_id, .checksum = directory.checksum, .byte_len = directory.byte_len });
+        }
+        if (self.file_contributions.len > 16384) return error.InvalidLakeIndexCatalog;
+        for (self.file_contributions) |contribution| {
+            if (contribution.name.len == 0 or contribution.name.len > 128 or std.mem.allEqual(u8, &contribution.file, 0) or std.mem.allEqual(u8, &contribution.recipe, 0) or contribution.artifact.kind != .algebraic_segment) return error.InvalidLakeIndexCatalog;
+            try artifactValid(contribution.artifact);
+        }
         try self.signature.validate();
         try self.base_source.validate();
         switch (self.base_source) {

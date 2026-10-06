@@ -714,6 +714,7 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
     const failure = if (state.value.failure) |value| if (std.mem.eql(u8, &value.desired, &desired)) value else null else null;
     const published: ?u64 = if (state.value.published) |value| published: {
         if (!std.mem.eql(u8, &value.signature.desired, &desired)) break :published null;
+        if (value.directory != null) break :published value.generation;
         const algebraic = if (config == .object) if (config.object.get("type")) |kind| kind == .string and std.mem.eql(u8, kind.string, "algebraic") else false else false;
         if (!algebraic) for (value.declarations) |declaration| {
             if (std.mem.eql(u8, declaration.name, index_name)) break :published value.generation;

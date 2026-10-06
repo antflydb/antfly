@@ -40,29 +40,67 @@ pub fn pin(source: *Source, context: Context) !Coverage {
     const a = source.alloc;
     var client = source.scanner.object_reader.client;
     client.allocator = a;
-    for (source.inventory.files, 0..) |*file, index| {
-        try context.ensureActive();
-        const location = try local.serverless_query_lake_range_io.objectLocationForUri(file.object_uri);
-        var metadata = try client.statObject(location.bucket, location.key);
-        defer metadata.deinit(a);
-        const etag = metadata.etag orelse "";
-        const version = metadata.version_id orelse "";
-        if (metadata.content_length != file.byte_len or !versionIsStrong(etag, version)) return error.InvalidExternalLakeIndexCoverage;
-        const unresolved = (source.lazy_versions and !source.pinned_files[index]) or !versionIsStrong(file.etag, file.version_id);
-        if (!unresolved and ((file.etag.len != 0 and !std.mem.eql(u8, file.etag, etag)) or
-            (file.version_id.len != 0 and !std.mem.eql(u8, file.version_id, version)))) return error.ExternalLakeIndexSourceChanged;
-        if (std.mem.eql(u8, file.etag, etag) and std.mem.eql(u8, file.version_id, version)) {
-            if (source.lazy_versions) source.pinned_files[index] = true;
-            continue;
+    // Fresh provider evidence is mandatory; bounded shared scheduling reduces
+    // network latency without treating a TTL or cached bytes as authority.
+    const Work = struct {
+        client: local.storage_object_storage.ObjectStorage,
+        uri: []const u8,
+        context: Context,
+        fn stat(self: @This()) anyerror!local.storage_object_storage.ObjectMetadata {
+            try self.context.ensureActive();
+            const location = try local.serverless_query_lake_range_io.objectLocationForUri(self.uri);
+            var worker_client = self.client;
+            worker_client.allocator = std.heap.page_allocator;
+            return worker_client.statObject(location.bucket, location.key);
         }
-        const pinned_etag = try a.dupe(u8, etag);
-        errdefer a.free(pinned_etag);
-        const pinned_version = try a.dupe(u8, version);
-        if (file.etag.len != 0) a.free(file.etag);
-        if (file.version_id.len != 0) a.free(file.version_id);
-        file.etag = pinned_etag;
-        file.version_id = pinned_version;
-        if (source.lazy_versions) source.pinned_files[index] = true;
+    };
+    var begin: usize = 0;
+    while (begin < source.inventory.files.len) {
+        const count = @min(8, source.inventory.files.len - begin);
+        var tasks: [8]?local.sql_parallel_scheduler.Task(anyerror!local.storage_object_storage.ObjectMetadata) = @splat(null);
+        var metadata_results: [8]?local.storage_object_storage.ObjectMetadata = @splat(null);
+        defer {
+            for (&tasks, &metadata_results) |*task, *result| if (task.*) |*future| {
+                result.* = future.cancel(context.io.?) catch null;
+            };
+            for (&metadata_results) |*result| if (result.*) |*metadata| metadata.deinit(std.heap.page_allocator);
+        }
+        for (0..count) |slot| {
+            const work: Work = .{ .client = client, .uri = source.inventory.files[begin + slot].object_uri, .context = context };
+            if (context.io) |io| tasks[slot] = local.sql_parallel_scheduler.global().submitTransient(io, 64 * 1024, Work.stat, .{work});
+            if (tasks[slot] == null) metadata_results[slot] = try work.stat();
+        }
+        for (tasks[0..count], 0..) |optional, slot| if (optional != null) {
+            const task = &tasks[slot].?;
+            const result = task.await(context.io.?);
+            tasks[slot] = null;
+            metadata_results[slot] = try result;
+        };
+        for (metadata_results[0..count], 0..) |optional, slot| {
+            const metadata = optional.?;
+            const index = begin + slot;
+            const file = &source.inventory.files[index];
+            try context.ensureActive();
+            const etag = metadata.etag orelse "";
+            const version = metadata.version_id orelse "";
+            if (metadata.content_length != file.byte_len or !versionIsStrong(etag, version)) return error.InvalidExternalLakeIndexCoverage;
+            const unresolved = (source.lazy_versions and !source.pinned_files[index]) or !versionIsStrong(file.etag, file.version_id);
+            if (!unresolved and ((file.etag.len != 0 and !std.mem.eql(u8, file.etag, etag)) or
+                (file.version_id.len != 0 and !std.mem.eql(u8, file.version_id, version)))) return error.ExternalLakeIndexSourceChanged;
+            if (std.mem.eql(u8, file.etag, etag) and std.mem.eql(u8, file.version_id, version)) {
+                if (source.lazy_versions) source.pinned_files[index] = true;
+                continue;
+            }
+            const pinned_etag = try a.dupe(u8, etag);
+            errdefer a.free(pinned_etag);
+            const pinned_version = try a.dupe(u8, version);
+            if (file.etag.len != 0) a.free(file.etag);
+            if (file.version_id.len != 0) a.free(file.version_id);
+            file.etag = pinned_etag;
+            file.version_id = pinned_version;
+            if (source.lazy_versions) source.pinned_files[index] = true;
+        }
+        begin += count;
     }
     try source.inventory.validateAlloc(a);
     var hash = Hash.init(.{});
