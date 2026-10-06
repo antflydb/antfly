@@ -3395,6 +3395,130 @@ pub const ChainLink = struct {
     }
 };
 
+pub const ChatGPTAccount = struct {
+    connection_id: []const u8,
+    email: []const u8,
+    label: []const u8,
+    connected: bool,
+    plan_enabled: bool,
+};
+
+pub const ChatGPTAccounts = struct {
+    accounts: []const ChatGPTAccount,
+};
+
+pub const ChatGPTAuthorize = struct {
+    connection_id: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "connection_id", "connection_id", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ChatGPTBegin = struct {
+    attempt_id: []const u8,
+    authorization_url: []const u8,
+    expires_at: i64,
+};
+
+pub const ChatGPTDisconnect = struct {
+    revocation_confirmed: bool,
+};
+
+/// Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime.
+pub const ChatGPTGeneratorConfig = struct {
+    provider: []const u8,
+    reasoning_effort: ?OpenAIReasoningEffort = null,
+    model: []const u8,
+    /// Opaque personal registration owned by the authenticated caller.
+    connection_id: []const u8,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "model", "model", false },
+        .{ "connection_id", "connection_id", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.reasoning_effort) |value| {
+            try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("connection_id");
+        try jw.write(self.connection_id);
+        try jw.endObject();
+    }
+};
+
+pub const ChatGPTOutcome = struct {
+    status: []const u8,
+    connection_id: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "status", "status", false },
+        .{ "connection_id", "connection_id", true },
+        .{ "error", "error", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("status");
+        try jw.write(self.status);
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
+        if (self.@"error") |value| {
+            try jw.objectField("error");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// OpenAI-compatible message in a generation/chat conversation.
 pub const ChatMessage = struct {
     role: ChatMessageRole,
@@ -4453,6 +4577,7 @@ pub const ClusterStatus = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    connectors: ?ConnectorCapabilities = null,
     index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
@@ -4464,6 +4589,7 @@ pub const ClusterStatus = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "connectors", "connectors", true },
         .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
@@ -4492,6 +4618,10 @@ pub const ClusterStatus = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
             try jw.write(value);
         }
         if (self.index_capabilities) |value| {
@@ -4522,6 +4652,7 @@ pub const ClusterTopology = struct {
     auth_enabled: ?bool = null,
     /// Runtime deployment topology
     deployment_mode: ?[]const u8 = null,
+    connectors: ?ConnectorCapabilities = null,
     index_capabilities: ?IndexRuntimeCapabilities = null,
     secret_store: ?SecretStoreStatus = null,
     runtime_config: ?RuntimeConfigStatus = null,
@@ -4534,6 +4665,7 @@ pub const ClusterTopology = struct {
         .{ "message", "message", true },
         .{ "auth_enabled", "auth_enabled", true },
         .{ "deployment_mode", "deployment_mode", true },
+        .{ "connectors", "connectors", true },
         .{ "index_capabilities", "index_capabilities", true },
         .{ "secret_store", "secret_store", true },
         .{ "runtime_config", "runtime_config", true },
@@ -4563,6 +4695,10 @@ pub const ClusterTopology = struct {
         }
         if (self.deployment_mode) |value| {
             try jw.objectField("deployment_mode");
+            try jw.write(value);
+        }
+        if (self.connectors) |value| {
+            try jw.objectField("connectors");
             try jw.write(value);
         }
         if (self.index_capabilities) |value| {
@@ -5000,6 +5136,11 @@ pub const ConnectionStatus = enum {
 
 pub const ConnectionsResponse = struct {
     connections: []const Connection,
+};
+
+/// Effective integration availability for this deployment; independent of login providers and individual grants.
+pub const ConnectorCapabilities = struct {
+    chatgpt: std.json.Value,
 };
 
 /// A content part for multimodal input (text, image URL, or inline media).
@@ -14753,10 +14894,11 @@ pub const GeneratorConfig = struct {
     timeout: ?i64 = null,
     /// The URL of the Inference API endpoint. Can also be set via ANTFLY_INFERENCE_URL environment variable.
     api_url: ?[]const u8 = null,
+    reasoning_effort: ?OpenAIReasoningEffort = null,
+    /// Opaque personal registration owned by the authenticated caller.
+    connection_id: ?[]const u8 = null,
     /// OpenAI completion budget, including visible output and reasoning tokens. Use for reasoning models instead of max_tokens; the two are mutually exclusive.
     max_completion_tokens: ?i64 = null,
-    /// Optional reasoning effort. Supported values depend on the selected OpenAI model.
-    reasoning_effort: ?OpenAIReasoningEffort = null,
     /// Penalty for token frequency (-2.0 to 2.0).
     frequency_penalty: ?f32 = null,
     /// Penalty for token presence (-2.0 to 2.0).
@@ -14778,8 +14920,9 @@ pub const GeneratorConfig = struct {
         .{ "credentials_path", "credentials_path", true },
         .{ "timeout", "timeout", true },
         .{ "api_url", "api_url", true },
-        .{ "max_completion_tokens", "max_completion_tokens", true },
         .{ "reasoning_effort", "reasoning_effort", true },
+        .{ "connection_id", "connection_id", true },
+        .{ "max_completion_tokens", "max_completion_tokens", true },
         .{ "frequency_penalty", "frequency_penalty", true },
         .{ "presence_penalty", "presence_penalty", true },
         .{ "rate_limit", "rate_limit", true },
@@ -14847,12 +14990,16 @@ pub const GeneratorConfig = struct {
             try jw.objectField("api_url");
             try jw.write(value);
         }
-        if (self.max_completion_tokens) |value| {
-            try jw.objectField("max_completion_tokens");
-            try jw.write(value);
-        }
         if (self.reasoning_effort) |value| {
             try jw.objectField("reasoning_effort");
+            try jw.write(value);
+        }
+        if (self.connection_id) |value| {
+            try jw.objectField("connection_id");
+            try jw.write(value);
+        }
+        if (self.max_completion_tokens) |value| {
+            try jw.objectField("max_completion_tokens");
             try jw.write(value);
         }
         if (self.frequency_penalty) |value| {
@@ -14877,6 +15024,7 @@ pub const GeneratorProvider = enum {
     vertex,
     ollama,
     openai,
+    chatgpt,
     openrouter,
     antfly,
     apple,
@@ -14887,6 +15035,7 @@ pub const GeneratorProvider = enum {
             .vertex => "vertex",
             .ollama => "ollama",
             .openai => "openai",
+            .chatgpt => "chatgpt",
             .openrouter => "openrouter",
             .antfly => "antfly",
             .apple => "apple",
@@ -14904,6 +15053,7 @@ pub const GeneratorProvider = enum {
             .{ "vertex", .vertex },
             .{ "ollama", .ollama },
             .{ "openai", .openai },
+            .{ "chatgpt", .chatgpt },
             .{ "openrouter", .openrouter },
             .{ "antfly", .antfly },
             .{ "apple", .apple },

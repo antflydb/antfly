@@ -1621,6 +1621,8 @@ test "session maintenance activation follows current range leadership without fo
 }
 
 pub const ApiHttpServerConfig = struct {
+    /// Node-local personal connection owner; never populated by distributed configuration.
+    chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
     pgwire: ?common_config.Config.PgwireConfig = null,
     restore_validation: ?@import("restore_catalog.zig").ValidationPort = null,
     auth_enabled: bool = false,
@@ -1941,6 +1943,8 @@ pub const TableVisibility = enum {
 
 pub const AuthenticatedIdentity = struct {
     const CatalogAlias = struct { logical: []u8, physical: []u8 };
+    /// Present only for a locally authenticated database user.
+    user_instance_id: ?[16]u8 = null,
     username: []u8,
     /// Borrowed from the serving ApiHttpServer. Target-table operations
     /// intersect the request's admitted permission snapshot with this live
@@ -4376,6 +4380,7 @@ pub const ApiHttpServer = struct {
         errdefer status.deinit(alloc);
         status.auth_enabled = self.cfg.auth_enabled;
         status.deployment_mode = self.cfg.deployment_mode;
+        status.connectors = self.connectorCapabilities();
         status.index_capabilities.artifact_sources_state = self.artifactSourcesCapabilityState(snapshot);
         status.index_capabilities.artifact_sources = status.index_capabilities.artifact_sources_state == .available;
         status.storage = self.currentStorageRuntimeStatus();
@@ -4404,6 +4409,15 @@ pub const ApiHttpServer = struct {
             return self.loadClusterStatusWithSnapshot(alloc, snapshot);
         }
         return self.loadClusterStatusWithSnapshot(alloc, null);
+    }
+
+    pub fn connectorCapabilities(self: *const ApiHttpServer) cluster.ConnectorCapabilities {
+        if (self.cfg.node_config) |config| if (!config.connectors.allowsLocalChatGPT())
+            return .{ .chatgpt = .{ .enabled = false, .reason = .operator_disabled } };
+        return if (self.cfg.chatgpt != null)
+            .{ .chatgpt = .{ .enabled = true, .reason = null } }
+        else
+            .{};
     }
 
     /// Transport-neutral topology operation. It composes the shared status
@@ -7542,6 +7556,7 @@ pub const ApiHttpServer = struct {
             defer self.alloc.free(credential_principal);
             var identity = try cloneAuthenticatedIdentity(self.alloc, user.username, credential_principal, manager_permissions, manager_row_filters, user.metadata_json, manager_roles);
             identity.live_user_manager = manager;
+            identity.user_instance_id = user.instance_id;
             return identity;
         }
 

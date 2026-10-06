@@ -21,6 +21,7 @@ pub const ProfileCredentialSource = aws.ProfileCredentialSource;
 pub const WebIdentityCredentialSource = aws.WebIdentityCredentialSource;
 pub const CredentialSource = aws.CredentialSource;
 pub const CredentialCache = aws.CredentialCache;
+pub const testBrowserProfileCredentialExpiration = aws.testBrowserProfileCredentialExpiration;
 pub const testSharedCredentialsProfileParser = aws.testSharedCredentialsProfileParser;
 pub const testMetadataCredentialParsers = aws.testMetadataCredentialParsers;
 pub const testCredentialUrlEncoding = aws.testCredentialUrlEncoding;

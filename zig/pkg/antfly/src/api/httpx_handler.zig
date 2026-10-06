@@ -858,6 +858,10 @@ const AgentQueryRunner = struct {
 /// Request-scoped generation for native agents. Every model round is a
 /// cancellation and deadline boundary.
 const AgentGenerationRunner = struct {
+    chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
+    personal_owner: ?[]const u8 = null,
+    chatgpt_pin: ?@import("antfly_local_sources").chatgpt_manager.Pin = null,
+    chatgpt_failure: generating_runtime.ChatGPTFailure = .{},
     antfly_provider: ?managed_embedder.AntflyProvider,
     secret_store: ?*common_secrets.FileStore,
     io: std.Io,
@@ -878,11 +882,18 @@ const AgentGenerationRunner = struct {
         messages: []const generating_runtime.ChatMessage,
     ) !generating_runtime.GenerateResult {
         const runner: *@This() = @ptrCast(@alignCast(ptr));
+        for (chain) |link| if (link.generator.provider == .chatgpt) {
+            const manager = runner.chatgpt orelse return error.ChatGPTDisabled;
+            const owner = runner.personal_owner orelse return error.ChatGPTInteractiveOnly;
+            const id = link.generator.connection_id orelse return error.InvalidGeneratorConfig;
+            if (runner.chatgpt_pin == null) runner.chatgpt_pin = try manager.pinWithContext(owner, id, runner.request_context);
+            try runner.chatgpt_pin.?.check(id);
+        };
         // Each model round is a cancellation and deadline boundary.
         try runner.request_context.check();
         var client = httpx.Client.initWithConfig(a, runner.io, .{ .keep_alive = false });
         defer client.deinit();
-        return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = runner.request_context }, messages);
+        return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .chatgpt = runner.chatgpt, .chatgpt_failure = &runner.chatgpt_failure, .chatgpt_pin = runner.chatgpt_pin, .personal_owner = runner.personal_owner, .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key, .request_context = runner.request_context }, messages);
     }
 };
 
@@ -4001,6 +4012,89 @@ pub const AntflyApiHandler = struct {
         return ctx.openApiJson(topology);
     }
 
+    fn personalOwner(self: *AntflyApiHandler, ctx: *httpx.Context, identity: ?AuthenticatedIdentity) ![]const u8 {
+        if (!self.api_server.connectorCapabilities().chatgpt.enabled) return error.ChatGPTDisabled;
+        if (ctx.header("sec-fetch-site")) |site| if (!std.mem.eql(u8, site, "same-origin") and !std.mem.eql(u8, site, "none")) return error.Forbidden;
+        const host = ctx.header("host") orelse return error.Forbidden;
+        if (!(std.mem.startsWith(u8, host, "127.0.0.1:") or std.mem.startsWith(u8, host, "localhost:") or std.mem.startsWith(u8, host, "[::1]:"))) return error.Forbidden;
+        if (ctx.header("origin")) |origin| {
+            const expected = try std.fmt.allocPrint(ctx.allocator, "http://{s}", .{host});
+            defer ctx.allocator.free(expected);
+            if (!std.mem.eql(u8, expected, origin)) return error.Forbidden;
+        }
+        if (identity) |authenticated| {
+            if (authenticated.is_internal_service or !std.mem.startsWith(u8, authenticated.credential_principal, "basic:")) return error.Forbidden;
+            return @import("antfly_local_sources").chatgpt_manager.userOwner(ctx.allocator, authenticated.user_instance_id orelse return error.Forbidden);
+        }
+        return ctx.allocator.dupe(u8, "local:");
+    }
+    pub fn authorizeChatGPT(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections require a trusted local runtime.");
+        defer ctx.allocator.free(owner);
+        const body = (try ctx.body()) orelse "{}";
+        var parsed = std.json.parseFromSlice(struct { connection_id: ?[]const u8 = null }, ctx.allocator, body, .{}) catch return jsonErrorResponse(ctx, 400, "Invalid connection request.");
+        defer parsed.deinit();
+        const result = self.api_server.cfg.chatgpt.?.begin(ctx.allocator, owner, parsed.value.connection_id) catch |err| return chatGPTFailure(ctx, err);
+        defer ctx.allocator.free(result.attempt_id);
+        defer ctx.allocator.free(result.authorization_url);
+        return ctx.json(result);
+    }
+    pub fn getChatGPTAttempt(self: *AntflyApiHandler, ctx: *httpx.Context, attempt_id: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
+        const outcome = self.api_server.cfg.chatgpt.?.outcome(ctx.allocator, owner, attempt_id) catch |err| return chatGPTFailure(ctx, err);
+        defer if (outcome.connection_id) |id| ctx.allocator.free(id);
+        return ctx.openApiJson(outcome);
+    }
+    pub fn listChatGPTAccounts(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
+        const accounts = self.api_server.cfg.chatgpt.?.summaries(ctx.allocator, owner) catch |err| return chatGPTFailure(ctx, err);
+        defer {
+            for (accounts) |account| {
+                ctx.allocator.free(account.connection_id);
+                ctx.allocator.free(account.email);
+                ctx.allocator.free(account.label);
+            }
+            ctx.allocator.free(accounts);
+        }
+        return ctx.json(.{ .accounts = accounts });
+    }
+    pub fn listChatGPTModels(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
+        const body = self.api_server.cfg.chatgpt.?.models(ctx.allocator, owner, connection_id) catch |err| return chatGPTFailure(ctx, err);
+        defer ctx.allocator.free(body);
+        return jsonResponse(ctx, 200, body);
+    }
+    pub fn disconnectChatGPT(self: *AntflyApiHandler, ctx: *httpx.Context, connection_id: []const u8) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*id| id.deinit(self.api_server.alloc);
+        if (try self.authorizeRequest(ctx, &identity)) |response| return response;
+        const owner = self.personalOwner(ctx, identity) catch |err| return if (err == error.ChatGPTDisabled) chatGPTFailure(ctx, err) else jsonErrorResponse(ctx, 403, "Personal connections unavailable.");
+        defer ctx.allocator.free(owner);
+        const confirmed = self.api_server.cfg.chatgpt.?.disconnect(owner, connection_id) catch |err| return chatGPTFailure(ctx, err);
+        return ctx.json(.{ .revocation_confirmed = confirmed });
+    }
+    fn chatGPTStatus(err: anyerror) u16 {
+        return if (err == error.NotFound) 404 else if (err == error.CapacityExhausted or err == error.ChatGPTUsageLimitExceeded) 429 else if (err == error.ChatGPTDisabled or err == error.ChatGPTReconnectRequired or err == error.ChatGPTPlanDisabled or err == error.ChatGPTNotEligible or err == error.ChatGPTInteractiveOnly) 403 else if (err == error.ChatGPTUnsupportedCapability or err == error.ChatGPTBillingFallbackForbidden or err == error.ChatGPTUnsupportedRateLimit) 400 else 503;
+    }
+    fn chatGPTFailure(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return ctx.status(chatGPTStatus(err)).json(.{ .error_code = @errorName(err) });
+    }
+
     pub fn listConnections(self: *AntflyApiHandler, ctx: *httpx.Context, params: metadata_server_openapi.server.ListConnectionsParams) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
         defer if (authenticated_identity) |*identity| identity.deinit(self.api_server.alloc);
@@ -6043,7 +6137,11 @@ pub const AntflyApiHandler = struct {
 
         const RetrievalQueryRunner = AgentQueryRunner;
         const RetrievalGenerationRunner = AgentGenerationRunner;
+        const personal_owner = self.personalOwner(ctx, authenticated_identity) catch null;
+        defer if (personal_owner) |owner| ctx.allocator.free(owner);
         var generation_runner = RetrievalGenerationRunner{
+            .chatgpt = if (self.api_server.connectorCapabilities().chatgpt.enabled) self.api_server.cfg.chatgpt else null,
+            .personal_owner = personal_owner,
             .antfly_provider = self.api_server.antfly_provider,
             .secret_store = self.api_server.cfg.secret_store,
             .io = self.api_server.inferenceIo(),
@@ -6065,10 +6163,15 @@ pub const AntflyApiHandler = struct {
                 // transport/cancellation failures must close the connection,
                 // never attempt to send a second HTTP response.
                 if (sink.failed or ctx.isCancellationRequested()) return err;
-                try sink.emitError();
+                if (std.mem.startsWith(u8, @errorName(err), "ChatGPT")) {
+                    const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .@"error" = @errorName(err), .manage_usage_url = "https://chatgpt.com/settings/usage", .upstream = generation_runner.chatgpt_failure.summary() }, .{});
+                    defer ctx.allocator.free(json);
+                    try RetrievalSseSink.emitJson(&sink, ctx.allocator, "error", json);
+                } else try sink.emitError();
                 try sink.close();
                 return ctx.response.build();
             }
+            if (std.mem.startsWith(u8, @errorName(err), "ChatGPT")) return ctx.status(chatGPTStatus(err)).json(.{ .error_code = @errorName(err), .upstream = generation_runner.chatgpt_failure.summary() });
             return switch (err) {
                 error.TreeRootSetTooLarge => {
                     _ = ctx.status(422);
@@ -6239,7 +6342,11 @@ pub const AntflyApiHandler = struct {
         }) catch |err| {
             if (sink.writer != null) {
                 if (sink.failed or ctx.isCancellationRequested()) return err;
-                try sink.emitError();
+                if (std.mem.startsWith(u8, @errorName(err), "ChatGPT")) {
+                    const json = try std.json.Stringify.valueAlloc(ctx.allocator, .{ .@"error" = @errorName(err), .manage_usage_url = "https://chatgpt.com/settings/usage", .upstream = runners.generation.chatgpt_failure.summary() }, .{});
+                    defer ctx.allocator.free(json);
+                    try RetrievalSseSink.emitJson(&sink, ctx.allocator, "error", json);
+                } else try sink.emitError();
                 try sink.close();
                 return ctx.response.build();
             }
@@ -6991,7 +7098,7 @@ pub const AntflyApiHandler = struct {
                 .inference_api_key = self.api_server.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
-            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest => {
+            error.InvalidCreateTableRequest, error.UnsupportedCreateTableRequest, error.ChatGPTInteractiveOnly => {
                 _ = ctx.status(400);
                 return ctx.text("unsupported table index configuration");
             },
@@ -7037,7 +7144,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(503);
                 return ctx.text("table index validation probe unavailable");
             },
-            error.InvalidCreateTableRequest => {
+            error.InvalidCreateTableRequest, error.ChatGPTInteractiveOnly => {
                 _ = ctx.status(400);
                 return ctx.text("unsupported table index configuration");
             },
@@ -15381,6 +15488,79 @@ test "httpx antfly cluster restore preserves backup location validation" {
         "{\"error\":\"unsupported backup location\"}",
         resp.body.?,
     );
+}
+
+test "httpx antfly ChatGPT connector policy rejects management before touching credentials" {
+    const a = std.testing.allocator;
+    var config = try common_config.Config.parseFromSlice(a, "{\"connectors\":{\"chatgpt\":{\"enabled\":false}}}");
+    defer config.deinit();
+    var source = AuthStatusSource{};
+    // A deliberately invalid manager proves the operator policy takes priority
+    // even if another bootstrap accidentally supplies a manager pointer.
+    var api = ApiHttpServer.init(a, .{ .node_config = &config, .chatgpt = @ptrFromInt(16) }, source.iface(), null, null);
+    defer api.deinit();
+    try std.testing.expect(!api.connectorCapabilities().chatgpt.enabled);
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    var client_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer client_io.deinit();
+    var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    for ([_][]const u8{ "/db/v1/connections/chatgpt/accounts", "/db/v1/connections/chatgpt/attempts/one", "/db/v1/connections/one/chatgpt/models", "/db/v1/connections/chatgpt/authorize", "/db/v1/connections/one/chatgpt/disconnect" }, 0..) |path, index| {
+        const url = try std.fmt.allocPrint(a, "{s}{s}", .{ base, path });
+        defer a.free(url);
+        var response = try requestWithRetry(&client, client_io.io(), if (index < 3) .GET else .POST, url, if (index < 3) null else "{}", null, 20);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+        try std.testing.expect(std.mem.indexOf(u8, response.body.?, "ChatGPTDisabled") != null);
+    }
+    const url = try std.fmt.allocPrint(a, "{s}/db/v1/status", .{base});
+    defer a.free(url);
+    var response = try requestWithRetry(&client, client_io.io(), .GET, url, null, null, 20);
+    defer response.deinit();
+    var status = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer status.deinit();
+    const capability = status.value.object.get("connectors").?.object.get("chatgpt").?.object;
+    try std.testing.expect(!capability.get("enabled").?.bool);
+    try std.testing.expectEqualStrings("operator_disabled", capability.get("reason").?.string);
+}
+
+test "httpx antfly ChatGPT connector policy pending login matches generated client" {
+    const a = std.testing.allocator;
+    var io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io.io(), ".", a);
+    defer a.free(root);
+    var manager = try @import("antfly_local_sources").chatgpt_manager.Manager.init(a, io.io(), root);
+    defer manager.deinit();
+    var source = AuthStatusSource{};
+    var api = ApiHttpServer.init(a, .{ .chatgpt = &manager }, source.iface(), null, null);
+    defer api.deinit();
+    var server: HttpxE2eServer = undefined;
+    try server.init(a, &api);
+    defer server.deinit();
+    const base = try server.baseUrl(a);
+    defer a.free(base);
+    var client = httpx.Client.initWithConfig(a, io.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    const begin = try manager.begin(a, "local:", null);
+    defer a.free(begin.attempt_id);
+    defer a.free(begin.authorization_url);
+    const url = try std.fmt.allocPrint(a, "{s}/db/v1/connections/chatgpt/attempts/{s}", .{ base, begin.attempt_id });
+    defer a.free(url);
+    var response = try requestWithRetry(&client, io.io(), .GET, url, null, null, 20);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(@import("antfly_client_openapi").types.ChatGPTOutcome, a, response.body.?, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("pending", parsed.value.status);
+    try std.testing.expect(parsed.value.connection_id == null);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "connection_id") == null);
 }
 
 fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {

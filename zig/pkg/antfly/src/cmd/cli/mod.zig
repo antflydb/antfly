@@ -30,6 +30,8 @@ pub const backup = @import("backup.zig");
 pub const agents = @import("agents.zig");
 pub const internal = @import("internal.zig");
 pub const auth = @import("auth.zig");
+pub const cloud_connections = @import("cloud_connections.zig");
+pub const connections = @import("connections.zig");
 
 pub const OutputFormat = @import("antfly_local_sources").cmd_cli_io.OutputFormat;
 
@@ -69,6 +71,7 @@ pub fn isHelpArg(arg: []const u8) bool {
 }
 
 pub fn commandUsage(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "connections")) return connections.usage;
     if (std.mem.eql(u8, command, "sql")) return
     \\usage: antfly sql --statement '<SQL>' [--parameters '<JSON array>']
     \\                  [--database <name>] [--namespace <name>] [--limit <1..4096>]
@@ -224,6 +227,7 @@ test "client commands expose help without a server" {
 /// Supported env vars:
 ///   ANTFLY_URL    — server base URL (default http://127.0.0.1:8080)
 ///   ANTFLY_TOKEN  — bearer token for authentication
+///   ANTFLY_USERNAME / ANTFLY_PASSWORD — Basic authentication (exclusive with token)
 pub const parseGlobalFlags = @import("antfly_local_sources").cmd_cli_io.parseGlobalFlags;
 
 pub const initClient = @import("antfly_local_sources").cmd_cli_io.initClient;
@@ -272,4 +276,6 @@ test "cli mod compiles" {
     _ = agents;
     _ = internal;
     _ = auth;
+    _ = connections;
+    _ = cloud_connections;
 }

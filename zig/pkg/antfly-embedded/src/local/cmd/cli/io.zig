@@ -35,6 +35,8 @@ pub const OutputFormat = enum { json, table_fmt };
 pub const GlobalConfig = struct {
     url: []const u8 = "http://127.0.0.1:8080",
     token: ?[]const u8 = null,
+    username: ?[]const u8 = null,
+    password: ?[]const u8 = null,
     output: OutputFormat = .json,
 };
 
@@ -46,11 +48,17 @@ pub fn parseGlobalFlags() GlobalConfig {
     if (platform.env.getenv("ANTFLY_TOKEN")) |raw| {
         config.token = raw;
     }
+    config.username = platform.env.getenv("ANTFLY_USERNAME");
+    config.password = platform.env.getenv("ANTFLY_PASSWORD");
     return config;
 }
 
 pub fn initClient(allocator: std.mem.Allocator, http: *httpx.Client, config: GlobalConfig) !antfly_client.AntflyClient {
     var client = try antfly_client.AntflyClient.init(allocator, http, config.url);
+    errdefer client.deinit();
+    if ((config.username == null) != (config.password == null)) return error.BasicAuthRequiresUsernameAndPassword;
+    if (config.token != null and config.username != null) return error.ConflictingAuthentication;
+    if (config.username) |username| try client.setBasicAuth(username, config.password.?);
     if (config.token) |token| {
         try client.setBearer(token);
     }

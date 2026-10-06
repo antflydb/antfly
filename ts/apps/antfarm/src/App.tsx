@@ -4,6 +4,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { ApiConfigProvider } from "@/components/api-config-provider";
 import { AppHeader } from "@/components/app-header";
 import { AuthProvider } from "@/components/auth-provider";
+import { ChatGPTProvider } from "@/components/chatgpt-provider";
 import { CommandPaletteProvider } from "@/components/command-palette-provider";
 import { ConnectionStatusBanner } from "@/components/connection-status-banner";
 import { ErrorBoundary } from "@/components/error-boundary";
@@ -277,13 +278,15 @@ function App() {
       <ErrorBoundary>
         <ApiConfigProvider>
           <AuthProvider>
-            <GeneratorPreferenceProvider>
-              <TableProvider>
-                <CommandPaletteProvider>
-                  <AppContent />
-                </CommandPaletteProvider>
-              </TableProvider>
-            </GeneratorPreferenceProvider>
+            <ChatGPTProvider>
+              <GeneratorPreferenceProvider>
+                <TableProvider>
+                  <CommandPaletteProvider>
+                    <AppContent />
+                  </CommandPaletteProvider>
+                </TableProvider>
+              </GeneratorPreferenceProvider>
+            </ChatGPTProvider>
           </AuthProvider>
         </ApiConfigProvider>
       </ErrorBoundary>

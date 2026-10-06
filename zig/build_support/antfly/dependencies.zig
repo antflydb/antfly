@@ -857,6 +857,7 @@ pub fn create(b: *std.Build) ?Shared {
     });
     credentials_mod.addImport("httpx", httpx_mod);
     credentials_mod.addImport("antfly_cancellation", cancellation_mod);
+    credentials_mod.addImport("antfly_platform", platform_mod);
     credentials_mod.link_libc = link_libc;
     const aws_tests_mod = b.createModule(.{
         .root_source_file = b.path("lib/credentials/src/aws.zig"),
@@ -866,6 +867,7 @@ pub fn create(b: *std.Build) ?Shared {
     });
     aws_tests_mod.addImport("httpx", httpx_mod);
     aws_tests_mod.addImport("antfly_cancellation", cancellation_mod);
+    aws_tests_mod.addImport("antfly_platform", platform_mod);
     const aws_tests = b.addTest(.{ .root_module = aws_tests_mod });
     b.step("aws-credentials-test", "Test shared AWS discovery and credential cache ownership")
         .dependOn(&b.addRunArtifact(aws_tests).step);
