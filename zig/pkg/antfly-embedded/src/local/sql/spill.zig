@@ -1093,6 +1093,62 @@ pub const Sequential = struct {
         return .{ .borrowed = .{ .a = a, .arena = .init(a), .rows = batch_rows.rows } };
     }
 
+    /// Compact input valid until the next physical pull from this source.
+    /// Probe consumers reuse this storage after draining all matches, avoiding
+    /// one heap lease and a full row matrix for every sequential block.
+    pub fn readInputBlockBorrowed(self: *Sequential, offset: u64) !InputBlock {
+        try self.seal();
+        if (offset >= self.size) return error.InvalidSqlSpill;
+        if (self.read_rows.len != 0 or self.read_single_offset == offset or offset != self.read_first)
+            return self.readInputBlock(offset);
+        var header: [17]u8 = undefined;
+        try self.file.readRaw(self.read_offset, &header);
+        if (header[16] == 255) return self.readInputBlock(offset);
+        const a = self.file.manager.allocator();
+        if (!self.read_arena.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
+        var block: OwnedBlock = .{ .a = a, .arena = .init(a) };
+        try self.decodeCompactBlock(&block, self.read_arena.allocator(), offset);
+        return .{ .borrowed = block };
+    }
+    fn decodeCompactBlock(self: *Sequential, owner: *OwnedBlock, owned: Allocator, offset: u64) !void {
+        try self.seal();
+        if (offset >= self.size) return error.InvalidSqlSpill;
+        var header: [17]u8 = undefined;
+        try self.file.readRaw(self.read_offset, &header);
+        if (header[16] == 255) {
+            var decoded = try self.file.read(owned, self.read_offset);
+            if (decoded.next != none or decoded.matched) return error.InvalidSqlSpill;
+            self.read_offset = decoded.following;
+            decoded.following = offset + 1;
+            owner.rows = try owned.dupe(Row, &.{decoded.row});
+        } else {
+            const len = std.mem.readInt(u64, header[0..8], .little);
+            if (header[16] > 1 or len > self.file.manager.max_record_bytes or len > self.file.size -| (self.read_offset + header.len)) return error.InvalidSqlSpill;
+            const encoded = try owned.alloc(u8, @intCast(len));
+            try self.file.readRaw(self.read_offset + header.len, encoded);
+            const payload = if (header[16] == 1) blk: {
+                if (try snappy.decodedLen(encoded) > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
+                break :blk try snappy.decode(owned, encoded);
+            } else encoded;
+            if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
+            var decoder: Decoder = .{ .manager = self.file.manager, .a = owned, .bytes = payload };
+            const count_rows = try decoder.count();
+            const width_values = try decoder.count();
+            const width_keys = try decoder.count();
+            if (count_rows == 0 or count_rows > 256 or count_rows > self.size - offset or width_values > 1024 or width_keys > 256) return error.InvalidSqlSpill;
+            const ordinals = try owned.alloc(u64, count_rows);
+            for (ordinals) |*ordinal| ordinal.* = try decoder.word();
+            const values = try owned.alloc(EncodedColumn, width_values);
+            const keys = try owned.alloc(EncodedColumn, width_keys);
+            for (values) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
+            for (keys) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
+            if (decoder.position != payload.len) return error.InvalidSqlSpill;
+            owner.encoded = .{ .values = values, .keys = keys, .ordinals = ordinals };
+            self.read_offset += header.len + len;
+        }
+        self.read_first = offset + owner.count();
+        self.read_single_offset = null;
+    }
     /// Transfer a decoded arena without copying its cell payloads. The file
     /// retains only its forward physical offset; the lease owns this block.
     pub fn readOwnedBlock(self: *Sequential, offset: u64) !*OwnedBlock {
@@ -1104,44 +1160,7 @@ pub const Sequential = struct {
         if (self.read_rows.len == 0 and self.read_single_offset != offset and offset == self.read_first) {
             owner.* = .{ .a = a, .arena = .init(a) };
             errdefer owner.arena.deinit();
-            try self.seal();
-            if (offset >= self.size) return error.InvalidSqlSpill;
-            var header: [17]u8 = undefined;
-            try self.file.readRaw(self.read_offset, &header);
-            const owned = owner.arena.allocator();
-            if (header[16] == 255) {
-                var decoded = try self.file.read(owned, self.read_offset);
-                if (decoded.next != none or decoded.matched) return error.InvalidSqlSpill;
-                self.read_offset = decoded.following;
-                decoded.following = offset + 1;
-                owner.rows = try owned.dupe(Row, &.{decoded.row});
-            } else {
-                const len = std.mem.readInt(u64, header[0..8], .little);
-                if (header[16] > 1 or len > self.file.manager.max_record_bytes or len > self.file.size -| (self.read_offset + header.len)) return error.InvalidSqlSpill;
-                const encoded = try owned.alloc(u8, @intCast(len));
-                try self.file.readRaw(self.read_offset + header.len, encoded);
-                const payload = if (header[16] == 1) blk: {
-                    if (try snappy.decodedLen(encoded) > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
-                    break :blk try snappy.decode(owned, encoded);
-                } else encoded;
-                if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
-                var decoder: Decoder = .{ .manager = self.file.manager, .a = owned, .bytes = payload };
-                const count_rows = try decoder.count();
-                const width_values = try decoder.count();
-                const width_keys = try decoder.count();
-                if (count_rows == 0 or count_rows > 256 or count_rows > self.size - offset or width_values > 1024 or width_keys > 256) return error.InvalidSqlSpill;
-                const ordinals = try owned.alloc(u64, count_rows);
-                for (ordinals) |*ordinal| ordinal.* = try decoder.word();
-                const values = try owned.alloc(EncodedColumn, width_values);
-                const keys = try owned.alloc(EncodedColumn, width_keys);
-                for (values) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
-                for (keys) |*column| column.* = try EncodedColumn.decode(&decoder, count_rows);
-                if (decoder.position != payload.len) return error.InvalidSqlSpill;
-                owner.encoded = .{ .values = values, .keys = keys, .ordinals = ordinals };
-                self.read_offset += header.len + len;
-            }
-            self.read_first = offset + owner.count();
-            self.read_single_offset = null;
+            try self.decodeCompactBlock(owner, owner.arena.allocator(), offset);
             return owner;
         }
         const block = try self.readBatchBorrowed(offset, 256);
@@ -2222,13 +2241,13 @@ fn retainingInputScenario(a: Allocator) !void {
     defer file.close();
     const wide: [4096]u8 = @splat('x');
     for (0..21) |index| _ = try file.append(.{ .values = &.{Datum.json(.{ .string = if (index == 10) &wide else "small" })}, .keys = &.{Datum.json(.{ .integer = @intCast(index) })}, .ordinal = index }, none);
-    for (0..2) |_| {
+    for ([_]bool{ false, true }) |borrow_compact| {
         file.rewind();
         var offset: usize = 0;
         var owned: usize = 0;
         var borrowed: usize = 0;
         while (offset < 21) {
-            var input = try file.readInputBlock(offset);
+            var input = if (borrow_compact) try file.readInputBlockBorrowed(offset) else try file.readInputBlock(offset);
             defer input.deinit();
             if (input == .owned) owned += 1 else borrowed += 1;
             const block = input.view();
@@ -2239,7 +2258,10 @@ fn retainingInputScenario(a: Allocator) !void {
             }
             offset += block.count();
         }
-        try std.testing.expect(owned != 0 and borrowed == 1);
+        if (borrow_compact) {
+            try std.testing.expectEqual(@as(usize, 0), owned);
+            try std.testing.expect(borrowed > 1);
+        } else try std.testing.expect(owned != 0 and borrowed == 1);
     }
 }
 test "SQL retaining spill consumers borrow singleton records between compact blocks" {

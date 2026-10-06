@@ -47,6 +47,8 @@ pub const Join = struct {
     pending_count: usize = 0,
     repartitions: usize = 0,
     probe_offset: u64 = 0,
+    probe_input: ?spill.Sequential.InputBlock = null,
+    probe_input_index: usize = 0,
     hash: ?*operators.HashJoin = null,
     probe: ?operators.HashJoin.Probe = null,
     left: ?[]const Datum = null,
@@ -56,7 +58,7 @@ pub const Join = struct {
     next_ordinals: [2]usize = @splat(0),
     finished: bool = false,
     probing_started: bool = false,
-    probe_arena: std.heap.ArenaAllocator,
+    probe_cells: []Datum = &.{},
     scratch: std.heap.ArenaAllocator,
     candidate: std.heap.ArenaAllocator,
     output_arena: std.heap.ArenaAllocator,
@@ -283,7 +285,7 @@ pub const Join = struct {
         const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
         const lanes = requested_lanes orelse @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
         const parallel = !assigned and bytes >= 512 * 1024 and lanes >= 2;
-        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (parallel) bytes / (lanes + 1) else bytes), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = parallel };
+        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (parallel) bytes / (lanes + 1) else bytes), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = parallel };
         return self;
     }
     pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {
@@ -313,7 +315,6 @@ pub const Join = struct {
         if (self.active_join) |owner| owner.close();
         self.closeInputs();
         if (self.output) |pipe| pipe.close();
-        self.probe_arena.deinit();
         self.scratch.deinit();
         self.candidate.deinit();
         self.output_arena.deinit();
@@ -321,6 +322,9 @@ pub const Join = struct {
         self.a.destroy(self);
     }
     fn closeInputs(self: *Join) void {
+        if (self.probe_input) |*block| block.deinit();
+        self.probe_input = null;
+        self.probe_input_index = 0;
         if (self.hash) |hash| hash.deinit();
         self.hash = null;
         self.probe = null;
@@ -334,7 +338,8 @@ pub const Join = struct {
         self.active = null;
         for (self.pending[0..self.pending_count]) |*task| task.close();
         self.pending_count = 0;
-        _ = self.probe_arena.reset(.free_all);
+        self.a.free(self.probe_cells);
+        self.probe_cells = &.{};
         _ = self.scratch.reset(.free_all);
         _ = self.candidate.reset(.free_all);
     }
@@ -522,14 +527,38 @@ pub const Join = struct {
             }
             if (self.active.?.probes) |*file| {
                 if (self.probe_offset < file.size) {
-                    _ = self.probe_arena.reset(.free_all);
-                    const row = try file.readBorrowed(self.probe_offset);
-                    self.probe_offset = row.following;
-                    self.left = row.row.values;
+                    // Keep the physical probe block until every match for its
+                    // rows has drained. Expand only the current row at the
+                    // join boundary, rather than boxing an entire typed block.
+                    if (self.probe_input) |*input| if (self.probe_input_index == input.view().count()) {
+                        input.deinit();
+                        self.probe_input = null;
+                    };
+                    if (self.probe_input == null) {
+                        self.probe_input = try file.readInputBlockBorrowed(self.probe_offset);
+                        self.probe_input_index = 0;
+                    }
+                    const block = self.probe_input.?.view();
+                    const row = if (block.encoded != null) row: {
+                        const width = block.width();
+                        const size = width + block.keyWidth();
+                        if (self.probe_cells.len < size) self.probe_cells = try self.a.realloc(self.probe_cells, size);
+                        const values = self.probe_cells[0..width];
+                        const keys = self.probe_cells[width..size];
+                        for (values, 0..) |*value, column| value.* = try block.cell(self.probe_input_index, column);
+                        for (keys, 0..) |*key, column| key.* = try block.keyCell(self.probe_input_index, column);
+                        break :row operators.Row{ .values = values, .keys = keys, .ordinal = block.ordinal(self.probe_input_index) };
+                    } else block.rows[self.probe_input_index];
+                    self.probe_input_index += 1;
+                    self.probe_offset += 1;
+                    self.left = row.values;
                     self.matched = false;
-                    self.probe = try self.hash.?.probe(row.row.keys);
+                    self.probe = try self.hash.?.probe(row.keys);
                     continue;
                 }
+                if (self.probe_input) |*input| input.deinit();
+                self.probe_input = null;
+                self.probe_input_index = 0;
                 file.close();
                 self.active.?.probes = null;
             }
@@ -820,4 +849,71 @@ test "SQL partition join child keeps its assigned workspace and prioritizes larg
     try child.finishInputs();
     try std.testing.expect(!child.parallel_builds);
     try std.testing.expectEqual(@as(usize, 1024 * 1024), child.limits.bytes);
+}
+
+test "SQL compact probe blocks retain rows through duplicate matches and early close" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    for ([_]bool{ false, true }) |early_close| {
+        const join = try Join.create(a, &manager, 256 * 1024, 10000, 0, true, false);
+        defer join.close();
+        for (0..8) |key_index| for (0..3) |duplicate| {
+            const key = Datum.json(.{ .integer = @intCast(key_index) });
+            try join.add(true, &.{ key, Datum.json(.{ .integer = @intCast(duplicate) }) }, &.{key}, key_index * 3 + duplicate);
+        };
+        var expected_matches: usize = 0;
+        var expected_unmatched: usize = 0;
+        for (0..1025) |index| {
+            const key = if (index % 97 == 0) Datum{} else Datum.json(.{ .integer = @intCast(index % 8) });
+            const nullable = if (index % 2 == 0) Datum{} else Datum.json(.null);
+            const text = if (index % 3 == 0) "alpha\x00tail" else "beta";
+            try join.add(false, &.{ Datum.json(.{ .integer = @intCast(index) }), Datum.json(.{ .string = text }), nullable }, &.{key}, index);
+            if (key.sql_null) expected_unmatched += 1 else expected_matches += 3;
+        }
+        var matches: usize = 0;
+        var unmatched: usize = 0;
+        var seen: [1025]u8 = @splat(0);
+        while (try join.next()) |pair| {
+            const row = pair.left orelse return error.TestUnexpectedResult;
+            const index: usize = @intCast(row[0].value.integer);
+            try std.testing.expect(index < seen.len);
+            try std.testing.expectEqualStrings(if (index % 3 == 0) "alpha\x00tail" else "beta", row[1].value.string);
+            try std.testing.expectEqual(index % 2 == 0, row[2].sql_null);
+            try std.testing.expect(row[2].value == .null);
+            if (pair.match) |matched| {
+                try std.testing.expect(index % 97 != 0);
+                const right = pair.right orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(i64, @intCast(index % 8)), right[0].value.integer);
+                const duplicate: u3 = @intCast(right[1].value.integer);
+                const mask = @as(u8, 1) << duplicate;
+                try std.testing.expect(seen[index] & mask == 0);
+                seen[index] |= mask;
+                try join.accept(matched);
+                matches += 1;
+                if (early_close) {
+                    // Closing while duplicate matches still borrow this probe
+                    // row must release the retained physical block exactly once.
+                    try std.testing.expect(join.probe_input != null);
+                    break;
+                }
+            } else {
+                try std.testing.expect(pair.right == null);
+                try std.testing.expect(index % 97 == 0);
+                try std.testing.expectEqual(@as(u8, 0), seen[index]);
+                seen[index] = 8;
+                unmatched += 1;
+            }
+        }
+        if (!early_close) {
+            try std.testing.expectEqual(expected_matches, matches);
+            try std.testing.expectEqual(expected_unmatched, unmatched);
+            for (seen, 0..) |mask, index| try std.testing.expectEqual(@as(u8, if (index % 97 == 0) 8 else 7), mask);
+            try std.testing.expect(join.probe_input == null);
+        }
+    }
 }
