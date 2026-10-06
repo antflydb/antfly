@@ -57,7 +57,7 @@ fn compare(a: Datum, b: Datum, direction: operators.Order) !std.math.Order {
         if (a.sql_null == b.sql_null) return .eq;
         return if (a.sql_null == (direction.nulls_first orelse direction.descending)) .lt else .gt;
     }
-    const result = try scalar.compare(a.value, b.value);
+    const result = try scalar.compareDatums(a, b);
     return if (direction.descending) result.invert() else result;
 }
 pub fn equal(cells: anytype, a: usize, b: usize, columns: []const usize) !bool {
@@ -345,7 +345,7 @@ const Tree = struct {
         result.true_count += right.true_count;
         switch (self.spec.kind) {
             .min, .max => {
-                const order = try scalar.compare((try self.cells.get(left.selected, self.spec.arguments[0])).value, (try self.cells.get(right.selected, self.spec.arguments[0])).value);
+                const order = try scalar.compareDatums(try self.cells.get(left.selected, self.spec.arguments[0]), try self.cells.get(right.selected, self.spec.arguments[0]));
                 if (order == (if (self.spec.kind == .min) std.math.Order.gt else .lt)) result.selected = right.selected;
             },
             .avg => {

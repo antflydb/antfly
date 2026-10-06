@@ -35,11 +35,11 @@ pub fn columns(a: A, values: []const []const scalar.Datum, count: usize, grouped
             if (valid.* == null) continue;
             const semantic = if (cell.sql_null) 0 else if (cell.value == .string) blk: {
                 if (text.get(cell.value.string)) |cached| break :blk cached;
-                const value = try scalar.semanticHash(cell.value);
+                const value = try scalar.semanticHashDatum(cell);
                 // Bound memo state for high-cardinality identifiers.
                 if (text.count() < 4096) try text.put(a, cell.value.string, value);
                 break :blk value;
-            } else try scalar.semanticHash(cell.value);
+            } else try scalar.semanticHashDatum(cell);
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(cell.sql_null);
             std.mem.writeInt(u64, bytes[1..9], semantic, .little);
@@ -70,10 +70,10 @@ pub fn rows(a: A, values: []const []const scalar.Datum, grouped: bool) ![]?u64 {
             if (valid.* == null) continue;
             const semantic = if (cell.sql_null) 0 else if (cell.value == .string) blk: {
                 if (text.get(cell.value.string)) |hash| break :blk hash;
-                const hash = try scalar.semanticHash(cell.value);
+                const hash = try scalar.semanticHashDatum(cell);
                 if (text.count() < 4096) try text.put(a, cell.value.string, hash);
                 break :blk hash;
-            } else try scalar.semanticHash(cell.value);
+            } else try scalar.semanticHashDatum(cell);
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(cell.sql_null);
             std.mem.writeInt(u64, bytes[1..9], semantic, .little);

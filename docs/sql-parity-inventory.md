@@ -81,10 +81,18 @@ Strict scalar ANY/ALL comparisons retain three-valued logic, including empty
 arrays and multidimensional row-major traversal. The shared
 `sql_array_reference.json` fixture checks 18 exact PostgreSQL expressions against
 both PostgreSQL and the native value operators. This is component evidence,
-**not public SQL activation**: array parsing/binding, durable typed-column
-metadata, operator/spill propagation, public result types and pgwire codecs
-still need end-to-end integration. Numeric/temporal element types and non-C
-collations also remain outside this layer's current contract. No original
+**not public SQL activation**. The complete typed cell now flows through shared
+physical ordering/hashing, top-K and hash-join ownership, retained-column
+equality, recursive distinct keys, window peer comparisons and row/column
+spill codecs. Arrays never use JSON-null sort prefixes or primitive vector
+kernels; exact comparison or fallback retains their identity. Spill decoders
+reject invalid types, noncanonical empty dimensions, nested SQL-array tags and
+every truncated array-cell prefix. Encoded record limits, decoded array bounds
+and statement resident-memory quotas are independent. Allocation-fault tests
+cover retained columns and codecs. Array parsing/binding, durable typed-column
+metadata, public result types and pgwire codecs still need end-to-end
+integration. Numeric/temporal element types and non-C collations also remain
+outside this layer's current contract. No original
 typed-array cases are marked complete on this evidence alone.
 
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.

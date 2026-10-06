@@ -52,7 +52,7 @@ const Vector = struct {
         };
     }
     pub fn set(self: Vector, row: usize, value: Datum) !void {
-        if (value.patterns != null) return error.UnsupportedTypedKernel;
+        if (value.patterns != null or value.array != null) return error.UnsupportedTypedKernel;
         self.states[row] = if (value.sql_null) .sql_null else if (value.value == .null) .json_null else .value;
         if (self.states[row] != .value) return;
         switch (self.kind) {

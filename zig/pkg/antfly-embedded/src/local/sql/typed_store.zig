@@ -84,6 +84,7 @@ const Column = struct {
     values: Values = .unknown,
     nulls: std.ArrayList(u64) = .empty,
     patterns: std.ArrayList(?*scalar.PatternSet) = .empty,
+    arrays: std.ArrayList(?*const @import("array_value.zig").Value) = .empty,
     fn deinit(self: *Column, a: A) void {
         switch (self.values) {
             .unknown => {},
@@ -91,6 +92,7 @@ const Column = struct {
         }
         self.nulls.deinit(a);
         self.patterns.deinit(a);
+        self.arrays.deinit(a);
     }
     fn isNull(self: Column, row: usize) bool {
         return self.nulls.items[row / 64] & (@as(u64, 1) << @as(u6, @intCast(row % 64))) != 0;
@@ -107,9 +109,16 @@ const Column = struct {
             .decimals => |v| .{ .number_string = v.getText(row) },
             .encoded => |v| v.items[row],
         };
-        return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row] };
+        return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row], .array = if (self.arrays.items.len == 0) null else self.arrays.items[row] };
     }
     fn append(self: *Column, a: A, owned: A, scratch: A, row: usize, value: Datum) !void {
+        if (self.arrays.items.len != 0 or value.array != null) {
+            if (self.arrays.items.len == 0) {
+                try self.arrays.resize(a, row);
+                @memset(self.arrays.items, null);
+            }
+            try self.arrays.append(a, if (value.array != null) (try @import("operators.zig").cloneDatum(owned, value)).array else null);
+        }
         if (row % 64 == 0) try self.nulls.append(a, 0);
         if (value.sql_null) self.nulls.items[row / 64] |= @as(u64, 1) << @as(u6, @intCast(row % 64));
         if (self.patterns.items.len != 0 or value.patterns != null) {
@@ -172,7 +181,7 @@ const Column = struct {
             .booleans => |*v| try v.append(a, !value.sql_null and value.value.bool),
             .strings => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.string),
             .decimals => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.number_string),
-            .encoded => |*v| try v.append(a, if (value.sql_null) .null else (try @import("operators.zig").cloneDatum(owned, value)).value),
+            .encoded => |*v| try v.append(a, if (value.sql_null or value.array != null) .null else (try @import("operators.zig").cloneDatum(owned, value)).value),
         }
     }
 };
@@ -285,6 +294,10 @@ pub const Store = struct {
                 if (!null_equal or is_null != value.sql_null) return false;
                 continue;
             }
+            if (value.array != null or (stored.arrays.items.len != 0 and stored.arrays.items[row_index] != null)) {
+                if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
+                continue;
+            }
             // Dispatch on the retained physical type, without constructing a
             // Datum or invoking JSON comparison for homogeneous primitive keys.
             const equal_ = switch (stored.values) {
@@ -296,11 +309,45 @@ pub const Store = struct {
             };
             if (equal_) |matches| {
                 if (!matches) return false;
-            } else if ((try scalar.compare((try stored.cell(a, row_index)).value, value.value)) != .eq) return false;
+            } else if ((try scalar.compareDatums(try stored.cell(a, row_index), value)) != .eq) return false;
         }
         return true;
     }
 };
+test "SQL typed array retained columns preserve bounds ownership and type separation under allocation faults" {
+    const Harness = struct {
+        fn run(a: A) !void {
+            const arrays = @import("array_value.zig");
+            var text: [3]u8 = "abc".*;
+            var dimensions = [_]arrays.Dimension{.{ .length = 3, .lower = -2 }};
+            const value = try arrays.Value.init(.text, &dimensions, &.{ Datum.json(.{ .string = &text }), .{}, Datum.json(.{ .string = "tail" }) }, .{});
+            var store = Store.init(a);
+            defer store.deinit();
+            _ = try store.append(&.{.{}});
+            _ = try store.append(&.{Datum.typedArray(&value)});
+            _ = try store.append(&.{Datum.json(.null)});
+            _ = try store.append(&.{Datum.json(.{ .integer = 7 })});
+            _ = try store.append(&.{Datum.typedArray(&value)});
+            @memset(&text, 'z');
+            dimensions[0].lower = 1;
+            const cell = try store.cell(a, 1, 0);
+            try std.testing.expect(!cell.sql_null and cell.array != null);
+            try std.testing.expectEqual(@as(i32, -2), cell.array.?.dimensions[0].lower);
+            try std.testing.expectEqualStrings("abc", cell.array.?.elements[0].value.string);
+            try std.testing.expect(cell.array.?.elements[1].sql_null);
+            try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
+            const json_null = try store.cell(a, 2, 0);
+            try std.testing.expect(!json_null.sql_null and json_null.array == null);
+            try std.testing.expectEqual(@as(i64, 7), (try store.cell(a, 3, 0)).value.integer);
+            try std.testing.expect(try store.equal(a, 4, &.{cell}, true));
+            try std.testing.expectError(error.SqlTypeMismatch, store.equal(a, 1, &.{json_null}, true));
+            const shifted = try arrays.Value.init(.text, &dimensions, cell.array.?.elements, .{});
+            try std.testing.expect(!try store.equal(a, 1, &.{Datum.typedArray(&shifted)}, true));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
 test "SQL typed store preserves bitmaps ownership mixed exact numerics and JSON null" {
     const a = std.testing.allocator;
     var store = Store.init(a);

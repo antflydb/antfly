@@ -284,6 +284,7 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
 }
 pub fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
     if (op == .is_null or op == .is_not_null) return Datum.json(.{ .bool = value.sql_null == (op == .is_null) });
+    if (value.array != null) return error.SqlTypeMismatch;
     if (op == .is_true or op == .is_not_true or op == .is_false or op == .is_not_false) {
         const target = op == .is_true or op == .is_not_true;
         const matches = value.value == .bool and value.value.bool == target;
@@ -309,11 +310,12 @@ fn comparison(op: Binary) bool {
 }
 pub fn binary(op: Binary, left: Datum, right: Datum) !Datum {
     if (op == .is_distinct or op == .is_not_distinct) {
-        const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try scalar.compare(left.value, right.value)) == .eq;
+        const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try scalar.compareDatums(left, right)) == .eq;
         return Datum.json(.{ .bool = equal == (op == .is_not_distinct) });
     }
     if (left.sql_null or right.sql_null) return .{};
-    if (comparison(op)) return Datum.json(scalar.comparison(op, try scalar.compare(left.value, right.value)));
+    if (comparison(op)) return Datum.json(scalar.comparison(op, try scalar.compareDatums(left, right)));
+    if (left.array != null or right.array != null) return error.SqlTypeMismatch;
     // Arithmetic shares the scalar overflow/division/finite-number contract.
     // JSON null is a value for comparison, but remains null in arithmetic.
     if (left.value == .null or right.value == .null) return .{};

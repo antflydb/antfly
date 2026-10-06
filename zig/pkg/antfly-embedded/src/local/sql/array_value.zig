@@ -221,7 +221,7 @@ pub const Value = struct {
 
 fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
     try budget.consume(1);
-    if (element.patterns != null) return error.SqlTypeMismatch;
+    if (element.patterns != null or element.array != null) return error.SqlTypeMismatch;
     if (element.sql_null) {
         if (element.value != .null) return error.InvalidSqlArrayShape;
         return;

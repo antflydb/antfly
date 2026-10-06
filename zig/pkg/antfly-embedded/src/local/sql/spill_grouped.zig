@@ -136,7 +136,7 @@ pub const Grouped = struct {
         if (!self.partitioned) return self.sort.add(row);
         var hash = std.hash.Wyhash.init(0);
         for (row.keys) |key| {
-            const value = if (key.sql_null) 0 else try scalar.semanticHash(key.value);
+            const value = if (key.sql_null) 0 else try scalar.semanticHashDatum(key);
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(key.sql_null);
             std.mem.writeInt(u64, bytes[1..9], value, .little);
@@ -275,7 +275,7 @@ pub const Grouped = struct {
     }
     fn same(left: []const Datum, right: []const Datum) !bool {
         if (left.len != right.len) return error.InvalidSqlSpill;
-        for (left, right) |a, b| if (a.sql_null != b.sql_null or (!a.sql_null and (try scalar.compare(a.value, b.value)) != .eq)) return false;
+        for (left, right) |a, b| if (a.sql_null != b.sql_null or (!a.sql_null and (try scalar.compareDatums(a, b)) != .eq)) return false;
         return true;
     }
     pub fn next(self: *Grouped, out: Allocator) !?operators.GroupResult {

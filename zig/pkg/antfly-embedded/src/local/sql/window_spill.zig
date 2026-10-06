@@ -25,7 +25,7 @@ const Datum = scalar.Datum;
 fn same(left: []const Datum, right: []const Datum, count: usize) !bool {
     for (left[0..count], right[0..count]) |a, b| {
         if (a.sql_null != b.sql_null) return false;
-        if (!a.sql_null and (try scalar.compare(a.value, b.value)) != .eq) return false;
+        if (!a.sql_null and (try scalar.compareDatums(a, b)) != .eq) return false;
     }
     return true;
 }

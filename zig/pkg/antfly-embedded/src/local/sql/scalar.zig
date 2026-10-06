@@ -31,6 +31,9 @@ pub const PatternSet = struct {
     close: *const fn (*anyopaque) void,
 };
 pub const Datum = struct {
+    /// A pinned, immutable SQL array. JSON arrays remain in value and never
+    /// acquire SQL-array semantics from their payload shape.
+    array: ?*const @import("array_value.zig").Value = null,
     patterns: ?*PatternSet = null,
     value: Json = .null,
     sql_null: bool = true,
@@ -40,6 +43,9 @@ pub const Datum = struct {
     }
     pub fn json(value: Json) Datum {
         return .{ .value = value, .sql_null = false };
+    }
+    pub fn typedArray(value: *const @import("array_value.zig").Value) Datum {
+        return .{ .array = value, .sql_null = false };
     }
 };
 pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true };
@@ -567,7 +573,9 @@ const Evaluator = struct {
     }
 
     fn run(self: *Evaluator, index: u32, depth: usize) anyerror!Json {
-        return (try self.runDatum(index, depth)).value;
+        const result = try self.runDatum(index, depth);
+        if (result.array != null) return error.SqlTypeMismatch;
+        return result.value;
     }
 
     fn runDatum(self: *Evaluator, index: u32, depth: usize) anyerror!Datum {
@@ -585,6 +593,7 @@ const Evaluator = struct {
             .cast => |cast| blk: {
                 const datum = try self.runDatum(cast.operand, depth + 1);
                 if (datum.sql_null) break :blk .{};
+                if (datum.array != null) return error.SqlTypeMismatch;
                 if (cast.type == .string and self.program.instructions[cast.operand].type.kind == .json) break :blk Datum.json(.{ .string = try self.jsonText(datum.value) });
                 if (datum.value == .null and cast.type == .string) break :blk Datum.json(.{ .string = "null" });
                 if (datum.value == .null and cast.type != .json) return error.SqlTypeMismatch;
@@ -598,6 +607,7 @@ const Evaluator = struct {
                 const left = try self.runDatum(binary.left, depth + 1);
                 const right = try self.runDatum(binary.right, depth + 1);
                 if (left.sql_null or right.sql_null) break :blk .{};
+                if (left.array != null or right.array != null) return error.SqlTypeMismatch;
                 const value: Json = if (left.value == .object and right.value == .string)
                     left.value.object.get(right.value.string) orelse break :blk .{}
                 else if (left.value == .array and right.value == .integer) selected: {
@@ -613,11 +623,11 @@ const Evaluator = struct {
                 const left = try self.runDatum(binary.left, depth + 1);
                 const right = try self.runDatum(binary.right, depth + 1);
                 if (binary.op == .is_distinct or binary.op == .is_not_distinct) {
-                    const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try compare(left.value, right.value)) == .eq;
+                    const equal = if (left.sql_null or right.sql_null) left.sql_null and right.sql_null else (try compareDatums(left, right)) == .eq;
                     break :blk Datum.json(.{ .bool = equal == (binary.op == .is_not_distinct) });
                 }
                 if (left.sql_null or right.sql_null) break :blk .{};
-                break :blk Datum.json(comparison(binary.op, try compare(left.value, right.value)));
+                break :blk Datum.json(comparison(binary.op, try compareDatums(left, right)));
             } else Datum.fromJson(try self.runLegacy(index, depth)),
             .case_when => |case| blk: {
                 for (case.branches) |branch| {
@@ -639,7 +649,7 @@ const Evaluator = struct {
                         unknown = true;
                         continue;
                     }
-                    if ((try compare(operand.value, value.value)) == .eq) break :blk Datum.json(.{ .bool = !list.negated });
+                    if ((try compareDatums(operand, value)) == .eq) break :blk Datum.json(.{ .bool = !list.negated });
                 }
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
@@ -753,14 +763,14 @@ const Evaluator = struct {
                     .nullif => {
                         const left = try self.runDatum(call.args[0], depth + 1);
                         const right = try self.runDatum(call.args[1], depth + 1);
-                        break :blk if (left.sql_null or (!right.sql_null and (try compare(left.value, right.value)) == .eq)) .{} else left;
+                        break :blk if (left.sql_null or (!right.sql_null and (try compareDatums(left, right)) == .eq)) .{} else left;
                     },
                     .greatest, .least => {
                         var best: Datum = .{};
                         for (call.args) |arg| {
                             const datum = try self.runDatum(arg, depth + 1);
                             if (datum.sql_null) continue;
-                            if (best.sql_null or (try compare(datum.value, best.value)) == (if (call.function == .greatest) std.math.Order.gt else .lt)) best = datum;
+                            if (best.sql_null or (try compareDatums(datum, best)) == (if (call.function == .greatest) std.math.Order.gt else .lt)) best = datum;
                         }
                         break :blk best;
                     },
@@ -1443,6 +1453,28 @@ pub fn compare(left: Json, right: Json) !std.math.Order {
 pub fn semanticHash(value: Json) !u64 {
     var budget: json_order.Budget = .{};
     return json_order.hash(value, &budget, 0);
+}
+
+/// Physical operators compare the complete typed cell, never its JSON-only
+/// payload. NULL ordering here matches array element ordering; row operators
+/// apply their explicit NULLS FIRST/LAST before calling this helper.
+pub fn compareDatums(left: Datum, right: Datum) anyerror!std.math.Order {
+    if (left.sql_null or right.sql_null) return if (left.sql_null == right.sql_null) .eq else if (left.sql_null) .gt else .lt;
+    if (left.array) |array| {
+        var work: json_order.Budget = .{};
+        return array.compare((right.array orelse return error.SqlTypeMismatch).*, &work);
+    }
+    if (right.array != null) return error.SqlTypeMismatch;
+    return compare(left.value, right.value);
+}
+
+pub fn semanticHashDatum(value: Datum) anyerror!u64 {
+    if (value.sql_null) return 0;
+    if (value.array) |array| {
+        var work: json_order.Budget = .{};
+        return array.semanticHash(&work);
+    }
+    return semanticHash(value.value);
 }
 /// Borrow a UTF-8 character interval; callers account for its linear work.
 fn textSlice(text: []const u8, begin: usize, end: usize) ![]const u8 {

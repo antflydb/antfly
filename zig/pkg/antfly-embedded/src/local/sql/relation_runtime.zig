@@ -808,7 +808,7 @@ fn Engine(comptime Context: type) type {
                 for (values) |value| {
                     var bytes: [9]u8 = undefined;
                     bytes[0] = @intFromBool(value.sql_null);
-                    std.mem.writeInt(u64, bytes[1..9], if (value.sql_null) 0 else try scalar.semanticHash(value.value), .little);
+                    std.mem.writeInt(u64, bytes[1..9], if (value.sql_null) 0 else try scalar.semanticHashDatum(value), .little);
                     hasher.update(&bytes);
                 }
                 const hash = hasher.final();
@@ -817,7 +817,7 @@ fn Engine(comptime Context: type) type {
                     try self.engine.checkpoint();
                     const entry = self.set_entries.items[index];
                     var equal = true;
-                    for (entry.values, values) |a, b| if (a.sql_null != b.sql_null or (!a.sql_null and try scalar.compare(a.value, b.value) != .eq)) {
+                    for (entry.values, values) |a, b| if (a.sql_null != b.sql_null or (!a.sql_null and try scalar.compareDatums(a, b) != .eq)) {
                         equal = false;
                         break;
                     };

@@ -36,6 +36,7 @@ pub fn encode(values: []const Datum, orders: anytype) ?Key {
     if (values.len != orders.len or values.len > 16) return null;
     var key: Key = .{};
     for (values, orders, 0..) |value, order, index| {
+        if (value.array != null) return null;
         const kind: u4 = if (value.sql_null) 0 else switch (value.value) {
             .integer => 1,
             .float => 2,

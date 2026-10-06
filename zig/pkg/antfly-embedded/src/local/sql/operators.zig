@@ -36,7 +36,7 @@ pub fn compareRows(left: Row, right: Row, orders: []const Order) !std.math.Order
             const nulls_first = order.nulls_first orelse order.descending;
             return if (a.sql_null == nulls_first) .lt else .gt;
         }
-        const comparison = try scalar.compare(a.value, b.value);
+        const comparison = try scalar.compareDatums(a, b);
         if (comparison != .eq) return if (order.descending) comparison.invert() else comparison;
     }
     return std.math.order(left.ordinal, right.ordinal);
@@ -231,7 +231,7 @@ pub const TopK = struct {
         // Validate values before mutation, including when there is no prior
         // row to compare; malformed input cannot poison a partly sorted heap.
         for (row.keys) |key| if (!key.sql_null) {
-            _ = try scalar.compare(key.value, key.value);
+            _ = try scalar.compareDatums(key, key);
         };
         if (self.count == self.capacity and (try self.compare(row, self.entries[0].row)) != .lt) return;
         if (self.count == self.entries.len and self.count < self.capacity) {
@@ -402,11 +402,11 @@ pub const Aggregate = struct {
         }
         if (self.kind == .pattern_set and value.value != .string) return error.SqlTypeMismatch;
         if (self.distinct) {
-            const hash = try scalar.semanticHash(value.value);
+            const hash = try scalar.semanticHashDatum(value);
             var slot = self.distinct_heads.get(hash);
             while (slot) |index| {
                 const entry = self.distinct_values.items[index];
-                if ((try scalar.compare(value.value, entry.row.row.values[0].value)) == .eq) return;
+                if ((try scalar.compareDatums(value, entry.row.row.values[0])) == .eq) return;
                 slot = entry.next;
             }
             try self.distinct_values.ensureUnusedCapacity(self.alloc, 1);
@@ -449,7 +449,7 @@ pub const Aggregate = struct {
             },
             .min, .max => {
                 if (self.selected) |current| {
-                    const order = try scalar.compare(value.value, current.row.values[0].value);
+                    const order = try scalar.compareDatums(value, current.row.values[0]);
                     if (order != (if (self.kind == .min) std.math.Order.lt else .gt)) {
                         self.count += 1;
                         return;
@@ -531,7 +531,7 @@ pub const HashJoin = struct {
                 self.owner.probes += 1;
                 if (decoded.row.keys.len != self.keys.len) return error.InvalidSqlSpill;
                 var equal = true;
-                for (decoded.row.keys, self.keys) |left, right| if (left.sql_null or right.sql_null or (try scalar.compare(left.value, right.value)) != .eq) {
+                for (decoded.row.keys, self.keys) |left, right| if (left.sql_null or right.sql_null or (try scalar.compareDatums(left, right)) != .eq) {
                     equal = false;
                     break;
                 };
@@ -625,7 +625,7 @@ pub const HashJoin = struct {
         for (keys) |key| {
             if (key.sql_null) return null;
             var bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, try scalar.semanticHash(key.value), .little);
+            std.mem.writeInt(u64, &bytes, try scalar.semanticHashDatum(key), .little);
             hasher.update(&bytes);
         }
         return hasher.final();
@@ -1216,7 +1216,7 @@ pub const Grouped = struct {
         for (keys) |key| {
             var bytes: [9]u8 = undefined;
             bytes[0] = @intFromBool(key.sql_null);
-            std.mem.writeInt(u64, bytes[1..9], if (key.sql_null) 0 else try scalar.semanticHash(key.value), .little);
+            std.mem.writeInt(u64, bytes[1..9], if (key.sql_null) 0 else try scalar.semanticHashDatum(key), .little);
             hasher.update(&bytes);
         }
         return self.resolveGroupHashed(keys, hasher.final());
@@ -1266,7 +1266,19 @@ pub const Grouped = struct {
     }
 };
 
-pub fn cloneDatum(alloc: Allocator, value: Datum) !Datum {
+pub fn cloneDatum(alloc: Allocator, value: Datum) anyerror!Datum {
+    if (value.array) |array| {
+        if (value.sql_null or value.patterns != null or value.value != .null) return error.SqlTypeMismatch;
+        const owned = try alloc.create(@import("array_value.zig").Value);
+        const dimensions = try alloc.dupe(@import("array_value.zig").Dimension, array.dimensions);
+        const elements = try alloc.alloc(Datum, array.elements.len);
+        for (array.elements, elements) |element, *out| {
+            if (element.array != null) return error.SqlTypeMismatch;
+            out.* = try cloneDatum(alloc, element);
+        }
+        owned.* = .{ .element_type = array.element_type, .dimensions = dimensions, .elements = elements };
+        return Datum.typedArray(owned);
+    }
     return .{ .value = try cloneJson(alloc, value.value, 0), .sql_null = value.sql_null, .patterns = value.patterns };
 }
 
@@ -1290,7 +1302,15 @@ fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, Sq
         else => value,
     };
 }
-pub fn datumBytes(value: Datum) !usize {
+pub fn datumBytes(value: Datum) anyerror!usize {
+    if (value.array) |array| {
+        var bytes: usize = @sizeOf(Datum) + @sizeOf(@import("array_value.zig").Value) + array.dimensions.len * @sizeOf(@import("array_value.zig").Dimension);
+        for (array.elements) |element| {
+            if (element.array != null) return error.SqlTypeMismatch;
+            bytes +|= try jsonBytes(element.value, 0);
+        }
+        return bytes;
+    }
     return jsonBytes(value.value, 0);
 }
 fn jsonBytes(value: Json, depth: usize) error{SqlProgramLimitExceeded}!usize {
@@ -1307,6 +1327,38 @@ fn jsonBytes(value: Json, depth: usize) error{SqlProgramLimitExceeded}!usize {
         else => {},
     }
     return size;
+}
+
+test "SQL typed array physical keys preserve ordering hashes join equality and copied ownership" {
+    const arrays = @import("array_value.zig");
+    const a = std.testing.allocator;
+    const elements = &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = 2 }) };
+    const first = try arrays.Value.init(.int32, &.{.{ .length = 2, .lower = 0 }}, elements, .{});
+    const second = try arrays.Value.init(.int32, &.{.{ .length = 2, .lower = 1 }}, elements, .{});
+    const first_cell = Datum.typedArray(&first);
+    const second_cell = Datum.typedArray(&second);
+    try std.testing.expectEqual(std.math.Order.lt, try scalar.compareDatums(first_cell, second_cell));
+    try std.testing.expect(try scalar.semanticHashDatum(first_cell) != try scalar.semanticHashDatum(second_cell));
+    try std.testing.expect(@import("sort_key.zig").encode(&.{first_cell}, &[_]Order{.{}}) == null);
+    var top = try TopK.init(a, 2, &.{.{}}, 128 * 1024);
+    defer top.deinit();
+    try top.add(.{ .values = &.{second_cell}, .keys = &.{second_cell}, .ordinal = 0 });
+    try top.add(.{ .values = &.{first_cell}, .keys = &.{first_cell}, .ordinal = 1 });
+    const ordered = try top.finish(a);
+    defer a.free(ordered);
+    try std.testing.expectEqual(@as(u64, 1), ordered[0].ordinal);
+    try std.testing.expect(ordered[0].values[0].array.? != &first);
+    const join = try HashJoin.create(a, .{});
+    defer join.deinit();
+    try join.add(&.{first_cell}, &.{first_cell});
+    try join.add(&.{second_cell}, &.{second_cell});
+    var probe = try join.probe(&.{first_cell});
+    const matched = (try probe.next()).?;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const values = try matched.materializeValues(arena.allocator());
+    try std.testing.expectEqual(@as(i32, 0), values[0].array.?.dimensions[0].lower);
+    try std.testing.expect((try probe.next()) == null);
 }
 
 test "SQL top K retains bounded competitive rows with stable null ordering" {

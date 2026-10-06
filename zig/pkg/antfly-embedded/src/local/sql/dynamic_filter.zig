@@ -27,11 +27,11 @@ pub const Domain = struct {
     max_owner: std.heap.ArenaAllocator,
     fn add(self: *Domain, value: Datum) !void {
         if (value.sql_null) return;
-        if (self.minimum == null or (try scalar.compare(value.value, self.minimum.?.value)) == .lt) {
+        if (self.minimum == null or (try scalar.compareDatums(value, self.minimum.?)) == .lt) {
             _ = self.min_owner.reset(.free_all);
             self.minimum = try @import("operators.zig").cloneDatum(self.min_owner.allocator(), value);
         }
-        if (self.maximum == null or (try scalar.compare(value.value, self.maximum.?.value)) == .gt) {
+        if (self.maximum == null or (try scalar.compareDatums(value, self.maximum.?)) == .gt) {
             _ = self.max_owner.reset(.free_all);
             self.maximum = try @import("operators.zig").cloneDatum(self.max_owner.allocator(), value);
         }
@@ -116,7 +116,7 @@ pub const Filter = struct {
                     const cell = try one.cell(scratch.allocator(), 0, definition.name);
                     break :blk Datum{ .value = if (cell.sql_null) .null else try @import("describe.zig").coerceAlloc(scratch.allocator(), cell.value, definition.type), .sql_null = cell.sql_null };
                 };
-                if (value.sql_null or (try scalar.compare(value.value, domain.minimum.?.value)) == .lt or (try scalar.compare(value.value, domain.maximum.?.value)) == .gt) keep.* = false;
+                if (value.sql_null or (try scalar.compareDatums(value.*, domain.minimum.?)) == .lt or (try scalar.compareDatums(value.*, domain.maximum.?)) == .gt) keep.* = false;
             }
         }
         const hashes = try @import("batch_hash.zig").columns(a, columns, batch.rowCount(), false);
@@ -140,7 +140,7 @@ pub const Filter = struct {
         const second = self.mask(std.math.rotr(u64, hash, 23));
         if (self.bits[first.index] & first.bit == 0 or self.bits[second.index] & second.bit == 0) return false;
         for (self.domains, values) |domain, value| {
-            if ((try scalar.compare(value.value, domain.minimum.?.value)) == .lt or (try scalar.compare(value.value, domain.maximum.?.value)) == .gt) return false;
+            if ((try scalar.compareDatums(value, domain.minimum.?)) == .lt or (try scalar.compareDatums(value, domain.maximum.?)) == .gt) return false;
         }
         return true;
     }

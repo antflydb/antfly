@@ -48,6 +48,7 @@ pub const Batch = union(enum) {
             .mapped => |v| blk: {
                 if (v.ordinals[column] == std.math.maxInt(usize)) break :blk .{};
                 const value = try v.source.cell(a, v.selection[index], v.ordinals[column]);
+                if (value.array != null) break :blk value;
                 break :blk .{ .value = try @import("describe.zig").coerceAlloc(a, value.value, v.kinds[column]), .sql_null = value.sql_null, .patterns = value.patterns };
             },
             .columns => |v| blk: {
