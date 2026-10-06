@@ -24,50 +24,97 @@ pub fn validateProfile(profile: []const u8) !void {
     for (profile) |byte| if (byte < 32 or byte == 127) return error.InvalidAwsProfile;
 }
 
-pub fn awsLoginKindFromConfig(data: []const u8, profile: []const u8) !AwsLoginKind {
+/// login_profile names the browser session to authenticate; exports always use
+/// the originally selected profile so AWS performs every role assumption.
+pub const AwsProfile = struct {
+    kind: AwsLoginKind,
+    login_profile: []const u8,
+    requires_export: bool,
+};
+
+pub fn awsProfileFromConfig(data: []const u8, profile: []const u8) !AwsProfile {
     try validateProfile(profile);
-    var selected = false;
-    var found = false;
-    var result: AwsLoginKind = .none;
-    var lines = std.mem.splitScalar(u8, data, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
-        if (line[0] == '[' and line[line.len - 1] == ']') {
-            const section = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
-            selected = if (std.mem.startsWith(u8, section, "profile "))
-                std.mem.eql(u8, std.mem.trim(u8, section[8..], " \t"), profile)
-            else
-                std.mem.eql(u8, section, "default") and std.mem.eql(u8, profile, "default");
-            if (selected) {
-                if (found) return error.DuplicateAwsProfile;
-                found = true;
+    var current = profile;
+    var visited: [32][]const u8 = undefined;
+    var count: usize = 0;
+    var requires_export = false;
+    while (true) {
+        for (visited[0..count]) |previous| if (std.mem.eql(u8, previous, current)) return error.InvalidAwsProfileChain;
+        if (count == visited.len) return error.InvalidAwsProfileChain;
+        visited[count] = current;
+        count += 1;
+        var selected = false;
+        var found = false;
+        var kind: AwsLoginKind = .none;
+        var source: ?[]const u8 = null;
+        var role = false;
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+            if (line[0] == '[' and line[line.len - 1] == ']') {
+                const section = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
+                selected = if (std.mem.startsWith(u8, section, "profile "))
+                    std.mem.eql(u8, std.mem.trim(u8, section[8..], " \t"), current)
+                else
+                    std.mem.eql(u8, section, "default") and std.mem.eql(u8, current, "default");
+                if (selected) {
+                    if (found) return error.DuplicateAwsProfile;
+                    found = true;
+                }
+                continue;
             }
+            if (!selected) continue;
+            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const key = std.mem.trim(u8, line[0..eq], " \t");
+            const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+            if (std.mem.eql(u8, key, "role_arn")) {
+                if (role or value.len == 0) return error.InvalidAwsProfile;
+                role = true;
+            } else if (std.mem.eql(u8, key, "source_profile")) {
+                if (source != null) return error.InvalidAwsProfile;
+                try validateProfile(value);
+                source = value;
+            } else {
+                const next: AwsLoginKind = if (std.mem.eql(u8, key, "login_session")) .console else if (std.mem.eql(u8, key, "sso_session") or std.mem.eql(u8, key, "sso_start_url")) .sso else continue;
+                if (value.len == 0 or (kind != .none and kind != next)) return error.InvalidAwsProfile;
+                kind = next;
+            }
+        }
+        requires_export = requires_export or role or kind != .none;
+        if (source) |parent| {
+            if (!role or kind != .none) return error.InvalidAwsProfile;
+            // AWS allows a role to source static keys from its own profile.
+            // Delegate that case to AWS, which validates the source credentials.
+            if (std.mem.eql(u8, parent, current))
+                return .{ .kind = .none, .login_profile = current, .requires_export = true };
+            current = parent;
             continue;
         }
-        if (!selected) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = std.mem.trim(u8, line[0..eq], " \t");
-        const kind: AwsLoginKind = if (std.mem.eql(u8, key, "login_session")) .console else if (std.mem.eql(u8, key, "sso_session") or std.mem.eql(u8, key, "sso_start_url")) .sso else continue;
-        if (std.mem.trim(u8, line[eq + 1 ..], " \t").len == 0 or (result != .none and result != kind)) return error.InvalidAwsProfile;
-        result = kind;
+        return .{ .kind = kind, .login_profile = current, .requires_export = requires_export };
     }
-    return result;
 }
 
-pub fn awsLoginKind(alloc: std.mem.Allocator, io: std.Io, profile: []const u8) !AwsLoginKind {
+pub fn awsLoginKindFromConfig(data: []const u8, profile: []const u8) !AwsLoginKind {
+    return (try awsProfileFromConfig(data, profile)).kind;
+}
+
+/// The returned login_profile is owned by the caller.
+pub fn resolveAwsProfile(alloc: std.mem.Allocator, io: std.Io, profile: []const u8) !AwsProfile {
     try validateProfile(profile);
     const path = if (platform.env.getenv("AWS_CONFIG_FILE")) |value| try alloc.dupe(u8, value) else blk: {
-        const home = platform.env.getenv("HOME") orelse return .none;
+        const home = platform.env.getenv("HOME") orelse return .{ .kind = .none, .login_profile = try alloc.dupe(u8, profile), .requires_export = false };
         break :blk try std.fs.path.join(alloc, &.{ home, ".aws", "config" });
     };
     defer alloc.free(path);
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch |err| switch (err) {
-        error.FileNotFound => return .none,
+        error.FileNotFound => return .{ .kind = .none, .login_profile = try alloc.dupe(u8, profile), .requires_export = false },
         else => return err,
     };
     defer alloc.free(data);
-    return awsLoginKindFromConfig(data, profile);
+    var resolved = try awsProfileFromConfig(data, profile);
+    resolved.login_profile = try alloc.dupe(u8, resolved.login_profile);
+    return resolved;
 }
 
 pub const AwsExport = struct {
@@ -117,6 +164,24 @@ pub fn parseAwsExport(alloc: std.mem.Allocator, raw: []const u8) !std.json.Parse
     if (parsed.value.SessionToken) |token| if (token.len == 0 or parsed.value.Expiration == null) return error.InvalidAwsCredentialExport;
     if (parsed.value.Expiration) |expiration| _ = try parseExpiration(expiration);
     return parsed;
+}
+
+/// Browser and assumed-role profiles must resolve to temporary credentials.
+/// Shared by CLI readiness checks and the runtime to prevent false success.
+pub fn validateTemporaryAwsExport(value: AwsExport, now: u64) !u64 {
+    const expiration = try parseExpiration(value.Expiration orelse return error.InvalidAwsCredentialExport);
+    if (expiration <= now) return error.AwsLoginRequired;
+    const token = value.SessionToken orelse return error.InvalidAwsCredentialExport;
+    if (token.len == 0) return error.InvalidAwsCredentialExport;
+    return expiration;
+}
+
+pub fn validateAwsProfileExport(value: AwsExport, profile: AwsProfile, io: std.Io) !void {
+    if (profile.requires_export) {
+        const now = std.Io.Timestamp.now(io, .real).toSeconds();
+        if (now < 0) return error.AwsLoginRequired;
+        _ = try validateTemporaryAwsExport(value, @intCast(now));
+    }
 }
 
 /// Some borrowed Io runtimes deliberately have an empty startup environment.
@@ -259,6 +324,34 @@ test "cloud credentials select only the requested AWS login profile" {
     try std.testing.expectError(error.InvalidAwsProfile, awsLoginKindFromConfig("[profile work]\nsso_session=x\nlogin_session=y", "work"));
     try std.testing.expectError(error.DuplicateAwsProfile, awsLoginKindFromConfig("[profile work]\n[profile work]", "work"));
     try std.testing.expectError(error.InvalidAwsProfile, validateProfile("--debug"));
+}
+
+test "cloud credentials resolve role chains and reject cycles" {
+    const config = "[profile work]\nrole_arn=arn:role/work\nsource_profile=middle\n[profile middle]\nrole_arn=arn:role/middle\nsource_profile=company\n[profile company]\nsso_session=company\n";
+    const resolved = try awsProfileFromConfig(config, "work");
+    try std.testing.expectEqual(AwsLoginKind.sso, resolved.kind);
+    try std.testing.expectEqualStrings("company", resolved.login_profile);
+    try std.testing.expect(resolved.requires_export);
+    const static_role = try awsProfileFromConfig("[profile work]\nrole_arn=arn:role/work\nsource_profile=static\n", "work");
+    try std.testing.expectEqual(AwsLoginKind.none, static_role.kind);
+    try std.testing.expect(static_role.requires_export);
+    const self_role = try awsProfileFromConfig("[profile work]\nrole_arn=arn:role/work\nsource_profile=work\n", "work");
+    try std.testing.expect(self_role.requires_export);
+    try std.testing.expectEqual(AwsLoginKind.none, self_role.kind);
+    try std.testing.expectError(error.InvalidAwsProfileChain, awsProfileFromConfig("[profile work]\nrole_arn=arn:role/work\nsource_profile=other\n[profile other]\nrole_arn=arn:role/other\nsource_profile=work\n", "work"));
+    try std.testing.expectError(error.InvalidAwsProfile, awsProfileFromConfig("[profile work]\nrole_arn=arn:role/work\nsource_profile=other\nsource_profile=third\n", "work"));
+}
+
+test "cloud credentials require temporary grants for browser and role readiness" {
+    var value: AwsExport = .{ .Version = 1, .AccessKeyId = "access", .SecretAccessKey = "secret" };
+    try std.testing.expectError(error.InvalidAwsCredentialExport, validateTemporaryAwsExport(value, 0));
+    value.Expiration = "2030-01-01T00:00:00Z";
+    try std.testing.expectError(error.InvalidAwsCredentialExport, validateTemporaryAwsExport(value, 0));
+    value.SessionToken = "";
+    try std.testing.expectError(error.InvalidAwsCredentialExport, validateTemporaryAwsExport(value, 0));
+    value.SessionToken = "session";
+    const expiration = try validateTemporaryAwsExport(value, 0);
+    try std.testing.expectError(error.AwsLoginRequired, validateTemporaryAwsExport(value, expiration));
 }
 
 test "cloud credentials reject malformed AWS exports without leaking secrets" {

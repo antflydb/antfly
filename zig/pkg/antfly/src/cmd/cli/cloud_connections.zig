@@ -117,26 +117,35 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
         }
     } else {
         const profile = options.profile.?;
-        const kind = try credentials.awsLoginKind(alloc, io, profile);
+        const resolved = try credentials.resolveAwsProfile(alloc, io, profile);
+        defer alloc.free(resolved.login_profile);
+        const kind = resolved.kind;
         const sso = options.sso or kind == .sso;
         switch (options.operation) {
             .login => {
+                if (resolved.requires_export and kind == .none and !options.sso) return error.AwsBrowserLoginNotConfigured;
                 if (options.no_browser and !sso) return error.AwsConsoleLoginRequiresBrowser;
                 var argv: std.ArrayList([]const u8) = .empty;
                 defer argv.deinit(alloc);
                 try argv.append(alloc, "aws");
                 if (sso) try argv.append(alloc, "sso");
-                try argv.appendSlice(alloc, &.{ "login", "--profile", profile, "--no-cli-pager" });
+                try argv.appendSlice(alloc, &.{ "login", "--profile", resolved.login_profile, "--no-cli-pager" });
                 if (options.no_browser) try argv.append(alloc, "--no-browser");
                 std.debug.print("Connecting local AWS profile {s} using {s}.\n", .{ profile, if (sso) "IAM Identity Center" else "console sign-in" });
                 try interactive(alloc, io, argv.items, .aws);
                 var exported = try credentials.exportAwsCredentials(alloc, io, profile, 30_000, null);
                 defer exported.deinit();
+                // Login always promises a browser grant, even if the vendor did
+                // not persist a config marker (or static keys shadow the grant).
+                var readiness = resolved;
+                readiness.requires_export = true;
+                try credentials.validateAwsProfileExport(exported.value, readiness, io);
                 try cli.writeJson(alloc, io, .{ .provider = "aws", .credential_source = "profile", .profile = profile, .status = "available" });
             },
             .list => {
                 var exported = try credentials.exportAwsCredentials(alloc, io, profile, 30_000, null);
                 defer exported.deinit();
+                try credentials.validateAwsProfileExport(exported.value, resolved, io);
                 try cli.writeJson(alloc, io, .{ .provider = "aws", .credential_source = "profile", .profile = profile, .status = "available" });
                 return;
             },
@@ -149,7 +158,7 @@ pub fn run(alloc: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterato
                     std.debug.print("This AWS profile has no console login session. Manage static credentials and workload identities through their existing credential source.\n", .{});
                     return error.AwsBrowserLoginNotConfigured;
                 }
-                try interactive(alloc, io, &.{ "aws", "logout", "--profile", profile, "--no-cli-pager" }, .aws);
+                try interactive(alloc, io, &.{ "aws", "logout", "--profile", resolved.login_profile, "--no-cli-pager" }, .aws);
                 try cli.writeJson(alloc, io, .{ .provider = "aws", .credential_source = "profile", .profile = profile, .status = "disconnected" });
             },
         }

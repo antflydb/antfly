@@ -94,15 +94,21 @@ connections:
 
 The identity needs separate IAM permissions for S3 and Bedrock and an applicable
 region/model configuration. Login does not grant permissions or model access.
+Role profiles (including nested `source_profile` chains) use the AWS CLI to
+resolve the selected role. Login authenticates the browser source profile;
+credential export always selects the requested role. Cyclic or overly deep
+chains fail closed. Browser and role profiles must export an unexpired session
+token and expiration; login/list reject static keys that shadow browser grants.
 Native static profiles, service credentials, web identity, ECS and instance
 credentials retain their paths. Explicit `shared_credentials_file` retains
-file-only semantics. Browser profiles require the AWS CLI to remain installed
-for refresh. Antfly does not execute arbitrary `credential_process` commands
-itself.
+file-only semantics. Browser and role profiles require the AWS CLI to remain
+installed for refresh. Antfly does not execute arbitrary `credential_process`
+commands itself.
 
-Console logout selects the requested login profile. Profiles without a console
-login session are rejected. `aws sso logout` clears **all** cached SSO sessions;
-Antfly rejects per-profile SSO logout and explains how to invoke that global
+Console logout selects the browser source profile, including for role chains;
+other profiles sharing that source session are also affected. Profiles without a
+console login session are rejected. `aws sso logout` clears **all** cached SSO
+sessions; Antfly rejects per-profile SSO logout and explains how to invoke that global
 vendor command deliberately. Restart servers after logout to discard cached
 unexpired credentials. Local logout does not promise immediate upstream
 revocation of all issued STS credentials.

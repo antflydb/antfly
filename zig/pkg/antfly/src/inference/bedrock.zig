@@ -984,10 +984,14 @@ fn resolveCredentialsUncachedWithContextAndIo(
             }
             const profile = getEnvOwned(alloc, "AWS_PROFILE") orelse try alloc.dupe(u8, "default");
             defer alloc.free(profile);
-            // A configured browser identity is authoritative. Never fall through
+            // A configured browser or role identity is authoritative. Never fall through
             // to instance metadata or a stale static key when its login expires.
-            if (builtin.os.tag != .freestanding and try cloud_credentials.awsLoginKind(alloc, filesystem_io orelse http.io, profile) != .none)
-                break :blk try credentialsFromBrowserProfile(alloc, http, filesystem_io, profile, context);
+            if (builtin.os.tag != .freestanding) {
+                const resolved = try cloud_credentials.resolveAwsProfile(alloc, filesystem_io orelse http.io, profile);
+                defer alloc.free(resolved.login_profile);
+                if (resolved.requires_export)
+                    break :blk try credentialsFromExportedProfile(alloc, http, filesystem_io, profile, context);
+            }
             if (credentialsFromSharedFiles(alloc, filesystem_io, profile, null)) |creds| break :blk creds else |_| {}
             try context.check(http.io);
             if (credentialsFromEcsMetadata(alloc, http, filesystem_io, context)) |creds| break :blk creds else |err| switch (err) {
@@ -1004,41 +1008,42 @@ fn resolveCredentialsUncachedWithContextAndIo(
 }
 
 fn credentialsFromProfile(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, profile: ProfileCredentialSource, context: RequestContext) !Credentials {
-    if (builtin.os.tag != .freestanding and profile.shared_credentials_file == null and
-        try cloud_credentials.awsLoginKind(alloc, filesystem_io orelse http.io, profile.name) != .none)
-        return credentialsFromBrowserProfile(alloc, http, filesystem_io, profile.name, context);
+    if (builtin.os.tag != .freestanding and profile.shared_credentials_file == null) {
+        const resolved = try cloud_credentials.resolveAwsProfile(alloc, filesystem_io orelse http.io, profile.name);
+        defer alloc.free(resolved.login_profile);
+        if (resolved.requires_export)
+            return credentialsFromExportedProfile(alloc, http, filesystem_io, profile.name, context);
+    }
     return credentialsFromSharedFiles(alloc, filesystem_io, profile.name, profile.shared_credentials_file);
 }
 
-fn credentialsFromBrowserProfile(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, profile: []const u8, context: RequestContext) !Credentials {
+fn credentialsFromExportedProfile(alloc: std.mem.Allocator, http: *httpx.Client, filesystem_io: ?std.Io, profile: []const u8, context: RequestContext) !Credentials {
     try context.check(http.io);
     const timeout_ms = @min(try context.remainingTimeoutMs(http.io) orelse 30_000, 30_000);
     var exported = try cloud_credentials.exportAwsCredentials(alloc, filesystem_io orelse http.io, profile, timeout_ms, context.cancellation);
     defer exported.deinit();
     try context.check(http.io);
-    return credentialsFromBrowserExport(alloc, exported.value, try currentUnixSeconds());
+    return credentialsFromTemporaryExport(alloc, exported.value, try currentUnixSeconds());
 }
 
-fn credentialsFromBrowserExport(alloc: std.mem.Allocator, value: cloud_credentials.AwsExport, now: u64) !Credentials {
-    const expiration = try cloud_credentials.parseExpiration(value.Expiration orelse return error.InvalidAwsCredentialExport);
-    if (expiration <= now) return error.AwsLoginRequired;
-    const token = value.SessionToken orelse return error.InvalidAwsCredentialExport;
-    return dupCredentials(alloc, value.AccessKeyId, value.SecretAccessKey, token, expiration);
+fn credentialsFromTemporaryExport(alloc: std.mem.Allocator, value: cloud_credentials.AwsExport, now: u64) !Credentials {
+    const expiration = try cloud_credentials.validateTemporaryAwsExport(value, now);
+    return dupCredentials(alloc, value.AccessKeyId, value.SecretAccessKey, value.SessionToken.?, expiration);
 }
 
 pub fn testBrowserProfileCredentialExpiration() !void {
     const a = std.testing.allocator;
     var value: cloud_credentials.AwsExport = .{ .Version = 1, .AccessKeyId = "access", .SecretAccessKey = "secret", .SessionToken = "session", .Expiration = "2030-01-02T03:04:05+00:00" };
     const expiration = try cloud_credentials.parseExpiration(value.Expiration.?);
-    var creds = try credentialsFromBrowserExport(a, value, expiration - 600);
+    var creds = try credentialsFromTemporaryExport(a, value, expiration - 600);
     defer creds.deinit(a);
     try std.testing.expectEqual(expiration, creds.expires_at_unix.?);
     try std.testing.expect(creds.isFresh(expiration - 600));
     try std.testing.expect(!creds.isFresh(expiration - 100));
     try std.testing.expect(creds.isUnexpired(expiration - 100));
-    try std.testing.expectError(error.AwsLoginRequired, credentialsFromBrowserExport(a, value, expiration));
+    try std.testing.expectError(error.AwsLoginRequired, credentialsFromTemporaryExport(a, value, expiration));
     value.Expiration = null;
-    try std.testing.expectError(error.InvalidAwsCredentialExport, credentialsFromBrowserExport(a, value, 0));
+    try std.testing.expectError(error.InvalidAwsCredentialExport, credentialsFromTemporaryExport(a, value, 0));
 }
 
 fn credentialsFromSharedFiles(alloc: std.mem.Allocator, filesystem_io: ?std.Io, profile: []const u8, explicit_path: ?[]const u8) !Credentials {

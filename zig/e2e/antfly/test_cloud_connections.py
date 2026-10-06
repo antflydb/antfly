@@ -71,7 +71,9 @@ with open(os.environ["CLOUD_TEST_LOG"],"a") as out:
 if args[:2]==["configure","export-credentials"]:
  if os.environ.get("CLOUD_TEST_FAILURE") or (os.environ.get("CLOUD_TEST_FAILURE_FILE") and Path(os.environ["CLOUD_TEST_FAILURE_FILE"]).exists()):
   print("secret-vendor-diagnostic",file=sys.stderr);sys.exit(1)
- print(json.dumps({"Version":1,"AccessKeyId":"fake-access","SecretAccessKey":"fake-secret","SessionToken":"fake-session","Expiration":os.environ.get("CLOUD_TEST_EXPIRATION","2035-01-01T00:00:00+00:00")}))
+ value={"Version":1,"AccessKeyId":"fake-access","SecretAccessKey":"fake-secret","SessionToken":"fake-session","Expiration":os.environ.get("CLOUD_TEST_EXPIRATION","2035-01-01T00:00:00+00:00")}
+ for key in os.environ.get("CLOUD_TEST_OMIT", "").split(","): value.pop(key, None)
+ print(json.dumps(value))
 elif args[:3]==["auth","application-default","print-access-token"]:
  print("fake-google-token")
 """
@@ -211,9 +213,94 @@ def test_aws_export_failure_or_expiration_never_reports_available(cloud_cli, ext
         assert secret not in result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("kind", ["sso", "console"])
+def test_aws_role_login_authenticates_source_but_exports_selected_role(cloud_cli, kind):
+    run, calls, env = cloud_cli
+    marker = "sso_session" if kind == "sso" else "login_session"
+    Path(env["AWS_CONFIG_FILE"]).write_text(
+        "[profile work]\nrole_arn=arn:role/work\nsource_profile=middle\n"
+        "[profile middle]\nrole_arn=arn:role/middle\nsource_profile=company\n"
+        f"[profile company]\n{marker}=test-session\n"
+    )
+    assert_safe(run("login", "aws", "--profile", "work"))
+    expected = ["aws"] + (["sso"] if kind == "sso" else [])
+    assert calls()[0] == expected + ["login", "--profile", "company", "--no-cli-pager"]
+    assert calls()[1][4] == "work"
+    if kind == "console":
+        assert_safe(run("logout", "aws", "--profile", "work"), "disconnected")
+        assert calls()[-1] == [
+            "aws",
+            "logout",
+            "--profile",
+            "company",
+            "--no-cli-pager",
+        ]
+    else:
+        before = calls()
+        result = run("logout", "aws", "--profile", "work")
+        assert result.returncode != 0 and "AwsSsoLogoutIsGlobal" in result.stderr
+        assert calls() == before
+
+
+@pytest.mark.parametrize("operation", ["login", "list"])
+@pytest.mark.parametrize(
+    "omit", ["SessionToken", "Expiration", "SessionToken,Expiration"]
+)
+def test_aws_browser_readiness_rejects_incomplete_temporary_exports(
+    cloud_cli, operation, omit
+):
+    run, _, _ = cloud_cli
+    result = run(
+        operation, "aws", "--profile", "work", extra_env={"CLOUD_TEST_OMIT": omit}
+    )
+    assert result.returncode != 0
+    assert "available" not in result.stdout
+    assert "InvalidAwsCredentialExport" in result.stderr
+    assert "fake-secret" not in result.stdout + result.stderr
+
+
+def test_aws_static_profile_list_remains_available(cloud_cli):
+    run, _, env = cloud_cli
+    Path(env["AWS_CONFIG_FILE"]).write_text("[profile work]\nregion=us-east-1\n")
+    assert_safe(
+        run(
+            "list",
+            "aws",
+            "--profile",
+            "work",
+            extra_env={"CLOUD_TEST_OMIT": "SessionToken,Expiration"},
+        )
+    )
+
+
+def test_aws_cycle_fails_before_launching_vendor_tools(cloud_cli):
+    run, calls, env = cloud_cli
+    Path(env["AWS_CONFIG_FILE"]).write_text(
+        "[profile work]\nrole_arn=arn:role/work\nsource_profile=other\n[profile other]\nrole_arn=arn:role/other\nsource_profile=work\n"
+    )
+    result = run("list", "aws", "--profile", "work")
+    assert result.returncode != 0 and "InvalidAwsProfileChain" in result.stderr
+    assert calls() == []
+
+
 @pytest.mark.parametrize("source", ["profile", "default"])
-def test_s3_browser_profiles_sign_requests_and_fail_closed(cloud_cli, tmp_path, source):
+@pytest.mark.parametrize(
+    "profile_kind", ["console", "sso_role", "console_role", "static_role"]
+)
+def test_s3_browser_profiles_sign_requests_and_fail_closed(
+    cloud_cli, tmp_path, source, profile_kind
+):
     _, calls, env = cloud_cli
+    if profile_kind != "console":
+        marker = {
+            "sso_role": "sso_session=test-sso",
+            "console_role": "login_session=test-console",
+            "static_role": "region=us-east-1",
+        }[profile_kind]
+        Path(env["AWS_CONFIG_FILE"]).write_text(
+            "[profile work]\nrole_arn=arn:role/work\nsource_profile=company\n"
+            f"[profile company]\n{marker}\n"
+        )
     failure = tmp_path / "export-failed"
     env = env | {"AWS_PROFILE": "work", "CLOUD_TEST_FAILURE_FILE": str(failure)}
     # A stale static file and a metadata endpoint must never substitute for
