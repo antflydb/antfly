@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import tempfile
 from pathlib import Path
 
 COMPAT = Path(__file__).with_name("antfly_windows_compat.zig")
@@ -45,7 +46,7 @@ EDITS = [
         "pub const MADV = switch (native_os) {\n    .windows => antfly_windows_compat.MADV,\n",
     ),
     (
-        "pub extern \"c\" fn madvise(\n    addr: *align(page_size) anyopaque,\n    length: usize,\n    advice: u32,\n) c_int;",
+        'pub extern "c" fn madvise(\n    addr: *align(page_size) anyopaque,\n    length: usize,\n    advice: u32,\n) c_int;',
         "pub const madvise = if (native_os == .windows) antfly_windows_compat.madvise else private.madvise;",
     ),
     (
@@ -53,66 +54,80 @@ EDITS = [
         "pub const pthread_mutex_t = switch (native_os) {\n    .windows => antfly_windows_compat.pthread_mutex_t,\n",
     ),
     (
-        "pub extern \"c\" fn pthread_mutex_lock(mutex: *pthread_mutex_t) E;\n"
-        "pub extern \"c\" fn pthread_mutex_unlock(mutex: *pthread_mutex_t) E;\n"
-        "pub extern \"c\" fn pthread_mutex_trylock(mutex: *pthread_mutex_t) E;\n"
-        "pub extern \"c\" fn pthread_mutex_destroy(mutex: *pthread_mutex_t) E;\n",
-        "pub const pthread_mutex_lock = if (native_os == .windows) antfly_windows_compat.pthread_mutex_lock else private.pthread_mutex_lock;\n"
-        "pub const pthread_mutex_unlock = if (native_os == .windows) antfly_windows_compat.pthread_mutex_unlock else private.pthread_mutex_unlock;\n"
-        "pub const pthread_mutex_trylock = if (native_os == .windows) antfly_windows_compat.pthread_mutex_trylock else private.pthread_mutex_trylock;\n"
-        "pub const pthread_mutex_destroy = if (native_os == .windows) antfly_windows_compat.pthread_mutex_destroy else private.pthread_mutex_destroy;\n",
+        (
+            'pub extern "c" fn pthread_mutex_lock(mutex: *pthread_mutex_t) E;\n'
+            'pub extern "c" fn pthread_mutex_unlock(mutex: *pthread_mutex_t) E;\n'
+            'pub extern "c" fn pthread_mutex_trylock(mutex: *pthread_mutex_t) E;\n'
+            'pub extern "c" fn pthread_mutex_destroy(mutex: *pthread_mutex_t) E;\n'
+        ),
+        (
+            "pub const pthread_mutex_lock = if (native_os == .windows) antfly_windows_compat.pthread_mutex_lock else private.pthread_mutex_lock;\n"
+            "pub const pthread_mutex_unlock = if (native_os == .windows) antfly_windows_compat.pthread_mutex_unlock else private.pthread_mutex_unlock;\n"
+            "pub const pthread_mutex_trylock = if (native_os == .windows) antfly_windows_compat.pthread_mutex_trylock else private.pthread_mutex_trylock;\n"
+            "pub const pthread_mutex_destroy = if (native_os == .windows) antfly_windows_compat.pthread_mutex_destroy else private.pthread_mutex_destroy;\n"
+        ),
     ),
     (
-        "    extern \"c\" fn clock_gettime(clk_id: clockid_t, tp: *timespec) c_int;\n",
-        "    extern \"c\" fn clock_gettime(clk_id: clockid_t, tp: *timespec) c_int;\n"
-        "    extern \"c\" fn madvise(addr: *align(page_size) anyopaque, length: usize, advice: u32) c_int;\n"
-        "    extern \"c\" fn pthread_mutex_lock(mutex: *pthread_mutex_t) E;\n"
-        "    extern \"c\" fn pthread_mutex_unlock(mutex: *pthread_mutex_t) E;\n"
-        "    extern \"c\" fn pthread_mutex_trylock(mutex: *pthread_mutex_t) E;\n"
-        "    extern \"c\" fn pthread_mutex_destroy(mutex: *pthread_mutex_t) E;\n",
+        '    extern "c" fn clock_gettime(clk_id: clockid_t, tp: *timespec) c_int;\n',
+        (
+            '    extern "c" fn clock_gettime(clk_id: clockid_t, tp: *timespec) c_int;\n'
+            '    extern "c" fn madvise(addr: *align(page_size) anyopaque, length: usize, advice: u32) c_int;\n'
+            '    extern "c" fn pthread_mutex_lock(mutex: *pthread_mutex_t) E;\n'
+            '    extern "c" fn pthread_mutex_unlock(mutex: *pthread_mutex_t) E;\n'
+            '    extern "c" fn pthread_mutex_trylock(mutex: *pthread_mutex_t) E;\n'
+            '    extern "c" fn pthread_mutex_destroy(mutex: *pthread_mutex_t) E;\n'
+        ),
     ),
     (
         "pub const pthread_cond_t = switch (native_os) {\n",
         "pub const pthread_cond_t = switch (native_os) {\n    .windows => antfly_windows_compat.pthread_cond_t,\n",
     ),
     (
-        "pub extern \"c\" fn pthread_cond_wait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t) E;\n"
-        "pub extern \"c\" fn pthread_cond_timedwait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t, noalias abstime: *const timespec) E;\n"
-        "pub extern \"c\" fn pthread_cond_signal(cond: *pthread_cond_t) E;\n"
-        "pub extern \"c\" fn pthread_cond_broadcast(cond: *pthread_cond_t) E;\n"
-        "pub extern \"c\" fn pthread_cond_destroy(cond: *pthread_cond_t) E;\n",
-        "pub const pthread_cond_wait = if (native_os == .windows) antfly_windows_compat.pthread_cond_wait else private.pthread_cond_wait;\n"
-        "pub const pthread_cond_timedwait = if (native_os == .windows) antfly_windows_compat.pthread_cond_timedwait else private.pthread_cond_timedwait;\n"
-        "pub const pthread_cond_signal = if (native_os == .windows) antfly_windows_compat.pthread_cond_signal else private.pthread_cond_signal;\n"
-        "pub const pthread_cond_broadcast = if (native_os == .windows) antfly_windows_compat.pthread_cond_broadcast else private.pthread_cond_broadcast;\n"
-        "pub const pthread_cond_destroy = if (native_os == .windows) antfly_windows_compat.pthread_cond_destroy else private.pthread_cond_destroy;\n",
+        (
+            'pub extern "c" fn pthread_cond_wait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t) E;\n'
+            'pub extern "c" fn pthread_cond_timedwait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t, noalias abstime: *const timespec) E;\n'
+            'pub extern "c" fn pthread_cond_signal(cond: *pthread_cond_t) E;\n'
+            'pub extern "c" fn pthread_cond_broadcast(cond: *pthread_cond_t) E;\n'
+            'pub extern "c" fn pthread_cond_destroy(cond: *pthread_cond_t) E;\n'
+        ),
+        (
+            "pub const pthread_cond_wait = if (native_os == .windows) antfly_windows_compat.pthread_cond_wait else private.pthread_cond_wait;\n"
+            "pub const pthread_cond_timedwait = if (native_os == .windows) antfly_windows_compat.pthread_cond_timedwait else private.pthread_cond_timedwait;\n"
+            "pub const pthread_cond_signal = if (native_os == .windows) antfly_windows_compat.pthread_cond_signal else private.pthread_cond_signal;\n"
+            "pub const pthread_cond_broadcast = if (native_os == .windows) antfly_windows_compat.pthread_cond_broadcast else private.pthread_cond_broadcast;\n"
+            "pub const pthread_cond_destroy = if (native_os == .windows) antfly_windows_compat.pthread_cond_destroy else private.pthread_cond_destroy;\n"
+        ),
     ),
     (
-        "    extern \"c\" fn madvise(addr: *align(page_size) anyopaque, length: usize, advice: u32) c_int;\n",
-        "    extern \"c\" fn madvise(addr: *align(page_size) anyopaque, length: usize, advice: u32) c_int;\n"
-        "    extern \"c\" fn pthread_cond_wait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t) E;\n"
-        "    extern \"c\" fn pthread_cond_timedwait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t, noalias abstime: *const timespec) E;\n"
-        "    extern \"c\" fn pthread_cond_signal(cond: *pthread_cond_t) E;\n"
-        "    extern \"c\" fn pthread_cond_broadcast(cond: *pthread_cond_t) E;\n"
-        "    extern \"c\" fn pthread_cond_destroy(cond: *pthread_cond_t) E;\n",
+        '    extern "c" fn madvise(addr: *align(page_size) anyopaque, length: usize, advice: u32) c_int;\n',
+        (
+            '    extern "c" fn madvise(addr: *align(page_size) anyopaque, length: usize, advice: u32) c_int;\n'
+            '    extern "c" fn pthread_cond_wait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t) E;\n'
+            '    extern "c" fn pthread_cond_timedwait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t, noalias abstime: *const timespec) E;\n'
+            '    extern "c" fn pthread_cond_signal(cond: *pthread_cond_t) E;\n'
+            '    extern "c" fn pthread_cond_broadcast(cond: *pthread_cond_t) E;\n'
+            '    extern "c" fn pthread_cond_destroy(cond: *pthread_cond_t) E;\n'
+        ),
     ),
     (
         "        else => private.readdir,\n    },\n    .windows => {},\n    else => private.readdir,\n};",
         "        else => private.readdir,\n    },\n    else => private.readdir,\n};",
     ),
     (
-        "pub extern \"c\" fn pread(fd: fd_t, buf: [*]u8, nbyte: usize, offset: off_t) isize;\n",
+        'pub extern "c" fn pread(fd: fd_t, buf: [*]u8, nbyte: usize, offset: off_t) isize;\n',
         "pub const pread = if (native_os == .windows) antfly_windows_compat.pread else private.pread;\n",
     ),
     (
-        "pub extern \"c\" fn munmap(addr: *align(page_size) const anyopaque, len: usize) c_int;\n",
+        'pub extern "c" fn munmap(addr: *align(page_size) const anyopaque, len: usize) c_int;\n',
         "pub const munmap = if (native_os == .windows) antfly_windows_compat.munmap else private.munmap;\n",
     ),
     (
-        "    extern \"c\" fn nanosleep(rqtp: *const timespec, rmtp: ?*timespec) c_int;\n",
-        "    extern \"c\" fn nanosleep(rqtp: *const timespec, rmtp: ?*timespec) c_int;\n"
-        "    extern \"c\" fn pread(fd: fd_t, buf: [*]u8, nbyte: usize, offset: off_t) isize;\n"
-        "    extern \"c\" fn munmap(addr: *align(page_size) const anyopaque, len: usize) c_int;\n",
+        '    extern "c" fn nanosleep(rqtp: *const timespec, rmtp: ?*timespec) c_int;\n',
+        (
+            '    extern "c" fn nanosleep(rqtp: *const timespec, rmtp: ?*timespec) c_int;\n'
+            '    extern "c" fn pread(fd: fd_t, buf: [*]u8, nbyte: usize, offset: off_t) isize;\n'
+            '    extern "c" fn munmap(addr: *align(page_size) const anyopaque, len: usize) c_int;\n'
+        ),
     ),
     (
         "pub const dirent = switch (native_os) {\n",
@@ -120,7 +135,7 @@ EDITS = [
     ),
     (
         "const windows = std.os.windows;\n",
-        "const windows = std.os.windows;\nconst antfly_windows_compat = @import(\"c/antfly_windows_compat.zig\");\n",
+        'const windows = std.os.windows;\nconst antfly_windows_compat = @import("c/antfly_windows_compat.zig");\n',
     ),
 ]
 
@@ -128,8 +143,10 @@ EDITS = [
 DYNLIB_EDITS = [
     (
         "        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => DlDynLib,\n",
-        "        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => DlDynLib,\n"
-        "        .windows => @import(\"c/antfly_windows_compat.zig\").WindowsDynLib,\n",
+        (
+            "        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => DlDynLib,\n"
+            '        .windows => @import("c/antfly_windows_compat.zig").WindowsDynLib,\n'
+        ),
     ),
 ]
 
@@ -155,19 +172,37 @@ def apply(path: Path, edits) -> None:
     path.write_text(source, encoding="utf-8")
 
 
+def create_overlay(zig_lib: Path, out: Path) -> None:
+    zig_lib = zig_lib.resolve(strict=True)
+    out = out.resolve()
+    if zig_lib == out or zig_lib in out.parents or out in zig_lib.parents:
+        raise ValueError("Zig library and overlay output must not overlap")
+    # Patch a complete copy first. An incompatible Zig release must not
+    # destroy the previously usable overlay.
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".antfly-zig-overlay-", dir=out.parent
+    ) as temporary:
+        staged = Path(temporary) / "lib"
+        shutil.copytree(zig_lib, staged, symlinks=True)
+        apply(staged / "std" / "c.zig", EDITS)
+        apply(staged / "std" / "dynamic_library.zig", DYNLIB_EDITS)
+        apply(staged / "std" / "Io" / "Threaded.zig", THREADED_EDITS)
+        shutil.copyfile(COMPAT, staged / "std" / "c" / "antfly_windows_compat.zig")
+        if out.exists():
+            shutil.rmtree(out)
+        staged.rename(out)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--zig-lib", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
 
-    if args.out.exists():
-        shutil.rmtree(args.out)
-    shutil.copytree(args.zig_lib, args.out, symlinks=True)
-    apply(args.out / "std" / "c.zig", EDITS)
-    apply(args.out / "std" / "dynamic_library.zig", DYNLIB_EDITS)
-    apply(args.out / "std" / "Io" / "Threaded.zig", THREADED_EDITS)
-    shutil.copyfile(COMPAT, args.out / "std" / "c" / "antfly_windows_compat.zig")
+    create_overlay(args.zig_lib, args.out)
     print(args.out)
     return 0
 

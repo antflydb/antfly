@@ -1,8 +1,10 @@
 # Experimental Windows build
 
 Branch `experimental/windows-build` cross-compiles `antfly.exe` for
-`x86_64-windows-gnu` from macOS or Linux. It targets one workflow: `antfly lite
-serve` over a full-text table, with no local inference. It is not a supported
+`x86_64-windows-gnu` from macOS or Linux. It targets a full-text table in Lite
+storage, with no local inference. After merging main, use `antfly standalone
+--storage-engine lite --storage-path <db.aflite>` for HTTP serving; main removed
+`antfly lite serve`. It is not a supported
 platform.
 
 ## Build
@@ -17,6 +19,48 @@ ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
 
 `zig build --zig-lib-dir` is rejected after the step name, so the overlay is
 selected with `ZIG_LIB_DIR`.
+
+The generator rejects overlapping input/output paths and stages its patches
+before replacing an existing overlay, so a mismatched Zig release leaves the
+previous overlay intact.
+
+## CrossOver smoke testing on macOS
+
+CrossOver's Intel loader requires Rosetta on Apple Silicon. Create a dedicated
+bottle so testing and forced shutdown do not affect other Windows applications:
+
+```sh
+export CX_BOTTLE_PATH=/private/tmp/antfly-windows-bottles
+/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/cxbottle \
+  --bottle antfly-test --create --template win10_64
+python3 tools/windows/crossover_smoke.py \
+  --binary zig-out/bin/antfly.exe \
+  --bottle antfly-test --bottle-path "$CX_BOTTLE_PATH" \
+  --out /private/tmp/antfly-windows-smoke
+```
+
+Use a fresh output directory each time. The runner retains logs and data. It
+creates a table, inserts documents with `full_index` synchronization, checks
+full-text results, runs concurrent requests, forcibly terminates the Windows
+process, reopens the database, repeats the queries, and runs `lite check`.
+Paths contain spaces to exercise argument forwarding into runtime units.
+Wine does not establish native NTFS power-loss durability, console shutdown,
+or Windows Server compatibility; those still need a real Windows runner.
+
+The Windows argument parser can also be tested without a full Antfly build:
+
+```sh
+ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test \
+  lib/platform/src/process.zig -target x86_64-windows-gnu -lc \
+  --test-no-exec -femit-bin=/private/tmp/antfly-windows-args.exe
+/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine \
+  --bottle antfly-test --no-update /private/tmp/antfly-windows-args.exe
+python3 -m unittest discover -s tools/windows -p 'test_*.py'
+```
+
+Use the same `zig test` command with `tools/windows/compat_test.zig` and a
+different output executable to check positional reads, EOF, clocks, and
+condition-variable timeout/lock behavior through the overlay.
 
 ## What the overlay does
 
@@ -52,8 +96,8 @@ like `lib/generating` cannot import it today, or upstream them to Zig.
   `CommandLineToArgvW` quoting. The `argsIterator` buffers are process-lifetime.
 - Durability (`lib/runtime/src/fs_paths.zig`, `lib/objectstore`): file sync uses
   `std.Io.File.sync` (`NtFlushBuffersFile`, so handles are opened read-write).
-  Directory sync is a no-op, relying on NTFS metadata journaling. Crash safety
-  of rename publication is not tested.
+  Directory sync is a no-op. NTFS journaling is not a proof that an acknowledged
+  rename survives power loss; crash safety of namespace publication is unverified.
 - LSM atomic writes on Windows use `BufferedAtomicWriteSink` (in-memory, then
   write, sync and rename) instead of the POSIX fd sink. Large compactions hold
   the whole output in memory.

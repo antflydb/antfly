@@ -101,3 +101,20 @@ fn appendWindowsArg(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), arg: []cons
     try buf.appendNTimes(gpa, '\\', backslashes * 2);
     try buf.append(gpa, '"');
 }
+
+test "Windows runtime arguments round trip through the Windows parser" {
+    const gpa = std.testing.allocator;
+    const argv = [_][*:0]const u8{
+        "",                       "plain",              "two words", "tab\tseparated", "quote\"inside",
+        "C:\\path with spaces\\", "slashes\\\\\"quote",
+        "日本語",
+        "\xed\xa0\x80",
+    };
+    const command_line = try windowsCommandLine(gpa, "antfly-runtime", &argv);
+    defer gpa.free(command_line);
+    var iterator = try std.process.Args.Iterator.Windows.init(gpa, command_line);
+    defer iterator.deinit();
+    try std.testing.expectEqualStrings("antfly-runtime", iterator.next().?);
+    for (argv) |argument| try std.testing.expectEqualStrings(std.mem.span(argument), iterator.next().?);
+    try std.testing.expect(iterator.next() == null);
+}

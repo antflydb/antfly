@@ -81,8 +81,8 @@ pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.Creat
 /// created for a different deployment target without target-specific catches.
 pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
     // Experimental Windows support: Win32 cannot flush a directory handle.
-    // NTFS journals namespace metadata, so treat directory durability as
-    // provided once the files themselves are flushed.
+    // This is a best-effort experimental path. Flushing file contents does
+    // not establish namespace durability; power-loss recovery is unverified.
     if (builtin.os.tag == .windows) return;
     if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
