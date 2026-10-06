@@ -728,27 +728,11 @@ pub fn bindLiteral(allocator: std.mem.Allocator, node: ast.Value, kind: ast.Colu
 }
 
 fn admitJsonLiteral(allocator: std.mem.Allocator, text: []const u8) !void {
-    var scanner = std.json.Scanner.initCompleteInput(allocator, text);
-    defer scanner.deinit();
-    var depth: usize = 0;
-    while (true) {
-        const token = scanner.next() catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            else => return error.SqlTypeMismatch,
-        };
-        switch (token) {
-            .object_begin, .array_begin => {
-                depth += 1;
-                if (depth > 64) return error.SqlProgramLimitExceeded;
-            },
-            .object_end, .array_end => {
-                if (depth == 0) return error.SqlTypeMismatch;
-                depth -= 1;
-            },
-            .end_of_document => return,
-            else => {},
-        }
-    }
+    var work: @import("json_order.zig").Budget = .{};
+    @import("json_order.zig").admitText(allocator, text, &work) catch |err| return switch (err) {
+        error.OutOfMemory, error.SqlProgramLimitExceeded => err,
+        else => error.SqlTypeMismatch,
+    };
 }
 
 /// Output aliases have SQL precedence over source columns in ORDER BY.

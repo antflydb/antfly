@@ -107,7 +107,7 @@ const Reader = struct {
     }
 };
 
-fn decodeElement(a: A, kind: arrays.ElementType, bytes: []const u8) !arrays.Element {
+fn decodeElement(a: A, kind: arrays.ElementType, bytes: []const u8, work: *arrays.Budget) !arrays.Element {
     const width: ?usize = switch (kind) {
         .int16 => 2,
         .int32, .float32 => 4,
@@ -134,9 +134,9 @@ fn decodeElement(a: A, kind: arrays.ElementType, bytes: []const u8) !arrays.Elem
         .uuid => .{ .string = try a.dupe(u8, &uuid.format(bytes[0..16].*)) },
         .jsonb => blk: {
             if (bytes.len < 2 or bytes[0] != 1) return error.InvalidSqlBinaryRepresentation;
-            break :blk std.json.parseFromSliceLeaky(std.json.Value, a, bytes[1..], .{ .allocate = .alloc_always, .parse_numbers = false, .max_value_len = bytes.len }) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                else => return error.InvalidSqlBinaryRepresentation,
+            break :blk @import("json_order.zig").parseTextLeaky(a, bytes[1..], work) catch |err| return switch (err) {
+                error.OutOfMemory, error.SqlProgramLimitExceeded => err,
+                else => error.InvalidSqlBinaryRepresentation,
             };
         },
     });
@@ -147,6 +147,8 @@ fn decodeElement(a: A, kind: arrays.ElementType, bytes: []const u8) !arrays.Elem
 /// from an injected or genuine backing-allocator failure.
 pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Owned {
     if (bytes.len > options.wire_bytes) return error.SqlProgramLimitExceeded;
+    var work: arrays.Budget = .{ .remaining = options.values.work };
+    try work.consume(bytes.len);
     var reader: Reader = .{ .bytes = bytes };
     const rank = try reader.int(i32);
     if (rank < 0) return error.InvalidSqlBinaryRepresentation;
@@ -182,11 +184,11 @@ pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, optio
             continue;
         }
         if (length < -1) return error.InvalidSqlBinaryRepresentation;
-        cell.* = decodeElement(a, expected, try reader.take(@intCast(length))) catch |err| return quotaError(budget, err);
+        cell.* = decodeElement(a, expected, try reader.take(@intCast(length)), &work) catch |err| return quotaError(budget, err);
     }
     if (reader.position != bytes.len) return error.InvalidSqlBinaryRepresentation;
     const owned_dimensions = a.dupe(arrays.Dimension, dimensions[0..@intCast(rank)]) catch |err| return quotaError(budget, err);
-    const value = try arrays.Value.init(expected, owned_dimensions, cells, options.values);
+    const value = try arrays.Value.initWithBudget(expected, owned_dimensions, cells, options.values, &work);
     return .{ .arena = arena, .budget = budget, .value = value };
 }
 

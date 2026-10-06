@@ -19,6 +19,34 @@
 const std = @import("std");
 const Json = std.json.Value;
 const Order = std.math.Order;
+/// Validate nesting before a dynamic JSON tree is constructed. The scanner
+/// owns only a bounded nesting stack; strings and numeric tokens are borrowed.
+pub fn admitText(a: std.mem.Allocator, text: []const u8, budget: *Budget) !void {
+    try budget.consume(text.len);
+    var scanner = std.json.Scanner.initCompleteInput(a, text);
+    defer scanner.deinit();
+    var depth: usize = 0;
+    while (true) {
+        const token = scanner.next() catch |err| return switch (err) {
+            error.OutOfMemory => err,
+            else => error.SqlInvalidTextRepresentation,
+        };
+        try budget.consume(1);
+        switch (token) {
+            .object_begin, .array_begin => {
+                depth += 1;
+                if (depth > 64) return error.SqlProgramLimitExceeded;
+            },
+            .object_end, .array_end => {
+                if (depth == 0) return error.SqlInvalidTextRepresentation;
+                depth -= 1;
+            },
+            .end_of_document => return,
+            else => {},
+        }
+    }
+}
+
 pub const Budget = struct {
     remaining: usize = 1_048_576,
     pub fn consume(self: *Budget, amount: usize) !void {
@@ -26,6 +54,43 @@ pub const Budget = struct {
         self.remaining -= amount;
     }
 };
+
+/// The caller owns the allocation region and its byte admission. All retained
+/// tokens own their bytes, including exact decimal tokens and escaped strings.
+pub fn parseTextLeaky(a: std.mem.Allocator, text: []const u8, budget: *Budget) !Json {
+    try admitText(a, text, budget);
+    return std.json.parseFromSliceLeaky(Json, a, text, .{ .allocate = .alloc_always, .parse_numbers = false, .max_value_len = text.len }) catch |err| return switch (err) {
+        error.OutOfMemory => err,
+        else => error.SqlInvalidTextRepresentation,
+    };
+}
+
+test "JSON text admission bounds nesting before DOM allocation and unwinds faults" {
+    const a = std.testing.allocator;
+    var nested: [131]u8 = undefined;
+    @memset(nested[0..65], '[');
+    nested[65] = '0';
+    @memset(nested[66..], ']');
+    var budget: Budget = .{};
+    try std.testing.expectError(error.SqlProgramLimitExceeded, parseTextLeaky(a, &nested, &budget));
+    budget = .{};
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    _ = try parseTextLeaky(arena.allocator(), nested[1..130], &budget);
+    budget = .{ .remaining = 1 };
+    try std.testing.expectError(error.SqlProgramLimitExceeded, admitText(a, "[0]", &budget));
+    budget = .{};
+    try std.testing.expectError(error.SqlInvalidTextRepresentation, admitText(a, "[0,]", &budget));
+    const Faults = struct {
+        fn run(backing: std.mem.Allocator) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            var work: Budget = .{};
+            _ = try parseTextLeaky(region.allocator(), "{\"n\":9007199254740993,\"s\":\"escaped\\ntext\",\"a\":[null,true]}", &work);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Faults.run, .{});
+}
 
 const Decimal = struct {
     negative: bool,

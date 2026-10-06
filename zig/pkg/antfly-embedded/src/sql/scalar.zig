@@ -238,7 +238,7 @@ test "SQL bound array expressions match PostgreSQL scalar contracts" {
     const Entry = struct { sql: []const u8, value: Json };
     const fixture = try std.json.parseFromSlice(struct { reference: []const u8, entries: []const Entry }, std.testing.allocator, @embedFile("fixtures/sql_array_expression_reference.json"), .{});
     defer fixture.deinit();
-    try std.testing.expectEqual(@as(usize, 98), fixture.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 118), fixture.value.entries.len);
     for (fixture.value.entries) |entry| {
         var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, entry.sql, .{});
         defer compiled.deinit();
@@ -363,6 +363,51 @@ test "SQL array pattern quantifiers bound work and avoid hot loop allocations" {
     }
     try std.testing.expectEqual(@as(usize, 5000), matched);
     std.debug.print("SQL array pattern quantifiers: rows=10000 scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
+}
+
+test "SQL text array casts prepare once and bound dynamic decoding allocation" {
+    const Faults = struct {
+        fn run(a: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(a, "3 = ANY(raw::int4[])", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{.{ .name = "raw", .type = .string }}, &.{}, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            try std.testing.expect((try program.evaluate(arena.allocator(), &.{Datum.json(.{ .string = "{1,2,3,NULL}" })}, &.{}, .{})).value.bool);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var constant = try @import("compiler.zig").compileScalar(std.testing.allocator, "probe = ANY('{1,2,3,4}'::integer[])", .{});
+    defer constant.deinit();
+    var dynamic = try @import("compiler.zig").compileScalar(std.testing.allocator, "probe = ANY(raw::integer[])", .{});
+    defer dynamic.deinit();
+    const columns = &.{ Column{ .name = "probe", .type = .integer }, Column{ .name = "raw", .type = .string } };
+    var cached = try bind(std.testing.allocator, constant.expression, columns, &.{}, .{});
+    defer cached.deinit();
+    var uncached = try bind(std.testing.allocator, dynamic.expression, columns, &.{}, .{});
+    defer uncached.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cached.constant_arrays.count());
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    var buffer: [4096]u8 = undefined;
+    var scratch = std.heap.FixedBufferAllocator.init(&buffer);
+    var elapsed: [2]i128 = undefined;
+    var counts: [2]usize = .{ 0, 0 };
+    var bytes: usize = 0;
+    for ([_]*const Program{ &cached, &uncached }, 0..) |program, mode| {
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        for (0..10000) |row| {
+            scratch.reset();
+            const result = try program.evaluate(if (mode == 0) none.allocator() else scratch.allocator(), &.{ Datum.json(.{ .integer = if (row % 2 == 0) 1 else 9 }), Datum.json(.{ .string = "{1,2,3,4}" }) }, &.{}, .{});
+            counts[mode] += @intFromBool(result.value.bool);
+            bytes = @max(bytes, scratch.end_index);
+        }
+        elapsed[mode] = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+    }
+    try std.testing.expectEqual(@as(usize, 5000), counts[0]);
+    try std.testing.expectEqual(counts[0], counts[1]);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, uncached.evaluate(scratch.allocator(), &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .string = "{1,2,3,4}" }) }, &.{}, .{ .output_bytes = 1 }));
+    std.debug.print("SQL text array casts: rows=10000 prepared_ns={} dynamic_ns={} prepared_scratch_bytes=0 dynamic_scratch_bytes={}\n", .{ elapsed[0], elapsed[1], bytes });
 }
 
 test "SQL array cast execution preserves bounds and releases allocations on every fault" {
@@ -571,7 +616,6 @@ const Binder = struct {
                 const empty_constructor = cast.operand.* == .call and std.mem.eql(u8, cast.operand.call.name, "$array") and cast.operand.call.args.len == 0;
                 const source = if (cast.type == .array and empty_constructor) Type{ .kind = .array, .nullable = false, .element_type = cast.element_type } else try self.infer(cast.operand, depth + 1);
                 if (cast.type == .array and source.kind != null and source.kind != .array and source.kind != .string) return error.SqlTypeMismatch;
-                if (cast.type == .array and source.kind == .string) return error.UnsupportedSqlShape; // Text array input codec is not activated yet.
                 if (cast.type == .array and source.kind == .array and !builtin_cast.allowed(source.element_type.?, cast.element_type.?)) return error.SqlCannotCoerce;
                 if (cast.type != .array and cast.element_type != null and source.kind != null and source.kind != .array and source.kind != .datetime) {
                     const source_element = source.element_type orelse try arrayElementType(source.kind.?);
@@ -956,6 +1000,14 @@ const Evaluator = struct {
                 const datum = try self.runDatum(cast.operand, depth + 1);
                 if (datum.sql_null) break :blk .{};
                 if (cast.type == .array) {
+                    if (datum.array == null and datum.value == .string) {
+                        const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.limits.steps -| self.steps } });
+                        self.steps += decoded.work;
+                        try self.charge(decoded.allocated_bytes + @sizeOf(arrays.Value));
+                        const value = try self.alloc.create(arrays.Value);
+                        value.* = decoded.value;
+                        break :blk Datum.typedArray(value);
+                    }
                     const source = datum.array orelse return error.UnsupportedSqlShape;
                     const target = cast.element_type orelse return error.InvalidSqlProgram;
                     if (source.element_type == target) break :blk datum;
@@ -1380,7 +1432,11 @@ const Evaluator = struct {
             },
             .json => if (value == .string) blk: {
                 try self.charge(value.string.len);
-                break :blk try std.json.parseFromSliceLeaky(Json, self.alloc, value.string, .{ .parse_numbers = false, .allocate = .alloc_always });
+                var work: json_order.Budget = .{ .remaining = self.limits.steps -| self.steps };
+                const initial = work.remaining;
+                const parsed = try json_order.parseTextLeaky(self.alloc, value.string, &work);
+                self.steps += initial - work.remaining;
+                break :blk parsed;
             } else value,
         };
     }

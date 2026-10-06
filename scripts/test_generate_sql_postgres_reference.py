@@ -233,7 +233,7 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_expression_reference.json"
             ).read_text()
         )
-        self.assertEqual(len(fixture["entries"]), 98)
+        self.assertEqual(len(fixture["entries"]), 118)
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 with self.db.transaction(force_rollback=True):
@@ -262,6 +262,54 @@ class PostgresReferenceTest(unittest.TestCase):
                     with self.db.transaction(force_rollback=True):
                         self.db.execute("SET TRANSACTION READ ONLY")
                         self.db.execute("SELECT " + case["sql"])
+                self.assertEqual(caught.exception.sqlstate, case["code"])
+
+    def test_typed_array_text_input_contracts(self):
+        import json
+        from pathlib import Path
+
+        import psycopg
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_text_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(len(fixture["entries"]), 19)
+        self.assertEqual(len(fixture["errors"]), 19)
+        types = {
+            "text",
+            "int2",
+            "int4",
+            "int8",
+            "real",
+            "float8",
+            "bool",
+            "uuid",
+            "jsonb",
+        }
+        for case in fixture["entries"]:
+            with self.subTest(input=case["input"], type=case["sql_type"]):
+                self.assertIn(case["sql_type"], types)
+                with self.db.transaction(force_rollback=True):
+                    self.assertEqual(
+                        self.db.execute(
+                            "SELECT encode(array_send(%s::"
+                            + case["sql_type"]
+                            + "[]),'hex')",
+                            (case["input"],),
+                        ).fetchone()[0],
+                        case["binary"],
+                    )
+        for case in fixture["errors"]:
+            with self.subTest(input=case["input"], type=case["sql_type"]):
+                self.assertIn(case["sql_type"], types)
+                with self.assertRaises(psycopg.Error) as caught:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(
+                            "SELECT %s::" + case["sql_type"] + "[]", (case["input"],)
+                        )
                 self.assertEqual(caught.exception.sqlstate, case["code"])
 
     def test_typed_array_binary_receive_boundary_admission(self):

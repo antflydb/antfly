@@ -112,7 +112,7 @@ public result descriptors or pgwire array parameters/results.
 SQL binding now distinguishes array types from both JSON and unknown NULL,
 including element identity. One-dimensional `ARRAY[...]` constructors feed
 strict comparisons, `ANY`/`ALL`/`SOME`, cardinality and dimension/bound queries.
-Ninety-eight shared PostgreSQL expression contracts run through binding,
+One hundred eighteen shared PostgreSQL expression contracts run through binding,
 native statement execution and the HTTP API, checking exact values and SQL
 NULL flags. Constant constructors are prepared once into the immutable
 program; the 10,000-row debug benchmark uses zero constructor scratch bytes
@@ -140,7 +140,17 @@ escaping and short-circuiting past an invalid later pattern. A 10,000-row debug
 probe runs with a zero-byte evaluation allocator (about 7 ms locally, not a
 production latency claim). Allocation-fault tests also cover dynamic arrays.
 
-Array-valued public outputs, array parameters, raw text-array input,
+PostgreSQL text-array casts share a bounded two-pass decoder with owned values,
+rectangular multidimensional shapes, explicit lower bounds, escaped text and
+distinct SQL NULL cells. Nineteen PostgreSQL binary-oracle examples and nineteen
+SQLSTATE examples cover all nine builtin element types. Allocation-fault tests
+cover decoding and dynamic casts. Constant text casts are prepared once: a
+10,000-row debug probe used zero scratch bytes versus 368 bytes per dynamic cast
+(about 6 ms versus 26 ms locally, not a production latency claim). Both text and
+binary JSONB array inputs share pre-DOM nesting/work admission with scalar JSON
+casts. These supplemental contracts grant no original disposition credit.
+
+Array-valued public outputs, array parameters,
 multidimensional constructor syntax, catalog storage and overloads converting
 whole arrays to text/JSON remain explicit activation gaps. Default decimal
 constructors still need an exact NUMERIC array representation; direct narrowing

@@ -97,6 +97,12 @@ pub const Value = struct {
     /// Validate borrowed prepared cells before they enter an operator. Empty
     /// arrays have no dimensions, including an input shape containing a zero.
     pub fn init(kind: ElementType, dimensions: []const Dimension, elements: []const Element, limits: Limits) !Value {
+        var work: Budget = .{ .remaining = limits.work };
+        return initWithBudget(kind, dimensions, elements, limits, &work);
+    }
+
+    /// Ingress codecs share parsing and typed validation under one work budget.
+    pub fn initWithBudget(kind: ElementType, dimensions: []const Dimension, elements: []const Element, limits: Limits, work: *Budget) !Value {
         if (dimensions.len > 6 or elements.len > limits.elements) return error.SqlProgramLimitExceeded;
         var empty = dimensions.len == 0;
         for (dimensions) |dimension| {
@@ -112,11 +118,10 @@ pub const Value = struct {
             if (count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         }
         if (count != elements.len) return error.InvalidSqlArrayShape;
-        var work: Budget = .{ .remaining = limits.work };
         var bytes: usize = @sizeOf(Value) + dimensions.len * @sizeOf(Dimension);
         if (bytes > limits.bytes) return error.SqlProgramLimitExceeded;
         for (elements) |element| {
-            try validateElement(kind, element, &work);
+            try validateElement(kind, element, work);
             bytes = std.math.add(usize, bytes, try operators.datumBytes(element)) catch return error.SqlProgramLimitExceeded;
             if (bytes > limits.bytes) return error.SqlProgramLimitExceeded;
         }
