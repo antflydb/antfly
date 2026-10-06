@@ -5,6 +5,33 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+test "Windows file locks exclude competing handles and allow header reads" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const options: std.Io.Dir.CreateFileOptions = .{ .read = true, .truncate = false, .lock = .exclusive, .lock_nonblocking = true };
+    const writer = try directory.dir.createFile(io, "locked.bin", options);
+    defer writer.close(io);
+    try writer.writeStreamingAll(io, "header");
+    try std.testing.expectError(error.WouldBlock, directory.dir.createFile(io, "locked.bin", options));
+    const reader = try directory.dir.openFile(io, "locked.bin", .{});
+    defer reader.close(io);
+    var bytes: [6]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 6), std.c.pread(reader.handle, &bytes, bytes.len, 0));
+    try std.testing.expectEqualStrings("header", &bytes);
+    writer.unlock(io);
+    const next = try directory.dir.createFile(io, "locked.bin", options);
+    defer next.close(io);
+    try next.downgradeLock(io);
+    try std.testing.expect(try reader.tryLock(io, .shared));
+    try std.testing.expect(!try writer.tryLock(io, .exclusive));
+    reader.unlock(io);
+    next.unlock(io);
+    try writer.lock(io, .exclusive);
+    writer.unlock(io);
+}
+
 test "Windows shim positional reads do not depend on the current offset" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const io = std.testing.io;

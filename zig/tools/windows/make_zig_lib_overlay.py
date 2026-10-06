@@ -188,6 +188,21 @@ def create_overlay(zig_lib: Path, out: Path) -> None:
         apply(staged / "std" / "c.zig", EDITS)
         apply(staged / "std" / "dynamic_library.zig", DYNLIB_EDITS)
         apply(staged / "std" / "Io" / "Threaded.zig", THREADED_EDITS)
+        threaded = staged / "std" / "Io" / "Threaded.zig"
+        source = threaded.read_text(encoding="utf-8")
+        lock_call = "windows.ntdll.NtLockFile("
+        if source.count(lock_call) != 4:
+            raise SystemExit("expected four NtLockFile calls in Threaded.zig")
+        source = source.replace(
+            lock_call, '@import("../c/antfly_windows_compat.zig").NtLockFile('
+        )
+        unlock_call = "windows.ntdll.NtUnlockFile("
+        if source.count(unlock_call) != 4:
+            raise SystemExit("expected four NtUnlockFile calls in Threaded.zig")
+        source = source.replace(
+            unlock_call, '@import("../c/antfly_windows_compat.zig").NtUnlockFile('
+        )
+        threaded.write_text(source, encoding="utf-8")
         shutil.copyfile(COMPAT, staged / "std" / "c" / "antfly_windows_compat.zig")
         if out.exists():
             shutil.rmtree(out)

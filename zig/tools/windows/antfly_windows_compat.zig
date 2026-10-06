@@ -18,6 +18,7 @@ extern "kernel32" fn SleepConditionVariableSRW(cond: *?*anyopaque, lock: *?*anyo
 extern "kernel32" fn WakeConditionVariable(cond: *?*anyopaque) callconv(.winapi) void;
 extern "kernel32" fn WakeAllConditionVariable(cond: *?*anyopaque) callconv(.winapi) void;
 extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GetModuleHandleW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn FreeLibrary(module: *anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
@@ -31,6 +32,42 @@ const Overlapped = extern struct {
     offset_high: u32,
     event: ?std.os.windows.HANDLE = null,
 };
+
+const windows = std.os.windows;
+const WineLockFn = *const fn (windows.HANDLE, ?windows.HANDLE, ?*align(2) const windows.IO_APC_ROUTINE, ?*anyopaque, ?*windows.IO_STATUS_BLOCK, *const windows.LARGE_INTEGER, *const windows.LARGE_INTEGER, ?*const windows.ULONG, windows.BOOLEAN, windows.BOOLEAN) callconv(.winapi) windows.NTSTATUS;
+const WineUnlockFn = *const fn (windows.HANDLE, *windows.IO_STATUS_BLOCK, *const windows.LARGE_INTEGER, *const windows.LARGE_INTEGER, ?*const windows.ULONG) callconv(.winapi) windows.NTSTATUS;
+
+fn wineNtdll() ?*anyopaque {
+    const module = GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral("ntdll.dll")) orelse return null;
+    return if (GetProcAddress(module, "wine_get_version") != null) module else null;
+}
+
+/// Wine implements synchronous byte-range locks with a null status block;
+/// passing one returns NOT_IMPLEMENTED. Preserve native Windows arguments and
+/// keep the real lock operation, including contention and shared-lock flags.
+pub fn NtLockFile(file: windows.HANDLE, event: ?windows.HANDLE, apc: ?*align(2) const windows.IO_APC_ROUTINE, context: ?*anyopaque, status: *windows.IO_STATUS_BLOCK, offset: *const windows.LARGE_INTEGER, length: *const windows.LARGE_INTEGER, key: ?*const windows.ULONG, immediately: windows.BOOLEAN, exclusive: windows.BOOLEAN) windows.NTSTATUS {
+    const synchronous = event == null and apc == null and context == null and key == null;
+    if (synchronous) if (wineNtdll()) |module| {
+        // Resolve separately so the optimizer cannot inherit non-null pointer
+        // assumptions from Zig's native declaration of the same import.
+        const lock: WineLockFn = @ptrCast(GetProcAddress(module, "NtLockFile") orelse return .NOT_IMPLEMENTED);
+        const result = lock(file, event, apc, context, null, offset, length, key, immediately, exclusive);
+        // Wine reports contention using FILE_LOCK_CONFLICT; Zig expects the
+        // native NtLockFile status LOCK_NOT_GRANTED for nonblocking locks.
+        return if (result == .FILE_LOCK_CONFLICT) .LOCK_NOT_GRANTED else result;
+    };
+    return windows.ntdll.NtLockFile(file, event, apc, context, status, offset, length, key, immediately, exclusive);
+}
+
+/// Wine's last parameter is a pointer, whereas the native Windows API takes
+/// ULONG. Pass a full-width null for the zero key used by Zig under Wine.
+pub fn NtUnlockFile(file: windows.HANDLE, status: *windows.IO_STATUS_BLOCK, offset: *const windows.LARGE_INTEGER, length: *const windows.LARGE_INTEGER, key: windows.ULONG) windows.NTSTATUS {
+    if (key == 0) if (wineNtdll()) |module| {
+        const unlock: WineUnlockFn = @ptrCast(GetProcAddress(module, "NtUnlockFile") orelse return .NOT_IMPLEMENTED);
+        return unlock(file, status, offset, length, null);
+    };
+    return windows.ntdll.NtUnlockFile(file, status, offset, length, key);
+}
 
 pub const clockid_t = enum(u32) {
     REALTIME = 0,

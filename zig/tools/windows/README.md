@@ -20,6 +20,15 @@ ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
 `zig build --zig-lib-dir` is rejected after the step name, so the overlay is
 selected with `ZIG_LIB_DIR`.
 
+Use `-Doptimize=Debug` for frequent edit/test loops to avoid optimizing every
+runtime library. Use `ReleaseFast` for final release-behavior qualification.
+The full target includes the partitioned storage and inference libraries even
+when the smoke workload does not use local inference.
+
+When other builds share a cache, set `ZIG_LOCAL_CACHE_DIR` and
+`ZIG_GLOBAL_CACHE_DIR` to dedicated directories and use `-j1` to limit compiler
+concurrency. A suspended compiler can hold cache locks needed by other builds.
+
 The generator rejects overlapping input/output paths and stages its patches
 before replacing an existing overlay, so a mismatched Zig release leaves the
 previous overlay intact.
@@ -60,7 +69,9 @@ python3 -m unittest discover -s tools/windows -p 'test_*.py'
 
 Use the same `zig test` command with `tools/windows/compat_test.zig` and a
 different output executable to check positional reads, EOF, clocks, and
-condition-variable timeout/lock behavior through the overlay.
+condition-variable timeout/lock behavior through the overlay. The file-lock
+test checks exclusion, header reads through a separate handle, explicit unlock,
+reacquisition, shared locks, and exclusive-to-shared downgrade.
 
 ## What the overlay does
 
@@ -80,11 +91,19 @@ of patching every call site:
 | `munmap` | `UnmapViewOfFile` |
 | `std.DynLib` | `LoadLibraryW`, `GetProcAddress` |
 | `Io.Threaded` file lock range | sentinel byte at offset 2^62 instead of offset 0 |
+| `Io.Threaded` lock/unlock under Wine | synchronous lock ABI and contention status adapters |
 
 The lock change matters most. Zig locks byte 0 of a file, and Windows byte-range
 locks are mandatory, so any other handle (even in the same process) that reads
 a Lite header or writer-lock marker gets `LockViolation`. SQLite avoids this
 by locking a byte range past real data, and the overlay does the same.
+
+Wine rejects a non-null `NtLockFile` status block and reports contention as
+`FILE_LOCK_CONFLICT`. It also declares the `NtUnlockFile` key as a pointer
+instead of native Windows' `ULONG`. The overlay detects Wine through ntdll's
+`wine_get_version`, uses Wine's synchronous locking arguments, and normalizes
+contention to Zig's `WouldBlock`. It retains real byte-range locks and preserves
+native Windows calls. See [Wine's implementation](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/unix/file.c).
 
 A supported port should move these behind `antfly_platform`, since modules
 like `lib/generating` cannot import it today, or upstream them to Zig.
