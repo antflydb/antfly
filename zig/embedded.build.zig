@@ -19,6 +19,7 @@ const wasm_owner = @import("pkg/antfly-embedded/build/wasm.zig");
 const source_owner = @import("pkg/antfly-embedded/build/source_owner.zig");
 
 pub fn build(b: *std.Build) void {
+    defer @import("antfly_platform").finalizeMacosSdk(b);
     defer source_owner.finalize(b);
     const shared = dependencies.create(b) orelse return;
     const local_module = b.createModule(.{

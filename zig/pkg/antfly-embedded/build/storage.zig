@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 pub const LmdbBackend = enum {
     c,
@@ -78,15 +79,7 @@ pub fn createLiteOptions(b: *std.Build, local_inference_runtime: bool) *std.Buil
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    if (target.result.os.tag != .macos) return;
-    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
-        // xcrun observes the selected Xcode installation outside configure inputs.
-        b.graph.poisonCache();
-        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
-    };
-    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
-    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
-    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
+    @import("antfly_platform").addMacosSdkPaths(b, module, target);
 }
 
 pub fn makeLmdbEngineModule(
@@ -104,13 +97,14 @@ pub fn makeLmdbEngineModule(
     });
     mod.addOptions("build_options", build_options);
     mod.addImport("antfly_platform", platform_mod);
-    const bindings = b.addTranslateC(.{
-        .root_source_file = b.path("lib/lmdb/lmdb.h"),
+    const bindings = Translator.init(b.dependency("translate_c", .{}), .{
+        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
+        .c_source_file = b.path("lib/lmdb/lmdb.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = target.result.os.tag != .freestanding,
     });
-    mod.addImport("lmdb_c_bindings", bindings.createModule());
+    mod.addImport("lmdb_c_bindings", bindings.mod);
     if (link_libc and target.result.os.tag != .freestanding) {
         mod.link_libc = true;
         addMacosSdkPaths(b, mod, target);

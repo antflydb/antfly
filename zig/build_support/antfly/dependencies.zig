@@ -23,7 +23,7 @@ const tools_build = @import("../../tools/build_support.zig");
 const pkg_antfly_build_codegen = @import("../openapi.zig");
 const addOpenApiRootCheckStep = pkg_antfly_build_codegen.addOpenApiRootCheckStep;
 const addOpenApiSourceSteps = pkg_antfly_build_codegen.addOpenApiSourceSteps;
-const lib_platform_build_support = @import("../../lib/platform/build_support.zig");
+const lib_platform_build_support = @import("antfly_platform");
 const platform_build = lib_platform_build_support;
 const addMacosSdkPaths = lib_platform_build_support.addMacosSdkPaths;
 const pkg_antfly_build_imports = @import("imports.zig");
@@ -658,7 +658,7 @@ pub fn create(b: *std.Build) ?Shared {
         .target = target,
         .optimize = optimize,
     });
-    const pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), target, optimize, image_mod, hash_mod, font_mod, pdf_standard_fonts_mod);
+    const pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), target, optimize, image_mod, hash_mod, font_mod, pdf_standard_fonts_mod, platform_mod);
 
     const tokenizer_build = @import("../../lib/tokenizer/build_support.zig");
     const sentencepiece_proto_source = tokenizer_build.generateSentencePieceProto(b, protobuf_dep.artifact("protoc-zig"), b.path("lib/tokenizer"));

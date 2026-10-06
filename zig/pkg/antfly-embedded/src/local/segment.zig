@@ -2964,12 +2964,12 @@ test "segment readers fail closed on checksummed malformed document offsets" {
 }
 
 test "segment stored document decompression honors the caller allocator" {
-    var reader_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(reader_gpa.deinit() == .ok);
+    var reader_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x53454701 });
+    defer std.debug.assert(reader_gpa.deinit() == 0);
     const reader_alloc = reader_gpa.allocator();
 
-    var output_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(output_gpa.deinit() == .ok);
+    var output_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x53454702 });
+    defer std.debug.assert(output_gpa.deinit() == 0);
     const output_alloc = output_gpa.allocator();
 
     var writer = SegmentWriter.init(reader_alloc);

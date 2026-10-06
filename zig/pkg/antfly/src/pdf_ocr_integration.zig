@@ -16,8 +16,8 @@ const template = @import("antfly_local_sources").template;
 const fixture = @import("pdf_integration_fixture");
 
 pub fn main(init: std.process.Init) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(gpa.deinit() == .ok);
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer std.debug.assert(gpa.deinit() == 0);
     const alloc = gpa.allocator();
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

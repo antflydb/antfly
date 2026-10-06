@@ -23843,8 +23843,8 @@ test "graph metric sparse vector chunks production scale" {
 fn testSparseGraphMetricVectorChunks(dictionary_count: usize) !void {
     // Keep allocation safety and leak detection; opt into expensive allocation
     // backtraces when diagnosing a failure.
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var store_buf: [256]u8 = undefined;
     const store_path = tmpPath(&store_buf, "store-metric-vector-chunks");
@@ -34705,8 +34705,8 @@ test "graph hits reduce pages only write their planned node range" {
 }
 
 test "graph hits planned build drains partitioned paired pages across workers" {
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     const Fixture = struct {
         fn seed(graph: *GraphIndex) !void {
