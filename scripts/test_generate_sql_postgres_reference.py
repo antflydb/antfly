@@ -233,7 +233,7 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_expression_reference.json"
             ).read_text()
         )
-        self.assertEqual(len(fixture["entries"]), 31)
+        self.assertEqual(len(fixture["entries"]), 76)
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 with self.db.transaction(force_rollback=True):
@@ -242,6 +242,27 @@ class PostgresReferenceTest(unittest.TestCase):
                         self.db.execute("SELECT " + case["sql"]).fetchone(),
                         (case["value"],),
                     )
+
+    def test_typed_array_cast_rejection_contracts(self):
+        import json
+        from pathlib import Path
+
+        import psycopg
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_array_cast_errors.json"
+            ).read_text()
+        )
+        self.assertEqual(len(fixture["entries"]), 18)
+        for case in fixture["entries"]:
+            with self.subTest(sql=case["sql"]):
+                with self.assertRaises(psycopg.Error) as caught:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute("SET TRANSACTION READ ONLY")
+                        self.db.execute("SELECT " + case["sql"])
+                self.assertEqual(caught.exception.sqlstate, case["code"])
 
     def test_typed_array_binary_receive_boundary_admission(self):
         import struct

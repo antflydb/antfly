@@ -71,7 +71,7 @@ const Builder = struct {
             .literal => return input,
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.walk(part.operand, depth + 1) } },
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.walk(part.left, depth + 1), .right = try self.walk(part.right, depth + 1) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .operand = try self.walk(part.operand, depth + 1) } },
+            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.walk(part.operand, depth + 1) } },
             .call => |part| blk: {
                 // Window arguments, FILTER and sort keys see source columns only.
                 if (part.window != null) return input;

@@ -466,9 +466,9 @@ const Parser = struct {
             try self.expect(.lparen);
             const operand = try self.scalar(depth + 1, 0);
             try self.expectKeyword(.as);
-            const kind = try self.columnType();
+            const kind = try self.castType();
             try self.expect(.rparen);
-            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind } });
+            left = try self.scalarNode(.{ .cast = .{ .operand = operand, .type = kind.type, .element_type = kind.element_type } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].owned and std.ascii.eqlIgnoreCase(self.tokens[self.pos].text, "array") and self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].kind == .lbracket) {
             self.pos += 2;
             var elements: std.ArrayList(*const ast.Scalar) = .empty;
@@ -625,7 +625,8 @@ const Parser = struct {
             if (self.peek(.colon_colon)) {
                 if (minimum > 8) break;
                 self.pos += 1;
-                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = try self.columnType() } });
+                const kind = try self.castType();
+                left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = kind.type, .element_type = kind.element_type } });
                 continue;
             }
             // PostgreSQL's postfix spellings share the ordinary IS NULL
@@ -1481,6 +1482,64 @@ const Parser = struct {
             else => null,
         };
         return if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = label };
+    }
+
+    const CastType = struct { type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType = null };
+
+    fn castType(self: *Parser) Error!CastType {
+        const start = self.pos;
+        if (!self.peek(.identifier) or self.tokens[self.pos].owned) return .{ .type = try self.columnType() };
+        const name_value = self.tokens[self.pos].text;
+        self.pos += 1;
+        const pairs = .{
+            .{ "text", @import("array_value.zig").ElementType.text },
+            .{ "uuid", @import("array_value.zig").ElementType.uuid },
+            .{ "smallint", @import("array_value.zig").ElementType.int16 },
+            .{ "int2", @import("array_value.zig").ElementType.int16 },
+            .{ "int", @import("array_value.zig").ElementType.int32 },
+            .{ "integer", @import("array_value.zig").ElementType.int32 },
+            .{ "int4", @import("array_value.zig").ElementType.int32 },
+            .{ "bigint", @import("array_value.zig").ElementType.int64 },
+            .{ "int8", @import("array_value.zig").ElementType.int64 },
+            .{ "real", @import("array_value.zig").ElementType.float32 },
+            .{ "float4", @import("array_value.zig").ElementType.float32 },
+            .{ "float8", @import("array_value.zig").ElementType.float64 },
+            .{ "double", @import("array_value.zig").ElementType.float64 },
+            .{ "bool", @import("array_value.zig").ElementType.boolean },
+            .{ "boolean", @import("array_value.zig").ElementType.boolean },
+            .{ "jsonb", @import("array_value.zig").ElementType.jsonb },
+        };
+        var element: ?@import("array_value.zig").ElementType = null;
+        inline for (pairs) |pair| if (std.ascii.eqlIgnoreCase(name_value, pair[0])) {
+            element = pair[1];
+        };
+        if (std.ascii.eqlIgnoreCase(name_value, "double")) {
+            if (!self.ddlWord("precision")) return self.fail(error.InvalidSqlSyntax, "expected DOUBLE PRECISION");
+        }
+        if (!self.take(.lbracket)) {
+            if (element) |resolved| return .{ .type = switch (resolved) {
+                .text => .string,
+                .uuid => .uuid,
+                .int16, .int32, .int64 => .integer,
+                .float32, .float64 => .number,
+                .boolean => .boolean,
+                .jsonb => .json,
+            }, .element_type = resolved };
+            self.pos = start;
+            return .{ .type = try self.columnType() };
+        }
+        const resolved = element orelse return self.fail(error.UnsupportedSqlShape, "unsupported SQL array element type");
+        // Declared dimensions do not participate in PostgreSQL type identity
+        // and do not constrain a value's actual rank or bounds.
+        while (true) {
+            if (self.peek(.number)) {
+                const size = try self.value();
+                if (size != .integer or size.integer < 0 or size.integer > std.math.maxInt(i32)) return self.fail(error.InvalidSqlSyntax, "invalid declared array dimension");
+            }
+            try self.expect(.rbracket);
+            if (!self.take(.lbracket)) break;
+        }
+        return .{ .type = .array, .element_type = resolved };
     }
 
     fn columnType(self: *Parser) Error!ast.ColumnType {

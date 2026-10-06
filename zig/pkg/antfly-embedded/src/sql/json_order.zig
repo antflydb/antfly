@@ -93,6 +93,28 @@ const Decimal = struct {
     }
 };
 
+/// PostgreSQL NUMERIC-to-integer rounding (ties away from zero), without a
+/// float intermediate. Work is bounded by input bytes plus at most 20 digits.
+pub fn roundedInteger(text: []const u8, budget: *Budget) !i64 {
+    const value = try Decimal.parse(text, budget);
+    if (value.digits.len == 0 or value.magnitude < -1) return 0;
+    if (value.magnitude > 18) return error.SqlNumericOutOfRange;
+    var at: usize = 0;
+    var magnitude: u64 = 0;
+    const count: usize = @intCast(@max(0, value.magnitude + 1));
+    for (0..count) |_| {
+        if (at < value.digits.len and value.digits[at] == '.') at += 1;
+        const digit = if (at < value.digits.len) value.digits[at] - '0' else 0;
+        magnitude = magnitude * 10 + digit;
+        at += @intFromBool(at < value.digits.len);
+    }
+    if (at < value.digits.len and value.digits[at] == '.') at += 1;
+    if (at < value.digits.len and value.digits[at] >= '5') magnitude += 1;
+    if (magnitude > @as(u64, std.math.maxInt(i64)) + @intFromBool(value.negative)) return error.SqlNumericOutOfRange;
+    if (value.negative and magnitude == @as(u64, 1) << 63) return std.math.minInt(i64);
+    return if (value.negative) -@as(i64, @intCast(magnitude)) else @intCast(magnitude);
+}
+
 fn rank(value: Json) u8 {
     return switch (value) {
         .null => 0,

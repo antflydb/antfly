@@ -1,0 +1,23 @@
+{
+  "reference": "PostgreSQL exact SQLSTATE",
+  "entries": [
+    {"sql": "ARRAY[1]::smallint[] = ARRAY[1]::integer[]", "code": "42883"},
+    {"sql": "ARRAY[1]::smallint[] IS DISTINCT FROM ARRAY[1]::integer[]", "code": "42883"},
+    {"sql": "ARRAY[1]::smallint[] IN (ARRAY[1]::integer[], ARRAY[2]::integer[])", "code": "42883"},
+    {"sql": "NULLIF(ARRAY[1]::smallint[], ARRAY[1]::integer[])", "code": "42883"},
+    {"sql": "ARRAY[1]::bigint[]::boolean[]", "code": "42846"},
+    {"sql": "ARRAY[TRUE]::smallint[]", "code": "42846"},
+    {"sql": "ARRAY[1]::uuid[]", "code": "42846"},
+    {"sql": "ARRAY['32768']::smallint[]", "code": "22003"},
+    {"sql": "ARRAY['x']::integer[]", "code": "22P02"},
+    {"sql": "ARRAY['1__0']::integer[]", "code": "22P02"},
+    {"sql": "ARRAY['o']::boolean[]", "code": "22P02"},
+    {"sql": "ARRAY['{}']::jsonb[]::integer[]", "code": "22023"},
+    {"sql": "ARRAY['\"1\"']::jsonb[]::integer[]", "code": "22023"},
+    {"sql": "ARRAY['1e-50']::real[]", "code": "22003"},
+    {"sql": "ARRAY['1e50']::real[]", "code": "22003"},
+    {"sql": "ARRAY['9223372036854775807.5']::jsonb[]::bigint[]", "code": "22003"},
+    {"sql": "2147483647::integer + 1", "code": "22003"},
+    {"sql": "2147483647 + 1", "code": "22003"}
+  ]
+}

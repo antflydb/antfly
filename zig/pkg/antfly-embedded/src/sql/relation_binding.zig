@@ -333,7 +333,7 @@ const Builder = struct {
             },
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.inferenceExpression(part.left, columns), .right = try self.inferenceExpression(part.right, columns) } },
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.inferenceExpression(part.operand, columns) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .operand = try self.inferenceExpression(part.operand, columns) } },
+            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.inferenceExpression(part.operand, columns) } },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
                 for (part.branches, branches) |branch, *out| out.* = .{ .condition = try self.inferenceExpression(branch.condition, columns), .value = try self.inferenceExpression(branch.value, columns) };
@@ -587,7 +587,7 @@ const Builder = struct {
             .literal => input.*,
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.expression(columns, part.operand, aliases) } },
             .binary => |part| .{ .binary = .{ .op = part.op, .left = try self.expression(columns, part.left, aliases), .right = try self.expression(columns, part.right, aliases) } },
-            .cast => |part| .{ .cast = .{ .type = part.type, .operand = try self.expression(columns, part.operand, aliases) } },
+            .cast => |part| .{ .cast = .{ .type = part.type, .element_type = part.element_type, .operand = try self.expression(columns, part.operand, aliases) } },
             .call => |part| blk: {
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
                 for (part.args, args) |arg, *out| out.* = try self.expression(columns, arg, aliases);

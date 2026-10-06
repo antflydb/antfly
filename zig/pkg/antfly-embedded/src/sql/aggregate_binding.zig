@@ -177,7 +177,7 @@ const Builder = struct {
             .literal => input.*,
             .unary => |unary| .{ .unary = .{ .op = unary.op, .operand = try self.rewrite(unary.operand) } },
             .binary => |binary| .{ .binary = .{ .op = binary.op, .left = try self.rewrite(binary.left), .right = try self.rewrite(binary.right) } },
-            .cast => |cast| .{ .cast = .{ .type = cast.type, .operand = try self.rewrite(cast.operand) } },
+            .cast => |cast| .{ .cast = .{ .type = cast.type, .element_type = cast.element_type, .operand = try self.rewrite(cast.operand) } },
             .call => |call| blk: {
                 const args = try self.alloc.alloc(*const ast.Scalar, call.args.len);
                 for (call.args, args) |arg, *out| out.* = try self.rewrite(arg);

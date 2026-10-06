@@ -20,7 +20,7 @@ pub const Scalar = union(enum) {
     unary: struct { op: Unary, operand: *const Scalar },
     binary: struct { op: Binary, left: *const Scalar, right: *const Scalar },
     call: struct { name: []const u8, args: []const *const Scalar, star: bool = false, distinct: bool = false, filter: ?*const Scalar = null, window: ?Window = null, subquery: ?*const Select = null },
-    cast: struct { operand: *const Scalar, type: ColumnType },
+    cast: struct { operand: *const Scalar, type: ColumnType, element_type: ?@import("array_value.zig").ElementType = null },
     case_when: struct { branches: []const Branch, otherwise: ?*const Scalar = null },
     in_list: struct { operand: *const Scalar, values: []const *const Scalar, negated: bool = false },
 

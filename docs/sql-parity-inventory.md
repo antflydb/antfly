@@ -112,7 +112,7 @@ public result descriptors or pgwire array parameters/results.
 SQL binding now distinguishes array types from both JSON and unknown NULL,
 including element identity. One-dimensional `ARRAY[...]` constructors feed
 strict comparisons, `ANY`/`ALL`/`SOME`, cardinality and dimension/bound queries.
-Thirty-one shared PostgreSQL expression contracts run through binding,
+Seventy-six shared PostgreSQL expression contracts run through binding,
 native statement execution and the HTTP API, checking exact values and SQL
 NULL flags. Constant constructors are prepared once into the immutable
 program; the 10,000-row debug benchmark uses zero constructor scratch bytes
@@ -120,12 +120,26 @@ versus 688 bytes per row for the parameter-dependent equivalent (about 7 ms
 versus 15 ms in one local run, not a production latency claim). Allocation
 faults cover both preparation and parameter-dependent evaluation. Wider
 integer probes against narrow array cells compare without narrowing overflow.
-Array-valued public outputs, array parameters, multidimensional constructor
-syntax, explicit array casts, catalog storage and overloads converting arrays
-to text/JSON remain explicit activation gaps. Constructor integer cells use
-the existing SQL integer binding contract (int64); PostgreSQL's complete
-element-width inference is not yet active. No original disposition credit is
-granted by these supplemental contracts.
+Explicit builtin array casts retain element widths, dimensions, lower bounds
+and SQL NULL provenance, including typed empty constructors. Constant cast
+chains are prepared once and require no evaluation allocator. Scalar and
+vector integer arithmetic check their inferred widths; real arithmetic uses
+the scalar path to preserve float4 rounding. Floating-point casts round ties
+to even; JSONB numeric casts round exact decimal tokens away from zero without
+an intermediate double. Eighteen shared PostgreSQL SQLSTATE contracts cover
+invalid syntax, range overflow, unsupported cast pairs and array operators.
+Comparison operators require matching array element identities, while
+CASE/COALESCE use common-type promotion.
+
+Array-valued public outputs, array parameters, raw text-array input,
+multidimensional constructor syntax, catalog storage and overloads converting
+whole arrays to text/JSON remain explicit activation gaps. Default decimal
+constructors still need an exact NUMERIC array representation; direct narrowing
+or text casts of these constructors remain guarded (explicit real/double casts
+provide floating-point semantics). Native table integer columns retain their
+existing int64 contract; integer literals infer int4/int8 and explicit casts
+carry their widths. No original disposition credit is granted by these
+supplemental contracts.
 
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.
