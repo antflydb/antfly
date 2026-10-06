@@ -717,11 +717,35 @@ pub const UserManager = struct {
         try self.user_instances.put(self.alloc, key, instance_id);
     }
 
+    /// Scoped authority snapshot. Readers that need credentials and policies
+    /// together acquire once, copy while held, then release before verification.
+    pub const SnapshotLease = struct {
+        manager: *UserManager,
+        pub fn getUser(self: *const SnapshotLease, username: []const u8) !User {
+            return self.manager.cloneUserUnlocked(username);
+        }
+        pub fn release(self: *SnapshotLease) void {
+            var receiver = self.manager.io_borrow.receive() catch @panic("invalid UserManager executor");
+            self.manager.mutation_mutex.unlock(receiver.io());
+            self.* = undefined;
+        }
+    };
+
+    pub fn acquireSnapshotLease(self: *UserManager) !SnapshotLease {
+        var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
+        try self.mutation_mutex.lock(receiver.io());
+        return .{ .manager = self };
+    }
+
     pub fn getUser(self: *UserManager, username: []const u8) !User {
         var receiver = self.io_borrow.receive() catch @panic("invalid UserManager executor");
-        const io = receiver.io();
-        self.mutation_mutex.lockUncancelable(io);
-        defer self.mutation_mutex.unlock(io);
+        self.mutation_mutex.lockUncancelable(receiver.io());
+        var lease: SnapshotLease = .{ .manager = self };
+        defer lease.release();
+        return lease.getUser(username);
+    }
+
+    fn cloneUserUnlocked(self: *UserManager, username: []const u8) !User {
         const password_hash = self.users.get(username) orelse return error.UserNotFound;
         const metadata_json = self.user_metadata.get(username) orelse "{}";
         const owned_username = try self.alloc.dupe(u8, username);
