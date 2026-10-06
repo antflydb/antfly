@@ -5,34 +5,40 @@ the `libantfly` C ABI. It exposes local databases and database-free inference fr
 Applications can embed `.aflite` or directory storage without talking to the
 network SDK.
 
-The Go module includes the matching `antfly.h` C ABI header. Applications
-still need `libantfly` at build and runtime. From the source tree, build the
-C library before running cgo-backed tests:
+The Go module includes the matching `antfly.h` header. Install `pkg-config`
+and extract the Apache **`antfly-embedded`** release archive for your platform.
+Keep its `lib/` and `include/` directories together; `lib/pkgconfig/libantfly.pc`
+is relocatable and supplies the library, header, and runtime search paths.
+No ELv2 server or CLI package is required.
+
+```sh
+export PKG_CONFIG_PATH="/path/to/antfly-embedded/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+go build ./...
+```
+
+The binding uses `#cgo pkg-config: libantfly`, so this works after `go get`
+without paths into the monorepo. If you install into a standard system prefix,
+your system pkg-config and loader configuration may already find it.
+The native library must remain installed when running the compiled application.
+
+From a source checkout:
 
 ```sh
 cd zig
 zig build capi
+export PKG_CONFIG_PATH="$PWD/zig-out/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 cd ../go/pkg/embedded
 go test -tags libantfly ./...
 ```
 
-Outside the source tree, install an Antfly CLI release package or archive that
-contains `include/antfly.h` and `lib/libantfly.*`, then point cgo and
-the dynamic loader at that installation when building your app. For example:
-
-```sh
-CGO_LDFLAGS="-L/path/to/antfly/lib" \
-LD_LIBRARY_PATH="/path/to/antfly/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-go build ./...
-```
-
-On macOS use `DYLD_LIBRARY_PATH` instead of `LD_LIBRARY_PATH` when the library
-is not already on the loader search path.
+Native release libraries are available for Linux and macOS targets in the
+release archive matrix. Python/npm prebuilt packages currently support
+Linux x86-64 and ARM64 (glibc 2.28+), and macOS ARM64. Go links native
+archives directly; it does not install a Python/npm platform package.
 
 ### Embedded inference
 
-`libantfly` always links the standalone inference runtime in-process, the
-same as the `antfly` executable (see `zig/COMPILATION.md`'s "C API
+`libantfly` always links the inference runtime and executes it in-process (see `zig/COMPILATION.md`'s "C API
 composition" section and `zig/LITE.md`'s "Local Embedded Inference"
 section). Setting `LocalRuntimeConfigured` (below) yields `local_embedded`
 behavior -- an embedded model runtime that runs chunker, embedder, and

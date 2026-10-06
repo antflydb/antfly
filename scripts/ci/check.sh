@@ -145,6 +145,13 @@ check_sdk() {
 check_lite_bindings() {
   section "Checking the Go Lite binding"
   (
+    # Vet compiles C declarations but does not link a native binary.
+    # Give it the same install metadata as a real build, without building libantfly.
+    metadata_root="$(mktemp -d)"
+    trap 'rm -rf "$metadata_root"' EXIT
+    python3 "$repo_root/scripts/packaging/render_libantfly_pkgconfig.py" \
+      --version dev --out "$metadata_root/lib/pkgconfig/libantfly.pc"
+    export PKG_CONFIG_PATH="$metadata_root/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     cd "$repo_root/go/pkg/embedded"
     GOWORK=off go mod tidy
     git diff --exit-code -- go.mod

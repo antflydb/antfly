@@ -87,6 +87,7 @@ pub const Shared = struct {
     inference_enable_onnx: bool,
     inference_enable_metal: bool,
     inference_enable_cuda: bool,
+    antfly_version: []const u8,
     build_info: @import("../../lib/build_info/build_support.zig").BuildInfo,
     platform_test_step: *std.Build.Step,
     build_options: *std.Build.Step.Options,
@@ -1148,6 +1149,7 @@ pub fn create(b: *std.Build) ?Shared {
         .inference_query_embedding_cache = inference_query_embedding_cache_mod,
         .inference_host = inference_host_mod,
         .build_info = build_info,
+
         .build_options = build_options,
         .lite_options = antfly_storage_build.createLiteOptions(b, lite_local_inference_runtime),
         .embedded_openapi = pkg_antfly_build_codegen.addEmbeddedSpecs(b, .{
@@ -1284,6 +1286,7 @@ pub fn create(b: *std.Build) ?Shared {
         .inference_enable_metal = inference_enable_metal,
         .inference_enable_cuda = inference_enable_cuda,
         .build_info = build_info,
+        .antfly_version = antfly_version,
         .platform_test_step = platform_test_step,
         .build_options = build_options,
         .standalone_runtime_build_options = standalone_runtime_build_options,

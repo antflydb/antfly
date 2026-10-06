@@ -15,8 +15,13 @@ build for browser use; this package is unrelated to that build.
 pnpm add @antfly/embedded
 ```
 
-Published platform packages include the Apache-2.0 `libantfly` library and
-private inference worker, without installing CLI commands. Source checkouts
+Published platform packages include the Apache-2.0 `libantfly` library,
+without installing CLI commands or an unused worker executable.
+Prebuilt embedded packages support Linux x86-64 and ARM64 with glibc 2.28
+or newer, and macOS ARM64. Windows, Intel macOS, and Alpine/musl do not
+have prebuilt language packages. The native release archive matrix is
+separate; a source build or native archive does not imply wheel/npm support.
+ Source checkouts
 can build the shared library with "Library discovery" below. From the
 `antfly` monorepo source tree, build it
 with `cd zig && zig build lite` (produces `zig/zig-out/lib/libantfly.*`);

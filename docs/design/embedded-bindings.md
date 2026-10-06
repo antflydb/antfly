@@ -36,13 +36,19 @@ convenience package should be introduced only when it offers a distinct API or
 distribution benefit; the current combined bindings cover both use cases.
 
 Installing an embedded binding does not register `antfly-lite` or
-`antfly-inference` as a command. Platform packages include
-`antfly-inference-worker` as a private executable next to `libantfly`.
-Bindings call the C API, which runs inference in-process on every backend,
-including Metal, CUDA, ONNX, and PJRT. `libantfly` disables process isolation
-and does not use `ANTFLY_INFERENCE_WORKER`. A GPU driver call cannot be
-interrupted once entered, and a driver fault can terminate the embedding
-application. The private worker does not provide crash containment for bindings.
+`antfly-inference` as a command. Python/npm packages include the native
+library without a private worker. Bindings call the C API, which runs
+inference in-process on every backend, including Metal, CUDA, ONNX, and
+PJRT. `libantfly` disables process isolation and does not use
+`ANTFLY_INFERENCE_WORKER`. A GPU driver call cannot be interrupted once
+entered, and a driver fault can terminate the embedding application.
+
+Prebuilt Python/npm packages support Linux x86-64 and ARM64 (glibc 2.28+)
+and macOS ARM64. Windows, Intel macOS, and Alpine/musl have no prebuilt
+language packages. Go/Rust/C consumers use the native archives, whose
+platform matrix is independent, with relocatable `lib/pkgconfig/libantfly.pc`
+metadata. Go uses pkg-config; Rust also retains explicit directory overrides
+and a source-checkout fallback. Keep the discovered library installed at runtime.
 
 Server hosts that enable process isolation can use a replaceable inference
 worker. The single Apache Embedded archive distributes both public CLIs
@@ -51,3 +57,8 @@ worker, with runtime files and license notices.
 There are two primary release products: the ELv2 server and the Apache embedded
 runtime. Source ownership remains separated between the embedded integration
 and inference engine packages.
+
+Independent Apache-only Zig fetching is tracked in
+[issue #988](https://github.com/antflydb/antfly/issues/988). The package
+currently requires a monorepo checkout; a standalone manifest, dependency
+closure, and immutable source artifact remain to be implemented.

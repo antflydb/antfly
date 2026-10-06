@@ -19,22 +19,32 @@ enabled (`--features libantfly`, or `antfly-embedded/libantfly` from a consumer)
 Without the feature, `build.rs` does nothing beyond registering the crate's
 `links = "antfly"` key.
 
-With the feature enabled, `build.rs` looks for the `libantfly` dylib/so in,
-in order:
+With the feature enabled, `build.rs` resolves the library in this order:
 
-1. The `ANTFLY_LIB_DIR` environment variable.
-2. `<this crate>/../../../zig/zig-out/lib`, i.e. `zig/zig-out/lib` from the
-   root of an `antfly` source checkout, if that directory exists.
+1. `ANTFLY_LIB_DIR`, an explicit directory override; a missing library is an error.
+2. `pkg-config libantfly`, including `PKG_CONFIG_PATH` and the pkg-config crate's
+   target-specific environment variables for cross-compilation.
+3. `zig/zig-out/lib` in an Antfly source checkout.
 
-and emits `-L`/`-l` link directives plus (on macOS and Linux) an `-rpath`
-link argument for that directory, so a linked test binary finds the dylib at
-runtime without `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`. If neither location
-resolves, the build script panics with a message telling you to set
-`ANTFLY_LIB_DIR`.
+Install `pkg-config` and extract the Apache **`antfly-embedded`** archive,
+then build with:
 
-Outside an `antfly` source checkout, install an Antfly release package or
-archive containing `lib/libantfly.*`, then set `ANTFLY_LIB_DIR` to that
-`lib` directory when building.
+```sh
+export PKG_CONFIG_PATH="/path/to/antfly-embedded/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+cargo build --features libantfly
+```
+
+The archive's relocatable `lib/pkgconfig/libantfly.pc` also works with Go
+and C build tools. Keep `lib/` and `include/` together. No ELv2 server is
+required. For cross-compilation, point pkg-config at a target installation
+using its target-specific configuration; do not allow it to select host
+libraries. Alternatively set `ANTFLY_LIB_DIR` to a target library directory.
+
+The sys crate emits library search paths and passes the resolved directories
+to the safe crate, so both crates' test/example binaries get runtime search
+paths on Linux/macOS. Downstream build tools can use the `.pc` file's `Libs`
+flags or configure their own loader paths. The library must remain available
+at runtime.
 
 ## Testing
 

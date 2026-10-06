@@ -35,6 +35,8 @@ class ReleaseLicenseTests(unittest.TestCase):
             for name in (
                 "scripts/packaging/build_zig_release_archive.sh",
                 "scripts/packaging/create_reproducible_tar.py",
+                "scripts/packaging/render_libantfly_pkgconfig.py",
+                "zig/pkg/antfly-embedded/libantfly.pc.in",
                 "scripts/packaging/lite-release-README.md",
                 "scripts/packaging/embedded-release-README.md",
                 "scripts/packaging/inference-release-README.md",
@@ -147,11 +149,20 @@ class ReleaseLicenseTests(unittest.TestCase):
                             "./scripts/apache_engine_files.txt",
                             "./scripts/embedded_asset_licenses.json",
                             "./lib/libantfly.dylib",
+                            "./lib/pkgconfig/libantfly.pc",
                             "./include/antfly.h",
                         ):
                             self.assertEqual(
                                 product != "inference", name in archive.getnames()
                             )
+                        if product != "inference":
+                            pc = (
+                                archive.extractfile("./lib/pkgconfig/libantfly.pc")
+                                .read()
+                                .decode()
+                            )
+                            self.assertIn("Version: test", pc)
+                            self.assertIn("prefix=${pcfiledir}/../..", pc)
                         self.assertEqual(
                             product == "server",
                             "./LICENSES/Elastic-2.0.txt" in archive.getnames(),

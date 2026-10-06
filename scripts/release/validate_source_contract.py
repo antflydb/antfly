@@ -25,7 +25,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 CONTRACT_PATH = "scripts/release/build-contract.json"
-SUPPORTED_SCHEMAS = (1, 2, 3)
+SUPPORTED_SCHEMAS = (1, 2, 3, 4)
 LEGACY_REQUIRED_PATHS = {
     "zig/build.zig",
     "scripts/install.sh",
@@ -62,7 +62,13 @@ APACHE_REQUIRED_PATHS = {
     "py/packages/embedded/pyproject.toml",
 }
 SPLIT_REQUIRED_PATHS = LEGACY_REQUIRED_PATHS | APACHE_REQUIRED_PATHS
-REQUIRED_PATHS = SPLIT_REQUIRED_PATHS | {"scripts/packaging/embedded-release-README.md"}
+COMBINED_REQUIRED_PATHS = SPLIT_REQUIRED_PATHS | {
+    "scripts/packaging/embedded-release-README.md"
+}
+REQUIRED_PATHS = COMBINED_REQUIRED_PATHS | {
+    "scripts/packaging/render_libantfly_pkgconfig.py",
+    "zig/pkg/antfly-embedded/libantfly.pc.in",
+}
 
 
 def runtime_products(schema: int) -> tuple[str, ...]:
@@ -72,6 +78,7 @@ def runtime_products(schema: int) -> tuple[str, ...]:
         1: ("server",),
         2: ("server", "lite", "inference"),
         3: ("server", "embedded"),
+        4: ("server", "embedded"),
     }[schema]
 
 
@@ -106,7 +113,8 @@ def validate(repo_root: Path, commit: str) -> int:
     required_paths = {
         1: LEGACY_REQUIRED_PATHS,
         2: SPLIT_REQUIRED_PATHS,
-        3: REQUIRED_PATHS,
+        3: COMBINED_REQUIRED_PATHS,
+        4: REQUIRED_PATHS,
     }[schema]
     paths = contract.get("required_source_paths")
     if not isinstance(paths, list) or not paths:

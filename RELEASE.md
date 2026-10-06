@@ -35,13 +35,17 @@ private inference worker, runtime files and notices. The root license is Apache;
 third-party components retain their original notices. Database serving remains
 in the separate ELv2 server product.
 
-Build contract schema 3 declares `server` and `embedded`. Schema 1 retains the
+Build contract schema 4 declares `server` and `embedded`, includes pkg-config
+metadata, and omits unused workers from language packages. Schema 3 retains
+the original combined archive/package contract. Schema 1 retains the
 historical server-only layout; schema 2 retains separate Lite and inference
 archives. The controller follows the immutable source contract and promotion
 requires every declared runtime archive for each supported platform.
 
 `.github/workflows/embedded-package.yml` assembles Python wheels and npm packages
-from the embedded archives, bundling only the native library and private worker.
+from the embedded archives, bundling only the native library. Prebuilt language
+packages cover Linux x86-64/ARM64 (glibc 2.28+) and macOS ARM64; the native
+archive matrix is separate. Go/Rust/C use `lib/pkgconfig/libantfly.pc`.
 Dispatch `.github/workflows/embedded-release-publish.yml` with the immutable tag
 and successful build run to verify and publish that snapshot. Go and Rust link
 `libantfly` from an embedded archive or local build. See

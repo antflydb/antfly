@@ -25,30 +25,18 @@
 //! `-sys` crate has no such targets, the rpath has to be re-emitted here,
 //! in the package that actually produces test binaries.
 use std::env;
-use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=ANTFLY_LIB_DIR");
-    println!("cargo:rerun-if-changed=build.rs");
-
+    println!("cargo:rerun-if-env-changed=DEP_ANTFLY_LIB_DIRS");
     if env::var_os("CARGO_FEATURE_LIBANTFLY").is_none() {
         return;
     }
-
-    let manifest_dir =
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"));
-    let default_lib_dir = manifest_dir.join("../../../zig/zig-out/lib");
-
-    let lib_dir = match env::var_os("ANTFLY_LIB_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None if default_lib_dir.is_dir() => default_lib_dir,
-        // antfly-embedded-sys's build script already panics with a clear
-        // message in this case; nothing more to do here.
-        None => return,
-    };
-
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "macos" || target_os == "linux" {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+        if let Some(paths) = env::var_os("DEP_ANTFLY_LIB_DIRS") {
+            for directory in env::split_paths(&paths) {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", directory.display());
+            }
+        }
     }
 }

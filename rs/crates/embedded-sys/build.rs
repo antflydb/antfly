@@ -40,28 +40,42 @@ fn main() {
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"));
     let default_lib_dir = manifest_dir.join("../../../zig/zig-out/lib");
 
-    let lib_dir = match env::var_os("ANTFLY_LIB_DIR") {
-        Some(dir) => PathBuf::from(dir),
-        None if default_lib_dir.is_dir() => default_lib_dir,
-        None => {
-            panic!(
-                "antfly-embedded-sys: the `libantfly` feature is enabled but no libantfly \
-                 library directory was found. Set ANTFLY_LIB_DIR to the directory \
-                 containing libantfly's dylib/so, or build it at {} (`zig build` in \
-                 zig/).",
-                default_lib_dir.display()
-            );
-        }
+    let lib_dirs = if let Some(dir) = env::var_os("ANTFLY_LIB_DIR") {
+        vec![PathBuf::from(dir)]
+    } else if let Ok(library) = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("libantfly")
+    {
+        library.link_paths
+    } else if env::var_os("HOST") == env::var_os("TARGET") && default_lib_dir.is_dir() {
+        vec![default_lib_dir.clone()]
+    } else {
+        panic!(
+            "antfly-embedded-sys: install the Apache antfly-embedded archive and add its lib/pkgconfig directory to PKG_CONFIG_PATH, or set ANTFLY_LIB_DIR to its lib directory. Source builds use `zig build capi` in zig/."
+        );
     };
-
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=dylib=antfly");
-
-    // Bake an rpath into test/example binaries so they find the dylib at
-    // runtime without the caller having to set DYLD_LIBRARY_PATH/
-    // LD_LIBRARY_PATH.
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "macos" || target_os == "linux" {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    for lib_dir in &lib_dirs {
+        let target = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+        let filename = match target.as_str() {
+            "macos" => "libantfly.dylib",
+            "windows" => "antfly.dll",
+            _ => "libantfly.so",
+        };
+        assert!(
+            lib_dir.join(filename).is_file(),
+            "libantfly not found in {}",
+            lib_dir.display()
+        );
+        println!("cargo:rustc-link-search=native={}", lib_dir.display());
+        if target == "macos" || target == "linux" {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+        }
     }
+    println!(
+        "cargo:lib_dirs={}",
+        env::join_paths(&lib_dirs)
+            .expect("valid library paths")
+            .to_string_lossy()
+    );
+    println!("cargo:rustc-link-lib=dylib=antfly");
 }

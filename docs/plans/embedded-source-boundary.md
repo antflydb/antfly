@@ -320,7 +320,12 @@ The current release shape has two primary products: the ELv2 `antfly` server
 archive and the Apache `antfly-embedded` archive. The embedded archive ships
 `antfly-lite`, `antfly-inference`, `libantfly`, `include/antfly.h`, the private
 worker, runtime files and notices. Python/npm packages consume that archive and
-install only the library and private worker; Go/Rust consumers link the same
+install only the library; Go/Rust consumers link the same
 library. Separate source owners do not require separate distribution archives.
 Release build contract schema 3 records this shape; schemas 1 and 2 retain their
 historical artifact layouts and verification rules.
+
+Independent Apache-only Zig fetching is tracked in
+[issue #988](https://github.com/antflydb/antfly/issues/988). The package
+currently requires a monorepo checkout; a standalone manifest, dependency
+closure, and immutable source artifact remain to be implemented.

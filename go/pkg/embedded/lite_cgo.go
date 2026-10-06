@@ -18,10 +18,8 @@
 package embedded
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/include -I${SRCDIR}/../../../zig/pkg/antfly-embedded/include
-#cgo LDFLAGS: -L${SRCDIR}/../../../zig/zig-out/lib -lantfly
-#cgo darwin LDFLAGS: -Wl,-rpath,${SRCDIR}/../../../zig/zig-out/lib
-#cgo linux LDFLAGS: -Wl,-rpath,${SRCDIR}/../../../zig/zig-out/lib
+#cgo CFLAGS: -I${SRCDIR}/include
+#cgo pkg-config: libantfly
 #include "antfly.h"
 #include <stdlib.h>
 */

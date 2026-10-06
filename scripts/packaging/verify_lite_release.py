@@ -43,7 +43,7 @@ def verify(
     archive_dir: Path,
     wheel_dir: Path,
     npm_dir: Path,
-    build_contract_schema: int = 3,
+    build_contract_schema: int = 4,
 ) -> None:
     version = normalize_release_version(version)
     python_version = python_version_from_release(version)
@@ -70,9 +70,19 @@ def verify(
             lib_name = lite_library_name(platform)
             library = source_bytes(f"./lib/{lib_name}")
             source_bytes("./antfly-lite")
-            if build_contract_schema == 3:
+            if build_contract_schema >= 3:
                 source_bytes("./antfly-inference")
             worker = source_bytes("./antfly-inference-worker")
+            pkgconfig = (
+                source_bytes("./lib/pkgconfig/libantfly.pc")
+                if build_contract_schema >= 4
+                else None
+            )
+            if pkgconfig is not None:
+                require(
+                    f"Version: {version}\n".encode() in pkgconfig,
+                    f"wrong pkg-config version: {archive_path}",
+                )
             source_maps = {
                 name: source_bytes(f"./scripts/{name}") for name in SOURCE_LICENSE_FILES
             }
@@ -94,10 +104,18 @@ def verify(
                 wheel.read(f"antfly_embedded/_lib/{lib_name}") == library,
                 f"library mismatch: {wheel_path}",
             )
-            require(
-                wheel.read("antfly_embedded/_lib/antfly-inference-worker") == worker,
-                f"worker mismatch: {wheel_path}",
-            )
+            if build_contract_schema >= 4:
+                require(
+                    "antfly_embedded/_lib/antfly-inference-worker"
+                    not in wheel.namelist(),
+                    f"unused worker in {wheel_path}",
+                )
+            if "antfly_embedded/_lib/antfly-inference-worker" in wheel.namelist():
+                require(
+                    wheel.read("antfly_embedded/_lib/antfly-inference-worker")
+                    == worker,
+                    f"worker mismatch: {wheel_path}",
+                )
             require(
                 not any(
                     name.startswith("antfly_embedded/_bin/")
@@ -162,10 +180,20 @@ def verify(
             require(
                 npm_bytes(f"lib/{lib_name}") == library, f"library mismatch: {npm_path}"
             )
-            require(
-                npm_bytes("lib/antfly-inference-worker") == worker,
-                f"worker mismatch: {npm_path}",
-            )
+            if build_contract_schema >= 4:
+                require(
+                    "package/lib/antfly-inference-worker" not in npm.getnames(),
+                    f"unused worker in {npm_path}",
+                )
+                require(
+                    npm_bytes("lib/pkgconfig/libantfly.pc") == pkgconfig,
+                    f"pkg-config mismatch: {npm_path}",
+                )
+            if "package/lib/antfly-inference-worker" in npm.getnames():
+                require(
+                    npm_bytes("lib/antfly-inference-worker") == worker,
+                    f"worker mismatch: {npm_path}",
+                )
             require(
                 not any(
                     member.name.startswith("package/bin/")
@@ -214,7 +242,9 @@ def main() -> int:
     parser.add_argument("--archive-dir", type=Path, required=True)
     parser.add_argument("--wheel-dir", type=Path, required=True)
     parser.add_argument("--npm-dir", type=Path, required=True)
-    parser.add_argument("--build-contract-schema", type=int, choices=(2, 3), default=3)
+    parser.add_argument(
+        "--build-contract-schema", type=int, choices=(2, 3, 4), default=4
+    )
     args = parser.parse_args()
     verify(
         args.version,

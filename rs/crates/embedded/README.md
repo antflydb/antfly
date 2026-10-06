@@ -52,10 +52,27 @@ calls, for example Tokio's `thread_stack_size` on the runtime builder.
 
 ## Building against `libantfly`
 
-`antfly-embedded-sys`'s `build.rs` (see that crate's README) locates the
-`libantfly` dylib via `ANTFLY_LIB_DIR`, or `zig/zig-out/lib` inside an
-`antfly` source checkout. Enable the `libantfly` Cargo feature to actually
-link it:
+Install `pkg-config`, extract the Apache `antfly-embedded` release archive,
+and add its `lib/pkgconfig` directory to `PKG_CONFIG_PATH`. Enable the
+`libantfly` Cargo feature to link the combined database and inference library:
+
+```sh
+export PKG_CONFIG_PATH="/path/to/antfly-embedded/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+cargo build --features antfly-embedded/libantfly
+```
+
+The sys crate tries an explicit `ANTFLY_LIB_DIR` first, then pkg-config,
+then `zig/zig-out/lib` in a source checkout. The library must remain installed
+when the app runs. Crate tests/examples receive runtime search paths;
+downstream application binaries should install the library in the system
+loader path or set `LD_LIBRARY_PATH` (Linux) / `DYLD_LIBRARY_PATH` (macOS)
+to the archive's `lib` directory, or configure their own rpath.
+No ELv2 server package is required. See the sys crate README for discovery
+and cross-compilation details. Native archive targets are independent of the
+Python/npm package matrix, which currently covers Linux x86-64 and ARM64
+(glibc 2.28+) and macOS ARM64.
+
+Source checkout tests:
 
 ```sh
 cd zig && zig build capi   # or: zig build, for the full antfly CLI

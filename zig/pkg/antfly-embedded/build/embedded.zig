@@ -83,6 +83,7 @@ const addSnowballModule = @import("snowball.zig").addSnowballModule;
 const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
 
 pub const AddEmbeddedOptions = struct {
+    version: []const u8,
     server_integration_tests: bool = false,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
@@ -300,6 +301,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         libantfly.headerpad_max_install_names = true;
     }
     const install_libantfly = b.addInstallArtifact(libantfly, .{});
+    const pc_template = @embedFile("../libantfly.pc.in");
+    const pc_contents = std.mem.replaceOwned(u8, b.allocator, pc_template, "@VERSION@", options.version) catch @panic("OOM");
+    const pc_file = b.addWriteFiles().add("libantfly.pc", pc_contents);
+    const install_pkg_config = b.addInstallFileWithDir(pc_file, .lib, "pkgconfig/libantfly.pc");
+    install_libantfly.step.dependOn(&install_pkg_config.step);
+    b.step("pkgconfig", "Install relocatable libantfly pkg-config metadata").dependOn(&install_pkg_config.step);
+
     const install_capi_header = b.addInstallFileWithDir(
         b.path("pkg/antfly-embedded/include/antfly.h"),
         .header,
@@ -383,6 +391,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "-count=1",
         "./...",
     });
+    run_lite_go_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_go_tests.setCwd(b.path("../go/pkg/embedded"));
     run_lite_go_tests.step.dependOn(&install_libantfly.step);
     run_lite_go_tests.step.dependOn(&install_capi_header.step);
@@ -450,6 +459,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "--backup",
         "../../zig/.zig-cache/antfly-lite-go-example.afb",
     });
+    run_lite_go_example.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
     run_lite_go_example.step.dependOn(&install_libantfly.step);
     run_lite_go_example.step.dependOn(&install_capi_header.step);
@@ -468,6 +478,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "--backup",
         "../../zig/.zig-cache/antfly-lite-retrieval-go.afb",
     });
+    run_lite_go_retrieval_template.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, "pkgconfig"), .prefix = "PKG_CONFIG_PATH=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
     run_lite_go_retrieval_template.step.dependOn(&install_libantfly.step);
     run_lite_go_retrieval_template.step.dependOn(&install_capi_header.step);

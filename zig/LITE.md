@@ -826,8 +826,8 @@ and Lite CLI enrichment explicitly sets `process_isolation: false`. All
 backends, including Metal, CUDA, ONNX, and PJRT, therefore run in the host
 process. `ANTFLY_INFERENCE_WORKER` is not used by this provider, and opening
 an embedded inference handle does not require a worker executable. The
-private worker bundled with the Apache Embedded archive and Python/npm
-packages does not provide process isolation for library calls.
+private worker bundled with the Apache Embedded archive serves CLI hosts;
+Python/npm packages omit it because library calls do not use it.
 
 Once a call enters a GPU driver, a deadline or close cannot interrupt it;
 cancellation takes effect after the call returns. A driver fault can

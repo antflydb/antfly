@@ -38,8 +38,9 @@ See the [quickstart guide](https://antfly.io/docs/guides/quickstart) for a full 
 The Apache `antfly-embedded` release archive bundles `antfly-lite`,
 `antfly-inference`, `libantfly`, its C header, and the private inference worker,
 with runtime files and license notices. Python/npm embedded packages use the same
-library and private worker without installing public commands. Go/Rust consumers
-link the library from the archive or a local build.
+library without installing public commands. Go/Rust consumers
+link the library from the archive or a local build using its relocatable
+`lib/pkgconfig/libantfly.pc` metadata.
 
 Build the Apache Lite CLI and native library from source:
 

@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Python binding for embedded Antfly databases and inference (libantfly C ABI)"
 readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [
     {name = "Antfly, Inc.", email = "ajroetker@antfly.io"},
 ]
@@ -16,7 +17,6 @@ keywords = ["antfly", "lite", "database", "search", "embedded", "vector"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",

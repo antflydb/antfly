@@ -18,5 +18,6 @@
 //
 // The package is backed by the stable Antfly C ABI. The Go module carries
 // the matching antfly.h header; build or install libantfly before
-// running cgo-backed tests or binaries.
+// running cgo-backed tests or binaries. Install pkg-config and add the
+// Apache antfly-embedded archive's lib/pkgconfig to PKG_CONFIG_PATH.
 package embedded

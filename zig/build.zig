@@ -170,6 +170,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     wasm.smoke.step.dependOn(wasm_step);
     b.step("wasm-test", "Build the Antfly WASM bundle and run its Node smoke test").dependOn(&wasm.smoke.step);
     const embedded = antfly_embedded_build.addEmbedded(b, .{
+        .version = shared.antfly_version,
         .server_integration_tests = true,
         .lmdb_engine = lmdb_engine_mod,
         .vopr = vopr_mod,

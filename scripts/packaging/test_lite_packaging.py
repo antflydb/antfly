@@ -18,7 +18,6 @@
 
 import importlib.util
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -52,7 +51,7 @@ snapshot_spec.loader.exec_module(snapshot)
 
 
 class LitePackagingTests(unittest.TestCase):
-    def test_platform_packages_bundle_apache_library_and_worker(self):
+    def test_platform_packages_bundle_apache_library_without_unused_worker(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             archives = root / "archives"
@@ -89,6 +88,12 @@ class LitePackagingTests(unittest.TestCase):
                     "apache native library"
                 )
                 (stage / "include/antfly.h").write_text("/* ABI */")
+                (stage / "lib/pkgconfig").mkdir()
+                (stage / "lib/pkgconfig/libantfly.pc").write_text(
+                    (ROOT / "zig/pkg/antfly-embedded/libantfly.pc.in")
+                    .read_text()
+                    .replace("@VERSION@", "1.2.3")
+                )
                 (stage / "LICENSE").write_bytes(apache)
                 (stage / "LICENSES/Apache-2.0.txt").write_bytes(apache)
                 (stage / "LICENSES/third-party/example.txt").write_text(
@@ -128,7 +133,7 @@ class LitePackagingTests(unittest.TestCase):
                 self.assertTrue(
                     (npm / "lib" / package.lite_library_name(platform)).is_file()
                 )
-                self.assertTrue((npm / "lib/antfly-inference-worker").is_file())
+                self.assertFalse((npm / "lib/antfly-inference-worker").exists())
                 self.assertFalse((npm / "bin").exists())
                 self.assertTrue((npm / "LICENSES/third-party/example.txt").is_file())
                 for name in package.SOURCE_LICENSE_FILES:
@@ -143,7 +148,9 @@ class LitePackagingTests(unittest.TestCase):
                 )
                 with zipfile.ZipFile(wheel) as archive:
                     names = set(archive.namelist())
-                    self.assertIn("antfly_embedded/_lib/antfly-inference-worker", names)
+                    self.assertNotIn(
+                        "antfly_embedded/_lib/antfly-inference-worker", names
+                    )
                     self.assertIn(
                         "antfly_embedded/_lib/" + package.lite_library_name(platform),
                         names,
@@ -194,12 +201,11 @@ class LitePackagingTests(unittest.TestCase):
                     check=True,
                     capture_output=True,
                 )
-                for location in ("_lib/antfly-inference-worker",):
-                    installed = install_dir / "antfly_embedded" / location
-                    self.assertTrue(
-                        os.access(installed, os.X_OK),
-                        f"{installed}: {oct(installed.stat().st_mode & 0o777)}",
-                    )
+                self.assertFalse(
+                    (
+                        install_dir / "antfly_embedded/_lib/antfly-inference-worker"
+                    ).exists()
+                )
 
             npm_dir = root / "out/npm"
             npm_dir.mkdir()

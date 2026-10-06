@@ -133,8 +133,7 @@ removed from both CLIs; use `antfly standalone --storage-engine lite
 --storage-path app.aflite` for HTTP serving through the ELv2 server. The independent executable retains the hidden inference worker
 entry point for process isolation. The Apache `antfly-embedded` archive contains both public CLIs, `libantfly`,
 `antfly.h`, the private worker, runtime files and notices. It is the embedded
-release product alongside the separate ELv2 server archive. Embedded language packages ship their native library and internal
-worker; public command installation belongs to the CLI distributions.
+release product alongside the separate ELv2 server archive. Embedded language packages ship their native library without a worker; public command installation belongs to the CLI distributions.
 
 The staged-build check removes the entire server package before compiling the
 CLI, public C API, public Zig package, AWS credentials, native lake and WASM products.

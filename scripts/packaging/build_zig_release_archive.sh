@@ -327,6 +327,10 @@ fi
 if [ -d "$prefix/share" ]; then
   cp -R "$prefix/share" "$stage/share"
 fi
+if [ "$product" != inference ]; then
+  python3 "$repo_root/scripts/packaging/render_libantfly_pkgconfig.py" \
+    --version "$version" --out "$prefix/lib/pkgconfig/libantfly.pc"
+fi
 if [ "$product" != inference ] && [ -d "$prefix/lib" ]; then
   cp -R "$prefix/lib" "$stage/lib"
 fi

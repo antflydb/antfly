@@ -138,7 +138,7 @@ class ReleasePromotionTests(unittest.TestCase):
             )
 
         with mock.patch.object(contract, "git_object", side_effect=read_object):
-            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 3)
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 4)
             document["runtime_products"] = ["server", "lite", "inference"]
             with self.assertRaisesRegex(SystemExit, "invalid runtime products"):
                 contract.validate(RELEASE_DIR, COMMIT)
@@ -148,6 +148,26 @@ class ReleasePromotionTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(SystemExit, "required builder inputs"):
                 contract.validate(RELEASE_DIR, COMMIT)
+
+    def test_historical_combined_source_contract_is_preserved(self) -> None:
+        contract = load_module(
+            "historical_combined_contract_test", "validate_source_contract.py"
+        )
+        document = {
+            "schema_version": 3,
+            "runtime_products": ["server", "embedded"],
+            "required_source_paths": sorted(contract.COMBINED_REQUIRED_PATHS),
+        }
+
+        def read_object(_root, _commit, path):
+            return (
+                json.dumps(document).encode()
+                if path == contract.CONTRACT_PATH
+                else b"present"
+            )
+
+        with mock.patch.object(contract, "git_object", side_effect=read_object):
+            self.assertEqual(contract.validate(RELEASE_DIR, COMMIT), 3)
 
     def test_runtime_archives_follow_source_contract_and_fail_closed(self) -> None:
         payload = load_module(
@@ -208,7 +228,16 @@ class ReleasePromotionTests(unittest.TestCase):
         contract = load_module(
             "workflow_dispatch_source_contract_test", "validate_source_contract.py"
         )
-        for schema, jobs in ((1, ""), (1, "2"), (2, ""), (2, "2"), (3, ""), (3, "2")):
+        for schema, jobs in (
+            (1, ""),
+            (1, "2"),
+            (2, ""),
+            (2, "2"),
+            (3, ""),
+            (3, "2"),
+            (4, ""),
+            (4, "2"),
+        ):
             with (
                 self.subTest(schema=schema, jobs=jobs),
                 tempfile.TemporaryDirectory() as directory,
@@ -253,7 +282,7 @@ class ReleasePromotionTests(unittest.TestCase):
         payload = load_module(
             "apache_release_spec_payload_test", "build_release_payload.py"
         )
-        for schema in (1, 2, 3):
+        for schema in (1, 2, 3, 4):
             with (
                 self.subTest(schema=schema),
                 tempfile.TemporaryDirectory() as directory,
@@ -1641,6 +1670,9 @@ class ReleasePromotionTests(unittest.TestCase):
 
     def test_combined_release_ledger_checksums_and_promotion_scope(self) -> None:
         self.assert_release_ledger(3)
+
+    def test_pkgconfig_release_ledger(self) -> None:
+        self.assert_release_ledger(4)
 
     def assert_release_ledger(self, schema: int) -> None:
         payload = load_module("build_release_payload_test", "build_release_payload.py")

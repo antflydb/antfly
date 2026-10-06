@@ -58,10 +58,10 @@ SOURCE_LICENSE_FILES = (
 
 
 def archive_name(
-    version: str, platform: Platform, build_contract_schema: int = 3
+    version: str, platform: Platform, build_contract_schema: int = 4
 ) -> str:
     variant = f"_{platform.release_variant}" if platform.release_variant else ""
-    if build_contract_schema not in {2, 3}:
+    if build_contract_schema not in {2, 3, 4}:
         raise ValueError("unsupported embedded release build contract")
     product = "lite" if build_contract_schema == 2 else "embedded"
     return f"antfly-{product}_{version}_{platform.release_os}_{platform.release_arch}{variant}.tar.gz"
@@ -118,10 +118,6 @@ def populate_npm_package(platform: Platform, extracted: Path, version: str) -> P
         extracted / "lib",
         package_dir / "lib",
         ignore=lambda d, n: {x for x in n if is_packaging_noise(Path(x))},
-    )
-    shutil.copy2(
-        extracted / "antfly-inference-worker",
-        package_dir / "lib" / "antfly-inference-worker",
     )
     shutil.copytree(extracted / "include", package_dir / "include")
     if (extracted / "share").is_dir():
@@ -183,18 +179,12 @@ def write_wheel(
                     item.read_bytes(),
                 )
         for item in sorted((extracted / "lib").rglob("*")):
-            if item.is_file():
+            if item.is_file() and item.suffix != ".pc":
                 add_bytes(
                     archive,
                     f"antfly_embedded/_lib/{item.relative_to(extracted / 'lib').as_posix()}",
                     item.read_bytes(),
                 )
-        add_bytes(
-            archive,
-            "antfly_embedded/_lib/antfly-inference-worker",
-            (extracted / "antfly-inference-worker").read_bytes(),
-            0o755,
-        )
         for name in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
             add_bytes(archive, f"{dist_info}/{name}", (extracted / name).read_bytes())
         for item in sorted((extracted / "LICENSES").rglob("*")):

@@ -54,6 +54,9 @@ dependencies = [
 [[package]]
 name = "antfly-embedded-sys"
 version = "0.1.0"
+dependencies = [
+ "pkg-config",
+]
 
 [[package]]
 name = "antfly-postgres"

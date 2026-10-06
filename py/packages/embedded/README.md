@@ -3,7 +3,7 @@
 Python binding for embedded Antfly databases and inference, built on the stable
 `libantfly` C ABI. The Python code uses plain `ctypes`, without a compiled
 extension or `cffi` dependency. Release wheels bundle platform-specific
-`libantfly` binaries and the inference worker. `ctypes.CDLL` releases the GIL
+`libantfly` binaries. `ctypes.CDLL` releases the GIL
 for the duration of each foreign call, allowing parallel calls from Python
 threads against one handle.
 
@@ -21,8 +21,12 @@ client). This package's import name is `antfly_embedded`.
 
 ## Installing libantfly
 
-Release platform wheels bundle the Apache-2.0 `libantfly` library and
-private `antfly-inference-worker` helper. Installing this binding does not add
+Release platform wheels bundle the Apache-2.0 `libantfly` library.
+Prebuilt embedded packages support Linux x86-64 and ARM64 with glibc 2.28
+or newer, and macOS ARM64. Windows, Intel macOS, and Alpine/musl do not
+have prebuilt language packages. The native release archive matrix is
+separate; a source build or native archive does not imply wheel/npm support.
+ Installing this binding does not add
 `antfly-lite` or `antfly-inference` commands. Source checkouts and the
 pure-Python development wheel need a built copy of the shared library. At
 import time, `antfly_embedded`
@@ -41,8 +45,9 @@ locates it using this order (first match wins):
 5. The system dynamic linker's search path, via
    `ctypes.util.find_library("antfly")`.
 
-Platform library names: `libantfly.dylib` (macOS), `libantfly.so` (Linux),
-`antfly.dll` (Windows).
+Published wheel library names are `libantfly.dylib` (macOS ARM64) and
+`libantfly.so` (Linux). Windows DLL discovery exists for custom builds;
+there is no supported Windows wheel.
 
 Call `antfly_embedded.validate_abi()` at startup to fail fast when the loaded
 library's ABI version or `antfly_open_options` struct size does not match

@@ -30,6 +30,7 @@ pub fn build(b: *std.Build) void {
     });
     shared.production_antfly_imports.configureEmbedded(b, local_module, shared.link_libc);
     const embedded = embedded_owner.addEmbedded(b, .{
+        .version = shared.antfly_version,
         .vopr = shared.vopr_mod,
         .lmdb_engine = shared.lmdb_engine_mod,
         .optimize = shared.optimize,
