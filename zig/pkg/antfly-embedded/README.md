@@ -26,7 +26,11 @@ The embedded module exports `db`, `api`, object storage, and `lake`. Local
 `.aflite` and directory storage and database-free native inference use the
 same Apache source owners as the C API. Defaults disable optional accelerator
 backends; opt in with `metal`, `cuda`, `pjrt`, or `onnx` dependency options
-when their target/runtime prerequisites are available.
+when their target/runtime prerequisites are available. Supply an absolute
+`onnx-root` for an external ONNX Runtime installation. `blas=auto|linked|off`
+and `blas-root` control CPU acceleration; `cuda-artifacts` selects the CUDA
+bundle format. These options are passed to the shared composition rather
+than requiring files to be added to the fetched package cache.
 
 The package also exposes the native `antfly` shared-library artifact
 (`libantfly`), `antfly-lite`, and `antfly_wasm`. The browser artifact contains
