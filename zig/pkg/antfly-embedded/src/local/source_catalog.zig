@@ -656,6 +656,7 @@ pub const storage_db_quarantine_recovery = @import("storage/db/quarantine_recove
 pub const storage_db_independent_maintenance = @import("storage/db/independent_maintenance.zig");
 pub const allocation_bench_support = @import("allocation_bench_support.zig");
 pub const sql_aggregate_partial = @import("sql/aggregate_partial.zig");
+pub const sql_aggregate_materialization = @import("sql/aggregate_materialization.zig");
 pub const sql_aggregate_state = @import("sql/aggregate_state.zig");
 pub const sql_batch_hash = @import("sql/batch_hash.zig");
 pub const sql_column_spill = @import("sql/column_spill.zig");

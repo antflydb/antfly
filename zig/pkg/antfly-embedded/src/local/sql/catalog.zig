@@ -283,6 +283,16 @@ pub const DdlReceipt = struct {
 };
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
+/// Complete, authorized aggregate states for one pinned table and recipe.
+/// Keys and AGS1 cells borrow the supplied page allocator until the next pull.
+/// A provider must return null before opening if it cannot prove equivalence;
+/// errors after selection abort execution rather than mixing source snapshots.
+pub const AggregatePartialCursor = struct {
+    ptr: *anyopaque,
+    next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!?[]const @import("operators.zig").GroupResult,
+    close: *const fn (*anyopaque) void,
+};
+
 pub const Backend = struct {
     execution_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
@@ -330,6 +340,10 @@ pub const Backend = struct {
         /// null means this provider cannot retain a statement snapshot. Never
         /// substitute a collection of independently refreshed shard pages.
         open_scan: ?*const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!?Cursor = null,
+        /// Fresh authority/source/coverage proofs belong to the provider. The
+        /// SQL engine binds a strict recipe and retains projection, HAVING,
+        /// ordering, limits and exact native reducer semantics.
+        aggregate_partials: ?*const fn (*anyopaque, std.mem.Allocator, Table, @import("aggregate_materialization.zig").Recipe) anyerror!?AggregatePartialCursor = null,
         open_statement: ?*const fn (*anyopaque, std.mem.Allocator, []const StatementScan) anyerror!StatementRead = null,
         // The mutation allocator is a call-scoped arena. Providers must copy
         // any data retained after return into their own durable/session owner.

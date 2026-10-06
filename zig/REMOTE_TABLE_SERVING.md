@@ -45,7 +45,7 @@ The following paths remain required before claiming complete remote index servin
 | Range caching | Public SQL/rows RAM → disk → source reads | Shared artifact-reader admission and per-statement explain accounting |
 | Index construction | RowSource sidecar builders, scoped artifact uploads; native catalog CAS leases, API creation/deletion, maintenance recovery and catalog status | Lease renewal during long builds, streaming builders beyond bounded replay |
 | Index selection | Fresh per-execution catalog definitions, authorized complete-coverage selection proofs, explicit mismatch errors and automatic fallback helpers | Connect proofs and candidate/hydration readers to SQL/rows/search |
-| Algebraic execution | Native exact typed reducers; separate legacy lake fold artifacts | Bound semantic matcher, durable native state artifacts and catalog-selected SQL substitution |
+| Algebraic execution | Native exact typed reducers, strict bound recipe matcher and SQL partial-state consumer; separate legacy lake fold artifacts | Durable native state artifacts and catalog-selected provider wiring |
 | Incremental refresh | Immutable file identities and invalidation foundations | Per-file contribution manifests, append merging and delete-aware correction |
 
 This table is an acceptance gate. Helper tests or a configured index alone do not
@@ -171,6 +171,18 @@ result bytes. In-memory sorted rows remain owned by the bounded sort after the
 first leased page; scalar/batch mixing cannot reclaim rows held by earlier pages.
 A page retains its cursor through terminal error cleanup. Active transactions,
 mutations and declined streaming shapes retain their existing result path.
+The SQL aggregate provider contract binds direct grouping columns and reducer
+inputs by physical path, type, nullability and DISTINCT semantics. COUNT(*) and
+COUNT(column) have different recipes. Aliases, HAVING, ordering and paging remain
+in the native SQL consumer. Predicates, casts, expressions and filtered
+aggregates fall back until a separate equivalence proof exists. Providers supply
+bounded AGS1 partial pages only after proving current authority and complete
+source coverage. SQL imports their exact states, including i128 integer sums and
+compensated floating sums; restoring the first floating partial copies its
+state without arithmetic. The optimized COUNT(*) path uses this same provider
+and signature. Read failures after selection abort rather than mixing snapshots.
+The provider callback is optional and still needs native artifact-reader wiring.
+
 Operational remote index/materialization selection remains open.
 
 Native partial aggregate handoff uses the `AGS` version 1 binary state codec.

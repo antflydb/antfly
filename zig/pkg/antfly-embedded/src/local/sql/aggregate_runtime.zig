@@ -245,6 +245,30 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
     }
 }
 
+fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, table: catalog.Table) !bool {
+    const open = context.backend.vtable.aggregate_partials orelse return false;
+    const recipe = (try @import("aggregate_materialization.zig").fromBound(context.arena, table, bound.*)) orelse return false;
+    const cursor = (try open(context.backend.ptr, context.alloc, table, recipe)) orelse return false;
+    defer cursor.close(cursor.ptr);
+    var pages: usize = 0;
+    var groups: usize = 0;
+    while (true) {
+        try context.checkpoint();
+        var arena = std.heap.ArenaAllocator.init(context.alloc);
+        defer arena.deinit();
+        const partials = (try cursor.next(cursor.ptr, arena.allocator(), context.limits.executionRows())) orelse break;
+        if (partials.len == 0 or partials.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
+        pages += 1;
+        if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| groups) return error.SqlProgramLimitExceeded;
+        groups += partials.len;
+        for (partials) |partial| {
+            if (partial.keys.len != recipe.keys.len or partial.aggregates.len != recipe.inputs.len) return error.InvalidSqlBackendResponse;
+            try grouped.importPartial(partial.keys, partial.aggregates, partial.ordinal);
+        }
+    }
+    return true;
+}
+
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
     try bound.input.validateDecisions(context.arena, context.parameters, context.backend.decision_provider);
@@ -275,16 +299,16 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer if (after) |key| context.alloc.free(key);
         var pages: usize = 0;
         var visited: usize = 0;
-        var metadata_counted = false;
+        var aggregate_loaded = try loadMaterialized(context, bound, grouped, table);
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
             if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
         } else true;
-        if (count_only and !predicates.empty) if (try scan.count(context, table, .{ .fields = fields[0..field_count], .limit = context.limits.page_rows })) |count| {
+        if (!aggregate_loaded and count_only and !predicates.empty) if (try scan.count(context, table, .{ .fields = fields[0..field_count], .limit = context.limits.page_rows })) |count| {
             try grouped.addGlobalCount(count);
-            metadata_counted = true;
+            aggregate_loaded = true;
         };
-        const parallel = !external and !predicates.empty and !metadata_counted and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
-        while (!predicates.empty and !metadata_counted and !parallel) {
+        const parallel = !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
+        while (!predicates.empty and !aggregate_loaded and !parallel) {
             try context.checkpoint();
             pages += 1;
             if (pages > context.limits.scan_pages) return error.SqlProgramLimitExceeded;
