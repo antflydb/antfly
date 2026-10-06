@@ -176,8 +176,18 @@ class MemoryStore:
     def read_optional(self, key: str) -> gc.StoredObject | None:
         return self.stored.get(key)
 
+    def write_if_absent(self, key: str, body: bytes) -> None:
+        current = self.stored.get(key)
+        if current is not None and current.body != body:
+            raise SystemExit("conflicting pending cleanup")
+        if current is None:
+            self.put(key, body)
+
     def delete_objects(self, keys: list[str]) -> None:
         self.deleted.extend(keys)
+        for key in keys:
+            self.objects.pop(key, None)
+            self.stored.pop(key, None)
 
 
 class ReleaseGCTests(unittest.TestCase):
@@ -361,9 +371,7 @@ class ReleaseGCTests(unittest.TestCase):
                     )
 
                 def apply(deletion):
-                    for key in deletion["delete_keys"]:
-                        store.objects.pop(key, None)
-                        store.stored.pop(key, None)
+                    gc.apply_gc_plan(store, deletion)
 
                 blocked = plan()
                 self.assertIn(tag, blocked["expired"])
@@ -382,7 +390,7 @@ class ReleaseGCTests(unittest.TestCase):
                 # Repair the legacy stable release, then finish the deferred
                 # artifact and image cleanup through the next normal plan.
                 store.add_release("v9.0.0", 100)
-                resumed = plan()
+                resumed = gc.plan_gc(store, now=NOW, nightly_min_count=1)
                 self.assertEqual(resumed["policy"]["shared_sweep"], "enabled")
                 self.assertIn(version_ledger, resumed["delete_keys"])
                 self.assertTrue(content_keys <= set(resumed["delete_keys"]))
@@ -399,6 +407,122 @@ class ReleaseGCTests(unittest.TestCase):
                 self.assertNotIn(version_ledger, store.objects)
                 self.assertNotIn(record_key, store.objects)
                 self.assertIn(unknown, store.objects)
+
+    def pending_legacy_cleanup(self):
+        store = MemoryStore()
+        tag = "v0.0.0-dev22"
+        ledger = store.add_release(tag, 100)
+        store.put("antfly/v9.0.0/antfly.tar.gz", b"legacy stable")
+        plan = gc.plan_gc(store, now=NOW, delete_dev_releases=True)
+        return store, tag, ledger, plan
+
+    def test_legacy_dev_cleanup_resumes_in_scheduled_gc(self) -> None:
+        store, tag, ledger, blocked = self.pending_legacy_cleanup()
+        marker = f"{gc.PENDING_ROOT}{ledger}.json"
+        self.assertNotIn(marker, store.objects)  # Planning never writes intent.
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "plan.json"
+            path.write_text(json.dumps(blocked))
+            self.assertEqual(gc.load_plan(path), blocked)
+        gc.apply_gc_plan(store, blocked)
+        self.assertIn(marker, store.objects)
+        self.assertNotIn(f"antfly/{tag}/metadata.json", store.objects)
+        again = gc.plan_gc(store, now=NOW)
+        self.assertEqual(again["expired"][tag], "explicit-dev-cleanup")
+        self.assertNotIn(marker, again["delete_keys"])
+        store.add_release("v9.0.0", 100)
+        resumed = gc.plan_gc(store, now=NOW)
+        self.assertEqual(resumed["expired"][tag], "explicit-dev-cleanup")
+        self.assertIn(marker, resumed["delete_keys"])
+        self.assertIn(f"antfly/{tag}/artifacts.json", resumed["delete_keys"])
+        self.assertEqual(resumed["container_deletions"][0]["ledger_sha256"], ledger)
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "plan.json"
+            path.write_text(json.dumps(resumed))
+            self.assertEqual(gc.load_plan(path), resumed)
+        gc.apply_gc_plan(store, resumed)
+        self.assertNotIn(marker, store.objects)
+        self.assertNotIn(tag, gc.plan_gc(store, now=NOW)["expired"])
+
+    def test_pending_cleanup_still_honors_channel_protection(self) -> None:
+        store, tag, ledger, blocked = self.pending_legacy_cleanup()
+        gc.apply_gc_plan(store, blocked)
+        store.add_journal("nightly", current=(tag, ledger))
+        protected = gc.plan_gc(store, now=NOW)
+        self.assertEqual(protected["retained"][tag], "channel-current-or-pending")
+        self.assertNotIn(f"{gc.PENDING_ROOT}{ledger}.json", protected["delete_keys"])
+        self.assertNotIn(f"antfly/{tag}/artifacts.json", protected["delete_keys"])
+
+    def test_pending_cleanup_rejects_changed_release_identity(self) -> None:
+        store, tag, _, blocked = self.pending_legacy_cleanup()
+        gc.apply_gc_plan(store, blocked)
+        store.add_release(tag, 100, artifacts={"different.bin": "f" * 64})
+        with self.assertRaisesRegex(SystemExit, "identity changed"):
+            gc.plan_gc(store, now=NOW)
+
+    def test_pending_write_failure_prevents_all_prefix_deletion(self) -> None:
+        store, tag, _, blocked = self.pending_legacy_cleanup()
+
+        def fail(*args):
+            raise OSError("write failed")
+
+        store.write_if_absent = fail
+        with self.assertRaisesRegex(OSError, "write failed"):
+            gc.apply_gc_plan(store, blocked)
+        self.assertIn(f"antfly/{tag}/metadata.json", store.objects)
+        self.assertEqual(store.deleted, [])
+
+    def test_completed_pending_marker_can_be_collected_after_interruption(self) -> None:
+        store, _, ledger, blocked = self.pending_legacy_cleanup()
+        gc.apply_gc_plan(store, blocked)
+        store.add_release("v9.0.0", 100)
+        final = gc.plan_gc(store, now=NOW)
+        marker = f"{gc.PENDING_ROOT}{ledger}.json"
+        # Model failure in the last deletion phase, after the version ledger.
+        store.delete_objects([key for key in final["delete_keys"] if key != marker])
+        retry = gc.plan_gc(store, now=NOW)
+        self.assertEqual(retry["delete_keys"], [marker])
+
+    def test_pending_writes_are_covered_by_approval_contract(self) -> None:
+        _, _, _, plan = self.pending_legacy_cleanup()
+        changed = {**plan, "pending_writes": {}}
+        with self.assertRaisesRegex(SystemExit, "changed after approval"):
+            gc.verify_approved_plan(plan, changed)
+
+    def test_invalid_pending_cleanup_cannot_expire_a_stable_release(self) -> None:
+        store, _, ledger, blocked = self.pending_legacy_cleanup()
+        key = f"{gc.PENDING_ROOT}{ledger}.json"
+        record = {**blocked["pending_writes"][key], "tag": "v1.0.0"}
+        store.put(key, json.dumps(record).encode())
+        with self.assertRaisesRegex(SystemExit, "invalid pending release cleanup"):
+            gc.plan_gc(store, now=NOW)
+
+    def test_r2_pending_write_is_conditional_and_checks_conflicts(self) -> None:
+        requests = []
+
+        class Conflict(Exception):
+            response = {"Error": {"Code": "PreconditionFailed"}}
+
+        class Client:
+            def put_object(self, **request):
+                requests.append(request)
+                if len(requests) > 1:
+                    raise Conflict()
+
+        store = object.__new__(gc.S3ObjectStore)
+        store.bucket = "releases"
+        store.client = Client()
+        store.client_error = Conflict
+        key = f"{gc.PENDING_ROOT}{'a' * 64}.json"
+        body = b"pending intent"
+        store.read_optional = lambda _: gc.StoredObject(body, "etag")
+        store.write_if_absent(key, body)
+        self.assertEqual(requests[0]["IfNoneMatch"], "*")
+        self.assertEqual(requests[0]["Key"], key)
+        store.write_if_absent(key, body)  # An identical retry is idempotent.
+        store.read_optional = lambda _: gc.StoredObject(b"other intent", "etag")
+        with self.assertRaisesRegex(SystemExit, "conflicting pending release cleanup"):
+            store.write_if_absent(key, body)
 
     def test_dev_cleanup_is_explicit_and_preserves_other_releases(self) -> None:
         store = MemoryStore()
@@ -517,6 +641,7 @@ class ReleaseGCTests(unittest.TestCase):
                         "delete_keys": ["antfly/channels/stable.json"],
                         "container_deletions": [],
                         "container_record_deletions": [],
+                        "pending_writes": {},
                         "snapshots": {},
                         "approval_sha256": "0" * 64,
                     }
@@ -567,7 +692,9 @@ class ReleaseGCTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "malformed container deletion"):
                 gc.load_plan(path)
 
-    def test_r2_deletion_removes_release_commit_markers_last(self) -> None:
+    def test_r2_deletion_removes_payloads_then_ledgers_then_pending_markers(
+        self,
+    ) -> None:
         calls = []
 
         class Client:
@@ -580,13 +707,15 @@ class ReleaseGCTests(unittest.TestCase):
         store.client = Client()
         store.delete_objects(
             [
+                f"{gc.PENDING_ROOT}{'a' * 64}.json",
                 "antfly/v1.2.3/artifacts.json",
                 "antfly/v1.2.3/metadata.json",
                 f"{gc.CONTENT_ROOT}{'1' * 64}/artifact.bin",
             ]
         )
 
-        self.assertEqual(calls[-1], ["antfly/v1.2.3/artifacts.json"])
+        self.assertEqual(calls[-1], [f"{gc.PENDING_ROOT}{'a' * 64}.json"])
+        self.assertEqual(calls[-2], ["antfly/v1.2.3/artifacts.json"])
         self.assertNotIn("antfly/v1.2.3/artifacts.json", calls[0])
 
 

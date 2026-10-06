@@ -33,6 +33,7 @@ DEFAULT_BUCKET = "antfly-releases"
 RELEASE_ROOT = "antfly/"
 CONTENT_ROOT = "antfly/artifacts/sha256/"
 CONTAINER_IDENTITY_ROOT = "antfly/container-identities/"
+PENDING_ROOT = "antfly/gc-pending/"
 LEDGER_NAME = "artifacts.json"
 SUPPORTED_LEDGER_SCHEMAS = {1, 2, 3, 4, 5}
 SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -65,6 +66,8 @@ class ObjectStore(Protocol):
     def list_objects(self, prefix: str) -> list[ObjectInfo]: ...
 
     def read_optional(self, key: str) -> StoredObject | None: ...
+
+    def write_if_absent(self, key: str, body: bytes) -> None: ...
 
     def delete_objects(self, keys: list[str]) -> None: ...
 
@@ -230,6 +233,64 @@ def load_releases(
     return releases, all_content_keys, all_container_keys, unmanifested
 
 
+def pending_document(key: str, document: dict[str, Any]) -> dict[str, Any]:
+    tag = document.get("tag")
+    digest = document.get("ledger_sha256")
+    match = TAG_PATTERN.fullmatch(tag) if isinstance(tag, str) else None
+    if (
+        document.get("schema_version") != 1
+        or match is None
+        or match.group("prerelease") is None
+        or not isinstance(digest, str)
+        or SHA256.fullmatch(digest) is None
+        or key != f"{PENDING_ROOT}{digest}.json"
+        or document.get("reason")
+        not in {
+            "explicit-dev-cleanup",
+            "nightly-retention-expired",
+            "prerelease-grace-expired",
+        }
+        or document.get("reason") == "explicit-dev-cleanup"
+        and match.group("pre_label") != "dev"
+    ):
+        raise SystemExit(f"invalid pending release cleanup: {key}")
+    return document
+
+
+def load_pending_cleanups(
+    store: ObjectStore,
+    objects: list[ObjectInfo],
+    releases: dict[str, Release],
+    unmanifested: dict[str, frozenset[str]],
+) -> tuple[dict[str, dict[str, Any]], set[str], dict[str, str]]:
+    pending: dict[str, dict[str, Any]] = {}
+    completed: set[str] = set()
+    snapshots: dict[str, str] = {}
+    for item in objects:
+        if not item.key.startswith(PENDING_ROOT):
+            continue
+        stored = store.read_optional(item.key)
+        if stored is None:
+            raise SystemExit(f"pending release cleanup disappeared: {item.key}")
+        record = pending_document(
+            item.key, parse_document(stored, "pending release cleanup")
+        )
+        snapshots[item.key] = stored.etag
+        tag = record["tag"]
+        if tag in unmanifested:
+            raise SystemExit(f"pending cleanup release is missing its manifest: {tag}")
+        release = releases.get(tag)
+        if release is None:
+            # The version ledger is deleted only after its other objects; an
+            # interrupted final marker batch can safely finish on the next run.
+            completed.add(item.key)
+        elif release.ledger_sha256 != record["ledger_sha256"]:
+            raise SystemExit(f"pending cleanup release identity changed: {tag}")
+        else:
+            pending[tag] = record
+    return pending, completed, snapshots
+
+
 def load_completion_history(
     store: ObjectStore,
     objects: list[ObjectInfo],
@@ -359,6 +420,10 @@ def plan_gc(
             "protected channel release is missing its immutable ledger: "
             + ", ".join(missing_protected)
         )
+    pending, completed_pending, pending_snapshots = load_pending_cleanups(
+        store, objects, releases, unmanifested
+    )
+    snapshots.update(pending_snapshots)
     known_ledgers = {release.ledger_sha256 for release in releases.values()}
     missing_ledgers = sorted(protected_ledgers - known_ledgers)
     if missing_ledgers:
@@ -388,6 +453,10 @@ def plan_gc(
         assert match is not None
         if tag in protected_tags or release.ledger_sha256 in protected_ledgers:
             retained[tag] = "channel-current-or-pending"
+        elif tag in pending and (
+            not delete_dev_releases or match.group("pre_label") == "dev"
+        ):
+            expired[tag] = pending[tag]["reason"]
         elif delete_dev_releases:
             if match.group("pre_label") == "dev":
                 expired[tag] = "explicit-dev-cleanup"
@@ -451,7 +520,18 @@ def plan_gc(
         if expired
         else set()
     )
+    pending_writes = {}
     if unknown_references:
+        for tag in sorted((expired.keys() & releases.keys()) - pending.keys()):
+            release = releases[tag]
+            key = f"{PENDING_ROOT}{release.ledger_sha256}.json"
+            pending_writes[key] = {
+                "schema_version": 1,
+                "tag": tag,
+                "ledger_sha256": release.ledger_sha256,
+                "reason": expired[tag],
+            }
+            snapshots[key] = None
         # Keep the commit marker until its shared references can be collected.
         # A later plan discovers these expired releases through their manifests,
         # even after their other version-prefix objects have been removed.
@@ -488,6 +568,12 @@ def plan_gc(
         )
 
     delete_keys.update(container_record_deletions)
+    delete_keys.update(completed_pending)
+    if not unknown_references:
+        delete_keys.update(
+            f"{PENDING_ROOT}{pending[tag]['ledger_sha256']}.json"
+            for tag in expired.keys() & pending.keys()
+        )
 
     plan = {
         "schema_version": 2,
@@ -510,6 +596,7 @@ def plan_gc(
         ),
         "container_record_deletions": sorted(container_record_deletions),
         "delete_keys": sorted(delete_keys),
+        "pending_writes": pending_writes,
         "snapshots": snapshots,
     }
     plan["approval_sha256"] = approval_sha256(plan)
@@ -525,6 +612,7 @@ APPROVAL_FIELDS = (
     "container_deletions",
     "container_record_deletions",
     "delete_keys",
+    "pending_writes",
 )
 
 
@@ -566,6 +654,7 @@ def load_plan(path: Path) -> dict[str, Any]:
         or not isinstance(plan.get("delete_keys"), list)
         or not isinstance(plan.get("container_deletions"), list)
         or not isinstance(plan.get("container_record_deletions"), list)
+        or not isinstance(plan.get("pending_writes"), dict)
         or not isinstance(plan.get("snapshots"), dict)
         or not isinstance(plan.get("approval_sha256"), str)
     ):
@@ -577,6 +666,7 @@ def load_plan(path: Path) -> dict[str, Any]:
         tag, separator, _name = remainder.partition("/")
         if not (
             key.startswith((CONTENT_ROOT, CONTAINER_IDENTITY_ROOT))
+            or re.fullmatch(rf"{re.escape(PENDING_ROOT)}[0-9a-f]{{64}}\.json", key)
             or separator
             and TAG_PATTERN.fullmatch(tag)
         ):
@@ -602,6 +692,12 @@ def load_plan(path: Path) -> dict[str, Any]:
             or item["record_key"] != f"{CONTAINER_IDENTITY_ROOT}{ledger}.json"
         ):
             raise SystemExit("release-GC plan contains a malformed container deletion")
+    for key, record in plan["pending_writes"].items():
+        if not isinstance(record, dict):
+            raise SystemExit("malformed pending release cleanup write")
+        pending_document(key, record)
+        if plan.get("expired", {}).get(record["tag"]) != record["reason"]:
+            raise SystemExit("pending cleanup write has no matching expiration")
     expected_record_keys = {item["record_key"] for item in plan["container_deletions"]}
     for key in plan["container_record_deletions"]:
         if (
@@ -673,20 +769,44 @@ class S3ObjectStore:
             raise
         return StoredObject(response["Body"].read(), str(response["ETag"]))
 
+    def write_if_absent(self, key: str, body: bytes) -> None:
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+        except self.client_error as exc:
+            if str(exc.response.get("Error", {}).get("Code")) not in {
+                "412",
+                "PreconditionFailed",
+            }:
+                raise
+            current = self.read_optional(key)
+            if current is None or current.body != body:
+                raise SystemExit(f"conflicting pending release cleanup: {key}") from exc
+
     def delete_objects(self, keys: list[str]) -> None:
         release_ledgers = []
+        pending_markers = []
         other_keys = []
         for key in keys:
             remainder = key.removeprefix(RELEASE_ROOT)
             tag, separator, name = remainder.partition("/")
-            if separator and TAG_PATTERN.fullmatch(tag) and name == LEDGER_NAME:
+            if key.startswith(PENDING_ROOT):
+                pending_markers.append(key)
+            elif separator and TAG_PATTERN.fullmatch(tag) and name == LEDGER_NAME:
                 release_ledgers.append(key)
             else:
                 other_keys.append(key)
         # The version ledger is the release prefix's commit marker. Delete it
-        # only after every other object so a failed batch remains discoverable
+        # only after every payload object so a failed batch remains discoverable
         # and a retry can finish the same plan safely.
-        for phase in (other_keys, release_ledgers):
+        # Pending intent outlives the ledger so a failed deletion cannot reset
+        # an explicit expiration to the normal retention policy.
+        for phase in (other_keys, release_ledgers, pending_markers):
             for offset in range(0, len(phase), 1000):
                 batch = phase[offset : offset + 1000]
                 response = self.client.delete_objects(
@@ -699,6 +819,14 @@ class S3ObjectStore:
                 errors = response.get("Errors", [])
                 if errors:
                     raise SystemExit(f"object-storage deletion failed: {errors}")
+
+
+def apply_gc_plan(store: ObjectStore, plan: dict[str, Any]) -> None:
+    # Save durable, digest-bound intent before removing any release bytes.
+    for key, record in plan["pending_writes"].items():
+        body = (json.dumps(record, sort_keys=True) + "\n").encode()
+        store.write_if_absent(key, body)
+    store.delete_objects(plan["delete_keys"])
 
 
 def main() -> int:
@@ -768,7 +896,7 @@ def main() -> int:
         args.plan_out.parent.mkdir(parents=True, exist_ok=True)
         args.plan_out.write_text(rendered, encoding="utf-8")
     if applying:
-        store.delete_objects(plan["delete_keys"])
+        apply_gc_plan(store, plan)
         print(f"deleted {len(plan['delete_keys'])} release objects")
     else:
         print(f"dry run: {len(plan['delete_keys'])} release objects would be deleted")

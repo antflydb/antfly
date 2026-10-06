@@ -133,7 +133,13 @@ shared-object and container sweeping remains disabled until the manifest is
 repaired or the prefix is explicitly removed. Expired releases retain their
 `artifacts.json` commit markers while this cleanup is blocked, so later runs can
 still discover and collect their shared artifacts and container identities;
-other expired version-prefix objects can be removed immediately. Malformed
+other expired version-prefix objects can be removed immediately. Apply first
+persists a pending-cleanup record under `antfly/gc-pending/`, bound to the
+manifest digest. Ordinary scheduled GC honors that expiration even if it was
+originally selected with the explicit dev-cleanup flag. Current and pending
+channel identities still take precedence. Cleanup records are removed after
+version manifests, so an interrupted deletion preserves the decision for a
+retry. Malformed
 existing manifests and missing manifests bound to a channel journal’s ledger
 digest still stop
 planning. Legacy aliases without a ledger digest protect their version prefixes
@@ -239,7 +245,8 @@ a repository-administrator GitHub token.
 
 Release retention plans are approval artifacts, not advisory previews. Their
 canonical SHA-256 covers policy, retained and expired identities, R2 keys,
-container digests, and per-ledger container records. Apply recomputes under the
+pending-cleanup record writes, container digests, and per-ledger container
+records. Apply recomputes under the
 release-storage lock and aborts unless that contract is unchanged. Container
 records are collected independently from their shared OCI digest, while a new
 release missing its required record is retained for repair.
