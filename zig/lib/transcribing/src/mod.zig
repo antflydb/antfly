@@ -114,9 +114,13 @@ pub const default_max_download_bytes: usize = 128 << 20;
 /// Zero is treated as unset. The schema's minimum is one byte and a ceiling
 /// of zero rejects every recording, so it is always a client that filled in
 /// a field it meant to leave out rather than an operator asking for it.
-fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
+pub fn effectiveMaxDownloadBytes(max_download_bytes: ?usize) usize {
     const configured = if (max_download_bytes) |value| (if (value == 0) null else value) else null;
-    return .{ .max_download_size_bytes = configured orelse default_max_download_bytes };
+    return configured orelse default_max_download_bytes;
+}
+
+fn remoteFetchSecurity(max_download_bytes: ?usize) scraping.ContentSecurityConfig {
+    return .{ .max_download_size_bytes = effectiveMaxDownloadBytes(max_download_bytes) };
 }
 
 threadlocal var active_runtime: ?*const Runtime = null;
@@ -567,6 +571,16 @@ test "Apple transcription recognizes a recording with phrase and word timestamps
     }
     try std.testing.expectError(error.UnsupportedAppleSpeechLocale, transcribeWithConfig(alloc, &client, .{ .provider = .apple, .language_code = "xx-XX" }, .{ .url = uri }, .{}));
     try std.testing.expectError(error.ResponseTooLarge, transcribeWithConfig(alloc, &client, .{ .provider = .apple, .max_response_bytes = 16 }, .{ .url = uri }, .{}));
+    // Keep the recording compact while representing more than an hour of
+    // audio: the PCM fixture has 39,946 frames, or 3,994.6 seconds at 10 Hz.
+    const long_fixture = try alloc.dupe(u8, fixture);
+    defer alloc.free(long_fixture);
+    std.mem.writeInt(u32, long_fixture[24..28], 10, .little);
+    std.mem.writeInt(u32, long_fixture[28..32], 20, .little);
+    _ = std.base64.standard.Encoder.encode(encoded, long_fixture);
+    const long_uri = try std.fmt.allocPrint(alloc, "data:audio/wav;base64,{s}", .{encoded});
+    defer alloc.free(long_uri);
+    try std.testing.expectError(error.AppleSpeechDurationExceeded, transcribeWithConfig(alloc, &client, .{ .provider = .apple }, .{ .url = long_uri }, .{ .timeout_ms = 60_000 }));
     const cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(error.Cancelled, transcribeWithConfig(alloc, &client, .{ .provider = .apple }, .{ .url = uri }, .{
         .cancellation = httpx.CancellationToken.fromAtomic(&cancelled),

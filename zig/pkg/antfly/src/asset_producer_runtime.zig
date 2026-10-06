@@ -185,6 +185,31 @@ test "asset producer runtime apple OCR uses local media without embedded inferen
     try std.testing.expectEqual(@as(usize, 1), batch.execution.serial_items);
 }
 
+test "Apple transcription admission uses the effective download ceiling" {
+    if (!transcribing.apple_native.enabled) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    defer client.deinit();
+    var runtime = Runtime.init(alloc, &client);
+    defer runtime.deinit();
+    var producer = runtime.producer();
+    var request = asset_producer.Request{
+        .producer_type = .transcriber,
+        .config_json = "{\"provider\":\"apple\"}",
+        .source_text = "https://example.com/recording.wav",
+        .content_type = "text/plain",
+    };
+    const baseline = try producer.invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expect(baseline.fixed_bytes >= transcribing.apple_native.workspace_bytes + transcribing.default_max_download_bytes);
+    // Pad with JSON whitespace so config-buffer overhead is identical.
+    request.config_json = "{\"provider\":\"apple\",\"max_download_bytes\":0}        ";
+    const zero = try producer.invocationMemoryForRequests(alloc, &.{request});
+    request.config_json = "{\"provider\":\"apple\",\"max_download_bytes\":134217728}";
+    const explicit = try producer.invocationMemoryForRequests(alloc, &.{request});
+    try std.testing.expectEqual(zero.fixed_bytes, explicit.fixed_bytes);
+    try std.testing.expectEqual(zero.allocator_limit_bytes, explicit.allocator_limit_bytes);
+}
+
 test "asset producer runtime derives coherent logical and wire result ceilings" {
     const alloc = std.testing.allocator;
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -783,7 +808,7 @@ pub const Runtime = struct {
                     try transcribing.apple_native.checkAvailable();
                     // The adapter owns its bounded downloaded recording; Swift
                     // borrows it while AVAudioFile streams decoded samples.
-                    native_workspace_bytes = transcribing.apple_native.workspace_bytes + (cfg.max_download_bytes orelse transcribing.default_max_download_bytes);
+                    native_workspace_bytes = transcribing.apple_native.workspace_bytes + transcribing.effectiveMaxDownloadBytes(cfg.max_download_bytes);
                     break :blk .borrowed_binary;
                 }
                 if (!remote) {

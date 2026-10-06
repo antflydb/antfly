@@ -2176,6 +2176,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.UnsupportedAppleTranscriptionOptions,
         error.InvalidAppleTranscribingConfig,
         error.UnsupportedAppleSpeechLocale,
+        error.AppleSpeechDurationExceeded,
         error.AppleContextWindowExceeded,
         error.AppleGenerationRefused,
         error.InferenceTaskMismatch,
@@ -2683,6 +2684,11 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfEmbeddingArtifactFanoutExceeded));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfEmbeddingArtifactScanBudgetExceeded));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnexpectedToken));
+}
+
+test "Apple transcription duration rejection is terminal while native failures retry" {
+    try std.testing.expect(!isRetryableEnrichmentError(error.AppleSpeechDurationExceeded));
+    try std.testing.expect(isRetryableEnrichmentError(error.AppleNativeFailed));
 }
 
 test "enrichment treats deterministic size-based inference rejections as terminal, not retryable" {

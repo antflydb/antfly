@@ -97,6 +97,7 @@ pub fn invoke(alloc: std.mem.Allocator, operation: Operation, json: []const u8, 
         10 => return error.AppleContextWindowExceeded,
         11 => return error.AppleGenerationRefused,
         12 => return error.AppleNativeBridgeUnavailable,
+        14 => return error.AppleSpeechDurationExceeded,
         15 => return error.AppleNativeBridgeIncompatible,
         else => return error.AppleNativeFailed,
     }
