@@ -937,7 +937,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     production_antfly_imports.configureEmbedded(b, lite_main_tests.root_module, link_libc);
     lite_main_tests.root_module.addImport("antfly-client", antfly_client_pkg_mod);
     lite_main_tests.root_module.addImport("antfly_inference_host", production_antfly_imports.inference_host);
-    build_info.link(lite_main_tests.root_module);
+    // Unit tests use the stable test version; only final products link release metadata.
+    lite_main_tests.root_module.addImport("build_info", build_info.module);
     const run_lite_main_tests = addFilteredTestRunArtifact(b, lite_main_tests);
     const install_lite_main = b.addInstallArtifact(lite_main, .{});
 
