@@ -95,6 +95,20 @@ integration. Numeric/temporal element types and non-C collations also remain
 outside this layer's current contract. No original
 typed-array cases are marked complete on this evidence alone.
 
+The shared PostgreSQL binary-array codec (`array_binary.zig`) verifies element
+OIDs against the pinned expected type and retains dimensions, lower bounds,
+primitive widths and SQL NULL versus JSONB-null elements. It streams encoding
+without per-element scratch arenas, bounds wire size before output, and charges
+actual decoded arena capacity independently. Eleven server-produced binary
+fixtures cover every currently supported element codec; the PostgreSQL oracle
+also accepts the native payloads as binary parameters and checks array equality
+and JSONB NULL provenance. Fault injection covers decoding every fixture and
+every truncated text-array prefix. Boundary probes preserve PostgreSQL's
+advisory NULL flags, nonzero boolean receive bytes and empty-extent
+normalization; the core now rejects an exclusive upper bound that cannot fit
+int32, with SQLSTATE `54000`. This still does not activate array SQL syntax,
+catalog types, public result descriptors or pgwire routes.
+
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.
 Original source SHA-256: `52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6`.

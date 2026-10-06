@@ -160,6 +160,140 @@ class PostgresReferenceTest(unittest.TestCase):
             ],
         )
 
+    def test_typed_array_binary_server_goldens_and_native_parameter_payloads(self):
+        import json
+        from pathlib import Path
+
+        import psycopg
+        from psycopg.adapt import Dumper
+        from psycopg.pq import Format
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_array_binary_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(fixture["reference"], "PostgreSQL 18+ binary array_send")
+        self.assertEqual(len(fixture["entries"]), 11)
+
+        class Payload:
+            def __init__(self, data):
+                self.data = data
+
+        for case in fixture["entries"]:
+            with self.subTest(sql=case["sql"]):
+                dumper = type(
+                    "TypedArrayDumper",
+                    (Dumper,),
+                    {
+                        "oid": case["array_oid"],
+                        "format": Format.BINARY,
+                        "dump": lambda self, obj: obj.data,
+                    },
+                )
+                self.db.adapters.register_dumper(Payload, dumper)
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute("SET TRANSACTION READ ONLY")
+                    with self.db.cursor(binary=True) as cursor:
+                        cursor.execute("SELECT " + case["sql"])
+                        self.assertEqual(cursor.pgresult.fformat(0), 1)
+                        self.assertEqual(cursor.pgresult.ftype(0), case["array_oid"])
+                        self.assertEqual(
+                            cursor.pgresult.get_value(0, 0).hex(), case["binary"]
+                        )
+                    payload = Payload(
+                        bytes.fromhex(case.get("native_binary", case["binary"]))
+                    )
+                    with psycopg.RawCursor(self.db) as cursor:
+                        cursor.execute("SELECT $1 = (" + case["sql"] + ")", [payload])
+                        self.assertEqual(cursor.fetchone(), (True,))
+                        if case["element_type"] == "jsonb":
+                            cursor.execute(
+                                "SELECT e IS NULL, jsonb_typeof(e) FROM unnest($1) AS e",
+                                [payload],
+                            )
+                            self.assertEqual(
+                                cursor.fetchall(),
+                                [
+                                    (False, "null"),
+                                    (True, None),
+                                    (False, "object"),
+                                    (False, "array"),
+                                ],
+                            )
+
+    def test_typed_array_binary_receive_boundary_admission(self):
+        import struct
+
+        import psycopg
+        from psycopg.adapt import Dumper
+        from psycopg.pq import Format
+
+        class Payload:
+            def __init__(self, data):
+                self.data = data
+
+        cases = [
+            (
+                1000,
+                struct.pack("!iiIiiiB", 1, 0, 16, 1, 1, 1, 2),
+                ("[1:1]", 1, "{t}"),
+                None,
+            ),
+            (
+                1007,
+                struct.pack("!iiIiiii", 1, 0, 23, 1, 2147483647, 4, 1),
+                None,
+                "54000",
+            ),
+            (
+                1007,
+                struct.pack("!iiIiiii", 1, 0, 23, 1, 2147483646, 4, 1),
+                ("[2147483646:2147483646]", 1, "[2147483646:2147483646]={1}"),
+                None,
+            ),
+            (
+                1007,
+                struct.pack("!iiIiiii", 2, 0, 23, 100000, 1, 0, 1),
+                (None, 0, "{}"),
+                None,
+            ),
+            (
+                1007,
+                struct.pack("!iiIiii", 1, 0, 23, 1, 1, -1),
+                ("[1:1]", 1, "{NULL}"),
+                None,
+            ),
+            (1009, struct.pack("!iiIiii", 1, 0, 25, 1, 1, 1) + b"\0", None, "22021"),
+        ]
+        for oid, data, expected, sqlstate in cases:
+            with self.subTest(oid=oid, payload=data.hex()):
+                dumper = type(
+                    "TypedArrayDumper",
+                    (Dumper,),
+                    {
+                        "oid": oid,
+                        "format": Format.BINARY,
+                        "dump": lambda self, obj: obj.data,
+                    },
+                )
+                self.db.adapters.register_dumper(Payload, dumper)
+                try:
+                    with self.db.transaction(force_rollback=True):
+                        with psycopg.RawCursor(self.db) as cursor:
+                            cursor.execute(
+                                "SELECT array_dims($1), cardinality($1), $1::text",
+                                [Payload(data)],
+                            )
+                            if sqlstate is not None:
+                                self.fail(
+                                    "PostgreSQL unexpectedly admitted invalid binary data"
+                                )
+                            self.assertEqual(cursor.fetchone(), expected)
+                except psycopg.Error as error:
+                    self.assertEqual(error.sqlstate, sqlstate)
+
     def test_exact_raw_parameter_reuse_bigint_and_json_null_provenance(self):
         result = execute(
             self.db,

@@ -101,13 +101,16 @@ pub const Value = struct {
         var empty = dimensions.len == 0;
         for (dimensions) |dimension| {
             if (dimension.length == 0) empty = true;
-            const upper_bound = @as(i64, dimension.lower) + dimension.length - 1;
-            if (dimension.length != 0 and upper_bound > std.math.maxInt(i32)) return error.SqlNumericOutOfRange;
+            // PostgreSQL requires the exclusive upper end to fit int32,
+            // not merely the last valid subscript. Dimension lengths and
+            // intermediate row-major products are also signed-int32 bounded.
+            if (dimension.length > std.math.maxInt(i32) or @as(i64, dimension.lower) + dimension.length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
         }
-        var count: usize = @intFromBool(!empty);
-        if (!empty) for (dimensions) |dimension| {
+        var count: usize = @intFromBool(dimensions.len != 0);
+        for (dimensions) |dimension| {
             count = std.math.mul(usize, count, dimension.length) catch return error.SqlProgramLimitExceeded;
-        };
+            if (count > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+        }
         if (count != elements.len) return error.InvalidSqlArrayShape;
         var work: Budget = .{ .remaining = limits.work };
         var bytes: usize = @sizeOf(Value) + dimensions.len * @sizeOf(Dimension);
@@ -409,8 +412,11 @@ test "SQL typed arrays preserve dimensions lower bounds widths and NULL provenan
     try std.testing.expectEqual(@as(usize, 4), value.cardinality());
     try std.testing.expectError(error.InvalidSqlArrayShape, Value.init(.int32, &.{.{ .length = 3 }}, elements, .{}));
     try std.testing.expectError(error.SqlNumericOutOfRange, Value.init(.int16, &.{.{ .length = 1 }}, &.{Element.json(.{ .integer = 32768 })}, .{}));
-    try std.testing.expectError(error.SqlNumericOutOfRange, Value.init(.int32, &.{.{ .length = 1, .lower = std.math.maxInt(i32) }}, &.{Element.json(.{ .integer = 2147483648 })}, .{}));
-    try std.testing.expectError(error.SqlNumericOutOfRange, Value.init(.int32, &.{.{ .length = 2, .lower = std.math.maxInt(i32) }}, elements[0..2], .{}));
+    try std.testing.expectError(error.SqlNumericOutOfRange, Value.init(.int32, &.{.{ .length = 1 }}, &.{Element.json(.{ .integer = 2147483648 })}, .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Value.init(.int32, &.{.{ .length = 2, .lower = std.math.maxInt(i32) }}, elements[0..2], .{}));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Value.init(.int32, &.{.{ .length = 1, .lower = std.math.maxInt(i32) }}, elements[0..1], .{}));
+    const last = try Value.init(.int32, &.{.{ .length = 1, .lower = std.math.maxInt(i32) - 1 }}, elements[0..1], .{});
+    try std.testing.expectEqual(@as(?i32, std.math.maxInt(i32) - 1), last.upper(1));
     try std.testing.expectError(error.SqlTypeMismatch, Value.init(.text, &.{.{ .length = 1 }}, &.{Element.json(.null)}, .{}));
     try std.testing.expectError(error.SqlTypeMismatch, Value.init(.text, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "a\x00b" })}, .{}));
     try std.testing.expectError(error.SqlTypeMismatch, Value.init(.jsonb, &.{.{ .length = 1 }}, &.{Element.json(.{ .string = "a\x00b" })}, .{}));
