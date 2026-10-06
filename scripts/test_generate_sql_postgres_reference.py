@@ -96,6 +96,70 @@ class PostgresReferenceTest(unittest.TestCase):
         self.assertGreaterEqual(self.db.info.server_version, 180000)
         self.assertEqual("", self.db.execute("SHOW listen_addresses").fetchone()[0])
 
+    def test_typed_array_quantifiers_against_exact_postgres_sql(self):
+        import json
+        from pathlib import Path
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_array_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(fixture["reference"], "PostgreSQL exact SQL")
+        self.assertEqual(len(fixture["entries"]), 18)
+        for case in fixture["entries"]:
+            with self.subTest(sql=case["sql"]):
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute("SET TRANSACTION READ ONLY")
+                    cursor = self.db.execute("SELECT " + case["sql"])
+                    self.assertEqual(cursor.fetchone(), (case["expected"],))
+                    self.assertEqual(cursor.description[0].type_code, 16)
+
+    def test_typed_array_shape_null_and_float_reference_boundaries(self):
+        cases = {
+            "array_ndims('{}'::int4[])": None,
+            "cardinality('{}'::int4[])": 0,
+            "array_length('{}'::int4[], 1)": None,
+            "array_lower('[-1:0][0:1]={{1,NULL},{3,4}}'::int4[], 1)": -1,
+            "array_upper('[-1:0][0:1]={{1,NULL},{3,4}}'::int4[], 1)": 0,
+            "('[-1:0][0:1]={{1,NULL},{3,4}}'::int4[])[0][1]": 4,
+            "ARRAY[NULL]::int4[] @> ARRAY[NULL]::int4[]": False,
+            "ARRAY[NULL]::int4[] && ARRAY[NULL]::int4[]": False,
+            "ARRAY[1]::int4[] @> ARRAY[1,1]::int4[]": True,
+            "'[0:1]={1,2}'::int4[] < '[1:2]={1,2}'::int4[]": True,
+            "'[0:1]={1,2}'::int4[] @> '[1:2]={1,2}'::int4[]": True,
+            "ARRAY['NaN'::float8] = ARRAY['NaN'::float8]": True,
+            "ARRAY['NaN'::float8] > ARRAY['Infinity'::float8]": True,
+            "ARRAY[0.0::float8] = ARRAY[-0.0::float8]": True,
+            "ARRAY['null'::jsonb] < ARRAY[NULL]::jsonb[]": True,
+            "array_position('[-3:-1]={a,NULL,a}'::text[], 'a')": -3,
+            "array_position('[-3:-1]={a,NULL,a}'::text[], NULL)": -2,
+        }
+        for expression, expected in cases.items():
+            with self.subTest(sql=expression):
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute("SET TRANSACTION READ ONLY")
+                    actual = self.db.execute("SELECT " + expression).fetchone()
+                    self.assertEqual(actual, (expected,))
+        self.assertEqual(
+            self.db.execute(
+                "SELECT oid, typelem FROM pg_type WHERE oid = ANY(%s) ORDER BY oid",
+                [[1000, 1005, 1007, 1009, 1016, 1021, 1022, 2951, 3807]],
+            ).fetchall(),
+            [
+                (1000, 16),
+                (1005, 21),
+                (1007, 23),
+                (1009, 25),
+                (1016, 20),
+                (1021, 700),
+                (1022, 701),
+                (2951, 2950),
+                (3807, 3802),
+            ],
+        )
+
     def test_exact_raw_parameter_reuse_bigint_and_json_null_provenance(self):
         result = execute(
             self.db,

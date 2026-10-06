@@ -70,6 +70,23 @@ inflate implemented-case counts. Mounted HTTP regression tests verify the
 malformed-request and unsupported-default diagnostics with zero catalog calls,
 so neither a truncated request nor a request-bound default reaches publication.
 
+Typed arrays have a distinct immutable value layer (`array_value.zig`), not a
+JSON-list approximation. It preserves element widths, up to six dimensions,
+non-default lower bounds and per-element SQL NULL provenance. Owned values and
+prepared membership indexes account for actual allocated capacity and clean up
+under allocation faults; indexed containment probes allocate no memory. Index
+growth reclaims replaced buffers rather than retaining them in an arena. Array
+ordering and hashing agree on bounds, NULLs, signed zero and floating-point NaN.
+Strict scalar ANY/ALL comparisons retain three-valued logic, including empty
+arrays and multidimensional row-major traversal. The shared
+`sql_array_reference.json` fixture checks 18 exact PostgreSQL expressions against
+both PostgreSQL and the native value operators. This is component evidence,
+**not public SQL activation**: array parsing/binding, durable typed-column
+metadata, operator/spill propagation, public result types and pgwire codecs
+still need end-to-end integration. Numeric/temporal element types and non-C
+collations also remain outside this layer's current contract. No original
+typed-array cases are marked complete on this evidence alone.
+
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.
 Original source SHA-256: `52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6`.

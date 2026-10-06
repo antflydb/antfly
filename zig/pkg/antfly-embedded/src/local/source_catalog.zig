@@ -180,6 +180,7 @@ pub const sql_relation_binding = @import("sql/relation_binding.zig");
 pub const sql_relation_runtime = @import("sql/relation_runtime.zig");
 pub const sql_runtime = @import("sql/runtime.zig");
 pub const sql_scalar = @import("sql/scalar.zig");
+pub const sql_array_value = @import("sql/array_value.zig");
 pub const sql_schema_ddl = @import("sql/schema_ddl.zig");
 pub const sql_session = @import("sql/session.zig");
 pub const sql_setting_catalog = @import("sql/setting_catalog.zig");
