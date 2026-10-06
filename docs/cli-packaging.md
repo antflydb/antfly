@@ -29,6 +29,21 @@ bindings that embed Lite, including the Go, Python, Rust, and TypeScript Lite
 bindings, link against
 that library and include `include/antfly.h`.
 
+When built with `-Dapple-providers=true`, macOS archives also include
+`lib/libantfly-apple.dylib`. This optional, ad-hoc-signed Swift bridge is loaded
+on demand on macOS 26+; it is not a launch dependency of the CLI or `libantfly`.
+The archive builder accepts `--apple-providers true` and checks that the sidecar
+is present. Default release builds keep the option disabled. Python/npm copies
+and Homebrew installs preserve the complete `lib/` directory, including the
+sidecar. Sign it along with the other native binaries when applying a
+production signing identity.
+
+CLI discovery supports both the archive-root executable and the installed
+`bin/antfly` layout. Lite resolves the sidecar relative to the loaded `libantfly`
+image, independently of the embedding application's location. Keep the two
+libraries together when moving an installation; a custom host may explicitly
+set the absolute `ANTFLY_APPLE_BRIDGE_PATH` before launch.
+
 The Python, npm, and Homebrew CLI installer packages preserve the same Lite C
 ABI files from the native archive. Consumers that need embedded Lite can install
 one of those packages or unpack the native runtime archive, then point their

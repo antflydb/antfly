@@ -2164,6 +2164,21 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.UnsupportedEmbeddingProvider,
         error.UnsupportedExtractionProvider,
         error.UnsupportedReaderProvider,
+        error.InvalidAppleReaderConfig,
+        error.UnsupportedAppleOcrOptions,
+        error.UnsupportedAppleOcrLanguage,
+        error.AppleProviderUnavailable,
+        error.AppleIntelligenceProviderUnavailable,
+        error.AppleIntelligenceDisabled,
+        error.AppleNativeBridgeUnavailable,
+        error.AppleNativeBridgeIncompatible,
+        error.UnsupportedAppleGenerationOptions,
+        error.UnsupportedAppleTranscriptionOptions,
+        error.InvalidAppleTranscribingConfig,
+        error.UnsupportedAppleSpeechLocale,
+        error.AppleSpeechDurationExceeded,
+        error.AppleContextWindowExceeded,
+        error.AppleGenerationRefused,
         error.InferenceTaskMismatch,
         error.InferenceBatchTooLarge,
         error.UnsupportedInferenceModality,
@@ -2669,6 +2684,11 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfEmbeddingArtifactFanoutExceeded));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.PdfEmbeddingArtifactScanBudgetExceeded));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnexpectedToken));
+}
+
+test "Apple transcription duration rejection is terminal while native failures retry" {
+    try std.testing.expect(!isRetryableEnrichmentError(error.AppleSpeechDurationExceeded));
+    try std.testing.expect(isRetryableEnrichmentError(error.AppleNativeFailed));
 }
 
 test "enrichment treats deterministic size-based inference rejections as terminal, not retryable" {
@@ -14569,6 +14589,7 @@ pub fn runNativePdfOcrGroundingIntegration(
     alloc: Allocator,
     fixture: []const u8,
     producer: asset_producer_mod.Producer,
+    resource_options: resource_manager_mod.Options,
 ) !void {
     if (!document_extraction_mod.pdf_runtime_available) return error.PdfRuntimeUnavailable;
     const config = document_extraction_mod.Config{
@@ -14584,6 +14605,22 @@ pub fn runNativePdfOcrGroundingIntegration(
             .max_decoded_stream_bytes = 32 * 1024 * 1024,
         },
     };
+    return runPdfOcrGroundingIntegrationWithConfig(alloc, fixture, producer, config, resource_options);
+}
+
+pub fn runApplePdfOcrGroundingIntegration(alloc: Allocator, fixture: []const u8, producer: asset_producer_mod.Producer, resource_options: resource_manager_mod.Options) !void {
+    return runPdfOcrGroundingIntegrationWithConfig(alloc, fixture, producer, .{
+        .ocr_enabled = true,
+        .ocr_mode = .always,
+        .ocr_executor = .reader,
+        .ocr_prompt_policy = .plain,
+        .ocr_config_json = "{\"provider\":\"apple\"}",
+        .ocr_render_dpi = 150,
+        .pdf_render_max_parallel_pages = 1,
+    }, resource_options);
+}
+
+fn runPdfOcrGroundingIntegrationWithConfig(alloc: Allocator, fixture: []const u8, producer: asset_producer_mod.Producer, config: document_extraction_mod.Config, resource_options: resource_manager_mod.Options) !void {
     const downloaded = .{
         .data = fixture,
         .content_type = "application/pdf",
@@ -14598,7 +14635,7 @@ pub fn runNativePdfOcrGroundingIntegration(
     if (!std.mem.eql(u8, extraction.route_type, "pdf") or extraction.units.len != 1)
         return error.InvalidGroundingIntegrationExtraction;
 
-    var resources = resource_manager_mod.ResourceManager.init(.{});
+    var resources = resource_manager_mod.ResourceManager.init(resource_options);
     defer resources.deinit(alloc);
     var runtime = EnrichmentRuntime{
         .alloc = alloc,
