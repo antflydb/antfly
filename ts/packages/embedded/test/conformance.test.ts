@@ -15,7 +15,7 @@
 
 /**
  * Runs the shared libantfly conformance cases (see
- * zig/pkg/antfly-embedded/capi-conformance/README.md) through the public @antfly/lite
+ * zig/pkg/antfly-embedded/capi-conformance/README.md) through the public @antfly/embedded
  * API, mirroring go/pkg/embedded/conformance_cgo_test.go's semantics exactly so
  * every binding stays behaviorally identical.
  */
@@ -38,7 +38,7 @@ const casesDir = join(
   "..",
   "zig",
   "pkg",
-  "antfly",
+  "antfly-embedded",
   "capi-conformance",
   "cases"
 );

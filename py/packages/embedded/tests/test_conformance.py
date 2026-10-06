@@ -34,7 +34,7 @@ import antfly_embedded
 
 pytestmark = pytest.mark.usefixtures("require_native")
 
-CASES_DIR = Path(__file__).resolve().parents[4] / "zig" / "pkg" / "antfly" / "capi-conformance" / "cases"
+CASES_DIR = Path(__file__).resolve().parents[4] / "zig" / "pkg" / "antfly-embedded" / "capi-conformance" / "cases"
 CASE_FILES = sorted(CASES_DIR.glob("*.json")) if CASES_DIR.is_dir() else []
 
 _MODE_NAMES = {
@@ -239,7 +239,7 @@ def _execute(runner: ConformanceRunner, step: dict) -> Any:
 
 
 def _result_text(result: Any) -> str:
-    if isinstance(result, (bytes, bytearray)):
+    if isinstance(result, bytes | bytearray):
         return result.decode("utf-8", errors="replace")
     if result is None:
         return ""

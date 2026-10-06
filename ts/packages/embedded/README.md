@@ -373,7 +373,10 @@ concurrency.test.ts` covers mixed concurrent operations, `close()` racing
 in-flight calls, `busyTimeoutMs` behavior, and that concurrent searches
 overlap instead of serializing on the event loop. `test/errors.test.ts` and
 `test/discovery.test.ts` include pure tests that need no native library at
-all. `test/inference.test.ts` covers the `Inference` handle: open/close,
+all. `test/package.test.ts` builds and packs the package, then verifies CommonJS
+and ESM discovery in isolated Node processes outside a checkout. It checks all
+three platform packages and package-relative source discovery without loading
+the fixture libraries. `test/inference.test.ts` covers the `Inference` handle: open/close,
 calls that need no model (`chunk`, `listModels`), missing-model
 `NotFoundError` for both `embed` and `generateStream`, `pull({})`/
 streaming-`generate`/malformed-JSON-`generateStream` `InvalidArgumentError`

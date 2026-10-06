@@ -88,7 +88,7 @@ export interface ResolveLibraryOptions {
 function defaultStartDir(): string {
   try {
     // import.meta.url is only available in ESM; the CJS build gets an
-    // equivalent shim from esbuild. Fall back to cwd if neither works.
+    // equivalent shim from tsup. Fall back to cwd if neither works.
     return dirname(fileURLToPath(import.meta.url));
   } catch {
     return process.cwd();
