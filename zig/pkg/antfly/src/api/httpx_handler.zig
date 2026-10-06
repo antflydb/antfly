@@ -1377,6 +1377,8 @@ pub const AntflyApiHandler = struct {
             try server.put(path, hot_standby_handler);
             try server.delete(path, hot_standby_handler);
         }
+        try server.get("/admin/v1/workload/query", httpx.Handler.bind(self, getWorkloadPolicy));
+        try server.put("/admin/v1/workload/query", httpx.Handler.bind(self, putWorkloadPolicy));
         try server.post(admin_routes.maintenance_check, httpx.Handler.bind(self, checkStorage));
         try server.post(admin_routes.maintenance_compact, httpx.Handler.bind(self, compactStorage));
         try server.post(admin_routes.maintenance_vacuum, httpx.Handler.bind(self, vacuumStorage));
@@ -4068,6 +4070,51 @@ pub const AntflyApiHandler = struct {
     // ---------------------------------------------------------------
     // metadata_openapi handler interface (29 methods)
     // ---------------------------------------------------------------
+
+    fn getWorkloadPolicy(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeStorageMaintenance(ctx, &identity)) |response| return response;
+        return ctx.json(.{
+            .query = self.api_server.queryAdmissionStats(),
+            .memory = self.api_server.workloadMemoryStats(),
+        });
+    }
+
+    fn putWorkloadPolicy(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        var identity: ?AuthenticatedIdentity = null;
+        defer if (identity) |*authenticated| authenticated.deinit(self.api_server.alloc);
+        if (try self.authorizeStorageMaintenance(ctx, &identity)) |response| return response;
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing workload policy");
+        if (body.len > 1024) return textResponse(ctx, 413, "workload policy exceeds 1024 bytes");
+        var parsed = std.json.parseFromSlice(http_server_mod.WorkloadPolicyRequest, ctx.allocator, body, .{}) catch
+            return textResponse(ctx, 400, "invalid workload policy");
+        defer parsed.deinit();
+        const policy = parsed.value;
+        const gate = &self.api_server.query_admission;
+        if (policy.action == .drain) {
+            if (policy.capacity != null or policy.waiting != null or policy.suspended != null)
+                return textResponse(ctx, 400, "drain does not accept a replacement policy");
+            gate.drain(policy.expected_version) catch |err| return workloadPolicyError(ctx, err);
+        } else {
+            gate.update(
+                policy.expected_version,
+                policy.capacity orelse return textResponse(ctx, 400, "capacity required"),
+                policy.waiting orelse return textResponse(ctx, 400, "waiting required"),
+                policy.suspended orelse return textResponse(ctx, 400, "suspended required"),
+            ) catch |err| return workloadPolicyError(ctx, err);
+        }
+        return ctx.json(.{ .query = self.api_server.queryAdmissionStats(), .memory = self.api_server.workloadMemoryStats() });
+    }
+
+    fn workloadPolicyError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
+        return switch (err) {
+            error.PolicyConflict => textResponse(ctx, 409, "policy version changed; refresh before retrying"),
+            error.AdmissionClosed => textResponse(ctx, 409, "admission is permanently draining"),
+            error.InvalidConfig => textResponse(ctx, 422, "policy exceeds startup reservations or has invalid waiting bounds"),
+            else => err,
+        };
+    }
 
     pub fn getStatus(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         var authenticated_identity: ?AuthenticatedIdentity = null;
@@ -13064,7 +13111,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     };
     var directory = try @import("../common/test_directory.zig").TestDirectory.init("antfly-httpx-sql");
     defer directory.cleanup();
-    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    const resources = @import("../storage/resource_manager.zig");
+    var storage_manager = resources.ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 64 << 20 }, .identity_allocator = alloc });
+    defer storage_manager.deinit(alloc);
+    var db = try db_mod.DB.open(alloc, directory.path(), .{ .resource_manager = &storage_manager });
     defer db.close();
     try db.setSchemaJson(alloc, schema_json);
     try db.batch(.{ .writes = &.{
@@ -13213,7 +13263,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
         try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().queued);
         try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().peak_in_flight);
-        try @import("sql_pgwire_socket_test.zig").qualify(&server);
+        try @import("sql_pgwire_socket_test.zig").qualify(&server, &storage_manager);
         try qualifyNativeH2Waiting(&server);
         // Live native streams retain coarse admission until actual close.
         const stream = (try backend.vtable.open_stream.?(backend.context, alloc, identity, wire_request)).?;
@@ -16030,4 +16080,72 @@ test "SQL protected control transport validates typed paths before granting rese
         try std.testing.expect(!classify(.POST, path));
     }
     try std.testing.expect(!classify(.DELETE, "/db/v1/sql/prepared/not-hex"));
+}
+
+test "httpx workload policy requires admin and versioned bounded updates" {
+    const alloc = std.testing.allocator;
+    var source = AuthStatusSource{};
+    const waiting: @import("../common/bounded_admission.zig").Waiting = .{ .max_queued_requests = 2, .max_queued_bytes = 4096, .max_wait_ms = 100 };
+    var api = try ApiHttpServer.initWithConfig(alloc, .{ .admin_bearer_token = "operator-secret", .query_max_concurrent_requests = 2, .query_waiting = waiting }, source.iface(), null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    var request = try httpx.Request.init(alloc, .PUT, "http://localhost/admin/v1/workload/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    request.body = "{\"expected_version\":1,\"capacity\":1,\"waiting\":{\"max_queued_requests\":1,\"max_queued_bytes\":1024,\"max_wait_ms\":50},\"suspended\":true}";
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 401), response.status.code);
+        try std.testing.expectEqual(@as(u64, 1), api.queryAdmissionStats().policy_version);
+    }
+    try request.headers.set("Authorization", "Bearer operator-secret");
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(api.queryAdmissionStats().suspended);
+        try std.testing.expect(!api.tryAcquireQuery());
+        var control = try api.acquireSqlControl();
+        control.release();
+    }
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 409), response.status.code);
+    }
+    request.body = "{\"expected_version\":2,\"capacity\":3,\"waiting\":{},\"suspended\":false}";
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 422), response.status.code);
+    }
+    request.body = "{\"expected_version\":2,\"capacity\":2,\"waiting\":{},\"suspended\":false}";
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(api.tryAcquireQuery());
+        api.releaseQuery();
+    }
+    request.body = "{\"expected_version\":3,\"action\":\"drain\"}";
+    {
+        _ = ctx.status(200);
+        var response = try handler.putWorkloadPolicy(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        try std.testing.expect(api.queryAdmissionStats().draining);
+        try std.testing.expect(api.queryAdmissionStats().quiescent);
+    }
+    const transport = api.configurePublicHttpTransport(.{});
+    try std.testing.expect(transport.is_protected_request.?(.GET, "/admin/v1/workload/query"));
+    try std.testing.expect(transport.is_protected_body_request.?(.PUT, "/admin/v1/workload/query", request.body.?));
+    try std.testing.expect(!transport.is_protected_body_request.?(.PUT, "/admin/v1/workload/query", "{\"expected_version\":3,\"sql\":\"SELECT 1\"}"));
+    try std.testing.expect(http_server_mod.requiresAdminPermission("/admin/v1/workload/query"));
 }

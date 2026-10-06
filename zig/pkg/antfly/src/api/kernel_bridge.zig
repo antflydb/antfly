@@ -117,7 +117,10 @@ const OpaqueApiHttpServer = struct {
     }
 
     pub fn configurePublicHttpTransport(self: *const OpaqueApiHttpServer, config: httpx.ServerConfig) httpx.ServerConfig {
-        return server_mod.configurePublicHttpTransportForConfig(self.cfg, config);
+        var out: httpx.ServerConfig = undefined;
+        var value = config;
+        callInfallible(httpx.ServerConfig, httpx.ServerConfig, self.functions.configure_http_transport, self.opaque_handle, &value, &out);
+        return out;
     }
 
     pub fn queryAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {

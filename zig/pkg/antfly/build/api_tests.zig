@@ -76,6 +76,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "request admission lease",
         "request admission metrics",
         "config query waiting",
+        "httpx workload policy",
         "httpx query waiting",
         "SQL query waiting",
         "httpx query admission",
@@ -93,7 +94,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "default-workload-pooling-tests",
         .root_module = options.api_http_runtime_test_mod,
         .filters = &pooling_filters,
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        // GNU AArch64 Debug compilation measured 13.24 GB. Keep this build
+        // allowance separate from the 2/4 GiB qualification runtime limits.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 14) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-workload-pooling-test", "Run bounded waiting and shared HTTP/SQL admission contracts")

@@ -2903,6 +2903,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "capacity percentage safety floor is capped on large volumes",
         "capacity reservation revalidation fails closed when available space falls",
         "resource manager background deferral follows slice policy",
+        "resource manager external allocator shares storage ceiling and preserves pinned control",
         "budgeted allocator admits before allocation and releases exact live bytes",
         "budgeted allocator reclamation is opt in and retries without raising limits",
         "budgeted allocator reclaim denial does not retry a busy cache",

@@ -1620,6 +1620,14 @@ test "session maintenance activation follows current range leadership without fo
     try std.testing.expectEqual([2]usize{ 2, 2 }, fake.generation_gc_reads);
 }
 
+pub const WorkloadPolicyRequest = struct {
+    expected_version: u64,
+    action: enum { update, drain } = .update,
+    capacity: ?u32 = null,
+    waiting: ?@import("../common/bounded_admission.zig").Waiting = null,
+    suspended: ?bool = null,
+};
+
 pub const ApiHttpServerConfig = struct {
     pgwire: ?common_config.Config.PgwireConfig = null,
     restore_validation: ?@import("restore_catalog.zig").ValidationPort = null,
@@ -1636,6 +1644,7 @@ pub const ApiHttpServerConfig = struct {
     /// Control work receives a separate partition within this envelope.
     request_memory_bytes: usize = 256 << 20,
     retained_memory_bytes: usize = 256 << 20,
+    memory_accounting: ?@import("../common/allocation_budget.zig").Accounting = null,
     /// SQL decoding/compilation admission shared by HTTP and pgwire.
     sql_max_concurrent_preparations: u32 = 16,
     /// Node-local foreground data-mutation admission capacity. Zero is unlimited.
@@ -3852,6 +3861,7 @@ pub const ApiHttpServer = struct {
     state_alloc: std.mem.Allocator,
     state_memory: ?*@import("../common/allocation_budget.zig").Shared = null,
     request_memory: ?*RequestMemory = null,
+    control_memory_reserved: usize = 0,
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
     sql_preparation_admission: RequestAdmission,
@@ -4282,6 +4292,24 @@ pub const ApiHttpServer = struct {
         });
     }
 
+    pub const WorkloadMemoryStats = struct {
+        node_accounted: bool,
+        control_reserved_bytes: usize,
+        foreground: ?@import("../common/allocation_budget.zig").Shared.Stats,
+        control: ?@import("../common/allocation_budget.zig").Shared.Stats,
+        retained: ?@import("../common/allocation_budget.zig").Shared.Stats,
+    };
+
+    pub fn workloadMemoryStats(self: *const ApiHttpServer) WorkloadMemoryStats {
+        return .{
+            .node_accounted = self.cfg.memory_accounting != null,
+            .control_reserved_bytes = self.control_memory_reserved,
+            .foreground = if (self.request_memory) |m| m.foreground.stats() else null,
+            .control = if (self.request_memory) |m| m.control.stats() else null,
+            .retained = if (self.state_memory) |m| m.stats() else null,
+        };
+    }
+
     pub fn queryAdmissionStats(self: *const ApiHttpServer) RequestAdmission.Stats {
         var result = self.query_admission.stats();
         result.sql_waiting_enabled = self.sqlQueryWaitingEnabled();
@@ -4373,7 +4401,10 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn configurePublicHttpTransport(self: *const ApiHttpServer, config: httpx.ServerConfig) httpx.ServerConfig {
-        return configurePublicHttpTransportForConfig(self.cfg, config);
+        var result = configurePublicHttpTransportForConfig(self.cfg, config);
+        result.application_allocator = self.alloc;
+        result.protected_application_allocator = @constCast(self).controlAllocator();
+        return result;
     }
 
     pub fn releaseQuery(self: *ApiHttpServer) void {
@@ -4580,14 +4611,20 @@ pub const ApiHttpServer = struct {
         var memory_transferred = false;
         errdefer if (!memory_transferred) alloc.destroy(memory);
         const control_bytes = @min(16 << 20, cfg.request_memory_bytes / 8);
+        var control_transferred = false;
+        if (cfg.memory_accounting) |owner| if (!owner.reserve(control_bytes)) return error.OutOfMemory;
+        errdefer if (!control_transferred) {
+            if (cfg.memory_accounting) |owner| owner.release(control_bytes);
+        };
+
         memory.* = .{
-            .foreground = .{ .child = backing, .limit = cfg.request_memory_bytes - control_bytes },
+            .foreground = .{ .child = backing, .limit = cfg.request_memory_bytes - control_bytes, .accounting = cfg.memory_accounting },
             .control = .{ .child = backing, .limit = control_bytes },
         };
         const state_memory = try alloc.create(@import("../common/allocation_budget.zig").Shared);
         var state_transferred = false;
         errdefer if (!state_transferred) alloc.destroy(state_memory);
-        state_memory.* = .{ .child = backing, .limit = cfg.retained_memory_bytes };
+        state_memory.* = .{ .child = backing, .limit = cfg.retained_memory_bytes, .accounting = cfg.memory_accounting };
         const request_alloc = memory.allocator(false);
         const owner_ids = try allocRuntimeOwnerIds(effective_cfg.backend_runtime);
         var owner_ids_transferred = false;
@@ -4612,6 +4649,8 @@ pub const ApiHttpServer = struct {
         );
         owner_ids_transferred = true;
         server.request_memory = memory;
+        server.control_memory_reserved = if (cfg.memory_accounting != null) control_bytes else 0;
+        control_transferred = true;
         server.state_memory = state_memory;
         state_transferred = true;
         memory_transferred = true;
@@ -4803,6 +4842,7 @@ pub const ApiHttpServer = struct {
             std.debug.assert(memory.control.used.load(.acquire) == 0);
             self.owner_alloc.destroy(memory);
         }
+        if (self.cfg.memory_accounting) |owner| owner.release(self.control_memory_reserved);
         self.* = undefined;
     }
 
@@ -26585,6 +26625,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 }
 
 pub fn requiresAdminPermission(path: []const u8) bool {
+    if (std.mem.eql(u8, path, "/admin/v1/workload/query")) return true;
     if (std.mem.eql(u8, path, "/settings")) return true;
     if (isHotStandbyAdminPath(path)) return true;
     if (isStorageMaintenancePath(path)) return true;
@@ -56821,14 +56862,24 @@ fn protectedHttpRequest(method: httpx.Method, target: []const u8) bool {
         }
     }
     if (method != .GET) return false;
+    if (std.mem.eql(u8, path, "/admin/v1/workload/query")) return true;
     return std.mem.eql(u8, path, "/db/v1/status") or std.mem.eql(u8, path, "/healthz") or std.mem.eql(u8, path, "/readyz");
 }
 
 fn protectedSqlBodyCandidate(method: httpx.Method, target: []const u8) bool {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
-    return method == .POST and std.mem.eql(u8, path, "/db/v1/sql");
+    return (method == .POST and std.mem.eql(u8, path, "/db/v1/sql")) or
+        (method == .PUT and std.mem.eql(u8, path, "/admin/v1/workload/query"));
 }
-fn protectedSqlBodyRequest(_: httpx.Method, _: []const u8, body: []const u8) bool {
+fn protectedSqlBodyRequest(method: httpx.Method, target: []const u8, body: []const u8) bool {
+    const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
+    if (method == .PUT and std.mem.eql(u8, path, "/admin/v1/workload/query")) {
+        if (body.len > 1024) return false;
+        var buffer: [8192]u8 = undefined;
+        var fixed = std.heap.FixedBufferAllocator.init(&buffer);
+        _ = std.json.parseFromSliceLeaky(WorkloadPolicyRequest, fixed.allocator(), body, .{}) catch return false;
+        return true;
+    }
     return @import("sql_control.zig").classifyBody(body);
 }
 

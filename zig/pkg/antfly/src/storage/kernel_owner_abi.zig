@@ -1659,6 +1659,11 @@ pub extern fn antfly_storage_context_configure_remote_content_security(
     security_json: BorrowedBytes,
 ) callconv(.c) Status;
 
+/// Allocation-free borrowed accounting. The caller must release all charges
+/// before destroying the context; reservation failure leaves ownership unchanged.
+pub extern fn antfly_storage_context_reserve_external(context: ?*anyopaque, bytes: usize) callconv(.c) bool;
+pub extern fn antfly_storage_context_release_external(context: ?*anyopaque, bytes: usize) callconv(.c) void;
+
 pub extern fn antfly_storage_context_metrics(
     context: ?*anyopaque,
     out_result: *ContextMetricsResult,

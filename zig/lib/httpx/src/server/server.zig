@@ -214,6 +214,10 @@ pub const ServerConfig = struct {
     request_body_buffer_budget_bytes: usize = 64 * 1024 * 1024,
     /// Context/decoded-value and response allocations remain charged until
     /// the handler and socket writer finish. Independent of raw body storage.
+    /// Optional stable application allocation owners; the listener must join
+    /// every response writer before those owners are destroyed.
+    application_allocator: ?Allocator = null,
+    protected_application_allocator: ?Allocator = null,
     application_memory_budget_bytes: usize = 256 * 1024 * 1024,
     protected_application_memory_bytes: usize = 16 * 1024 * 1024,
     /// Reserved for future server-side TLS support. Zig 0.16 only provides
@@ -2428,7 +2432,7 @@ pub const Server = struct {
                 return self.handleH2cUpgrade(&connection.control, &sock, &req, buffer[0..leftover]);
             }
 
-            var application_scope: ApplicationMemoryScope = .{ .child = self.allocator, .shared = self.applicationQuota(&req) };
+            var application_scope: ApplicationMemoryScope = .{ .child = self.applicationAllocator(&req), .shared = self.applicationQuota(&req) };
             defer application_scope.deinit();
             var ctx = Context.init(application_scope.allocator(), self.io, &req);
             ctx.max_file_size = self.config.max_file_size;
@@ -3155,6 +3159,13 @@ pub const Server = struct {
         return self.tryStartRequestWithBody(method, path, &.{});
     }
 
+    fn applicationAllocator(self: *Server, req: *const Request) Allocator {
+        if (self.isProtectedRequestWithBody(req.method, req.uri.path, req.body orelse &.{})) {
+            if (self.config.protected_application_allocator) |alloc| return alloc;
+        }
+        return self.config.application_allocator orelse self.allocator;
+    }
+
     fn applicationQuota(self: *Self, req: *const Request) ?*SharedBodyBudget {
         if (self.config.application_memory_budget_bytes == 0) return null;
         return if (self.config.protected_application_memory_bytes != 0 and self.isProtectedRequestWithBody(req.method, req.uri.path, req.body orelse &.{})) &self.control_application_memory else &self.application_memory;
@@ -3260,7 +3271,7 @@ pub const Server = struct {
     /// Routes a request through middleware and sends the H2 response.
     /// Shared between normal H2 streams (from HPACK) and h2c upgrade (from HTTP/1.1).
     fn routeAndRespondH2(self: *Self, h2: *H2Connection, sock: *Socket, stream_id: u31, req: *Request, body_reader: ?*Context.H2StreamReader) !void {
-        var application_scope: ApplicationMemoryScope = .{ .child = self.allocator, .shared = self.applicationQuota(req) };
+        var application_scope: ApplicationMemoryScope = .{ .child = self.applicationAllocator(req), .shared = self.applicationQuota(req) };
         defer application_scope.deinit();
         var ctx = Context.init(application_scope.allocator(), self.io, req);
         ctx.max_file_size = self.config.max_file_size;

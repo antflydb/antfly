@@ -2520,12 +2520,13 @@ pub const HealthSource = struct {
             try health_metrics.appendPromMetric(writer, "antfly_http_connection_thread_limit", "gauge", "Maximum public HTTP connection handoff threads", http.max_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_active_connection_threads", "gauge", "Currently active public HTTP connection handoff threads", http.active_connection_threads);
             try health_metrics.appendPromMetric(writer, "antfly_http_peak_connection_threads", "gauge", "Peak public HTTP connection handoff threads since process start", http.peak_connection_threads);
-            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
+            const query_stats = if (self.data_server.http_server) |*api| api.queryAdmissionStats() else antfly.common.request_admission.RequestAdmission.Stats{
                 .capacity = http.max_active_requests,
                 .in_flight = http.active_requests,
                 .peak_in_flight = http.peak_active_requests,
                 .rejected_total = http.rejected_requests_total,
-            });
+            };
+            try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, query_stats);
             try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
                 .capacity = http.max_active_writes,
                 .in_flight = http.active_writes,
@@ -6847,6 +6848,11 @@ pub const DataServer = struct {
         // used by DB internals (c_allocator when libc is linked): search hits
         // adopt index-owned metadata buffers, so a distinct request allocator
         // identity turns those adoptions into cross-allocator frees.
+        api_server_cfg.memory_accounting = .{
+            .ptr = self,
+            .reserve_fn = reserveApiMemory,
+            .release_fn = releaseApiMemory,
+        };
         self.http_server = try antfly.public_api.ApiHttpServer.initWithConfig(
             self.alloc,
             api_server_cfg,
@@ -6862,6 +6868,21 @@ pub const DataServer = struct {
         const ttl_port: server_coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
         _ = self.write_source.withCoordinatedTtl(ttl_port);
         if (self.data_raft_apply) |apply_sm| _ = apply_sm.write_source.withCoordinatedTtl(ttl_port);
+    }
+
+    fn reserveApiMemory(ptr: *anyopaque, bytes: usize) callconv(.c) bool {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (comptime linked_storage) return self.kernel_owner_source.?.context.reserveExternal(bytes);
+        return self.provisioned_storage.resource_manager.reserveExternal(bytes);
+    }
+
+    fn releaseApiMemory(ptr: *anyopaque, bytes: usize) callconv(.c) void {
+        const self: *DataServer = @ptrCast(@alignCast(ptr));
+        if (comptime linked_storage) {
+            self.kernel_owner_source.?.context.releaseExternal(bytes);
+        } else {
+            self.provisioned_storage.resource_manager.releaseExternal(bytes);
+        }
     }
 
     fn enqueueArtifactPublication(ptr: *anyopaque, group_id: u64, namespace: [24]u8, command: []const u8) !void {

@@ -585,6 +585,7 @@ const DenseSearchWaiters = admission.Fifo(struct {
 const DenseSearchWaiter = DenseSearchWaiters.Waiter;
 
 pub const MemoryStats = struct {
+    external_bytes: u64 = 0,
     used_bytes: u64 = 0,
     peak_bytes: u64 = 0,
     soft_limit_bytes: u64 = 0,
@@ -991,6 +992,7 @@ pub const ReplayNotVisibleTracker = struct {
 };
 
 const MutableMemory = struct {
+    external_bytes: u64 = 0,
     budget: Budget = .{},
     used_bytes: u64 = 0,
     peak_bytes: u64 = 0,
@@ -1847,6 +1849,7 @@ pub const ResourceManager = struct {
     /// ledger. Reservation handles remain strict because they can outlive the
     /// backing allocation and must be released before their manager.
     pub fn deinit(self: *ResourceManager, alloc: std.mem.Allocator) void {
+        std.debug.assert(self.memory.external_bytes == 0);
         self.dense_checkpoint_ready.assertUnbound();
         self.dense_rerank_admission.assertIdle();
         self.dense_driver_admission.assertIdle();
@@ -2134,6 +2137,27 @@ pub const ResourceManager = struct {
             return error.ResourceBudgetExceeded;
         }
         return next;
+    }
+
+    /// Allocation-free accounting for a stable external allocator owner.
+    /// Includes API allocations in the host ceiling enforced by this manager.
+    /// The caller owns exact single-release accounting, not a replayable handle.
+    pub fn reserveExternal(self: *ResourceManager, bytes: u64) bool {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const next = self.checkMemoryLocked(bytes) catch return false;
+        self.commitMemoryLocked(next);
+        self.memory.external_bytes += bytes;
+        return true;
+    }
+
+    pub fn releaseExternal(self: *ResourceManager, bytes: u64) void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        std.debug.assert(bytes <= self.memory.external_bytes);
+        self.memory.external_bytes -= bytes;
+        self.memory.used_bytes -= bytes;
+        self.pressure_change.advance();
     }
 
     fn issueIdentityLocked(self: *ResourceManager) u64 {
@@ -3189,6 +3213,7 @@ pub const ResourceManager = struct {
                 .hard_limit_bytes = self.memory.budget.hard_limit_bytes,
                 .soft_limit_events = self.memory.soft_limit_events,
                 .hard_limit_rejections = self.memory.hard_limit_rejections,
+                .external_bytes = self.memory.external_bytes,
                 .accounting_errors = self.memory.accounting_errors,
                 .pressure = pressureFor(self.memory.budget, self.memory.used_bytes),
             },
@@ -6261,7 +6286,7 @@ test "resource manager replay skip snapshots clean up every allocation failure" 
 test "source vector payloads scoped allocator receipts distinguish admission and backing across shared failures" {
     const alloc = std.testing.allocator;
     var budgets = Options.defaultBudgets();
-    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 64 };
+    budgets[@backingInt(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 64 };
     var manager = ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
@@ -6283,4 +6308,23 @@ test "source vector payloads scoped allocator receipts distinguish admission and
     // Allocations and frees are interchangeable with the original allocator.
     budget.threadSafeAllocator().free(memory);
     try std.testing.expect(first.last_failure == null);
+}
+
+test "resource manager external allocator shares storage ceiling and preserves pinned control" {
+    var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 }, .identity_allocator = std.testing.allocator });
+    defer manager.deinit(std.testing.allocator);
+    // Pin control headroom before publishing foreground work. Its allocations
+    // consume this reservation, so they must not charge it again.
+    try std.testing.expect(manager.reserveExternal(10));
+    try std.testing.expect(manager.reserveExternal(30));
+    var storage = try manager.reserveWithoutReclaim(.lsm_compaction_work, 60);
+    try std.testing.expect(!manager.reserveExternal(1));
+    try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserveWithoutReclaim(.dense_search_working_set, 1));
+    try std.testing.expectEqual(@as(u64, 100), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 40), manager.snapshot().memory.external_bytes);
+    manager.releaseExternal(30);
+    storage.release();
+    try std.testing.expectEqual(@as(u64, 10), manager.snapshot().memory.used_bytes);
+    manager.releaseExternal(10);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
 }

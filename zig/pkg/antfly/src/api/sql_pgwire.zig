@@ -44,9 +44,9 @@ pub const Listener = struct {
         if (api.cfg.user_manager == null) return error.PgwireRequiresAuthentication;
         if (api.cfg.backend_runtime == null) return error.PgwireRequiresBackendRuntime;
         _ = api.sharedApiNetworkIo() orelse return error.PgwireRequiresBackendRuntime;
-        const self = try api.owner_alloc.create(Listener);
-        errdefer api.owner_alloc.destroy(self);
-        self.alloc = api.owner_alloc;
+        const self = try api.state_alloc.create(Listener);
+        errdefer api.state_alloc.destroy(self);
+        self.alloc = api.state_alloc;
         self.adapter = .{ .server = api };
         // Long-lived idle sessions must not consume the shared outbound lane.
         // One session task per connection plus accept, deadline and cancel slots.

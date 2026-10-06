@@ -678,6 +678,23 @@ const StandaloneHealthSource = struct {
             .in_flight = handler.query_in_flight,
             .peak_in_flight = handler.query_peak_in_flight,
             .rejected_total = handler.query_rejected_total,
+            .configured_capacity = handler.query_configured_capacity,
+            .queued = handler.query_queued,
+            .queued_bytes = handler.query_queued_bytes,
+            .waited_total = handler.query_waited_total,
+            .wait_ns_total = handler.query_wait_ns_total,
+            .wait_completed_total = handler.query_wait_completed_total,
+            .wait_buckets = handler.query_wait_buckets,
+            .expired_total = handler.query_expired_total,
+            .cancelled_total = handler.query_cancelled_total,
+            .waiting = .{ .max_queued_requests = handler.query_queue_capacity, .max_queued_bytes = handler.query_queue_bytes, .max_wait_ms = handler.query_wait_ms },
+            .policy_version = handler.query_policy_version,
+            .policy_retired_total = handler.query_policy_retired_total,
+            .retiring_waiters = handler.query_retiring_waiters,
+            .draining = handler.query_draining,
+            .suspended = handler.query_suspended,
+            .quiescent = handler.query_quiescent,
+            .sql_waiting_enabled = handler.query_sql_waiting_enabled,
         });
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
             .capacity = handler.write_capacity,
@@ -691,6 +708,15 @@ const StandaloneHealthSource = struct {
             .peak_in_flight = handler.inference_peak_in_flight,
             .rejected_total = handler.inference_rejected_total,
         });
+        inline for (.{ "foreground", "control", "retained" }, 0..) |name, index| {
+            const memory = handler.memory[index];
+            const prefix = "antfly_api_memory_" ++ name;
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_enabled", "gauge", "API allocation envelope installed", @intFromBool(memory.enabled));
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_limit_bytes", "gauge", "API allocation envelope ceiling", memory.limit_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_used_bytes", "gauge", "Currently reserved API allocation bytes", memory.used_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_peak_bytes", "gauge", "Peak API allocation reservations", memory.peak_bytes);
+            try antfly.common.health_server.appendPromMetric(writer, prefix ++ "_rejected_total", "counter", "API allocation reservations rejected by ceiling", memory.rejected_total);
+        }
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_capacity", "gauge", "Maximum concurrent streaming H2 query bodies", handler.query_body_capacity);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_bodies_in_flight", "gauge", "Streaming H2 query bodies currently admitted", handler.query_body_in_flight);
         try antfly.common.health_server.appendPromMetric(writer, "antfly_query_body_peak_in_flight", "gauge", "Peak concurrent streaming H2 query bodies since process start", handler.query_body_peak_in_flight);

@@ -89,6 +89,12 @@ pub const Controller = struct {
     expired: u64 = 0,
     cancelled: u64 = 0,
     closed: bool = false,
+    suspended: bool = false,
+    policy_version: u64 = 1,
+    configured_capacity: usize,
+    configured_waiting: Waiting = .{},
+    policy_retired: u64 = 0,
+    retiring: usize = 0,
     head: ?*Entry = null,
     tail: ?*Entry = null,
 
@@ -101,16 +107,18 @@ pub const Controller = struct {
         ready: std.Io.Event = .unset,
         bytes: u64,
         was_queued: bool = false,
+        max_wait_ms: u32 = 0,
+        failure: ?anyerror = null,
         state: enum { fresh, queued, granted, closed, retired } = .fresh,
     };
 
     pub fn init(capacity: usize) Controller {
-        return .{ .capacity = capacity };
+        return .{ .capacity = capacity, .configured_capacity = capacity };
     }
 
     pub fn initConfigured(capacity: usize, waiting: Waiting) !Controller {
         try waiting.validate();
-        return .{ .capacity = capacity, .waiting = waiting };
+        return .{ .capacity = capacity, .configured_capacity = capacity, .waiting = waiting, .configured_waiting = waiting };
     }
 
     fn lock(self: *Controller) void {
@@ -126,7 +134,7 @@ pub const Controller = struct {
         self.lock();
         defer self.mutex.unlock();
         // New callers cannot bypass existing waiters.
-        if (!self.closed and self.head == null and (self.capacity == 0 or self.active < self.capacity)) {
+        if (!self.closed and !self.suspended and self.head == null and (self.capacity == 0 or self.active < self.capacity)) {
             self.grant();
             return true;
         }
@@ -155,6 +163,8 @@ pub const Controller = struct {
         defer self.mutex.unlock();
         std.debug.assert(entry.state == .fresh);
         if (self.closed) return self.reject(error.AdmissionClosed);
+        if (self.suspended) return self.reject(error.AdmissionClosed);
+        entry.max_wait_ms = self.waiting.max_wait_ms;
         if (self.head == null and (self.capacity == 0 or self.active < self.capacity)) {
             self.grant();
             entry.state = .granted;
@@ -190,7 +200,7 @@ pub const Controller = struct {
     }
 
     fn dispatch(self: *Controller) void {
-        while (!self.closed and (self.capacity == 0 or self.active < self.capacity)) {
+        while (!self.closed and !self.suspended and (self.capacity == 0 or self.active < self.capacity)) {
             const entry = self.head orelse break;
             self.unlink(entry);
             self.grant();
@@ -217,6 +227,7 @@ pub const Controller = struct {
         std.debug.assert(entry.state != .fresh and entry.state != .retired);
         const state = entry.state;
         if (state == .queued) self.unlink(entry);
+        if (state == .closed) self.retiring -= 1;
         entry.state = .retired;
         if (failure) |err| {
             if (state == .granted) {
@@ -229,7 +240,9 @@ pub const Controller = struct {
             }
             return err;
         }
-        if (state == .closed) return self.reject(error.AdmissionClosed);
+        if (state == .closed) {
+            return self.reject(entry.failure orelse error.AdmissionClosed);
+        }
         std.debug.assert(state == .granted);
         return .{ .admission = self };
     }
@@ -245,9 +258,9 @@ pub const Controller = struct {
             return lease;
         }
         const started = options.now();
-        const until = @min(options.deadline_ns orelse std.math.maxInt(u64), started +| @as(u64, self.waiting.max_wait_ms) * std.time.ns_per_ms);
         var entry: Entry = .{ .io = options.io, .bytes = options.retained_bytes };
         try self.enqueue(&entry);
+        const until = @min(options.deadline_ns orelse std.math.maxInt(u64), started +| @as(u64, entry.max_wait_ms) * std.time.ns_per_ms);
         const did_wait = entry.was_queued;
         while (true) {
             const failure: ?anyerror = if (options.check()) |_| (if (did_wait and options.now() >= until) error.AdmissionWaitTimeout else null) else |err| err;
@@ -289,9 +302,56 @@ pub const Controller = struct {
         self.lock();
         defer self.mutex.unlock();
         self.closed = true;
+        self.policy_version +|= 1;
         while (self.head) |entry| {
             self.unlink(entry);
             entry.state = .closed;
+            self.retiring += 1;
+            entry.ready.set(entry.io);
+        }
+    }
+
+    /// Live policies may shrink and later restore startup reservations. Growing
+    /// transport/worker envelopes requires a restart. Zero remains unlimited.
+    /// Already granted leases are never revoked; queue shrink keeps oldest work.
+    pub fn update(self: *Controller, expected_version: u64, capacity: usize, waiting: Waiting, suspended: bool) !void {
+        try waiting.validate();
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.AdmissionClosed;
+        if (expected_version != self.policy_version) return error.PolicyConflict;
+        if (self.configured_capacity != 0 and (capacity == 0 or capacity > self.configured_capacity)) return error.InvalidConfig;
+        if (waiting.max_queued_requests > self.configured_waiting.max_queued_requests or
+            waiting.max_queued_bytes > self.configured_waiting.max_queued_bytes or
+            waiting.max_wait_ms > self.configured_waiting.max_wait_ms) return error.InvalidConfig;
+        self.capacity = capacity;
+        self.waiting = waiting;
+        self.suspended = suspended;
+        self.policy_version +|= 1;
+        while (self.tail) |entry| {
+            if (!suspended and waiting.max_wait_ms != 0 and self.queued <= waiting.max_queued_requests and self.queued_bytes <= waiting.max_queued_bytes) break;
+            self.unlink(entry);
+            entry.state = .closed;
+            entry.failure = error.AdmissionClosed;
+            self.retiring += 1;
+            self.policy_retired +|= 1;
+            entry.ready.set(entry.io);
+        }
+        self.dispatch();
+    }
+
+    pub fn drain(self: *Controller, expected_version: u64) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.closed) return error.AdmissionClosed;
+        if (expected_version != self.policy_version) return error.PolicyConflict;
+        self.closed = true;
+        self.policy_version +|= 1;
+        while (self.head) |entry| {
+            self.unlink(entry);
+            entry.state = .closed;
+            self.retiring += 1;
+            self.policy_retired +|= 1;
             entry.ready.set(entry.io);
         }
     }
@@ -312,6 +372,13 @@ pub const Controller = struct {
         draining: bool = false,
         waiting: Waiting = .{},
         sql_waiting_enabled: ?bool = null,
+        configured_capacity: usize = 0,
+        configured_waiting: Waiting = .{},
+        policy_version: u64 = 1,
+        policy_retired_total: u64 = 0,
+        suspended: bool = false,
+        quiescent: bool = true,
+        retiring_waiters: usize = 0,
     };
 
     pub fn stats(self: *const Controller) Stats {
@@ -333,6 +400,13 @@ pub const Controller = struct {
             .cancelled_total = self.cancelled,
             .draining = self.closed,
             .waiting = self.waiting,
+            .configured_capacity = self.configured_capacity,
+            .configured_waiting = self.configured_waiting,
+            .policy_version = self.policy_version,
+            .policy_retired_total = self.policy_retired,
+            .suspended = self.suspended,
+            .quiescent = self.active == 0 and self.queued == 0 and self.retiring == 0,
+            .retiring_waiters = self.retiring,
         };
     }
 };
@@ -479,4 +553,56 @@ test "bounded admission unsupported executor remains fail fast without enqueue" 
     try std.testing.expectError(error.AdmissionFull, gate.acquire(.{ .io = std.testing.io, .allow_wait = false }));
     try std.testing.expectEqual(@as(usize, 0), gate.stats().queued);
     try std.testing.expectEqual(@as(u64, 0), gate.stats().waited_total);
+}
+
+test "bounded admission live shrink preserves grants and retires newest waiters" {
+    const waiting: Waiting = .{ .max_queued_requests = 3, .max_queued_bytes = 30, .max_wait_ms = 100 };
+    var gate = try Controller.initConfigured(2, waiting);
+    var first = gate.tryAcquireLease().?;
+    var second = gate.tryAcquireLease().?;
+    var entries: [3]Controller.Entry = undefined;
+    for (&entries) |*entry| {
+        entry.* = .{ .io = std.testing.io, .bytes = 10 };
+        try gate.enqueue(entry);
+    }
+    try gate.update(1, 1, .{ .max_queued_requests = 1, .max_queued_bytes = 10, .max_wait_ms = 50 }, false);
+    try std.testing.expectEqual(@as(usize, 2), gate.stats().in_flight);
+    try std.testing.expectEqual(@as(usize, 2), gate.stats().retiring_waiters);
+    try std.testing.expectError(error.AdmissionClosed, gate.retire(&entries[2], null));
+    try std.testing.expectError(error.Canceled, gate.retire(&entries[1], error.Canceled));
+    first.release();
+    try std.testing.expect(entries[0].state == .queued);
+    second.release();
+    var surviving = try gate.retire(&entries[0], null);
+    surviving.release();
+    try std.testing.expect(gate.stats().quiescent);
+    try std.testing.expectError(error.PolicyConflict, gate.update(1, 2, waiting, false));
+    try std.testing.expectError(error.InvalidConfig, gate.update(2, 0, waiting, false));
+    try gate.update(2, 2, waiting, false);
+    try std.testing.expectEqual(@as(u64, 3), gate.stats().policy_version);
+}
+
+test "bounded admission suspension and terminal drain reconcile caller ownership" {
+    const waiting: Waiting = .{ .max_queued_requests = 1, .max_queued_bytes = 10, .max_wait_ms = 100 };
+    var gate = try Controller.initConfigured(1, waiting);
+    var lease = gate.tryAcquireLease().?;
+    var entry: Controller.Entry = .{ .io = std.testing.io, .bytes = 10 };
+    try gate.enqueue(&entry);
+    try gate.update(1, 1, waiting, true);
+    lease.release();
+    try std.testing.expect(!gate.stats().quiescent);
+    try std.testing.expectError(error.AdmissionClosed, gate.retire(&entry, null));
+    try std.testing.expect(gate.stats().quiescent);
+    try std.testing.expect(!gate.tryAcquire());
+    try gate.update(2, 1, waiting, false);
+    lease = gate.tryAcquireLease().?;
+    entry = .{ .io = std.testing.io, .bytes = 10 };
+    try gate.enqueue(&entry);
+    try gate.drain(3);
+    try std.testing.expect(gate.stats().draining);
+    try std.testing.expectError(error.AdmissionClosed, gate.update(4, 1, waiting, false));
+    try std.testing.expectError(error.AdmissionClosed, gate.retire(&entry, null));
+    lease.release();
+    try std.testing.expect(gate.stats().quiescent);
+    try std.testing.expectEqual(@as(u64, 2), gate.stats().policy_retired_total);
 }

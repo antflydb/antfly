@@ -27,7 +27,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 19;
+pub const abi_version: u32 = 20;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -175,6 +175,34 @@ pub const HandlerStats = extern struct {
     query_body_in_flight: usize,
     query_body_peak_in_flight: usize,
     query_body_rejected_total: u64,
+    query_configured_capacity: usize,
+    query_queued: usize,
+    query_queued_bytes: u64,
+    query_waited_total: u64,
+    query_wait_ns_total: u64,
+    query_wait_completed_total: u64,
+    query_wait_buckets: [11]u64,
+    query_expired_total: u64,
+    query_cancelled_total: u64,
+    query_queue_capacity: u32,
+    query_queue_bytes: u64,
+    query_wait_ms: u32,
+    query_policy_version: u64,
+    query_policy_retired_total: u64,
+    query_retiring_waiters: usize,
+    query_draining: bool,
+    query_suspended: bool,
+    query_quiescent: bool,
+    query_sql_waiting_enabled: bool,
+    memory: [3]WorkloadMemoryStats,
+};
+
+pub const WorkloadMemoryStats = extern struct {
+    enabled: bool,
+    limit_bytes: usize,
+    used_bytes: usize,
+    peak_bytes: usize,
+    rejected_total: u64,
 };
 
 /// Features exposed by the independently code-generated API-kernel archive.
@@ -220,6 +248,7 @@ pub const FunctionTable = extern struct {
     handler_destroy: *const fn (*anyopaque) callconv(.c) void,
     inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
+    configure_http_transport: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {

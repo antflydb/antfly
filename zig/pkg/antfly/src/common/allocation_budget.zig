@@ -5,10 +5,34 @@
 //! until all allocations and joined operations are retired.
 const std = @import("std");
 
+/// Borrowed node owner. Callbacks cross native runtime partitions without an
+/// error union; the owner must outlive every charged allocation and join.
+pub const Accounting = struct {
+    ptr: *anyopaque,
+    reserve_fn: *const fn (*anyopaque, usize) callconv(.c) bool,
+    release_fn: *const fn (*anyopaque, usize) callconv(.c) void,
+
+    pub fn reserve(self: Accounting, bytes: usize) bool {
+        return self.reserve_fn(self.ptr, bytes);
+    }
+    pub fn release(self: Accounting, bytes: usize) void {
+        self.release_fn(self.ptr, bytes);
+    }
+};
+
 pub const Shared = struct {
     child: std.mem.Allocator,
+    accounting: ?Accounting = null,
     limit: usize,
     used: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+    rejected: std.atomic.Value(u64) = .init(0),
+
+    pub const Stats = struct { limit_bytes: usize, used_bytes: usize, peak_bytes: usize, rejected_total: u64 };
+
+    pub fn stats(self: *const Shared) Stats {
+        return .{ .limit_bytes = self.limit, .used_bytes = self.used.load(.acquire), .peak_bytes = self.peak.load(.acquire), .rejected_total = self.rejected.load(.acquire) };
+    }
 
     pub fn allocator(self: *Shared) std.mem.Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
@@ -17,14 +41,27 @@ pub const Shared = struct {
     pub fn reserve(self: *Shared, bytes: usize) bool {
         var observed = self.used.load(.acquire);
         while (observed <= self.limit and bytes <= self.limit - observed) {
-            if (self.used.cmpxchgWeak(observed, observed + bytes, .acq_rel, .acquire)) |changed| observed = changed else return true;
+            if (self.used.cmpxchgWeak(observed, observed + bytes, .acq_rel, .acquire)) |changed| observed = changed else {
+                if (self.accounting) |owner| if (!owner.reserve(bytes)) {
+                    _ = self.used.fetchSub(bytes, .acq_rel);
+                    _ = self.rejected.fetchAdd(1, .monotonic);
+                    return false;
+                };
+                var peak = self.peak.load(.acquire);
+                while (peak < observed + bytes) {
+                    peak = self.peak.cmpxchgWeak(peak, observed + bytes, .acq_rel, .acquire) orelse break;
+                }
+                return true;
+            }
         }
+        _ = self.rejected.fetchAdd(1, .monotonic);
         return false;
     }
 
     pub fn release(self: *Shared, bytes: usize) void {
         const previous = self.used.fetchSub(bytes, .acq_rel);
         std.debug.assert(previous >= bytes);
+        if (self.accounting) |owner| owner.release(bytes);
     }
 
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
@@ -146,4 +183,35 @@ test "workload envelope preserves allocation provenance across control ownership
     foreground.free(second);
     try std.testing.expectEqual(@as(usize, 0), memory.foreground.used.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), memory.control.used.load(.acquire));
+}
+
+test "workload envelope node accounting rolls back allocation and growth failures" {
+    const Owner = struct {
+        remaining: usize = 20,
+        fn reserve(raw: *anyopaque, bytes: usize) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes > self.remaining) return false;
+            self.remaining -= bytes;
+            return true;
+        }
+        fn release(raw: *anyopaque, bytes: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.remaining += bytes;
+        }
+    };
+    var owner: Owner = .{};
+    var memory: Shared = .{ .child = std.testing.allocator, .limit = 100, .accounting = .{ .ptr = &owner, .reserve_fn = Owner.reserve, .release_fn = Owner.release } };
+    const alloc = memory.allocator();
+    const bytes = try alloc.alloc(u8, 20);
+    try std.testing.expectError(error.OutOfMemory, alloc.alloc(u8, 1));
+    try std.testing.expect(!alloc.resize(bytes, 21));
+    try std.testing.expectEqual(@as(usize, 20), memory.stats().used_bytes);
+    try std.testing.expectEqual(@as(usize, 0), owner.remaining);
+    alloc.free(bytes);
+    try std.testing.expectEqual(@as(usize, 20), owner.remaining);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var denied: Shared = .{ .child = failing.allocator(), .limit = 100, .accounting = memory.accounting };
+    try std.testing.expectError(error.OutOfMemory, denied.allocator().alloc(u8, 10));
+    try std.testing.expectEqual(@as(usize, 20), owner.remaining);
+    try std.testing.expectEqual(@as(usize, 0), denied.stats().used_bytes);
 }

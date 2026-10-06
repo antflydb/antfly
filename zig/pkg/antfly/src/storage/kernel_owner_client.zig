@@ -87,6 +87,14 @@ pub const Context = struct {
         ));
     }
 
+    pub fn reserveExternal(self: *Context, bytes: usize) bool {
+        return abi.antfly_storage_context_reserve_external(self.handle, bytes);
+    }
+
+    pub fn releaseExternal(self: *Context, bytes: usize) void {
+        abi.antfly_storage_context_release_external(self.handle, bytes);
+    }
+
     pub fn metrics(self: *Context) !abi.ContextMetricsResult {
         try self.ensure();
         var result: abi.ContextMetricsResult = .{};

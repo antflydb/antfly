@@ -893,6 +893,18 @@ pub fn storageOwnerContextCacheKindStats(stats: anytype) kernel_owner_abi.Contex
     };
 }
 
+/// Borrowed allocation accounting for API heaps sharing this storage owner.
+/// The context must remain alive until all charges have been released.
+pub fn storageOwnerContextReserveExternal(context: ?*anyopaque, bytes: usize) callconv(.c) bool {
+    const owner = asStorageOwnerContext(context) orelse return false;
+    return owner.resources.resource_manager.reserveExternal(bytes);
+}
+
+pub fn storageOwnerContextReleaseExternal(context: ?*anyopaque, bytes: usize) callconv(.c) void {
+    const owner = asStorageOwnerContext(context) orelse unreachable;
+    owner.resources.resource_manager.releaseExternal(bytes);
+}
+
 pub fn storageOwnerContextMetrics(
     context: ?*anyopaque,
     out_result: *kernel_owner_abi.ContextMetricsResult,

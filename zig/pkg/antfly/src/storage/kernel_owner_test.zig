@@ -2698,6 +2698,14 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(abi.abi_version, metrics.version);
     try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
+    try std.testing.expect(!abi.antfly_storage_context_reserve_external(null, 1));
+    const original_used = metrics.resource_memory.used_bytes;
+    try std.testing.expect(abi.antfly_storage_context_reserve_external(context, 4096));
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(original_used + 4096, metrics.resource_memory.used_bytes);
+    abi.antfly_storage_context_release_external(context, 4096);
+    try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
+    try std.testing.expectEqual(original_used, metrics.resource_memory.used_bytes);
     for (71..abi.abi_version) |version| {
         const old_version: u32 = @intCast(version);
         // Reject every earlier layout, including main's independent ABI

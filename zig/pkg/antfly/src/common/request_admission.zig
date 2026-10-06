@@ -64,6 +64,12 @@ pub fn appendPrometheusMetrics(
     try prometheus.appendPromMetric(writer, names.peak_in_flight, "gauge", names.peak_help, stats.peak_in_flight);
     try prometheus.appendPromMetric(writer, names.rejected_total, "counter", names.rejected_help, stats.rejected_total);
     const prefix = "antfly_admission_" ++ @tagName(class);
+    try prometheus.appendPromMetric(writer, prefix ++ "_configured_capacity_requests", "gauge", "Startup admission reservation; zero means unlimited", stats.configured_capacity);
+    try prometheus.appendPromMetric(writer, prefix ++ "_policy_version", "gauge", "Node-local admission policy version", stats.policy_version);
+    try prometheus.appendPromMetric(writer, prefix ++ "_policy_retired_requests_total", "counter", "Waiters retired by policy shrink or suspension", stats.policy_retired_total);
+    try prometheus.appendPromMetric(writer, prefix ++ "_suspended", "gauge", "Admission suspended by operator", @intFromBool(stats.suspended));
+    try prometheus.appendPromMetric(writer, prefix ++ "_retiring_waiters", "gauge", "Notified waiters whose callers have not retired ownership", stats.retiring_waiters);
+    try prometheus.appendPromMetric(writer, prefix ++ "_quiescent", "gauge", "No active operations or queued waiters", @intFromBool(stats.quiescent));
     if (stats.sql_waiting_enabled) |enabled| {
         try prometheus.appendPromMetric(writer, prefix ++ "_sql_waiting_enabled", "gauge", "Dedicated bounded SQL waiting executor available", @intFromBool(enabled));
     }

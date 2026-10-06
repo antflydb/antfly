@@ -3,6 +3,7 @@
 const std = @import("std");
 const http = @import("http_server.zig");
 const admission = @import("../common/request_admission.zig").RequestAdmission;
+const resources = @import("../storage/resource_manager.zig");
 const io = std.testing.io;
 const alloc = std.testing.allocator;
 
@@ -109,16 +110,16 @@ fn awaitQueued(server: *http.ApiHttpServer) !void {
     }
 }
 
-pub fn qualify(server: *http.ApiHttpServer) !void {
+pub fn qualify(server: *http.ApiHttpServer, storage: *resources.ResourceManager) !void {
     // A watchdog bounds the entire native socket qualification, including a
     // regression that loses ReadyForQuery or fails to join listener shutdown.
     var done: std.Io.Event = .unset;
-    var future = try io.concurrent(run, .{ server, &done });
+    var future = try io.concurrent(run, .{ server, storage, &done });
     defer future.cancel(io) catch {};
     try done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(20), .clock = .awake } });
     try future.await(io);
 }
-fn run(server: *http.ApiHttpServer, done: *std.Io.Event) anyerror!void {
+fn run(server: *http.ApiHttpServer, storage: *resources.ResourceManager, done: *std.Io.Event) anyerror!void {
     defer done.set(io);
     var adapter = @import("sql_pgwire.zig").Adapter{ .server = server };
     var listener = try @import("../pgwire/server.zig").start(alloc, .{ .io = io, .backend = adapter.backend(), .bind_port = 0, .max_connections = 2 });
@@ -164,6 +165,12 @@ fn run(server: *http.ApiHttpServer, done: *std.Io.Event) anyerror!void {
         const pressure = try server.alloc.alloc(u8, remaining - @import("../common/allocation_budget.zig").Partitioned.overhead(.of(u8)));
         defer server.alloc.free(pressure);
         try std.testing.expectError(error.OutOfMemory, server.alloc.alloc(u8, 1));
+        // Real storage owner: deny new managed memory while retiring existing
+        // snapshots/cursors. No assertion of distributed WAL progress is made.
+        const storage_stats = storage.snapshot().memory;
+        var storage_pressure = try storage.reserveWithoutReclaim(.lsm_compaction_work, storage_stats.hard_limit_bytes - storage_stats.used_bytes);
+        defer storage_pressure.release();
+        try std.testing.expectError(error.ResourceBudgetExceeded, storage.reserveWithoutReclaim(.dense_search_working_set, 1));
         _ = try first.query("COMMIT", 'I', null);
         _ = try second.query("ROLLBACK", 'I', null);
         _ = try first.query("BEGIN", 'I', "53300");
