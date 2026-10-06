@@ -36,6 +36,21 @@ release archive matrix. Python/npm prebuilt packages currently support
 Linux x86-64 and ARM64 (glibc 2.28+), and macOS ARM64. Go links native
 archives directly; it does not install a Python/npm platform package.
 
+
+The archive relocates before compilation: pkg-config resolves its current
+installation directory when you build. The resulting runtime search path is
+absolute, so moving the archive afterward requires rebuilding the application
+or configuring the system loader. For distribution packages, install the
+library into the final system prefix and remove the `-Wl,-rpath,${libdir}`
+flag from `libantfly.pc`; use the distribution's loader policy instead.
+
+`go vet`, `gopls`, and `golangci-lint` also run cgo and therefore need
+`pkg-config` and the same `PKG_CONFIG_PATH` configuration as `go build`.
+Set that environment in your editor's launch environment as well as your shell.
+Native builds and tests that link the binding require the actual library.
+Repository CI's declaration-only vet check generates temporary pkg-config
+metadata without a library; that setup cannot run or link an application.
+
 ### Embedded inference
 
 `libantfly` always links the inference runtime and executes it in-process (see `zig/COMPILATION.md`'s "C API
@@ -51,9 +66,8 @@ inference-free variant to link against instead.
 Normal `go test ./...` does not run the C ABI smoke test. The `libantfly`
 build tag means "a built `libantfly` is available to link"; it is not
 Lite-specific, because the C ABI itself is storage-neutral. Without it, test
-binaries would fail at link time, so package consumers and repository-wide
-`go test ./...` runs do not need a freshly built `libantfly` unless they are
-testing the binding against the source-tree C library.
+binaries would fail at link time, but cgo still requires pkg-config metadata during compilation. Tests that
+exercise native calls require the actual library.
 
 The open helpers call `ValidateABI` before filling C option structures or
 creating handles. Applications can call `ValidateABI` at startup to fail fast

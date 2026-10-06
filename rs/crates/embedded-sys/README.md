@@ -46,6 +46,16 @@ paths on Linux/macOS. Downstream build tools can use the `.pc` file's `Libs`
 flags or configure their own loader paths. The library must remain available
 at runtime.
 
+
+Pkg-config resolves the archive's current installation directory when you
+build. These crates' test/example binaries receive an absolute runtime search
+path; downstream applications follow their own loader configuration. If a
+binary uses the archive directory as its rpath, moving the archive afterward
+requires rebuilding that binary or configuring the system loader. Distribution
+packages should install the library into the final system prefix, remove the
+`-Wl,-rpath,${libdir}` flag from `libantfly.pc` for C/Go consumers, and configure
+application binaries according to the distribution's loader policy.
+
 ## Testing
 
 - `cargo test -p antfly-embedded-sys` (no feature) runs only pure, non-linking

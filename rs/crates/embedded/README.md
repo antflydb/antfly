@@ -83,6 +83,16 @@ cargo test -p antfly-embedded --features libantfly
 Outside the source tree, set `ANTFLY_LIB_DIR` to point at an installed
 `libantfly`'s `lib` directory.
 
+
+Pkg-config resolves the archive's current installation directory when you
+build. These crates' test/example binaries receive an absolute runtime search
+path; downstream applications follow their own loader configuration. If a
+binary uses the archive directory as its rpath, moving the archive afterward
+requires rebuilding that binary or configuring the system loader. Distribution
+packages should install the library into the final system prefix, remove the
+`-Wl,-rpath,${libdir}` flag from `libantfly.pc` for C/Go consumers, and configure
+application binaries according to the distribution's loader policy.
+
 ### Embedded inference
 
 `libantfly` always links the standalone inference runtime in-process, the

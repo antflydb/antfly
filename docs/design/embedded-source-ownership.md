@@ -198,3 +198,10 @@ Build composition and test partitioning use Zig 0.17 configuration APIs.
 Generated inputs retain LazyPath ownership until make phase; authored imports
 inspected during configuration are registered as configure dependencies so the
 serialized build graph is invalidated when source ownership changes.
+
+The fetched source package selects runtime/build owners and individual literal
+`@embedFile` assets from the same immutable commit. It excludes repository-wide
+test corpora, benchmarks, CI tools and language bindings. Optional accelerator
+artifacts and host code generators remain build inputs. The external consumer
+checks this reduced package through native modules, the C ABI and pkg-config
+installation, and both browser memory models.

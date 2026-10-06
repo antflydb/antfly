@@ -48,7 +48,7 @@ class SourcePackageTests(unittest.TestCase):
             "LICENSES/MIT.txt": "MIT dependency license",
             "THIRD_PARTY_NOTICES.md": "dependency notices",
             "specs/openapi/query.yaml": "query contract",
-            "scripts/tool.py": "# SPDX-License-Identifier: Apache-2.0\n",
+            "scripts/yaml_to_json.py": "# SPDX-License-Identifier: Apache-2.0\n",
         }
         for name, content in files.items():
             path = root / name
@@ -79,6 +79,10 @@ class SourcePackageTests(unittest.TestCase):
             "zig/e2e/antfly/test.zig",
             "LICENSES/Elastic-2.0.txt",
             "py/project.py",
+            "zig/testdata/image/jpeg/upstream/fuzz.jpg",
+            "zig/bench/bench.zig",
+            "zig/tools/unneeded.py",
+            "zig/pkg/inference/testdata/model.bin",
         ):
             self.assertFalse(package.selected(path), path)
         for path in (
@@ -91,15 +95,59 @@ class SourcePackageTests(unittest.TestCase):
         ):
             self.assertTrue(package.selected(path), path)
 
+    def test_literal_assets_are_selected_without_the_rest_of_the_corpus(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "repo"
+            root.mkdir()
+            self.fixture(root)
+            source = root / "zig/lib/example/src/root.zig"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                'const asset = @embedFile("../../../testdata/required.bin");\n'
+            )
+            corpus = root / "zig/testdata"
+            corpus.mkdir()
+            (corpus / "required.bin").write_bytes(b"required")
+            (corpus / "unused.bin").write_bytes(b"unused")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "asset",
+                ],
+                cwd=root,
+                check=True,
+            )
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root, text=True
+            ).strip()
+            (corpus / "required.bin").write_bytes(b"dirty")
+            destination = Path(raw) / "stage"
+            package.stage(root, commit, destination)
+            self.assertEqual(
+                (destination / "zig/testdata/required.bin").read_bytes(), b"required"
+            )
+            self.assertFalse((destination / "zig/testdata/unused.bin").exists())
+
     def test_immutable_staging_does_not_take_dirty_working_tree(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / "repo"
             root.mkdir()
             commit = self.fixture(root)
-            (root / "scripts/tool.py").write_text("dirty")
+            (root / "scripts/yaml_to_json.py").write_text("dirty")
             staged = Path(raw) / "stage"
             package.stage(root, commit, staged)
-            self.assertIn("Apache-2.0", (staged / "scripts/tool.py").read_text())
+            self.assertIn(
+                "Apache-2.0", (staged / "scripts/yaml_to_json.py").read_text()
+            )
             self.assertFalse((staged / "zig/pkg/antfly").exists())
             self.assertFalse((staged / "LICENSES/Elastic-2.0.txt").exists())
 
@@ -108,7 +156,8 @@ class SourcePackageTests(unittest.TestCase):
             root = Path(raw) / "repo"
             root.mkdir()
             commit = self.fixture(root)
-            path = root / "zig/new_owner.zig"
+            path = root / "zig/lib/new_owner.zig"
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(
                 '// SPDX-License-Identifier: Apache-2.0\nconst fixture = "SPDX-License-Identifier: Elastic-2.0";\n'
             )
@@ -172,7 +221,8 @@ class SourcePackageTests(unittest.TestCase):
             root = Path(raw) / "repo"
             root.mkdir()
             commit = self.fixture(root)
-            (root / "zig/broken.zig").symlink_to("missing.zig")
+            (root / "scripts/yaml_to_json.py").unlink()
+            (root / "scripts/yaml_to_json.py").symlink_to("missing.py")
             with self.assertRaisesRegex(ValueError, "symlink"):
                 package.stage(root, commit, Path(raw) / "stage", True)
             output = Path(raw) / "output"

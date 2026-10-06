@@ -39,17 +39,72 @@ PACKAGE = "zig/pkg/antfly-embedded"
 MANIFEST = "embedded-zig-source.json"
 
 
+# Runtime/build owners are included; repository-wide test corpora, benchmarks,
+# CI tools and language bindings are not part of a consumer dependency.
+BUILD_INPUTS = {
+    "zig/build.zig",
+    "zig/build.zig.zon",
+    "zig/embedded.build.zig",
+    "zig/build_test_filters.zig",
+    "zig/pdf_standard_fonts.zig",
+    "zig/lib/tokenizer/testdata/embedder/tokenizer.json",
+    "zig/tools/build_support.zig",
+    "zig/tools/check_files_equal.zig",
+    "zig/examples/antfly_wasm.zig",
+    "zig/examples/antfly_c_smoke.c",
+    "scripts/yaml_to_json.py",
+    "scripts/pyproject.toml",
+    "scripts/uv.lock",
+    "scripts/apache_engine_files.txt",
+    "scripts/source_license_roots.json",
+    "scripts/embedded_asset_licenses.json",
+    "THIRD_PARTY_NOTICES.md",
+}
+SOURCE_OWNERS = (
+    "zig/build_support/",
+    "zig/lib/",
+    "zig/deps/snowball/",
+    "zig/pkg/antfly-embedded/",
+    "zig/pkg/antfly-client/",
+    "zig/pkg/antfly-server-api/",
+    "zig/pkg/inference/",
+    "zig/pkg/inference-client/",
+    "specs/openapi/",
+    "LICENSES/",
+)
+
+
 def selected(path: str) -> bool:
-    # Include the Apache composition's authored inputs and tooling, not language
-    # bindings, apps, server implementations, or the server's test source tree.
-    if is_under(path, ELV2_ROOTS):
+    if is_under(path, ELV2_ROOTS) or path.startswith("LICENSES/Elastic-"):
         return False
-    if path.startswith("LICENSES/Elastic-"):
+    if path in BUILD_INPUTS:
+        return True
+    if not path.startswith(SOURCE_OWNERS):
         return False
-    return (
-        path.startswith(("zig/", "scripts/", "specs/", "LICENSES/"))
-        or path == "THIRD_PARTY_NOTICES.md"
-    )
+    # Compile-time embedded fixtures are added individually below, instead of
+    # shipping complete third-party fuzz corpora and training datasets.
+    if any(
+        part in {"testdata", "bench", "e2e", "zig-pkg"} for part in Path(path).parts
+    ):
+        return False
+    if path.startswith("zig/pkg/inference/scripts/"):
+        return False
+    return True
+
+
+def referenced_inputs(destination: Path):
+    """Resolve literal source imports and assets, including host-tool fixtures."""
+    for source in destination.rglob("*.zig"):
+        for name in re.findall(
+            rb'@(?:embedFile|import)\s*\(\s*"([^"\n]+)"\s*\)', source.read_bytes()
+        ):
+            target = (source.parent / name.decode()).resolve()
+            try:
+                yield target.relative_to(destination.resolve()).as_posix()
+            except ValueError:
+                raise ValueError(
+                    f"embedded asset escapes source package: {source}"
+                ) from None
 
 
 def stage(
@@ -98,6 +153,48 @@ def stage(
                     with target.open("wb") as output:
                         shutil.copyfileobj(stream, output)
                     target.chmod(member.mode)
+    # Generated @embedFile inputs are not tracked; real authored assets are
+    # copied from the same immutable commit as their source, never from HEAD.
+    tracked = set(
+        subprocess.check_output(
+            ["git", "ls-tree", "-r", "--name-only", commit], cwd=repository, text=True
+        ).splitlines()
+    )
+    while True:
+        missing = {
+            name
+            for name in referenced_inputs(destination)
+            if name in tracked
+            and not is_under(name, ELV2_ROOTS)
+            and not (destination / name).exists()
+        }
+        if not missing:
+            break
+        for name in sorted(missing):
+            if name not in tracked or (destination / name).exists():
+                continue
+            if is_under(name, ELV2_ROOTS):
+                # Shared composition helpers also declare inactive server
+                # steps. They must not pull server inputs into the archive.
+                continue
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if working_tree:
+                source = repository / name
+                if source.is_symlink():
+                    raise ValueError(f"source package cannot contain a symlink: {name}")
+                target.write_bytes(source.read_bytes())
+            else:
+                mode = subprocess.check_output(
+                    ["git", "ls-tree", commit, "--", name], cwd=repository, text=True
+                ).split()[0]
+                if mode not in {"100644", "100755"}:
+                    raise ValueError(f"source package cannot contain a link: {name}")
+                target.write_bytes(
+                    subprocess.check_output(
+                        ["git", "show", f"{commit}:{name}"], cwd=repository
+                    )
+                )
     # Fail closed even for newly introduced ELv2 owners not yet in the map.
     for path in destination.rglob("*"):
         if path.is_file() and path.suffix in {".zig", ".c", ".h", ".py", ".sh"}:

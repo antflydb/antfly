@@ -145,6 +145,10 @@ case "$apple_providers" in
   true|false) ;;
   *) echo "--apple-providers must be true or false" >&2; exit 2 ;;
 esac
+if [ "$apple_providers" = true ] && [ "$product" != server ]; then
+  echo "--apple-providers currently requires --product server" >&2
+  exit 2
+fi
 if [ "$apple_providers" = true ]; then
   case "$target" in
     *macos*) ;;
@@ -210,14 +214,13 @@ zig_build_options=(
   -Dcpu=baseline
   -Dantfly-version="$version"
   -Donnx=false
-  -Dapple-providers="$apple_providers"
   -Dmetal="$metal"
   -Dcuda="$cuda"
   -Dpjrt="$pjrt"
   -Dsystem-blas="$system_blas"
 )
 if [ "$product" = server ]; then
-  zig_build_options+=(-Dantfly-bin-name=antfly)
+  zig_build_options+=(-Dantfly-bin-name=antfly -Dapple-providers="$apple_providers")
 fi
 
 zig_install_args=(

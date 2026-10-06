@@ -63,6 +63,7 @@ PACKAGE_ENTRYPOINTS = (
 # Generated data modules resolve to their producers. Only Zig's standard library
 # and build-generated configuration constants terminate traversal.
 SOURCE_MODULES = {
+    "antfly_apple_native": ("zig/lib/apple_native/src/mod.zig",),
     "root": tuple(SOURCE_ROOT + name for name in ENTRYPOINTS) + PACKAGE_ENTRYPOINTS,
     "onnx_c": ("zig/pkg/inference/src/backends/onnx_c.h",),
     "ortgenai_c": ("zig/pkg/inference/src/backends/ortgenai_c.h",),
@@ -199,7 +200,6 @@ SOURCE_MODULES = {
     ),
     "antfly_inference_request_types": ("zig/pkg/inference/src/host/request_types.zig",),
     "antfly_inference_runtime_paths": ("zig/pkg/inference/src/host/runtime_paths.zig",),
-    "antfly_inference_host": ("zig/pkg/inference/src/host/host.zig",),
     "antfly_inference_query_embedding_cache": (
         "zig/pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig",
     ),
@@ -337,6 +337,8 @@ SOURCE_MODULES = {
     "xla_proto": ("zig/lib/pjrt/proto/xla_proto_stub.zig",),
 }
 CONFIGURATION_IMPORTS = {
+    "apple_native_options",
+    "apple_reader_options",
     "standalone_runtime_options",
     "antfly_lite_options",
     "build_options",

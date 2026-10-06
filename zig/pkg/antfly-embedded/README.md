@@ -47,8 +47,11 @@ existing supported Linux and macOS targets; optional accelerator runtimes
 must be supplied by the consumer.
 
 The source archive includes the complete first-party Apache composition and
-shared library tree, generated contracts, pinned dependency manifests,
+shared runtime sources, generated contracts, pinned dependency manifests,
 source provenance, and third-party notices. It contains no ELv2 server or
-server test sources. Third-party dependencies retain their own licenses.
+server test sources. Repository-wide corpora, benchmarks and CI tooling are
+excluded; compile-time embedded assets are included individually. Optional
+backend artifacts remain available for consumers enabling acceleration.
+Third-party dependencies retain their own licenses.
 A downloaded package has no dependency on a monorepo checkout. Development
 checkouts can use the same package entry point under `zig/pkg/antfly-embedded`.

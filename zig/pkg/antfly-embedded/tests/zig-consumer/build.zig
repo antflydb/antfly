@@ -24,6 +24,9 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("antfly-inference", dependency.module("antfly-inference"));
     tests.root_module.link_libc = true;
     b.step("test", "Exercise fetched Apache package").dependOn(&b.addRunArtifact(tests).step);
+    const native = b.step("native", "Build fetched C ABI, header and install metadata");
+    native.dependOn(&dependency.builder.top_level_steps.get("capi").?.step);
+    native.dependOn(&dependency.builder.top_level_steps.get("pkgconfig").?.step);
     const browser = b.addInstallArtifact(dependency.artifact("antfly_wasm"), .{});
     b.step("wasm", "Install fetched browser product").dependOn(&browser.step);
     b.step("inference-wasm32", "Build fetched inference wasm32").dependOn(&dependency.builder.top_level_steps.get("inference-wasm").?.step);

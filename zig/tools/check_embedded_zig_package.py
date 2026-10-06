@@ -23,6 +23,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -46,6 +47,13 @@ def main() -> None:
         workspace = Path(raw)
         artifacts = workspace / "artifacts"
         identity = build(ROOT, commit, "0.1.0", artifacts, args.zig, args.working_tree)
+        archive = artifacts / identity["archive"]
+        with tarfile.open(archive) as source:
+            unpacked = sum(member.size for member in source if member.isfile())
+        print(
+            f"Fetched source archive: {archive.stat().st_size / 1024**2:.1f} MiB compressed, {unpacked / 1024**2:.1f} MiB unpacked",
+            flush=True,
+        )
         consumer = workspace / "consumer"
         shutil.copytree(ROOT / "zig/pkg/antfly-embedded/tests/zig-consumer", consumer)
         url = (
@@ -61,9 +69,9 @@ def main() -> None:
             + ' } }, .paths = .{ "build.zig", "build.zig.zon", "main.zig" } }\n'
         )
         steps = (
-            ["test"]
+            ["test", "native"]
             if args.native_only
-            else ["test", "wasm", "inference-wasm32", "inference-wasm64"]
+            else ["test", "native", "wasm", "inference-wasm32", "inference-wasm64"]
         )
         subprocess.run(
             [

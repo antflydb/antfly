@@ -119,11 +119,15 @@ class ReleaseLicenseTests(unittest.TestCase):
                         steps,
                         [arg for arg in args if arg in ("lite", "antfly", "capi")],
                     )
+                    self.assertEqual(
+                        product == "server", "-Dapple-providers=false" in args
+                    )
                     if product == "embedded":
                         inference_args = json.loads(
                             (root / "zig/pkg/inference/build-args.json").read_text()
                         )
                         self.assertNotIn("--build-file", inference_args)
+                        self.assertNotIn("-Dapple-providers=false", inference_args)
                         for option in (
                             "-Dtarget=aarch64-macos",
                             "-Dantfly-version=test",

@@ -26,6 +26,26 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=ANTFLY_LIB_DIR");
+    // Track discovery settings even when ANTFLY_LIB_DIR bypasses pkg-config.
+    for name in [
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_LIBDIR",
+        "PKG_CONFIG_SYSROOT_DIR",
+        "PKG_CONFIG",
+        "PKG_CONFIG_ALLOW_CROSS",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+        for prefix in ["HOST", "TARGET"] {
+            println!("cargo:rerun-if-env-changed={prefix}_{name}");
+        }
+        if let Ok(target) = env::var("TARGET") {
+            println!("cargo:rerun-if-env-changed={name}_{target}");
+            println!(
+                "cargo:rerun-if-env-changed={name}_{}",
+                target.replace('-', "_")
+            );
+        }
+    }
     println!("cargo:rerun-if-changed=build.rs");
 
     // Only wire up linking when a consumer actually asked for it. Without

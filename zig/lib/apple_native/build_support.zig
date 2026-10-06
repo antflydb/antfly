@@ -1,6 +1,35 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
+
+/// Configure the portable, disabled Apple provider surface. Native server
+/// composition replaces these imports when it enables and builds the bridge.
+pub fn createDisabled(b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, platform: *std.Build.Module, httpx: *std.Build.Module) *std.Build.Module {
+    const options = b.addOptions();
+    options.addOption(bool, "enabled", false);
+    const module = b.createModule(.{
+        .root_source_file = root.path(b, "lib/apple_native/src/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("apple_native_options", options.createModule());
+    module.addImport("antfly_platform", platform);
+    module.addImport("httpx", httpx);
+    return module;
+}
 
 /// Generated paths are resolved during the make phase in Zig 0.17. Pass the
 /// explicit test library path through env rather than baking a cache path into

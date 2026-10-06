@@ -33,11 +33,11 @@ test "fetched public database creates and reopens a file" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/external.aflite", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
     {
-        var db = try embedded.db.DB.createLiteHosted(std.heap.page_allocator, path, .{ .lite_io = std.testing.io });
+        var db = try embedded.db.DB.createLite(std.heap.page_allocator, path, .{ .lite_io = std.testing.io });
         defer db.close();
         _ = try db.liteStatus(std.heap.page_allocator);
     }
-    var reopened = try embedded.db.DB.openLiteHosted(std.heap.page_allocator, path, .{ .lite_io = std.testing.io, .open_mode = .query_readonly });
+    var reopened = try embedded.db.DB.openLite(std.heap.page_allocator, path, .{ .lite_io = std.testing.io, .open_mode = .query_readonly });
     defer reopened.close();
     _ = try reopened.liteStatus(std.heap.page_allocator);
 }
