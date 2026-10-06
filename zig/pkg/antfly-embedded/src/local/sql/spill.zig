@@ -415,7 +415,7 @@ pub const File = struct {
     }
 };
 const Encoder = struct {
-    manager: *Manager,
+    manager: ?*Manager = null,
     a: Allocator,
     bytes: *std.ArrayList(u8),
     limit: usize,
@@ -437,7 +437,7 @@ const Encoder = struct {
         for (values) |value| {
             try self.append(&.{@intFromBool(value.sql_null)});
             if (value.patterns) |pattern| {
-                const id = try self.manager.patternId(pattern);
+                const id = try (self.manager orelse return error.InvalidSqlSpill).patternId(pattern);
                 try self.append(&.{8});
                 try self.word(id);
             } else try self.json(value.value, 0);
@@ -481,7 +481,7 @@ const Encoder = struct {
     }
 };
 const Decoder = struct {
-    manager: *Manager,
+    manager: ?*Manager = null,
     a: Allocator,
     bytes: []const u8,
     position: usize = 0,
@@ -514,7 +514,7 @@ const Decoder = struct {
                 self.position += 1;
                 const id = try self.word();
                 if (flag != 0) return error.InvalidSqlSpill;
-                value.* = .{ .sql_null = false, .patterns = try self.manager.patternAt(id) };
+                value.* = .{ .sql_null = false, .patterns = try (self.manager orelse return error.InvalidSqlSpill).patternAt(id) };
             } else value.* = .{ .sql_null = flag == 1, .value = try self.json(0) };
         }
         return values;
@@ -551,6 +551,66 @@ const Decoder = struct {
         };
     }
 };
+
+/// Versioned native column block shared by immutable artifacts and local spill
+/// vectors. V1 is frozen: wire tag/layout changes require a new encoder version
+/// and a decoder that retains V1 support. Pattern callbacks are never portable.
+pub const ColumnarBlock = struct {
+    values: []const Sequential.EncodedColumn,
+    keys: []const Sequential.EncodedColumn,
+    ordinals: []const u64,
+    pub fn count(self: ColumnarBlock) usize {
+        return self.ordinals.len;
+    }
+    pub fn cell(self: ColumnarBlock, row: usize, column: usize) !Datum {
+        if (row >= self.count() or column >= self.values.len) return error.InvalidSqlSpill;
+        return self.values[column].cell(row);
+    }
+    pub fn keyCell(self: ColumnarBlock, row: usize, column: usize) !Datum {
+        if (row >= self.count() or column >= self.keys.len) return error.InvalidSqlSpill;
+        return self.keys[column].cell(row);
+    }
+};
+const columnar_v1_magic = "NCB\x01";
+pub fn encodeColumnarBlockAlloc(a: Allocator, rows: []const Row, max_bytes: usize) ![]u8 {
+    if (rows.len == 0 or rows.len > 256 or rows[0].values.len > 1024 or rows[0].keys.len > 256) return error.InvalidSqlSpill;
+    for (rows) |row| {
+        if (row.values.len != rows[0].values.len or row.keys.len != rows[0].keys.len) return error.InvalidSqlSpill;
+        for (row.values) |value| if (value.patterns != null) return error.InvalidSqlSpill;
+        for (row.keys) |value| if (value.patterns != null) return error.InvalidSqlSpill;
+    }
+    var bytes: std.ArrayList(u8) = .empty;
+    errdefer bytes.deinit(a);
+    var encoder: Encoder = .{ .a = a, .bytes = &bytes, .limit = max_bytes };
+    try encoder.append(columnar_v1_magic);
+    try encoder.word(rows.len);
+    try encoder.word(rows[0].values.len);
+    try encoder.word(rows[0].keys.len);
+    for (rows) |row| try encoder.word(row.ordinal);
+    try Sequential.encodeColumns(&encoder, rows, false);
+    try Sequential.encodeColumns(&encoder, rows, true);
+    return bytes.toOwnedSlice(a);
+}
+/// Payload bytes and decoded metadata borrow the caller's page arena. Fetch
+/// authenticated artifact bytes into that same arena before decoding, so no
+/// payload copy or per-row cell array is needed. The caller resets the arena
+/// only after all lanes drain, including on malformed input/allocation failure.
+pub fn decodeColumnarBlockInArena(a: Allocator, bytes: []const u8, max_bytes: usize) !ColumnarBlock {
+    if (bytes.len > max_bytes or bytes.len < columnar_v1_magic.len or !std.mem.eql(u8, bytes[0..columnar_v1_magic.len], columnar_v1_magic)) return error.InvalidSqlSpill;
+    var decoder: Decoder = .{ .a = a, .bytes = bytes, .position = columnar_v1_magic.len };
+    const count = try decoder.count();
+    const width = try decoder.count();
+    const key_width = try decoder.count();
+    if (count == 0 or count > 256 or width > 1024 or key_width > 256) return error.InvalidSqlSpill;
+    const ordinals = try a.alloc(u64, count);
+    for (ordinals) |*ordinal| ordinal.* = try decoder.word();
+    const values = try a.alloc(Sequential.EncodedColumn, width);
+    const keys = try a.alloc(Sequential.EncodedColumn, key_width);
+    for (values) |*column| column.* = try Sequential.EncodedColumn.decode(&decoder, count);
+    for (keys) |*column| column.* = try Sequential.EncodedColumn.decode(&decoder, count);
+    if (decoder.position != bytes.len) return error.InvalidSqlSpill;
+    return .{ .values = values, .keys = keys, .ordinals = ordinals };
+}
 
 /// Sequential native runs use typed column blocks when multiple rows fit;
 /// wide rows retain the compact record framing without extra staging copies.
@@ -966,7 +1026,7 @@ pub const Sequential = struct {
         a: Allocator,
         arena: std.heap.ArenaAllocator,
         rows: []const Row = &.{},
-        encoded: ?struct { values: []const EncodedColumn, keys: []const EncodedColumn, ordinals: []const u64 } = null,
+        encoded: ?ColumnarBlock = null,
         refs: std.atomic.Value(usize) = .init(1),
         pub fn count(self: *const OwnedBlock) usize {
             return if (self.encoded) |v| v.ordinals.len else self.rows.len;
@@ -2267,4 +2327,82 @@ fn retainingInputScenario(a: Allocator) !void {
 test "SQL retaining spill consumers borrow singleton records between compact blocks" {
     try retainingInputScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainingInputScenario, .{});
+}
+
+test "SQL native immutable column block retains the frozen v1 integer layout" {
+    const a = std.testing.allocator;
+    const rows = [_]Row{
+        .{ .values = &.{Datum.json(.{ .integer = 9007199254740993 })}, .keys = &.{}, .ordinal = 0 },
+        .{ .values = &.{Datum.json(.{ .integer = -9007199254740993 })}, .keys = &.{}, .ordinal = 1 },
+    };
+    const golden = "\x4e\x43\x42\x01\x02\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x02\x00\x01\x00\x00\x00\x00\x00\x20\x00\xff\xff\xff\xff\xff\xff\xdf\xff";
+    const bytes = try encodeColumnarBlockAlloc(a, &rows, 4096);
+    defer a.free(bytes);
+    try std.testing.expectEqualSlices(u8, golden, bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const block = try decodeColumnarBlockInArena(arena.allocator(), golden, 4096);
+    try std.testing.expectEqual(@as(i64, -9007199254740993), (try block.cell(1, 0)).value.integer);
+    try std.testing.expectEqual(@as(u64, 1), block.ordinals[1]);
+}
+
+fn portableColumnBlockScenario(a: Allocator) !void {
+    var cells: [32][4]Datum = undefined;
+    var keys: [32][1]Datum = undefined;
+    var rows: [32]Row = undefined;
+    for (&rows, 0..) |*row, index| {
+        cells[index] = .{
+            Datum.json(.{ .integer = if (index % 2 == 0) 9007199254740993 else -9007199254740993 }),
+            Datum.json(.{ .float = if (index % 2 == 0) -0.0 else 0.0 }),
+            Datum.json(.{ .string = "a long repeated payload with an embedded\x00 byte" }),
+            Datum.json(.{ .number_string = "123456789012345678901234567890.123456789" }),
+        };
+        keys[index][0] = if (index % 2 == 0) Datum{} else Datum.json(.null);
+        row.* = .{ .values = &cells[index], .keys = &keys[index], .ordinal = index };
+    }
+    const bytes = try encodeColumnarBlockAlloc(a, &rows, 1024 * 1024);
+    defer a.free(bytes);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const block = try decodeColumnarBlockInArena(arena.allocator(), bytes, 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, rows.len), block.count());
+    try std.testing.expect(block.values[0].values == .dictionary);
+    try std.testing.expect(block.values[2].values == .dictionary);
+    for (rows, 0..) |row, index| {
+        try std.testing.expectEqual(row.ordinal, block.ordinals[index]);
+        try std.testing.expectEqual(row.values[0].value.integer, (try block.cell(index, 0)).value.integer);
+        try std.testing.expectEqual(@as(u64, @bitCast(row.values[1].value.float)), @as(u64, @bitCast((try block.cell(index, 1)).value.float)));
+        try std.testing.expectEqualStrings(row.values[2].value.string, (try block.cell(index, 2)).value.string);
+        try std.testing.expectEqualStrings(row.values[3].value.number_string, (try block.cell(index, 3)).value.number_string);
+        try std.testing.expectEqual(row.keys[0].sql_null, (try block.keyCell(index, 0)).sql_null);
+    }
+    const borrowed = (try block.cell(0, 2)).value.string;
+    try std.testing.expect(@intFromPtr(borrowed.ptr) >= @intFromPtr(bytes.ptr) and @intFromPtr(borrowed.ptr) + borrowed.len <= @intFromPtr(bytes.ptr) + bytes.len);
+}
+
+test "SQL native immutable column blocks borrow dictionaries and preserve null and float identity" {
+    try portableColumnBlockScenario(std.testing.allocator);
+    var fixed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(fixed.allocator(), portableColumnBlockScenario, .{});
+}
+
+test "SQL native immutable column blocks reject truncation versions and callbacks" {
+    const a = std.testing.allocator;
+    const rows = [_]Row{.{ .values = &.{Datum.json(.{ .string = "binary\x00 payload" })}, .keys = &.{Datum.json(.null)}, .ordinal = 9 }};
+    const bytes = try encodeColumnarBlockAlloc(a, &rows, 4096);
+    defer a.free(bytes);
+    for (0..bytes.len) |len| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bytes[0..len], 4096));
+    }
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const bad = try arena.allocator().dupe(u8, bytes);
+    bad[3] = 2;
+    try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bad, 4096));
+    try std.testing.expectError(error.InvalidSqlSpill, decodeColumnarBlockInArena(arena.allocator(), bytes, bytes.len - 1));
+    var callback: scalar.PatternSet = undefined;
+    const callback_rows = [_]Row{.{ .values = &.{.{ .patterns = &callback, .sql_null = false }}, .keys = &.{}, .ordinal = 0 }};
+    try std.testing.expectError(error.InvalidSqlSpill, encodeColumnarBlockAlloc(a, &callback_rows, 4096));
 }
