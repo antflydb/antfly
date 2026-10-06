@@ -701,7 +701,8 @@ fn Engine(comptime Context: type) type {
                 if (self.query_remaining == 0) return null;
                 while (self.query_buffer_index == self.query_buffer.len) {
                     // Keep only one page of input, provider scratch and output.
-                    // Every upstream row is copied into this arena by next().
+                    // next() may lend an upstream page until its next pull.
+                    // Own buffered cells before advancing across that page.
                     if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
                     const scratch = self.scratch.allocator();
                     self.query_buffer = &.{};
@@ -719,7 +720,8 @@ fn Engine(comptime Context: type) type {
                         const sources = try scratch.alloc(?*scalar.PatternSet, input.len);
                         for (input, sources) |cell, *source| source.* = cell.patterns;
                         for (input, query.source.columns, nulls) |cell, column, *is_null| {
-                            try object.put(scratch, column.internal, cell.value);
+                            const owned = try operators.cloneDatum(scratch, cell);
+                            try object.put(scratch, column.internal, owned.value);
                             is_null.* = cell.sql_null;
                         }
                         const row: catalog.Row = .{ .id = "", .version = 0, .value = .{ .object = object }, .sql_nulls = nulls, .pattern_sources = sources };

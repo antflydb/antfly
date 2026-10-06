@@ -21,6 +21,69 @@ const Backend = struct {
     }
 };
 
+test "SQL nested join buffers own borrowed text and JSON across upstream pulls" {
+    const Fixture = struct {
+        const Owner = @This();
+        const Cursor = struct {
+            offset: usize = 0,
+            payload: [32]u8 = undefined,
+            fn next(ptr: *anyopaque, a: std.mem.Allocator, _: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (self.offset == 9) return .{ .rows = &.{} };
+                const text = try std.fmt.bufPrint(&self.payload, "payload-{d:0>3}", .{self.offset});
+                var object: std.json.ObjectMap = .empty;
+                var metadata: std.json.ObjectMap = .empty;
+                try metadata.put(a, "text", .{ .string = text });
+                try object.put(a, "id", .{ .integer = @intCast(self.offset) });
+                try object.put(a, "label", .{ .string = text });
+                try object.put(a, "metadata", .{ .object = metadata });
+                const rows = try a.alloc(catalog.Row, 1);
+                rows[0] = .{ .id = text, .version = 1, .value = .{ .object = object } };
+                self.offset += 1;
+                return .{ .rows = rows, .after = if (self.offset < 9) "more" else null };
+            }
+        };
+        states: [2]Cursor = .{ .{}, .{} },
+        cursors: [2]catalog.Cursor = undefined,
+        closes: usize = 0,
+        fn resolve(_: *anyopaque, _: std.mem.Allocator, name: ast.Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .integer },
+                .{ .name = "label", .path = "label", .type = .string },
+                .{ .name = "metadata", .path = "metadata", .type = .json },
+            } };
+        }
+        fn capture(ptr: *anyopaque, _: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self: *Owner = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 2), scans.len);
+            for (&self.states, &self.cursors) |*state, *cursor| cursor.* = .{ .ptr = state, .next = Cursor.next, .close = undefined };
+            return .{ .ptr = self, .cursors = &self.cursors, .close = close };
+        }
+        fn close(ptr: *anyopaque) void {
+            const self: *Owner = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+        }
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: Owner = .{};
+            const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = resolve, .scan = Backend.scan, .mutate = Backend.mutate, .checkpoint = Backend.checkpoint, .open_statement = capture } };
+            var compiled = try compiler.compile(a, "WITH joined_rows AS (SELECT o.id,o.label,o.metadata FROM records o JOIN records c ON o.id=c.id WHERE o.label <> 'discard') SELECT id,label,metadata FROM joined_rows ORDER BY id", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend, &compiled, &.{}, .{ .page_rows = 3 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 9), result.output.rows.len);
+            for (result.output.rows, 0..) |row, index| {
+                var buffer: [32]u8 = undefined;
+                const expected = try std.fmt.bufPrint(&buffer, "payload-{d:0>3}", .{index});
+                try std.testing.expectEqualStrings(expected, row[1].string);
+                try std.testing.expectEqualStrings(expected, row[2].object.get("text").?.string);
+            }
+            try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
 test "SQL quantified subqueries match three valued comparison truth tables" {
     const Set = struct { sql: []const u8, values: []const ?i64 };
     const sets = [_]Set{

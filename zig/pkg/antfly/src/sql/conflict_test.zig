@@ -7,6 +7,36 @@ const compiler = @import("antfly_local_sources").sql_compiler;
 const runtime = @import("antfly_local_sources").sql_runtime;
 const Allocator = std.mem.Allocator;
 
+test "SQL conflict qualified old cells and INSERT aliases share dependency ordinals" {
+    for ([_][]const u8{
+        "INSERT INTO public.items(_id,n) VALUES('existing',5) ON CONFLICT(_id) DO UPDATE SET n=public.items.n+excluded.n RETURNING n",
+        "INSERT INTO items AS i(_id,n) VALUES('existing',5) ON CONFLICT(_id) DO UPDATE SET n=i.n+excluded.n RETURNING i.n",
+    }) |sql| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var described = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, fixture.backend(), &compiled, &.{});
+        defer described.deinit();
+        const conflict = described.binding.conflict.?;
+        try std.testing.expectEqual(@as(usize, 9), conflict.columns.len);
+        try std.testing.expectEqualSlices(u32, &.{ 3, 6 }, conflict.assignments[0].?.required_columns);
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.commits);
+        try std.testing.expectEqualStrings("9", result.output.rows[0][0].string);
+    }
+    for ([_][]const u8{
+        "INSERT INTO public.items AS i(_id,n) VALUES('existing',5) ON CONFLICT(_id) DO UPDATE SET n=public.items.n+excluded.n RETURNING i.n",
+        "INSERT INTO public.items(_id,n) VALUES('existing',5) ON CONFLICT(_id) DO UPDATE SET n=secret.items.n+excluded.n RETURNING n",
+    }) |sql| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.UnknownColumn, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    }
+}
+
 const Fixture = struct {
     commits: usize = 0,
     affected: usize = 0,
@@ -409,7 +439,7 @@ test "SQL conflict allocations cannot partially publish a statement" {
     const Faults = struct {
         fn run(alloc: Allocator) !void {
             var fixture: Fixture = .{};
-            var compiled = try compiler.compile(alloc, "INSERT INTO items (_id,n) VALUES ('existing',3),('new',9) ON CONFLICT (_id) DO UPDATE SET n=items.n+excluded.n RETURNING n,g", .{});
+            var compiled = try compiler.compile(alloc, "INSERT INTO public.items (_id,n) VALUES ('existing',3),('new',9) ON CONFLICT (_id) DO UPDATE SET n=public.items.n+excluded.n RETURNING public.items.n,public.items.g", .{});
             defer compiled.deinit();
             var result = runtime.execute(alloc, fixture.backend(), &compiled, &.{}, .{}) catch |err| {
                 try std.testing.expectEqual(@as(usize, 0), fixture.commits);
@@ -467,7 +497,7 @@ test "SQL conflict binder separates partial arbiter predicates from DO UPDATE fi
     var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (n) VALUES (3) ON CONFLICT (n) WHERE n >= 2 DO UPDATE SET n = excluded.n WHERE items.n < 9", .{});
     defer compiled.deinit();
     const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer, .nullable = false }} };
-    const bound = try @import("antfly_local_sources").sql_conflict.bind(alloc, backend, table, compiled.statement.insert.table, compiled.statement.insert.conflict.?, &.{}, &.{});
+    const bound = try @import("antfly_local_sources").sql_conflict.bind(alloc, backend, table, compiled.statement.insert.table, false, compiled.statement.insert.conflict.?, &.{}, &.{});
     try std.testing.expectEqual(@as(usize, 1), bound.arbiter_conditions.len);
     try std.testing.expectEqual(catalog.Condition.Op.gte, bound.arbiter_conditions[0].op);
     try std.testing.expectEqual(@as(i64, 2), bound.arbiter_conditions[0].value.integer);

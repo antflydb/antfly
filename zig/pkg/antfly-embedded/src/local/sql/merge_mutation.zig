@@ -508,24 +508,17 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
     return .{ .arms = bound, .parameters = parameters };
 }
 
-fn bindReturning(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, statement: ast.Merge, input: *const describe.BoundStatement, parameters: []?ast.ColumnType) !Returning {
+fn bindReturning(alloc: Allocator, backend: catalog.Backend, statement: ast.Merge, input: *const describe.BoundStatement, parameters: []?ast.ColumnType) !Returning {
     const relation = input.relation orelse return error.InvalidSqlBackendResponse;
-    const projections = statement.returning orelse return error.InvalidSqlBackendResponse;
-    const count = if (projections.len == 0) target.columns.len else projections.len;
+    const requested = statement.returning orelse return error.InvalidSqlBackendResponse;
+    const projections = try relation_binding.expandWildcards(alloc, relation.root.columns, if (requested.len == 0) &[_]ast.Projection{.{ .wildcard = true }} else requested, statement.alias orelse statement.table.table);
+    const count = projections.len;
     const expressions = try alloc.alloc(*const ast.Scalar, count);
     const names = try alloc.alloc([]const u8, count);
-    if (projections.len == 0) {
-        const alias = statement.alias orelse statement.table.table;
-        for (target.columns, expressions, names) |field, *expression, *name| {
-            const node = try alloc.create(ast.Scalar);
-            node.* = .{ .column = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ alias, field.name }) };
-            expression.* = node;
-            name.* = field.name;
-        }
-    } else for (projections, expressions, names) |projection, *expression, *name| {
+    for (projections, expressions, names) |projection, *expression, *name| {
         const node = if (projection.expression) |value| value else blk: {
             const column = try alloc.create(ast.Scalar);
-            column.* = .{ .column = projection.field };
+            column.* = .{ .column = if (projection.bound_column) |ordinal| relation.root.columns[ordinal].internal else projection.field };
             break :blk column;
         };
         expression.* = node;
@@ -537,7 +530,7 @@ fn bindReturning(alloc: Allocator, backend: catalog.Backend, target: catalog.Tab
         out.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = column.type };
     }
     const lowered = try alloc.alloc(*const ast.Scalar, count);
-    for (expressions, lowered) |expression, *out| out.* = try relation_binding.lowerBoundExpression(alloc, relation.root.columns, expression);
+    for (expressions, projections, lowered) |expression, projection, *out| out.* = if (projection.bound_column != null) expression else try relation_binding.lowerBoundExpression(alloc, relation.root.columns, expression);
     for (lowered) |expression| _ = try scalar.inferParameters(alloc, expression, scalar_columns, parameters, null, .{});
     const programs = try alloc.alloc(scalar.Program, count);
     const columns = try alloc.alloc(describe.Column, count);
@@ -695,6 +688,11 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
         .delete => needs_complete_target = needs_complete_target or (statement.returning != null and statement.returning.?.len == 0),
         .insert, .nothing => {},
     };
+    const target_relation = try alloc.create(ast.Relation);
+    target_relation.* = .{ .table = .{ .name = statement.table, .alias = statement.alias, .mutation_target = true, .mutation_document = needs_document } };
+    const source = try alloc.create(ast.Relation);
+    source.* = .{ .join = .{ .kind = .right, .left = target_relation, .right = statement.source, .condition = statement.condition } };
+    var adapter: relation_binding.TargetResolveAdapter = .{ .backend = backend, .table = target, .name = statement.table, .cache_sources = true };
     if (needs_complete_target) for (target.columns) |field| try projections.qualified(alias, field.name);
     try projections.expression(statement.condition);
     for (statement.arms) |arm| {
@@ -719,8 +717,18 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
         }
     }
     if (statement.returning) |returning| {
+        var wildcard_domain: ?[]const relation_binding.Column = null;
         for (returning) |projection| {
-            if (projection.expression) |expression| try projections.expression(expression) else try projections.append(projection.field);
+            if (projection.wildcard) {
+                if (wildcard_domain == null) {
+                    const hints = try alloc.alloc(?ast.ColumnType, compiled.parameter_count);
+                    @memset(hints, null);
+                    @memcpy(hints[0..parameter_types.len], parameter_types);
+                    wildcard_domain = try relation_binding.projectionColumns(alloc, adapter.iface(), .{ .source = source, .ctes = statement.ctes, .columns = &.{.{ .field = try std.fmt.allocPrint(alloc, "{s}\x00_id", .{alias}) }} }, hints);
+                }
+                const expanded = try relation_binding.expandWildcards(alloc, wildcard_domain.?, &.{projection}, alias);
+                for (expanded) |entry| try projections.append(try qualifiedColumn(alloc, wildcard_domain.?[entry.bound_column.?]));
+            } else if (projection.expression) |expression| try projections.expression(expression) else try projections.append(projection.field);
         }
         // An unqualified target reference resolves to the target's internal
         // name only after relation binding. Preserve that postimage slot even
@@ -729,19 +737,14 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
             try projections.qualified(alias, field.name);
         };
     }
-    const target_relation = try alloc.create(ast.Relation);
-    target_relation.* = .{ .table = .{ .name = statement.table, .alias = statement.alias, .mutation_target = true, .mutation_document = needs_document } };
-    const source = try alloc.create(ast.Relation);
-    source.* = .{ .join = .{ .kind = .right, .left = target_relation, .right = statement.source, .condition = statement.condition } };
     const query: ast.Select = .{ .source = source, .ctes = statement.ctes, .columns = try projections.projections.toOwnedSlice(alloc) };
-    var adapter: relation_binding.TargetResolveAdapter = .{ .backend = backend, .table = target, .name = statement.table, .cache_sources = true };
     const selected: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = query }, .parameter_count = compiled.parameter_count };
     const input = try alloc.create(describe.BoundStatement);
     input.* = try describe.bind(alloc, adapter.iface(), &selected, parameter_types);
     if (input.relation == null or input.relation.?.root.operation != .join or input.relation.?.root.operation.join.kind != .right) return error.InvalidSqlBackendResponse;
     const arms = try bindArms(alloc, backend, target, statement, input);
     const parameters = try alloc.dupe(?ast.ColumnType, arms.parameters);
-    const returning_plan = if (statement.returning != null) try bindReturning(alloc, backend, target, statement, input, parameters) else null;
+    const returning_plan = if (statement.returning != null) try bindReturning(alloc, backend, statement, input, parameters) else null;
     const field_ordinals = try alloc.alloc(?usize, target.columns.len);
     for (target.columns, field_ordinals) |field, *ordinal| {
         ordinal.* = null;
@@ -1049,9 +1052,9 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
             }
             const projected = try context.arena.alloc(std.json.Value, plan.programs.len);
             const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
-            for (plan.programs, projected, projected_nulls) |program, *value, *is_null| {
+            for (plan.programs, projected, projected_nulls, plan.columns) |program, *value, *is_null, column| {
                 const datum = try decision_eval.evaluate(context.arena, context.backend.decision_provider, &program, cells, context.parameters);
-                value.* = try context.outputValue(datum.value);
+                value.* = try context.outputCell(datum.value, column.type);
                 is_null.* = datum.sql_null;
             }
             values.* = projected;
@@ -1077,9 +1080,9 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
                 for (first..end) |index| {
                     const projected = try context.arena.alloc(std.json.Value, plan.programs.len);
                     const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
-                    for (columns, projected, projected_nulls) |values, *value, *is_null| {
+                    for (columns, projected, projected_nulls, plan.columns) |values, *value, *is_null, column| {
                         const datum = values[index - first];
-                        value.* = try context.outputValue(datum.value);
+                        value.* = try context.outputCell(datum.value, column.type);
                         is_null.* = datum.sql_null;
                     }
                     output_rows[index] = projected;

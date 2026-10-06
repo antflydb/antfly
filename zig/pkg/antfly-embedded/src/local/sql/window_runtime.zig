@@ -737,8 +737,8 @@ pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytyp
             } else {
                 const output = try context.arena.alloc(Json, values.len);
                 const nulls = try context.arena.alloc(bool, values.len);
-                for (values, output, nulls) |value, *cell, *is_null| {
-                    cell.* = try context.outputValue(value.value);
+                for (values, output, nulls, bound.outputs) |value, *cell, *is_null, program| {
+                    cell.* = try context.outputCell(value.value, program.output_type.kind);
                     is_null.* = value.sql_null;
                 }
                 rows[index - offset] = output;
@@ -753,7 +753,10 @@ pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytyp
     const alloc = output_state.allocator();
     const orders = try alloc.alloc(operators.Order, statement.order_by.len);
     for (statement.order_by, orders) |order, *out| out.* = .{ .descending = order.descending, .nulls_first = order.nulls_first };
-    var top = try operators.TopK.initWithSpill(context.alloc, offset + limit + @intFromBool(statement.limit == null), orders, context.limits.retained_bytes, context.spill);
+    // The window input is already materialized: size the heap for rows that
+    // exist, not the API's maximum result budget (especially in nested plans).
+    const retained_count = @min(cells.len, offset +| limit +| @intFromBool(statement.limit == null));
+    var top = try operators.TopK.initWithSpill(context.alloc, retained_count, orders, context.limits.retained_bytes, context.spill);
     defer top.deinit();
     var eval = std.heap.ArenaAllocator.init(context.alloc);
     defer eval.deinit();
@@ -799,8 +802,8 @@ pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytyp
     for (selected, rows, flags) |row, *out, *nulls| {
         const values = try context.arena.alloc(Json, row.values.len);
         const bits = try context.arena.alloc(bool, row.values.len);
-        for (row.values, values, bits) |value, *cell, *is_null| {
-            cell.* = try context.outputValue(value.value);
+        for (row.values, values, bits, bound.outputs) |value, *cell, *is_null, program| {
+            cell.* = try context.outputCell(value.value, program.output_type.kind);
             is_null.* = value.sql_null;
         }
         out.* = values;

@@ -389,8 +389,8 @@ pub const SortedProjection = struct {
             for (values, first..) |row, index| {
                 const output = try context.arena.alloc(std.json.Value, self.outputs.len);
                 const nulls = try context.arena.alloc(bool, self.outputs.len);
-                for (row, output, nulls) |value, *out, *flag| {
-                    out.* = try context.outputValue(value.value);
+                for (row, output, nulls, self.outputs) |value, *out, *flag, program| {
+                    out.* = try context.outputCell(value.value, program.output_type.kind);
                     flag.* = value.sql_null;
                 }
                 rows[index] = output;

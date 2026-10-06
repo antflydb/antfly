@@ -12858,7 +12858,81 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
     try std.testing.expectEqual(@as(u16, 400), after_close.status);
 }
 
+test "httpx SQL document campaign verifies exact native mutation and storage outcomes" {
+    // Exact PostgreSQL-backed campaign IDs (source SQL is looked up, not copied):
+    // sql-0886, sql-0887, sql-0888, sql-0890, sql-0893, sql-0947.
+    // sql-0948, sql-0949, sql-0950, sql-0951, sql-0952, sql-0953.
+    // sql-0954, sql-0955, sql-0981, sql-0986, sql-0995, sql-1000.
+    // sql-1008, sql-1013, sql-1029, sql-1054, sql-1055, sql-1056.
+    // sql-1057, sql-1059, sql-1060, sql-1061, sql-1062, sql-1063.
+    // sql-1064, sql-1070, sql-1076, sql-1077, sql-1081, sql-1084.
+    // sql-1085, sql-1086, sql-1087, sql-1089, sql-1090, sql-1092.
+    // sql-1093, sql-1094, sql-1095, sql-1096, sql-1098, sql-1099.
+    // sql-1100.
+    const alloc = std.testing.allocator;
+    const Source = struct {
+        schema: []const u8 = "",
+        records: [1]@import("antfly_local_sources").common_topology_records.TableRecord = .{.{ .table_id = 7, .name = "docs", .schema_json = "" }},
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            if (input == .policy_publication_status) return a.dupe(u8, "null");
+            if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = self.schema }, .{});
+            if (input != .resolve_many) return error.UnexpectedCatalogCall;
+            if (input.resolve_many.expected_revision) |revision| if (revision != 7) return error.CatalogGenerationChanged;
+            if (input.resolve_many.storage_names.len != 0) {
+                if (input.resolve_many.storage_names.len != 1 or !std.mem.eql(u8, input.resolve_many.storage_names[0], "docs")) return error.UnexpectedCatalogCall;
+                const name = try (system_catalog.Target{ .table = "docs" }).resourceNameAlloc(a);
+                defer a.free(name);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{}, .logical_names = &.{name} }, .{});
+            }
+            if (input.resolve_many.targets.len == 0) return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{} }, .{});
+            const tables = try a.alloc(?system_catalog.ResolvedTable, input.resolve_many.targets.len);
+            for (input.resolve_many.targets, tables) |target, *table| {
+                if (!std.mem.eql(u8, target.table, "docs")) return error.UnexpectedCatalogCall;
+                table.* = .{ .table_id = 7, .name = "docs", .query_definition = if (input.resolve_many.include_query_definitions) .{ .table_id = 7, .schema_json = self.schema, .read_schema_json = "", .indexes_json = "{}" } else null };
+            }
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = tables }, .{});
+        }
+        fn snapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{ .status = try status(ptr), .tables = &self.records, .ranges = &.{}, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} };
+        }
+        fn freeSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-document-campaign");
+    defer directory.cleanup();
+    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    var reads = table_reads.BoundTableReadSource.init("docs", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
+    var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("docs", &db);
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var source: Source = .{};
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, reads.source(), writes.source());
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const parity = @import("sql_parity_reference.zig");
+    const reference = try std.json.parseFromSlice(parity.DocumentReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.document_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try parity.runDocuments(alloc, &handler, &db, &source, reference.value);
+}
+
 test "httpx SQL executes one relational page with exact integer parameters" {
+    // Exact PostgreSQL-backed campaign IDs (source SQL is looked up, not copied):
+    // sql-0166, sql-0169, sql-0182, sql-0191, sql-0192, sql-0193.
+    // sql-0196, sql-0199, sql-0209, sql-0226, sql-0227, sql-0228.
+    // sql-0232, sql-0233, sql-0238, sql-0239, sql-0240, sql-0241.
+    // sql-0242, sql-0243, sql-0246, sql-0253, sql-0254, sql-0255.
+    // sql-0258, sql-0271, sql-0272, sql-0273, sql-0275.
+    // sql-0276, sql-0277, sql-0278, sql-0279, sql-0281, sql-0282.
+    // sql-0454, sql-0455, sql-0457, sql-0458, sql-0491, sql-0511.
+    // sql-0512, sql-0514, sql-0515, sql-0554, sql-0555, sql-0556.
+    // sql-0557, sql-1205, sql-1206, sql-1265, sql-1268, sql-1269.
+    // sql-1578.
     const alloc = std.testing.allocator;
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"keyword"},"amount":{"type":"integer"},"quantity":{"type":"integer"},"status":{"type":"keyword"},"enabled":{"type":"boolean"},"customer_id":{"type":"integer"},"tenant_id":{"type":"integer"},"created_at":{"type":"keyword"},"metadata":{"type":"object","properties":{"source":{"type":"keyword"}},"additionalProperties":false}},"additionalProperties":false}}}}
@@ -12904,17 +12978,16 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     var db = try db_mod.DB.open(alloc, directory.path(), .{});
     defer db.close();
     try db.setSchemaJson(alloc, schema_json);
-    try db.batch(.{ .writes = &.{
-        .{ .key = "a", .value = "{\"id\":9007199254740993,\"name\":\"exact\",\"amount\":10,\"quantity\":2,\"status\":\"OPEN\",\"enabled\":true,\"customer_id\":1,\"tenant_id\":1,\"created_at\":\"2026-01-01\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "b", .value = "{\"id\":2,\"name\":\"other\",\"amount\":15,\"quantity\":4,\"status\":\"open\",\"customer_id\":1,\"tenant_id\":1,\"created_at\":\"2026-01-02\",\"metadata\":{\"source\":\"internal\"}}" },
-        .{ .key = "c", .value = "{\"id\":3,\"name\":\"third\",\"amount\":17,\"quantity\":3,\"status\":\"closed\",\"customer_id\":2,\"tenant_id\":1,\"created_at\":\"2026-01-03\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "d", .value = "{\"id\":4,\"name\":\"fourth\",\"amount\":18,\"quantity\":7,\"status\":\"open\",\"customer_id\":3,\"tenant_id\":2,\"created_at\":\"2026-01-04\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "e", .value = "{\"id\":5,\"name\":\"fifth\",\"amount\":6,\"quantity\":2,\"status\":\"pending\",\"customer_id\":3,\"tenant_id\":2,\"created_at\":\"2026-01-05\",\"metadata\":{\"source\":\"internal\"}}" },
-        .{ .key = "f", .value = "{\"id\":6,\"name\":\"sixth\",\"amount\":25,\"quantity\":5,\"status\":\"OPEN\",\"customer_id\":4,\"tenant_id\":3,\"created_at\":\"2026-01-06\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "g", .value = "{\"id\":7,\"name\":\"seventh\",\"amount\":1,\"quantity\":0,\"status\":\"open\",\"customer_id\":5,\"tenant_id\":2,\"created_at\":\"2026-01-07\",\"metadata\":{\"source\":\"api\"}}" },
-        .{ .key = "h", .value = "{\"id\":8,\"name\":\"eighth\",\"amount\":3,\"quantity\":0,\"status\":\"Open\",\"customer_id\":6,\"tenant_id\":4,\"created_at\":\"2026-01-08\",\"metadata\":{}}" },
-        .{ .key = "i", .value = "{\"id\":9,\"name\":\"ninth\",\"amount\":2,\"quantity\":0,\"customer_id\":7,\"tenant_id\":4,\"created_at\":\"2026-01-09\",\"metadata\":{\"source\":\"api\"}}" },
-    }, .timestamp_ns = 42 });
+    {
+        var seed_arena = std.heap.ArenaAllocator.init(alloc);
+        defer seed_arena.deinit();
+        const seed_alloc = seed_arena.allocator();
+        const seeds = try std.json.parseFromSliceLeaky(std.json.Value, seed_alloc, @import("antfly_local_sources").sql_parity_fixtures.read_rows, .{});
+        const rows = seeds.object.get("rows").?.array.items;
+        const writes = try seed_alloc.alloc(db_mod.types.BatchWrite, rows.len);
+        for (rows, writes) |row, *write| write.* = .{ .key = row.object.get("key").?.string, .value = try std.json.Stringify.valueAlloc(seed_alloc, row.object.get("value").?, .{}) };
+        try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    }
     var reads = table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier());
     var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer backend_runtime.deinit();
@@ -12927,6 +13000,57 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
+    const reference_cases = [_][]const u8{
+        "sql-0172", "sql-0180", "sql-0181", "sql-0183", "sql-0184", "sql-0223", "sql-0224",
+        "sql-0229", "sql-0234", "sql-0235", "sql-0236", "sql-0237", "sql-0247", "sql-0297",
+        "sql-0300", "sql-0301", "sql-0303", "sql-0304", "sql-0305", "sql-0450", "sql-0451",
+        "sql-0452", "sql-0453", "sql-0456", "sql-0460", "sql-0461", "sql-0462", "sql-0463",
+        "sql-0464", "sql-0465", "sql-0466", "sql-0467", "sql-0469", "sql-0470", "sql-0472",
+        "sql-0474", "sql-0478", "sql-0479", "sql-0480", "sql-0481", "sql-0482", "sql-0483",
+        "sql-0484", "sql-0485", "sql-0486", "sql-0487", "sql-0488", "sql-0489", "sql-0490",
+        "sql-0496", "sql-0497", "sql-0498", "sql-0499", "sql-0500", "sql-0501", "sql-0502",
+        "sql-0503", "sql-0504", "sql-0505", "sql-0506", "sql-0507", "sql-0508", "sql-0509",
+        "sql-0510", "sql-0513", "sql-0517", "sql-0518", "sql-0519", "sql-0520", "sql-0521",
+        "sql-0522", "sql-0523", "sql-0524", "sql-0525", "sql-0526", "sql-0527", "sql-0528",
+        "sql-0529", "sql-0530", "sql-0531", "sql-0532", "sql-0533", "sql-0534", "sql-0535",
+        "sql-0536", "sql-0538", "sql-0539", "sql-0545", "sql-0546", "sql-0550", "sql-0551",
+        "sql-0558", "sql-0559", "sql-1219", "sql-1220", "sql-1223", "sql-1240", "sql-1241",
+        "sql-1249", "sql-1252", "sql-1267", "sql-1337", "sql-1367", "sql-1368", "sql-1371",
+        "sql-1372", "sql-1373", "sql-1375", "sql-1377", "sql-1382", "sql-1383", "sql-1384",
+        "sql-1385", "sql-1386", "sql-1387",
+    };
+    try @import("sql_parity_reference.zig").run(alloc, &handler, &reference_cases);
+    {
+        const parity = @import("sql_parity_reference.zig");
+        const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.read_campaign_reference;
+        const profile = try std.json.parseFromSlice(struct {
+            profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
+            entries: []const struct { id: []const u8 },
+        }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+        defer profile.deinit();
+        const schema = try std.json.Stringify.valueAlloc(alloc, profile.value.profile.schema, .{});
+        defer alloc.free(schema);
+        var campaign_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-read-campaign");
+        defer campaign_directory.cleanup();
+        var campaign_db = try db_mod.DB.open(alloc, campaign_directory.path(), .{});
+        defer campaign_db.close();
+        try campaign_db.setSchemaJson(alloc, schema);
+        var seed_arena = std.heap.ArenaAllocator.init(alloc);
+        defer seed_arena.deinit();
+        const a = seed_arena.allocator();
+        const writes = try a.alloc(db_mod.types.BatchWrite, profile.value.profile.rows.len);
+        for (profile.value.profile.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+        try campaign_db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+        var campaign_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &campaign_db, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var campaign_source: Source = .{ .schema = schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = schema }} };
+        var campaign_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &campaign_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, campaign_reads.source(), null);
+        defer campaign_server.deinit();
+        var campaign_handler = AntflyApiHandler{ .api_server = &campaign_server };
+        const ids = try a.alloc([]const u8, profile.value.entries.len);
+        for (profile.value.entries, ids) |entry, *id| id.* = entry.id;
+        try parity.runReference(alloc, &campaign_handler, ids, reference_bytes);
+    }
+    try @import("sql_parity_reference.zig").runNativeContracts(alloc, &handler, &.{ "sql-0208", "sql-1369" });
     for ([_][]const u8{
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}",
         "{\"statement\":\"SELECT id, name FROM usage_records WHERE _id = $1\",\"parameters\":[\"a\"]}",
@@ -13761,6 +13885,47 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
             try std.testing.expectEqualStrings("2025-01-01T00:00:00.000000000Z", result.value.rows[0][0].string);
         }
+    }
+    {
+        const mutation_schema =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"integer"}},"additionalProperties":false}}}}
+        ;
+        var mutation_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-point-parity");
+        defer mutation_directory.cleanup();
+        var mutation_db = try db_mod.DB.open(alloc, mutation_directory.path(), .{});
+        defer mutation_db.close();
+        try mutation_db.setSchemaJson(alloc, mutation_schema);
+        var mutation_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &mutation_db, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var mutation_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &mutation_db);
+        var mutation_source: Source = .{ .schema = mutation_schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = mutation_schema }} };
+        var mutation_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &mutation_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, mutation_reads.source(), mutation_writes.source());
+        defer mutation_server.deinit();
+        var mutation_handler = AntflyApiHandler{ .api_server = &mutation_server };
+        try @import("sql_parity_reference.zig").runPointMutations(alloc, &mutation_handler, &mutation_db, &.{
+            "sql-1497", "sql-1498", "sql-1504", "sql-1505", "sql-1506", "sql-1507",
+            "sql-1513", "sql-1518", "sql-1519", "sql-1520", "sql-1521", "sql-1522",
+        });
+    }
+    {
+        const parity = @import("sql_parity_reference.zig");
+        const reference = try std.json.parseFromSlice(parity.MutationReference, alloc, @import("antfly_local_sources").sql_parity_fixtures.mutation_reference, .{ .ignore_unknown_fields = true });
+        defer reference.deinit();
+        const mutation_schema = try std.json.Stringify.valueAlloc(alloc, reference.value.schema, .{});
+        defer alloc.free(mutation_schema);
+        var mutation_directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("antfly-httpx-sql-mutation-campaign");
+        defer mutation_directory.cleanup();
+        var mutation_db = try db_mod.DB.open(alloc, mutation_directory.path(), .{});
+        defer mutation_db.close();
+        try mutation_db.setSchemaJson(alloc, mutation_schema);
+        var mutation_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &mutation_db, raft_mod.read_gate.alreadyReadSafeBarrier());
+        var mutation_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &mutation_db);
+        var mutation_source: Source = .{ .schema = mutation_schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = mutation_schema }} };
+        var mutation_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &mutation_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, mutation_reads.source(), mutation_writes.source());
+        defer mutation_server.deinit();
+        var mutation_handler = AntflyApiHandler{ .api_server = &mutation_server };
+        // Exact source cases: sql-0571, sql-0572, sql-0606, sql-0607,
+        // sql-1488, sql-1493. Golden regeneration is an independent gate.
+        try parity.runMutationReference(alloc, &mutation_handler, &mutation_db, reference.value);
     }
     {
         // sql-0048/sql-0050 storage half: the cursor's blocking ORDER BY query

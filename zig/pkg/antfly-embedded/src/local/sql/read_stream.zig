@@ -101,6 +101,24 @@ test "SQL pull stream releases pages and streams beyond materialized result limi
     std.debug.print("SQL pull stream: rows={d} peak_bytes={d} first_page_ns={d} elapsed_ns={d}\n", .{ seen, stream.budget.peak, first_page_ns, std.Io.Clock.awake.now(std.testing.io).nanoseconds - started });
 }
 
+test "SQL pull stream owns polymorphic parameter types and preserves JSON numeric output" {
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT to_jsonb($1) AS j,n FROM docs", .{});
+    defer compiled.deinit();
+    var fixture: Fixture = .{ .count = 3 };
+    const stream = (try Stream.open(std.testing.allocator, fixture.backend(), &compiled, &.{.{ .integer = 9007199254740993 }}, .{ .page_rows = 1 })).?;
+    defer stream.close();
+    try std.testing.expectEqual(@import("ast.zig").ColumnType.json, stream.context.binding.columns[0].type);
+    try std.testing.expectEqualSlices(?@import("ast.zig").ColumnType, &.{.integer}, stream.context.backend.parameter_fallback_types);
+    for (0..3) |_| {
+        var page = try stream.next(1);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.output.rows.len);
+        try std.testing.expectEqual(@as(i64, 9007199254740993), page.output.rows[0][0].integer);
+        try std.testing.expect(!page.output.sql_nulls.?[0][0]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), fixture.opened);
+}
+
 test "SQL pull stream keeps one pinned policy setting across pages" {
     const settings = @import("setting_catalog.zig");
     const Owner = struct {
@@ -415,6 +433,7 @@ pub const Stream = struct {
         errdefer if (self.settings) |view| view.deinit();
         const arena = self.arena.allocator();
         var statement_backend = backend;
+        statement_backend.parameter_fallback_types = try runtime.parameterFallbackTypes(arena, parameters);
         if (backend.setting_capture) |capture| {
             const view = try arena.create(@import("setting_catalog.zig").View);
             view.* = try @import("setting_catalog.zig").View.capture(self.budget.allocator(), capture.owner, capture.scope, capture.overlay);
@@ -896,8 +915,8 @@ pub const Stream = struct {
                     const nulls = try out.alloc(bool, projected.len);
                     var output_context = self.context;
                     output_context.arena = out;
-                    for (projected, cells, nulls) |value, *cell, *is_null| {
-                        cell.* = try output_context.outputValue(value.value);
+                    for (projected, cells, nulls, self.context.binding.columns) |value, *cell, *is_null, column| {
+                        cell.* = try output_context.outputCell(value.value, column.type);
                         is_null.* = value.sql_null;
                     }
                     try rows.append(out, cells);

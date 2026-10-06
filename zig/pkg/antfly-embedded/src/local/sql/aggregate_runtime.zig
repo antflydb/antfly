@@ -357,8 +357,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         const patterns = try context.arena.alloc(?*scalar.PatternSet, row.values.len);
         for (row.values, patterns) |value, *pattern| pattern.* = value.patterns;
         pattern_row.* = patterns;
-        for (row.values, values, sql_nulls) |value, *out, *sql_null| {
-            out.* = try context.outputValue(value.value);
+        for (row.values, values, sql_nulls, bound.outputs) |value, *out, *sql_null, program| {
+            out.* = try context.outputCell(value.value, program.output_type.kind);
             sql_null.* = value.sql_null;
         }
         output.* = values;

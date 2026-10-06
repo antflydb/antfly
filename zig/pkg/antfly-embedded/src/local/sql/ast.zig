@@ -55,7 +55,17 @@ pub const Predicate = union(enum) {
     negation: *const Predicate,
 };
 
-pub const Projection = struct { field: []const u8 = "", alias: ?[]const u8 = null, expression: ?*const Scalar = null };
+pub const Projection = struct {
+    field: []const u8 = "",
+    alias: ?[]const u8 = null,
+    expression: ?*const Scalar = null,
+    /// SELECT wildcard, expanded against the pinned visible source layout.
+    /// field is empty for * or the source qualifier for qualifier.*.
+    wildcard: bool = false,
+    /// Transient wildcard-expansion ordinal in the caller's pinned layout.
+    /// Consumed during lowering, never resolved by a user-visible column name.
+    bound_column: ?usize = null,
+};
 pub const Order = struct {
     field: []const u8 = "",
     expression: ?*const Scalar = null,
@@ -91,6 +101,9 @@ pub const Select = struct {
     group_by: []const *const Scalar = &.{},
     having: ?*const Scalar = null,
     order_by: []const Order = &.{},
+    // Internal binding-domain marker: lowered window orders must not expand
+    // output aliases a second time when entering their virtual-table binder.
+    order_aliases_expanded: bool = false,
     limit: ?Value = null,
     offset: ?Value = null,
 };
@@ -111,6 +124,7 @@ pub const Relation = union(enum) {
 };
 pub const JoinKind = enum { inner, left, right, full, cross };
 pub const Insert = struct {
+    alias: ?[]const u8 = null,
     conflict: ?Conflict = null,
     returning: ?[]const Projection = null,
     table: Name,

@@ -322,10 +322,15 @@ const Parser = struct {
     }
 
     fn field(self: *Parser) Error![]const u8 {
-        const result = try self.identifier();
+        var result = try self.identifier();
         // Internal separator preserves the distinction between t.column and
         // the single quoted identifier "t.column" without reparsing names.
-        if (self.take(.dot)) return std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ result, try self.identifier() });
+        var parts: usize = 1;
+        while (self.take(.dot)) {
+            if (parts == 4) return self.fail(error.InvalidSqlSyntax, "column references have at most four identifiers");
+            result = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ result, try self.identifier() });
+            parts += 1;
+        }
         return result;
     }
 
@@ -587,6 +592,16 @@ const Parser = struct {
                 left = try self.scalarNode(.{ .cast = .{ .operand = left, .type = try self.columnType() } });
                 continue;
             }
+            // PostgreSQL's postfix spellings share the ordinary IS NULL
+            // precedence. Quoted identifiers are never consumed as operators.
+            if (minimum <= 3 and self.peek(.identifier) and !self.tokens[self.pos].owned) {
+                const spelling = self.tokens[self.pos].text;
+                if (std.ascii.eqlIgnoreCase(spelling, "isnull") or std.ascii.eqlIgnoreCase(spelling, "notnull")) {
+                    self.pos += 1;
+                    left = try self.scalarNode(.{ .unary = .{ .op = if (std.ascii.eqlIgnoreCase(spelling, "isnull")) .is_null else .is_not_null, .operand = left } });
+                    continue;
+                }
+            }
             if (minimum <= 3 and self.keyword(.is)) {
                 const negated = self.keyword(.not);
                 if (self.keyword(.distinct)) {
@@ -841,24 +856,15 @@ const Parser = struct {
 
     fn selectCore(self: *Parser) Error!ast.Select {
         var columns = std.ArrayList(ast.Projection).empty;
-        if (self.take(.star)) {
-            // Wildcard must stand alone in this execution shape.
-        } else {
-            while (true) {
-                try self.node();
-                const expression = try self.scalar(0, 0);
-                try self.checkScalarDepth(expression, 0);
-                const alias = if (self.keyword(.as))
-                    try self.identifier()
-                else if (self.peek(.identifier) and (self.tokens[self.pos].owned or self.tokens[self.pos].keyword == null or token.keywordClass(self.tokens[self.pos].keyword.?) == .unreserved))
-                    try self.identifier()
-                else
-                    null;
-                try columns.append(self.alloc, if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = alias });
-                if (!self.take(.comma)) break;
-            }
+        while (true) {
+            try columns.append(self.alloc, try self.parseProjection(true));
+            if (!self.take(.comma)) break;
         }
         const source = if (self.keyword(.from)) try self.relation() else null;
+        if (source == null) for (columns.items) |projection| if (projection.wildcard) return self.fail(error.InvalidSqlSyntax, "wildcard projection requires a FROM source");
+        // Preserve the established compact representation of a lone * only
+        // after validating its source; an empty projection loses that marker.
+        if (columns.items.len == 1 and columns.items[0].wildcard and columns.items[0].field.len == 0) columns.clearRetainingCapacity();
         const simple = source != null and source.?.* == .table and source.?.table.alias == null;
         const table = if (simple) source.?.table.name else null;
         const filter = try self.where();
@@ -1051,11 +1057,12 @@ const Parser = struct {
     fn insert(self: *Parser) Error!ast.Insert {
         try self.expectKeyword(.into);
         const table = try self.tableReferenceName();
+        const alias = if (self.keyword(.as)) try self.identifier() else null;
         if (self.keyword(.default)) {
             try self.expectKeyword(.values);
             const rows = try self.alloc.alloc([]const ast.Value, 1);
             rows[0] = &.{};
-            return .{ .table = table, .columns = &.{}, .rows = rows, .conflict = try self.conflict(), .returning = try self.returning() };
+            return .{ .table = table, .alias = alias, .columns = &.{}, .rows = rows, .conflict = try self.conflict(), .returning = try self.returning() };
         }
         try self.expect(.lparen);
         var columns = std.ArrayList([]const u8).empty;
@@ -1087,7 +1094,7 @@ const Parser = struct {
                     source.columns = projected;
                 }
             }
-            return .{ .table = table, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
+            return .{ .table = table, .alias = alias, .columns = try columns.toOwnedSlice(self.alloc), .source = source, .conflict = conflict_clause, .returning = try self.returning() };
         }
         try self.expectKeyword(.values);
         var rows = std.ArrayList([]const ast.Value).empty;
@@ -1131,7 +1138,7 @@ const Parser = struct {
         for (cells) |row| for (row) |cell| if (cell) |expression| {
             contains_subquery = contains_subquery or @import("subquery_lowering.zig").has(expression);
         };
-        if (!contains_subquery and captures.len == 0) return .{ .table = table, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        if (!contains_subquery and captures.len == 0) return .{ .table = table, .alias = alias, .columns = names, .rows = values, .expressions = cells, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
 
         // VALUES with scalar subqueries is one source relation, not a collection
         // of independent expression evaluations. Keep source arms flat and in
@@ -1157,7 +1164,7 @@ const Parser = struct {
         }
         const source = try self.alloc.create(ast.Select);
         source.* = .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
-        return .{ .table = table, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
+        return .{ .table = table, .alias = alias, .columns = names, .source = source, .values_source_rows = values, .defaults = default_cells, .conflict = conflict_clause, .returning = returning_columns };
     }
 
     fn conflictCaptures(self: *Parser, clause: *ast.Conflict) Error![]const *const ast.Scalar {
@@ -1378,17 +1385,48 @@ const Parser = struct {
 
     fn returning(self: *Parser) Error!?[]const ast.Projection {
         if (!self.keyword(.returning)) return null;
-        if (self.take(.star)) return &.{};
         var columns: std.ArrayList(ast.Projection) = .empty;
         while (true) {
-            try self.node();
-            const expression = try self.scalar(0, 0);
-            try self.checkScalarDepth(expression, 0);
-            const alias = if (self.keyword(.as)) try self.identifier() else null;
-            try columns.append(self.alloc, if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = alias });
+            try columns.append(self.alloc, try self.parseProjection(false));
             if (!self.take(.comma)) break;
         }
+        if (columns.items.len == 1 and columns.items[0].wildcard and columns.items[0].field.len == 0) columns.clearRetainingCapacity();
         return try columns.toOwnedSlice(self.alloc);
+    }
+
+    fn parseProjection(self: *Parser, implicit_alias: bool) Error!ast.Projection {
+        try self.node();
+        if (self.take(.star)) return .{ .wildcard = true };
+        if (self.peek(.identifier)) {
+            var end = self.pos;
+            var parts: usize = 0;
+            while (end + 2 < self.tokens.len and self.tokens[end].kind == .identifier and self.tokens[end + 1].kind == .dot) {
+                parts += 1;
+                if (self.tokens[end + 2].kind == .star) {
+                    if (parts > 3) return self.fail(error.InvalidSqlSyntax, "wildcard qualification has at most three identifiers");
+                    var qualifier = try self.identifier();
+                    while (self.pos < end + 1) {
+                        try self.expect(.dot);
+                        qualifier = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ qualifier, try self.identifier() });
+                    }
+                    try self.expect(.dot);
+                    try self.expect(.star);
+                    return .{ .field = qualifier, .wildcard = true };
+                }
+                end += 2;
+            }
+        }
+        const expression = try self.scalar(0, 0);
+        try self.checkScalarDepth(expression, 0);
+        const alias = if (self.keyword(.as)) try self.identifier() else if (implicit_alias and self.peek(.identifier) and (self.tokens[self.pos].owned or self.tokens[self.pos].keyword == null or token.keywordClass(self.tokens[self.pos].keyword.?) == .unreserved)) try self.identifier() else null;
+        // Keep the original PostgreSQL function/CASE label before lowering
+        // replaces expressions with internal columns or aggregate slots.
+        const label = alias orelse switch (expression.*) {
+            .call => |call| if (std.mem.startsWith(u8, call.name, "$")) null else call.name,
+            .case_when => "case",
+            else => null,
+        };
+        return if (expression.* == .column) .{ .field = expression.column, .alias = alias } else .{ .expression = expression, .alias = label };
     }
 
     fn columnType(self: *Parser) Error!ast.ColumnType {
@@ -2383,6 +2421,16 @@ test "compiler implicit projection aliases preserve clause and expression bounda
     }
     try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id name extra FROM usage_records", .{}));
     try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id 42 FROM usage_records", .{}));
+}
+
+test "compiler preserves PostgreSQL expression labels before relational lowering" {
+    var statement = try compile(std.testing.allocator, "SELECT lower(name), jsonb_typeof(metadata), CASE WHEN enabled THEN 1 ELSE 0 END, upper(name) AS display FROM usage_records", .{});
+    defer statement.deinit();
+    for (statement.statement.select.columns, [_][]const u8{ "lower", "jsonb_typeof", "case", "display" }) |projection, label| try std.testing.expectEqualStrings(label, projection.alias.?);
+    var quoted = try compile(std.testing.allocator, "SELECT id AS \"isnull\" FROM usage_records WHERE status ISNULL AND email NOTNULL", .{});
+    defer quoted.deinit();
+    try std.testing.expectEqualStrings("isnull", quoted.statement.select.columns[0].alias.?);
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id FROM usage_records WHERE status \"isnull\"", .{}));
 }
 
 test "compiler preserves keyword-named columns and quoted SQL-looking values" {

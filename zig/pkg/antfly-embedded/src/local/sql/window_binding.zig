@@ -119,6 +119,8 @@ const Builder = struct {
         if (scalar.statementConstant(node_)) return node_;
         if (!contains(node_) and !containsDecision(node_)) return self.slot("input", try self.input(node_));
         if (node_.* == .call and node_.call.window != null) {
+            // Alias reuse must not allocate/evaluate another identical window.
+            for (self.specs.items, 0..) |pending, index| if (@import("aggregate_binding.zig").same(pending.node, node_)) return self.slot("window", index);
             const call = node_.call;
             if (call.distinct) return error.UnsupportedSqlShape;
             _ = std.meta.stringToEnum(Kind, call.name) orelse return error.UndefinedSqlFunction;
@@ -178,7 +180,7 @@ fn directionsEqual(left: []const @import("operators.zig").Order, right: []const 
 }
 
 pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType) !Bound {
-    const statement = compiled.statement.select;
+    const statement = try @import("order_aliases.zig").normalize(alloc, compiled.statement.select);
     const inferred = try alloc.alloc(?ast.ColumnType, compiled.parameter_count);
     @memset(inferred, null);
     @memcpy(inferred[0..hints.len], hints);

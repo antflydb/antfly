@@ -15,6 +15,9 @@ pub const Column = struct {
     name: []const u8,
     internal: []const u8,
     qualifier: []const u8,
+    /// Full qualification is available only for unaliased physical tables.
+    /// Derived relations and aliases deliberately do not inherit this scope.
+    scope: ?catalog.Table.Scope = null,
     type: ast.ColumnType,
     nullable: bool,
     visible: bool = true,
@@ -22,6 +25,64 @@ pub const Column = struct {
     /// Symbolic lineage exists only during the pre-emission constraint pass.
     origin: ?*const ast.Scalar = null,
 };
+
+/// Expand only authorized visible columns, before allocating expression
+/// programs. RETURNING's unqualified * is target-only even for a MERGE join;
+/// qualified stars resolve in the caller's already-bound relation domain.
+pub fn expandWildcards(alloc: Allocator, columns: []const Column, projections: []const ast.Projection, default_qualifier: ?[]const u8) ![]const ast.Projection {
+    const max_output_columns = 1024;
+    var count: usize = 0;
+    var has_wildcard = false;
+    for (projections) |projection| {
+        if (!projection.wildcard) {
+            count += 1;
+            if (count > max_output_columns) return error.SqlProgramLimitExceeded;
+            continue;
+        }
+        has_wildcard = true;
+        const before = count;
+        for (columns) |column| {
+            if (!wildcardMatches(column, projection, default_qualifier)) continue;
+            count += 1;
+            if (count > max_output_columns) return error.SqlProgramLimitExceeded;
+        }
+        if (projection.field.len != 0 and count == before) return error.UndefinedColumn;
+    }
+    if (!has_wildcard) return projections;
+    const result = try alloc.alloc(ast.Projection, count);
+    var index: usize = 0;
+    for (projections) |projection| {
+        if (!projection.wildcard) {
+            result[index] = projection;
+            index += 1;
+            continue;
+        }
+        for (columns, 0..) |column, ordinal| {
+            if (!wildcardMatches(column, projection, default_qualifier)) continue;
+            result[index] = .{ .bound_column = ordinal, .alias = column.name };
+            index += 1;
+        }
+    }
+    return result;
+}
+
+fn wildcardMatches(column: Column, projection: ast.Projection, default_qualifier: ?[]const u8) bool {
+    if (!column.visible) return false;
+    const qualifier = if (projection.field.len != 0) projection.field else default_qualifier orelse return true;
+    return qualifierMatches(column, qualifier);
+}
+
+fn qualifierMatches(column: Column, qualifier: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, qualifier, 0) == null) return std.mem.eql(u8, column.qualifier, qualifier);
+    const scope = column.scope orelse return false;
+    return scope.matchesQualifier(qualifier);
+}
+
+fn physicalScope(table: catalog.Table, name: ast.Name, aliased: bool) ?catalog.Table.Scope {
+    if (aliased) return null;
+    return table.scope orelse if (name.namespace) |namespace| .{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;
+}
+
 pub const Node = struct {
     columns: []const Column,
     operation: union(enum) {
@@ -83,9 +144,16 @@ fn qualifiedPredicate(node: *const ast.Predicate) bool {
         .conjunction, .disjunction => |part| qualifiedPredicate(part.left) or qualifiedPredicate(part.right),
     };
 }
+pub fn hasQualifiedScalar(node: *const ast.Scalar) bool {
+    return qualified(node);
+}
+pub fn hasQualifiedPredicate(node: ?*const ast.Predicate) bool {
+    return if (node) |predicate| qualifiedPredicate(predicate) else false;
+}
 pub fn accepts(statement: ast.Select) bool {
     if (statement.source != null or statement.ctes.len != 0 or statement.set_operation != null or statement.values_arms.len != 0) return true;
     for (statement.columns) |projection| {
+        if (projection.wildcard) return true;
         if (std.mem.indexOfScalar(u8, projection.field, 0) != null) return true;
         if (projection.expression) |node| if (qualified(node)) return true;
     }
@@ -103,7 +171,7 @@ pub const ResolveAdapter = struct {
     backend: catalog.Backend,
     table: catalog.Table,
     pub fn iface(self: *ResolveAdapter) catalog.Backend {
-        return .{ .ptr = self, .settings_view = self.backend.settings_view, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .settings_view = self.backend.settings_view, .parameter_fallback_types = self.backend.parameter_fallback_types, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, _: Allocator, _: ast.Name, action: catalog.Action) !catalog.Table {
         if (action != .read) return error.UnsupportedSqlExecution;
@@ -134,7 +202,7 @@ pub const TargetResolveAdapter = struct {
     cache_sources: bool = false,
     source_tables: std.StringHashMapUnmanaged(catalog.Table) = .empty,
     pub fn iface(self: *@This()) catalog.Backend {
-        return .{ .ptr = self, .settings_view = self.backend.settings_view, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .settings_view = self.backend.settings_view, .parameter_fallback_types = self.backend.parameter_fallback_types, .decision_provider = self.backend.decision_provider, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
     fn resolve(ptr: *anyopaque, alloc: Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         // This adapter is only used while binding the read side of a mutation.
@@ -452,12 +520,16 @@ const Builder = struct {
         return result;
     }
     fn field(columns: []const Column, name: []const u8) !Column {
-        const separator = std.mem.indexOfScalar(u8, name, 0);
-        const unqualified = if (separator) |position| name[position + 1 ..] else name;
         var found: ?Column = null;
         for (columns) |column| {
-            if (!std.mem.eql(u8, column.name, unqualified)) continue;
-            if (separator) |position| if (!std.mem.eql(u8, column.qualifier, name[0..position])) continue;
+            // Compiler-owned mutation metadata names themselves begin with
+            // NUL. Match the complete bound column suffix before splitting
+            // qualification; splitting at the last NUL would lose provenance.
+            if (!std.mem.eql(u8, column.name, name)) {
+                if (name.len <= column.name.len or !std.mem.endsWith(u8, name, column.name)) continue;
+                const separator = name.len - column.name.len - 1;
+                if (name[separator] != 0 or !qualifierMatches(column, name[0..separator])) continue;
+            }
             if (found != null) return error.AmbiguousSqlColumn;
             found = column;
         }
@@ -545,6 +617,8 @@ const Builder = struct {
         return result;
     }
     fn lower(self: *Builder, source: *const Node, statement: ast.Select) !ast.Select {
+        const requested = if (statement.columns.len == 0 and !statement.count_all) &[_]ast.Projection{.{ .wildcard = true }} else statement.columns;
+        const expanded = try expandWildcards(self.alloc, source.columns, requested, null);
         var result = statement;
         result.source = null;
         result.ctes = &.{};
@@ -552,15 +626,11 @@ const Builder = struct {
         result.values_arms = &.{};
         result.table = .{ .table = "$sql_relation" };
         var projections: std.ArrayList(ast.Projection) = .empty;
-        if (statement.columns.len == 0 and !statement.count_all) {
-            for (source.columns) |column| if (column.visible) {
-                try projections.append(self.alloc, .{ .field = column.internal, .alias = try self.alloc.dupe(u8, column.name) });
-            };
-        } else for (statement.columns) |projection| {
+        for (expanded) |projection| {
             if (projection.expression) |node_| {
                 try projections.append(self.alloc, .{ .expression = try self.expression(source.columns, node_, &.{}), .alias = projection.alias });
             } else {
-                const column = try field(source.columns, projection.field);
+                const column = if (projection.bound_column) |ordinal| source.columns[ordinal] else try field(source.columns, projection.field);
                 try projections.append(self.alloc, .{ .field = column.internal, .expression = if (column.untyped_null) try self.scalarNode(.{ .literal = .null }) else null, .alias = projection.alias orelse column.name });
             }
         }
@@ -570,10 +640,14 @@ const Builder = struct {
         for (statement.group_by, groups) |input, *out| out.* = try self.expression(source.columns, input, result.columns);
         result.group_by = groups;
         result.having = if (statement.having) |input| try self.expression(source.columns, input, &.{}) else null;
+        const window_orders = @import("window_binding.zig").accepts(statement);
+        const order_domain = if (window_orders) try @import("order_aliases.zig").normalize(self.alloc, statement) else statement;
         const orders = try self.alloc.alloc(ast.Order, statement.order_by.len);
-        for (statement.order_by, orders) |order, *out| {
+        for (order_domain.order_by, orders) |order, *out| {
             out.* = order;
-            if (order.expression) |input| out.expression = try self.expression(source.columns, input, &.{}) else if (order.position == null) {
+            if (order.expression) |input| {
+                out.expression = try self.expression(source.columns, input, &.{});
+            } else if (order.position == null) {
                 var alias = false;
                 for (result.columns) |projection| if (projection.alias) |name| if (std.mem.eql(u8, name, order.field)) {
                     alias = true;
@@ -583,6 +657,7 @@ const Builder = struct {
             }
         }
         result.order_by = orders;
+        result.order_aliases_expanded = statement.order_aliases_expanded or window_orders;
         const windows = try self.alloc.alloc(ast.NamedWindow, statement.windows.len);
         for (statement.windows, windows) |definition, *out| {
             const wrapped = try self.scalarNode(.{ .call = .{ .name = "row_number", .args = &.{}, .window = definition.window } });
@@ -800,6 +875,7 @@ const Builder = struct {
         for (columns) |*column| {
             column.internal = try self.internal();
             column.qualifier = alias;
+            column.scope = null;
             column.nullable = true;
         }
         return self.node(columns, source.operation);
@@ -884,11 +960,11 @@ const Builder = struct {
                 const source_columns = try self.alloc.alloc([]const u8, columns.len);
                 const fields = try self.alloc.alloc([]const u8, table.columns.len);
                 for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields) |column, *out, *source_name, *field_name| {
-                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = column.type, .nullable = column.nullable };
+                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .nullable = column.nullable };
                     source_name.* = column.name;
                     field_name.* = column.path;
                 }
-                columns[table.columns.len] = .{ .name = "_id", .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = .string, .nullable = false, .visible = false };
+                columns[table.columns.len] = .{ .name = "_id", .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = .string, .nullable = false, .visible = false };
                 for (@import("joined_mutation.zig").metadata_fields[0..metadata_count], 0..) |name, i| {
                     columns[table.columns.len + 1 + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
                     source_columns[table.columns.len + 1 + i] = name;
@@ -1122,6 +1198,15 @@ pub fn inferExpected(alloc: Allocator, backend: catalog.Backend, statement: ast.
     try shape.inferShape(statement, expected);
 }
 
+/// Catalog-only output domain for mutation wildcard dependencies. The caller
+/// keeps the authorized identity cache for the eventual executable binding;
+/// no cursor, snapshot, row program or backend mutation is opened here.
+pub fn projectionColumns(alloc: Allocator, backend: catalog.Backend, statement: ast.Select, parameters: []?ast.ColumnType) ![]const Column {
+    var shape: Builder = .{ .alloc = alloc, .backend = backend, .parameters = parameters, .shape_only = true };
+    try shape.inferShape(statement, &.{});
+    return (try shape.querySource(statement, &.{}, 0)).columns;
+}
+
 /// Normalize one expression against an already-bound relation. Mutation arms
 /// use the same qualified-name and ambiguity rules as SELECT, then bind typed
 /// programs against the projected internal column ordinals.
@@ -1133,11 +1218,11 @@ pub fn lowerBoundExpression(alloc: Allocator, columns: []const Column, expressio
 /// RETURNING has one authorized target, not a separate relational read. Reuse
 /// ordinary qualification validation while retaining native column names for
 /// evaluating the already-prepared mutation image.
-pub fn normalizeTargetProjection(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, projections: []const ast.Projection) ![]const ast.Projection {
+pub fn normalizeTargetProjection(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, aliased: bool, projections: []const ast.Projection) ![]const ast.Projection {
     var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = &.{} };
     const columns = try alloc.alloc(Column, table.columns.len + 1);
-    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .type = column.type, .nullable = column.nullable };
-    columns[table.columns.len] = .{ .name = "_id", .internal = "_id", .qualifier = name.table, .type = .string, .nullable = false, .visible = false };
+    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .nullable = column.nullable };
+    columns[table.columns.len] = .{ .name = "_id", .internal = "_id", .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = .string, .nullable = false, .visible = false };
     const source: Node = .{ .columns = columns, .operation = .singleton };
     return (try builder.lower(&source, .{ .table = name, .columns = projections })).columns;
 }

@@ -13,6 +13,7 @@
 // limitations.
 
 test {
+    _ = @import("parity_case_test.zig");
     _ = @import("window_test.zig");
     _ = @import("subquery_test.zig");
     _ = @import("recursive_test.zig");

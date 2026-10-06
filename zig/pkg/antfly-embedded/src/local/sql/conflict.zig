@@ -19,7 +19,7 @@ pub const Bound = struct {
     arbiter_expressions: []const catalog.ConflictExpression = &.{},
 };
 
-pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, clause: ast.Conflict, parameters: []?ast.ColumnType, capture_types: []const ast.ColumnType) !Bound {
+pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, aliased: bool, clause: ast.Conflict, parameters: []?ast.ColumnType, capture_types: []const ast.ColumnType) !Bound {
     if ((clause.capture_count != 0 or clause.deferred_count != 0) and (!backend.atomic_statement_read_set or backend.vtable.open_statement == null)) return error.SqlRangeTrackingRequired;
     if (clause.deferred_count != 0 and !backend.dynamic_statement_read_set) return error.SqlStatementSnapshotRequired;
     if (capture_types.len != clause.capture_count) return error.InvalidSqlBackendResponse;
@@ -46,6 +46,15 @@ pub fn bind(alloc: std.mem.Allocator, backend: catalog.Backend, table: catalog.T
         const column = if (i == table.columns.len) try table.column("_id") else table.columns[i];
         columns[i] = .{ .name = column.name, .type = column.type, .nullable = column.nullable };
         columns[count + i] = .{ .name = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ name.table, column.name }), .type = column.type, .nullable = column.nullable };
+        if (!aliased) {
+            const scope = table.scope orelse if (name.namespace) |namespace| catalog.Table.Scope{ .database = name.database orelse "", .namespace = namespace, .name = name.table, .revision = 0 } else null;
+            if (scope) |logical| {
+                const aliases = try alloc.alloc([]const u8, if (logical.database.len == 0) 1 else 2);
+                aliases[0] = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}", .{ logical.namespace, logical.name, column.name });
+                if (aliases.len == 2) aliases[1] = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}\x00{s}", .{ logical.database, logical.namespace, logical.name, column.name });
+                columns[count + i].aliases = aliases;
+            }
+        }
         columns[count * 2 + i] = .{ .name = try std.fmt.allocPrint(alloc, "excluded\x00{s}", .{column.name}), .type = column.type, .nullable = column.nullable };
     }
     for (columns[count * 3 ..], capture_types, 0..) |*column, kind, ordinal| {

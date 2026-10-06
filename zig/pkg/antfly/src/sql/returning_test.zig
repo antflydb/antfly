@@ -9,6 +9,23 @@ const runtime = @import("antfly_local_sources").sql_runtime;
 const Json = std.json.Value;
 const Allocator = std.mem.Allocator;
 
+test "SQL RETURNING preserves JSON numeric scalars instead of SQL bigint wire strings" {
+    for ([_][]const u8{
+        "INSERT INTO items(_id,n) VALUES('a',4) RETURNING to_jsonb(n)",
+        "UPDATE items SET n=4 RETURNING to_jsonb(n)",
+        "DELETE FROM items RETURNING to_jsonb(n)",
+    }) |sql| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(true), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(ast.ColumnType.json, result.output.columns[0].type);
+        try std.testing.expectEqual(@as(i64, 4), result.output.rows[0][0].integer);
+        try std.testing.expect(!result.output.sql_nulls.?[0][0]);
+    }
+}
+
 const Fixture = struct {
     writes: usize = 0,
     prepares: usize = 0,
@@ -193,6 +210,62 @@ test "SQL RETURNING wildcard exposes schema columns not implicit row identity" {
     try std.testing.expectEqualStrings("n", result.output.columns[0].name);
     try std.testing.expectEqualStrings("g", result.output.columns[4].name);
     try std.testing.expectEqualStrings("8", result.output.rows[0][4].string);
+}
+
+test "SQL RETURNING mixed and qualified wildcards use normalized images without hidden identity" {
+    for ([_][]const u8{
+        "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING items.*, n+1 AS next, _id",
+        "UPDATE items SET n=4 RETURNING *, n+1 AS next, _id",
+        "DELETE FROM items RETURNING items.*, n+1 AS next, _id",
+    }) |sql| {
+        var fixture: Fixture = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, fixture.backend(true), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+        try std.testing.expectEqual(@as(usize, 7), result.output.columns.len);
+        try std.testing.expectEqualStrings("n", result.output.columns[0].name);
+        try std.testing.expectEqualStrings("g", result.output.columns[4].name);
+        try std.testing.expectEqualStrings("next", result.output.columns[5].name);
+        try std.testing.expectEqualStrings("_id", result.output.columns[6].name);
+        try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("8", result.output.rows[0][4].string);
+        try std.testing.expectEqualStrings("5", result.output.rows[0][5].string);
+        try std.testing.expectEqualStrings(if (compiled.statement == .insert) "a" else "existing", result.output.rows[0][6].string);
+    }
+}
+
+test "SQL RETURNING wildcard errors and output amplification fail before writes" {
+    var fixture: Fixture = .{};
+    var unknown = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING missing.*", .{});
+    defer unknown.deinit();
+    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, fixture.backend(true), &unknown, &.{}, .{}));
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(std.testing.allocator);
+    try sql.appendSlice(std.testing.allocator, "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING ");
+    for (0..205) |index| {
+        if (index != 0) try sql.append(std.testing.allocator, ',');
+        try sql.append(std.testing.allocator, '*');
+    }
+    var oversized = try compiler.compile(std.testing.allocator, sql.items, .{});
+    defer oversized.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, fixture.backend(true), &oversized, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), fixture.prepares);
+    try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+}
+
+test "SQL RETURNING qualified wildcard preparation owns every allocation failure" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            var fixture: Fixture = .{};
+            var compiled = try compiler.compile(alloc, "INSERT INTO items (_id,n) VALUES ('a',4) RETURNING items.*, n+1 AS next", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(alloc, fixture.backend(true), &compiled, &.{}, .{});
+            defer result.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "SQL RETURNING rejects preparation projection and quota failures before commit" {

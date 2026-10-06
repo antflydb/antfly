@@ -119,6 +119,7 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     var pinned_settings: ?@import("setting_catalog.zig").View = null;
     defer if (pinned_settings) |*view| view.deinit();
     var statement_backend = backend;
+    if (parameters.len > 1024) return error.InvalidSqlParameters;
     if (backend.setting_capture) |capture| {
         pinned_settings = try @import("setting_catalog.zig").View.capture(alloc, capture.owner, capture.scope, capture.overlay);
         statement_backend.settings_view = &pinned_settings.?;
@@ -129,11 +130,32 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     var result = Result{ .state = state, .output = undefined };
     errdefer result.deinit();
     const arena = state.arena.allocator();
+    statement_backend.parameter_fallback_types = try parameterFallbackTypes(arena, parameters);
     result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
         if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlProgramLimitExceeded;
         return err;
     };
     return result;
+}
+
+/// Execution-only transport hints fill polymorphic holes after SQL constraints
+/// converge. Prepare/Describe without values must not invent these types.
+/// The returned metadata belongs to the statement or cursor's owned arena.
+pub fn parameterFallbackTypes(arena: std.mem.Allocator, parameters: []const Json) ![]const ?ast.ColumnType {
+    if (parameters.len > 1024) return error.InvalidSqlParameters;
+    const types = try arena.alloc(?ast.ColumnType, parameters.len);
+    for (parameters, types) |value, *kind| kind.* = switch (value) {
+        .null => null,
+        .bool => .boolean,
+        .integer => .integer,
+        .float => .number,
+        .string => .string,
+        .array, .object => .json,
+        // Integer tokens never pass through f64, including overflow tokens
+        // which the eventual integer coercion must reject rather than round.
+        .number_string => |text| if (std.mem.indexOfAny(u8, text, ".eE") == null) .integer else .number,
+    };
+    return types;
 }
 
 fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits, sink: ?RowSink) !Output {
@@ -276,6 +298,12 @@ pub const Context = struct {
     pub fn outputValue(self: Context, value_: Json) !Json {
         if (!self.typed_output and value_ == .integer) return .{ .string = try std.fmt.allocPrint(self.arena, "{d}", .{value_.integer}) };
         return clone(self.arena, value_);
+    }
+    pub fn outputCell(self: Context, value_: Json, kind: ?ast.ColumnType) !Json {
+        // SQL bigint uses a lossless string wire representation. A JSON
+        // numeric scalar is still a JSON number, not a SQL bigint cell.
+        if (kind == .json) return clone(self.arena, value_);
+        return self.outputValue(value_);
     }
 
     fn value(self: Context, input: ast.Value, column: catalog.Column) !Json {
@@ -561,7 +589,7 @@ pub const Context = struct {
                         const typed = try coerce(self.arena, input_cell.value, column.type);
                         is_null.* = input_cell.sql_null;
                         // SQL bigint results are lossless even in JS SDKs.
-                        cell.* = try self.outputValue(typed);
+                        cell.* = try self.outputCell(typed, column.type);
                         retained = std.math.add(usize, retained, jsonSize(cell.*)) catch return error.SqlProgramLimitExceeded;
                         if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
                     }
@@ -610,8 +638,8 @@ pub const Context = struct {
                     for (output, first + start..) |values, index| {
                         const cells = try self.arena.alloc(Json, values.len);
                         const nulls = try self.arena.alloc(bool, values.len);
-                        for (values, cells, nulls) |datum, *cell, *flag| {
-                            cell.* = try self.outputValue(datum.value);
+                        for (values, cells, nulls, columns) |datum, *cell, *flag, column| {
+                            cell.* = try self.outputCell(datum.value, column.type);
                             flag.* = datum.sql_null;
                         }
                         try rows.append(self.arena, cells);
@@ -624,8 +652,8 @@ pub const Context = struct {
                 try self.checkpoint();
                 const cells = try self.arena.alloc(Json, row.values.len);
                 const nulls = try self.arena.alloc(bool, row.values.len);
-                for (row.values, cells, nulls) |value_, *cell, *is_null| {
-                    cell.* = try self.outputValue(value_.value);
+                for (row.values, cells, nulls, columns) |value_, *cell, *is_null, column| {
+                    cell.* = try self.outputCell(value_.value, column.type);
                     is_null.* = value_.sql_null;
                 }
                 try rows.append(self.arena, cells);
@@ -705,7 +733,7 @@ pub const Context = struct {
             const program = optional orelse return error.InvalidSqlBackendResponse;
             if (!evaluation.reset(.retain_capacity)) return error.OutOfMemory;
             const evaluated = try self.evaluate(evaluation.allocator(), program, &.{});
-            cell.* = try self.outputValue(evaluated.value);
+            cell.* = try self.outputCell(evaluated.value, program.output_type.kind);
             is_null.* = evaluated.sql_null;
         }
         rows[0] = cells;
@@ -1156,8 +1184,8 @@ pub const Context = struct {
                 const projected = try context.projectValues(self.arena, row, fields.items, expressions);
                 const values = try self.arena.alloc(Json, projected.len);
                 const sql_nulls = try self.arena.alloc(bool, projected.len);
-                for (projected, values, sql_nulls) |value_, *cell_value, *is_null| {
-                    cell_value.* = try self.outputValue(value_.value);
+                for (projected, values, sql_nulls, binding.columns) |value_, *cell_value, *is_null, column| {
+                    cell_value.* = try self.outputCell(value_.value, column.type);
                     is_null.* = value_.sql_null;
                 }
                 cells.* = values;
@@ -1231,8 +1259,8 @@ pub const Context = struct {
             for (projected, first..) |values, index| {
                 const output = try self.arena.alloc(Json, values.len);
                 const nulls = try self.arena.alloc(bool, values.len);
-                for (values, output, nulls) |datum, *cell, *flag| {
-                    cell.* = try self.outputValue(datum.value);
+                for (values, output, nulls, self.binding.columns) |datum, *cell, *flag, column| {
+                    cell.* = try self.outputCell(datum.value, column.type);
                     flag.* = datum.sql_null;
                 }
                 rows[index] = output;

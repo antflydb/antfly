@@ -40,6 +40,14 @@ pub const Table = struct {
         namespace: []const u8,
         name: []const u8,
         revision: u64,
+
+        pub fn matchesQualifier(self: Scope, qualifier: []const u8) bool {
+            var parts = std.mem.splitScalar(u8, qualifier, 0);
+            const first = parts.next().?;
+            const second = parts.next() orelse return std.mem.eql(u8, first, self.name);
+            const third = parts.next() orelse return std.mem.eql(u8, first, self.namespace) and std.mem.eql(u8, second, self.name);
+            return parts.next() == null and std.mem.eql(u8, first, self.database) and std.mem.eql(u8, second, self.namespace) and std.mem.eql(u8, third, self.name);
+        }
     };
     id: u64,
     physical_name: []const u8,
@@ -56,7 +64,24 @@ pub const Table = struct {
     pub fn column(self: Table, name: []const u8) !Column {
         if (std.mem.eql(u8, name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
         for (self.columns) |value| if (std.mem.eql(u8, value.name, name)) return value;
+        // Point predicate planning must use the same pinned logical authority
+        // as relation binding; never strip a namespace before validating it.
+        const separator = std.mem.lastIndexOfScalar(u8, name, 0) orelse return error.UndefinedColumn;
+        const scope = self.scope orelse return error.UndefinedColumn;
+        if (!scope.matchesQualifier(name[0..separator])) return error.UndefinedColumn;
+        const column_name = name[separator + 1 ..];
+        if (std.mem.eql(u8, column_name, "_id")) return .{ .name = "_id", .path = "_id", .type = .string, .nullable = false };
+        for (self.columns) |value| if (std.mem.eql(u8, value.name, column_name)) return value;
         return error.UndefinedColumn;
+    }
+
+    pub fn columnAliases(self: Table, alloc: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+        const scope = self.scope orelse return &.{};
+        const aliases = try alloc.alloc([]const u8, 3);
+        aliases[0] = try std.fmt.allocPrint(alloc, "{s}\x00{s}", .{ scope.name, name });
+        aliases[1] = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}", .{ scope.namespace, scope.name, name });
+        aliases[2] = try std.fmt.allocPrint(alloc, "{s}\x00{s}\x00{s}\x00{s}", .{ scope.database, scope.namespace, scope.name, name });
+        return aliases;
     }
 };
 
@@ -266,6 +291,9 @@ pub const Backend = struct {
     /// Authorized, immutable settings captured for this exact statement.
     /// Providers must never populate this from pgwire-local string settings.
     settings_view: ?*const @import("setting_catalog.zig").View = null,
+    /// Request-owned transport types fill only unconstrained parameters after
+    /// SQL inference. They never replace explicit or schema-derived types.
+    parameter_fallback_types: []const ?ast.ColumnType = &.{},
     /// Only set when every page belongs to the same retained statement read
     /// view. Catalog revisions and per-page read_index are not such a view.
     pinned_statement_snapshot: bool = false,

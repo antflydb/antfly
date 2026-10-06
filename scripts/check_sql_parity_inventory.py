@@ -173,6 +173,56 @@ def release_blockers(entries):
     return [entry for entry in entries if entry["status"] not in RESOLVED]
 
 
+def family_report(inventory, entries):
+    """Describe recorded evidence, never infer execution support from SQL text."""
+    dispositions = {entry["id"]: entry for entry in entries}
+    families = {}
+    for case in inventory["entries"]:
+        row = families.setdefault(
+            case["family"],
+            {
+                "total": 0,
+                "statuses": Counter(),
+                "partial_evidence": 0,
+                "no_evidence": 0,
+                "original_rejections": 0,
+            },
+        )
+        entry = dispositions[case["id"]]
+        row["total"] += 1
+        row["statuses"][entry["status"]] += 1
+        if entry["status"] not in RESOLVED:
+            row["partial_evidence" if entry.get("evidence") else "no_evidence"] += 1
+            row["original_rejections"] += case["source_expectation"] == "rejection"
+    return dict(sorted(families.items()))
+
+
+def select_evidence_gates(inventory, entries, used_gates, family=None, requested=None):
+    """Narrow evidence execution without narrowing inventory or release validation."""
+    selected = entries
+    if family is not None:
+        ids = {case["id"] for case in inventory["entries"] if case["family"] == family}
+        require(bool(ids), f"unknown family: {family}")
+        selected = [entry for entry in entries if entry["id"] in ids]
+    available = {
+        proof["gate"] for entry in selected for proof in entry.get("evidence", [])
+    }
+    if requested:
+        for gate in requested:
+            require(
+                gate in used_gates, f"unknown or unreferenced evidence gate: {gate}"
+            )
+            require(
+                gate in available, f"gate {gate} has no evidence in selected family"
+            )
+        available.intersection_update(requested)
+    require(
+        bool(available),
+        "selection has no recorded executable evidence; no tests were run",
+    )
+    return sorted(available)
+
+
 def evidence_runs(gate_ids, gates):
     """Share one Zig test binary across gates that differ only by test filters."""
     runs = []
@@ -182,6 +232,30 @@ def evidence_runs(gate_ids, gates):
         command = gate["command"]
         separator = command.index("--") if "--" in command else -1
         filters = command[separator + 1 :] if separator >= 0 else []
+        compile_filters = [arg for arg in command if arg.startswith("-Dtest-filter=")]
+        if command[:2] == ["zig", "build"] and separator < 0 and compile_filters:
+            prefix = [arg for arg in command if not arg.startswith("-Dtest-filter=")]
+            key = (gate["cwd"], tuple(prefix))
+            if key in grouped:
+                run = grouped[key]
+                run["gate_ids"].append(gate_id)
+                existing = set(run["command"])
+                run["command"].extend(
+                    arg for arg in dict.fromkeys(compile_filters) if arg not in existing
+                )
+                run["timeout_seconds"] = min(
+                    3600, run["timeout_seconds"] + gate["timeout_seconds"]
+                )
+            else:
+                run = {
+                    "gate_ids": [gate_id],
+                    "command": prefix + list(dict.fromkeys(compile_filters)),
+                    "cwd": gate["cwd"],
+                    "timeout_seconds": gate["timeout_seconds"],
+                }
+                grouped[key] = run
+                runs.append(run)
+            continue
         mergeable = (
             command[:2] == ["zig", "build"]
             and separator >= 0
@@ -246,7 +320,21 @@ def main(argv=None):
     parser.add_argument(
         "--family", help="print stable IDs and SQL for one original family"
     )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="summarize family dispositions and evidence gaps, not inferred feature support",
+    )
+    parser.add_argument(
+        "--gate",
+        action="append",
+        help="with --evidence, run only this referenced gate (repeatable)",
+    )
     args = parser.parse_args(argv)
+    if args.gate and not args.evidence:
+        parser.error(
+            "--gate requires --evidence; release validation cannot be narrowed"
+        )
     try:
         ledger = json.loads((FIXTURES / "sql_parity_dispositions.json").read_bytes())
         inventory, entries, gates = validate(
@@ -271,13 +359,37 @@ def main(argv=None):
                 case for case in inventory["entries"] if case["family"] == args.family
             ]
             require(bool(matches), f"unknown family: {args.family}")
-            for case in matches:
-                print(f"{case['id']} | {case['name']} | {case['sql']}")
+            if not args.report and not args.evidence:
+                for case in matches:
+                    print(f"{case['id']} | {case['name']} | {case['sql']}")
+        if args.report:
+            print(
+                "Family | Total | Implemented | Rejected | Superseded | Blocking | "
+                "Partial evidence | No evidence | Blocking original rejections"
+            )
+            for family, row in family_report(inventory, entries).items():
+                if args.family and family != args.family:
+                    continue
+                statuses = row["statuses"]
+                blocking = row["partial_evidence"] + row["no_evidence"]
+                print(
+                    f"{family} | {row['total']} | {statuses['implemented']} | "
+                    f"{statuses['rejected']} | {statuses['superseded']} | {blocking} | "
+                    f"{row['partial_evidence']} | {row['no_evidence']} | "
+                    f"{row['original_rejections']}"
+                )
+            print(
+                "Blocking records are unadjudicated contracts, not counts of "
+                "missing features. Partial evidence does not close a case."
+            )
         blockers = release_blockers(entries)
         if args.evidence:
-            run_evidence(gates, ledger["gates"])
+            selected = select_evidence_gates(
+                inventory, entries, gates, args.family, args.gate
+            )
+            run_evidence(selected, ledger["gates"])
             print(
-                f"Referenced evidence passed; {len(blockers)} unresolved/deferred cases still block release."
+                f"Selected referenced evidence passed ({len(selected)} gates); {len(blockers)} unresolved/deferred cases still block release."
             )
             return 0
         if args.release:

@@ -8,11 +8,52 @@ and deliberate rejections must be distinguished.
 
 ## Provenance and scope
 
+PostgreSQL is the SQL compatibility standard for this work. Its behavior governs
+syntax, type coercion, result types, SQL NULL semantics, ordering, JSON/array
+operations and mutations. Historical source plans and SQLite results do not
+override that contract. SQLite-backed fixtures below are limited regression
+checks, not evidence of PostgreSQL compatibility; new campaign completion must
+be validated against PostgreSQL and the native engine. An unavailable PostgreSQL
+oracle is a validation gap, not permission to substitute SQLite silently.
+
+The next read/document campaigns now use a real PostgreSQL 18+ oracle
+(PostgreSQL 19 is the target). `generate_sql_postgres_reference.py` starts a
+disposable private Unix-socket server, sends the original `$n` SQL unchanged,
+and records complete values, labels, PostgreSQL type OIDs and SQL NULL flags.
+The oracle uses UTF-8, C locale and UTC. Server-side raw cursors cap fetched
+read rows without modifying the source SQL or buffering its entire result.
+Reads are transactionally read-only; each mutation has an isolated rolled-back
+fixture. Time, lock, temporary-file and output limits bound oracle execution.
+Assignment-column triggers distinguish an explicit NULL write from a missing
+document property. Source schemas remain intact; an explicit current document
+schema models the historical object-valued `metadata: json` shorthand without
+granting any index-readiness or cardinality authority.
+
+Four non-unique ordering contracts additionally use independent, bounded
+PostgreSQL observers for the complete eligible peer frontier. Validation checks
+a complete ordered prefix, allowing arbitrary selection only within genuine
+peers at the LIMIT boundary. Skipping better rows, duplicating rows or selecting
+worse rows fails; PostgreSQL's arbitrary tie order is not a compatibility rule.
+
+Install PostgreSQL 18 or newer, put its binaries on PATH or set `ANTFLY_PG_BIN`,
+then verify selected PostgreSQL goldens with:
+
+```sh
+uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py read --check zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_read_campaign_reference.json
+uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py document --check zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_document_reference.json
+uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_generate_sql_postgres_reference.py
+```
+
+The fixed 251-case read and 211-case document campaign manifests still describe
+the complete cohorts, not a claim that every case works. Oracle admission and
+discovery-mode native runs do not change dispositions; selected goldens must
+pass the non-discovery native endpoint gate before receiving completion credit.
+
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.
 Original source SHA-256: `52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6`.
 
-`zig/pkg/antfly/src/sql/fixtures/sql_parity_inventory.json` is an immutable compact
+`zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_parity_inventory.json` is an immutable compact
 projection preserving source order, exact name/family/SQL/parameters, and the
 SHA-256 of every complete original entry. Stable IDs are original one-based
 positions, `sql-0001` through `sql-1586`. The entire projection is also checksum
@@ -22,6 +63,81 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
+The current branch records 317 implemented, 136 rejected and 67 superseded
+cases, with 1,066 still unresolved. The earlier batches add 77 exact compiler
+rejection contracts, 117 mounted native reads, twelve native UPDATE/DELETE
+contracts and six independently referenced mutations
+contracts; they do not claim complete SQL
+activation. The immutable corpus remains 1,586 original cases.
+
+The PostgreSQL-backed campaign adds 103 resolved contracts: 54 reads and 49
+document mutations. Of those, 24 obsolete document planner rejections are
+superseded by the guarded native mutation path, not reclassified as original
+positive contracts. Native execution checks full persisted state as well as
+public results. Five recorded gates verify mounted execution, both PostgreSQL
+references, oracle safety/ordering contracts and pipeline allocation-fault
+regressions. This is a validated batch, not completion of either entire campaign;
+getting below 800 still requires at least 267 additional resolved dispositions.
+
+The mutation fixture verifies complete RETURNING rows and labels, SQL NULL
+provenance, affected rows, persisted state and untouched rows. A failed RETURNING
+projection must leave physical primary bytes, version and content digest
+unchanged. `sql-mutation-projections` also covers wildcard scope, output budgets,
+allocation faults and MERGE source/target domains. Three-part qualified columns
+in `sql-1519` now execute through the native gate. Point and scalar binding share
+validation against the pinned database/namespace/table scope; aliases hide the
+original name, and qualified synonyms do not add per-row payload cells.
+
+The next mutation campaign is a fixed, source-owned 235-case cohort, not a
+completion claim: 91 INSERT/source cases, 76 nonjoined UPDATE/DELETE/source
+cases and 68 joined mutations. Compiler discovery currently admits 102/235;
+it never updates dispositions. Set `ANTFLY_SQL_MUTATION_DISCOVERY=1` to report
+individual compiler gaps. Its profiles separate point, conflict/index-owner,
+source, temporal and joined execution contracts.
+
+`sql-0571`, `sql-0572`, `sql-0606`, `sql-0607`, `sql-1488` and `sql-1493`
+execute exact SQL and parameters against a fresh native table for each case.
+The bounded independent reference checks complete RETURNING and final storage
+state, not just row counts. Regenerate only selected goldens with:
+
+```sh
+python3 scripts/generate_sql_mutation_reference.py --check zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_mutation_reference.json
+```
+
+The generator does not rewrite SQL or treat an empty mutation as evidence.
+Locking, temporal, multi-table and conflict-arbiter profiles need native owner
+fixtures; SQLite compatibility is not a substitute. Those profiles remain
+unfinished, including ordered/locked mutation admission, temporal portions,
+typed arrays/regex, constraint/index-owner and distributed fault contracts.
+
+Shared JSON construction/extraction preserves SQL NULL separately from JSON
+null. Transport types fill unconstrained execution-time polymorphic parameters
+only after SQL constraints converge; value-less Prepare/Describe still requires
+a determined type. Materialized and cursor execution share this metadata.
+JSON numeric output stays numeric across projection, sorting, windows,
+aggregation and RETURNING; SQL bigint retains its lossless wire encoding.
+Sparse in-memory sorts grow heap slots with admitted rows under the byte budget,
+rather than reserving a full scan ceiling for a tiny nested result. Tests cover
+growth, quota exhaustion, allocation faults and exact output.
+
+The shared read reference preserves exact source SQL and logical parameters,
+checks complete results and SQL NULL provenance, and runs on a native relational
+fixture. Its independent SQLite generator is read-only and work/result bounded;
+SQLite-specific behavior is not a waiver for a missing native contract. The 115
+SQLite-backed cases are separate from the two explicit native contracts
+(default NULL ordering and implicit window labels). Regenerate
+or check only explicitly selected golden IDs with:
+
+```sh
+python3 scripts/generate_sql_parity_read_reference.py --cases zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_read_reference.json --check
+```
+
+Discovery output cannot update dispositions. Unknown/duplicate manifest IDs,
+unavailable reference shapes and changed results fail the reproducibility gate.
+Source parameters use the original internal tagged representation; the harness
+converts those tags to today's public JSON values without changing types or
+rounding integers. This is not a legacy-wire compatibility layer.
+
 The inventory began unresolved; seven TRUNCATE cases now have explicit
 supersession rationale and admission plus staged-owner publication evidence.
 One session-setting case has mounted pgwire evidence for a deliberate UTF-8-only
@@ -218,6 +334,10 @@ must be reviewed as a change to gate policy, not hidden as a passing test.
 make sql-parity-inventory-check
 make sql-parity-evidence-check
 python3 scripts/check_sql_parity_inventory.py --family truncate_source
+python3 scripts/check_sql_parity_inventory.py --report
+python3 scripts/check_sql_parity_inventory.py --family read --report
+python3 scripts/check_sql_parity_inventory.py --evidence --family read
+python3 scripts/check_sql_parity_inventory.py --evidence --gate sql-compiler-rejections --gate sql-explain-runtime
 python3 scripts/check_sql_parity_inventory.py --source /path/to/sql_api_parity_source_corpus.json
 python3 -m unittest discover -s scripts -p test_check_sql_parity_inventory.py
 make sql-parity-release-check
@@ -225,8 +345,17 @@ make sql-parity-release-check
 
 Inventory checking succeeds when provenance, exact ID coverage, dispositions,
 and referenced evidence are structurally valid. It reports remaining blockers.
-Evidence checking runs the executable gates for resolved cases without claiming
-release readiness; use it as dispositions are added. Release checking fails while any case is unresolved or deferred. Once all cases
+Evidence checking runs referenced gates, including partial evidence on unresolved
+cases, without claiming release readiness. `--family` and repeatable `--gate`
+select recorded evidence; missing or empty selections fail rather than reporting
+success without tests. Family reports distinguish unresolved cases with partial
+evidence from cases without recorded evidence and identify original rejection
+contracts; neither category is an inferred count of missing features.
+Zig 0.17 gates use repeatable `-Dtest-filter=...` compile options. Filters for the
+same owner/build options share one build without broadening other selected gates.
+`--gate` requires `--evidence`; it cannot narrow the release gate. A family report
+used with `--release` still checks every original ID.
+Release checking fails while any case is unresolved or deferred. Once all cases
 are resolved, it runs each distinct referenced evidence gate and propagates
 failure or timeout. Neither target is part of default tests.
 For a resolved case, at least one cited Zig test must name its stable case ID

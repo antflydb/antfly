@@ -89,9 +89,14 @@ pub const TopK = struct {
     scratch: ?std.heap.ArenaAllocator = null,
 
     pub fn init(alloc: Allocator, k: usize, orders: []const Order, max_bytes: usize) !TopK {
-        const bytes = std.math.add(usize, std.math.mul(usize, k, @sizeOf(OwnedRow)) catch return error.SqlProgramLimitExceeded, std.math.mul(usize, orders.len, @sizeOf(Order)) catch return error.SqlProgramLimitExceeded) catch return error.SqlProgramLimitExceeded;
+        // A logical row ceiling is not a cardinality estimate. Reserve only a
+        // small initial heap, then grow with admitted rows under the same
+        // retained-byte budget. Sparse nested sorts must not allocate slots
+        // for their entire scan ceiling before opening the first page.
+        const initial = @min(k, 16);
+        const bytes = std.math.add(usize, std.math.mul(usize, initial, @sizeOf(OwnedRow)) catch return error.SqlProgramLimitExceeded, std.math.mul(usize, orders.len, @sizeOf(Order)) catch return error.SqlProgramLimitExceeded) catch return error.SqlProgramLimitExceeded;
         if (bytes > max_bytes or orders.len > 256) return error.SqlProgramLimitExceeded;
-        const entries = try alloc.alloc(OwnedRow, k);
+        const entries = try alloc.alloc(OwnedRow, initial);
         errdefer alloc.free(entries);
         const owned_orders = try alloc.dupe(Order, orders);
         return .{ .alloc = alloc, .entries = entries, .orders = owned_orders, .max_bytes = max_bytes, .retained_bytes = bytes, .capacity = k };
@@ -210,13 +215,21 @@ pub const TopK = struct {
     fn addInMemory(self: *TopK, row: Row) !void {
         if (self.finished) return error.InvalidSqlBackendResponse;
         if (row.keys.len != self.orders.len) return error.InvalidSqlBackendResponse;
-        if (self.entries.len == 0) return;
+        if (self.capacity == 0) return;
         // Validate values before mutation, including when there is no prior
         // row to compare; malformed input cannot poison a partly sorted heap.
         for (row.keys) |key| if (!key.sql_null) {
             _ = try scalar.compare(key.value, key.value);
         };
-        if (self.count == self.entries.len and (try self.compare(row, self.entries[0].row)) != .lt) return;
+        if (self.count == self.capacity and (try self.compare(row, self.entries[0].row)) != .lt) return;
+        if (self.count == self.entries.len and self.count < self.capacity) {
+            const available_slots = (self.max_bytes -| self.retained_bytes) / @sizeOf(OwnedRow);
+            const next_len = @min(self.capacity, @min(self.entries.len *| 2, self.entries.len +| available_slots));
+            if (next_len <= self.entries.len) return error.SqlProgramLimitExceeded;
+            const old_len = self.entries.len;
+            self.entries = try self.alloc.realloc(self.entries, next_len);
+            self.retained_bytes += (next_len - old_len) * @sizeOf(OwnedRow);
+        }
         var estimate: usize = 0;
         for (row.values) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
         for (row.keys) |value| estimate = std.math.add(usize, estimate, try datumBytes(value)) catch return error.SqlProgramLimitExceeded;
@@ -1306,6 +1319,62 @@ test "SQL top K retains bounded competitive rows with stable null ordering" {
     try std.testing.expectEqual(@as(u64, 3), descending[0].ordinal);
     try std.testing.expectEqual(@as(u64, 1), descending[1].ordinal);
     try std.testing.expectEqual(@as(u64, 2), descending[2].ordinal);
+}
+
+test "SQL top K sparse logical ceilings reserve only admitted heap capacity" {
+    var top = try TopK.init(std.testing.allocator, 10_000_000, &.{.{}}, 64 * 1024);
+    defer top.deinit();
+    try std.testing.expectEqual(@as(usize, 16), top.entries.len);
+    for ([_]i64{ 2, 1 }, 0..) |number, ordinal| {
+        const value = Datum.json(.{ .integer = number });
+        try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = ordinal });
+    }
+    const rows = try top.finish(std.testing.allocator);
+    defer std.testing.allocator.free(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].values[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 2), rows[1].values[0].value.integer);
+    try std.testing.expect(top.retained_bytes < 16 * 1024);
+    std.debug.print("SQL sparse topK: logical_k=10000000 rows=2 heap_slots={d} retained_bytes={d}\n", .{ top.entries.len, top.retained_bytes });
+}
+
+test "SQL top K growing heaps preserve the logical limit under allocation faults" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            var top = try TopK.init(alloc, 33, &.{.{}}, 256 * 1024);
+            defer top.deinit();
+            for (0..70) |ordinal| {
+                const value = Datum.json(.{ .integer = @intCast(69 - ordinal) });
+                try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = ordinal });
+            }
+            const rows = try top.finish(alloc);
+            defer alloc.free(rows);
+            try std.testing.expectEqual(@as(usize, 33), rows.len);
+            for (rows, 0..) |row, ordinal| try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.values[0].value.integer);
+            try std.testing.expectEqual(@as(usize, 33), top.entries.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL top K growing heaps retain an intact prefix when the byte budget is exhausted" {
+    var top = try TopK.init(std.testing.allocator, 10_000_000, &.{.{}}, 8 * 1024);
+    defer top.deinit();
+    var admitted: usize = 0;
+    for (0..100) |ordinal| {
+        const value = Datum.json(.{ .integer = @intCast(ordinal) });
+        top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = ordinal }) catch |err| {
+            try std.testing.expectEqual(error.SqlProgramLimitExceeded, err);
+            break;
+        };
+        admitted += 1;
+    }
+    try std.testing.expect(admitted > 0 and admitted < 100);
+    try std.testing.expect(top.retained_bytes <= top.max_bytes);
+    const rows = try top.finish(std.testing.allocator);
+    defer std.testing.allocator.free(rows);
+    try std.testing.expectEqual(admitted, rows.len);
+    for (rows, 0..) |row, ordinal| try std.testing.expectEqual(@as(i64, @intCast(ordinal)), row.values[0].value.integer);
 }
 
 test "SQL top K encoding releases retained rows incrementally" {

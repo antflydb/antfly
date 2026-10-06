@@ -314,7 +314,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     }
     if (compiled.statement == .select and compiled.statement.select.table == null) {
         try backend.vtable.checkpoint(backend.ptr);
-        return bindConstantSelect(allocator, compiled, explicit_parameter_types, backend.settings_view);
+        return bindConstantSelect(allocator, compiled, explicit_parameter_types, backend.settings_view, backend.parameter_fallback_types);
     }
     if (compiled.statement == .merge) {
         try backend.vtable.checkpoint(backend.ptr);
@@ -349,6 +349,9 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     };
     var projection_name = target.name;
     switch (compiled.statement) {
+        .insert => |statement| if (statement.alias) |alias| {
+            projection_name.table = alias;
+        },
         .update => |statement| if (statement.alias) |alias| {
             projection_name.table = alias;
         },
@@ -357,7 +360,13 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         },
         else => {},
     }
-    const returning_select: ?ast.Select = if (returning_columns) |projections| .{ .table = target.name, .columns = try @import("relation_binding.zig").normalizeTargetProjection(allocator, backend, table, projection_name, projections) } else null;
+    const target_aliased = switch (compiled.statement) {
+        .insert => |statement| statement.alias != null,
+        .update => |statement| statement.alias != null,
+        .delete => |statement| statement.alias != null,
+        else => false,
+    };
+    const returning_select: ?ast.Select = if (returning_columns) |projections| .{ .table = target.name, .columns = try @import("relation_binding.zig").normalizeTargetProjection(allocator, backend, table, projection_name, target_aliased, projections) } else null;
     if (returning_select) |selection| {
         if (@import("aggregate_binding.zig").accepts(selection)) return error.UnsupportedSqlShape;
         var adapter: @import("relation_binding.zig").ResolveAdapter = .{ .backend = backend, .table = table };
@@ -367,7 +376,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     defer allocator.free(contexts);
     @memset(contexts, null);
     var context: Context = .{ .allocator = allocator, .backend = backend, .table = table, .parameters = parameters, .contexts = contexts };
-    if (!joined) context.scalars = try bound_scalars.bindWithSettings(allocator, table, compiled.statement, parameters, backend.settings_view);
+    if (!joined) context.scalars = try bound_scalars.bindWithParameterFallback(allocator, table, compiled.statement, parameters, backend.settings_view, backend.parameter_fallback_types);
     const columns: []const Column = if (joined) &.{} else switch (compiled.statement) {
         .select => |statement| try context.select(statement),
         .insert => |statement| blk: {
@@ -427,7 +436,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
             const source = result.insert_source orelse return error.InvalidSqlBackendResponse;
             for (source.columns[compiled.statement.insert.columns.len..], capture_types) |column, *kind| kind.* = column.type;
         }
-        result.conflict = try @import("conflict.zig").bind(allocator, backend, table, target.name, clause, parameters, capture_types);
+        result.conflict = try @import("conflict.zig").bind(allocator, backend, table, projection_name, target_aliased, clause, parameters, capture_types);
     };
     if (returning_select) |selection| {
         var adapter: @import("relation_binding.zig").ResolveAdapter = .{ .backend = backend, .table = table };
@@ -442,7 +451,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     return result;
 }
 
-fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View) !BoundStatement {
+fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const ?ast.ColumnType) !BoundStatement {
     const statement = compiled.statement.select;
     if (!statement.count_all and statement.columns.len == 0) return error.UndefinedColumn;
     const parameters = try alloc.alloc(?ast.ColumnType, compiled.parameter_count);
@@ -459,7 +468,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
             else => return error.InvalidSqlLimit,
         }
     };
-    const scalars = try bound_scalars.bindWithSettings(alloc, null, compiled.statement, parameters, settings);
+    const scalars = try bound_scalars.bindWithParameterFallback(alloc, null, compiled.statement, parameters, settings, fallbacks);
     const columns = try alloc.alloc(Column, if (statement.count_all) 1 else statement.columns.len);
     if (statement.count_all) {
         columns[0] = .{ .name = try alloc.dupe(u8, statement.count_alias orelse "count"), .type = .integer };
@@ -944,7 +953,9 @@ test "SQL shape binding releases partial allocations" {
     };
     var compiled = try compiler.compile(std.testing.allocator, "WITH a AS (SELECT $1 AS x) SELECT d.x FROM (SELECT x FROM a) d UNION SELECT 1", .{});
     defer compiled.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+    // Force deterministic growth rather than depending on whether the backing
+    // allocator happens to resize an arena chunk at a particular address.
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
 }
 
 test "SQL RETURNING Describe uses authorized target and output parameter context" {

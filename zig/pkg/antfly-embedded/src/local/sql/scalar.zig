@@ -31,7 +31,14 @@ pub const Datum = struct {
     }
 };
 pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true };
-pub const Column = struct { name: []const u8, type: ast.ColumnType, nullable: bool = true };
+pub const Column = struct {
+    name: []const u8,
+    type: ast.ColumnType,
+    nullable: bool = true,
+    /// Authorized alternate spellings share one cell/dependency ordinal.
+    /// They are binding metadata, never additional physical row values.
+    aliases: []const []const u8 = &.{},
+};
 pub const BindLimits = struct { nodes: usize = 8192, depth: usize = 64, parameters: usize = 1024 };
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
@@ -43,7 +50,7 @@ pub const EvalLimits = struct {
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified" };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse };
 
 pub const Instruction = struct {
     type: Type,
@@ -114,7 +121,7 @@ pub fn inferParameters(alloc: Allocator, expression: *const ast.Scalar, columns:
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .allow_unresolved = true };
-    for (columns, 0..) |column, i| try binder.names.put(binder.alloc, column.name, @intCast(i));
+    try binder.registerColumns();
     @memcpy(binder.parameters[0..parameters.len], parameters);
     _ = try binder.compile(expression, expected, 0);
     if (binder.parameter_count > parameters.len) return error.InvalidSqlParameters;
@@ -134,7 +141,7 @@ pub fn inferOutput(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = .{}, .allow_unresolved = true };
     if (parameters.len > binder.parameters.len) return error.SqlProgramLimitExceeded;
     @memcpy(binder.parameters[0..parameters.len], parameters);
-    for (columns, 0..) |column, index| try binder.names.put(binder.alloc, column.name, @intCast(index));
+    try binder.registerColumns();
     return binder.infer(expression, 0);
 }
 
@@ -147,11 +154,7 @@ pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar,
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .settings = settings };
-    for (columns, 0..) |column, i| {
-        const entry = try binder.names.getOrPut(binder.alloc, column.name);
-        if (entry.found_existing) return error.AmbiguousSqlColumn;
-        entry.value_ptr.* = @intCast(i);
-    }
+    try binder.registerColumns();
     @memcpy(binder.parameters[0..parameter_hints.len], parameter_hints);
     binder.parameter_count = parameter_hints.len;
     const root = try binder.compile(expression, expected, 0);
@@ -209,14 +212,17 @@ fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
         .ai_decide, .ai_probability => count == 3,
         .ai_choice, .ai_score => count == 4,
-        .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .sqrt, .to_timestamp, .current_setting => count == 1,
-        .nullif, .power, .mod, .starts_with, .date_part, .date_trunc, .@"$single" => count == 2,
+        .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .trunc, .sign, .sqrt, .to_timestamp, .current_setting, .to_jsonb, .bit_length, .jsonb_typeof, .reverse => count == 1,
+        .concat_ws => count >= 2,
+        .jsonb_build_object => count % 2 == 0,
+        .jsonb_extract_path_text => count >= 2,
+        .nullif, .power, .mod, .starts_with, .strpos, .repeat, .date_part, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified" => count == 5,
-        .substring => count == 2 or count == 3,
+        .substring, .lpad, .rpad => count == 2 or count == 3,
         .replace => count == 3,
         .trim, .ltrim, .rtrim => count == 1 or count == 2,
         .coalesce, .greatest, .least => count > 0,
-        .concat => true,
+        .concat => count > 0,
     };
     if (!valid) return error.InvalidSqlParameters;
 }
@@ -233,6 +239,20 @@ const Binder = struct {
     parameter_count: usize = 0,
     allow_unresolved: bool = false,
     settings: ?*const setting_catalog.View = null,
+
+    fn registerColumns(self: *Binder) !void {
+        for (self.columns, 0..) |column, ordinal| {
+            if (column.aliases.len > 3) return error.SqlProgramLimitExceeded;
+            try self.registerName(column.name, ordinal);
+            for (column.aliases) |alias| try self.registerName(alias, ordinal);
+        }
+    }
+    fn registerName(self: *Binder, name: []const u8, ordinal: usize) !void {
+        if (self.names.count() >= self.limits.nodes) return error.SqlProgramLimitExceeded;
+        const entry = try self.names.getOrPut(self.alloc, name);
+        if (entry.found_existing and entry.value_ptr.* != ordinal) return error.AmbiguousSqlColumn;
+        entry.value_ptr.* = @intCast(ordinal);
+    }
 
     fn infer(self: *Binder, expression: *const ast.Scalar, depth: usize) anyerror!Type {
         if (depth >= self.limits.depth) return error.SqlProgramLimitExceeded;
@@ -321,24 +341,25 @@ const Binder = struct {
                 var merged: Type = .{};
                 switch (function) {
                     .@"$single" => merged = try self.infer(call.args[0], depth + 1),
-                    .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .sqrt, .power, .mod => for (call.args) |arg| {
+                    .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .sqrt, .power, .mod => for (call.args) |arg| {
                         merged = try common(merged, try self.infer(arg, depth + 1));
                     },
                     else => for (call.args) |arg| {
                         _ = try self.infer(arg, depth + 1);
                     },
                 }
-                if (function == .abs or function == .ceil or function == .floor or function == .round or function == .sqrt or function == .power or function == .mod) {
+                if (function == .abs or function == .ceil or function == .floor or function == .round or function == .trunc or function == .sign or function == .sqrt or function == .power or function == .mod) {
                     if (merged.kind != null and !numeric(merged.kind)) return error.SqlTypeMismatch;
                 }
                 break :blk .{ .kind = switch (function) {
-                    .length, .octet_length => .integer,
+                    .to_jsonb, .jsonb_build_object => .json,
+                    .length, .octet_length, .bit_length, .strpos => .integer,
                     .starts_with, .@"$pattern_quantified" => .boolean,
                     .sqrt, .power, .date_part => .number,
                     .date_trunc, .to_timestamp => .datetime,
-                    .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .mod, .@"$single" => merged.kind,
+                    .coalesce, .nullif, .greatest, .least, .abs, .ceil, .floor, .round, .trunc, .sign, .mod, .@"$single" => merged.kind,
                     else => .string,
-                }, .nullable = function != .concat };
+                }, .nullable = function != .concat and function != .jsonb_build_object };
             },
             .case_when => |case| blk: {
                 var merged: Type = if (case.otherwise) |other| try self.infer(other, depth + 1) else .{};
@@ -444,11 +465,16 @@ const Binder = struct {
                         .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
                         .@"$single" => if (i == 0) kind.kind else .integer,
                         .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
-                        .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with => .string,
-                        .substring => if (i == 0) .string else .integer,
+                        .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with, .strpos, .bit_length, .reverse => .string,
+                        .concat_ws => if (i == 0) .string else null,
+                        .jsonb_typeof => .json,
+                        .substring, .repeat => if (i == 0) .string else .integer,
+                        .lpad, .rpad => if (i == 1) .integer else .string,
                         .date_part, .date_trunc => if (i == 0) .string else .datetime,
                         .to_timestamp => .number,
                         .concat => null,
+                        .to_jsonb, .jsonb_build_object => null,
+                        .jsonb_extract_path_text => if (i == 0) .json else .string,
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
@@ -599,6 +625,79 @@ const Evaluator = struct {
                     } });
                 }
                 switch (call.function) {
+                    .jsonb_typeof => {
+                        const datum = try self.runDatum(call.args[0], depth + 1);
+                        if (datum.sql_null) break :blk .{};
+                        break :blk Datum.json(.{ .string = switch (datum.value) {
+                            .null => "null",
+                            .bool => "boolean",
+                            .integer, .float, .number_string => "number",
+                            .string => "string",
+                            .array => "array",
+                            .object => "object",
+                        } });
+                    },
+                    .concat_ws => {
+                        const separator = try self.runDatum(call.args[0], depth + 1);
+                        if (separator.sql_null) break :blk .{};
+                        if (separator.value != .string) return error.SqlTypeMismatch;
+                        var output: std.ArrayList(u8) = .empty;
+                        errdefer output.deinit(self.alloc);
+                        var emitted = false;
+                        for (call.args[1..]) |arg| {
+                            const datum = try self.runDatum(arg, depth + 1);
+                            if (datum.sql_null) continue;
+                            const string = if (self.program.instructions[arg].type.kind == .json) try self.jsonText(datum.value) else try self.formatText(datum.value);
+                            if (emitted) {
+                                try self.charge(separator.value.string.len);
+                                try output.appendSlice(self.alloc, separator.value.string);
+                            }
+                            try self.charge(string.len);
+                            try output.appendSlice(self.alloc, string);
+                            emitted = true;
+                        }
+                        break :blk Datum.json(.{ .string = try output.toOwnedSlice(self.alloc) });
+                    },
+                    .to_jsonb => {
+                        // JSON scalar null is a value, unlike a SQL NULL cell.
+                        break :blk try self.runDatum(call.args[0], depth + 1);
+                    },
+                    .jsonb_build_object => {
+                        var object: std.json.ObjectMap = .empty;
+                        errdefer object.deinit(self.alloc);
+                        var i: usize = 0;
+                        while (i < call.args.len) : (i += 2) {
+                            const key = try self.runDatum(call.args[i], depth + 1);
+                            if (key.sql_null or key.value == .null or key.value == .object or key.value == .array) return error.InvalidSqlParameters;
+                            const name = try self.formatText(key.value);
+                            try self.charge(name.len + @sizeOf(Json) + @sizeOf([]const u8));
+                            const value = try self.runDatum(call.args[i + 1], depth + 1);
+                            try object.put(self.alloc, name, if (value.sql_null) .null else value.value);
+                        }
+                        break :blk Datum.json(.{ .object = object });
+                    },
+                    .jsonb_extract_path_text => {
+                        var value = try self.runDatum(call.args[0], depth + 1);
+                        if (value.sql_null) break :blk .{};
+                        for (call.args[1..]) |arg| {
+                            const key = try self.runDatum(arg, depth + 1);
+                            if (key.sql_null) break :blk .{};
+                            if (key.value != .string) return error.SqlTypeMismatch;
+                            value.value = switch (value.value) {
+                                .object => |object| object.get(key.value.string) orelse break :blk .{},
+                                .array => |array| element: {
+                                    const ordinal = std.fmt.parseInt(i64, key.value.string, 10) catch break :blk .{};
+                                    const count: i64 = @intCast(array.items.len);
+                                    const position = if (ordinal < 0) count +| ordinal else ordinal;
+                                    if (position < 0 or position >= count) break :blk .{};
+                                    break :element array.items[@intCast(position)];
+                                },
+                                else => break :blk .{},
+                            };
+                        }
+                        if (value.value == .null) break :blk .{};
+                        break :blk Datum.json(.{ .string = if (value.value == .string) value.value.string else try self.jsonText(value.value) });
+                    },
                     .@"$single" => {
                         const count = try self.runDatum(call.args[1], depth + 1);
                         if (!count.sql_null and (count.value != .integer or count.value.integer > 1)) return error.SqlCardinalityViolation;
@@ -925,11 +1024,17 @@ const Evaluator = struct {
                 .float => |v| finite(@abs(v)),
                 else => error.SqlTypeMismatch,
             },
-            .ceil, .floor, .round => return if (first == .integer) first else if (first == .float) finite(switch (function) {
+            .ceil, .floor, .round, .trunc => return if (first == .integer) first else if (first == .float) finite(switch (function) {
                 .ceil => @ceil(first.float),
                 .floor => @floor(first.float),
+                .trunc => @trunc(first.float),
                 else => @round(first.float),
             }) else error.SqlTypeMismatch,
+            .sign => return switch (first) {
+                .integer => |value| .{ .integer = if (value < 0) -1 else if (value > 0) 1 else 0 },
+                .float => |value| if (!std.math.isFinite(value)) error.SqlNumericOutOfRange else finite(if (value < 0) -1 else if (value > 0) 1 else 0),
+                else => error.SqlTypeMismatch,
+            },
             .sqrt => {
                 const v = try asFloat(first);
                 if (v < 0) return error.SqlNumericOutOfRange;
@@ -945,6 +1050,34 @@ const Evaluator = struct {
             .ai_decide, .ai_choice, .ai_score, .ai_probability => error.DecisionNotEvaluated,
             .length => .{ .integer = @intCast(std.unicode.utf8CountCodepoints(text_value) catch return error.SqlTypeMismatch) },
             .octet_length => .{ .integer = @intCast(text_value.len) },
+            .bit_length => .{ .integer = std.math.mul(i64, std.math.cast(i64, text_value.len) orelse return error.SqlNumericOutOfRange, 8) catch return error.SqlNumericOutOfRange },
+            .repeat => blk: {
+                if (values[1] != .integer) return error.SqlTypeMismatch;
+                if (values[1].integer <= 0 or text_value.len == 0) break :blk .{ .string = "" };
+                const count = std.math.cast(usize, values[1].integer) orelse return error.SqlProgramLimitExceeded;
+                const size = std.math.mul(usize, text_value.len, count) catch return error.SqlProgramLimitExceeded;
+                try self.charge(size);
+                const output = try self.alloc.alloc(u8, size);
+                for (0..count) |index| @memcpy(output[index * text_value.len ..][0..text_value.len], text_value);
+                break :blk .{ .string = output };
+            },
+            .reverse => blk: {
+                var iterator = (std.unicode.Utf8View.init(text_value) catch return error.SqlTypeMismatch).iterator();
+                try self.charge(text_value.len);
+                const output = try self.alloc.alloc(u8, text_value.len);
+                var offset = text_value.len;
+                while (iterator.nextCodepointSlice()) |character| {
+                    offset -= character.len;
+                    @memcpy(output[offset..][0..character.len], character);
+                }
+                break :blk .{ .string = output };
+            },
+            .lpad, .rpad => try self.padText(function == .lpad, text_value, values[1], if (args.len == 3) values[2] else .{ .string = " " }),
+            .strpos => blk: {
+                if (values[1] != .string) return error.SqlTypeMismatch;
+                const position = std.mem.indexOf(u8, text_value, values[1].string) orelse break :blk .{ .integer = 0 };
+                break :blk .{ .integer = @intCast((std.unicode.utf8CountCodepoints(text_value[0..position]) catch return error.SqlTypeMismatch) + 1) };
+            },
             .lower, .upper => blk: {
                 try self.charge(text_value.len);
                 const output = try self.alloc.dupe(u8, text_value);
@@ -1018,6 +1151,36 @@ const Evaluator = struct {
             },
             else => unreachable,
         };
+    }
+
+    fn padText(self: *Evaluator, left: bool, text: []const u8, length: Json, filling: Json) !Json {
+        if (length != .integer or filling != .string) return error.SqlTypeMismatch;
+        if (length.integer <= 0) return .{ .string = "" };
+        const wanted = std.math.cast(usize, length.integer) orelse return error.SqlProgramLimitExceeded;
+        const count = std.unicode.utf8CountCodepoints(text) catch return error.SqlTypeMismatch;
+        if (wanted <= count) {
+            var iterator = (std.unicode.Utf8View.init(text) catch return error.SqlTypeMismatch).iterator();
+            for (0..wanted) |_| _ = iterator.nextCodepointSlice();
+            return .{ .string = text[0..iterator.i] };
+        }
+        const fill = filling.string;
+        const fill_count = std.unicode.utf8CountCodepoints(fill) catch return error.SqlTypeMismatch;
+        if (fill_count == 0) return .{ .string = text };
+        const padding = wanted - count;
+        const cycles = padding / fill_count;
+        var iterator = (std.unicode.Utf8View.init(fill) catch return error.SqlTypeMismatch).iterator();
+        for (0..padding % fill_count) |_| _ = iterator.nextCodepointSlice();
+        const partial = fill[0..iterator.i];
+        const full_bytes = std.math.mul(usize, cycles, fill.len) catch return error.SqlProgramLimitExceeded;
+        const pad_bytes = std.math.add(usize, full_bytes, partial.len) catch return error.SqlProgramLimitExceeded;
+        const size = std.math.add(usize, pad_bytes, text.len) catch return error.SqlProgramLimitExceeded;
+        try self.charge(size);
+        const output = try self.alloc.alloc(u8, size);
+        const start = if (left) 0 else text.len;
+        for (0..cycles) |index| @memcpy(output[start + index * fill.len ..][0..fill.len], fill);
+        @memcpy(output[start + full_bytes ..][0..partial.len], partial);
+        @memcpy(output[if (left) pad_bytes else 0..][0..text.len], text);
+        return .{ .string = output };
     }
 
     fn like(self: *Evaluator, text_value: Json, pattern: Json, insensitive: bool) !bool {
@@ -1149,6 +1312,16 @@ pub fn comparison(op: ast.Scalar.Binary, order: std.math.Order) Json {
 test "SQL scalar bound programs preserve lazy truth exact integers and function semantics" {
     const cases = [_]struct { sql: []const u8, expected: []const u8 }{
         .{ .sql = "1 + 2 * 3", .expected = "7" },
+        .{ .sql = "trunc(-7.9)", .expected = "-7" },
+        .{ .sql = "trunc(7.9)", .expected = "7" },
+        .{ .sql = "trunc(9007199254740993)", .expected = "9007199254740993" },
+        .{ .sql = "trunc(NULL)", .expected = "null" },
+        .{ .sql = "sign(-9223372036854775808)", .expected = "-1" },
+        .{ .sql = "sign(9223372036854775807)", .expected = "1" },
+        .{ .sql = "sign(-0.0)", .expected = "0" },
+        .{ .sql = "sign(-0.01)", .expected = "-1" },
+        .{ .sql = "sign(0.01)", .expected = "1" },
+        .{ .sql = "sign(NULL)", .expected = "null" },
         .{ .sql = "-7 / 2", .expected = "-3" },
         .{ .sql = "NULL AND FALSE", .expected = "false" },
         .{ .sql = "NULL OR TRUE", .expected = "true" },
@@ -1191,6 +1364,26 @@ test "SQL scalar bound programs preserve lazy truth exact integers and function 
         const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
         const encoded = try std.json.Stringify.valueAlloc(arena.allocator(), value.value, .{});
         try std.testing.expectEqualStrings(case.expected, encoded);
+    }
+}
+
+test "SQL trunc and sign reject invalid types arity and nonfinite numeric inputs" {
+    for ([_][]const u8{ "trunc('text')", "sign(TRUE)" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlTypeMismatch, bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{}));
+    }
+    for ([_][]const u8{ "trunc(1, 2)", "sign()" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidSqlParameters, bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{}));
+    }
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "sign($1)", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{.number}, .{});
+    defer program.deinit();
+    for ([_]f64{ std.math.inf(f64), std.math.nan(f64) }) |value| {
+        try std.testing.expectError(error.SqlNumericOutOfRange, program.evaluate(std.testing.allocator, &.{}, &.{.{ .float = value }}, .{}));
     }
 }
 
@@ -1337,4 +1530,124 @@ test "SQL LIKE admits large ordinary text with an independent bounded work budge
         try std.testing.expectEqual(expected, actual.value.bool);
     }
     try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.allocator, &.{}, &.{ .{ .string = text }, .{ .string = "%absent%" } }, .{ .pattern_steps = 32 }));
+}
+
+test "SQL document and read text primitives preserve Unicode NULLs and bounded outputs" {
+    for ([_][]const u8{ "concat_ws(':')", "concat()" }) |sql| {
+        var invalid = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidSqlParameters, bind(std.testing.allocator, invalid.expression, &.{}, &.{}, .{}));
+    }
+    const cases = [_]struct { sql: []const u8, json: []const u8, sql_null: bool = false }{
+        .{ .sql = "concat_ws(':','a',NULL,'',3)", .json = "\"a::3\"" },
+        .{ .sql = "concat_ws(':',NULL,NULL)", .json = "\"\"" },
+        .{ .sql = "concat_ws(NULL,'a')", .json = "null", .sql_null = true },
+        .{ .sql = "concat_ws(':',CAST('null' AS json),'a')", .json = "\"null:a\"" },
+        .{ .sql = "bit_length('é')", .json = "16" },
+        .{ .sql = "lpad('é',4,'🍎x')", .json = "\"🍎x🍎é\"" },
+        .{ .sql = "rpad('é',4,'🍎x')", .json = "\"é🍎x🍎\"" },
+        .{ .sql = "lpad('é🍎',1,'x')", .json = "\"é\"" },
+        .{ .sql = "rpad('é',3,'')", .json = "\"é\"" },
+        .{ .sql = "lpad('é',3)", .json = "\"  é\"" },
+        .{ .sql = "lpad('é',-1)", .json = "\"\"" },
+        .{ .sql = "repeat('é🍎',2)", .json = "\"é🍎é🍎\"" },
+        .{ .sql = "repeat('é',-1)", .json = "\"\"" },
+        .{ .sql = "repeat('',9223372036854775807)", .json = "\"\"" },
+        .{ .sql = "reverse('aé🍎')", .json = "\"🍎éa\"" },
+        .{ .sql = "lpad('é',NULL)", .json = "null", .sql_null = true },
+        .{ .sql = "NULL ISNULL", .json = "true" },
+        .{ .sql = "NULL NOTNULL", .json = "false" },
+        .{ .sql = "1 ISNULL", .json = "false" },
+        .{ .sql = "NULL ISNULL AND 1 NOTNULL", .json = "true" },
+        .{ .sql = "strpos('aé🍎z','🍎')", .json = "3" },
+        .{ .sql = "strpos('aé','')", .json = "1" },
+        .{ .sql = "strpos('aé','x')", .json = "0" },
+        .{ .sql = "jsonb_typeof(CAST('null' AS json))", .json = "\"null\"" },
+        .{ .sql = "jsonb_typeof(CAST(NULL AS json))", .json = "null", .sql_null = true },
+        .{ .sql = "jsonb_typeof(to_jsonb(9007199254740993))", .json = "\"number\"" },
+        .{ .sql = "jsonb_typeof(to_jsonb(true))", .json = "\"boolean\"" },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const datum = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(case.sql_null, datum.sql_null);
+        try std.testing.expectEqualStrings(case.json, try std.json.Stringify.valueAlloc(arena.allocator(), datum.value, .{}));
+    }
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "concat_ws(':','long','value')", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, &.{}, .{ .output_bytes = 2 }));
+    for ([_][]const u8{ "repeat('ab',9223372036854775807)", "lpad('é',9223372036854775807,'🍎')", "rpad('x',128,'a')", "reverse('abcdef')" }) |sql| {
+        var bounded = try @import("compiler.zig").compileScalar(std.testing.allocator, sql, .{});
+        defer bounded.deinit();
+        var bounded_program = try bind(std.testing.allocator, bounded.expression, &.{}, &.{}, .{});
+        defer bounded_program.deinit();
+        try std.testing.expectError(error.SqlProgramLimitExceeded, bounded_program.evaluate(arena.allocator(), &.{}, &.{}, .{ .output_bytes = 2 }));
+    }
+}
+
+test "SQL Unicode text hot loop reuses bounded output scratch" {
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "rpad(reverse($1),128,'é')", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{.string}, .{});
+    defer program.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var checksum: usize = 0;
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..50000) |_| {
+        if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
+        const value = try program.evaluate(arena.allocator(), &.{}, &.{.{ .string = "antfly 🍎" }}, .{ .output_bytes = 1024 });
+        checksum += value.value.string.len;
+    }
+    try std.testing.expectEqual(@as(usize, 12550000), checksum);
+    try std.testing.expect(arena.queryCapacity() <= 8192);
+    std.debug.print("SQL Unicode text: rows=50000 scratch_bytes={d} elapsed_ns={d}\n", .{ arena.queryCapacity(), std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+}
+
+test "SQL typed JSON construction and path extraction preserve scalar and NULL provenance" {
+    const cases = [_]struct { sql: []const u8, json: []const u8, sql_null: bool = false }{
+        .{ .sql = "to_jsonb('wrapped')", .json = "\"wrapped\"" },
+        .{ .sql = "to_jsonb(9007199254740993)", .json = "9007199254740993" },
+        .{ .sql = "to_jsonb(NULL)", .json = "null", .sql_null = true },
+        .{ .sql = "to_jsonb(CAST('null' AS json))", .json = "null" },
+        .{ .sql = "jsonb_build_object()", .json = "{}" },
+        .{ .sql = "jsonb_build_object('a',1,'b',NULL,'a',2,'json',CAST('null' AS json))", .json = "{\"a\":2,\"b\":null,\"json\":null}" },
+        .{ .sql = "jsonb_extract_path_text(CAST('{\"a\":[1,\"last\"]}' AS json),'a','-1')", .json = "\"last\"" },
+        .{ .sql = "jsonb_extract_path_text(CAST('{\"a\":null}' AS json),'a')", .json = "null", .sql_null = true },
+        .{ .sql = "jsonb_extract_path_text(CAST('{}' AS json),'missing')", .json = "null", .sql_null = true },
+        .{ .sql = "jsonb_extract_path_text(CAST('[1]' AS json),'9223372036854775807')", .json = "null", .sql_null = true },
+        .{ .sql = "jsonb_extract_path_text(CAST('{\"a\":true}' AS json),'a')", .json = "\"true\"" },
+    };
+    for (cases) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const actual = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(case.sql_null, actual.sql_null);
+        const expected = try std.json.parseFromSlice(Json, arena.allocator(), case.json, .{});
+        defer expected.deinit();
+        try std.testing.expectEqualStrings(try std.json.Stringify.valueAlloc(arena.allocator(), expected.value, .{}), try std.json.Stringify.valueAlloc(arena.allocator(), actual.value, .{}));
+    }
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "jsonb_build_object(NULL,1)", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectError(error.InvalidSqlParameters, program.evaluate(std.testing.allocator, &.{}, &.{}, .{}));
+    var bounded = try @import("compiler.zig").compileScalar(std.testing.allocator, "jsonb_build_object('large',1)", .{});
+    defer bounded.deinit();
+    var bounded_program = try bind(std.testing.allocator, bounded.expression, &.{}, &.{}, .{});
+    defer bounded_program.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, bounded_program.evaluate(std.testing.allocator, &.{}, &.{}, .{ .output_bytes = 1 }));
 }
