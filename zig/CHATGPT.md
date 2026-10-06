@@ -182,8 +182,8 @@ placeholder fields for them.
   management routes reject before dereferencing it, and status reports the reason.
 - Generation with no manager rejects before any upstream work; CLI recognizes the
   stable disabled error and retains normal ownership errors.
-- Antfarm does not query accounts/models or authorize while disabled and does not
-  silently replace saved ChatGPT generator selections.
+- Antfarm does not query accounts/models while disabled and does not silently
+  replace saved ChatGPT generator selections. Authorization is CLI-only.
 - A disabled standalone startup does not create its ChatGPT store or callback
   listener; an enabled local startup retains account access.
 
@@ -216,18 +216,21 @@ key with an OAuth token is insufficient.
 
 ```mermaid
 sequenceDiagram
+    participant CLI as Antfly CLI
     participant UI as Antfarm
     participant AF as Local Antfly runtime
     participant Browser as System browser
     participant Auth as OpenAI authorization
     participant API as OpenAI Responses
-    UI->>AF: Begin connection for local owner
-    AF-->>UI: Authorization URL and attempt ID
-    UI->>Browser: Open authorization URL
+    CLI->>AF: Begin connection for local owner
+    AF-->>CLI: Authorization URL and attempt ID
+    CLI->>Browser: Open authorization URL
     Browser->>Auth: Sign in and authorize plan usage
     Auth-->>AF: Code at 127.0.0.1 callback
     AF->>Auth: Exchange code and validate identity
-    AF-->>UI: Safe connection summary
+    CLI->>AF: Observe authorization outcome
+    AF-->>CLI: Safe connection summary
+    UI->>AF: Read CLI-connected accounts and models
     UI->>AF: Interactive request with connection ID
     AF->>AF: Authorize database access and connection use
     AF->>API: Responses request with OAuth bearer
@@ -393,8 +396,9 @@ appropriate commercial client registration. Follow the
 
 1. **Local lifecycle:** registration manager, owner-bound management endpoints,
    credential storage, model discovery, refresh, disconnect, and mock auth tests.
-2. **Chat:** Responses adapter, provider/schema changes, Antfarm connection UI and
-   generator selection, terminal-stream and cancellation tests.
+2. **Chat:** Responses adapter, provider/schema changes, CLI authorization and
+   read-only Antfarm account discovery/generator selection, terminal-stream and
+   cancellation tests.
 3. **RAG:** translate retrieval tools and history; verify database authorization
    and that one registration is used throughout each request.
 4. **Self-hosted remote:** protected credential transfer, VM host identity, deployment controls.
@@ -458,7 +462,7 @@ Management endpoints under the public API base are:
 | POST | `/connections/{connection_id}/chatgpt/disconnect` | Durable local disable and best-effort remote revocation |
 
 Local CLI commands use the same owner-bound runtime endpoints and credential
-manager as Antfarm; the CLI never creates a second OAuth store:
+manager used for inference; the CLI never creates a second OAuth store:
 
 ```sh
 antfly connections login chatgpt
@@ -525,16 +529,17 @@ and cancellation signal. Refresh keeps its 15-second ceiling within the remainin
 budget; inference recalculates that budget after credential acquisition. A timeout
 or cancellation preserves the saved grant rather than treating it as revoked.
 
-Antfarm Connections owns authorization and disconnect controls; Chat and RAG
-selectors show eligible accounts and catalog model slugs. Browser state contains
-safe summaries, models and opaque references. Switching the application user or
-API endpoint aborts previous operations and clears account/catalog state.
+Authorization, reconnect and disconnect are CLI-only in this PR. Antfarm
+Connections shows safe account summaries and CLI instructions, with no sign-in
+popup, authorization polling or account mutation actions. Chat and RAG selectors
+can use eligible CLI-connected accounts and catalog model slugs. Reload Antfarm
+after CLI login, reconnect or logout to refresh account and model discovery.
+Browser state contains safe summaries, models and opaque references. Switching
+the application user or API endpoint aborts previous reads and clears
+account/catalog state; stale requests cannot release a newer catalog request.
 The TypeScript helpers use `/db/v1` routes after normalizing the configured API
 URL to its server root, including Antfarm's default relative `/db/v1` URL.
-Catalog versions are tracked per account. Disconnect invalidates only that
-account’s pending catalog results; discarded requests cannot block a newer fetch.
-Reauthorization reloads the connected account’s catalog. Other generation pickers do not
-offer personal plans for durable or unattended work.
+Other generation pickers do not offer personal plans for durable or unattended work.
 
 Automated tests use public signed JWT fixtures and a loopback mock auth server.
 They cover signature/audience/nonce/expiry, callback state and owner isolation,
@@ -569,9 +574,9 @@ status response, short caller deadlines, recovery after a timed-out poll,
 declined consent, and absence of authorization replay.
 
 Review regressions cover delayed callbacks after logout, stale authorization
-pins, owner isolation, explicit reconnect, unrelated account catalog fetches,
-replacement request ownership, catalog refresh after reauthorization and owner
-changes during sign-in refresh. Saved model selections wait for account discovery
+pins, owner isolation and explicit CLI reconnect. Antfarm regressions cover
+read-only CLI instructions, replacement request ownership and catalog reads
+across application identity changes. Saved model selections wait for account discovery
 and reload after API scope changes. Authorization startup allocates its response
 before launching tasks; allocation-failure coverage checks that no attempt remains
 registered and all response memory is released. The

@@ -25,9 +25,10 @@ export function chatGPTErrorMessage(error: unknown): string {
     return "ChatGPT connections are disabled on this server. Choose another generator.";
   if (code.includes("UsageLimitExceeded"))
     return "Your ChatGPT plan or app usage limit was reached. Manage usage in ChatGPT settings, or choose another provider.";
-  if (code.includes("ReconnectRequired")) return "Reconnect your ChatGPT account to continue.";
+  if (code.includes("ReconnectRequired"))
+    return "Reconnect using antfly connections login chatgpt --connection-id <id>, then reload Antfarm.";
   if (code.includes("PlanDisabled"))
-    return "Allow ChatGPT plan usage when connecting your account.";
+    return "Allow ChatGPT plan usage when connecting with antfly connections login chatgpt, then reload Antfarm.";
   if (code.includes("NotEligible"))
     return "ChatGPT plan usage is unavailable for this account or workspace.";
   if (code.includes("UsageUnavailable"))
@@ -39,11 +40,7 @@ interface State {
   unavailableMessage: string | null;
   accounts: ChatGPTAccount[];
   models: Record<string, ChatGPTModel[]>;
-  busy: boolean;
   error: string | null;
-  notice: string | null;
-  connect: (connectionId?: string) => Promise<void>;
-  disconnect: (connectionId: string) => Promise<void>;
   loadModels: (connectionId: string) => Promise<void>;
 }
 const empty: State = {
@@ -51,11 +48,7 @@ const empty: State = {
   unavailableMessage: "Checking ChatGPT availability…",
   accounts: [],
   models: {},
-  busy: false,
   error: null,
-  notice: null,
-  connect: async () => {},
-  disconnect: async () => {},
   loadModels: async () => {},
 };
 const Context = createContext<State>(empty);
@@ -66,7 +59,8 @@ export function useChatGPT(): State {
 export function ChatGPTProvider({ children }: { children: ReactNode }) {
   const { apiUrl } = useApiConfig();
   const { user, isAuthenticated, isLoading } = useAuth();
-  // The application session authenticates connection ownership. OAuth tokens
+  // The CLI owns authorization and disconnect. Antfarm reads account summaries
+  // and model catalogs using the application session. OAuth tokens
   // are never available here; only safe summaries and opaque references are.
   const client = useMemo(() => {
     let auth: { username: string; password: string } | undefined;
@@ -84,13 +78,10 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
   );
   const [accounts, setAccounts] = useState<ChatGPTAccount[]>([]);
   const [models, setModels] = useState<Record<string, ChatGPTModel[]>>({});
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const scope = useRef<AbortController | null>(null);
   const modelRequests = useRef(new Map<string, symbol>());
   const modelCatalog = useRef<Record<string, ChatGPTModel[]>>({});
-  const catalogVersions = useRef(new Map<string, number>());
   const refresh = useCallback(
     async (signal: AbortSignal) => {
       const result = await client.chatgpt.accounts(signal);
@@ -104,15 +95,12 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const controller = new AbortController();
     scope.current = controller;
-    catalogVersions.current.clear();
     modelCatalog.current = {};
     setSupported(false);
     setUnavailableMessage("Checking ChatGPT availability…");
     setAccounts([]);
     setModels({});
     setError(null);
-    setNotice(null);
-    setBusy(false);
     modelRequests.current.clear();
     if (!isLoading && isAuthenticated)
       (async () => {
@@ -141,16 +129,6 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
     };
   }, [client, refresh, isAuthenticated, isLoading]);
 
-  const invalidateModels = useCallback((id: string) => {
-    catalogVersions.current.set(id, (catalogVersions.current.get(id) ?? 0) + 1);
-    delete modelCatalog.current[id];
-    modelRequests.current.delete(id);
-    setModels((current) => {
-      const next = { ...current };
-      delete next[id];
-      return next;
-    });
-  }, []);
   const loadModels = useCallback(
     async (id: string) => {
       const signal = scope.current?.signal;
@@ -164,116 +142,21 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
         return;
       const request = Symbol(id);
       modelRequests.current.set(id, request);
-      const version = catalogVersions.current.get(id) ?? 0;
       try {
         const result = await client.chatgpt.models(id, signal);
-        if (!signal.aborted && version === (catalogVersions.current.get(id) ?? 0)) {
+        if (!signal.aborted) {
           const catalog = result.models.filter((model) => model.visibility === "list");
           modelCatalog.current[id] = catalog;
           setModels((current) => ({ ...current, [id]: catalog }));
         }
       } catch (err) {
-        if (!signal.aborted && version === (catalogVersions.current.get(id) ?? 0))
-          setError(chatGPTErrorMessage(err));
+        if (!signal.aborted) setError(chatGPTErrorMessage(err));
       } finally {
         // A stale request must not release a newer request for the same account.
         if (modelRequests.current.get(id) === request) modelRequests.current.delete(id);
       }
     },
     [client, supported]
-  );
-  const connect = useCallback(
-    async (id?: string) => {
-      const signal = scope.current?.signal;
-      if (!signal || signal.aborted || busy || !supported) return;
-      // Open during the click gesture to avoid popup blockers while waiting for
-      // the runtime to bind its callback listener.
-      const popup = window.open("about:blank", "_blank");
-      if (!popup) {
-        setError("Allow the sign-in popup, then try again.");
-        return;
-      }
-      popup.opener = null;
-      setBusy(true);
-      setError(null);
-      setNotice(null);
-      try {
-        const attempt = await client.chatgpt.authorize(id, signal);
-        const url = new URL(attempt.authorization_url);
-        if (url.origin !== "https://auth.openai.com" || url.pathname !== "/api/accounts/authorize")
-          throw new Error("Unexpected authorization endpoint");
-        popup.location.replace(url.href);
-        for (;;) {
-          if (signal.aborted) return;
-          if (Date.now() >= attempt.expires_at * 1000) throw new Error("Authorization expired");
-          const result = await client.chatgpt.attempt(attempt.attempt_id, signal);
-          if (signal.aborted) return;
-          if (result.status === "connected") {
-            const connectedId = result.connection_id;
-            if (!connectedId) throw new Error("Missing connected account");
-            invalidateModels(connectedId);
-            await refresh(signal);
-            if (signal.aborted) return;
-            await loadModels(connectedId);
-            if (!signal.aborted)
-              setNotice(
-                "Eligible AI requests will use your ChatGPT plan. You can manage usage in ChatGPT settings."
-              );
-            return;
-          }
-          if (!["pending", "exchanging"].includes(result.status)) {
-            if (!signal.aborted)
-              setError(
-                result.status === "declined"
-                  ? "ChatGPT connection cancelled. You can connect again or choose another provider."
-                  : "ChatGPT sign-in expired or could not be verified. Try again."
-              );
-            return;
-          }
-          await new Promise<void>((resolve, reject) => {
-            const onAbort = () => {
-              clearTimeout(timer);
-              reject(new DOMException("Aborted", "AbortError"));
-            };
-            const timer = setTimeout(() => {
-              signal.removeEventListener("abort", onAbort);
-              resolve();
-            }, 1500);
-            signal.addEventListener("abort", onAbort, { once: true });
-          });
-        }
-      } catch (err) {
-        if (!signal.aborted) setError(chatGPTErrorMessage(err));
-      } finally {
-        if (!signal.aborted) setBusy(false);
-      }
-    },
-    [client, refresh, busy, supported, invalidateModels, loadModels]
-  );
-  const disconnect = useCallback(
-    async (id: string) => {
-      const signal = scope.current?.signal;
-      if (!signal || signal.aborted || busy || !supported) return;
-      setBusy(true);
-      setError(null);
-      try {
-        const result = await client.chatgpt.disconnect(id, signal);
-        if (signal.aborted) return;
-        invalidateModels(id);
-        await refresh(signal);
-        if (!signal.aborted)
-          setNotice(
-            result.revocation_confirmed
-              ? "ChatGPT disconnected."
-              : "Disconnected locally. Remote revocation was not confirmed; disconnect Antfly in ChatGPT settings."
-          );
-      } catch (err) {
-        if (!signal.aborted) setError(chatGPTErrorMessage(err));
-      } finally {
-        if (!signal.aborted) setBusy(false);
-      }
-    },
-    [client, refresh, busy, supported, invalidateModels]
   );
   return (
     <Context.Provider
@@ -282,11 +165,7 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
         unavailableMessage,
         accounts,
         models,
-        busy,
         error,
-        notice,
-        connect,
-        disconnect,
         loadModels,
       }}
     >

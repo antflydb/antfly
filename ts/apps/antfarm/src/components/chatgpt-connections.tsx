@@ -1,4 +1,3 @@
-import { Button } from "@antfly/design-system";
 import { useChatGPT } from "./chatgpt-provider";
 
 export function ChatGPTConnections() {
@@ -13,11 +12,11 @@ export function ChatGPTConnections() {
           are sent to OpenAI. Usage counts toward your existing ChatGPT plan limits.
         </p>
       </div>
-      {chatgpt.notice && (
-        <p role="status" className="text-sm">
-          {chatgpt.notice}
-        </p>
-      )}
+      <div className="space-y-2 text-sm">
+        <p>Connect from a terminal on the machine running your local Antfly server:</p>
+        <code className="block">antfly connections login chatgpt</code>
+        <p>Reload Antfarm after connecting, reconnecting, or signing out with the CLI.</p>
+      </div>
       {chatgpt.error && (
         <p role="alert" className="text-sm text-destructive">
           {chatgpt.error}
@@ -39,29 +38,9 @@ export function ChatGPTConnections() {
                 : "Disconnected"}
             </p>
           </div>
-          <Button
-            size="sm"
-            disabled={chatgpt.busy}
-            onClick={() => void chatgpt.connect(account.connection_id)}
-          >
-            Continue with ChatGPT
-          </Button>
-          {account.connected && (
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={chatgpt.busy}
-              onClick={() => void chatgpt.disconnect(account.connection_id)}
-            >
-              Disconnect
-            </Button>
-          )}
         </div>
       ))}
       <div className="flex items-center gap-4">
-        <Button disabled={chatgpt.busy} onClick={() => void chatgpt.connect()}>
-          {chatgpt.busy ? "Connecting…" : "Continue with ChatGPT"}
-        </Button>
         <a
           className="text-sm underline"
           href="https://chatgpt.com/settings/usage"
