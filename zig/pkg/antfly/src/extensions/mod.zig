@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const system_catalog = @import("../system_catalog/domain.zig");
-const schema_mod = @import("../schema/mod.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
+const schema_mod = @import("antfly_local_sources").schema_mod;
 
 pub const wasmtime_runtime = @import("wasmtime_runtime.zig");
 

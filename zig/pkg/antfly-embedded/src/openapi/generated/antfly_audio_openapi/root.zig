@@ -4,6 +4,7 @@
 pub const types = @import("types.zig");
 
 pub const AntflySTTConfig = types.AntflySTTConfig;
+pub const AppleSTTConfig = types.AppleSTTConfig;
 pub const AudioFormat = types.AudioFormat;
 pub const ElevenLabsTTSConfig = types.ElevenLabsTTSConfig;
 pub const OpenAISTTConfig = types.OpenAISTTConfig;

@@ -255,3 +255,10 @@ zig build antfly-storage-bench
 ./zig-out/bin/storage_bench hbc-write --samples 1 --vectors 5000 --dims 1536 --batch-size 500 --leaf-size 168 --storage host
 ./zig-out/bin/storage_bench ingest --docs 5000 --dims 1536 --batch-size 500 --sync-level write --status-probe-every 1 --max-dense-lsm-run-bytes 1073741824 --max-dense-l0-runs 64 --max-status-probe-ns 500000000
 ```
+
+## Threaded versus Evented storage I/O
+
+See [Evented qualification and comparison commands](lib/platform/EVENTED.md)
+for the positional I/O benchmark and optional LMDB async commit comparison.
+The runner saves raw samples, median elapsed times, backend identity, and host
+metadata; production storage defaults remain Threaded.

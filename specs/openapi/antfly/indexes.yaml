@@ -939,6 +939,11 @@ components:
           type: integer
           minimum: 1
           description: "Largest recording fetched from a URL, in bytes. Defaults to 128 MiB, which covers a one hour voice memo or podcast."
+        download_assets:
+          type: boolean
+          default: false
+          x-go-type-skip-optional-pointer: true
+          description: "For Apple transcription, explicitly permit preparing and installing the selected on-device Speech assets."
     FullTextIndexConfig:
       type: object
       x-antfly-mutually-exclusive:

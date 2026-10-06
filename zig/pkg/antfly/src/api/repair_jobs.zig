@@ -14,8 +14,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const docstore_mod = @import("../storage/docstore.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const platform_time = @import("antfly_platform").time;
 const platform_sync = @import("antfly_platform").sync;
 

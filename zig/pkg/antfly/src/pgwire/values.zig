@@ -64,7 +64,7 @@ pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []co
                 break :blk value;
             },
             .json => try parseJson(alloc, bytes),
-            .uuid => .{ .string = @import("../common/uuid.zig").canonicalAlloc(alloc, bytes) catch |err| switch (err) {
+            .uuid => .{ .string = @import("antfly_local_sources").common_uuid.canonicalAlloc(alloc, bytes) catch |err| switch (err) {
                 error.InvalidUuid => return error.InvalidParameter,
                 else => return err,
             } },
@@ -87,7 +87,7 @@ pub fn decode(alloc: std.mem.Allocator, param_oid: u32, format: u16, bytes: []co
         114 => try parseJson(alloc, bytes),
         3802 => if (bytes.len > 0 and bytes[0] == 1) try parseJson(alloc, bytes[1..]) else error.InvalidParameter,
         2950 => if (bytes.len == 16) .{ .string = blk: {
-            const canonical = @import("../common/uuid.zig").format(bytes[0..16].*);
+            const canonical = @import("antfly_local_sources").common_uuid.format(bytes[0..16].*);
             break :blk try alloc.dupe(u8, &canonical);
         } } else error.InvalidParameter,
         25, 1043 => if (std.unicode.utf8ValidateSlice(bytes) and std.mem.indexOfScalar(u8, bytes, 0) == null) .{ .string = try alloc.dupe(u8, bytes) } else error.InvalidParameter,
@@ -156,7 +156,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         .integer => try std.fmt.allocPrint(alloc, "{d}", .{try integer(value)}),
         .datetime => try timestampText(alloc, value),
         .json => try std.json.Stringify.valueAlloc(alloc, value, .{}),
-        .uuid => if (value == .string) @import("../common/uuid.zig").canonicalAlloc(alloc, value.string) catch |err| switch (err) {
+        .uuid => if (value == .string) @import("antfly_local_sources").common_uuid.canonicalAlloc(alloc, value.string) catch |err| switch (err) {
             error.InvalidUuid => return error.InvalidResult,
             else => return err,
         } else error.InvalidResult,
@@ -186,7 +186,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
             break :blk try std.mem.concat(alloc, u8, &.{ &.{1}, json });
         },
         .uuid => if (value == .string) blk: {
-            const parsed = @import("../common/uuid.zig").parse(value.string) catch return error.InvalidResult;
+            const parsed = @import("antfly_local_sources").common_uuid.parse(value.string) catch return error.InvalidResult;
             break :blk try alloc.dupe(u8, &parsed);
         } else error.InvalidResult,
         .string => if (value == .string) try alloc.dupe(u8, value.string) else error.InvalidResult,
@@ -212,7 +212,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
             },
             .uuid => {
                 if (value != .string) return error.InvalidResult;
-                const canonical = @import("../common/uuid.zig").format(@import("../common/uuid.zig").parse(value.string) catch return error.InvalidResult);
+                const canonical = @import("antfly_local_sources").common_uuid.format(@import("antfly_local_sources").common_uuid.parse(value.string) catch return error.InvalidResult);
                 try writer.writeAll(&canonical);
             },
             .json => try std.json.Stringify.value(value, .{}, writer),
@@ -247,7 +247,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
         },
         .uuid => {
             if (value != .string) return error.InvalidResult;
-            const parsed = @import("../common/uuid.zig").parse(value.string) catch return error.InvalidResult;
+            const parsed = @import("antfly_local_sources").common_uuid.parse(value.string) catch return error.InvalidResult;
             try writer.writeAll(&parsed);
         },
         .string => {

@@ -8,13 +8,13 @@ const std = @import("std");
 const stages = @import("../metadata/restore_staging.zig");
 const owners = @import("restore_owner_contract.zig");
 const jobs = @import("restore_jobs.zig");
-const operation = @import("operation.zig");
-const wire = @import("../storage/db/online_merge_io_contract.zig");
-const source = @import("../storage/db/online_source_contract.zig");
-const rewrite = @import("../storage/db/relational_rewrite_contract.zig");
-const artifact = @import("../storage/db/source_artifact_transfer.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const wire = @import("antfly_local_sources").storage_db_online_merge_io_contract;
+const source = @import("antfly_local_sources").storage_db_online_source_contract;
+const rewrite = @import("antfly_local_sources").storage_db_relational_rewrite_contract;
+const artifact = @import("antfly_local_sources").storage_db_source_artifact_transfer;
 
-var owner_timing_gate: @import("bounded_diagnostic_gate.zig").Gate = .{};
+var owner_timing_gate: @import("antfly_local_sources").api_bounded_diagnostic_gate.Gate = .{};
 
 fn readSource(host: anytype, comptime T: type, alloc: std.mem.Allocator, table: []const u8, request: wire.Request, context: operation.RequestContext) !T {
     const started = @import("antfly_platform").time.monotonicNs();
@@ -87,13 +87,13 @@ fn prepareOneSource(host: anytype, alloc: std.mem.Allocator, target: stages.Targ
     const status = try readSource(host, wire.SourceStatus, alloc, target.table.name, .{ .scope = scope, .operation = .{ .status = .donor } }, context);
     if (!std.meta.eql(status.scope, scope)) return error.RestoreStagingScopeChanged;
     if (status.progress == null) {
-        try host.submitRewriteSource(target.table.name, .{ .online_source = .{ .admit = .{ .scope = scope, .limit = @import("../storage/retained_effects.zig").default_limit } } }, context);
+        try host.submitRewriteSource(target.table.name, .{ .online_source = .{ .admit = .{ .scope = scope, .limit = @import("antfly_local_sources").storage_retained_effects.default_limit } } }, context);
         return null;
     }
     const progress = status.progress.?;
     if (progress.phase != .retaining) return error.RestoreStagingScopeChanged;
     if (progress.snapshot_phase != .published) {
-        const certificate = try readSource(host, ?@import("../storage/source_snapshot.zig").Certificate, alloc, target.table.name, .{ .scope = scope, .operation = .publication }, context);
+        const certificate = try readSource(host, ?@import("antfly_local_sources").storage_source_snapshot.Certificate, alloc, target.table.name, .{ .scope = scope, .operation = .publication }, context);
         if (certificate) |value| try host.submitRewriteSource(target.table.name, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = value } } }, context);
         return null;
     }
@@ -127,7 +127,7 @@ fn checkpointAfter(progress: jobs.RewriteProgress, pending: bool, count: u32) !j
     return next;
 }
 
-fn transferTail(host: anytype, alloc: std.mem.Allocator, target: stages.Target, scope: @import("../storage/db/restore_staging_contract.zig").Scope, status: owners.Response, source_status: wire.SourceStatus, context: operation.RequestContext) !bool {
+fn transferTail(host: anytype, alloc: std.mem.Allocator, target: stages.Target, scope: @import("antfly_local_sources").storage_db_restore_staging_contract.Scope, status: owners.Response, source_status: wire.SourceStatus, context: operation.RequestContext) !bool {
     const progress = status.rewrite orelse return error.RestoreStagingScopeChanged;
     const source_scope = scope.rewrite.?.source_scope.?;
     const source_progress = source_status.progress orelse return error.RestoreSourceProofMissing;
@@ -366,7 +366,7 @@ fn testOwnerWaves(concurrent: bool) !void {
                 else => error.TestUnexpectedResult,
             };
         }
-        pub fn submitRewriteSource(self: *@This(), _: []const u8, request: @import("../storage/db/types.zig").BatchRequest, _: operation.RequestContext) !void {
+        pub fn submitRewriteSource(self: *@This(), _: []const u8, request: @import("antfly_local_sources").storage_db_types.BatchRequest, _: operation.RequestContext) !void {
             if (request.relational_topology) |topology| {
                 try std.testing.expectEqual(.begin, topology.action);
                 for (self.targets) |target| {
@@ -441,7 +441,7 @@ fn testOwnerWaves(concurrent: bool) !void {
     var ranges: [2]@import("../metadata/table_manager.zig").RangeRecord = undefined;
     for (0..2) |ordinal| {
         const scope: source.Scope = .{ .fence = .{ .role = .rewrite_source, .transition_id = 1, .attempt = 1, .admission_epoch = 1, .owner_group_id = 301 + ordinal, .peer_group_id = 401 + ordinal, .namespace = .{ .table_id = 11 + ordinal, .shard_id = 301 + ordinal, .range_id = 301 + ordinal }, .catalog_digest = @splat(1) }, .receiver_namespace = .{ .table_id = 21 + ordinal, .shard_id = 401 + ordinal, .range_id = 401 + ordinal }, .consumer_epoch = 1, .copy_attempt = .{ .donor_term = 1, .sequence = 1 } };
-        const certificate: @import("../storage/source_snapshot.zig").Certificate = .{ .cut = .{ .namespace = scope.fence.namespace, .applied_index = 2, .retained_start = 0 }, .objects = 1, .content_bytes = 1, .schema_manifest_digest = @splat(1), .ordered_content_digest = @splat(2) };
+        const certificate: @import("antfly_local_sources").storage_source_snapshot.Certificate = .{ .cut = .{ .namespace = scope.fence.namespace, .applied_index = 2, .retained_start = 0 }, .objects = 1, .content_bytes = 1, .schema_manifest_digest = @splat(1), .ordered_content_digest = @splat(2) };
         const digest = try certificate.digest();
         fixture.sources[ordinal] = .{ .scope = scope, .certificate = certificate, .progress = .{ .namespace = scope.namespace(), .consumer_epoch = 1, .pin = scope.pin(), .start = 0, .acknowledged = 0, .admitted_applied_index = 2, .snapshot_certificate = digest, .published_certificate = certificate, .snapshot_phase = .published }, .retained_head = 1, .fence = null, .next_epoch = 1, .drained = false, .row_derived_indexes = true };
         definitions[ordinal] = .{ .target_group_id = 401 + ordinal, .source_namespace = scope.fence.namespace, .format = .portable, .snapshot_path = "source.afb2", .artifact_size_bytes = 1, .artifact_sha256 = digest, .rewrite = .{ .program_digest = @splat(9), .retained_pin = scope.pin(), .snapshot_certificate = digest, .retained_epoch = 1, .retained_start = 0, .source_applied_index = 2, .source_scope = scope } };

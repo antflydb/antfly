@@ -17,7 +17,7 @@
 package lite
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/include -I${SRCDIR}/../../../zig/pkg/antfly/include
+#cgo CFLAGS: -I${SRCDIR}/include -I${SRCDIR}/../../../zig/pkg/antfly-embedded/include
 #cgo LDFLAGS: -L${SRCDIR}/../../../zig/zig-out/lib -lantfly
 #cgo darwin LDFLAGS: -Wl,-rpath,${SRCDIR}/../../../zig/zig-out/lib
 #cgo linux LDFLAGS: -Wl,-rpath,${SRCDIR}/../../../zig/zig-out/lib

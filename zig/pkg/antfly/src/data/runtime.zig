@@ -14,13 +14,13 @@
 
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
-const replication_ingress = @import("../storage/db/replication_ingress.zig");
+const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const std = @import("std");
 const store_report_update = @import("../metadata/store_report_update.zig");
 const store_report_baseline = @import("../metadata/store_report_baseline.zig");
 const report_collection = @import("../metadata/report_collection.zig");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
@@ -30,11 +30,11 @@ const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const antfly = @import("runtime_root.zig");
 const indexes_api = @import("../api/indexes.zig");
-const json_helpers = @import("../api/json_helpers.zig");
+const json_helpers = @import("antfly_local_sources").api_json_helpers;
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const process_memory_budget = @import("../common/process_memory_budget.zig");
-const runtime_status = @import("../api/runtime_status.zig");
+const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
 const artifact_publication_dispatch = @import("../storage/artifact_publication_dispatch.zig");
 const metadata_runtime_status_protocol = @import("../metadata/runtime_status_protocol.zig");
 const api_http_test_runtime = if (@import("builtin").is_test) @import("../api/http_test_runtime.zig") else struct {};
@@ -79,24 +79,24 @@ fn publishRuntimeStatusRefreshForTest(
     defer result.deinit();
     try std.testing.expect(!result.hasRejectedTables());
 }
-const backend_runtime_mod = @import("../storage/background_runtime.zig");
-const lsm_backend_mod = @import("../storage/lsm_backend.zig");
-const lsm_storage_io = @import("../storage/lsm_backend/storage_io.zig");
-const resource_manager_mod = @import("../storage/resource_manager.zig");
+const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
+const lsm_backend_mod = @import("antfly_local_sources").storage_lsm_backend;
+const lsm_storage_io = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
 const kernel_owner_descriptor = @import("../storage/kernel_owner_descriptor.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
-const index_manager_mod = @import("../storage/db/catalog/index_manager.zig");
-const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
-const doc_identity = @import("../storage/db/doc_identity.zig");
-const range_state_mod = @import("../storage/db/range_state.zig");
+const index_manager_mod = @import("antfly_local_sources").storage_db_catalog_index_manager;
+const change_journal_mod = @import("antfly_local_sources").storage_db_derived_change_journal;
+const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
+const range_state_mod = @import("antfly_local_sources").storage_db_range_state;
 const data_raft_batch = @import("raft_batch.zig");
 const platform_clock = @import("antfly_platform").clock;
 const process_memory_mod = @import("antfly_platform").process_memory;
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
-const thread_config = @import("../runtime_thread_config.zig");
+const thread_config = @import("antfly_local_sources").runtime_thread_config;
 
 fn seedControlOnlyStorageOwnerForTest(
     path: []const u8,
@@ -410,7 +410,7 @@ const DataRaftBatchRoute = struct {
     write_route_fence: ?antfly.metadata_api.CatalogRouteFence = null,
     /// Exact private bootstrap for an unpublished initial FK child. Only the
     /// metadata-authorized initial-child control path may supply this.
-    initial_child_bootstrap: ?@import("../storage/db/relational_initial_child_publication.zig").Bootstrap = null,
+    initial_child_bootstrap: ?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap = null,
 };
 
 const DataRaftBatchForwardState = struct {
@@ -1330,11 +1330,11 @@ const RaftTableApplyStateMachine = struct {
         InitialChildProvisionAlreadyCommitted,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
-            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.error_names.?) |field| {
-                if (err == @field(@import("../storage/db/online_source_contract.zig").Rejection, field)) return @field(ExpectedApplyFailure, field);
+            inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
+                if (err == @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field)) return @field(ExpectedApplyFailure, field);
             }
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
-                if (err == @field(@import("../schema/relational_expression_errors.zig").Error, field)) return @field(ExpectedApplyFailure, field);
+            inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+                if (err == @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field)) return @field(ExpectedApplyFailure, field);
             }
             // Share the stable typed contract with the participant HTTP path.
             // A semantic rejection must advance this committed log entry so
@@ -1382,11 +1382,11 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn toError(self: ExpectedApplyFailure) anyerror {
-            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.error_names.?) |field| {
-                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../storage/db/online_source_contract.zig").Rejection, field);
+            inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field);
             }
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
-                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../schema/relational_expression_errors.zig").Error, field);
+            inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
             }
             inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.error_names.?) |field| {
                 if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../api/relational_integrity_errors.zig").Error, field);
@@ -4583,7 +4583,7 @@ const HotStandbyStandbyReplicationErrorCode = enum(u8) {
 };
 
 fn hotStandbyStandbyReplicationErrorCode(err: anyerror) HotStandbyStandbyReplicationErrorCode {
-    return switch (@import("../common/http/http_common.zig").canonicalTransportError(err)) {
+    return switch (@import("antfly_local_sources").common_http_http_common.canonicalTransportError(err)) {
         error.HttpConnectionClosing => .HttpConnectionClosing,
         error.ConnectionResetByPeer => .ConnectionResetByPeer,
         error.ConnectionRefused => .ConnectionRefused,
@@ -6300,7 +6300,7 @@ pub const DataServer = struct {
         if (comptime linked_storage) _ = try self.ensureKernelOwnerSource();
     }
 
-    fn readColdInitialFkRecord(self: *DataServer, alloc: std.mem.Allocator, group_path: []const u8) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+    fn readColdInitialFkRecord(self: *DataServer, alloc: std.mem.Allocator, group_path: []const u8) !?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record {
         if (comptime linked_storage) {
             const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
             return try owner.readColdInitialChildRetirementRecordAtPath(alloc, group_path);
@@ -6325,7 +6325,7 @@ pub const DataServer = struct {
         }
     }
 
-    fn cancelColdInitialFkRecord(self: *DataServer, alloc: std.mem.Allocator, group_path: []const u8, expected: @import("../storage/db/relational_initial_child_publication.zig").Record, cancel_revision: u64) !void {
+    fn cancelColdInitialFkRecord(self: *DataServer, alloc: std.mem.Allocator, group_path: []const u8, expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Record, cancel_revision: u64) !void {
         if (comptime linked_storage) {
             const owner = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
             return owner.cancelColdInitialChildRetirementAtPath(alloc, group_path, expected, cancel_revision);
@@ -6403,7 +6403,7 @@ pub const DataServer = struct {
         }, .{ .ptr = action.ptr, .run = action.run });
     }
 
-    fn cancelHiddenInitialFkRetirement(ptr: *anyopaque, ticket: @import("fk_retirement_worker.zig").Ticket, group_path: []const u8, expected: @import("../storage/db/relational_initial_child_publication.zig").Record) !void {
+    fn cancelHiddenInitialFkRetirement(ptr: *anyopaque, ticket: @import("fk_retirement_worker.zig").Ticket, group_path: []const u8, expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Record) !void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         try self.cancelColdInitialFkRecord(self.alloc, group_path, expected, ticket.cancel_revision);
     }
@@ -6487,7 +6487,7 @@ pub const DataServer = struct {
         const metadata_incarnation = try RemoteMetadataSource.requireValidMetadataIncarnation(snapshot.status.metadata_incarnation);
         const runtime = try self.ensureBackendRuntime();
         const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
-        const root = try @import("../storage/db/root_signing_identity.zig").load(self.alloc, io, self.write_source.replica_root_dir);
+        const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(self.alloc, io, self.write_source.replica_root_dir);
         if (root.root_incarnation != root_incarnation) return error.StoreRootIdentityUnconfirmed;
         const registered = for (snapshot.stores) |store| {
             if (store.store_id == registration.store_id and store.node_id == registration.node_id) break store;
@@ -6550,7 +6550,7 @@ pub const DataServer = struct {
         if (page.value.next_key) |next| @memcpy(self.initial_fk_retirement_cursor[0..next.len], next);
     }
 
-    fn fetchRowPolicyInstallSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("../system_catalog/policies.zig").InstallRequest) ![]u8 {
+    fn fetchRowPolicyInstallSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, request: @import("antfly_local_sources").system_catalog_policies.InstallRequest) ![]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (request.table_id == 0 or request.expected_generation == 0 or request.expected_catalog_epoch == 0 or request.owner_group_id == 0)
             return error.InvalidRowPolicyPublication;
@@ -6563,7 +6563,7 @@ pub const DataServer = struct {
             .row_policy_install_authority = self.api_server_cfg.deployment_mode == .standalone,
         }, .{ .policy_install_snapshot = request });
         errdefer alloc.free(bytes);
-        if (bytes.len == 0 or bytes.len > @import("../system_catalog/policies.zig").max_install_snapshot_bytes)
+        if (bytes.len == 0 or bytes.len > @import("antfly_local_sources").system_catalog_policies.max_install_snapshot_bytes)
             return error.InvalidRowPolicyBundle;
         return bytes;
     }
@@ -6868,8 +6868,8 @@ pub const DataServer = struct {
         const io = runtime.io() orelse return error.ArtifactCatalogDrift;
         if (self.hotStandbyWriteGate()) |gate| try gate.check();
         if (self.group_leadership_source) |leadership| if (!leadership.isLocalLeader(group_id)) return error.NotLeader;
-        const recovery = try @import("../storage/db/artifact_publication_transport.zig").RecoveryHint.decode(command);
-        const class: artifact_publication_dispatch.Queue.Class = if (recovery != null or @import("../storage/db/artifact_publication_transport_codec.zig").controlAdmissionHint(command)) .control else .producer;
+        const recovery = try @import("antfly_local_sources").storage_db_artifact_publication_transport.RecoveryHint.decode(command);
+        const class: artifact_publication_dispatch.Queue.Class = if (recovery != null or @import("antfly_local_sources").storage_db_artifact_publication_transport_codec.controlAdmissionHint(command)) .control else .producer;
         const proposal = (try self.artifact_publication_queue.reserveClass(io, self.alloc, group_id, namespace, command, class)) orelse return;
         errdefer self.artifact_publication_queue.release(io, proposal);
         const job = try self.alloc.create(ArtifactPublicationJob);
@@ -6894,9 +6894,9 @@ pub const DataServer = struct {
         const self = job.server;
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         if (self.hotStandbyWriteGate()) |gate| try gate.check();
-        const publication = @import("../storage/db/artifact_publication.zig");
-        const codec = @import("../storage/db/artifact_publication_transport_codec.zig");
-        const transport = @import("../storage/db/artifact_publication_transport.zig");
+        const publication = @import("antfly_local_sources").storage_db_artifact_publication;
+        const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
+        const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
         // Resolve from current authoritative routing only after leaving the
         // producer stack. The job owns no resident DB or cache lease.
         const expected_namespace = publication.namespaceFromBytes(job.proposal.namespace);
@@ -7290,7 +7290,7 @@ pub const DataServer = struct {
         try self.applyHotStandbyReplicationRecord(record);
     }
 
-    fn applyHotStandbyHiddenOwnerRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView, descriptor: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) !void {
+    fn applyHotStandbyHiddenOwnerRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView, descriptor: @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap) !void {
         try descriptor.validate();
         if (descriptor.scope.target_namespace.table_id != record.table_id or descriptor.scope.target_namespace.shard_id != record.shard_id) return error.RestoreStagingScopeChanged;
         const source = self.liveRuntimeWriteSource();
@@ -7358,12 +7358,12 @@ pub const DataServer = struct {
         return control.finish.scope;
     }
 
-    fn readHotStandbyHiddenOwnerBootstrap(self: *DataServer, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+    fn readHotStandbyHiddenOwnerBootstrap(self: *DataServer, group_id: u64, table_id: u64) !?std.json.Parsed(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap) {
         if (comptime linked_storage) return (try self.ensureKernelOwnerSource()).readHotStandbyHiddenOwnerBootstrap(self.alloc, group_id, table_id);
         return self.liveRuntimeWriteSource().readHotStandbyHiddenOwnerBootstrap(self.alloc, group_id, table_id);
     }
 
-    fn primeHotStandbyHiddenOwner(self: *DataServer, bootstrap: @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) !void {
+    fn primeHotStandbyHiddenOwner(self: *DataServer, bootstrap: @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap) !void {
         const compiled = try self.ensureKernelOwnerSource();
         const encoded = try std.json.Stringify.valueAlloc(self.alloc, bootstrap, .{});
         defer self.alloc.free(encoded);
@@ -8367,7 +8367,7 @@ pub const DataServer = struct {
         return @import("../storage/hot_standby/restore_owner_contract.zig").metadataRootAlloc(alloc, self.write_source.replica_root_dir, self.hot_standby_cfg.restore_owner_metadata_root);
     }
 
-    fn findHotStandbyNativeRestoreOwner(owners: []const @import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, group_id: u64) ?@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap {
+    fn findHotStandbyNativeRestoreOwner(owners: []const @import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, group_id: u64) ?@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap {
         for (owners) |owner| if (owner.scope.target_namespace.shard_id == group_id) return owner;
         return null;
     }
@@ -10050,7 +10050,7 @@ pub const DataServer = struct {
             if (self.densePostingMaintenanceDue(posting_now_ns)) {
                 const posting = live_write_source.runDensePostingMaintenanceRoundBestEffort() catch |err| blk: {
                     std.log.warn("dense posting refresh deferred: {}", .{err});
-                    break :blk @import("../storage/posting_refresh_progress.zig").Progress{ .pending = true };
+                    break :blk @import("antfly_local_sources").storage_posting_refresh_progress.Progress{ .pending = true };
                 };
                 const next_delay_ns: u64 = if (posting.pending)
                     dense_posting_maintenance_retry_interval_ns
@@ -10724,14 +10724,14 @@ pub const DataServer = struct {
         return try alloc.dupe(u8, store.api_url);
     }
 
-    fn onlineMergeIo(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/online_merge_io_contract.zig").Request, context: antfly.public_api.operation.RequestContext) ![]u8 {
+    fn onlineMergeIo(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_online_merge_io_contract.Request, context: antfly.public_api.operation.RequestContext) ![]u8 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
         const source = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
         if (self.data_raft == null) {
             if (self.api_server_cfg.deployment_mode != .standalone) return error.UnsupportedRestoreSource;
             const NativeOwner = struct {
-                fn execute(owner_ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, input: @import("../storage/db/online_merge_io_contract.zig").Request, control: antfly.public_api.operation.RequestContext) ![]u8 {
+                fn execute(owner_ptr: *anyopaque, allocator: std.mem.Allocator, group: u64, table: []const u8, input: @import("antfly_local_sources").storage_db_online_merge_io_contract.Request, control: antfly.public_api.operation.RequestContext) ![]u8 {
                     const owner: *antfly.public_api.ProvisionedKernelOwnerSource = @ptrCast(@alignCast(owner_ptr));
                     return owner.onlineMergeIo(allocator, group, table, input, control);
                 }
@@ -10749,7 +10749,7 @@ pub const DataServer = struct {
             // same replica; the returned command still arbitrates at apply.
             const observation = try source.onlineMergeIo(alloc, group_id, table_name, .{ .scope = request.scope, .operation = .{ .status = .donor } }, context);
             defer alloc.free(observation);
-            const contract = @import("../storage/db/online_merge_io_contract.zig");
+            const contract = @import("antfly_local_sources").storage_db_online_merge_io_contract;
             const raw = self.localTransitionApplyStore() orelse return error.GroupLeaderUnavailable;
             const ordinary = try raw.currentMergeSourceState(alloc, group_id);
             try context.ensureActive();
@@ -10816,7 +10816,7 @@ pub const DataServer = struct {
         // The owner read performs ReadIndex before observing durable counters.
         const json = try source.onlineMergeIo(alloc, group_id, table_name, request, context);
         defer alloc.free(json);
-        const contract = @import("../storage/db/online_merge_io_contract.zig");
+        const contract = @import("antfly_local_sources").storage_db_online_merge_io_contract;
         var parsed = try std.json.parseFromSlice(contract.AdmissionFacts, alloc, json, .{});
         defer parsed.deinit();
         const raw = self.localTransitionApplyStore() orelse return error.GroupLeaderUnavailable;
@@ -10922,7 +10922,7 @@ pub const DataServer = struct {
     fn restoreParentActivationControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: antfly.public_api.restore_parent_activation.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.restore_parent_activation.Response {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const staging = @import("../metadata/restore_staging.zig");
-        const retirement = @import("../storage/db/relational_integrity_generation_retirement.zig");
+        const retirement = @import("antfly_local_sources").storage_db_relational_integrity_generation_retirement;
         try context.ensureActive();
         try input.validate(group_id);
         const raft_leader = blk: {
@@ -10942,7 +10942,7 @@ pub const DataServer = struct {
             _ = self.kernel_owner_source orelse return error.StorageKernelOwnerUnavailable;
             var identity_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .read_index)) orelse return error.GenerationRetirementPending;
             defer identity_response.deinit(scratch);
-            const identity = try std.json.parseFromSliceLeaky(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, scratch, identity_response.json, .{});
+            const identity = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, scratch, identity_response.json, .{});
             if (!identity.namespace.eql(input.fence.namespace) or identity.generation_handoff_receipt_authority != .native) return error.UnsupportedEmptyGenerationAuthority;
             var snapshot = (try self.status_source.linearizableSnapshot(context)) orelse return error.RestoreStagingScopeChanged;
             defer self.status_source.freeAdminSnapshot(&snapshot);
@@ -11005,9 +11005,9 @@ pub const DataServer = struct {
         consistency: @import("../raft/read_gate.zig").ReadConsistency,
     ) !void {
         if (names.len == 0) return;
-        var parent_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(scratch, table.schema_json);
+        var parent_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(scratch, table.schema_json);
         defer parent_schema.deinit(scratch);
-        const index_status = @import("../storage/db/relational_index_status_contract.zig");
+        const index_status = @import("antfly_local_sources").storage_db_relational_index_status_contract;
         for (names) |name| {
             try context.ensureActive();
             const expected_comparison = try @import("../api/relational_index_status.zig").expectedComparison(scratch, parent_schema, name);
@@ -11050,7 +11050,7 @@ pub const DataServer = struct {
     fn fkGenerationParentControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_fk_generation_publication.Request, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_fk_generation_publication.Receipt {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const publication = @import("../metadata/fk_generation_publication.zig");
-        const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
+        const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
         try context.ensureActive();
         try request.validate(group_id);
         const leader_term = try self.fkGenerationControlTerm(group_id, context);
@@ -11076,7 +11076,7 @@ pub const DataServer = struct {
         // authenticates the requested action against its durable phase.
         const ParentDecision = struct {
             plan_digest: publication.Digest,
-            fence: @import("../storage/db/relational_integrity_topology_contract.zig").Fence,
+            fence: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence,
             transitions: []const publication.Transition,
             parent_table: @import("../metadata/table_manager.zig").TableRecord,
             parent_range: @import("../metadata/table_manager.zig").RangeRecord,
@@ -11104,7 +11104,7 @@ pub const DataServer = struct {
         const read_source = self.read_source.source();
         var identity_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer identity_response.deinit(scratch);
-        const owner_identity = try std.json.parseFromSliceLeaky(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, scratch, identity_response.json, .{ .allocate = .alloc_always });
+        const owner_identity = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, scratch, identity_response.json, .{ .allocate = .alloc_always });
         if (!owner_identity.namespace.eql(decision.fence.namespace) or
             !std.mem.eql(u8, &owner_identity.catalog_digest, &decision.fence.catalog_digest)) return error.IntegrityTopologyChanged;
         // Initial MATCH PARTIAL CREATE may publish an owned parent index
@@ -11149,7 +11149,7 @@ pub const DataServer = struct {
             // Admission is durable before the staged accepted-generation CAS.
             try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .begin, .fence = decision.fence } }, leader_term);
         }
-        const action: @FieldType(@import("../storage/db/relational_integrity_topology_contract.zig").Command, "action") = switch (request.action) {
+        const action: @FieldType(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Command, "action") = switch (request.action) {
             .stage => .stage_child_generation,
             .activate => .activate_child_generation,
             .acknowledge => .acknowledge_child_generation,
@@ -11191,8 +11191,8 @@ pub const DataServer = struct {
     fn fkGenerationSourceControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_fk_generation_publication.SourceRequest, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_fk_generation_publication.SourceReceipt {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const publication = @import("../metadata/fk_generation_publication.zig");
-        const admission = @import("../storage/db/relational_integrity_generation_admission.zig");
-        const schema = @import("../schema/mod.zig");
+        const admission = @import("antfly_local_sources").storage_db_relational_integrity_generation_admission;
+        const schema = @import("antfly_local_sources").schema_mod;
         try context.ensureActive();
         try request.validate(group_id);
         const leader_term = try self.fkGenerationControlTerm(group_id, context);
@@ -11221,7 +11221,7 @@ pub const DataServer = struct {
         const read_source = self.read_source.source();
         var identity_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .read_index)) orelse return error.GenerationAdmissionPending;
         defer identity_response.deinit(scratch);
-        const owner_identity = try std.json.parseFromSliceLeaky(@import("../storage/db/relational_integrity_topology_contract.zig").Identity, scratch, identity_response.json, .{ .allocate = .alloc_always });
+        const owner_identity = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity, scratch, identity_response.json, .{ .allocate = .alloc_always });
         if (!owner_identity.namespace.eql(decision.fence.namespace)) return error.IntegrityTopologyChanged;
         var catalog_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_integrity_catalog = true, .fk_generation_source_control = true }, .read_index)) orelse return error.IntegrityCatalogChanged;
         defer catalog_response.deinit(scratch);
@@ -11284,7 +11284,7 @@ pub const DataServer = struct {
         if (request.action == .fence) {
             var drained_response = (try read_source.lookupGroupLocal(scratch, group_id, table_name, "", .{ .relational_topology_json = "{\"mode\":\"status\"}", .fk_generation_source_control = true }, .read_index)) orelse return error.GenerationAdmissionPending;
             defer drained_response.deinit(scratch);
-            const topology_status = try std.json.parseFromSliceLeaky(@import("../storage/db/relational_integrity_topology_contract.zig").Status, scratch, drained_response.json, .{ .allocate = .alloc_always });
+            const topology_status = try std.json.parseFromSliceLeaky(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Status, scratch, drained_response.json, .{ .allocate = .alloc_always });
             if (topology_status.fence == null or !topology_status.fence.?.eql(decision.fence) or !topology_status.drained) return error.GenerationAdmissionPending;
         } else if (request.action == .install and !already_completed) {
             try self.applyFkGenerationControl(alloc, group_id, table_name, .{ .relational_topology = .{ .action = .install_child_schema, .fence = decision.fence, .child_schema_install = .{
@@ -11336,9 +11336,9 @@ pub const DataServer = struct {
     fn fkInitialChildControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: antfly.public_api.relational_fk_generation_publication.InitialChildRequest, context: antfly.public_api.operation.RequestContext) !antfly.public_api.relational_fk_generation_publication.InitialChildReceipt {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         const publication = @import("../metadata/fk_generation_publication.zig");
-        const hidden = @import("../storage/db/relational_initial_child_publication.zig");
-        const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
-        const schema = @import("../schema/mod.zig");
+        const hidden = @import("antfly_local_sources").storage_db_relational_initial_child_publication;
+        const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+        const schema = @import("antfly_local_sources").schema_mod;
         try context.ensureActive();
         try request.validate(group_id);
         const leader_term: ?u64 = blk: {
@@ -11382,7 +11382,7 @@ pub const DataServer = struct {
             (request.action == .provision and decision.phase != .provisioning_child) or
             (request.action == .release and decision.phase != .published_hidden and decision.phase != .publishing_child) or
             (request.action == .cancel and decision.phase != .canceling)) return error.GenerationPublicationChanged;
-        const namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{
+        const namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{
             .table_id = request.child_table_id,
             .shard_id = @import("../metadata/table_manager.zig").rangeDocIdentityShardId(decision.range),
             .range_id = @import("../metadata/table_manager.zig").rangeDocIdentityRangeId(decision.range),
@@ -11438,7 +11438,7 @@ pub const DataServer = struct {
         )) orelse return error.GenerationAdmissionPending;
         defer preflight_response.deinit(scratch);
         const preflight = try std.json.parseFromSliceLeaky(struct {
-            namespace: @import("../storage/db/doc_identity_namespace.zig").Namespace,
+            namespace: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace,
             row_count: u64,
             has_schema: bool,
             has_catalog: bool,
@@ -11540,7 +11540,7 @@ pub const DataServer = struct {
             const registration = self.store_registration orelse return error.StoreRegistrationUnavailable;
             const runtime = try self.ensureBackendRuntime();
             const io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
-            const root = try @import("../storage/db/root_signing_identity.zig").load(scratch, io, self.write_source.replica_root_dir);
+            const root = try @import("antfly_local_sources").storage_db_root_signing_identity.load(scratch, io, self.write_source.replica_root_dir);
             var point = blk: {
                 lockAtomic(&self.data_raft_mutex);
                 defer self.data_raft_mutex.unlock();
@@ -12260,7 +12260,7 @@ pub const DataServer = struct {
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
         if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
-        if (@import("../api/batch.zig").requiresRowSemanticsEnvelope(req.writes, req.predicates))
+        if (@import("antfly_local_sources").api_batch.requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
         if (req.merge_proof_adoption != null) return data_raft_batch.merge_proof_adoption_protocol_version;
         if (req.artifact_publication_transport != null) return @import("../common/data_raft_protocol.zig").batch_artifact_publication_transport_protocol_version;
@@ -12803,8 +12803,8 @@ pub const DataServer = struct {
         route: DataRaftBatchRoute,
         leader_wait_ns: u64,
     ) !void {
-        try @import("../storage/db/artifact_publication.zig").validateRequest(alloc, req);
-        try @import("../storage/db/artifact_publication_transport.zig").validateBatchRequest(req);
+        try @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, req);
+        try @import("antfly_local_sources").storage_db_artifact_publication_transport.validateBatchRequest(req);
         // Do not allow a private/direct batch route to bypass the metadata
         // admission policy. This happens before a protocol barrier or a data
         // entry can be appended, so rejection is never an ambiguous outcome.
@@ -15386,8 +15386,8 @@ pub const DataServer = struct {
         return coordinated;
     }
 
-    const IntegrityTopology = @import("../storage/db/relational_integrity_topology_contract.zig");
-    const IntegrityHandoff = @import("../storage/db/relational_integrity_handoff_contract.zig");
+    const IntegrityTopology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+    const IntegrityHandoff = @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract;
     const IntegrityTopologyStatus = struct { fence: ?IntegrityTopology.Fence, drained: bool };
 
     fn ensureRelationalSplitFence(self: *DataServer, group_id: u64, peer_id: u64, transition_id: u64, attempt: u64, role: IntegrityTopology.Role, contract: antfly.metadata.TransitionTableContract) !IntegrityTopology.Fence {
@@ -16877,8 +16877,8 @@ pub const DataServer = struct {
         }
     }
 
-    fn readMergeReceiverCopyReceipt(self: *DataServer, group_id: u64, contract: antfly.metadata.TransitionTableContract, transition_id: u64) !std.json.Parsed(@import("../storage/db/merge_contract.zig").CopyReceipt) {
-        const Receipt = @import("../storage/db/merge_contract.zig").CopyReceipt;
+    fn readMergeReceiverCopyReceipt(self: *DataServer, group_id: u64, contract: antfly.metadata.TransitionTableContract, transition_id: u64) !std.json.Parsed(@import("antfly_local_sources").storage_db_merge_contract.CopyReceipt) {
+        const Receipt = @import("antfly_local_sources").storage_db_merge_contract.CopyReceipt;
         if (self.data_raft) |raft| if (raft.host.http_host.host.isLocalLeader(group_id)) {
             // This trusted caller already owns the admitted transition contract.
             // Obtain the receiver quorum/apply proof before leasing its owner;
@@ -16915,7 +16915,7 @@ pub const DataServer = struct {
         );
         const donor_range = try source_store.currentRange(self.alloc, donor_group_id);
         defer range_state_mod.freeRange(self.alloc, donor_range);
-        const Receipt = @import("../storage/db/merge_contract.zig").CopyReceipt;
+        const Receipt = @import("antfly_local_sources").storage_db_merge_contract.CopyReceipt;
         var receiver_receipt: ?std.json.Parsed(Receipt) = self.readMergeReceiverCopyReceipt(receiver_group_id, table_contract, transition_id) catch |err| switch (err) {
             error.GuardedMergeCopyReceiptUnsupported => null,
             else => return err,
@@ -17039,7 +17039,7 @@ pub const DataServer = struct {
     }
 
     fn guardedMergeCopyReceiptMatches(
-        receipt: @import("../storage/db/merge_contract.zig").CopyReceipt,
+        receipt: @import("antfly_local_sources").storage_db_merge_contract.CopyReceipt,
         transition_id: u64,
         donor: u64,
         receiver: u64,
@@ -17882,7 +17882,7 @@ pub const DataServer = struct {
         // through this process's cached identity.
         const runtime = try self.ensureBackendRuntime();
         const api_io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
-        const loaded = try @import("../storage/db/root_identity.zig").loadOrCreate(self.alloc, api_io, self.write_source.replica_root_dir);
+        const loaded = try @import("antfly_local_sources").storage_db_root_identity.loadOrCreate(self.alloc, api_io, self.write_source.replica_root_dir);
         lockAtomic(&self.reporter_incarnation_mutex);
         defer self.reporter_incarnation_mutex.unlock();
         return retainReplicaRootIncarnation(&self.replica_root_incarnation, loaded.incarnation);
@@ -17921,7 +17921,7 @@ pub const DataServer = struct {
         if (signing_ready) {
             const runtime = try self.ensureBackendRuntime();
             const api_io = runtime.apiIo() orelse return error.BackendRuntimeUnavailable;
-            const signing = try @import("../storage/db/root_signing_identity.zig").loadOrCreate(
+            const signing = try @import("antfly_local_sources").storage_db_root_signing_identity.loadOrCreate(
                 self.alloc,
                 api_io,
                 self.write_source.replica_root_dir,
@@ -20418,7 +20418,7 @@ pub const DataServer = struct {
             }
         }
         const descriptor = owner.descriptor;
-        const bootstrap: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap = .{
+        const bootstrap: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap = .{
             .plan_id = descriptor.plan_id,
             .plan_digest = descriptor.plan_digest,
             .namespace = descriptor.namespace,
@@ -20449,7 +20449,7 @@ pub const DataServer = struct {
         return self.primePrivateInitialChildOwner(owner, null);
     }
 
-    pub fn readHiddenInitialChildRecord(self: *DataServer, group_id: u64, table_id: u64) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+    pub fn readHiddenInitialChildRecord(self: *DataServer, group_id: u64, table_id: u64) !?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record {
         if (comptime !linked_storage) return error.StorageKernelOwnerUnavailable;
         return (try self.ensureKernelOwnerSource()).readHiddenInitialChildRecord(self.alloc, group_id, table_id);
     }
@@ -24141,10 +24141,10 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         }
         try std.testing.expect(RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ArtifactCatalogDrift) == null);
         try std.testing.expect(RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.ArtifactCatalogCorrupt) == null);
-        const contract = @import("../storage/db/online_merge_io_contract.zig");
-        const source_contract = @import("../storage/db/online_source_contract.zig");
-        const donor: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
-        const receiver: @import("../storage/db/doc_identity_namespace.zig").Namespace = .{ .table_id = 1, .shard_id = 4, .range_id = 5 };
+        const contract = @import("antfly_local_sources").storage_db_online_merge_io_contract;
+        const source_contract = @import("antfly_local_sources").storage_db_online_source_contract;
+        const donor: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 };
+        const receiver: @import("antfly_local_sources").storage_db_doc_identity_namespace.Namespace = .{ .table_id = 1, .shard_id = 4, .range_id = 5 };
         const unbound: source_contract.Scope = .{
             .fence = .{ .transition_id = 7, .attempt = 0, .admission_epoch = 0, .owner_group_id = 2, .peer_group_id = 4, .role = .merge_source, .namespace = donor, .catalog_digest = @splat(0) },
             .receiver_namespace = receiver,
@@ -24208,7 +24208,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(rollback_accept));
         try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{ .online_source = .{ .release = bound } }));
         try std.testing.expect(!onlineMergeRaftBatchRequiresArtifactBarrier(.{}));
-        const inventory = @import("../storage/db/artifact_inventory.zig");
+        const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
         const catalogs: inventory.Catalogs = .{};
         const binding: inventory.Binding = .{ .epoch = 1, .digest = catalogs.digest(), .semantic_digest = try catalogs.semanticDigest(alloc) };
         var admitted = source_admit;
@@ -24226,7 +24226,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
         try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(extended_admission));
         const invalid_publication: antfly.db.types.BatchRequest = .{ .artifact_publication = .{ .mode = .activate, .namespace = @splat(0), .authority_epoch = 0, .catalog_digest = @splat(0), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) } };
         try std.testing.expectEqual(@as(u16, 15), DataServer.requiredRaftBatchProtocolVersion(invalid_publication));
-        try std.testing.expectError(error.InvalidBatchRequest, @import("../storage/db/artifact_publication.zig").validateRequest(alloc, invalid_publication));
+        try std.testing.expectError(error.InvalidBatchRequest, @import("antfly_local_sources").storage_db_artifact_publication.validateRequest(alloc, invalid_publication));
         const adoption: antfly.db.types.BatchRequest = .{ .merge_proof_adoption = .{
             .transition_id = 1,
             .attempt = .{ .donor_term = 2, .sequence = 3 },
@@ -24292,9 +24292,9 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 
 fn onlineMergeRaftIneligibleAdmission(
     alloc: std.mem.Allocator,
-    request: @import("../storage/db/online_merge_io_contract.zig").Request,
+    request: @import("antfly_local_sources").storage_db_online_merge_io_contract.Request,
 ) ![]u8 {
-    const facts: @import("../storage/db/online_merge_io_contract.zig").AdmissionFacts = .{
+    const facts: @import("antfly_local_sources").storage_db_online_merge_io_contract.AdmissionFacts = .{
         .namespace = if (request.operation.admission == .donor)
             request.scope.fence.namespace
         else
@@ -24349,7 +24349,7 @@ fn onlineMergeRaftBatchHasArtifactBarrier(req: antfly.db.types.BatchRequest) boo
     return false;
 }
 
-fn onlineMergeRevokeBatch(scope: @import("../storage/db/online_source_contract.zig").Scope, ordinary: ?@import("../storage/data_raft_projection_wire.zig").AppliedMergeSourceState) antfly.db.types.BatchRequest {
+fn onlineMergeRevokeBatch(scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope, ordinary: ?@import("../storage/data_raft_projection_wire.zig").AppliedMergeSourceState) antfly.db.types.BatchRequest {
     if (ordinary) |merge| if (merge.phase == .accepting and merge.transition_id == scope.fence.transition_id and merge.receiver_group_id == scope.fence.peer_group_id) {
         return .{ .merge_source_transition = .{ .kind = .rollback, .transition_id = merge.transition_id, .receiver_group_id = merge.receiver_group_id } };
     };
@@ -31946,9 +31946,9 @@ const MultiOwnerReplayStep = struct {
 };
 
 fn seedTransitionIntegrityRows(alloc: std.mem.Allocator, donor: *antfly.db.DB, receiver: *antfly.db.DB, receiver_json: []const u8) !void {
-    const integrity = @import("../storage/db/relational_integrity.zig");
-    const catalogs = @import("../storage/db/relational_integrity_catalog.zig");
-    const tuples = @import("../storage/db/relational_index_keys.zig");
+    const integrity = @import("antfly_local_sources").storage_db_relational_integrity;
+    const catalogs = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
+    const tuples = @import("antfly_local_sources").storage_db_relational_index_keys;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
@@ -31972,16 +31972,16 @@ fn seedTransitionIntegrityRows(alloc: std.mem.Allocator, donor: *antfly.db.DB, r
     const ids = [_]antfly.db.types.TxnId{ @splat(193), @splat(194) };
     for ([_]*antfly.db.DB{ donor, receiver }, 0..) |db, index| {
         const txn = try db.beginTransactionWithId(ids[index], 100);
-        try db.writeTransaction(txn, .{ .relational_schema_version = 1, .relational_integrity_generation_set = @import("../storage/db/relational_integrity_activation.zig").generationSet(catalog), .writes = &.{.{ .key = if (index == 0) "doc:b" else "doc:z", .value = if (index == 0) "{\"side\":\"donor\"}" else receiver_json }}, .integrity_commands = commands[index].items });
+        try db.writeTransaction(txn, .{ .relational_schema_version = 1, .relational_integrity_generation_set = @import("antfly_local_sources").storage_db_relational_integrity_activation.generationSet(catalog), .writes = &.{.{ .key = if (index == 0) "doc:b" else "doc:z", .value = if (index == 0) "{\"side\":\"donor\"}" else receiver_json }}, .integrity_commands = commands[index].items });
     }
     // All owners are prepared before any participant publishes the fixture.
     for ([_]*antfly.db.DB{ donor, receiver }, 0..) |db, index| try db.commitTransaction(ids[index], 200);
 }
 
 fn verifyTransitionIntegrityOwnership(alloc: std.mem.Allocator, db: *antfly.db.DB) !void {
-    const integrity = @import("../storage/db/relational_integrity.zig");
-    const catalogs = @import("../storage/db/relational_integrity_catalog.zig");
-    const tuples = @import("../storage/db/relational_index_keys.zig");
+    const integrity = @import("antfly_local_sources").storage_db_relational_integrity;
+    const catalogs = @import("antfly_local_sources").storage_db_relational_integrity_catalog;
+    const tuples = @import("antfly_local_sources").storage_db_relational_index_keys;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
@@ -32026,10 +32026,10 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     const internal_service_issuer = "data-runtime-vopr";
     const public_port_base: u16 = 24_100;
     const raft_port_base: u16 = 24_200;
-    var alloc_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var alloc_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
-    var tmp = @import("../common/test_directory.zig").fastTmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM and Raft image backends remain explicit differential boundaries
+    var tmp = @import("antfly_local_sources").common_test_directory.fastTmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM and Raft image backends remain explicit differential boundaries
     defer tmp.cleanup();
 
     var roots: [3][:0]u8 = undefined;
@@ -32155,7 +32155,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             // read contract as production instead of relying on data caches
             // to stand in for the catalog authority.
             if (std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog")) {
-                const catalog = @import("../system_catalog/domain.zig");
+                const catalog = @import("antfly_local_sources").system_catalog_domain;
                 const parsed = try std.json.parseFromSlice(@import("../system_catalog/server_call.zig").Call, response_alloc, request.body, .{});
                 defer parsed.deinit();
                 const body = switch (parsed.value) {
@@ -32261,7 +32261,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
             }
             return .{ .status = 404 };
         }
-        fn resolve(snapshot: *const antfly.metadata_api.AdminSnapshot, target: @import("../system_catalog/domain.zig").Target) ?@import("../system_catalog/domain.zig").ResolvedTable {
+        fn resolve(snapshot: *const antfly.metadata_api.AdminSnapshot, target: @import("antfly_local_sources").system_catalog_domain.Target) ?@import("antfly_local_sources").system_catalog_domain.ResolvedTable {
             if (!target.isDefault()) return null;
             for (snapshot.tables) |table| if (std.mem.eql(u8, table.name, target.table)) return .{ .table_id = table.table_id, .name = table.name };
             return null;
@@ -37465,18 +37465,18 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InvalidData));
             try std.testing.expectEqual(error.GenerationRetired, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.GenerationRetired).?.toError());
             try std.testing.expectEqual(error.InitialChildProvisionAlreadyCommitted, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InitialChildProvisionAlreadyCommitted).?.toError());
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
-                const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field);
+            inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.error_names.?) |field| {
+                const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field);
                 try std.testing.expectEqual(reason, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason).?.toError());
             }
-            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.error_names.?) |field| {
-                const reason = @field(@import("../storage/db/online_source_contract.zig").Rejection, field);
+            inline for (@typeInfo(@import("antfly_local_sources").storage_db_online_source_contract.Rejection).error_set.error_names.?) |field| {
+                const reason = @field(@import("antfly_local_sources").storage_db_online_source_contract.Rejection, field);
                 try std.testing.expectEqual(reason, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason).?.toError());
             }
             inline for (.{ error.OutOfMemory, error.RetainedEffectsCorrupt, error.RetainedEffectsTransactionFailed, error.OnlineSourceCorrupt, error.SourceSnapshotCorrupt }) |reason|
                 try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason));
 
-            const OwnerIdentity = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+            const OwnerIdentity = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
             const owner_identity: OwnerIdentity = if (comptime linked_storage) owner: {
                 var reply = (try linked_owner.owner.readSource().lookupGroupLocal(alloc, group_id, "docs", "", .{ .relational_topology_json = "{\"mode\":\"identity\"}" }, .stale)) orelse return error.TestExpectedEqual;
                 defer reply.deinit(alloc);
@@ -37489,7 +37489,7 @@ fn consumerTests() type {
                 const value = try lease.db().relationalTopologyIdentity();
                 break :owner .{ .namespace = value.namespace, .catalog_digest = value.catalog_digest, .next_epoch = value.next_epoch };
             };
-            const source_scope: @import("../storage/db/online_source_contract.zig").Scope = .{
+            const source_scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
                 .fence = .{ .admission_epoch = owner_identity.next_epoch, .transition_id = 901, .attempt = 1, .peer_group_id = 78, .owner_group_id = group_id, .role = .merge_source, .namespace = owner_identity.namespace, .catalog_digest = owner_identity.catalog_digest },
                 .receiver_namespace = .{ .table_id = 7, .shard_id = 78, .range_id = 78 },
                 .consumer_epoch = 1,
@@ -37849,13 +37849,13 @@ fn consumerTests() type {
             try std.testing.expect(server.localDataRaftLeaderReady(77));
 
             const Source = antfly.public_api.ProvisionedKernelOwnerSource;
-            const staging = @import("../storage/db/restore_staging_contract.zig");
+            const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
             const tables = @import("../api/tables.zig");
             var parsed_schema = try tables.parseValidatedTableSchema(alloc, "{}");
             defer parsed_schema.deinit(alloc);
             const schema = try tables.deriveRuntimeTableSchema(alloc, parsed_schema);
-            defer @import("../storage/schema.zig").freeSchema(alloc, schema);
-            const encoded_schema = try @import("../storage/schema.zig").serializeSchema(alloc, schema);
+            defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, schema);
+            const encoded_schema = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, schema);
             defer alloc.free(encoded_schema);
             const scope: staging.Scope = .{
                 .plan_id = @splat(1),
@@ -37888,7 +37888,7 @@ fn consumerTests() type {
                 evicted: bool = false,
                 recovered: usize = 0,
                 accepted_index: ?u64 = null,
-                fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("../api/operation.zig").RequestContext) !Source.OwnedRestoreDescriptor {
+                fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !Source.OwnedRestoreDescriptor {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try context.ensureActive();
                     try std.testing.expect(self.evicted);
@@ -41521,7 +41521,7 @@ fn consumerTests() type {
             defer alloc.free(root);
             var raw = try DataRaftApplyStore.init(alloc, .{ .root_dir = root, .native_source_delegate = true });
             defer raw.deinit();
-            const scope: @import("../storage/db/online_source_contract.zig").Scope = .{
+            const scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope = .{
                 .fence = .{ .transition_id = 9, .attempt = 1, .admission_epoch = 1, .owner_group_id = 77, .peer_group_id = 78, .role = .merge_source, .namespace = .{ .table_id = 7, .shard_id = 77, .range_id = 1 }, .catalog_digest = @splat(3) },
                 .receiver_namespace = .{ .table_id = 7, .shard_id = 78, .range_id = 2 },
                 .consumer_epoch = 1,
@@ -41605,7 +41605,7 @@ fn consumerTests() type {
             const negotiated = DataServer.raftBatchRequestForProtocol(explicit, true, 456);
             try std.testing.expectEqual(@as(u64, 123), negotiated.timestamp_ns);
 
-            const pages = @import("../storage/db/merge_page_contract.zig");
+            const pages = @import("antfly_local_sources").storage_db_merge_page_contract;
             var page_request: antfly.db.types.BatchRequest = .{
                 .writes = &.{.{ .key = "row", .value = "{ \"x\": 1 }" }},
                 .merge_replication = .{
@@ -41655,7 +41655,7 @@ fn consumerTests() type {
             // Receiver acceptance has an artifact adjunct but no online_source
             // command. It must remain valid across timestamp negotiation and
             // the real Raft codec, just like donor admission and row pages.
-            const inventory = @import("../storage/db/artifact_inventory.zig");
+            const inventory = @import("antfly_local_sources").storage_db_artifact_inventory;
             const catalogs: inventory.Catalogs = .{};
             const accept_request: antfly.db.types.BatchRequest = .{
                 .artifact_catalog = .{
@@ -42242,7 +42242,7 @@ fn consumerTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
             };
 
-            var fixture = try @import("../common/test_directory.zig").TestDirectory.init("ha-node");
+            var fixture = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("ha-node");
             defer fixture.cleanup();
             const primary_log = try std.fmt.allocPrintSentinel(alloc, "{s}-primary-log", .{fixture.path()}, 0);
             defer alloc.free(primary_log);
@@ -46470,8 +46470,8 @@ fn implementationTests() type {
 
         test "data runtime native FK retirement preserves source ownership and exact cold path" {
             const alloc = std.testing.allocator;
-            const hidden = @import("../storage/db/relational_initial_child_publication.zig");
-            const table_catalog = @import("../storage/db/table_catalog.zig");
+            const hidden = @import("antfly_local_sources").storage_db_relational_initial_child_publication;
+            const table_catalog = @import("antfly_local_sources").storage_db_table_catalog;
             var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
             defer runtime.deinit();
             var tmp = std.testing.tmpDir(.{});
@@ -46561,7 +46561,7 @@ fn implementationTests() type {
         }
 
         test "pure topology control bypasses only ordinary dense repair writer preflight" {
-            const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+            const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
             const fence: topology.Fence = .{
                 .role = .child_generation_dual,
                 .transition_id = 1,
@@ -46958,7 +46958,7 @@ fn implementationTests() type {
                 const metadata_root = try std.fs.path.join(scratch, &.{ fixture_root, "source-metadata" });
                 var source_metadata = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = metadata_root });
                 defer source_metadata.deinit();
-                const metadata_group = @import("../common/group_ids.zig").main_metadata_group_id;
+                const metadata_group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
                 var catalog_snapshot = try FakeMetadata.adminSnapshot(undefined);
                 defer FakeMetadata.freeAdminSnapshot(undefined, &catalog_snapshot);
                 try source_metadata.replaceStandaloneCatalog(metadata_group, 0, catalog_snapshot.tables, catalog_snapshot.ranges, "{}");
@@ -47006,7 +47006,7 @@ fn implementationTests() type {
                     fn private(ptr: *anyopaque, allocator: std.mem.Allocator, epoch: u64) !?std.json.Parsed(staging.ProvisioningProjection) {
                         const metadata = store(ptr);
                         if (try metadata.standaloneRevision() != epoch) return error.MetadataSnapshotHeadMismatch;
-                        var projection = try metadata.captureProvisioningCatalog(allocator, @import("../common/group_ids.zig").main_metadata_group_id);
+                        var projection = try metadata.captureProvisioningCatalog(allocator, @import("antfly_local_sources").common_group_ids.main_metadata_group_id);
                         defer projection.deinit(allocator);
                         var hidden_tables: std.ArrayList(antfly.metadata.TableRecord) = .empty;
                         defer hidden_tables.deinit(allocator);
@@ -47020,7 +47020,7 @@ fn implementationTests() type {
                     }
                     fn loadJobs(ptr: *anyopaque, allocator: std.mem.Allocator) ![]antfly.public_api.restore_jobs.ReplicatedPersistence.OwnedRow {
                         const metadata = store(ptr);
-                        const rows = try metadata.listRestoreJobRows(allocator, @import("../common/group_ids.zig").main_metadata_group_id);
+                        const rows = try metadata.listRestoreJobRows(allocator, @import("antfly_local_sources").common_group_ids.main_metadata_group_id);
                         errdefer metadata.freeRestoreJobRows(allocator, rows);
                         const result = try allocator.alloc(antfly.public_api.restore_jobs.ReplicatedPersistence.OwnedRow, rows.len);
                         for (rows, result) |row, *output| output.* = .{ .key = row.key, .value = row.value };
@@ -47028,7 +47028,7 @@ fn implementationTests() type {
                         return result;
                     }
                     fn getJob(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
-                        return store(ptr).getRestoreJobValue(allocator, @import("../common/group_ids.zig").main_metadata_group_id, key);
+                        return store(ptr).getRestoreJobValue(allocator, @import("antfly_local_sources").common_group_ids.main_metadata_group_id, key);
                     }
                     fn putJob(_: *anyopaque, _: []const u8, _: []const u8, _: u64) !void {
                         return error.TestUnexpectedResult;
@@ -47148,12 +47148,12 @@ fn implementationTests() type {
                 var standby = DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = post_seed_root, .replica_catalog_path = post_seed_catalog, .api_server_cfg = .{ .deployment_mode = .standalone } }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
                 defer standby.deinit();
                 standby.write_source.write_cache = &standby.provisioned_storage.write_cache;
-                const descriptor: @import("../storage/db/restore_staging.zig").OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = "{}", .indexes_json = "{}", .byte_range = .{ .start = "", .end = "" } };
+                const descriptor: @import("antfly_local_sources").storage_db_restore_staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = "{}", .indexes_json = "{}", .byte_range = .{ .start = "", .end = "" } };
                 const begin_payload = try antfly.hot_standby.effects.encodeBatchMutationWithRestoreBootstrapAlloc(scratch, .{ .restore_staging = .{ .begin = scope } }, descriptor);
                 const begin_record: antfly.hot_standby.replication_record.RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .table_id = 8, .shard_id = 88, .timeline_id = 1, .epoch = 1, .lsn = 1, .previous_lsn = 0, .payload = begin_payload };
-                try replication_ingress.applyRecord(&standby, begin_record);
+                try standby.applyHotStandbyReplicationRecord(begin_record);
                 try standby.write_source.clearWriteCache();
-                try replication_ingress.applyRecord(&standby, begin_record);
+                try standby.applyHotStandbyReplicationRecord(begin_record);
                 const cancel_payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .canceled } } });
                 var cancel_record = begin_record;
                 cancel_record.lsn = 2;
@@ -47166,7 +47166,7 @@ fn implementationTests() type {
                 var wrong_scope = scope.digest();
                 wrong_scope[0] ^= 1;
                 try std.testing.expectError(error.RestoreStagingScopeChanged, standby.write_source.retireCanceledRestoreOwner(alloc, 88, 8, wrong_scope, standby.replicaRetirementOwnership()));
-                try replication_ingress.applyRecord(&standby, cancel_record);
+                try standby.applyHotStandbyReplicationRecord(cancel_record);
                 _ = try std.Io.Dir.cwd().statFile(io_impl.io(), canceled_root, .{});
                 canceled_lease.deinit(alloc);
                 // Crash/restart after terminal acknowledgement and before cleanup:
@@ -47193,7 +47193,7 @@ fn implementationTests() type {
                 active_begin.lsn = 3;
                 active_begin.previous_lsn = 2;
                 active_begin.payload = try antfly.hot_standby.effects.encodeBatchMutationWithRestoreBootstrapAlloc(scratch, .{ .restore_staging = .{ .begin = active_descriptor.scope } }, active_descriptor);
-                try replication_ingress.applyRecord(&standby, active_begin);
+                try standby.applyHotStandbyReplicationRecord(active_begin);
 
                 // The replay-created group is absent from both public placement and
                 // the local Raft catalog. A later OFFLINE seed must still retain it.
@@ -47269,11 +47269,11 @@ fn implementationTests() type {
                     var next_seed = try next_standby.prepareDefaultHotStandbySeedSnapshot(alloc, .{ .capture_root = next_capture, .generation = "second-offline-reseed" });
                     defer next_seed.deinit(alloc);
                     // Terminal replay needs neither source schema nor a retained DB.
-                    try replication_ingress.applyRecord(&next_standby, cancel_record);
-                    try std.testing.expectError(error.RestoreStagingCanceled, replication_ingress.applyRecord(&next_standby, begin_record));
+                    try next_standby.applyHotStandbyReplicationRecord(cancel_record);
+                    try std.testing.expectError(error.RestoreStagingCanceled, next_standby.applyHotStandbyReplicationRecord(begin_record));
                     var wrong_cancel = cancel_record;
                     wrong_cancel.payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .restore_staging = .{ .finish = .{ .scope = active_descriptor.scope.digest(), .phase = .canceled } } });
-                    try std.testing.expectError(error.RestoreStagingScopeChanged, replication_ingress.applyRecord(&next_standby, wrong_cancel));
+                    try std.testing.expectError(error.RestoreStagingScopeChanged, next_standby.applyHotStandbyReplicationRecord(wrong_cancel));
                     wrong_cancel.payload = try antfly.hot_standby.effects.encodeBatchMutationRequestAlloc(scratch, .{ .writes = &.{.{ .key = "resurrect", .value = "{}" }}, .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .canceled } } });
                     try std.testing.expectError(error.InvalidBatchRequest, replication_ingress.applyRecord(&next_standby, wrong_cancel));
                     var terminal_view = try (try next_standby.hotStandbyRestoreTerminalLedger()).snapshot();
@@ -47298,8 +47298,8 @@ fn implementationTests() type {
                     try std.testing.expect(try compacted.get(88) == null);
                     try std.testing.expectEqual(active_begin.lsn, (try compacted.floor()).?.lsn);
                 }
-                try std.testing.expectError(error.HAReplayBelowReclamationFloor, replication_ingress.applyRecord(&standby, begin_record));
-                try std.testing.expectError(error.HAReplayBelowReclamationFloor, replication_ingress.applyRecord(&standby, cancel_record));
+                try std.testing.expectError(error.HAReplayBelowReclamationFloor, standby.applyHotStandbyReplicationRecord(begin_record));
+                try std.testing.expectError(error.HAReplayBelowReclamationFloor, standby.applyHotStandbyReplicationRecord(cancel_record));
                 const floor_seed_root = try std.fs.path.join(scratch, &.{ parent_absolute, "floor-seed-capture" });
                 var floor_seed = try standby.prepareDefaultHotStandbySeedSnapshot(alloc, .{ .capture_root = floor_seed_root, .generation = "terminal-floor-seed" });
                 defer floor_seed.deinit(alloc);
@@ -47385,7 +47385,7 @@ fn implementationTests() type {
         }
 
         test "data runtime guarded completed copy receipt requires exact current authority" {
-            const Receipt = @import("../storage/db/merge_contract.zig").CopyReceipt;
+            const Receipt = @import("antfly_local_sources").storage_db_merge_contract.CopyReceipt;
             const namespace: antfly.db.DocIdentityNamespace = .{ .table_id = 7, .shard_id = 74, .range_id = 741 };
             const contract: antfly.metadata.TransitionTableContract = .{
                 .table_id = 7,
@@ -47598,7 +47598,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 1), server.artifact_publication_queue.jobs);
             try std.testing.expectEqualStrings("owned command", successor.proposal.command);
             try std.testing.expectEqualStrings("items", successor.table_name.?);
-            const recovery: @import("../storage/db/artifact_publication_transport.zig").RecoveryHint = .{ .namespace = @splat(1), .publication_digest = @splat(3), .root = @splat(2), .created_index = 7 };
+            const recovery: @import("antfly_local_sources").storage_db_artifact_publication_transport.RecoveryHint = .{ .namespace = @splat(1), .publication_digest = @splat(3), .root = @splat(2), .created_index = 7 };
             const hint = recovery.encode();
             // Scheduler refusal releases the control reservation without
             // disturbing the in-flight producer's ownership or cursor.
@@ -47807,9 +47807,9 @@ fn implementationTests() type {
         test "data runtime private cancel proof recovers a restarted native terminal owner" {
             const alloc = std.testing.allocator;
             const staging = @import("../metadata/restore_staging.zig");
-            const native = @import("../storage/db/restore_staging.zig");
+            const native = @import("antfly_local_sources").storage_db_restore_staging;
             const private = @import("private_provisioning.zig");
-            const metadata_group = @import("../common/group_ids.zig").main_metadata_group_id;
+            const metadata_group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
             const Probe = struct {
                 fn admin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
                     return error.UnexpectedPublicCatalogLookup;
@@ -48320,7 +48320,7 @@ fn implementationTests() type {
                     // The metadata client owns one bounded retry for replay-safe
                     // control requests after a socket reset. Backoff begins only
                     // after that whole attempt finishes, not after its first send.
-                    const attempt_count: usize = if (!registered and @import("../common/http/http_common.zig").canonicalTransportError(transport_error) == error.ConnectionResetByPeer) 2 else 1;
+                    const attempt_count: usize = if (!registered and @import("antfly_local_sources").common_http_http_common.canonicalTransportError(transport_error) == error.ConnectionResetByPeer) 2 else 1;
                     const started_at_ms = server.backgroundMonotonicMs();
                     const requests_before = metadata_transport.requests;
                     try RuntimeRound.run(&server, &vopr_io);
@@ -55055,7 +55055,7 @@ fn implementationTests() type {
             // Zig's debug stack unwinder cannot walk a suspended fiber stack. Retain
             // allocation accounting while disabling only stack capture, as the other
             // production-shaped VOPR fixtures do.
-            var alloc_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+            var alloc_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             defer _ = alloc_state.deinit();
             const alloc = alloc_state.allocator();
             var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM backend remains an explicit differential boundary
@@ -55592,18 +55592,18 @@ fn implementationTests() type {
             }
             if (maintenance.failure) |err| return err;
             const edges = try receiver.getEdges(alloc, "gr_v1", "doc:b", "links", .out);
-            defer @import("../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
+            defer @import("antfly_local_sources").graph_graph.GraphIndex.freeEdges(alloc, edges);
             try std.testing.expectEqual(@as(usize, 1), edges.len);
             try std.testing.expectEqualStrings("doc:z", edges[0].target);
             const stale = try receiver.getEdges(alloc, "gr_v1", "doc:c", "links", .out);
-            defer @import("../graph/graph.zig").GraphIndex.freeEdges(alloc, stale);
+            defer @import("antfly_local_sources").graph_graph.GraphIndex.freeEdges(alloc, stale);
             try std.testing.expectEqual(@as(usize, 0), stale.len);
             const stale_artifact = try antfly.db.internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:c", "gr_v1", "links", "doc:q");
             defer alloc.free(stale_artifact);
             try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, stale_artifact));
             const due_rows = try receiver.core.store.scanPrefix(alloc, &antfly.db.internal_keys.graph_edge_expiration_index_prefix);
             defer antfly.db.docstore.DocStore.freeResults(alloc, due_rows);
-            for (due_rows) |row| switch (try @import("../storage/db/graph_edge_ttl_expiration.zig").decodeDue(row.value)) {
+            for (due_rows) |row| switch (try @import("antfly_local_sources").storage_db_graph_edge_ttl_expiration.decodeDue(row.value)) {
                 .direct => |candidate| try std.testing.expect(!std.mem.eql(u8, candidate.artifact_key, stale_artifact)),
                 .source => {},
             };
@@ -55818,7 +55818,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
             };
 
-            var fixture = try @import("../common/test_directory.zig").TestDirectory.init("ha-node");
+            var fixture = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("ha-node");
             defer fixture.cleanup();
             const standby_log = try std.fmt.allocPrintSentinel(alloc, "{s}-standby-log", .{fixture.path()}, 0);
             defer alloc.free(standby_log);

@@ -19,15 +19,23 @@
 //! graph. API query routing and serverless publication both use this policy.
 
 const std = @import("std");
-const common_config = @import("../common/config.zig");
-const common_secrets = @import("../common/secrets.zig");
-const catalog_binding = @import("external_source/catalog_binding.zig");
-const object_store_support = @import("object_store_support.zig");
-const remote_uri = @import("remote_uri.zig");
+const common_config = @import("antfly_local_sources").common_config;
+const common_secrets = @import("antfly_local_sources").common_secrets;
+const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
+const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 
 const Allocator = std.mem.Allocator;
 
 pub const BindingObjectStoreOpenOptions = struct {
+    /// Borrowed options must outlive synchronous lake source opening.
+    pub fn lakeOptions(self: *const @This()) @import("antfly_local_sources").serverless_lake_host.OpenOptions {
+        return .{ .file_bucket = self.file_bucket, .resolver = .{ .ptr = self, .open_fn = openLake } };
+    }
+    fn openLake(raw: *const anyopaque, alloc: Allocator, source: catalog_binding.Binding) anyerror!object_store_support.OpenedObjectStore {
+        const self: *const @This() = @ptrCast(@alignCast(raw));
+        return openBindingObjectStoreAlloc(alloc, source, self.*);
+    }
     file_bucket: []const u8 = "antfly",
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,

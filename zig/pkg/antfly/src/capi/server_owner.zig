@@ -17,7 +17,7 @@ const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const server_document_child_range = @import("../storage/server_document_child_range.zig");
 pub const storage_root = @import("antfly_source_root");
 pub const antfly = @import("../capi_root.zig");
-const handles = @import("handles.zig");
+const handles = @import("antfly_local_sources").capi_handles;
 pub const std = handles.std;
 pub const builtin = handles.builtin;
 pub const local_write = handles.local_write;
@@ -522,12 +522,12 @@ pub const StorageOwnerRuntimeHooks = struct {
         return .{ .ptr = self, .enqueue = enqueueArtifactPublication, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
     }
 
-    fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("../storage/db/artifact_publication.zig").UploadRecoveryTick) bool {
+    fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryTick) bool {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
         return self.artifact_upload_recovery.shouldPoll(tick);
     }
 
-    fn recoverArtifactUploads(ptr: *anyopaque, invocation: @import("../storage/db/artifact_publication.zig").UploadRecoveryInvocation) !bool {
+    fn recoverArtifactUploads(ptr: *anyopaque, invocation: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryInvocation) !bool {
         const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
         return self.artifact_upload_recovery.advance(self.artifactPublicationDispatcher().?, invocation);
     }
@@ -914,7 +914,7 @@ pub fn storageOwnerContextMetrics(
     };
     const resources = owner_context.resources.resource_manager.snapshot();
     out_result.resource_memory = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(resources.memory);
-    comptime std.debug.assert(@import("../storage/resource_manager.zig").slice_count <= kernel_owner_abi.context_resource_slice_capacity);
+    comptime std.debug.assert(@import("antfly_local_sources").storage_resource_manager.slice_count <= kernel_owner_abi.context_resource_slice_capacity);
     const slice_count = resources.slices.len;
     out_result.resource_slice_count = @intCast(slice_count);
     for (resources.slices[0..slice_count], out_result.resource_slices[0..slice_count]) |slice, *out| {
@@ -6256,3 +6256,7 @@ pub fn releaseServerContext(context_ptr: *anyopaque) void {
     const context: *StorageOwnerContext = @ptrCast(@alignCast(context_ptr));
     context.release();
 }
+
+pub const test_support = if (@import("builtin").is_test) struct {
+    pub const transactionRecoveryConfig = StorageOwnerTransactionRecovery.serverConfig;
+} else struct {};

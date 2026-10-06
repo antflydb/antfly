@@ -15,7 +15,7 @@
 //! Stable server routing for local visibility observations. The DB callback
 //! detachment barrier owns the lifetime of the binding and its borrowed route.
 const std = @import("std");
-const db = @import("db/db.zig");
+const db = @import("antfly_local_sources").storage_db_db;
 pub const Binding = struct {
     pub const Route = struct {
         ptr: *anyopaque,

@@ -15,7 +15,7 @@
 const std = @import("std");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const metadata_server_openapi = @import("antfly_metadata_server_openapi");
-const query_contract = @import("query_contract.zig");
+const query_contract = @import("antfly_local_sources").api_query_contract;
 const http_common = @import("../raft/transport/http_common.zig");
 
 pub fn jsonResponse(alloc: std.mem.Allocator, value: anytype) !http_common.HttpResponse {
@@ -122,7 +122,7 @@ pub const OwnedLookupOptions = struct {
     relational_activation_json: []const u8 = "",
     relational_index_status_json: []const u8 = "",
     relational_topology_json: []const u8 = "",
-    opts: @import("../storage/db/types.zig").LookupOptions = .{},
+    opts: @import("antfly_local_sources").storage_db_types.LookupOptions = .{},
 
     pub fn deinit(self: *OwnedLookupOptions, alloc: std.mem.Allocator) void {
         if (self.relational_integrity_jobs_json.len != 0) alloc.free(self.relational_integrity_jobs_json);
@@ -141,7 +141,7 @@ pub const OwnedScanKeysRequest = struct {
     fields: [][]const u8 = &.{},
     filter_query_json: []const u8 = "",
     relational_query_json: []const u8 = "",
-    opts: @import("../storage/db/types.zig").ScanOptions = .{},
+    opts: @import("antfly_local_sources").storage_db_types.ScanOptions = .{},
 
     pub fn deinit(self: *OwnedScanKeysRequest, alloc: std.mem.Allocator) void {
         if (self.from.len > 0) alloc.free(self.from);
@@ -365,7 +365,7 @@ pub fn parseRelationalRowQueryRequest(alloc: std.mem.Allocator, body: []const u8
     if (req.index) |name| {
         if (name.len == 0 or req.schema_version == null or req.from != null or req.to != null) return error.InvalidQueryRequest;
     } else if (req.after != null or req.lower != null or req.upper != null) return error.InvalidQueryRequest;
-    if (req.after) |cursor| @import("../storage/db/relational_row_cursor.zig").validate(cursor) catch return error.InvalidQueryRequest;
+    if (req.after) |cursor| @import("antfly_local_sources").storage_db_relational_row_cursor.validate(cursor) catch return error.InvalidQueryRequest;
     inline for (.{ "lower", "upper" }) |field| if (@field(req, field)) |bound| {
         if (bound.values.len == 0 or bound.values.len > 256) return error.InvalidQueryRequest;
     };
@@ -522,7 +522,7 @@ pub const ScanRequestError = struct {
 
 /// Public responses deliberately hide internal read failures. Preserve the
 /// cause operationally without allowing a failing read loop to flood logs.
-pub const RelationalReadDiagnosticGate = @import("bounded_diagnostic_gate.zig").Gate;
+pub const RelationalReadDiagnosticGate = @import("antfly_local_sources").api_bounded_diagnostic_gate.Gate;
 
 test "relational row query diagnostics bound repeated unavailable responses" {
     var gate: RelationalReadDiagnosticGate = .{};

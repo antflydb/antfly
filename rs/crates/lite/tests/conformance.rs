@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Runs the shared libantfly conformance cases (see
-//! `zig/pkg/antfly/capi-conformance/README.md`) through this crate's public
+//! `zig/pkg/antfly-embedded/capi-conformance/README.md`) through this crate's public
 //! API, porting `go/pkg/lite/conformance_cgo_test.go`'s semantics exactly.
 //! Requires linking against the real library (`--features libantfly`).
 
@@ -42,7 +42,7 @@ fn conformance_cases() {
 /// Beyond the shared conformance suite: a `.aflite` backup restores into a
 /// normal Antfly directory (`RestoreOptions { storage: Storage::Directory,
 /// .. }`), and the resulting directory database survives a close/reopen
-/// cycle with its documents intact. See `zig/pkg/antfly/capi-conformance/
+/// cycle with its documents intact. See `zig/pkg/antfly-embedded/capi-conformance/
 /// cases/directory_storage.json` and `backup_across_storage.json` for the
 /// declarative cases this exercises via other bindings too; this test adds
 /// an explicit reopen after the restore, which the shared cases do not.
@@ -134,7 +134,7 @@ fn restore_into_directory_storage_and_reopen_inner() {
 
 fn conformance_cases_inner() {
     let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../zig/pkg/antfly/capi-conformance/cases");
+        .join("../../../zig/pkg/antfly-embedded/capi-conformance/cases");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&cases_dir)
         .unwrap_or_else(|e| panic!("read_dir {}: {e}", cases_dir.display()))
         .filter_map(|entry| entry.ok().map(|e| e.path()))

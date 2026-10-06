@@ -4,7 +4,7 @@
 //! Physical HA seed capture shared by inline and compiled storage owners.
 const std = @import("std");
 const Io = std.Io;
-const backups_api = @import("../../api/local_backups.zig");
+const backups_api = @import("antfly_local_sources").api_local_backups;
 
 pub fn capture(alloc: std.mem.Allocator, db: anytype, db_path: []const u8, snapshot_token: []const u8, destination_root: []const u8) !void {
     switch (db.primary_backend) {

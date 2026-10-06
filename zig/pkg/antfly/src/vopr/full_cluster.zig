@@ -17,7 +17,7 @@ const production_cluster = @import("production_cluster.zig");
 const replication_backfill_vopr = @import("replication_backfill.zig");
 const serverless_workflow = @import("serverless_workflow.zig");
 const serverless_runtime = @import("../serverless/runtime/manager.zig");
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const FixtureAllocator = std.heap.SafeAllocator;
 
 pub const Scenario = struct {
     pub const name: []const u8 = "full-cluster";
@@ -931,7 +931,7 @@ pub const Scenario = struct {
             // teardown ownership when the allocator reuses a released State.
             self.* = .{
                 .owner_alloc = alloc,
-                .fixture_allocator = .init,
+                .fixture_allocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 }),
                 .sim = undefined,
                 .service_rate_model = undefined,
                 .data_service_rate_adapters = undefined,
@@ -1072,7 +1072,7 @@ pub const Scenario = struct {
         pub fn deinit(self: *State) void {
             self.releaseRuntime();
             self.sim.deinit();
-            std.debug.assert(self.fixture_allocator.deinit() == .ok);
+            std.debug.assert(self.fixture_allocator.deinit() == 0);
             self.owner_alloc.destroy(self);
         }
 
@@ -3395,8 +3395,8 @@ pub fn recordStandbyScaling(alloc: std.mem.Allocator, seed: u64, transition_budg
 
 test "production standby scaling VOPR exact replays bounded startup cleanup" {
     for ([_]u64{ 1, 2, 4, 8, 16, 32 }) |budget| {
-        var history_allocator: FixtureAllocator = .init;
-        defer std.debug.assert(history_allocator.deinit() == .ok);
+        var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+        defer std.debug.assert(history_allocator.deinit() == 0);
         const alloc = history_allocator.allocator();
         var choices = vopr.choice.PrefixedCooperativeSeeded.init(&.{}, 42);
         const backends = vopr.vopr_io.artifactBackendIds();
@@ -3421,8 +3421,8 @@ test "production standby scaling VOPR exact replays bounded startup cleanup" {
 }
 
 test "production standby scaling VOPR exact replays standby promotion automatic sharding and drain" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const alloc = history_allocator.allocator();
     var recorded = try recordStandbyScaling(alloc, 0x4655_4c4c + Scenario.production_split_ordinal, 600_000);
     defer recorded.deinit();
@@ -3716,8 +3716,8 @@ fn runExactMode(
 }
 
 test "full cluster VOPR bounded startup cleanup exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = @backingInt(Scenario.Mode.clean);
     for ([_]u64{ 1, 32, 512, 8192 }) |budget| {
         try runExactMode(
@@ -3734,8 +3734,8 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
     // Stackful fibers make host unwinding both expensive and unsafe. Preserve
     // leak and ownership checking while keeping stack capture disabled, as the
     // production-sized fixtures below already do.
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const history_alloc = history_allocator.allocator();
     // Keep the promoted aggregate on its last green contract. Experimental
     // modes receive a distinct focused gate and join this slice only after
@@ -3759,29 +3759,29 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
 test "full cluster VOPR graph inflight restart repeated exact replay" {
     const ordinal = @backingInt(Scenario.Mode.graph_inflight_restart);
     for (0..3) |_| {
-        var history_allocator: FixtureAllocator = .init;
-        defer std.debug.assert(history_allocator.deinit() == .ok);
+        var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+        defer std.debug.assert(history_allocator.deinit() == 0);
         try runExactMode(history_allocator.allocator(), Scenario.mode_ids[ordinal], ordinal, 50_000, .complete);
     }
 }
 
 test "full cluster graph inflight restart cutoff drains parked hooks" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = @backingInt(Scenario.Mode.graph_inflight_restart);
     try runExactMode(history_allocator.allocator(), Scenario.mode_ids[ordinal], ordinal, 19_474, .bounded_lifecycle);
 }
 
 test "full cluster VOPR exact replays resource pressure recovery" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = @backingInt(Scenario.Mode.resource_pressure);
     try runExactMode(history_allocator.allocator(), Scenario.mode_ids[ordinal], ordinal, 50_000, .complete);
 }
 
 test "full cluster production data plane VOPR active split exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_split_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3793,8 +3793,8 @@ test "full cluster production data plane VOPR active split exact replay" {
 }
 
 test "full cluster production data plane graph exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3806,8 +3806,8 @@ test "full cluster production data plane graph exact replay" {
 }
 
 test "full cluster production data plane graph active split exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_split_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3819,8 +3819,8 @@ test "full cluster production data plane graph active split exact replay" {
 }
 
 test "full cluster production data plane graph active split transport failure exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_split_transport_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3832,8 +3832,8 @@ test "full cluster production data plane graph active split transport failure ex
 }
 
 test "full cluster production data plane graph active split owner restart exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_split_owner_restart_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3845,8 +3845,8 @@ test "full cluster production data plane graph active split owner restart exact 
 }
 
 test "full cluster production data plane graph active split partial write exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_split_partial_write_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3858,8 +3858,8 @@ test "full cluster production data plane graph active split partial write exact 
 }
 
 test "full cluster production data plane graph active split resource pressure exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_split_resource_pressure_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3871,8 +3871,8 @@ test "full cluster production data plane graph active split resource pressure ex
 }
 
 test "full cluster production data plane distributed join active split exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_join_split_ordinal;
     // Abort while routing and ingress requests still own resources. A clean
     // successful history alone does not certify replay-error teardown.
@@ -3893,8 +3893,8 @@ test "full cluster production data plane distributed join active split exact rep
 }
 
 test "full cluster production data plane durable shuffle join finalizer takeover exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_durable_join_takeover_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3906,8 +3906,8 @@ test "full cluster production data plane durable shuffle join finalizer takeover
 }
 
 test "full cluster production durable shuffle join cancellation exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_durable_join_cancellation_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3919,8 +3919,8 @@ test "full cluster production durable shuffle join cancellation exact replay" {
 }
 
 test "full cluster production durable shuffle partition worker failover exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_durable_join_worker_retry_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3932,8 +3932,8 @@ test "full cluster production durable shuffle partition worker failover exact re
 }
 
 test "full cluster production durable shuffle partition owner reconstruction exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_durable_join_owner_restart_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3945,8 +3945,8 @@ test "full cluster production durable shuffle partition owner reconstruction exa
 }
 
 test "full cluster production durable shuffle overlapping fault retry exhaustion exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_durable_join_retry_exhaustion_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3958,8 +3958,8 @@ test "full cluster production durable shuffle overlapping fault retry exhaustion
 }
 
 test "full cluster production durable shuffle cancellation under overlapping faults exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_durable_join_cancellation_overlap_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3971,8 +3971,8 @@ test "full cluster production durable shuffle cancellation under overlapping fau
 }
 
 test "full cluster production durable shuffle cancellation with owner reconstruction exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_durable_join_cancellation_owner_restart_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3984,8 +3984,8 @@ test "full cluster production durable shuffle cancellation with owner reconstruc
 }
 
 test "full cluster production data plane graph active split overlapping link resource faults exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_split_overlapping_faults_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -3997,8 +3997,8 @@ test "full cluster production data plane graph active split overlapping link res
 }
 
 test "full cluster production data plane graph active split socket pressure exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_split_socket_pressure_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4010,8 +4010,8 @@ test "full cluster production data plane graph active split socket pressure exac
 }
 
 test "full cluster production service rates compose heal and exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_service_rate_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4023,8 +4023,8 @@ test "full cluster production service rates compose heal and exact replay" {
 }
 
 test "full cluster production query embedding cache deadline owner restart and exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_query_cache_service_rate_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4038,8 +4038,8 @@ test "full cluster production query embedding cache deadline owner restart and e
 // Keep this production-sized scenario out of the broad `serverless` unit shard.
 // Its bounded CI target is `production-cluster-serverless-fencing-vopr-test`.
 test "full cluster production generation progress conflict exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_serverless_fencing_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4051,8 +4051,8 @@ test "full cluster production generation progress conflict exact replay" {
 }
 
 test "full cluster production authenticated tenant isolation exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_authenticated_tenant_isolation_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4064,8 +4064,8 @@ test "full cluster production authenticated tenant isolation exact replay" {
 }
 
 test "full cluster production disk capacity pressure exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_disk_capacity_pressure_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4077,8 +4077,8 @@ test "full cluster production disk capacity pressure exact replay" {
 }
 
 test "full cluster production managed index publication bounded lifecycle exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_managed_index_publication_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4090,8 +4090,8 @@ test "full cluster production managed index publication bounded lifecycle exact 
 }
 
 test "full cluster production replication backfill crosses public data raft and exact replays" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_replication_backfill_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4103,8 +4103,8 @@ test "full cluster production replication backfill crosses public data raft and 
 }
 
 test "full cluster production replication schema change resumes through public data raft and exact replays" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_replication_schema_change_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4116,8 +4116,8 @@ test "full cluster production replication schema change resumes through public d
 }
 
 test "full cluster production replication target owner restarts resumes and exact replays" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_replication_owner_restart_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4129,8 +4129,8 @@ test "full cluster production replication target owner restarts resumes and exac
 }
 
 test "full cluster production replication source session crashes resumes and exact replays" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_replication_source_crash_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4142,8 +4142,8 @@ test "full cluster production replication source session crashes resumes and exa
 }
 
 test "full cluster production replication durable cancellation resumes and exact replays" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_replication_cancellation_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4155,8 +4155,8 @@ test "full cluster production replication durable cancellation resumes and exact
 }
 
 test "full cluster production replication stale owner replays undurable batch and exact replays" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_replication_stale_owner_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4168,8 +4168,8 @@ test "full cluster production replication stale owner replays undurable batch an
 }
 
 test "full cluster production replication metadata topology rotates cutover authority and exact replays" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_replication_topology_change_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4181,8 +4181,8 @@ test "full cluster production replication metadata topology rotates cutover auth
 }
 
 test "full cluster production public graph hydration exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_hydration_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4194,8 +4194,8 @@ test "full cluster production public graph hydration exact replay" {
 }
 
 test "full cluster production public graph cancellation exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_cancellation_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4207,8 +4207,8 @@ test "full cluster production public graph cancellation exact replay" {
 }
 
 test "full cluster production public graph cancellation under transport fault exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_cancellation_transport_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4220,8 +4220,8 @@ test "full cluster production public graph cancellation under transport fault ex
 }
 
 test "full cluster production public graph inflight authorization revocation exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_authorization_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4233,8 +4233,8 @@ test "full cluster production public graph inflight authorization revocation exa
 }
 
 test "full cluster production public graph stale snapshot retry exhaustion exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_graph_stale_snapshot_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4246,8 +4246,8 @@ test "full cluster production public graph stale snapshot retry exhaustion exact
 }
 
 test "full cluster production public global query exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_global_query_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4259,8 +4259,8 @@ test "full cluster production public global query exact replay" {
 }
 
 test "full cluster production public global query cancellation exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_global_query_cancellation_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4272,8 +4272,8 @@ test "full cluster production public global query cancellation exact replay" {
 }
 
 test "full cluster production public global query inflight authorization revocation exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_global_query_authorization_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4285,8 +4285,8 @@ test "full cluster production public global query inflight authorization revocat
 }
 
 test "full cluster production public global query transport failure exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_global_query_transport_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4298,8 +4298,8 @@ test "full cluster production public global query transport failure exact replay
 }
 
 test "full cluster production public global query owner restart exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_global_query_owner_restart_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4311,8 +4311,8 @@ test "full cluster production public global query owner restart exact replay" {
 }
 
 test "full cluster production data plane VOPR bounded cutoff exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_split_ordinal;
     try runExactMode(
         history_allocator.allocator(),
@@ -4324,8 +4324,8 @@ test "full cluster production data plane VOPR bounded cutoff exact replay" {
 }
 
 test "full cluster production data plane baseline exact replay" {
-    var history_allocator: FixtureAllocator = .init;
-    defer std.debug.assert(history_allocator.deinit() == .ok);
+    var history_allocator: FixtureAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(history_allocator.deinit() == 0);
     const ordinal = Scenario.production_baseline_ordinal;
     try runExactMode(
         history_allocator.allocator(),

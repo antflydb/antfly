@@ -4,7 +4,7 @@
 //! schema. Reconciliation and the metadata FK-lock admission check must use
 //! the same transformation; neither may retire the old read layout early.
 const std = @import("std");
-const records = @import("../common/topology_records.zig");
+const records = @import("antfly_local_sources").common_topology_records;
 const tables = @import("../api/tables.zig");
 
 /// `table` owns its strings and remains owned by the caller after mutation.

@@ -16,13 +16,13 @@
 //! Local DB methods own the durable mutation/receipt transaction and pin safety.
 const std = @import("std");
 const builtin = @import("builtin");
-const types = @import("db/types.zig");
+const types = @import("antfly_local_sources").storage_db_types;
 const snapshots = @import("../raft/storage/native_snapshot.zig");
 
 fn physicalOwner(owner: anytype) if (@typeInfo(@TypeOf(owner.*)) == .pointer) @TypeOf(owner.*) else @TypeOf(owner) {
     return if (@typeInfo(@TypeOf(owner.*)) == .pointer) owner.* else owner;
 }
-const requiresDurableLifecycleReplication = @import("db/replication_contract.zig").requiresDurableLifecycleReplication;
+const requiresDurableLifecycleReplication = @import("antfly_local_sources").storage_db_replication_contract.requiresDurableLifecycleReplication;
 
 pub fn applyOrdered(
     owner: anytype,
@@ -62,7 +62,7 @@ pub fn applyOrdered(
     var apply_req = req;
     apply_req.sync_level = .write;
     if (req.artifact_catalog != null) if (req.online_source != null or req.merge_checkpoint != null) {
-        try @import("db/artifact_inventory.zig").validateRequest(req);
+        try @import("antfly_local_sources").storage_db_artifact_inventory.validateRequest(req);
         try db.reconcileReplicatedArtifactAdmission(req, identity);
     };
     db.applyOrderedCommittedMutation(apply_req, identity, !mirror_scoped_restore) catch |err| switch (err) {
@@ -103,7 +103,7 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     // when it catches up; validating against that schema would make apply
     // order depend on metadata delivery and can even reject an already
     // applied entry before the native marker gets a chance to short-circuit.
-    @import("../api/local_write_test_hooks.zig").runTestBeforeBatchExecutionHook();
+    @import("antfly_local_sources").api_local_write_test_hooks.runTestBeforeBatchExecutionHook();
     if (req.transaction != null)
         try @import("server_transaction_dispatch.zig").applyReplicatedTransactionMutationAtRaftEntry(alloc, db, table_name, group_id, req, raft_entry)
     else
@@ -113,12 +113,12 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
 /// The seed coordinator verifies the complete manifest and every artifact before
 /// installation, then publishes the repaired staged generation before reads.
 pub fn restoreAuthenticatedReplicaToStagedGeneration(
-    staged: *const @import("db/generation_lifecycle.zig").StagedGeneration,
+    staged: *const @import("antfly_local_sources").storage_db_generation_lifecycle.StagedGeneration,
     alloc: std.mem.Allocator,
     snapshot_root: []const u8,
     path: []const u8,
     opts: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions,
-    namespace: @import("db/doc_identity.zig").Namespace,
+    namespace: @import("antfly_local_sources").storage_db_doc_identity.Namespace,
 ) !void {
     try @import("antfly_source_root").antfly_sources.physical_db.DB.restoreIdentityPreservingSnapshotToStagedGeneration(staged, alloc, snapshot_root, path, opts, namespace);
 }

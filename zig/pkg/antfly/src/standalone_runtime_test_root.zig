@@ -15,8 +15,8 @@
 pub const runtime = @import("standalone/runtime.zig");
 pub const inference_host = @import("antfly_inference_host");
 pub const inference_client = @import("standalone/inference_client.zig");
-pub const storage_backend_erased = @import("storage/backend_erased.zig");
-pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
+pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
+pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
 
 test {
     _ = @import("antfly_inference_worker_rpc");
@@ -32,3 +32,6 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

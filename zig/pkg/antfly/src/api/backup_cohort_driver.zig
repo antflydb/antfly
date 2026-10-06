@@ -16,18 +16,18 @@
 //! remain owned by backups.zig; this adapter never holds a write fence across
 //! an upload and never substitutes a fresh snapshot for a missing durable pin.
 const std = @import("std");
-const cohort = @import("../metadata/backup_cohort.zig");
+const cohort = @import("antfly_local_sources").metadata_backup_cohort;
 const metadata = @import("../metadata/table_manager.zig");
 const metadata_api = @import("../metadata/api.zig");
-const operation = @import("operation.zig");
-const reads = @import("table_read_source.zig");
-const writes = @import("table_write_source.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const reads = @import("antfly_local_sources").api_table_read_source;
+const writes = @import("antfly_local_sources").api_table_write_source;
 const router_api = @import("table_router.zig");
 const catalog_api = @import("table_catalog.zig");
-const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
-const identity = @import("../storage/db/doc_identity.zig");
-const seal = @import("../storage/db/native_backup_seal.zig");
-var diagnostic_gate: @import("bounded_diagnostic_gate.zig").Gate = .{};
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
+const identity = @import("antfly_local_sources").storage_db_doc_identity;
+const seal = @import("antfly_local_sources").storage_db_native_backup_seal;
+var diagnostic_gate: @import("antfly_local_sources").api_bounded_diagnostic_gate.Gate = .{};
 
 pub fn idForAttempt(attempt: []const u8) u64 {
     var hash = std.crypto.hash.Blake3.init(.{});
@@ -79,7 +79,7 @@ pub fn Session(comptime Source: type) type {
                     try request.ensureActive();
                     var response = (try read.topologyStatus(alloc, table.name, range.start_key, "{\"mode\":\"identity\"}")) orelse return error.TableNotFound;
                     defer response.deinit(alloc);
-                    const Identity = @import("../storage/db/relational_integrity_topology_contract.zig").Identity;
+                    const Identity = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Identity;
                     const native = try std.json.parseFromSlice(Identity, a, response.json, .{ .allocate = .alloc_always });
                     if (!native.value.backup_seal_supported) return error.BackupSealBackendUnsupported;
                     if (native.value.namespace.table_id != table.table_id) return error.CatalogChanged;

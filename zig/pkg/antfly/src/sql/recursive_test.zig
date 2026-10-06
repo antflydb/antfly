@@ -1,10 +1,10 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const ast = @import("ast.zig");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
-const catalog = @import("catalog.zig");
+const ast = @import("antfly_local_sources").sql_ast;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
+const catalog = @import("antfly_local_sources").sql_catalog;
 
 const Fixture = struct {
     checkpoints: usize = 0,

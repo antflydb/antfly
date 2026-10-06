@@ -21,7 +21,7 @@
 //! to drift from the runtime classifier.
 
 const std = @import("std");
-const http_common = @import("../../common/http/http_common.zig");
+const http_common = @import("antfly_local_sources").common_http_http_common;
 const routes = @import("../../api/http_routes.zig");
 
 pub const Disposition = enum {

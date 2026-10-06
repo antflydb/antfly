@@ -5,6 +5,7 @@ pub const types = @import("types.zig");
 
 pub const AntflyGeneratorConfig = types.AntflyGeneratorConfig;
 pub const AnthropicGeneratorConfig = types.AnthropicGeneratorConfig;
+pub const AppleGeneratorConfig = types.AppleGeneratorConfig;
 pub const BedrockGeneratorConfig = types.BedrockGeneratorConfig;
 pub const ChainCondition = types.ChainCondition;
 pub const ChainLink = types.ChainLink;

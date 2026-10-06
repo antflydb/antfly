@@ -14,13 +14,13 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const graph_edge_type = @import("../../graph/edge_type.zig");
+const graph_edge_type = @import("antfly_local_sources").graph_edge_type;
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const request_mod = @import("request.zig");
 const runtime_mod = @import("runtime.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const work_budget_mod = @import("../../graph/work_budget.zig");
+const work_budget_mod = @import("antfly_local_sources").graph_work_budget;
 
 /// Retain distinct traversal identities, not visited adjacency. Streaming
 /// cursors share one I/O/work/memory allowance across the entire query.

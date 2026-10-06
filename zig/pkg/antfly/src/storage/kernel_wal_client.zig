@@ -47,7 +47,7 @@ pub const WalOptions = struct {
     commit_backend: CommitBackend = .adaptive,
     backend: ?StorageBackend = null,
     read_only: bool = false,
-    clock: @import("sim_runtime.zig").Clock = @import("sim_runtime.zig").real_clock,
+    clock: @import("antfly_local_sources").storage_sim_runtime.Clock = @import("antfly_local_sources").storage_sim_runtime.real_clock,
     model_commit_backend_completions: bool = false,
 
     pub fn resolvedBackend(self: WalOptions) StorageBackend {
@@ -56,7 +56,7 @@ pub const WalOptions = struct {
 };
 
 pub const WAL = struct {
-    clock: @import("sim_runtime.zig").Clock,
+    clock: @import("antfly_local_sources").storage_sim_runtime.Clock,
     handle: ?*anyopaque = null,
 
     pub const ScanAction = WalScanAction;
@@ -285,7 +285,7 @@ fn validateOptions(opts: anytype) !void {
         if (!std.meta.eql(opts.lsm_options, @TypeOf(opts.lsm_options){})) return error.UnsupportedKernelWalOptions;
     }
     if (@hasField(@TypeOf(opts), "commit_scheduler")) {
-        if (!std.meta.eql(opts.commit_scheduler, @import("sim_runtime.zig").real_completion_scheduler)) return error.UnsupportedKernelWalOptions;
+        if (!std.meta.eql(opts.commit_scheduler, @import("antfly_local_sources").storage_sim_runtime.real_completion_scheduler)) return error.UnsupportedKernelWalOptions;
     }
-    if (!std.meta.eql(opts.clock, @import("sim_runtime.zig").real_clock)) return error.UnsupportedKernelWalOptions;
+    if (!std.meta.eql(opts.clock, @import("antfly_local_sources").storage_sim_runtime.real_clock)) return error.UnsupportedKernelWalOptions;
 }
