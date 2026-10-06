@@ -28,6 +28,56 @@ const unicode_classes = @import("unicode_classes.zig");
 const unicode_normalizer = @import("unicode_normalizer.zig");
 const unicode_punctuation_data = @import("unicode_punctuation_data.zig");
 
+/// Zig/WebAssembly supports atomics only up to the target's pointer width.
+/// The browser build is explicitly single-threaded, so keep 64-bit profiling
+/// counters non-atomic there while preserving native atomic behavior.
+const AtomicU64 = if (builtin.cpu.arch == .wasm32 and builtin.single_threaded)
+    SingleThreadedU64
+else
+    std.atomic.Value(u64);
+
+const SingleThreadedU64 = extern struct {
+    raw: u64,
+
+    const Self = @This();
+
+    fn init(value: u64) Self {
+        return .{ .raw = value };
+    }
+
+    fn load(self: *const Self, comptime _: std.builtin.AtomicOrder) u64 {
+        return self.raw;
+    }
+
+    fn store(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) void {
+        self.raw = value;
+    }
+
+    fn swap(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw = value;
+        return previous;
+    }
+
+    fn fetchAdd(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw +%= value;
+        return previous;
+    }
+
+    fn fetchSub(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw -%= value;
+        return previous;
+    }
+
+    fn fetchOr(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw |= value;
+        return previous;
+    }
+};
+
 const ModelType = enum { word_piece, bpe, unigram };
 
 const PreTokenizerType = enum {

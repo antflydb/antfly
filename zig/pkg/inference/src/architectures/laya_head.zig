@@ -26,47 +26,11 @@ fn weight(cb: *const CB, prefix: []const u8, suffix: []const u8) !CT {
     return cb.getWeight(try std.fmt.bufPrint(&buf, "model.{s}.{s}", .{ prefix, suffix }));
 }
 fn linear(cb: *const CB, x: CT, prefix: []const u8, rows: usize, input: usize, output: usize) !CT {
-    return linearWithSlot(cb, x, prefix, rows, input, output, null);
-}
-fn linearWithSlot(cb: *const CB, x: CT, prefix: []const u8, rows: usize, input: usize, output: usize, slot: ?usize) !CT {
-    if (slot) |id| if (try cb.decoderRuntimeApplyLinear(&.{ .slot = id, .input = x, .in_dim = input, .out_dim = output })) |result| return result;
     const w = try weight(cb, prefix, "weight");
     defer cb.free(w);
     const b = try weight(cb, prefix, "bias");
     defer cb.free(b);
     return cb.linear(x, w, b, rows, input, output);
-}
-fn prepareLinear(cb: *const CB, prefix: []const u8, w_name: []const u8, b_name: []const u8, slot: usize, input: usize, output: usize) !void {
-    if (cb.decoderRuntimeLinearSlotPrepared(slot, input, output)) return;
-    const w = try weight(cb, prefix, w_name);
-    defer cb.free(w);
-    const b = try weight(cb, prefix, b_name);
-    defer cb.free(b);
-    if (!try cb.decoderRuntimePrepareLinear(&.{ .slot = slot, .weight = w, .bias = b, .in_dim = input, .out_dim = output, .retain_dense_fallback = false })) return error.UnsupportedLayaBackend;
-}
-
-fn headSlot(base: ?usize, offset: usize) ?usize {
-    return if (base) |b| b + offset else null;
-}
-
-// Slots live on the session's Metal provider, after the encoder's slots. They
-// must not be dynamic request-owned slots, which would re-upload every request.
-fn prepareMetalHeads(cb: *const CB, cfg: Config, dim: usize, base: usize) !void {
-    if (base + cfg.head_layers * 4 + 4 > 1024) return error.UnsupportedLayaBackend;
-    for (0..cfg.head_layers) |layer| {
-        var buf: [160]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&buf, "head.layers.{d}", .{layer});
-        try prepareLinear(cb, prefix, "self_attn.in_proj_weight", "self_attn.in_proj_bias", base + layer * 4, dim, dim * 3);
-        var name: [192]u8 = undefined;
-        try prepareLinear(cb, try std.fmt.bufPrint(&name, "{s}.self_attn.out_proj", .{prefix}), "weight", "bias", base + layer * 4 + 1, dim, dim);
-        try prepareLinear(cb, try std.fmt.bufPrint(&name, "{s}.linear1", .{prefix}), "weight", "bias", base + layer * 4 + 2, dim, dim * 4);
-        try prepareLinear(cb, try std.fmt.bufPrint(&name, "{s}.linear2", .{prefix}), "weight", "bias", base + layer * 4 + 3, dim * 4, dim);
-    }
-    const tail = base + cfg.head_layers * 4;
-    try prepareLinear(cb, "scorer.1", "weight", "bias", tail, dim, dim);
-    try prepareLinear(cb, "scorer.3", "weight", "bias", tail + 1, dim, 1);
-    try prepareLinear(cb, "act_head.0", "weight", "bias", tail + 2, dim + 4, 256);
-    try prepareLinear(cb, "act_head.2", "weight", "bias", tail + 3, 256, cfg.n_act);
 }
 fn norm(cb: *const CB, x: CT, prefix: []const u8, dim: usize) !CT {
     const w = try weight(cb, prefix, "weight");
@@ -80,10 +44,6 @@ fn exactGelu(cb: *const CB, x: CT) !CT {
 }
 
 pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, mask: []const i64, kinds: []const i64, markers: []const i64, batch: usize, seq: usize, count: usize, dim: usize) ![]Tensor {
-    return forwardWithSlots(cb, a, cfg, encoder, mask, kinds, markers, batch, seq, count, dim, null);
-}
-
-pub fn forwardWithSlots(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, mask: []const i64, kinds: []const i64, markers: []const i64, batch: usize, seq: usize, count: usize, dim: usize, metal_slot_base: ?usize) ![]Tensor {
     if (batch == 0 or seq == 0 or mask.len != batch * seq or count < 2 or count > 20 or dim < 64 or dim % 64 != 0 or seq > cfg.max_len or kinds.len != batch or markers.len != batch * count) return error.InvalidLayaInputs;
     for (kinds) |kind| if (kind < 0 or kind > 2) return error.InvalidLayaInputs;
     for (0..batch) |row| {
@@ -95,18 +55,9 @@ pub fn forwardWithSlots(cb: *const CB, a: std.mem.Allocator, cfg: Config, encode
         }
         if (valid < 2) return error.InvalidLayaInputs;
     }
-    const slots = if (cb.kind() == .metal and cfg.format == .laya and cfg.decision_head == .scorer and (try cfg.effectiveWeightQuantization()) == .none) metal_slot_base else null;
-    if (slots) |base| try prepareMetalHeads(cb, cfg, dim, base);
-    var frame = false;
-    if (slots != null and !cb.decoderRuntimeHasActiveFrame()) frame = try cb.decoderRuntimeBeginFrame();
-    errdefer if (frame) cb.decoderRuntimeCancelFrame() catch {};
     // OpenDecider scores the encoder's output directly.
-    const transformed = if (cfg.format == .laya) try transformWithSlots(cb, a, cfg, encoder, mask, kinds, batch, seq, dim, slots) else null;
+    const transformed = if (cfg.format == .laya) try transform(cb, a, cfg, encoder, mask, kinds, batch, seq, dim) else null;
     defer if (transformed) |t| cb.free(t);
-    if (frame) {
-        try cb.decoderRuntimeSubmitAndWaitFrame();
-        frame = false;
-    }
     const hidden = transformed orelse encoder;
     // The CUDA tail is scorer-only; a pointer head scores on the host path.
     if (cb.kind() == .cuda and cfg.decision_head == .scorer and cfg.format == .laya) return forwardCudaTail(cb, a, cfg, hidden, markers, batch, seq, count, dim);
@@ -119,7 +70,7 @@ pub fn forwardWithSlots(cb: *const CB, a: std.mem.Allocator, cfg: Config, encode
         const rows = try a.alloc(i64, batch);
         defer a.free(rows);
         for (rows, 0..) |*row, i| row.* = @intCast(i * seq);
-        return scoreDevice(cb, a, cfg, hidden, tokens, rows, count, dim, slots);
+        return scoreDevice(cb, a, cfg, hidden, tokens, rows, count, dim);
     }
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
@@ -133,7 +84,7 @@ pub fn forwardWithSlots(cb: *const CB, a: std.mem.Allocator, cfg: Config, encode
 /// The option scorer over gathered marker rows `[rows, dim]`, read back.
 /// Laya: LayerNorm `scorer.0`, linear `scorer.1`, GELU, linear `scorer.3`.
 /// OpenDecider: linear `scorer.0`, GELU, LayerNorm `scorer.2`, linear `scorer.3`.
-fn scorerLogits(cb: *const CB, a: std.mem.Allocator, cfg: Config, m: CT, rows: usize, dim: usize, slots: ?usize) ![]f32 {
+fn scorerLogits(cb: *const CB, a: std.mem.Allocator, cfg: Config, m: CT, rows: usize, dim: usize) ![]f32 {
     if (cfg.format == .opendecider) {
         const s0 = try linear(cb, m, "scorer.0", rows, dim, dim);
         defer cb.free(s0);
@@ -147,11 +98,11 @@ fn scorerLogits(cb: *const CB, a: std.mem.Allocator, cfg: Config, m: CT, rows: u
     }
     const n = try norm(cb, m, "scorer.0", dim);
     defer cb.free(n);
-    const s1 = try linearWithSlot(cb, n, "scorer.1", rows, dim, dim, headSlot(slots, cfg.head_layers * 4));
+    const s1 = try linear(cb, n, "scorer.1", rows, dim, dim);
     defer cb.free(s1);
     const sg = try exactGelu(cb, s1);
     defer cb.free(sg);
-    const s2 = try linearWithSlot(cb, sg, "scorer.3", rows, dim, 1, headSlot(slots, cfg.head_layers * 4 + 1));
+    const s2 = try linear(cb, sg, "scorer.3", rows, dim, 1);
     defer cb.free(s2);
     return cb.toFloat32(s2, a);
 }
@@ -181,7 +132,7 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     const logits = if (cfg.decision_head == .pointer)
         try pointerLogits(cb, a, cfg, host, m, anchors, count, dim)
     else
-        try scorerLogits(cb, a, cfg, m, batch * count, dim, null);
+        try scorerLogits(cb, a, cfg, m, batch * count, dim);
     defer a.free(logits);
     if (logits.len != batch * count) return error.UnexpectedOutputShape;
     for (markers, logits) |pos, *logit| if (pos < 0) {
@@ -197,7 +148,7 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     }
     const f = try cb.fromFloat32Shape(features, &.{ @intCast(batch), @intCast(dim + 4) });
     defer cb.free(f);
-    return actionHead(cb, a, cfg, f, logits, batch, count, dim, null);
+    return actionHead(cb, a, cfg, f, logits, batch, count, dim);
 }
 
 /// Gather activations through the backend's device row operation.
@@ -213,7 +164,7 @@ fn gatherRows(cb: *const CB, a: std.mem.Allocator, hidden: CT, rows: []const i64
 /// rows are gathered there, so only the scorer logits (for the action
 /// statistics) and the action logits are read back. `markers` indexes rows
 /// of `hidden`, -1 padded.
-fn scoreDevice(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, markers: []const i64, anchors: []const i64, count: usize, dim: usize, slots: ?usize) ![]Tensor {
+fn scoreDevice(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, markers: []const i64, anchors: []const i64, count: usize, dim: usize) ![]Tensor {
     const batch = anchors.len;
     if (markers.len != batch * count) return error.UnexpectedOutputShape;
     const rows = try a.alloc(i64, markers.len);
@@ -221,7 +172,7 @@ fn scoreDevice(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, mar
     for (markers, rows) |marker, *row| row.* = @max(marker, 0);
     const gathered = try gatherRows(cb, a, hidden, rows, dim);
     defer cb.free(gathered);
-    const logits = try scorerLogits(cb, a, cfg, gathered, batch * count, dim, slots);
+    const logits = try scorerLogits(cb, a, cfg, gathered, batch * count, dim);
     defer a.free(logits);
     if (logits.len != batch * count) return error.UnexpectedOutputShape;
     for (markers, logits) |pos, *logit| if (pos < 0) {
@@ -237,7 +188,7 @@ fn scoreDevice(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, mar
     defer cb.free(stats_ct);
     const f = try cb.concat(anchored, stats_ct, batch, dim, 4);
     defer cb.free(f);
-    return actionHead(cb, a, cfg, f, logits, batch, count, dim, slots);
+    return actionHead(cb, a, cfg, f, logits, batch, count, dim);
 }
 
 /// Pointer head scores, `[decisions * count]`: the scaled dot product of a
@@ -309,12 +260,12 @@ fn actionStats(z: []const f32, markers: []const i64, dst: *[4]f32) void {
 }
 
 /// Action logits from `[batch, dim + 4]` features, returned with `logits`.
-fn actionHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, f: CT, logits: []const f32, batch: usize, count: usize, dim: usize, slots: ?usize) ![]Tensor {
-    const act1 = try linearWithSlot(cb, f, "act_head.0", batch, dim + 4, 256, headSlot(slots, cfg.head_layers * 4 + 2));
+fn actionHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, f: CT, logits: []const f32, batch: usize, count: usize, dim: usize) ![]Tensor {
+    const act1 = try linear(cb, f, "act_head.0", batch, dim + 4, 256);
     defer cb.free(act1);
     const actg = try exactGelu(cb, act1);
     defer cb.free(actg);
-    const act2 = try linearWithSlot(cb, actg, "act_head.2", batch, 256, cfg.n_act, headSlot(slots, cfg.head_layers * 4 + 3));
+    const act2 = try linear(cb, actg, "act_head.2", batch, 256, cfg.n_act);
     defer cb.free(act2);
     const act = try cb.toFloat32(act2, a);
     defer a.free(act);
@@ -365,7 +316,7 @@ pub fn captureTrunk(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: C
     const mask = try a.alloc(i64, rows);
     defer a.free(mask);
     @memset(mask, 1);
-    const hidden = try layers(cb, a, cfg, try cb.add(encoder, zero_ct), mask, null, 1, rows, dim, null, capture, null);
+    const hidden = try layers(cb, a, cfg, try cb.add(encoder, zero_ct), mask, null, 1, rows, dim, null, capture);
     cb.free(hidden);
 }
 
@@ -402,7 +353,7 @@ fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, seg
     const mask = try a.alloc(i64, seq);
     defer a.free(mask);
     @memset(mask, 1);
-    const hidden = try layers(cb, a, cfg, try cb.add(encoder, type_ct), mask, segments, 1, seq, dim, prefix, null, null);
+    const hidden = try layers(cb, a, cfg, try cb.add(encoder, type_ct), mask, segments, 1, seq, dim, prefix, null);
     defer cb.free(hidden);
     // Metal keeps the hidden states on the device; a full readback would
     // synchronize the frame and copy every row to score a few of them. The
@@ -410,7 +361,7 @@ fn packedHead(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, seg
     if ((cb.kind() == .metal or cb.kind() == .wasm) and cfg.decision_head == .scorer) {
         for (anchors) |anchor| if (anchor < 0 or anchor >= rows) return error.InvalidLayaInputs;
         for (markers) |marker| if (marker >= rows) return error.InvalidLayaInputs;
-        return scoreDevice(cb, a, cfg, hidden, markers, anchors, width, dim, null);
+        return scoreDevice(cb, a, cfg, hidden, markers, anchors, width, dim);
     }
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
@@ -445,7 +396,7 @@ fn forwardCudaTail(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT,
     defer cb.free(act1);
     const actg = try exactGelu(cb, act1);
     defer cb.free(actg);
-    const actions = try linearWithSlot(cb, actg, "act_head.2", batch, 256, cfg.n_act, null);
+    const actions = try linear(cb, actg, "act_head.2", batch, 256, cfg.n_act);
     defer cb.free(actions);
     try cb.checkExecutionControl();
     // These are the only CUDA tensor readbacks in the complete Laya forward.
@@ -467,10 +418,6 @@ fn forwardCudaTail(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT,
 
 /// Resident TransformerEncoder portion, also used by intermediate parity tests.
 pub fn transform(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, mask: []const i64, kinds: []const i64, batch: usize, seq: usize, dim: usize) !CT {
-    return transformWithSlots(cb, a, cfg, encoder, mask, kinds, batch, seq, dim, null);
-}
-
-fn transformWithSlots(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, mask: []const i64, kinds: []const i64, batch: usize, seq: usize, dim: usize, slots: ?usize) !CT {
     const repeated = try a.alloc(i64, batch * seq);
     defer a.free(repeated);
     for (kinds, 0..) |kind, row| @memset(repeated[row * seq ..][0..seq], kind);
@@ -478,7 +425,7 @@ fn transformWithSlots(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder:
     defer cb.free(type_weight);
     const types = try cb.embeddingLookup(type_weight, repeated, batch * seq, dim);
     defer cb.free(types);
-    return layers(cb, a, cfg, try cb.add(encoder, types), mask, null, batch, seq, dim, null, null, slots);
+    return layers(cb, a, cfg, try cb.add(encoder, types), mask, null, batch, seq, dim, null, null);
 }
 
 /// Cached trunk keys and values per head layer, `[rows, dim]` each, and a
@@ -497,7 +444,7 @@ pub const Capture = struct {
 /// prefix, `input` holds only the rows after it and attention spans both.
 /// With `segments`, attention is segment-masked (tree-packed rows) and
 /// `seq` counts every key of the row; otherwise it is dense over `mask`.
-fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []const i64, segments: ?modern.Packed, batch: usize, seq: usize, dim: usize, trunk: ?Prefix, capture: ?Capture, slots: ?usize) !CT {
+fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []const i64, segments: ?modern.Packed, batch: usize, seq: usize, dim: usize, trunk: ?Prefix, capture: ?Capture) !CT {
     const prefix_rows: usize = if (trunk) |p| p.rows else 0;
     const rows = batch * seq - prefix_rows;
     var hidden = input;
@@ -513,10 +460,7 @@ fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []c
         defer cb.free(qw);
         const qb = try weight(cb, prefix, "self_attn.in_proj_bias");
         defer cb.free(qb);
-        const qkv = if (headSlot(slots, layer * 4)) |slot|
-            (try cb.decoderRuntimeApplyLinear(&.{ .slot = slot, .input = n1, .in_dim = dim, .out_dim = dim * 3 })) orelse return error.UnsupportedLayaBackend
-        else
-            try cb.linear(n1, qw, qb, rows, dim, dim * 3);
+        const qkv = try cb.linear(n1, qw, qb, rows, dim, dim * 3);
         defer cb.free(qkv);
         const q = try cb.sliceLastDim(qkv, 0, dim);
         defer cb.free(q);
@@ -536,17 +480,17 @@ fn layers(cb: *const CB, a: std.mem.Allocator, cfg: Config, input: CT, mask: []c
         else
             try cb.scaledDotProductAttention(q, k, v, mask, null, batch, seq, dim / 64, 64);
         defer cb.free(attn);
-        const proj = try linearWithSlot(cb, attn, try std.fmt.bufPrint(&buf, "{s}.self_attn.out_proj", .{prefix}), rows, dim, dim, headSlot(slots, layer * 4 + 1));
+        const proj = try linear(cb, attn, try std.fmt.bufPrint(&buf, "{s}.self_attn.out_proj", .{prefix}), rows, dim, dim);
         defer cb.free(proj);
         const residual = try cb.add(hidden, proj);
         defer cb.free(residual);
         const n2 = try norm(cb, residual, try std.fmt.bufPrint(&buf, "{s}.norm2", .{prefix}), dim);
         defer cb.free(n2);
-        const up = try linearWithSlot(cb, n2, try std.fmt.bufPrint(&buf, "{s}.linear1", .{prefix}), rows, dim, dim * 4, headSlot(slots, layer * 4 + 2));
+        const up = try linear(cb, n2, try std.fmt.bufPrint(&buf, "{s}.linear1", .{prefix}), rows, dim, dim * 4);
         defer cb.free(up);
         const relu = try cb.relu(up);
         defer cb.free(relu);
-        const down = try linearWithSlot(cb, relu, try std.fmt.bufPrint(&buf, "{s}.linear2", .{prefix}), rows, dim * 4, dim, headSlot(slots, layer * 4 + 3));
+        const down = try linear(cb, relu, try std.fmt.bufPrint(&buf, "{s}.linear2", .{prefix}), rows, dim * 4, dim);
         defer cb.free(down);
         const next = try cb.add(residual, down);
         cb.free(hidden);

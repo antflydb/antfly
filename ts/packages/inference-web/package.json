@@ -1,16 +1,35 @@
 {
   "name": "@antfly/inference-web",
   "version": "0.1.0",
-  "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm run build",
+    "test:browser": "pnpm run build && node --test --test-concurrency=1 test/browser/*.test.mjs"
   },
   "devDependencies": {
-    "typescript": "~5.9.3"
+    "typescript": "~5.9.3",
+    "@playwright/test": "^1.61.0"
+  },
+  "description": "Browser-local GLiNER extraction and Laya decisions backed by Antfly WASM and WebGPU",
+  "license": "Apache-2.0",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/antflydb/antfly.git",
+    "directory": "ts/packages/inference-web"
   }
 }

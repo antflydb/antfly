@@ -17,6 +17,7 @@ packages/components/     → @antfly/components (unstyled search primitives:
 packages/design-system/  → @antfly/design-system (shadcn/ui-based shared
                            component library: primitives, compound patterns,
                            brand/marketing blocks, OKLCH tokens, Aeonik)
+packages/inference-web/  → @antfly/inference-web (browser WASM/WebGPU client; UI in Colony)
 packages/graph/          → @antfly/graph (graph visualization widgets)
 packages/cli/            → @antfly/cli (npm wrapper that installs the antfly
                            binary) with platform packages cli-darwin-arm64,

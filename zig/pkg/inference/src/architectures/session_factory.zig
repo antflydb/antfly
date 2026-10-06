@@ -8636,7 +8636,7 @@ fn archRunImpl(
                 }
                 const hidden = try modern_bert_arch.forwardCT(&cb, allocator, cfg, bi.input_ids, bi.attention_mask, bi.batch, bi.seq_len);
                 defer cb.free(hidden);
-                return @import("laya_head.zig").forwardWithSlots(&cb, allocator, laya, hidden, bi.attention_mask, kinds.values, markers.values, bi.batch, bi.seq_len, markers.shape[1], cfg.hidden_size, @as(usize, cfg.num_hidden_layers) * 4);
+                return @import("laya_head.zig").forward(&cb, allocator, laya, hidden, bi.attention_mask, kinds.values, markers.values, bi.batch, bi.seq_len, markers.shape[1], cfg.hidden_size);
             }
             if (self.task != .generic) return error.UnsupportedArchitectureTask;
             const bert_inputs = try parseBertRunInputs(inputs);
