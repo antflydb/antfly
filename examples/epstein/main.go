@@ -213,7 +213,7 @@ const (
 	DefaultEmbeddingDims    = 512
 	DefaultChunkerModel     = "fixed-bert-tokenizer"
 	DefaultOCRModel         = "microsoft/Florence-2-base-ft"
-	DefaultRecognizerModel  = "antflydb/gliner2-base-v1-q4_k"
+	DefaultRecognizerModel  = "antflydb/gliner2-base-v1"
 	DefaultAutographIndex   = "autograph_relations"
 	DefaultAutographAsset   = "relations_v1"
 	DefaultAutographModel   = DefaultRecognizerModel

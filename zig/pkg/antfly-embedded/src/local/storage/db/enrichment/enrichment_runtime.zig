@@ -2152,6 +2152,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         => .fatal_worker,
 
         error.InvalidAssetProducerConfig,
+        error.ModelNotFound,
         error.GenerateBatchItemRejected,
         error.InvalidExtractorResponse,
         error.InvalidDocumentExtractionConfig,
@@ -2160,6 +2161,12 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidEmbeddingResponse,
         error.InvalidEmbeddingDimensions,
         error.ReadRequestFailed,
+        error.ExtractionInvalidRequest,
+        error.ExtractionUnauthorized,
+        error.ExtractionForbidden,
+        error.ExtractionNotFound,
+        error.ExtractionRequestTooLarge,
+        error.ExtractionRequestRejected,
         error.OcrPromptEcho,
         error.TrivialOcrOutput,
         error.UnsupportedEmbeddingProvider,
@@ -2663,7 +2670,7 @@ fn isEnrichmentControlError(err: anyerror) bool {
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
-    try std.testing.expect(isRetryableEnrichmentError(error.ModelNotFound));
+    try std.testing.expect(!isRetryableEnrichmentError(error.ModelNotFound));
     try std.testing.expect(isRetryableEnrichmentError(error.ResourceTemporarilyUnavailable));
     try std.testing.expect(!isRetryableEnrichmentError(error.ResourceLimitExceeded));
 }
@@ -2673,6 +2680,11 @@ test "enrichment retries unknown errors and isolates known permanent errors" {
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.UnsupportedEmbeddingProvider));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.InvalidEmbeddingDimensions));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.ReadRequestFailed));
+    inline for (.{ error.ExtractionInvalidRequest, error.ExtractionUnauthorized, error.ExtractionForbidden, error.ExtractionNotFound, error.ExtractionRequestTooLarge, error.ExtractionRequestRejected }) |err| {
+        try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(err));
+    }
+    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.ExtractionRateLimited));
+    try std.testing.expectEqual(EnrichmentErrorDisposition.retryable_request, enrichmentErrorDisposition(error.ExtractionTransientFailure));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.OcrPromptEcho));
     try std.testing.expectEqual(EnrichmentErrorDisposition.terminal_request, enrichmentErrorDisposition(error.TrivialOcrOutput));
     try std.testing.expectEqual(EnrichmentErrorDisposition.fatal_worker, enrichmentErrorDisposition(error.OutOfMemory));

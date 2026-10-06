@@ -338,7 +338,7 @@ func printCorpusJSON(value any) error {
 	return enc.Encode(value)
 }
 
-func corpusIndexes(embeddingModel, inferenceURL, language string, graph, semantic bool) (map[string]any, error) {
+func corpusIndexes(embeddingModel, extractorModel, inferenceURL, language string, graph, semantic bool) (map[string]any, error) {
 	producer := map[string]any{"type": "document_extraction", "config": map[string]any{
 		"source":        map[string]any{"filename_field": "filename", "content_type_field": "mime_type", "version_field": "version"},
 		"ocr":           map[string]any{"enabled": true, "executor": "reader", "mode": "auto", "render_dpi": 150, "prompt_policy": "plain", "config": map[string]any{"provider": "apple", "recognition_languages": []string{language}, "recognition_level": "accurate", "uses_language_correction": false}},
@@ -360,7 +360,7 @@ func corpusIndexes(embeddingModel, inferenceURL, language string, graph, semanti
 		indexes[DefaultEmbeddingIndex] = map[string]any{"type": "embeddings", "field": "embedding", "dimension": DefaultEmbeddingDims, "distance_metric": "cosine", "embedding_name": "document_dense_v1", "source_artifact_name": corpusChunks, "embedder": map[string]any{"provider": "antfly", "model": embeddingModel, "api_url": apiURL}, "enrichments": []any{map[string]any{"name": "document_dense_v1", "kind": "embedding", "field": "text", "source_artifact_name": corpusChunks, "expected_dims": DefaultEmbeddingDims}}}
 	}
 	if graph {
-		index, e := createArtifactGraphIndex(DefaultAutographIndex, DefaultAutographAsset, "extractor", DefaultAutographModel, inferenceURL, strings.Split(DefaultEntityLabels, ","), strings.Split(DefaultRelationLabels, ","))
+		index, e := createArtifactGraphIndex(DefaultAutographIndex, DefaultAutographAsset, "extractor", extractorModel, inferenceURL, strings.Split(DefaultEntityLabels, ","), strings.Split(DefaultRelationLabels, ","))
 		if e != nil {
 			return nil, e
 		}
@@ -445,6 +445,7 @@ func corpusLoadCmd(args []string) error {
 	graph := flags.Bool("graph", false, "Create relation graph; run corpus graph after extraction (requires extractor inference)")
 	inference := flags.String("inference-url", "http://localhost:8080", "Antfly inference URL")
 	model := flags.String("embedding-model", DefaultEmbeddingModel, "Embedding model, with 512 dimensions")
+	extractorModel := flags.String("artifact-extractor-model", DefaultAutographModel, "Registered inference model for relation extraction")
 	language := flags.String("language", "en-US", "Apple OCR and transcription locale")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -473,7 +474,7 @@ func corpusLoadCmd(args []string) error {
 	if err = readCorpusJSON(filepath.Join(*state, "sources.json"), &sourceConfig); err != nil {
 		return err
 	}
-	indexes, err := corpusIndexes(*model, *inference, *language, *graph, *semantic)
+	indexes, err := corpusIndexes(*model, *extractorModel, *inference, *language, *graph, *semantic)
 	if err != nil {
 		return err
 	}

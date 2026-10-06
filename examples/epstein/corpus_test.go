@@ -250,7 +250,7 @@ func TestCorpusLoadResumeAfterFailedBatch(t *testing.T) {
 	if err := corpusPrepareCmd([]string{"--state", state, "--source", "ds9=" + source}); err != nil {
 		t.Fatal(err)
 	}
-	indexConfig, err := corpusIndexes(DefaultEmbeddingModel, DefaultInferenceURL, "en-US", false, false)
+	indexConfig, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, DefaultInferenceURL, "en-US", false, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,7 +318,7 @@ func TestCorpusTruncatedManifestIsNotEOF(t *testing.T) {
 	}
 }
 func TestCorpusAppleIndexConfiguration(t *testing.T) {
-	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultInferenceURL, "en-US", true, true)
+	indexes, err := corpusIndexes(DefaultEmbeddingModel, DefaultAutographModel, DefaultInferenceURL, "en-US", true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,6 +352,30 @@ func TestCorpusAppleIndexConfiguration(t *testing.T) {
 		t.Fatal("graph must consume materialized unit text")
 	}
 
+}
+
+func TestCorpusExtractorModelUsesRegisteredIdentifier(t *testing.T) {
+	for _, model := range []string{DefaultAutographModel, "custom/extractor:gguf:Q4_K"} {
+		indexes, err := corpusIndexes(DefaultEmbeddingModel, model, DefaultInferenceURL, "en-US", true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, err := json.Marshal(indexes[DefaultAutographIndex])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var graph map[string]any
+		if err = json.Unmarshal(raw, &graph); err != nil {
+			t.Fatal(err)
+		}
+		producer := graph["artifact"].(map[string]any)["producer_json"].(map[string]any)
+		if got := producer["config"].(map[string]any)["model"]; got != model {
+			t.Fatalf("model=%v want=%s", got, model)
+		}
+	}
+	if DefaultAutographModel != "antflydb/gliner2-base-v1" {
+		t.Fatalf("unregistered default %s", DefaultAutographModel)
+	}
 }
 
 func pdfPageCount(reader io.ReaderAt, size int64) (int, error) {

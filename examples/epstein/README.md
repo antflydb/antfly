@@ -40,7 +40,7 @@ omitted here.
 ```bash
 cd zig
 ./zig-out/bin/antfly inference pull antflydb/clipclap:gguf:Q4_K --tasks embed
-./zig-out/bin/antfly inference pull antflydb/gliner2-base-v1-q4_k --tasks extract --capabilities extraction
+./zig-out/bin/antfly inference pull antflydb/gliner2-base-v1 --tasks extract --capabilities extraction
 ./zig-out/bin/antfly inference pull microsoft/Florence-2-base-ft --tasks read
 ```
 
@@ -102,7 +102,7 @@ export EPSTEIN_ZIP="/path/to/T9/DataSet_10.zip"
 ./epstein load --input epstein-smoke.json --table epstein_smoke --create-table \
   --enable-artifact-graph \
   --artifact-producer extractor \
-  --artifact-extractor-model antflydb/gliner2-base-v1-q4_k
+  --artifact-extractor-model antflydb/gliner2-base-v1
 
 # Optional: use the slower Gemma tool-call generator path for richer relation extraction.
 ./epstein load --input epstein-smoke.json --table epstein_smoke_gemma --create-table \
@@ -196,7 +196,7 @@ Flags:
                     (default: extractor)
   --artifact-extractor-model
                     Antfly model for artifact relation extraction
-                    (default: antflydb/gliner2-base-v1-q4_k)
+                    (default: antflydb/gliner2-base-v1)
   --artifact-labels Entity labels for the artifact extractor
   --artifact-relation-labels
                     Relation labels for the artifact extractor
@@ -300,7 +300,7 @@ Flags:
   --input           Input JSON file (default: epstein-docs.json)
   --output          Output JSON file (default: {input-base}-entities.json)
   --inference-url     Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
-  --model           Recognizer model (default: antflydb/gliner2-base-v1-q4_k)
+  --model           Recognizer model (default: antflydb/gliner2-base-v1)
   --labels          Entity labels to extract
   --relation-labels Relation labels to extract (default: associated with, communicated with, traveled to, visited, worked for, represented by, mentioned in, located in)
   --batch-size      Text windows per Antfly inference recognize request (default: 16)
@@ -556,6 +556,18 @@ Use `--semantic=false` on both load commands for a BM25-only pilot, and
 `corpus graph` command to measure text/semantic storage without graph costs. Install
 the embedding model and optional extractor model using the existing model-pull
 instructions above. Use `--language` to select the Apple OCR/transcription locale.
+The relation extractor defaults to the registered model ID `antflydb/gliner2-base-v1`;
+its installed bundle selects the quantized weights. Use `--artifact-extractor-model`
+on both corpus load commands to select another registered extractor. Inspect
+`GET /ai/v1/models` to find registered IDs. Existing tables retain their producer
+configuration; changing the CLI default does not migrate them. For an existing
+pilot using `antflydb/gliner2-base-v1-q4_k`, create a new table with the corrected
+flags and rerun loading and graph materialization. Producer configuration is
+write-only, so an index status response cannot recover its original definition.
+Permanent extraction HTTP errors (including missing models and authorization
+failures) settle as failed artifacts; provider recovery or configuration changes
+require reprocessing. Rate limits, temporary server errors, and stale capability
+leases remain retryable. Provider logs include the HTTP status and error details.
 `ANTFLY_API_KEY`, when set, supplies a bearer token to corpus API requests.
 
 Preparation checkpoints every 100 sources and at completion. Resume with
