@@ -66,13 +66,13 @@ The standalone server uses the same Apache engine under ELv2. See [LICENSING.md]
 ## Features
 
 - **Hybrid search** — full-text (BM25), dense vectors ([RaBitQ](https://arxiv.org/abs/2405.12497)-compressed with [SPFresh](https://arxiv.org/abs/2410.14452)-style updates), sparse vectors ([SPLADE](https://arxiv.org/abs/2107.05720)), and [late interaction](https://arxiv.org/abs/2004.12832) (ColQwen2), fused with [reciprocal rank](https://cormack.uwaterloo.ca/cormacksigir09-rrf.pdf) or relative score fusion in one query
-- **Full-text search** — Lucene-style segments with [highlighting](zig/pkg/antfly-embedded/src/local/search/highlight.zig), geo, regex, wildcard, and fuzzy queries, plus English and ten [Snowball](https://snowballstem.org/) stemmer languages
+- **Full-text search** — Lucene-style segments with [highlighting](zig/pkg/antfly-embedded/src/search/highlight.zig), geo, regex, wildcard, and fuzzy queries, plus English and ten [Snowball](https://snowballstem.org/) stemmer languages
 - **RAG agents** — built-in [retrieval-augmented generation](zig/pkg/antfly/src/api/retrieval_agent.zig) with streaming, multi-turn chat, tool calling (graph traversal, plus web search through an Exa connection), confidence scoring, and [TOON](docs/reference/toon-format.md) document rendering to cut prompt tokens
 - **Query-builder agent** — turns a natural-language question into a structured Antfly query, with [evaluation metrics](go/pkg/evalaf) to measure retrieval quality
-- **Graph indexes** — automatic relationship extraction and [graph traversal](zig/pkg/antfly-embedded/src/local/graph) over your data
+- **Graph indexes** — automatic relationship extraction and [graph traversal](zig/pkg/antfly-embedded/src/graph) over your data
 - **Multimodal** — index and search [images, audio, and video](docs/guides/multimodal.mdx) with CLIP, CLAP, and vision-language models
 - **Reranking** — cross-encoder reranking with score-based pruning to cut the noise
-- **Aggregations** — stats, terms facets, histogram, date histogram, range, and geo-distance [aggregations](zig/pkg/antfly-embedded/src/local/search/aggregation.zig) for analytics
+- **Aggregations** — stats, terms facets, histogram, date histogram, range, and geo-distance [aggregations](zig/pkg/antfly-embedded/src/search/aggregation.zig) for analytics
 - **Transactions** — ACID transactions at the shard level with distributed coordination
 - **Document TTL** — automatic [document expiration](docs/guides/ttl-example.md) so you don't have to clean up yourself
 - **PostgreSQL CDC** — [mirror a Postgres table](docs/guides/cdc-replication.mdx) into Antfly over logical replication, every insert, update, and delete included
@@ -82,9 +82,9 @@ The standalone server uses the same Apache engine under ELv2. See [LICENSING.md]
 - **CPU, Metal, and CUDA** — native kernels for [inference](zig/pkg/inference) and vector search: SIMD on x86 and ARM, Metal on Apple silicon, and [CUDA](zig/pkg/inference/CUDA.md) with a kernel JIT
 - **Distributed** — multi-Raft consensus, key-range sharding and replication, online shard splits (automatic size-based split and merge is opt-in), cross-shard transactions, horizontal scaling
 - **Runs anywhere** — [Antfly Lite](docs/guides/lite.mdx) as a single `.aflite` file, a single node with a [hot standby](zig/pkg/antfly/src/storage/hot_standby), a Raft cluster, or [serverless](zig/pkg/antfly/src/serverless) over object storage
-- **Embeddable** — a [C API](zig/pkg/antfly-embedded/src/local/capi) (`libantfly`), [embedded bindings](docs/reference/sdks.mdx#embedded-bindings) for [Go](go/pkg/embedded), [Python](py/packages/embedded), [Rust](rs/crates/embedded), and [TypeScript](ts/packages/embedded), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
+- **Embeddable** — a [C API](zig/pkg/antfly-embedded/src/capi) (`libantfly`), [embedded bindings](docs/reference/sdks.mdx#embedded-bindings) for [Go](go/pkg/embedded), [Python](py/packages/embedded), [Rust](rs/crates/embedded), and [TypeScript](ts/packages/embedded), and an in-browser [WASM build](zig/pkg/antfly-embedded/WASM.md) so the engine runs in-process, in unit tests, or on the edge
 - **Extensions** — run your own code inside the engine with the [Wasmtime extension runtime](zig/pkg/antfly/src/extensions)
-- **Enrichment pipelines** — [configurable pipelines](zig/pkg/antfly-embedded/src/local/storage/db/enrichment) per index for embeddings, summaries, graph edges, and custom computed fields
+- **Enrichment pipelines** — [configurable pipelines](zig/pkg/antfly-embedded/src/storage/db/enrichment) per index for embeddings, summaries, graph edges, and custom computed fields
 - **Bring your own models** — Ollama, OpenAI, OpenRouter, Cohere, Bedrock, Gemini, Vertex AI, or run models locally with Antfly inference (GGUF, safetensors, and ONNX)
 - **Fine-tuning** — [LoRA, QLoRA, SFT, DPO, GRPO and more](zig/pkg/inference/src/finetune) with recipes for Gemma 4, GLiNER2, ColQwen2, LayoutLMv3, rerankers, and chunkers
 - **Auth** — built-in [user management](zig/pkg/antfly/src/usermgr) with API keys, basic auth, and bearer tokens
@@ -160,7 +160,7 @@ The distributed database server uses a multi-[Raft](https://raft.github.io/raft.
 - **Metadata raft** — table schemas, shard assignments, cluster topology
 - **Storage rafts** — one per shard, handling data, indexes, and queries
 
-The runtime includes our own [Raft](zig/pkg/antfly/src/raft), [LSM](zig/pkg/antfly-embedded/src/local/storage/lsm), WAL, [full-text search](zig/pkg/antfly-embedded/src/local/search), HTTP/2 and HTTP/3, and inference implementations. The repository also maintains a standalone Apache-licensed [Zig LMDB-compatible B+tree](zig/lib/lmdb/src) and a vendored [C LMDB oracle](zig/deps/lmdb) for compatibility testing; neither is a production storage backend. Bundled and adapted third-party code retains its original licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Our [Snowball fork](zig/deps/snowball) generates the checked-in stemmer tables. The engine runs under a deterministic [VOPR](zig/pkg/antfly/src/vopr) simulation harness that injects storage, network, concurrency, and clock faults, in the style of [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
+The runtime includes our own [Raft](zig/pkg/antfly/src/raft), [LSM](zig/pkg/antfly-embedded/src/storage/lsm), WAL, [full-text search](zig/pkg/antfly-embedded/src/search), HTTP/2 and HTTP/3, and inference implementations. The repository also maintains a standalone Apache-licensed [Zig LMDB-compatible B+tree](zig/lib/lmdb/src) and a vendored [C LMDB oracle](zig/deps/lmdb) for compatibility testing; neither is a production storage backend. Bundled and adapted third-party code retains its original licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Our [Snowball fork](zig/deps/snowball) generates the checked-in stemmer tables. The engine runs under a deterministic [VOPR](zig/pkg/antfly/src/vopr) simulation harness that injects storage, network, concurrency, and clock faults, in the style of [TigerBeetle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md).
 
 End-to-end [chaos tests](zig/e2e/antfly) — inspired by [Jepsen](https://jepsen.io/) — cover node crashes, leader failures, shard splits under load, and cluster scaling. These tests run real multi-node clusters and inject faults to verify that Raft consensus, transactions, and replication behave correctly under failure.
 

@@ -58203,7 +58203,7 @@ fn runModeledDbSplitReplayCase(
 }
 
 fn runDbSplitReplayFixtures(alloc: Allocator) !void {
-    const root_dir = "pkg/antfly-embedded/src/local/storage/db/db_sim_fixtures";
+    const root_dir = "pkg/antfly-embedded/src/storage/db/db_sim_fixtures";
     var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
     defer fixture_dir.close(std.testing.io);
 
@@ -58254,7 +58254,7 @@ fn runDbSplitReplayFixtures(alloc: Allocator) !void {
 }
 
 fn runModeledDbSplitReplayFixtures(alloc: Allocator) !void {
-    const root_dir = "pkg/antfly-embedded/src/local/storage/db/db_sim_fixtures/replay";
+    const root_dir = "pkg/antfly-embedded/src/storage/db/db_sim_fixtures/replay";
     var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
     defer fixture_dir.close(std.testing.io);
 
