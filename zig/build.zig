@@ -304,7 +304,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
 
     const onnx_tests = onnx_build.createTests(b, inference_onnx, .{
-        .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+        .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
         .mode = .simple,
     });
     onnx_tests.graph.setEnvironmentVariable("ANTFLY_TEST_FAIL_ON_ERROR_LOGS", "0");
@@ -974,7 +974,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     antfly_step.dependOn(&install_antfarm_assets.step);
 
     const lite_module_options: std.Build.Module.CreateOptions = .{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/lite_main.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/lite_main.zig"),
         .target = target,
         .optimize = optimize,
     };
@@ -1005,7 +1005,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = b.createModule(lite_module_options),
         .filters = &.{"lite main compiles"},
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });

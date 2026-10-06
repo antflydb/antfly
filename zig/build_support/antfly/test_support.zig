@@ -138,7 +138,7 @@ pub fn chainLabeledFilteredTests(
         .root_module = root_module,
         .filters = filters,
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -298,7 +298,7 @@ pub fn addAntflyTestRunArtifact(
     tests: *std.Build.Step.Compile,
 ) *std.Build.Step.Run {
     if (tests.test_runner == null) {
-        const runner_path = b.path("pkg/antfly-embedded/src/local/test_runner.zig");
+        const runner_path = b.path("pkg/antfly-embedded/src/test_runner.zig");
         tests.test_runner = .{ .path = runner_path, .mode = .simple };
         runner_path.addStepDependencies(&tests.step);
     }

@@ -29,7 +29,7 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
     const shared = dependencies.create(b, asking_build_zig) orelse return;
     b.modules.put(b.allocator, "antfly-inference", shared.inference_graph.inference_mod) catch @panic("OOM");
     const local_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/embedded_root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/embedded_root.zig"),
         .target = shared.target,
         .optimize = shared.optimize,
     });
@@ -45,7 +45,7 @@ pub fn buildDependency(b: *std.Build, comptime asking_build_zig: type) void {
     });
     shared.build_info.link(embedded.libantfly_link_mod);
     const lite_module = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/lite_main.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/lite_main.zig"),
         .target = shared.target,
         .optimize = shared.optimize,
     });

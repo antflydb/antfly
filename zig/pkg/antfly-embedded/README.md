@@ -55,3 +55,13 @@ backend artifacts remain available for consumers enabling acceleration.
 Third-party dependencies retain their own licenses.
 A downloaded package has no dependency on a monorepo checkout. Development
 checkouts can use the same package entry point under `zig/pkg/antfly-embedded`.
+
+## Source organization
+
+The implementation lives directly under `src/`: `storage/` contains the local
+DB, `api/` its operations and contracts, `metadata/` local catalog contracts, and
+`inference/` provider integration. SQL, search, graph, lake readers and C API
+implementations share this Apache owner. `src/root.zig` and the configured
+`src/engine/` modules expose the public Zig API; `src/source_catalog.zig` is an
+internal bridge for server consumers. See the [ownership design](../../../docs/design/embedded-source-ownership.md)
+for the embedded/server boundary.

@@ -238,7 +238,7 @@ def source_owner_path(relative: str) -> str:
         "storage/query.zig",
         "storage/kernel_owner_abi.zig",
     }
-    owner = "antfly-embedded/src/local" if relative in embedded else "antfly/src"
+    owner = "antfly-embedded/src" if relative in embedded else "antfly/src"
     return f"zig/pkg/{owner}/{relative}"
 
 
