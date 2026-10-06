@@ -1530,6 +1530,12 @@ class RuntimeCacheTest(unittest.TestCase):
             if name != "antfly-quant-kernel-codegen":
                 self.assertRegex(output, rf"compile exe {name} safe \S+ cached")
 
+    def test_unrelated_targets_do_not_require_snowball_generator_inputs(self):
+        # Normal builds use checked-in stemmers without initializing Snowball's
+        # generator submodule. Its inputs must stay lazy make-phase inputs.
+        self.own("zig/deps/snowball/zig/env.zig").unlink()
+        self.build("runtime-unit-cli")
+
     def test_sql_and_snowball_generation_contracts(self):
         sql = self.own("zig/lib/sql/grammar/generated/root.zig")
         snowball_root = "zig/pkg/antfly-embedded/src/local/search/snowball/generated"
@@ -1538,7 +1544,7 @@ class RuntimeCacheTest(unittest.TestCase):
         snowball = self.root / snowball_root / "german_stemmer.zig"
 
         self.build("regen-sql-grammar", "regen-snowball")
-        # Snapshot the generators' raw and formatted products. Zig 0.17 also
+        # Snapshot the generators' published, formatted products. Zig 0.17 also
         # stores configure metadata here (dependencies.zig), which can be
         # rewritten independently of these producer/consumer contracts.
         output_names = {"sql_grammar_root.zig"} | {
@@ -1554,10 +1560,15 @@ class RuntimeCacheTest(unittest.TestCase):
         checked = self.build("sql-grammar-generated-check", "check-snowball")
         self.assertRegex(checked, r"run exe yacc-zig \(sql_grammar_root.zig\) cached")
         self.assertEqual(
-            len(re.findall(r"run exe snowball \(\w+_stemmer.zig\) cached", checked)),
+            len(
+                re.findall(
+                    r"run exe snowball-generate \(\w+_stemmer.zig\) cached", checked
+                )
+            ),
             10,
         )
-        self.assertEqual(len(re.findall(r"format Snowball [\w.]+ cached", checked)), 12)
+        self.assertRegex(checked, r"WriteFile root.zig cached")
+        self.assertRegex(checked, r"run exe snowball-generate \(env.zig\) cached")
 
         # Checking reports drift without repairing it, even with warm generators.
         for path in expected:

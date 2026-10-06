@@ -209,6 +209,12 @@ test {
 """
         )
         build = self.root / "build.zig"
+        self.write(
+            "pkg/antfly-embedded/src/local/source_catalog_control.zig",
+            catalog.read_text().replace(
+                ' pub const physical = @import("physical.zig");', ""
+            ),
+        )
         build.write_text(
             build.read_text().replace(
                 "    owner.attach(root);",

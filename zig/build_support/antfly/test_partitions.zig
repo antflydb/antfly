@@ -59,7 +59,7 @@ var selected_names: std.AutoHashMapUnmanaged(*std.Build.Module, []const []const 
 
 var physical_sources: std.StringHashMapUnmanaged(bool) = .empty;
 
-fn controlOnly(consumer: *std.Build.Module) bool {
+pub fn controlOnly(consumer: *std.Build.Module) bool {
     const module = consumer.import_table.get("storage_source_options") orelse return false;
     const path = module.root_source_file orelse return false;
     if (path != .generated) return false;
@@ -88,6 +88,9 @@ fn requiresPhysical(b: *std.Build, path: []const u8) bool {
     const result = search: while (index < pending.items.len) : (index += 1) {
         const current = pending.items[index];
         if (!std.mem.startsWith(u8, current, local)) continue;
+        if (std.mem.endsWith(u8, current, "/storage/db/db.zig") or
+            std.mem.endsWith(u8, current, "/storage/query.zig") or
+            std.mem.endsWith(u8, current, "/storage/write.zig")) break :search true;
         if (std.mem.endsWith(u8, current, "/storage/db/selected_root.zig")) continue;
         if ((seen.getOrPut(current) catch @panic("OOM")).found_existing) continue;
         if (physical_sources.get(current)) |value| {
