@@ -1,3 +1,18 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 import re
@@ -176,8 +191,9 @@ class SoakTests(unittest.TestCase):
                     root / "scripts/ci/zig_vopr_qualify.sh",
                 )
                 (root / "tools/run_bounded_zig_build.py").write_text(
-                    "import json, sys\n"
+                    "import json, sys, os\n"
                     "from pathlib import Path\n"
+                    "Path('cache-env.txt').write_text(os.environ['ZIG_GLOBAL_CACHE_DIR'])\n"
                     "Path('invocation.json').write_text(json.dumps(sys.argv[1:]))\n"
                     "sys.exit(37)\n"
                 )
@@ -228,14 +244,12 @@ class SoakTests(unittest.TestCase):
                 )
                 self.assertIn("-Doptimize=safe", args)
                 self.assertEqual(
-                    args[-4:],
-                    [
-                        "--cache-dir",
-                        "local-cache",
-                        "--global-cache-dir",
-                        "global-cache",
-                    ],
+                    args[-2:],
+                    ["--cache-dir", "local-cache"],
                 )
+
+                self.assertNotIn("--global-cache-dir", args)
+                self.assertEqual((root / "cache-env.txt").read_text(), "global-cache")
 
     def test_timeout_kills_and_reaps_a_child_that_ignores_termination(self):
         with tempfile.TemporaryDirectory() as root:

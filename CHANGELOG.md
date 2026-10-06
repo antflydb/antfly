@@ -16,6 +16,11 @@ All notable changes to Antfly will be documented in this file.
 
 ### [Unreleased]
 
+- **PostgreSQL integration naming** — rename the Cargo package from `pgaf` to
+  `antfly-postgres`, the PostgreSQL extension and query-builder schema to
+  `antfly_postgres`, and move its source to `rs/crates/postgres`. Enable it with
+  `CREATE EXTENSION antfly_postgres;`.
+
 - **Native PDF extraction** — repair demonstrably interleaved horizontal prose
   columns without changing paint order. Require sustained prose in both columns
   and preserve ambiguous table row associations. Preserve authored order for
@@ -491,7 +496,7 @@ that supplied the group score. It is omitted for non-dense and fused results.
 
 #### Features
 
-- **pgaf** — PostgreSQL extension providing a custom index access method (`CREATE INDEX ... USING antfly`), `@@@` operator for full-text/semantic/hybrid search, query builder functions, sync triggers, and `antfly_search()` for native Postgres integration
+- **pgaf** (now `antfly-postgres`; SQL extension `antfly_postgres`) — PostgreSQL extension providing a custom index access method (`CREATE INDEX ... USING antfly`), `@@@` operator for full-text/semantic/hybrid search, query builder functions, sync triggers, and `antfly_search()` for native Postgres integration
 - Foreign table join support with filter pushdown and SQL aggregations (#400)
 - Routed PostgreSQL replication with evaluator package extraction (#403)
 - Configurable distance metrics for embedding indexes (#406)

@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 """Verify source ownership with the real compiler, archives, and owner tests.
 
@@ -113,7 +125,12 @@ def write_report(path: Path, records: list[dict]) -> None:
 
 
 def measured_build(
-    command: list[str], cwd: Path, *, timeout_seconds: float = 1800, progress=None
+    command: list[str],
+    cwd: Path,
+    *,
+    timeout_seconds: float = 1800,
+    progress=None,
+    env=None,
 ) -> tuple[int, str, dict]:
     """Sample concurrent RSS; wait4 accounts CPU for the entire waited tree."""
     started = time.monotonic()
@@ -125,6 +142,7 @@ def measured_build(
         process = subprocess.Popen(
             command,
             cwd=cwd,
+            env=env,
             stdout=output,
             stderr=subprocess.STDOUT,
             text=True,
@@ -339,8 +357,6 @@ def main() -> None:
                 "off",
                 "--cache-dir",
                 str(local_cache),
-                "--global-cache-dir",
-                str(global_cache),
             ]
             command = bounded_build_command(args.zig, arguments)
             record = {
@@ -358,7 +374,10 @@ def main() -> None:
 
             try:
                 returncode, output, measurements = measured_build(
-                    command, root / "zig", progress=progress
+                    command,
+                    root / "zig",
+                    progress=progress,
+                    env={**os.environ, "ZIG_GLOBAL_CACHE_DIR": str(global_cache)},
                 )
             except BaseException as err:
                 record.update(status="interrupted", error=type(err).__name__)

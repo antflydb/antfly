@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +21,9 @@ const retrieval_agent_timeout_ms = 300_000;
 /// Research runs and job advances are bounded by the request's declared
 /// budget (at most 30 minutes); allow that plus transport slack.
 const research_agent_timeout_ms = 1_860_000;
+// OAuth exchange/validation and refresh followed by model discovery can each
+// take up to 45 seconds on the server. Leave transport and persistence slack.
+const personal_connection_timeout_ms = 60_000;
 
 pub const ApiError = struct {
     status_code: u16,
@@ -66,6 +70,68 @@ pub const AntflyClient = struct {
         self.inner.base_url = url;
     }
 
+    // Personal connection operations must never redirect credentials or replay authorization.
+    pub fn authorizeChatGPT(self: *AntflyClient, body: openapi.types.ChatGPTAuthorize) !openapi.ApiResponse(openapi.types.ChatGPTBegin) {
+        const encoded = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(encoded);
+        return self.connectionRequest(openapi.types.ChatGPTBegin, "/db/v1/connections/chatgpt/authorize", encoded);
+    }
+
+    pub fn listChatGPTAccounts(self: *AntflyClient) !openapi.ApiResponse(openapi.types.ChatGPTAccounts) {
+        return self.connectionRequest(openapi.types.ChatGPTAccounts, "/db/v1/connections/chatgpt/accounts", null);
+    }
+
+    pub fn getChatGPTAttempt(self: *AntflyClient, id: []const u8) !openapi.ApiResponse(openapi.types.ChatGPTOutcome) {
+        return self.getChatGPTAttemptWithTimeout(id, personal_connection_timeout_ms);
+    }
+
+    /// Polling may wait behind OAuth exchange. The CLI lends its remaining
+    /// overall login budget to each request; no automatic replay occurs here.
+    pub fn getChatGPTAttemptWithTimeout(self: *AntflyClient, id: []const u8, timeout_ms: u64) !openapi.ApiResponse(openapi.types.ChatGPTOutcome) {
+        const path = try self.connectionPath("/db/v1/connections/chatgpt/attempts/", id, "");
+        defer self.allocator.free(path);
+        return self.connectionRequestWithTimeout(openapi.types.ChatGPTOutcome, path, null, timeout_ms);
+    }
+
+    pub fn listChatGPTModels(self: *AntflyClient, id: []const u8) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const path = try self.connectionPath("/db/v1/connections/", id, "/chatgpt/models");
+        defer self.allocator.free(path);
+        return self.connectionRequest(std.json.ArrayHashMap(std.json.Value), path, null);
+    }
+
+    pub fn disconnectChatGPT(self: *AntflyClient, id: []const u8) !openapi.ApiResponse(openapi.types.ChatGPTDisconnect) {
+        const path = try self.connectionPath("/db/v1/connections/", id, "/chatgpt/disconnect");
+        defer self.allocator.free(path);
+        return self.connectionRequest(openapi.types.ChatGPTDisconnect, path, "{}");
+    }
+
+    fn connectionPath(self: *AntflyClient, prefix: []const u8, id: []const u8, suffix: []const u8) ![]u8 {
+        if (id.len == 0 or id.len > 256) return error.InvalidConnectionId;
+        for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return error.InvalidConnectionId;
+        return std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ prefix, id, suffix });
+    }
+
+    fn connectionRequest(self: *AntflyClient, comptime T: type, path: []const u8, body: ?[]const u8) !openapi.ApiResponse(T) {
+        return self.connectionRequestWithTimeout(T, path, body, personal_connection_timeout_ms);
+    }
+
+    fn connectionRequestWithTimeout(self: *AntflyClient, comptime T: type, path: []const u8, body: ?[]const u8, timeout_ms: u64) !openapi.ApiResponse(T) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.inner.base_url, path });
+        defer self.allocator.free(url);
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header| @as(*const [1][2][]const u8, header) else null;
+        const options: httpx.RequestOptions = .{
+            .json = body,
+            .headers = headers,
+            .max_response_size = 1 << 20,
+            .timeout_ms = @max(timeout_ms, 1),
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        };
+        var response = if (body != null) try self.inner.http.post(url, options) else try self.inner.http.get(url, options);
+        return openapi.ApiResponse(T).fromResponse(self.allocator, &response);
+    }
+
     // --- Auth ---
 
     pub fn setBearer(self: *AntflyClient, token: []const u8) !void {
@@ -73,22 +139,24 @@ pub const AntflyClient = struct {
     }
 
     pub fn setBasicAuth(self: *AntflyClient, username: []const u8, password: []const u8) !void {
-        self.inner.freeAuth();
+        if (self.inner.auth_header) |header| self.allocator.free(header[1]);
+        self.inner.auth_header = null;
         const cred = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ username, password });
         defer self.allocator.free(cred);
         const encoded = try base64Encode(self.allocator, cred);
-        const header_val = try std.fmt.allocPrint(self.allocator, "Basic {s}", .{encoded});
         defer self.allocator.free(encoded);
+        const header_val = try std.fmt.allocPrint(self.allocator, "Basic {s}", .{encoded});
         self.inner.auth_header = .{ "Authorization", header_val };
     }
 
     pub fn setApiKey(self: *AntflyClient, key_id: []const u8, key_secret: []const u8) !void {
-        self.inner.freeAuth();
+        if (self.inner.auth_header) |header| self.allocator.free(header[1]);
+        self.inner.auth_header = null;
         const cred = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ key_id, key_secret });
         defer self.allocator.free(cred);
         const encoded = try base64Encode(self.allocator, cred);
-        const header_val = try std.fmt.allocPrint(self.allocator, "ApiKey {s}", .{encoded});
         defer self.allocator.free(encoded);
+        const header_val = try std.fmt.allocPrint(self.allocator, "ApiKey {s}", .{encoded});
         self.inner.auth_header = .{ "Authorization", header_val };
     }
 

@@ -1,22 +1,23 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Local source tests have their own main module. Zig does not collect tests
 //! from named dependencies, even when their implementation is exercised by a
 //! server test. Selection audits therefore include both compilation owners.
 const std = @import("std");
-const source_owner = @import("../../pkg/antfly-embedded/build/source_owner.zig");
+const source_owner = @import("../embedded/source_owner.zig");
 const paths = @import("source_paths.zig");
 const support = @import("test_support.zig");
 
@@ -94,10 +95,10 @@ fn requiresPhysical(b: *std.Build, path: []const u8) bool {
             continue;
         }
         const text = sourceText(b, current) orelse continue;
-        if (std.mem.indexOf(u8, text, ".antfly_sources.physical_db") != null) break :search true;
+        if (findMarker(text, 0, ".antfly_sources.physical_db") != null) break :search true;
         var cursor: usize = 0;
         const marker = "@import(\"";
-        while (std.mem.indexOfPos(u8, text, cursor, marker)) |offset| {
+        while (findMarker(text, cursor, marker)) |offset| {
             const start = offset + marker.len;
             const end = std.mem.indexOfScalarPos(u8, text, start, '\"') orelse break;
             const relative = text[start..end];
@@ -116,11 +117,61 @@ fn physicalName(b: *std.Build, name: []const u8) bool {
     const catalog = paths.authored(b, b.path("pkg/antfly-embedded/src/local/source_catalog.zig")).?;
     const text = sourceText(b, catalog) orelse return false;
     const marker = b.fmt("pub const {s} = @import(\"", .{name});
-    const offset = std.mem.indexOf(u8, text, marker) orelse return false;
+    const offset = findMarker(text, 0, marker) orelse return false;
     const start = offset + marker.len;
     const end = std.mem.indexOfScalarPos(u8, text, start, '\"') orelse return false;
     const path = std.fs.path.resolve(b.allocator, &.{ std.fs.path.dirname(catalog).?, text[start..end] }) catch @panic("OOM");
     return requiresPhysical(b, path);
+}
+
+// Skip directly to candidate delimiters instead of comparing an import marker
+// at every byte. Build configurators also execute this code in debug mode.
+fn findMarker(text: []const u8, start: usize, marker: []const u8) ?usize {
+    var cursor = start;
+    while (std.mem.indexOfScalarPos(u8, text, cursor, marker[0])) |offset| {
+        if (std.mem.startsWith(u8, text[offset..], marker)) return offset;
+        cursor = offset + 1;
+    }
+    return null;
+}
+
+// Different test profiles often walk the same authored import graph. Parse
+// each file once; keep physical/control ownership filtering per consumer.
+const SourceImports = struct { local_names: []const []const u8, relative_paths: []const []const u8 };
+var source_imports: std.StringHashMapUnmanaged(SourceImports) = .empty;
+
+fn importsFor(b: *std.Build, path: []const u8) ?SourceImports {
+    if (source_imports.get(path)) |imports| return imports;
+    const text = sourceText(b, path) orelse return null;
+    var names: std.ArrayList([]const u8) = .empty;
+    var dependencies: std.ArrayList([]const u8) = .empty;
+    const marker = "@import(\"antfly_local_sources\").";
+    var cursor: usize = 0;
+    while (findMarker(text, cursor, marker)) |offset| {
+        const start = offset + marker.len;
+        var end = start;
+        while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) : (end += 1) {}
+        if (end > start) names.append(b.allocator, text[start..end]) catch @panic("OOM");
+        cursor = end;
+    }
+    cursor = 0;
+    const import = "@import(\"";
+    while (findMarker(text, cursor, import)) |offset| {
+        const start = offset + import.len;
+        const end = std.mem.indexOfScalarPos(u8, text, start, '\"') orelse break;
+        const relative = text[start..end];
+        if (std.mem.endsWith(u8, relative, ".zig")) {
+            const dependency = std.fs.path.resolve(b.allocator, &.{ std.fs.path.dirname(path).?, relative }) catch @panic("OOM");
+            dependencies.append(b.allocator, dependency) catch @panic("OOM");
+        }
+        cursor = end + 1;
+    }
+    const imports: SourceImports = .{
+        .local_names = names.toOwnedSlice(b.allocator) catch @panic("OOM"),
+        .relative_paths = dependencies.toOwnedSlice(b.allocator) catch @panic("OOM"),
+    };
+    source_imports.put(b.allocator, path, imports) catch @panic("OOM");
+    return imports;
 }
 
 fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
@@ -138,28 +189,9 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
         if ((seen.getOrPut(path) catch @panic("OOM")).found_existing) continue;
         const base = std.fs.path.basename(path);
         if (std.mem.eql(u8, base, "local_test_sources.zig") or std.mem.startsWith(u8, base, "source_owner_")) continue;
-        const text = sourceText(b, path) orelse continue;
-        const marker = "@import(\"antfly_local_sources\").";
-        var cursor: usize = 0;
-        while (std.mem.indexOfPos(u8, text, cursor, marker)) |offset| {
-            const start = offset + marker.len;
-            var end = start;
-            while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '_')) : (end += 1) {}
-            if (end > start) names.put(b.allocator, text[start..end], {}) catch @panic("OOM");
-            cursor = end;
-        }
-        cursor = 0;
-        const import = "@import(\"";
-        while (std.mem.indexOfPos(u8, text, cursor, import)) |offset| {
-            const start = offset + import.len;
-            const end = std.mem.indexOfScalarPos(u8, text, start, '"') orelse break;
-            const relative = text[start..end];
-            if (std.mem.endsWith(u8, relative, ".zig")) {
-                const dependency = std.fs.path.resolve(b.allocator, &.{ std.fs.path.dirname(path).?, relative }) catch @panic("OOM");
-                pending.append(b.allocator, dependency) catch @panic("OOM");
-            }
-            cursor = end + 1;
-        }
+        const imports = importsFor(b, path) orelse continue;
+        for (imports.local_names) |name| names.put(b.allocator, name, {}) catch @panic("OOM");
+        pending.appendSlice(b.allocator, imports.relative_paths) catch @panic("OOM");
     }
     var selected: std.ArrayList([]const u8) = .empty;
     for (names.keys()) |name| {
@@ -176,7 +208,12 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
 
 fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     const tests = testObject(executable) orelse return null;
-    if (partitions.get(tests)) |existing| return existing;
+    const max_rss = if (tests.step.max_rss != 0) tests.step.max_rss else executable.step.max_rss;
+    const partition_max_rss = if (max_rss >= 12 * 1024 * 1024 * 1024 and max_rss < 14 * 1024 * 1024 * 1024) 14 * 1024 * 1024 * 1024 else max_rss;
+    if (partitions.get(tests)) |existing| {
+        if (existing.step.max_rss == 0) existing.step.max_rss = partition_max_rss;
+        return existing;
+    }
     const local = source_owner.localFor(tests.root_module) orelse return null;
     const names = localNames(b, tests.root_module);
     if (names.len == 0) return null;
@@ -200,7 +237,7 @@ fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Ste
         .name = b.fmt("{s}-local", .{tests.name}),
         .root_module = root,
         .filters = tests.filters,
-        .max_rss = if (tests.step.max_rss >= 12 * 1024 * 1024 * 1024 and tests.step.max_rss < 14 * 1024 * 1024 * 1024) 14 * 1024 * 1024 * 1024 else tests.step.max_rss,
+        .max_rss = partition_max_rss,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     partitions.put(b.allocator, tests, artifact) catch @panic("OOM");
@@ -250,6 +287,7 @@ fn allowEmpty(run: *std.Build.Step.Run) void {
 
 fn inventory(b: *std.Build, artifact: *std.Build.Step.Compile, original: *std.Build.Step.Run) *std.Build.Step.Run {
     const run = b.addRunArtifact(artifact);
+    run.step.max_rss = original.step.max_rss;
     run.addArgs(&.{ "--list-tests", "--allow-empty-test-filter" });
     var i: usize = 0;
     while (i + 1 < original.argv.items.len) : (i += 1) {
@@ -299,6 +337,7 @@ pub fn add(b: *std.Build) void {
         if (hasPartition(run, local)) continue;
         const allow_empty = hasArg(run, "--allow-empty-test-filter");
         const child = if (run.producer == null) partitionRun(b, local, run) else b.addRunArtifact(local);
+        child.step.max_rss = run.step.max_rss;
         child.environ_map = run.environ_map;
         child.cwd = run.cwd;
         support.configureTestRun(child);
@@ -314,6 +353,7 @@ pub fn add(b: *std.Build) void {
         const tests = testObject(executable).?;
         if (tests.test_runner != null and tests.test_runner.?.mode == .simple) {
             const audit = b.addSystemCommand(&.{"python3"});
+            audit.step.max_rss = run.step.max_rss;
             expanded_audits.put(b.allocator, audit, {}) catch @panic("OOM");
             audit.addFileArg(b.path("tools/audit_test_selection.py"));
             if (allow_empty) audit.addArg("--allow-empty");

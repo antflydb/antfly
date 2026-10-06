@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Run the real root composition, assert transitive ownership contracts, then
 //! replace only expensive runtime bodies. External modules, options, generated
@@ -272,9 +273,10 @@ pub fn build(b: *std.Build) void {
     // Pointer-keyed step traversal must not change the shared generated source
     // directory when an input is removed and restored. Stable paths are part
     // of the cache contract for every runtime archive in this fixture.
-    std.mem.sort(std.Build.Step.WriteFile.File, sources.files.items, {}, struct {
-        fn lessThan(_: void, a: std.Build.Step.WriteFile.File, c: std.Build.Step.WriteFile.File) bool {
-            return std.mem.lessThan(u8, a.sub_path, c.sub_path);
+    const configuration: *const std.Build.Configuration.Wip = &b.graph.wip_configuration;
+    std.mem.sort(std.Build.Step.WriteFile.Embed, sources.embeds.items, configuration, struct {
+        fn lessThan(config: *const std.Build.Configuration.Wip, a: std.Build.Step.WriteFile.Embed, c: std.Build.Step.WriteFile.Embed) bool {
+            return std.mem.lessThan(u8, config.stringSlice(a.sub_path), config.stringSlice(c.sub_path));
         }
     }.lessThan);
 }

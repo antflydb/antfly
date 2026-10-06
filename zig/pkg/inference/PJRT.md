@@ -5,7 +5,7 @@
 PJRT is now a package-backed compiled backend with a working whole-model artifact
 path, but it is still not a finished backend-owned decoder runtime.
 
-> **Relocated:** The detailed "Current state" bullet log that previously lived here (23 lines) is preserved verbatim in [work-log/completed/inference/pjrt-status-history.md](../../../work-log/completed/inference/pjrt-status-history.md). Durable decisions from it are in the Current shape list below.
+> **Relocated:** The detailed "Current state" bullet log that previously lived here (23 lines) is preserved verbatim in [docs/design/inference/history/pjrt-status-history.md](../../../docs/design/inference/history/pjrt-status-history.md). Durable decisions from it are in the Current shape list below.
 
 Current shape:
 

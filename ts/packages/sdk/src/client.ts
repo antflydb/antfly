@@ -22,6 +22,9 @@ import type {
   BatchResult,
   ChatAgentConfig,
   ChatAgentTurnResult,
+  ChatGPTAccount,
+  ChatGPTBegin,
+  ChatGPTOutcome,
   ChatMessage,
   ChatStreamCallbacks,
   ClusterRestoreRequest,
@@ -620,6 +623,78 @@ export class AntflyClient {
     }
 
     return headers;
+  }
+
+  /** Personal ChatGPT registrations. OAuth credentials never enter this client. */
+  readonly chatgpt = {
+    accounts: (signal?: AbortSignal) =>
+      this.personalRequest<{ accounts: ChatGPTAccount[] }>(
+        "/db/v1/connections/chatgpt/accounts",
+        "GET",
+        undefined,
+        signal
+      ),
+    authorize: (connectionId?: string, signal?: AbortSignal) =>
+      this.personalRequest<ChatGPTBegin>(
+        "/db/v1/connections/chatgpt/authorize",
+        "POST",
+        connectionId ? { connection_id: connectionId } : {},
+        signal
+      ),
+    attempt: (attemptId: string, signal?: AbortSignal) =>
+      this.personalRequest<ChatGPTOutcome>(
+        `/db/v1/connections/chatgpt/attempts/${encodeURIComponent(attemptId)}`,
+        "GET",
+        undefined,
+        signal
+      ),
+    models: (connectionId: string, signal?: AbortSignal) =>
+      this.personalRequest<{
+        models: { slug: string; display_name: string; visibility: string }[];
+      }>(
+        `/db/v1/connections/${encodeURIComponent(connectionId)}/chatgpt/models`,
+        "GET",
+        undefined,
+        signal
+      ),
+    disconnect: (connectionId: string, signal?: AbortSignal) =>
+      this.personalRequest<{ revocation_confirmed: boolean }>(
+        `/db/v1/connections/${encodeURIComponent(connectionId)}/chatgpt/disconnect`,
+        "POST",
+        {},
+        signal
+      ),
+  };
+
+  private async personalRequest<T>(
+    path: string,
+    method: "GET" | "POST",
+    body?: unknown,
+    signal?: AbortSignal
+  ): Promise<T> {
+    const response = await fetch(this.url(path), {
+      method,
+      headers: this.requestHeaders(),
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      signal,
+      credentials: "same-origin",
+      redirect: "error",
+    });
+    const { text, truncated } = await readLimitedResponseText(
+      response,
+      response.ok ? 1024 * 1024 : MAX_ERROR_RESPONSE_BYTES
+    );
+    if (truncated) throw new Error("ChatGPT connection response exceeded its size limit");
+    if (!response.ok) {
+      let code = "ChatGPTRequestFailed";
+      try {
+        code = (JSON.parse(text) as { error_code?: string }).error_code ?? code;
+      } catch {
+        /* status remains authoritative */
+      }
+      throw new ChatGPTConnectionError(response.status, code);
+    }
+    return parseJSON<T>(text);
   }
 
   private url(path: string): string {
@@ -2689,4 +2764,15 @@ export function normalizeBaseUrl(baseUrl: string): string {
     .replace(/\/db\/v1$/, "")
     .replace(/\/auth\/v1$/, "")
     .replace(/\/ai\/v1$/, "");
+}
+
+/** Machine-readable personal connection errors, without upstream token responses. */
+export class ChatGPTConnectionError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly code: string
+  ) {
+    super(code);
+    this.name = "ChatGPTConnectionError";
+  }
 }

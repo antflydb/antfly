@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 pub const std = @import("std");
 pub fn writeStdout(io: std.Io, bytes: []const u8) void {
@@ -35,6 +36,8 @@ pub const OutputFormat = enum { json, table_fmt };
 pub const GlobalConfig = struct {
     url: []const u8 = "http://127.0.0.1:8080",
     token: ?[]const u8 = null,
+    username: ?[]const u8 = null,
+    password: ?[]const u8 = null,
     output: OutputFormat = .json,
 };
 
@@ -46,11 +49,17 @@ pub fn parseGlobalFlags() GlobalConfig {
     if (platform.env.getenv("ANTFLY_TOKEN")) |raw| {
         config.token = raw;
     }
+    config.username = platform.env.getenv("ANTFLY_USERNAME");
+    config.password = platform.env.getenv("ANTFLY_PASSWORD");
     return config;
 }
 
 pub fn initClient(allocator: std.mem.Allocator, http: *httpx.Client, config: GlobalConfig) !antfly_client.AntflyClient {
     var client = try antfly_client.AntflyClient.init(allocator, http, config.url);
+    errdefer client.deinit();
+    if ((config.username == null) != (config.password == null)) return error.BasicAuthRequiresUsernameAndPassword;
+    if (config.token != null and config.username != null) return error.ConflictingAuthentication;
+    if (config.username) |username| try client.setBasicAuth(username, config.password.?);
     if (config.token) |token| {
         try client.setBearer(token);
     }

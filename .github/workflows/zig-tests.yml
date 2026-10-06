@@ -280,7 +280,7 @@ jobs:
             scripts/test-backup-s3-integration.sh \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
-            ':(glob)zig/pkg/antfly-embedded/build/**' \
+            ':(glob)zig/build_support/embedded/**' \
             ':(glob)zig/build_support/antfly/**' \
             zig/embedded.build.zig \
             ':(glob)zig/pkg/inference/build/**' \
@@ -321,7 +321,7 @@ jobs:
             Makefile \
             zig/build.zig \
             ':(glob)zig/pkg/antfly/build/**' \
-            ':(glob)zig/pkg/antfly-embedded/build/**' \
+            ':(glob)zig/build_support/embedded/**' \
             ':(glob)zig/build_support/antfly/**' \
             zig/embedded.build.zig \
             ':(glob)zig/pkg/inference/build/**' \
@@ -549,7 +549,7 @@ jobs:
         with:
           node-version-file: ts/package.json
 
-      - name: Build and test WASM artifacts
+      - name: Build and test Apache WASM artifacts
         working-directory: zig
         run: |
           node pkg/antfly-embedded/wasm_client_test.mjs
@@ -859,6 +859,13 @@ jobs:
           fi
           exit "$status"
 
+      - name: Verify externally fetched Apache Zig source package
+        run: >-
+          taskset -c ${{ steps.cpus.outputs.list }}
+          python3 zig/tools/check_embedded_zig_package.py --
+          --maxrss ${{ steps.cpus.outputs.max_rss }}
+          --summary all
+
       - name: Release correctness-fixture workspace
         if: always() && env.ANTFLY_TEST_WORKSPACE != ''
         run: |
@@ -1039,7 +1046,7 @@ jobs:
           fi
           exit "$status"
 
-      - name: Verify isolated embedded lake, C API, and WASM builds
+      - name: Verify server-free Apache Lite, lake, C API, WASM, and inference builds
         run: >-
           taskset -c ${{ steps.cpus.outputs.list }}
           python3 zig/tools/check_embedded_isolated_build.py --
@@ -1202,7 +1209,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [runtime, storage]
+        shard: [runtime-1, runtime-2, storage]
     env:
       ANTFLY_ZIG_MAX_RSS: "23622320128"
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
@@ -1251,13 +1258,13 @@ jobs:
           # /tmp counts toward the runner pod's 10 GiB ephemeral-storage limit.
           echo "TMPDIR=$ANTFLY_BUILD_CACHE_TMPDIR" >> "$GITHUB_ENV"
 
-      # Each shard gets its own runner and PVC. The runtime shard runs the
-      # remaining runtime cache contracts; the storage shard balances the slow
-      # host-generator contract with linked fixtures and storage ownership.
+      # Each shard gets its own runner and PVC. Spread runtime contracts across
+      # two runners; the storage shard balances the cold host-generator build
+      # with linked fixtures and storage ownership.
       - name: Test runtime compilation and cache contracts
-        if: matrix.shard == 'runtime'
+        if: startsWith(matrix.shard, 'runtime-')
         working-directory: zig
-        run: python3 -u -m tools.run_build_cache_contracts runtime
+        run: python3 -u -m tools.run_build_cache_contracts "${{ matrix.shard }}"
 
       - name: Test host-generator and linked cache contracts
         if: matrix.shard == 'storage'

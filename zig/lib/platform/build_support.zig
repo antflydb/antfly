@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -229,7 +230,10 @@ pub fn macosSdkLibCFile(b: *std.Build, target: std.Build.ResolvedTarget) ?std.Bu
 /// Configure every macOS artifact after its owners have constructed the graph,
 /// including linked libraries and generated host tools.
 pub fn finalizeMacosSdk(b: *std.Build) void {
-    if (!b.named_lazy_paths.contains("antfly_macos_sdk_root")) return;
+    // Host generators can target macOS even when the product targets Linux or
+    // wasm. Select the SDK lazily for those artifacts too, so their libc input
+    // does not change with the product target.
+    if (!b.named_lazy_paths.contains("antfly_macos_sdk_root") and b.graph.host.result.os.tag != .macos) return;
     var steps: std.AutoHashMap(*std.Build.Step, void) = .init(b.allocator);
     var modules: std.AutoHashMap(*std.Build.Module, void) = .init(b.allocator);
     for (b.top_level_steps.values()) |top| visitSdkStep(b, &top.step, &steps, &modules);

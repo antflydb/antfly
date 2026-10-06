@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -136,7 +137,7 @@ run_case() {
 
 if [[ "$WARM_BUILD" == "1" ]]; then
   echo "warming antfly-api-bench"
-  zig build --cache-dir "$ZIG_CACHE_DIR" --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR" -Doptimize=fast antfly-api-bench
+  ZIG_GLOBAL_CACHE_DIR="$ZIG_GLOBAL_CACHE_DIR" zig build --cache-dir "$ZIG_CACHE_DIR" -Doptimize=fast antfly-api-bench
 fi
 
 run_case index_sort_first_page_small exact-sort-index-sort "$DOCS_SMALL" "$LIMIT_SMALL"

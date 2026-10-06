@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
 //
 // Licensed under the Elastic License 2.0 (ELv2); you may not use this file
 // except in compliance with the Elastic License 2.0. You may obtain a copy of
@@ -45,6 +46,9 @@ pub fn runFromIterator(
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
+    if (std.mem.eql(u8, command, "connections") and
+        try cli.connections.runLocalProviderIfRequested(init.gpa, io, args)) return;
+
     var http = httpx.Client.initWithConfig(init.gpa, io, .{});
     defer http.deinit();
 
@@ -82,6 +86,7 @@ pub fn runFromIterator(
     if (std.mem.eql(u8, command, "agents")) return cli.agents.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "backup")) return cli.backup.runBackup(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "restore")) return cli.backup.runRestore(init.gpa, io, &client, args);
+    if (std.mem.eql(u8, command, "connections")) return cli.connections.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "auth")) return cli.auth.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "internal")) return cli.internal.run(init.gpa, io, &client, args);
     return error.InvalidArguments;

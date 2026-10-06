@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Validate and resolve the canonical release-channel policy."""
 
 from __future__ import annotations
@@ -58,6 +73,7 @@ class ReleaseSpec:
     release_line: str | None = None
     source_ref: str | None = None
     source_ref_head: str | None = None
+    build_contract_schema: int = 1
 
     def document(self) -> dict[str, object]:
         document: dict[str, object] = {
@@ -67,7 +83,7 @@ class ReleaseSpec:
             "channel": self.channel,
             "source_commit": self.source_commit,
             "build_controller_commit": self.build_controller_commit,
-            "build_contract_schema": 1,
+            "build_contract_schema": self.build_contract_schema,
             "registry_versions": {
                 "npm": self.npm_version,
                 "python": self.python_version,
@@ -177,7 +193,11 @@ def build_release_spec(
     release_line: str | None = None,
     source_ref: str | None = None,
     source_ref_head: str | None = None,
+    build_contract_schema: int = 1,
 ) -> ReleaseSpec:
+    from validate_source_contract import runtime_products
+
+    runtime_products(build_contract_schema)
     for name, commit in (
         ("source", source_commit),
         ("build controller", build_controller_commit),
@@ -211,6 +231,7 @@ def build_release_spec(
         release_line=release_line,
         source_ref=source_ref,
         source_ref_head=source_ref_head,
+        build_contract_schema=build_contract_schema,
     )
 
 
@@ -499,6 +520,7 @@ def main() -> int:
     parser.add_argument("--source-ref")
     parser.add_argument("--source-ref-head")
     parser.add_argument("--allow-legacy", action="store_true")
+    parser.add_argument("--build-contract-schema", type=int, default=1)
     args = parser.parse_args()
 
     policy = load_policy()
@@ -524,6 +546,7 @@ def main() -> int:
             release_line=args.release_line,
             source_ref=args.source_ref,
             source_ref_head=args.source_ref_head,
+            build_contract_schema=args.build_contract_schema,
         )
         print(json.dumps(spec.document(), indent=2, sort_keys=True))
         return 0

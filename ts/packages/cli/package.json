@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "type": "module",
   "description": "Native Antfly CLI installer package",
-  "license": "Elastic-2.0",
+  "license": "Elastic-2.0 AND Apache-2.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/antflydb/antfly.git",
@@ -18,7 +18,8 @@
   },
   "files": [
     "bin",
-    "README.md"
+    "README.md",
+    "LICENSES"
   ],
   "scripts": {
     "test": "node --test ./test/*.test.js && node --check ./bin/antfly.js"

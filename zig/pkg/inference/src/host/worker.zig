@@ -1,16 +1,17 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
-// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
-// except in compliance with the Elastic License 2.0. You may obtain a copy of
-// the Elastic License 2.0 at
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-//     https://www.antfly.io/licensing/ELv2-license
+//     http://www.apache.org/licenses/LICENSE-2.0
 //
-// Unless required by applicable law or agreed to in writing, software distributed
-// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
-// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-// Elastic License 2.0 for the specific language governing permissions and
-// limitations.
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 //! Host-owned replaceable inference process. Only wire values cross the pipes.
 const std = @import("std");
@@ -316,7 +317,9 @@ fn callSegments(endpoint: *rpc.Endpoint, operation: wire.Operation, options: []c
 /// Explicit override for the worker executable. Takes priority over every
 /// other resolution step; see `resolveWorkerExecutable`.
 const worker_executable_env = "ANTFLY_INFERENCE_WORKER";
-const antfly_binary_name = if (builtin.target.os.tag == .windows) "antfly.exe" else "antfly";
+const inference_worker_binary_name = if (builtin.target.os.tag == .windows) "antfly-inference-worker.exe" else "antfly-inference-worker";
+const lite_binary_name = if (builtin.target.os.tag == .windows) "antfly-lite.exe" else "antfly-lite";
+const worker_binary_names = [_][]const u8{ inference_worker_binary_name, lite_binary_name };
 
 /// Layout shared by glibc, musl, and Darwin's libc; sufficient to recover the
 /// path of the image an address was loaded from.
@@ -378,8 +381,8 @@ fn findOnPathAlloc(alloc: std.mem.Allocator, io: std.Io, name: []const u8) !?[]u
 ///  2. The image this code was loaded from, via `dladdr`: for the statically
 ///     linked `antfly` binary this resolves to itself (unchanged behavior);
 ///     for a shared `libantfly`, it resolves to the `.dylib`/`.so`, next to
-///     which we look for a sibling `antfly` binary.
-///  3. `antfly` on `PATH`.
+///     which we look for a sibling Apache worker or Lite binary.
+///  3. An Apache worker or Lite binary on `PATH`.
 fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
     if (platform.env.getenvSlice(worker_executable_env)) |override| {
         if (override.len == 0) return error.InferenceWorkerExecutableNotConfigured;
@@ -390,14 +393,18 @@ fn resolveWorkerExecutable(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
         const basename = std.fs.path.basename(self_path);
         if (!isSharedLibraryName(basename)) return alloc.dupe(u8, self_path);
         const dir = std.fs.path.dirname(self_path) orelse ".";
-        const candidate = try std.fs.path.join(alloc, &.{ dir, antfly_binary_name });
-        if (fileExists(io, candidate)) return candidate;
-        alloc.free(candidate);
+        for (worker_binary_names) |name| {
+            const candidate = try std.fs.path.join(alloc, &.{ dir, name });
+            if (fileExists(io, candidate)) return candidate;
+            alloc.free(candidate);
+        }
     } else |_| {}
-    if (try findOnPathAlloc(alloc, io, antfly_binary_name)) |path| return path;
+    for (worker_binary_names) |name| {
+        if (try findOnPathAlloc(alloc, io, name)) |path| return path;
+    }
     std.log.err(
         "no inference worker executable found for the embedded runtime; set {s} to the path " ++
-            "of the `antfly` binary, or place an `antfly` binary next to the loaded libantfly or on PATH",
+            "of an `antfly-inference-worker` or `antfly-lite` executable next to the loaded libantfly or on PATH",
         .{worker_executable_env},
     );
     return error.InferenceWorkerExecutableNotConfigured;

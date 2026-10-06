@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -31,7 +32,7 @@ class SdkCiContractTests(unittest.TestCase):
     def test_vitest_worker_counts_are_bounded(self) -> None:
         packages = (
             "ts/packages/sdk/package.json",
-            "ts/packages/lite/package.json",
+            "ts/packages/embedded/package.json",
             "ts/packages/components/package.json",
             "ts/apps/antfarm/package.json",
         )

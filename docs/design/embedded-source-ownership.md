@@ -2,19 +2,20 @@
 
 The local DB and its dependency closure live in `zig/pkg/antfly-embedded/src/local`.
 The server consumes this implementation through the internal `antfly_local_sources`
-module. This refactor preserves existing licenses; the Apache/ELv2 licensing and
-release changes belong to the separate licensing PR.
+module. The embedded and shared owners are Apache-2.0; the server coordination owner
+remains ELv2. See [LICENSING.md](../../LICENSING.md) for authoritative package
+classification and third-party exceptions.
 
 ## Physical owners
 
 | Owner | Responsibility |
 | --- | --- |
 | `pkg/antfly-embedded/src/local` | DB, WAL, LSM, indexes, search, graph execution, local transactions, local backups/restore, SQL and decision-function evaluation, portable lake readers, Lite, public C API and file CLI |
-| `pkg/antfly-embedded/src/inference` | Antfly inference providers and embedding integration |
+| `pkg/antfly-embedded/src/inference` | Antfly Inference providers and embedding integration |
 | `pkg/inference` | Model execution, inference host and native provider exports |
 | `lib/credentials` | Credential-source identities and native AWS discovery/cache shared by lake, backups and Bedrock |
 | `pkg/antfly/src` | HTTP handlers, distributed transactions, Raft coordination, cluster metadata, hot standby, server storage-owner adapters and private C API |
-| `pkg/antfly-embedded/build` | Local storage profiles, public C API, native provider archives and browser build |
+| `build_support/embedded` | Local storage profiles, public C API, native provider archives and browser build |
 | `build_support/antfly` | Shared module composition, dependency configuration, runtime contracts and test collection |
 
 Portable local transaction receipts and replication records remain with the DB.
@@ -70,9 +71,8 @@ lake readers, backups and server connection validation consume that owner.
 Bedrock retains type aliases for compatibility. Cache leases keep credentials
 alive across refresh and cache shutdown; absolute deadline/cancellation context
 continues across credential discovery and provider dispatch. Browser identity
-contracts do not expose native AWS discovery. The extracted implementation keeps
-its ELv2 license in this structural PR and is part of the Apache transition in
-#893, explicitly tracked by the license-header classifier.
+contracts do not expose native AWS discovery. The extracted implementation is Apache-2.0, along with its shared credentials
+owner; server secret resolution and managed-connection policy remain ELv2.
 
 Google authentication already follows this split: `lib/google/src/auth.zig`
 owns ADC/service-account discovery, token minting, refresh and caching. Vertex
@@ -128,11 +128,12 @@ and enrichment compute archives. It does not reuse the server storage archive or
 link server runtime entry points. The server compiles the same authored sources
 under its storage profile and keeps its own private adapters.
 
-The independent CLI supports file-oriented Lite commands. The server command
-wrapper supplies the `lite serve` callback; its behavior remains available through
-the server product. The independent executable retains the hidden inference worker
-entry point for process isolation. Public executable names and release packaging are unchanged
-by this refactor.
+The independent CLI supports file-oriented Lite commands. `lite serve` is
+removed from both CLIs; use `antfly standalone --storage-engine lite
+--storage-path app.aflite` for HTTP serving through the ELv2 server. The independent executable retains the hidden inference worker
+entry point for process isolation. The Apache `antfly-embedded` archive contains both public CLIs, `libantfly`,
+`antfly.h`, the private worker, runtime files and notices. It is the embedded
+release product alongside the separate ELv2 server archive. Embedded language packages ship their native library without a worker; public command installation belongs to the CLI distributions.
 
 The staged-build check removes the entire server package before compiling the
 CLI, public C API, public Zig package, AWS credentials, native lake and WASM products.
@@ -146,8 +147,9 @@ python3 tools/check_embedded_isolated_build.py -- -j1
 
 This runs in the existing full-suite CI path. Import-boundary audits separately
 reject a production local module graph that resolves any server source. PDF
-products obtain their font assets from the canonical TypeScript design-system
-fonts through a generated module, rather than importing server UI assets.
+products embed the reviewed Apache-2.0 Roboto fonts through a generated module,
+independently of server UI fonts. The asset manifest validates their byte identities
+and upstream notices.
 
 ## Test ownership
 
@@ -178,16 +180,28 @@ partitions or inventories. Small real-build fixtures cover these contracts in
 `tools/test_local_test_partitions.py`; the normal product suites exercise the
 actual local/server fixture graph.
 
-## Licensing transition
+## Licensing boundary
 
-This PR keeps existing source licenses. The follow-on licensing PR must classify
-and audit the entire native lake dependency closure along with DB and inference
-as Apache-2.0. Do not infer Apache eligibility from directory names. Server
-credential adapters, provisioning and cluster publication remain ELv2. Future
-changes must extend the isolated embedded build and tests when they add a local
-reader or host integration, rather than importing the server query barrel.
+The entire first-party local engine and native lake dependency closure is
+Apache-2.0. Server credential adapters, provisioning, Raft, hot standby and cluster
+publication remain ELv2. Third-party sources and assets retain their upstream
+licenses; package ownership does not replace those notices. The header policy,
+source dependency audit and asset manifest enforce this classification.
+
+Future changes must extend the isolated embedded build and tests when they add a
+local reader or host integration, rather than importing the server query barrel.
+The full suite builds without the entire server package and validates native,
+C ABI conformance and browser consumers. License and release packaging checks
+validate the canonical notices shipped with each product.
 
 Build composition and test partitioning use Zig 0.17 configuration APIs.
 Generated inputs retain LazyPath ownership until make phase; authored imports
 inspected during configuration are registered as configure dependencies so the
 serialized build graph is invalidated when source ownership changes.
+
+The fetched source package selects runtime/build owners and individual literal
+`@embedFile` assets from the same immutable commit. It excludes repository-wide
+test corpora, benchmarks, CI tools and language bindings. Optional accelerator
+artifacts and host code generators remain build inputs. The external consumer
+checks this reduced package through native modules, the C ABI and pkg-config
+installation, and both browser memory models.

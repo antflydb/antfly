@@ -1,4 +1,5 @@
 // Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -122,11 +123,11 @@ fn linuxHwcap() usize {
     // libc owns auxv initialization for C-hosted executables and shared libs.
     // Zig owns it for libc-free executables. A libc-free library without a
     // startup-provided auxv simply stays portable.
-    if (builtin.link_libc) return std.c.getauxval(std.elf.AT_HWCAP);
+    if (builtin.link_libc) return std.c.getauxval(std.elf.AT.HWCAP);
     const auxv = std.os.linux.elf_aux_maybe orelse return 0;
     var index: usize = 0;
-    while (auxv[index].a_type != std.elf.AT_NULL) : (index += 1) {
-        if (auxv[index].a_type == std.elf.AT_HWCAP) return auxv[index].a_un.a_val;
+    while (auxv[index].a_type != std.elf.AT.NULL) : (index += 1) {
+        if (auxv[index].a_type == std.elf.AT.HWCAP) return auxv[index].a_un.a_val;
     }
     return 0;
 }

@@ -1,4 +1,5 @@
 # Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1497,7 +1498,9 @@ class RuntimeCacheTest(unittest.TestCase):
 
     def test_host_generator_cache_contracts(self):
         names = ("openapi-zig", "antfly-quant-kernel-codegen", "protoc-zig", "yacc-zig")
-        self.build("cache-host-tools")
+        # A private cold compiler cache also builds the configurer and four
+        # LLVM host executables. Keep warm cache checks at the normal deadline.
+        self.build("cache-host-tools", timeout=600)
         for settings in (
             ("-Doptimize=fast",),
             ("-Doptimize=safe", "-Dcuda-artifacts=portable", "-Dwebgpu=true"),
@@ -1770,7 +1773,7 @@ pub fn build(b: *std.Build) void {
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=120,
+                timeout=240,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -1829,7 +1832,7 @@ pub fn build(b: *std.Build) void {
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=120,
+                    timeout=240,
                 )
                 output = result.stdout + result.stderr
                 self.assertEqual(result.returncode, 0, output)
@@ -1886,7 +1889,7 @@ pub fn build(b: *std.Build) void {
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=120,
+                    timeout=240,
                 )
                 output = result.stdout + result.stderr
                 self.assertEqual(result.returncode, 0, output)
