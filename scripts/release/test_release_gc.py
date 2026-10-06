@@ -500,6 +500,80 @@ class ReleaseGCTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "identity changed"):
             gc.plan_gc(store, now=NOW)
 
+    def test_unblocked_cleanup_resumes_after_interrupted_deletion(self) -> None:
+        for explicit in (False, True):
+            for failed_phase in ("payload", "manifest", "marker"):
+                with self.subTest(explicit=explicit, failed_phase=failed_phase):
+                    store = MemoryStore()
+                    tag = "v0.0.0-dev.1"
+                    ledger = store.add_release(tag, 100)
+                    newest = store.add_release("v0.0.0-dev.11", 0)
+                    store.add_journal("nightly", current=("v0.0.0-dev.11", newest))
+                    manifest = f"antfly/{tag}/artifacts.json"
+                    marker = f"{gc.PENDING_ROOT}{ledger}.json"
+                    identity = f"{gc.CONTAINER_IDENTITY_ROOT}{ledger}.json"
+                    plan = gc.plan_gc(
+                        store,
+                        now=NOW,
+                        nightly_min_count=1,
+                        delete_dev_releases=explicit,
+                    )
+                    self.assertEqual(plan["policy"]["shared_sweep"], "enabled")
+                    with tempfile.TemporaryDirectory() as raw:
+                        path = Path(raw) / "plan.json"
+                        path.write_text(json.dumps(plan))
+                        self.assertEqual(gc.load_plan(path), plan)
+
+                    class Client:
+                        def delete_objects(self, *, Bucket, Delete):
+                            keys = [item["Key"] for item in Delete["Objects"]]
+                            phase = (
+                                "marker"
+                                if marker in keys
+                                else "manifest"
+                                if manifest in keys
+                                else "payload"
+                            )
+                            if phase == failed_phase:
+                                # Multi-object deletion may partially succeed.
+                                store.delete_objects(keys[1:])
+                                return {
+                                    "Errors": [
+                                        {"Key": keys[0], "Code": "InternalError"}
+                                    ]
+                                }
+                            store.delete_objects(keys)
+                            return {}
+
+                    remote = object.__new__(gc.S3ObjectStore)
+                    remote.client, remote.bucket = Client(), "releases"
+
+                    # Persist markers in memory, using real S3 deletion phases.
+                    class ApplyingStore:
+                        def write_if_absent(self, key, body):
+                            store.write_if_absent(key, body)
+
+                        def delete_objects(self, keys):
+                            remote.delete_objects(keys)
+
+                    with self.assertRaisesRegex(SystemExit, "deletion failed"):
+                        gc.apply_gc_plan(ApplyingStore(), plan)
+                    self.assertIn(marker, store.objects)
+                    if failed_phase == "manifest":
+                        self.assertIn(manifest, store.objects)
+                        self.assertNotIn(identity, store.objects)
+                    retry = gc.plan_gc(store, now=NOW, nightly_min_count=10)
+                    if failed_phase == "marker":
+                        self.assertEqual(retry["delete_keys"], [marker])
+                    else:
+                        self.assertEqual(retry["expired"][tag], plan["expired"][tag])
+                        self.assertIn(manifest, retry["delete_keys"])
+                    gc.apply_gc_plan(store, retry)
+                    self.assertNotIn(marker, store.objects)
+                    self.assertNotIn(manifest, store.objects)
+                    self.assertNotIn(identity, store.objects)
+                    self.assertEqual(gc.plan_gc(store, now=NOW)["expired"], {})
+
     def test_pending_write_failure_prevents_all_prefix_deletion(self) -> None:
         store, tag, _, blocked = self.pending_legacy_cleanup()
 
@@ -710,7 +784,7 @@ class ReleaseGCTests(unittest.TestCase):
         store.add_release("v0.0.0-dev.1", 100)
         store.add_release("v0.0.0-dev.2", 1)
         plan = gc.plan_gc(store, now=NOW, nightly_days=30, nightly_min_count=1)
-        plan["expired"] = {}
+        plan["retained"] = {}
 
         with tempfile.TemporaryDirectory() as raw:
             path = Path(raw) / "plan.json"

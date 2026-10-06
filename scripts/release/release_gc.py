@@ -528,17 +528,19 @@ def plan_gc(
         else set()
     )
     pending_writes = {}
+    # Persist every expiration before deletion, including unblocked sweeps:
+    # payload/identity deletion can succeed before a manifest deletion fails.
+    for tag in sorted((expired.keys() & releases.keys()) - pending.keys()):
+        release = releases[tag]
+        key = f"{PENDING_ROOT}{release.ledger_sha256}.json"
+        pending_writes[key] = {
+            "schema_version": 1,
+            "tag": tag,
+            "ledger_sha256": release.ledger_sha256,
+            "reason": expired[tag],
+        }
+        snapshots[key] = None
     if unknown_references:
-        for tag in sorted((expired.keys() & releases.keys()) - pending.keys()):
-            release = releases[tag]
-            key = f"{PENDING_ROOT}{release.ledger_sha256}.json"
-            pending_writes[key] = {
-                "schema_version": 1,
-                "tag": tag,
-                "ledger_sha256": release.ledger_sha256,
-                "reason": expired[tag],
-            }
-            snapshots[key] = None
         # Keep the commit marker until its shared references can be collected.
         # A later plan discovers these expired releases through their manifests,
         # even after their other version-prefix objects have been removed.
@@ -577,6 +579,8 @@ def plan_gc(
     delete_keys.update(container_record_deletions)
     delete_keys.update(completed_pending)
     if not unknown_references:
+        # Newly written markers also complete in the last deletion phase.
+        delete_keys.update(pending_writes)
         delete_keys.update(
             f"{PENDING_ROOT}{pending[tag]['ledger_sha256']}.json"
             for tag in expired.keys() & pending.keys()

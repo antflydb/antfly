@@ -134,10 +134,11 @@ shared-object and container sweeping remains disabled until the manifest is
 repaired or the prefix is explicitly removed. Expired releases retain their
 `artifacts.json` commit markers while this cleanup is blocked, so later runs can
 still discover and collect their shared artifacts and container identities;
-other expired version-prefix objects can be removed immediately. Apply first
-persists a pending-cleanup record under `antfly/gc-pending/`, bound to the
-manifest digest. Ordinary scheduled GC honors that expiration even if it was
-originally selected with the explicit dev-cleanup flag. Current and pending
+other expired version-prefix objects can be removed immediately. Before any R2
+deletion, apply persists a pending-cleanup record under `antfly/gc-pending/` for
+every expired manifested release, bound to its manifest digest, including when
+shared sweeping is enabled. Ordinary scheduled GC honors that expiration even
+if it was originally selected with the explicit dev-cleanup flag. Current and pending
 channel identities still take precedence. Cleanup records are removed after
 version manifests, so an interrupted deletion preserves the decision for a
 retry. Malformed
