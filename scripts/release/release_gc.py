@@ -148,7 +148,7 @@ def release_prefix(tag: str) -> str:
 
 def load_releases(
     store: ObjectStore, objects: list[ObjectInfo]
-) -> tuple[dict[str, Release], set[str], set[str]]:
+) -> tuple[dict[str, Release], set[str], set[str], dict[str, frozenset[str]]]:
     by_key = {item.key: item for item in objects}
     release_keys: dict[str, set[str]] = {}
     for item in objects:
@@ -158,6 +158,7 @@ def load_releases(
             release_keys.setdefault(segment, set()).add(item.key)
 
     releases: dict[str, Release] = {}
+    unmanifested: dict[str, frozenset[str]] = {}
     all_content_keys = {
         item.key for item in objects if item.key.startswith(CONTENT_ROOT)
     }
@@ -168,7 +169,10 @@ def load_releases(
         ledger_key = f"{release_prefix(tag)}{LEDGER_NAME}"
         ledger_info = by_key.get(ledger_key)
         if ledger_info is None:
-            raise SystemExit(f"release {tag} has objects but no {LEDGER_NAME}")
+            # Old releases and interrupted uploads may have no commit marker.
+            # Keep their exact keys visible without inventing shared references.
+            unmanifested[tag] = frozenset(keys)
+            continue
         stored = store.read_optional(ledger_key)
         if stored is None:
             raise SystemExit(f"release ledger disappeared while planning: {ledger_key}")
@@ -223,7 +227,7 @@ def load_releases(
             content_keys=frozenset(content_keys),
             schema_version=schema,
         )
-    return releases, all_content_keys, all_container_keys
+    return releases, all_content_keys, all_container_keys, unmanifested
 
 
 def load_completion_history(
@@ -315,6 +319,7 @@ def plan_gc(
     nightly_days: int | None = None,
     nightly_min_count: int | None = None,
     prerelease_grace_days: int | None = None,
+    delete_dev_releases: bool = False,
 ) -> dict[str, Any]:
     policy = policy or load_policy()
     nightly_retention = policy["channels"]["nightly"]["retention"]
@@ -338,7 +343,9 @@ def plan_gc(
         )
     now = utc(now or datetime.now(timezone.utc))
     objects = store.list_objects(RELEASE_ROOT)
-    releases, all_content_keys, all_container_keys = load_releases(store, objects)
+    releases, all_content_keys, all_container_keys, unmanifested = load_releases(
+        store, objects
+    )
     container_records = load_container_records(store, releases, all_container_keys)
     stable_completed_at = load_completion_history(
         store, objects, releases, container_records
@@ -346,7 +353,7 @@ def plan_gc(
     protected_tags, protected_ledgers, snapshots = load_protected_identities(
         store, policy
     )
-    missing_protected = sorted(protected_tags - releases.keys())
+    missing_protected = sorted(protected_tags - releases.keys() - unmanifested.keys())
     if missing_protected:
         raise SystemExit(
             "protected channel release is missing its immutable ledger: "
@@ -381,6 +388,11 @@ def plan_gc(
         assert match is not None
         if tag in protected_tags or release.ledger_sha256 in protected_ledgers:
             retained[tag] = "channel-current-or-pending"
+        elif delete_dev_releases:
+            if match.group("pre_label") == "dev":
+                expired[tag] = "explicit-dev-cleanup"
+            else:
+                retained[tag] = "outside-dev-cleanup"
         elif match.group("prerelease") is None:
             retained[tag] = "stable"
         elif NIGHTLY_PATTERN.fullmatch(tag):
@@ -403,20 +415,44 @@ def plan_gc(
             else:
                 expired[tag] = "prerelease-grace-expired"
 
+    for tag in sorted(unmanifested):
+        match = TAG_PATTERN.fullmatch(tag)
+        assert match is not None
+        if tag in protected_tags:
+            retained[tag] = "channel-current-or-pending"
+        elif delete_dev_releases and match.group("pre_label") == "dev":
+            expired[tag] = "explicit-dev-cleanup"
+        else:
+            retained[tag] = "missing-artifact-manifest"
+
+    # A retained release without a manifest may reference any shared artifact
+    # or container digest. Its presence disables shared-object/image sweeping,
+    # while unrelated version prefixes can still be expired safely.
+    unknown_references = bool(unmanifested.keys() & retained.keys())
     retained_content = (
-        set().union(*(releases[tag].content_keys for tag in retained))
+        set().union(
+            *(releases[tag].content_keys for tag in retained if tag in releases)
+        )
         if retained
         else set()
     )
     expired_content = (
-        set().union(*(releases[tag].content_keys for tag in expired))
+        set().union(*(releases[tag].content_keys for tag in expired if tag in releases))
         if expired
         else set()
     )
     delete_keys = (
-        set().union(*(releases[tag].keys for tag in expired)) if expired else set()
+        set().union(
+            *(
+                releases[tag].keys if tag in releases else unmanifested[tag]
+                for tag in expired
+            )
+        )
+        if expired
+        else set()
     )
-    delete_keys.update((expired_content - retained_content) & all_content_keys)
+    if not unknown_references:
+        delete_keys.update((expired_content - retained_content) & all_content_keys)
 
     retained_container_digests = {
         str(container_records[tag]["container_digest"])
@@ -430,6 +466,8 @@ def plan_gc(
         if record is None:
             continue
         record_key = f"{CONTAINER_IDENTITY_ROOT}{record['ledger_sha256']}.json"
+        if unknown_references:
+            continue
         container_record_deletions.append(record_key)
         if record["container_digest"] in retained_container_digests:
             continue
@@ -452,6 +490,10 @@ def plan_gc(
             "nightly_min_count": nightly_min_count,
             "prerelease_grace_days": prerelease_grace_days,
             "stable": "forever",
+            "delete_dev_releases": delete_dev_releases,
+            "shared_sweep": "blocked-by-missing-manifest"
+            if unknown_references
+            else "enabled",
         },
         "protected_tags": sorted(protected_tags),
         "retained": retained,
@@ -659,6 +701,11 @@ def main() -> int:
     parser.add_argument("--nightly-days", type=int)
     parser.add_argument("--nightly-min-count", type=int)
     parser.add_argument("--prerelease-grace-days", type=int)
+    parser.add_argument(
+        "--delete-dev-releases",
+        action="store_true",
+        help="Delete unprotected dev prereleases only, including manifest-free prefixes",
+    )
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--apply-plan", type=Path)
     parser.add_argument("--approved-plan", type=Path)
@@ -674,6 +721,8 @@ def main() -> int:
         parser.error(
             "--apply, --apply-plan, and --approved-plan are mutually exclusive"
         )
+    if args.apply_plan and args.delete_dev_releases:
+        parser.error("--delete-dev-releases cannot be combined with --apply-plan")
     if args.apply_plan and any(
         value is not None
         for value in (
@@ -691,6 +740,7 @@ def main() -> int:
             nightly_days=args.nightly_days,
             nightly_min_count=args.nightly_min_count,
             prerelease_grace_days=args.prerelease_grace_days,
+            delete_dev_releases=args.delete_dev_releases,
         )
     )
     if args.approved_plan:

@@ -126,6 +126,24 @@ that channel journals and aliases did not change, and only then removes version
 objects, unshared content-addressed objects, and their R2 container-identity
 record. Compact completion receipts remain as permanent audit history.
 
+A release prefix without `artifacts.json` is retained and reported as
+`missing-artifact-manifest`. It does not stop retention of other version
+prefixes. Because its shared artifact and container references are unknown,
+shared-object and container sweeping remains disabled until the manifest is
+repaired or the prefix is explicitly removed. Malformed existing manifests and
+missing manifests bound to a channel journal’s ledger digest still stop
+planning. Legacy aliases without a ledger digest protect their version prefixes
+even when the manifest is absent.
+
+For an explicit cleanup of dev releases, dispatch `Release object retention`
+with `delete_dev_releases=true`. This selects only unprotected dev prereleases,
+including legacy tags such as `v0.0.0-dev22`, and leaves other release tags out
+of the deletion set. Channel current and pending identities remain protected.
+Use `apply=false` to inspect the plan first; `apply=true` uses the same protected
+approval, fresh-plan comparison, and release-storage lock as ordinary retention.
+The CLI equivalent for planning is `release_gc.py --delete-dev-releases` with
+the usual endpoint and output arguments.
+
 For recovery, send the same repository dispatch with an existing release tag
 and the SHA-256 of its `artifacts.json` asset:
 
