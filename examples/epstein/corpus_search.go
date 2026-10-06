@@ -31,8 +31,8 @@ func (s *SearchServer) searchRequest(queryText string) antfly.QueryRequest {
 		}
 		request.Fields = []string{"title", "mime_type", "original_url", "metadata"}
 		request.Hierarchy = &antfly.QueryHierarchy{
-			GroupBy:   &antfly.HierarchyGroupBy{Level: "source", Matches: &antfly.HierarchyMatches{Limit: 3, Fields: []string{"text"}}},
-			Ancestors: &antfly.HierarchyAncestors{Unit: &antfly.HierarchyProjection{Fields: []string{"provenance.page_number", "provenance.transcript_spans"}}},
+			GroupBy:   &antfly.HierarchyGroupBy{Level: "source", Matches: &antfly.HierarchyMatches{Limit: 3, Fields: []string{"text", "_start_time_ms"}}},
+			Ancestors: &antfly.HierarchyAncestors{Unit: &antfly.HierarchyProjection{Fields: []string{"provenance.page_number"}}},
 		}
 
 	}
@@ -73,15 +73,11 @@ func applyCorpusHit(result *SearchResult, hit antfly.QueryHit) {
 		result.PageNum = int(start + page - 1)
 		result.URL = strings.Split(result.URL, "#")[0] + fmt.Sprintf("#page=%d", result.PageNum)
 	}
-	spans, ok := unit["transcript_spans"].([]any)
-	if !ok {
-		spans, _ = match.Source["transcript_spans"].([]any)
-	}
-	if len(spans) > 0 {
-		if span, ok := spans[0].(map[string]any); ok {
-			if start, ok := span["start_ms"].(float64); ok {
-				result.URL = strings.Split(result.URL, "#")[0] + fmt.Sprintf("#t=%.3f", start/1000)
-			}
+	// Native transcription assigns each chunk the first overlapping phrase's
+	// timestamp. The unit's first span may be minutes before this search match.
+	if result.Audio {
+		if start, ok := match.Source["_start_time_ms"].(float64); ok && start >= 0 {
+			result.URL = strings.Split(result.URL, "#")[0] + fmt.Sprintf("#t=%.3f", start/1000)
 		}
 	}
 }

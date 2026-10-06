@@ -3,6 +3,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bufio"
 	"bytes"
 	"encoding/json"
@@ -15,8 +16,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func writeCorpusFixture(t *testing.T, name string, data []byte) {
@@ -435,7 +439,7 @@ func TestCorpusSearchProvenance(t *testing.T) {
 		t.Fatalf("result=%+v", result)
 	}
 	hit.Source["mime_type"] = "audio/wav"
-	hit.Hierarchy.Matches[0].Hierarchy.Ancestors.Unit.Document = map[string]any{"provenance": map[string]any{"transcript_spans": []any{map[string]any{"start_ms": float64(1250)}}}}
+	hit.Hierarchy.Matches[0].Source["_start_time_ms"] = float64(1250)
 	applyCorpusHit(&result, hit)
 	if !result.Audio || result.URL != "http://source/file#t=1.250" {
 		t.Fatalf("audio=%+v", result)
@@ -471,5 +475,157 @@ func TestCorpusSourceRejectsSymlinkEscapeAndChangedFile(t *testing.T) {
 	store.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
 	if response.Code != 409 {
 		t.Fatalf("changed source returned %d", response.Code)
+	}
+}
+
+func TestCorpusPDFWhitespaceHeader(t *testing.T) {
+	// Insert header whitespace and adjust xref offsets to keep the PDF valid.
+	lines := strings.Split(string(bytes.Replace(createMultiPagePDF(2), []byte("%PDF-1.4\n"), []byte("%PDF-1.4 \n"), 1)), "\n")
+	for i, line := range lines {
+		var offset int
+		if strings.HasSuffix(line, "00000 n ") {
+			fmt.Sscanf(line, "%d", &offset)
+			lines[i] = fmt.Sprintf("%010d 00000 n ", offset+1)
+		}
+		if i > 0 && lines[i-1] == "startxref" {
+			fmt.Sscanf(line, "%d", &offset)
+			lines[i] = fmt.Sprint(offset + 1)
+		}
+	}
+	data := []byte(strings.Join(lines, "\n"))
+	source := t.TempDir()
+	writeCorpusFixture(t, filepath.Join(source, "whitespace.pdf"), data)
+	state := filepath.Join(t.TempDir(), "state")
+	if err := corpusPrepareCmd([]string{"--state", state, "--source", "test=" + source, "--base-url", "http://localhost", "--pages-per-record", "1"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testCorpusConfig(t, state)
+	store := newCorpusStore(cfg)
+	defer store.Close()
+	info := mustStat(t, filepath.Join(source, "whitespace.pdf"))
+	for _, bounds := range [][2]int{{1, 2}, {2, 2}} {
+		loc := sourceLocator{Source: 0, Name: "whitespace.pdf", Size: info.Size(), Modified: info.ModTime().UnixNano(), First: bounds[0], Last: bounds[1]}
+		response := httptest.NewRecorder()
+		store.ServeHTTP(response, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, loc), nil))
+		if response.Code != 200 {
+			t.Fatalf("range %v: %d %s", bounds, response.Code, response.Body.String())
+		}
+		if bounds[0] == 1 {
+			if !bytes.Equal(response.Body.Bytes(), data) {
+				t.Fatal("whole-document request changed source bytes")
+			}
+		} else {
+			doc, err := pdf.NewReader(bytes.NewReader(response.Body.Bytes()), int64(response.Body.Len()))
+			if err != nil || doc.NumPage() != 1 {
+				t.Fatalf("split PDF: %v", err)
+			}
+		}
+	}
+}
+
+type blockedCorpusResponse struct {
+	*httptest.ResponseRecorder
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockedCorpusResponse) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered); <-w.release })
+	return w.ResponseRecorder.Write(p)
+}
+
+func TestCorpusConcurrentArchiveTransfers(t *testing.T) {
+	dir := t.TempDir()
+	cfg := corpusConfig{Key: "key"}
+	var locs []sourceLocator
+	payload := bytes.Repeat([]byte("PDF source bytes\n"), 20000)
+	for i := range 2 {
+		name := filepath.Join(dir, fmt.Sprintf("source%d.zip", i))
+		f, err := os.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		zw := zip.NewWriter(f)
+		w, err := zw.CreateHeader(&zip.FileHeader{Name: "file.pdf", Method: zip.Store})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = w.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err = zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err = f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		zr, err := zip.OpenReader(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		info := mustStat(t, name)
+		locs = append(locs, sourceLocator{Source: i, Name: "file.pdf", Size: int64(len(payload)), Modified: info.ModTime().UnixNano(), CRC: zr.File[0].CRC32})
+		zr.Close()
+		cfg.Sources = append(cfg.Sources, corpusSource{Path: name, Zip: true})
+	}
+	store := newCorpusStore(cfg)
+	defer store.Close()
+	first := &blockedCorpusResponse{ResponseRecorder: httptest.NewRecorder(), entered: make(chan struct{}), release: make(chan struct{})}
+	var release sync.Once
+	defer release.Do(func() { close(first.release) })
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		store.ServeHTTP(first, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, locs[0]), nil))
+	}()
+	select {
+	case <-first.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first transfer did not start")
+	}
+	second := httptest.NewRecorder()
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		store.ServeHTTP(second, httptest.NewRequest("GET", "/sources/"+sourceToken(cfg, locs[1]), nil))
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second archive blocked behind first transfer")
+	}
+	// Also exercise Close while an evicted archive still has an active reader.
+	store.Close()
+	release.Do(func() { close(first.release) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first transfer did not finish")
+	}
+	for _, response := range []*httptest.ResponseRecorder{first.ResponseRecorder, second} {
+		if response.Code != 200 || !bytes.Equal(response.Body.Bytes(), payload) {
+			t.Fatalf("archive transfer truncated: status=%d bytes=%d", response.Code, response.Body.Len())
+		}
+	}
+}
+
+func TestCorpusAudioMatchingChunkTimestamp(t *testing.T) {
+	server := &SearchServer{corpus: true, indexes: []string{corpusTextIndex}}
+	request := server.searchRequest("late phrase")
+	if !slices.Contains(request.Hierarchy.GroupBy.Matches.Fields, "_start_time_ms") {
+		t.Fatal("search must project the matching chunk timestamp")
+	}
+	hit := antfly.QueryHit{Source: map[string]any{"mime_type": "audio/wav", "original_url": "http://source/audio"}, Hierarchy: antfly.QueryHitHierarchy{Matches: []antfly.HierarchyMatchHit{{Source: map[string]any{"text": "late phrase", "_start_time_ms": float64(9000)}, Hierarchy: antfly.HierarchyMatchContext{Ancestors: antfly.QueryHitHierarchyAncestors{Unit: antfly.HierarchyAncestor{Document: map[string]any{"provenance": map[string]any{"transcript_spans": []any{map[string]any{"start_ms": float64(0)}, map[string]any{"start_ms": float64(9000)}}}}}}}}}}}
+	for _, test := range []struct {
+		time any
+		want string
+	}{{float64(9000), "http://source/audio#t=9.000"}, {float64(0), "http://source/audio#t=0.000"}, {nil, "http://source/audio"}, {float64(-1), "http://source/audio"}} {
+		hit.Hierarchy.Matches[0].Source["_start_time_ms"] = test.time
+		var result SearchResult
+		applyCorpusHit(&result, hit)
+		if result.URL != test.want {
+			t.Fatalf("timestamp %v: %s", test.time, result.URL)
+		}
 	}
 }

@@ -327,19 +327,55 @@ func mergeCorpusRuns(cfg corpusConfig, paths []string, output string, dedup bool
 }
 
 // Keep one ZIP central directory open. This avoids repeatedly parsing enormous
-// archives while bounding cache memory; concurrent source requests are serialized.
+// archives while bounding cache memory. Active readers retain their archive when
+// another request switches the cached source; transfers never hold the cache lock.
 type corpusStore struct {
-	cfg       corpusConfig
-	mu        sync.Mutex
-	zip       *zip.ReadCloser
-	zipSource int
-	zipFiles  map[string]*zip.File
+	cfg corpusConfig
+	mu  sync.Mutex
+	zip *corpusArchive
 }
 
-func newCorpusStore(cfg corpusConfig) *corpusStore { return &corpusStore{cfg: cfg, zipSource: -1} }
+type corpusArchive struct {
+	reader  *zip.ReadCloser
+	source  int
+	files   map[string]*zip.File
+	readers int
+}
+
+type corpusArchiveReader struct {
+	io.ReadCloser
+	store   *corpusStore
+	archive *corpusArchive
+	once    sync.Once
+	err     error
+}
+
+func (r *corpusArchiveReader) Close() error {
+	r.once.Do(func() {
+		r.err = r.ReadCloser.Close()
+		r.store.mu.Lock()
+		defer r.store.mu.Unlock()
+		r.archive.readers--
+		if r.archive != r.store.zip && r.archive.readers == 0 {
+			r.archive.reader.Close()
+		}
+	})
+	return r.err
+}
+
+func newCorpusStore(cfg corpusConfig) *corpusStore { return &corpusStore{cfg: cfg} }
 func (s *corpusStore) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeArchive()
+}
+
+// Caller holds mu. Readers of an evicted archive close it when the last finishes.
+func (s *corpusStore) closeArchive() {
 	if s.zip != nil {
-		s.zip.Close()
+		if s.zip.readers == 0 {
+			s.zip.reader.Close()
+		}
 		s.zip = nil
 	}
 }
@@ -349,6 +385,8 @@ func (s *corpusStore) open(loc sourceLocator) (io.ReadCloser, error) {
 	}
 	source := s.cfg.Sources[loc.Source]
 	if source.Zip {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		stat, err := os.Stat(source.Path)
 		if err != nil {
 			return nil, err
@@ -356,26 +394,32 @@ func (s *corpusStore) open(loc sourceLocator) (io.ReadCloser, error) {
 		if stat.ModTime().UnixNano() != loc.Modified {
 			return nil, fmt.Errorf("archive changed; prepare a new corpus state")
 		}
-		if s.zipSource != loc.Source {
-			s.Close()
-			s.zip, err = zip.OpenReader(source.Path)
+		if s.zip == nil || s.zip.source != loc.Source {
+			reader, err := zip.OpenReader(source.Path)
 			if err != nil {
 				return nil, err
 			}
-			s.zipSource = loc.Source
-			s.zipFiles = make(map[string]*zip.File, len(s.zip.File))
-			for _, f := range s.zip.File {
-				if _, exists := s.zipFiles[f.Name]; exists {
+			files := make(map[string]*zip.File, len(reader.File))
+			for _, f := range reader.File {
+				if _, exists := files[f.Name]; exists {
+					reader.Close()
 					return nil, fmt.Errorf("duplicate ZIP member %q", f.Name)
 				}
-				s.zipFiles[f.Name] = f
+				files[f.Name] = f
 			}
+			s.closeArchive()
+			s.zip = &corpusArchive{reader: reader, source: loc.Source, files: files}
 		}
-		f := s.zipFiles[loc.Name]
+		f := s.zip.files[loc.Name]
 		if f == nil || int64(f.UncompressedSize64) != loc.Size || f.CRC32 != loc.CRC {
 			return nil, fmt.Errorf("ZIP member changed")
 		}
-		return f.Open()
+		reader, err := f.Open()
+		if err != nil {
+			return nil, err
+		}
+		s.zip.readers++
+		return &corpusArchiveReader{ReadCloser: reader, store: s, archive: s.zip}, nil
 	}
 	root, err := os.OpenRoot(source.Path)
 	if err != nil {
@@ -398,8 +442,6 @@ func (s *corpusStore) open(loc sourceLocator) (io.ReadCloser, error) {
 	return f, nil
 }
 func (s *corpusStore) digest(loc sourceLocator) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	r, err := s.open(loc)
 	if err != nil {
 		return "", err
@@ -439,18 +481,27 @@ func (s *corpusStore) seekable(loc sourceLocator) (*os.File, func(), error) {
 	return f, cleanup, nil
 }
 func (s *corpusStore) pages(loc sourceLocator) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	f, cleanup, err := s.seekable(loc)
 	if err != nil {
 		return 0, err
 	}
 	defer cleanup()
-	doc, err := pdf.NewReader(f, loc.Size)
-	if err != nil {
+	return corpusPDFPages(f, loc.Size)
+}
+
+func corpusPDFPages(f *os.File, size int64) (int, error) {
+	doc, err := pdf.NewReader(f, size)
+	if err == nil {
+		return doc.NumPage(), nil
+	}
+	// The fast reader rejects headers with trailing whitespace found in DOJ PDFs.
+	// Fall back to the parser already used for page-range extraction, preserving
+	// the original bytes and their xref offsets.
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
 		return 0, err
 	}
-	return doc.NumPage(), nil
+	defer f.Seek(0, io.SeekStart)
+	return api.PageCount(f, nil)
 }
 func sourceToken(cfg corpusConfig, loc sourceLocator) string {
 	data, _ := json.Marshal(loc)
@@ -485,8 +536,6 @@ func (s *corpusStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid source token", http.StatusForbidden)
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if loc.First < 0 || loc.Last < loc.First || ((loc.First == 0) != (loc.Last == 0)) {
 		http.Error(w, "invalid page range", 400)
 		return
@@ -506,8 +555,8 @@ func (s *corpusStore) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer cleanup()
 		if loc.First == 1 && loc.Size <= corpusMaxBytes {
-			doc, parseErr := pdf.NewReader(source, loc.Size)
-			if parseErr == nil && doc.NumPage() == loc.Last {
+			pages, parseErr := corpusPDFPages(source, loc.Size)
+			if parseErr == nil && pages == loc.Last {
 				http.ServeContent(w, r, path.Base(loc.Name), time.Time{}, source)
 				return
 			}
