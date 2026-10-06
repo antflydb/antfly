@@ -50,3 +50,91 @@ cursor rows, then closes cursors and sessions and measures resource recovery.
 Fixture failures produce a failed receipt. Credentials and raw pgwire error
 messages are excluded. It covers retained cursors; extended-protocol prepared
 portals and slow-consumer overload still require their own performance profiles.
+
+## Resource ledger and operator controls
+
+[RESOURCE_OWNERSHIP.md](RESOURCE_OWNERSHIP.md) records nested versus independent
+owners, acquisition order and progress boundaries. Native data/standalone API
+allocations now charge the node memory manager used by managed storage/models;
+HTTP application output and pgwire heap charge the corresponding API envelopes.
+Raw transport buffers, native stacks/TLS and backend mappings still need separate
+qualification. A total-process RSS guarantee is not implied.
+
+Authenticated administrators can GET `/admin/v1/workload/query` for configured
+and effective query limits, policy version, queue timing, retiring waiter count,
+drain/suspension state and allocation envelope counters. PUT replaces a policy:
+
+```json
+{
+  "expected_version": 1,
+  "capacity": 2,
+  "waiting": {"max_queued_requests": 2, "max_queued_bytes": 1048576, "max_wait_ms": 100},
+  "suspended": false
+}
+```
+
+Limits may shrink and later return to startup reservations. A stale version
+returns 409; increasing finite capacity, queue size/bytes or wait ceiling beyond
+startup reservations returns 422. Explicit startup capacity zero remains
+unlimited; changing a finite startup capacity to zero is rejected. Queue shrinking
+retires newest excess waiters; existing grants survive. Suspension retires queued
+work and rejects fresh queries while transaction controls remain available.
+Existing waiters keep their original finite wait ceiling/deadline; a replacement
+wait ceiling applies to subsequent enqueue operations. PUT
+`{"expected_version":2,"action":"drain"}` permanently closes query admission.
+Quiescence requires active and queued counts and notified-but-unretired entries
+to reach zero; transport/background-owner joins are separate shutdown barriers.
+Policies are node-local and reset to configuration after restart.
+
+## Reproducible pressure comparison
+
+`run_matrix.py` runs origin/main (when supplied), candidate fail-fast, and candidate
+fixed waiting in independent temporary stores. Candidate fail-fast uses the same
+startup heaps and configuration as fixed waiting, with only query waiting disabled. `load_clients.py` records every
+offered/submitted/completed/successful/failed/generator-dropped request, zero
+retries, successful and all-response p95/p99, resource peaks, control latency and
+recovery. Latency starts at the scheduled offer time, including client queueing.
+Mixed workloads validate exact query rows, issue writes, and delay reading large
+results. The generator has a finite task envelope; dropping offered work fails
+its manifest gate. Successful throughput excludes failures and includes drain
+elapsed time. A status code without valid rows is not a successful query.
+
+```sh
+python3 zig/qualification/workload-pooling/run_matrix.py \
+  --candidate /path/to/candidate/antfly --baseline /path/to/main/antfly \
+  --manifest zig/qualification/workload-pooling/macos-mixed-load.json \
+  --output-dir /tmp/fresh-pooling-comparison
+```
+
+The Linux profiles require exact enforced cgroup-v2 limits and fail on macOS or
+an unlimited Linux host. Build native GNU Linux binaries outside the measurement
+container, then run the small profiles with two CPUs, 2 GiB, 512 PIDs and 512 FDs;
+the large profile uses four CPUs, 4 GiB, 768 PIDs and 1024 FDs. The Dockerfile and
+manual `Zig Workload Pooling Qualification` workflow provide that environment,
+build the selected baseline with the same optimization/toolchain, run the GNU
+signal-stack fixture, and retain all receipts. Small/large authenticated profiles
+also exercise extended-protocol prepared portal suspension/continuation.
+
+The comparison requires identical manifest hashes, enforced limits, offered
+work and zero retries. It checks a 25% low-load/recovery p95 regression ceiling
+and 90% successful-throughput floor, in addition to each profile's absolute
+limits. These are proposed release gates fixed before measurement, not achieved
+performance claims. Passing one comparison never enables automatic defaults;
+Linux, whole-node ownership and distributed-progress gates remain explicit.
+Receipts cannot be overwritten accidentally. `test_harness.py` verifies the
+comparison and resource gates fail closed.
+
+The cold and warm macOS load profiles are separate measurements. The warm
+manifest explicitly records warm-up operations and uses cheap low-load/recovery
+queries; it is not a replacement for a failed cold profile. Historical development
+[receipts](receipts/2026-10-06/README.md) retain both outcomes and binary provenance.
+The API accounting port shares the actual storage owner in linked composition.
+Inference and unmanaged transport/native allocations remain independent owners;
+see [the ownership ledger](RESOURCE_OWNERSHIP.md) before interpreting health
+counters as a whole-process cap.
+
+Same-binary comparisons reject configuration differences other than waiting and
+the ephemeral pgwire bind port. Each new receipt preserves a redacted server log
+beside its measurements. Missing idle control samples fail with `null`, never a
+passing zero. Final Linux comparisons currently fail sustained throughput; see
+[recorded outcomes](receipts/2026-10-06/README.md).

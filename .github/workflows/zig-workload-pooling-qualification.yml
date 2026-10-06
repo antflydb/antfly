@@ -1,0 +1,73 @@
+name: Zig Workload Pooling Qualification
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline ref to compare under identical container limits
+        default: main
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: workload-pooling-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  qualify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          persist-credentials: false
+      - name: Load pinned toolchain
+        id: toolchain
+        uses: ./.github/actions/load-toolchain-policy
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils
+      - name: Build and test candidate
+        working-directory: zig
+        run: zig build antfly antfly-workload-pooling-test shared-signal-stack-test -Doptimize=ReleaseSafe -j1 --prefix ../qualification-bin/candidate
+      - name: Build baseline
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+        run: |
+          git fetch --no-tags origin "$BASELINE_REF"
+          git worktree add --detach /tmp/antfly-pooling-baseline FETCH_HEAD
+          git -C /tmp/antfly-pooling-baseline submodule update --init --recursive
+          git rev-parse HEAD > qualification-bin/candidate/revision.txt
+          git -C /tmp/antfly-pooling-baseline rev-parse HEAD > qualification-bin/baseline-revision.txt
+          cd /tmp/antfly-pooling-baseline/zig
+          zig build antfly -Doptimize=ReleaseSafe -j1 --prefix "$GITHUB_WORKSPACE/qualification-bin/baseline"
+      - name: Build measurement image
+        run: docker build -t antfly-pooling-qualification -f zig/qualification/workload-pooling/Dockerfile .
+      - name: Qualify small Linux envelope
+        run: |
+          docker run --rm --cpus=2 --memory=2g --memory-swap=2g --pids-limit=512 --ulimit nofile=512:512 \
+            -v "$GITHUB_WORKSPACE:/workspace" antfly-pooling-qualification \
+            --candidate qualification-bin/candidate/bin/antfly --baseline qualification-bin/baseline/bin/antfly \
+            --manifest zig/qualification/workload-pooling/linux-small.json \
+            --manifest zig/qualification/workload-pooling/linux-mixed-load.json \
+            --output-dir qualification-receipts/small
+      - name: Qualify larger Linux envelope
+        if: ${{ !cancelled() }}
+        run: |
+          docker run --rm --cpus=4 --memory=4g --memory-swap=4g --pids-limit=768 --ulimit nofile=1024:1024 \
+            -v "$GITHUB_WORKSPACE:/workspace" antfly-pooling-qualification \
+            --candidate qualification-bin/candidate/bin/antfly --baseline qualification-bin/baseline/bin/antfly \
+            --manifest zig/qualification/workload-pooling/linux-large.json \
+            --output-dir qualification-receipts/large
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: ${{ !cancelled() }}
+        with:
+          name: workload-pooling-qualification
+          path: |
+            qualification-receipts
+            qualification-bin/**/revision.txt
+            qualification-bin/baseline-revision.txt

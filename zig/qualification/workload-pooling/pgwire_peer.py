@@ -56,7 +56,11 @@ class Peer:
 
     def query(self, sql, state=b"I"):
         self.send(b"Q", sql.encode() + b"\0")
+        return self.ready(state)
+
+    def ready(self, state=b"I", allow_suspended=False):
         rows, problem = [], None
+        suspended = False
         while True:
             tag, payload = self.message()
             if tag == b"E":
@@ -83,12 +87,34 @@ class Peer:
                 if offset != len(payload):
                     raise RuntimeError("invalid pgwire row length")
                 rows.append(row)
+            elif tag == b"s":
+                suspended = True
             elif tag == b"Z":
+                if suspended and not allow_suspended:
+                    raise RuntimeError("unexpected suspended portal")
                 if problem:
                     raise problem
                 if payload != state:
                     raise RuntimeError("unexpected pgwire transaction state")
                 return rows
+
+    def open_portal(self, statement):
+        self.send(
+            b"P", b"prepared\0" + statement.encode() + b"\0" + struct.pack("!H", 0)
+        )
+        self.send(b"B", b"portal\0prepared\0" + struct.pack("!HHH", 0, 0, 0))
+        return self.execute_portal(1)
+
+    def execute_portal(self, rows):
+        self.send(b"E", b"portal\0" + struct.pack("!I", rows))
+        self.send(b"S", b"")
+        return self.ready(b"T", allow_suspended=True)
+
+    def close_portal(self):
+        self.send(b"C", b"Pportal\0")
+        self.send(b"C", b"Sprepared\0")
+        self.send(b"S", b"")
+        self.ready(b"T")
 
     def close(self):
         self.sock.close()

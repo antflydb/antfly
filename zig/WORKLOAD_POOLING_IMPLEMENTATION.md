@@ -509,3 +509,76 @@ and also passed the fixed limits. These receipts qualify the specified small
 macOS profiles; they are not main-versus-candidate throughput measurements or
 permission to enable automatic query waiting. Linux, larger/slow-consumer and
 distributed release profiles remain required.
+
+
+### Resource accounting, controls and qualification harness (2026-10-06)
+
+API foreground and persistent allocation budgets now report successful reservation
+peaks and quota rejections, and charge an allocation-free borrowed parent port.
+The native data server connects that port to the actual storage-kernel context in
+linked composition, or the local ResourceManager in direct composition. The
+control allocation reserve is pinned before API publication and returned only
+after API owners join. Nested HTTP application/output scopes and native pgwire
+protocol/runtime allocations use these API allocators; parent reservations are
+counted once. Backing OOM, growth failure and free return charges. The compiled
+storage-owner ABI regression verifies reserve/release changes the actual owner's
+memory usage and restores the original value.
+
+The [ownership ledger](qualification/workload-pooling/RESOURCE_OWNERSHIP.md)
+records independent inference, raw transport, native and OS owners rather than
+calling the storage-owner ceiling a complete process/RSS cap. The native DB
+socket fixture exhausts real storage reservations alongside SQL foreground
+workers and allocations, then verifies held-cursor COMMIT and failed-transaction
+ROLLBACK. Distributed durable completion remains a separate qualification gate.
+
+Authenticated GET/PUT `/admin/v1/workload/query` expose effective/startup policy,
+version, queued bytes, wait outcomes/histograms, heap accounting and quiescence.
+PUT can shrink/restore limits within startup reservations, suspend/resume, or
+permanently drain using an expected version. Granted work remains owned;
+shrinking retires excess newest waiters; quiescence includes notified waiters
+until they retire. Verified operator requests use protected transport/application
+capacity. Policies are node-local and reset on restart. Tests cover authorization,
+stale versions, growth rejection, suspension, restoration, drain and ownership.
+
+The [qualification harness](qualification/workload-pooling/README.md) adds an
+open-loop finite generator, cheap/expensive queries, writes, delayed readers,
+exact row validation, scheduled-offer latency, successful throughput including
+drain, offered/dropped/error accounting, status responsiveness and recovery.
+Baseline, candidate fail-fast and fixed-waiting variants run in isolated stores.
+Receipts preserve binary/manifest identities, configuration and enforced cgroup
+limits; comparisons reject missing/different identities, retries, failed phases,
+latency regression and throughput loss. Linux small/large manifests and a manual
+CI workflow use the same pinned toolchain/optimization for main and candidate.
+Seven Python tests verify these gates fail closed.
+
+Final macOS pooling tests passed 46/46; the linked storage-context test passed.
+The preceding integrated run also passed resource budgets 92/92 plus its
+filesystem fixture, pgwire 84/84 and protected HTTP 10/10. GNU Linux ran the real
+worker guard-page overflow fixture successfully and passed all 56 compiled
+pooling-root tests from a writable temporary directory. The first Linux build
+attempt exceeded its declared compiler memory estimate and the read-only source
+mount prevented test temporary-directory creation; those attempts are build/test
+environment failures, not passing qualification receipts.
+
+Historical macOS cold/warm comparisons retain both outcomes in
+[receipt provenance](qualification/workload-pooling/receipts/2026-10-06/README.md).
+The cold profile failed relative low-load p95. The distinct recorded warm profile
+passed, with low-load p95 about 1% above main and sustained successful throughput
+about 99% of main. These measurements precede the final linked-storage hook
+correction and do not certify the final binary. Automatic defaults remain opt-in
+pending coordinated whole-process ownership, distributed progress and all
+required performance profiles; a passing warm run cannot erase a cold failure.
+
+
+The corrected GNU Linux build/test targets passed 17/17 steps, 46/46 pooling
+contracts and the native overflow fixture. Candidate and unmodified origin/main
+CLIs built successfully using identical pinned AArch64 GNU Debug settings.
+Fixed waiting passed small and larger authenticated idle profiles under enforced
+2 CPU/2 GiB/512 PID/512 FD and 4 CPU/4 GiB/768 PID/1024 FD containers.
+The equal-heap small mixed comparison retains a **failed** throughput gate:
+fixed waiting achieved 82.5% of main and 80.3% of candidate fail-fast sustained
+successful throughput. All absolute profiles, offered-work/no-retry gates and
+low-load/recovery latency gates passed; main failed authenticated idle setup.
+Raw receipts and server logs are preserved, including the earlier unequal-heap
+comparison and its limitation. Default waiting remains disabled; do not tune
+or relax an existing manifest to erase this result.

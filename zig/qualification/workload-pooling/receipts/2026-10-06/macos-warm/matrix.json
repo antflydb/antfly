@@ -1,0 +1,25 @@
+{
+  "passed": true,
+  "failures": [],
+  "profiles": [
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-warm-mixed-load.json",
+      "variant": "origin-main",
+      "receipt": "/private/tmp/antfly-pooling-stage-three-macos-warm-matrix/macos-warm-mixed-load-origin-main.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-warm-mixed-load.json",
+      "variant": "candidate-fixed",
+      "receipt": "/private/tmp/antfly-pooling-stage-three-macos-warm-matrix/macos-warm-mixed-load-candidate-fixed.json",
+      "exit_code": 0
+    },
+    {
+      "manifest": "zig/qualification/workload-pooling/macos-warm-mixed-load.json",
+      "variant": "candidate-failfast",
+      "receipt": "/private/tmp/antfly-pooling-stage-three-macos-warm-matrix/macos-warm-mixed-load-candidate-failfast.json",
+      "exit_code": 0
+    }
+  ],
+  "automatic_defaults_qualified": false
+}

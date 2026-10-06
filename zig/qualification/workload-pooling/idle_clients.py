@@ -78,7 +78,7 @@ def status(url):
         conn.close()
 
 
-def seed_fixture(target, rows):
+def seed_fixture(target, rows, payload_bytes=0):
     connection = http.client.HTTPConnection(target.hostname, target.port, timeout=30)
     base = (target.path or "/db/v1/status").rsplit("/", 1)[0]
 
@@ -108,7 +108,10 @@ def seed_fixture(target, rows):
                         "row": {
                             "schema": {
                                 "type": "object",
-                                "properties": {"id": {"type": "integer"}},
+                                "properties": {
+                                    "id": {"type": "integer"},
+                                    "payload": {"type": "string"},
+                                },
                                 "additionalProperties": False,
                             }
                         }
@@ -116,15 +119,20 @@ def seed_fixture(target, rows):
                 },
             },
         )
-        request(
-            "/tables/pooling_qualification/batch",
-            {
-                "inserts": {
-                    f"row-{i}": {"id": 9007199254740993 + i} for i in range(rows)
+        for offset in range(0, rows, 64):
+            request(
+                "/tables/pooling_qualification/batch",
+                {
+                    "inserts": {
+                        f"row-{i}": {
+                            "id": 9007199254740993 + i,
+                            "payload": "x" * payload_bytes,
+                        }
+                        for i in range(offset, min(rows, offset + 64))
+                    },
+                    "sync_level": "write",
                 },
-                "sync_level": "write",
-            },
-        )
+            )
     finally:
         connection.close()
 
@@ -189,6 +197,14 @@ def main():
                     if first != [["9007199254740993"]]:
                         raise RuntimeError("held cursor lost exact integer row")
                     peer.query("COMMIT")
+                elif index < manifest["held_cursors"] + manifest.get(
+                    "extended_portals", 0
+                ):
+                    peer.query("BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY", b"T")
+                    if peer.open_portal(
+                        "SELECT id FROM pooling_qualification ORDER BY id"
+                    ) != [["9007199254740993"]]:
+                        raise RuntimeError("extended portal lost exact integer")
             else:
                 sql_peers.append(
                     socket.create_connection(
@@ -220,7 +236,15 @@ def main():
                 if peer.query("FETCH ALL FROM held") != expected:
                     raise RuntimeError("held cursor continuation changed after COMMIT")
                 peer.query("CLOSE held")
-            for peer in sql_peers[manifest["held_cursors"] :]:
+            portal_start = manifest["held_cursors"]
+            portal_end = portal_start + manifest.get("extended_portals", 0)
+            for peer in sql_peers[portal_start:portal_end]:
+                if peer.execute_portal(0) != expected:
+                    raise RuntimeError("extended portal continuation changed")
+                peer.close_portal()
+                peer.query("ROLLBACK")
+            receipt["verified_extended_portals"] = portal_end - portal_start
+            for peer in sql_peers[portal_end:]:
                 if (
                     peer.query("SELECT id FROM pooling_qualification ORDER BY id")
                     != [["9007199254740993"]] + expected
@@ -240,6 +264,10 @@ def main():
     except Exception as error:
         failures.append(str(error))
     finally:
+        receipt["retained_http_peers_before_close"] = sum(
+            peer.sock is not None for peer in http_peers
+        )
+        receipt["constructed_pgwire_peers_before_close"] = len(sql_peers)
         for peer in http_peers:
             peer.close()
         for peer in sql_peers:
@@ -257,14 +285,14 @@ def main():
         "idle_rss_growth_bytes": peak["rss_bytes"] - baseline["rss_bytes"],
         "idle_thread_growth": peak["threads"] - baseline["threads"],
         "idle_fd_growth": peak["fds"] - baseline["fds"],
-        "control_latency_seconds": max(
-            receipt.get("control_latencies_seconds", [float("inf")])
-        ),
+        "control_latency_seconds": max(receipt["control_latencies_seconds"])
+        if receipt.get("control_latencies_seconds")
+        else None,
         "recovery_fd_growth": recovery["fds"] - baseline["fds"],
         "recovery_rss_growth_bytes": recovery["rss_bytes"] - baseline["rss_bytes"],
     }
     for key, value in checks.items():
-        if value > thresholds[key]:
+        if value is None or value > thresholds[key]:
             failures.append(f"{key}: {value} exceeds {thresholds[key]}")
     receipt.update(checks=checks, failures=failures, passed=not failures)
     args.output.write_text(json.dumps(receipt, indent=2) + "\n")
