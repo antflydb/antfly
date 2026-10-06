@@ -96,15 +96,6 @@ pub fn addSnowballCompiler(b: *std.Build) *std.Build.Step.Compile {
 
 const addFileCompareTool = @import("../../tools/build_support.zig").addFileCompareTool;
 
-fn formatGenerated(b: *std.Build, source: std.Build.LazyPath, basename: []const u8) std.Build.LazyPath {
-    // Formatting produces a separate cached file; the compiler's output stays immutable.
-    const fmt = b.addSystemCommand(&.{ b.graph.zig_exe, "fmt", "--stdin" });
-    fmt.step.name = b.fmt("format Snowball {s}", .{basename});
-    fmt.addFileInput(b.graph.cwdRelativePath(b.graph.zig_exe));
-    fmt.setStdIn(.{ .lazy_path = source });
-    return fmt.captureStdOut(.{ .basename = basename });
-}
-
 pub fn addSnowballGeneratedOutputs(
     b: *std.Build,
     snowball_compiler: *std.Build.Step.Compile,
@@ -116,17 +107,31 @@ pub fn addSnowballGeneratedOutputs(
     const snowball_dep = b.path("deps/snowball");
 
     const wf = b.addWriteFiles();
-    const root = formatGenerated(b, wf.add("root.zig", snowballRootContents(b)), "root.zig");
-    const env = formatGenerated(b, wf.addCopyFile(snowball_dep.path(b, "zig/env.zig"), "env.zig"), "env.zig");
+    const root = wf.add("root.zig", snowballRootContents(b));
+    const generator = b.addExecutable(.{
+        .name = "snowball-generate",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/generate_snowball.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+
+    const env_format = b.addRunArtifact(generator);
+    env_format.addArg("--format");
+    env_format.addFileArg2(snowball_dep.path(b, "zig/env.zig"), .{ .make_absolute = true });
+    const env = env_format.addOutputFileArg2("env.zig", .{ .make_absolute = true });
 
     var stemmers: [snowball_languages.len]std.Build.LazyPath = undefined;
     inline for (snowball_languages, 0..) |lang, idx| {
-        const run = b.addRunArtifact(snowball_compiler);
+        // Generate and format before publishing one immutable cached product.
+        // A second Run over fresh generated stdin can miss on timestamp-only
+        // changes in Zig 0.17 and rewrite its already published output.
+        const run = b.addRunArtifact(generator);
+        run.addArtifactArg(snowball_compiler);
         run.addFileArg2(snowball_dep.path(b, b.fmt("algorithms/{s}.sbl", .{lang})), .{ .make_absolute = true });
-        run.addArg("-zig");
-        run.addArg("-o");
         const basename = b.fmt("{s}_stemmer.zig", .{lang});
-        stemmers[idx] = formatGenerated(b, run.addOutputFileArg2(basename, .{ .make_absolute = true }), basename);
+        stemmers[idx] = run.addOutputFileArg2(basename, .{ .make_absolute = true });
     }
 
     return .{
