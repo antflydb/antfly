@@ -233,6 +233,12 @@ pub fn merge(target: *operators.Aggregate, source: operators.Aggregate) !void {
         .count => {},
         .sum => if (target.input_type == .integer) {
             target.integer_sum = std.math.add(i128, target.integer_sum, source.integer_sum) catch return error.SqlNumericOutOfRange;
+        } else if (target.count == 0) {
+            // Restoring the first partial is an ownership transfer of exact
+            // numeric state. Reapplying its compensation can round a persisted
+            // answer differently before any other contribution is merged.
+            target.number_sum = source.number_sum;
+            target.compensation = source.compensation;
         } else {
             // Include the incoming compensation when composing local sums.
             for ([_]f64{ source.number_sum, -source.compensation }) |value| {

@@ -2033,3 +2033,25 @@ test "SQL encoded grouping preserves exact integers floating lane order and dist
     try encodedGroupScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, encodedGroupScenario, .{});
 }
+
+test "SQL exact partial restoration preserves compensated floating sum bits" {
+    const a = std.testing.allocator;
+    const specs = [_]AggregateSpec{.{ .kind = .sum, .input_type = .number }};
+    for ([_]f64{ 9007199254740994.0, -9007199254740994.0 }) |sum| {
+        for ([_]f64{ 1.0, -1.0 }) |compensation| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const state: Aggregate = .{ .alloc = scratch, .kind = .sum, .input_type = .number, .count = 3, .number_sum = sum, .compensation = compensation };
+            const encoded = try @import("aggregate_partial.zig").cell(scratch, state);
+            const target = try Grouped.create(a, &specs, .{});
+            defer target.deinit();
+            try target.importPartial(&.{}, &.{encoded}, 0);
+            const result = try target.resultAt(scratch, 0);
+            try std.testing.expectEqual(@as(u64, @bitCast(sum)), @as(u64, @bitCast(result.aggregates[0].value.float)));
+            const restored = try target.state_columns[0].snapshot(scratch, 0);
+            try std.testing.expectEqual(@as(u64, @bitCast(compensation)), @as(u64, @bitCast(restored.compensation)));
+            try std.testing.expectEqual(@as(u64, 3), restored.count);
+        }
+    }
+}
