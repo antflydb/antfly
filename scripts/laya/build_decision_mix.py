@@ -562,29 +562,59 @@ BUILDERS: dict[str, tuple[Callable[[Mix, int], None], int]] = {
 
 
 def fits(
-    records: list[dict[str, Any]], tokenizer_path: Path, max_len: int
+    records: list[dict[str, Any]],
+    tokenizer_path: Path,
+    max_len: int,
+    head_max_len: int = 192,
 ) -> list[dict[str, Any]]:
-    """Records whose unpacked Laya sequence surely fits `max_len`: state,
-    question and every option run (`[MASK]` plus at most 48 tokens), plus
-    the four special tokens and a small margin for the type prefix."""
+    """Records whose unpacked Laya sequence fits `max_len`, computed exactly
+    as pipelines/laya.zig `questionTokens` and `prepare` do: the
+    "<kind> question: ..." head, upstream's option text (including the
+    default yes/no descriptions), the shared `head_max_len` budget that caps
+    option runs and the head, the state and four special tokens."""
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(str(tokenizer_path))
 
     def count(text: str) -> int:
-        return len(tok.encode(text, add_special_tokens=False).ids)
+        return len(
+            tok.encode(text.replace("[MASK]", " "), add_special_tokens=False).ids
+        )
+
+    def option_text(kind: str, i: int, label: str, desc: str) -> str:
+        if kind == "choice":
+            return f" {label}: {desc}" if desc else f" {label}"
+        if kind == "score":
+            return f" level {i}: {desc or label}"
+        default = (
+            "no, the statement does not hold" if i == 0 else "yes, the statement holds"
+        )
+        return f" {label}: {desc or default}"
 
     state_tokens: dict[str, int] = {}
     kept = []
     for record in records:
-        text = record["text"]
+        text, kind = record["text"], record["kind"]
         if text not in state_tokens:
             state_tokens[text] = count(text)
-        options = sum(
-            1 + min(48, count(f" {label}: {desc}" if desc else f" {label}"))
-            for label, desc in zip(record["labels"], record["descriptions"])
+        lengths = [
+            count(option_text(kind, i, label, desc))
+            for i, (label, desc) in enumerate(
+                zip(record["labels"], record["descriptions"])
+            )
+        ]
+        options = sum(1 + min(n, 48) for n in lengths)
+        per = (
+            max(4, (head_max_len - 16) // len(lengths))
+            if options + 16 > head_max_len
+            else 49
         )
-        if state_tokens[text] + count(record["instruction"]) + options + 12 <= max_len:
+        options = sum(min(1 + min(n, 48), per) for n in lengths)
+        head = min(
+            count(f"{kind} question: {record['instruction']}"),
+            max(8, head_max_len - options),
+        )
+        if 4 + head + options + state_tokens[text] <= max_len:
             kept.append(record)
     return kept
 
