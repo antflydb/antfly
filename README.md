@@ -61,7 +61,7 @@ The Lite build installs its CLI, `libantfly`, and the C header. To serve that fi
 antfly standalone --storage-engine lite --storage-path app.aflite
 ```
 
-`lite serve` has been removed. The standalone server uses the same Apache engine under ELv2. See [LICENSING.md](LICENSING.md) for the source boundaries and third-party licenses.
+The standalone server uses the same Apache engine under ELv2. See [LICENSING.md](LICENSING.md) for the source boundaries and third-party licenses.
 
 ## Features
 
