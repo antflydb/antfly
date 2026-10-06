@@ -65,10 +65,12 @@ def stage(
                 continue
             name = raw.decode()
             source = repository / name
-            if not selected(name) or not source.is_file():
+            if not selected(name):
                 continue
             if source.is_symlink():
                 raise ValueError(f"source package cannot contain a symlink: {name}")
+            if not source.is_file():
+                continue
             target = destination / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)

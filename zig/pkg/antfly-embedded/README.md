@@ -33,7 +33,14 @@ The package also exposes the native `antfly` shared-library artifact
 both embedded database and inference APIs. Use `dependency.artifact(...)`
 with `b.addInstallArtifact` to install a selected product. Standalone source
 package commands include `zig build lite`, `capi`, `wasm`, and `wasm-test`;
-the default builds native Lite and its C API.
+the default builds native Lite and its C API. `zig build inference-wasm`
+builds database-free browser inference, with `-Dwasm-memory-model=wasm64`
+selecting memory64 (the default is wasm32). `wasm` builds the combined
+embedded database/inference wasm32 bundle. Both browser owners reuse their
+authored build profiles; they exclude native cloud credentials and server
+coordination. Zig 0.17.0 or later is required. Native builds retain the
+existing supported Linux and macOS targets; optional accelerator runtimes
+must be supplied by the consumer.
 
 The source archive includes the complete first-party Apache composition and
 shared library tree, generated contracts, pinned dependency manifests,

@@ -167,6 +167,20 @@ class SourcePackageTests(unittest.TestCase):
                 self.assertEqual(contents["LICENSE"], b"Apache license")
                 self.assertNotIn(package.PACKAGE + "/build.zig.zon", contents)
 
+    def test_source_links_and_stale_outputs_are_rejected(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "repo"
+            root.mkdir()
+            commit = self.fixture(root)
+            (root / "zig/broken.zig").symlink_to("missing.zig")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                package.stage(root, commit, Path(raw) / "stage", True)
+            output = Path(raw) / "output"
+            output.mkdir()
+            (output / "stale").write_text("stale")
+            with self.assertRaisesRegex(ValueError, "must be empty"):
+                package.build(root, commit, "0.2.1", output, "zig")
+
     def test_invalid_commit_and_version_are_rejected(self):
         with tempfile.TemporaryDirectory() as raw:
             for commit, version in (

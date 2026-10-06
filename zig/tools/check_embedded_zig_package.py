@@ -60,7 +60,11 @@ def main() -> None:
             + json.dumps(identity["zig_hash"])
             + ' } }, .paths = .{ "build.zig", "build.zig.zon", "main.zig" } }\n'
         )
-        steps = ["test"] if args.native_only else ["test", "wasm"]
+        steps = (
+            ["test"]
+            if args.native_only
+            else ["test", "wasm", "inference-wasm32", "inference-wasm64"]
+        )
         subprocess.run(
             [
                 sys.executable,

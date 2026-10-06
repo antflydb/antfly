@@ -27,13 +27,16 @@ pub fn build(b: *std.Build) void {
         .metal = b.option(bool, "metal", "Enable Metal") orelse false,
         .onnx = b.option(bool, "onnx", "Enable ONNX Runtime") orelse false,
         .cuda = b.option(bool, "cuda", "Enable CUDA") orelse false,
+        .@"wasm-memory-model" = b.option([]const u8, "wasm-memory-model", "Inference browser memory model: wasm32 or wasm64") orelse "wasm32",
+        .webgpu = b.option(bool, "webgpu", "Enable browser inference WebGPU") orelse false,
+        .@"wasm-strip" = b.option(bool, "wasm-strip", "Strip embedded WASM debug information") orelse false,
         .pjrt = b.option(bool, "pjrt", "Enable PJRT") orelse false,
         .@"antfly-version" = b.option([]const u8, "antfly-version", "Antfly version") orelse @import("build.zig.zon").version,
     });
     for ([_][]const u8{ "antfly-embedded", "antfly-inference" }) |name| {
         b.modules.put(b.allocator, name, composition.module(name)) catch @panic("OOM");
     }
-    for ([_][]const u8{ "lite", "capi", "capi-smoke", "embedded-package-test", "embedded-lake-test", "wasm", "wasm-test", "pkgconfig" }) |name| {
+    for ([_][]const u8{ "lite", "capi", "capi-smoke", "embedded-package-test", "embedded-lake-test", "wasm", "wasm-test", "inference-wasm", "pkgconfig" }) |name| {
         const step = composition.builder.top_level_steps.get(name) orelse @panic("missing composition step");
         b.step(name, step.description).dependOn(&step.step);
     }

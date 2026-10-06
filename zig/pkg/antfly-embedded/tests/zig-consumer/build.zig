@@ -13,8 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Public standalone package entry point. Release source bundles relocate the
-//! composition dependency into the package; checkout builds use the shared tree.
+//! Consumer of the fetched package, with no monorepo path dependencies.
 const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -27,4 +26,11 @@ pub fn build(b: *std.Build) void {
     b.step("test", "Exercise fetched Apache package").dependOn(&b.addRunArtifact(tests).step);
     const browser = b.addInstallArtifact(dependency.artifact("antfly_wasm"), .{});
     b.step("wasm", "Install fetched browser product").dependOn(&browser.step);
+    b.step("inference-wasm32", "Build fetched inference wasm32").dependOn(&dependency.builder.top_level_steps.get("inference-wasm").?.step);
+    const memory64 = b.dependency("embedded", .{
+        .target = target,
+        .optimize = optimize,
+        .@"wasm-memory-model" = "wasm64",
+    });
+    b.step("inference-wasm64", "Build fetched inference wasm64").dependOn(&memory64.builder.top_level_steps.get("inference-wasm").?.step);
 }
