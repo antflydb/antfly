@@ -15,6 +15,7 @@
 
 //! The embedded Antfly database handle and its core operations.
 
+use std::fmt;
 use std::path::Path;
 
 use antfly_embedded_sys::{self as sys, antfly_buffer, antfly_db, antfly_error_code, antfly_slice};
@@ -542,6 +543,37 @@ impl Database {
         })
     }
 
+    /// Executes one SQL statement against `table` using an `SQLRequest`
+    /// (`statement`, `parameters`, `limit`) and returns the SQL response JSON.
+    ///
+    /// Embedded SQL is single-table and autocommit: sessions, DDL, qualified
+    /// catalog names, and managed owners are rejected. On failure the
+    /// returned [`SqlError`] carries the runtime's SQL diagnostics body.
+    pub fn sql_json(
+        &self,
+        table: &str,
+        request: impl AsRef<[u8]>,
+    ) -> std::result::Result<Vec<u8>, SqlError> {
+        let raw = self.with_handle(|handle| {
+            let mut out = antfly_buffer::default();
+            let code = unsafe {
+                sys::antfly_db_sql_json(
+                    handle,
+                    borrow_slice(table.as_bytes()),
+                    borrow_slice(request.as_ref()),
+                    &mut out,
+                )
+            };
+            let body = unsafe { take_buffer(out) };
+            Ok((code, body))
+        });
+        match raw {
+            Ok((code, body)) if code == sys::ANTFLY_OK => Ok(body),
+            Ok((code, body)) => Err(SqlError::new(Error::from_code(code), body)),
+            Err(error) => Err(SqlError::new(error, Vec::new())),
+        }
+    }
+
     /// Executes a packed dense-vector wire search request.
     pub fn dense_search_wire(&self, request: impl AsRef<[u8]>) -> Result<Vec<u8>> {
         self.with_input_output(request.as_ref(), |h, input, out| unsafe {
@@ -676,6 +708,45 @@ impl std::fmt::Debug for Database {
         f.debug_struct("Database")
             .field("open", &self.gate.is_open())
             .finish()
+    }
+}
+
+/// An [`Error`] together with the SQL diagnostics body that
+/// [`Database::sql_json`] left behind on failure.
+///
+/// `antfly_db_sql_json` writes its SQL diagnostics into the output buffer
+/// even when it returns an error code; this type keeps that body instead of
+/// discarding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlError {
+    pub error: Error,
+    /// The raw diagnostics body, decoded as UTF-8 (lossy). Empty when the
+    /// call never reached the SQL runtime (for example, a closed handle).
+    pub body: String,
+}
+
+impl SqlError {
+    fn new(error: Error, body: Vec<u8>) -> Self {
+        SqlError {
+            error,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
+    }
+}
+
+impl fmt::Display for SqlError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.body.is_empty() {
+            fmt::Display::fmt(&self.error, f)
+        } else {
+            write!(f, "{}: {}", self.error, self.body)
+        }
+    }
+}
+
+impl std::error::Error for SqlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
