@@ -3693,3 +3693,42 @@ fails on existing drift, unknown/duplicate IDs or PostgreSQL rejection.
 The inventory records 359 implemented, 136 rejected, 73 superseded and 1,018
 unresolved cases. General array regressions do not create additional original
 case credit, and native stored-array columns remain unfinished.
+
+### NULL-aware tuple membership execution kernel (integration pending)
+
+`sql/tuple_membership.zig`, exported through the relational operators, provides
+the retained lookup kernel for row-valued `IN` and `NOT IN`. Ordinary equality
+hash joins cannot implement the required three-valued logic: `(NULL, 1)` is
+definitively unequal to `(2, 2)`, but potentially equal to `(2, 1)`. Empty inner
+relations are false for `IN`, including an all-NULL left tuple, and `NOT IN`
+negates only true/false, retaining UNKNOWN.
+
+A shared-prefix trie hashes edges by parent and typed cell value, checks hash
+collisions with typed comparison, and retains one owned payload per distinct
+prefix. Exact non-NULL hits use one lookup per column. Ambiguous NULL probes
+visit only compatible prefixes using a fixed stack bounded by the admitted
+256-column arity. This avoids per-probe allocation, per-outer-row source scans,
+JSON key serialization and exponential precomputed NULL-mask tables. Duplicate
+right tuples share their complete path. Array keys preserve dimensions, lower
+bounds, exact integer values and element NULL flags; JSONB null is a non-NULL
+SQL value. The future binder must establish common typed comparison domains
+before building or probing the index, as it does for ordinary hash joins.
+
+Input-row, retained-byte and cumulative-work admission and cooperative
+checkpoints bound build and ambiguous searches. A failed build poisons the
+index so partial prefixes cannot become visible as successful rows. Source
+payloads are cloned before their page owner retires. Allocation-fault tests
+exercise complete cleanup, and deterministic work tests bound 4,096 exact
+two-column probes independently of machine timing. PostgreSQL independently
+reproduces 1,740 IN/NOT IN truth pairs over 110 right-hand multisets, including
+all one/two-column NULL combinations, duplicates, empty sources and selected
+three-column sources. No original-case disposition credit is claimed here.
+
+Still required before public activation: parse row constructors in membership
+contexts; bind per-position common types and exact arity errors; lower to a
+statement-owned captured membership relation rather than a scalar JSON value;
+share correlated build partitions and invariant source work; integrate spill
+and admission with the relation iterator; and verify unchanged original reads
+and mutations through mounted HTTP/pgwire and complete persisted-state checks.
+Scalar membership's existing grouped fast path remains unchanged until that
+adapter is ready. In particular, `sql-0602` and `sql-0612` remain unresolved.

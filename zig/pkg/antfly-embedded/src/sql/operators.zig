@@ -17,6 +17,10 @@
 //! Inputs may borrow a scan page. Competitive top-K rows and aggregate extrema
 //! take ownership before that page closes; discarded rows allocate nothing.
 const std = @import("std");
+pub const TupleMembership = @import("tuple_membership.zig").Index;
+test {
+    _ = @import("tuple_membership.zig");
+}
 pub const OrderedAggregate = @import("ordered_aggregate.zig").State;
 test {
     _ = @import("ordered_aggregate.zig");
