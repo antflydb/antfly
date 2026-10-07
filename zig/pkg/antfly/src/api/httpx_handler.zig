@@ -13401,6 +13401,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         const parity = @import("sql_parity_reference.zig");
         const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.read_campaign_reference;
         try parity.runNumberWireContracts(alloc);
+        try parity.runArrayWireContracts(alloc);
         const profile = try std.json.parseFromSlice(struct {
             profile: struct { schema: std.json.Value, rows: []const struct { key: []const u8, value: std.json.Value } },
             entries: []const struct { id: []const u8 },
@@ -13428,7 +13429,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         for (profile.value.entries, ids) |entry, *id| id.* = entry.id;
         // These source-owned pagination/array contracts must not silently disappear when
         // regenerating the campaign or discovering other unsupported shapes.
-        for ([_][]const u8{ "sql-0205", "sql-0206", "sql-0207", "sql-0220", "sql-0221", "sql-0222", "sql-0284", "sql-0302", "sql-0560", "sql-0562", "sql-0563", "sql-0564", "sql-0565", "sql-0566", "sql-1226", "sql-1227", "sql-1340" }) |required| {
+        for ([_][]const u8{ "sql-0205", "sql-0206", "sql-0207", "sql-0220", "sql-0221", "sql-0222", "sql-0284", "sql-0302", "sql-0560", "sql-0561", "sql-0562", "sql-0563", "sql-0564", "sql-0565", "sql-0566", "sql-1226", "sql-1227", "sql-1340" }) |required| {
             var found = false;
             for (ids) |id| if (std.mem.eql(u8, id, required)) {
                 found = true;

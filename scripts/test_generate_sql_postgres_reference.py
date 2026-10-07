@@ -19,10 +19,15 @@ These tests intentionally require PostgreSQL 18+: no skip or substitute oracle.
 """
 
 from copy import deepcopy
+from contextlib import redirect_stderr
+from io import StringIO
 import unittest
 from unittest.mock import patch
 
 from generate_sql_postgres_reference import (
+    array_reference,
+    FIXTURES,
+    main,
     document_reference,
     execute,
     postgres,
@@ -33,12 +38,98 @@ from generate_sql_postgres_reference import (
 )
 
 
+class ReferenceExtensionTest(unittest.TestCase):
+    def test_extension_rejects_missing_baseline_unknown_and_duplicate_ids(self):
+        golden = str(FIXTURES / "sql_read_campaign_reference.json")
+        for arguments in (
+            ["read", "--include", "sql-0561"],
+            ["read", "--check", golden, "--include", "sql-not-a-case"],
+            ["read", "--check", golden, "--include", "sql-0561"],
+        ):
+            with self.subTest(arguments=arguments):
+                with (
+                    patch("sys.argv", ["reference", *arguments]),
+                    patch("generate_sql_postgres_reference.postgres") as server,
+                    redirect_stderr(StringIO()),
+                    self.assertRaises(SystemExit) as error,
+                ):
+                    main()
+                self.assertEqual(2, error.exception.code)
+                server.assert_not_called()
+
+
 class PostgresReferenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.server = postgres()
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
+
+    def test_array_result_reference_preserves_bounds_width_and_json_nulls(self):
+        cases = (
+            (
+                "'[-1:1]={9007199254740993,NULL,2}'::bigint[]",
+                1016,
+                {
+                    "dimensions": [{"length": 3, "lower_bound": -1}],
+                    "values": ["9007199254740993", None, "2"],
+                    "sql_nulls": [False, True, False],
+                },
+            ),
+            (
+                '\'[0:2]={"null",NULL,"{\\"x\\":1}"}\'::jsonb[]',
+                3807,
+                {
+                    "dimensions": [{"length": 3, "lower_bound": 0}],
+                    "values": [None, None, {"x": 1}],
+                    "sql_nulls": [False, True, False],
+                },
+            ),
+            (
+                "ARRAY[]::integer[]",
+                1007,
+                {"dimensions": [], "values": [], "sql_nulls": []},
+            ),
+            (
+                "ARRAY[[1,NULL],[2,3]]::smallint[]",
+                1005,
+                {
+                    "dimensions": [
+                        {"length": 2, "lower_bound": 1},
+                        {"length": 2, "lower_bound": 1},
+                    ],
+                    "values": ["1", None, "2", "3"],
+                    "sql_nulls": [False, True, False, False],
+                },
+            ),
+        )
+        for expression, oid, expected in cases:
+            with self.subTest(sql=expression):
+                result = execute(self.db, self.case("SELECT " + expression), read=True)
+                self.assertEqual([oid], result["column_oids"])
+                self.assertEqual([[expected]], result["rows"])
+                self.assertEqual([[False]], result["sql_nulls"])
+        result = execute(self.db, self.case("SELECT NULL::bigint[]"), read=True)
+        self.assertEqual([[None]], result["rows"])
+        self.assertEqual([[True]], result["sql_nulls"])
+
+    def test_array_result_reference_rejects_corrupt_headers_and_partial_cells(self):
+        import struct
+
+        good = struct.pack("!iiiiiii", 1, 0, 20, 1, -1, 8, 0) + struct.pack("!i", 1)
+        self.assertEqual(["1"], array_reference(good, 1016)["values"])
+        for end in range(len(good)):
+            with self.subTest(end=end):
+                with self.assertRaises(ValueError):
+                    array_reference(good[:end], 1016)
+        for bad in (
+            good + b"x",
+            struct.pack("!iii", 7, 0, 20),
+            struct.pack("!iii", 0, 0, 23),
+            struct.pack("!iiiii", 1, 0, 20, 65537, 1),
+        ):
+            with self.assertRaises(ValueError):
+                array_reference(bad, 1016)
 
     def test_array_common_types_precede_set_identity(self):
         cases = (

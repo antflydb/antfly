@@ -4939,6 +4939,72 @@
       "affected": 0
     },
     {
+      "id": "sql-0561",
+      "columns": [
+        "customer_id",
+        "amount_percentiles"
+      ],
+      "rows": [
+        [
+          "c1",
+          {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              15,
+              33,
+              51
+            ],
+            "sql_nulls": [
+              false,
+              false,
+              false
+            ]
+          }
+        ],
+        [
+          "c2",
+          {
+            "dimensions": [
+              {
+                "length": 3,
+                "lower_bound": 1
+              }
+            ],
+            "values": [
+              18,
+              36,
+              54
+            ],
+            "sql_nulls": [
+              false,
+              false,
+              false
+            ]
+          }
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        1022
+      ],
+      "affected": 0
+    },
+    {
       "id": "sql-0562",
       "columns": ["customer_id", "median_amount"],
       "rows": [["c1", 33.0], ["c2", 36.0]],

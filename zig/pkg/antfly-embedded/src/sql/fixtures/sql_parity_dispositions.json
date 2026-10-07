@@ -5729,8 +5729,12 @@
     },
     {
       "id": "sql-0561",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original grouped multi-percentile query executes through mounted HTTP over native typed storage. Independent PostgreSQL binary results verify complete fractional values, array element OIDs, dimensions, lower bounds and SQL NULL provenance without flattening SQL arrays into JSON lists. The strict required-ID guard prevents silently dropping this original contract.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0562",

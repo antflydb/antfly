@@ -36,8 +36,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 from tempfile import TemporaryDirectory
+from uuid import UUID
 
 from generate_sql_document_reference import SEEDS
 from generate_sql_parity_read_reference import EMPTY_CONTRACTS, parameter
@@ -187,6 +189,109 @@ def encoded(value):
     raise ValueError(f"{type(value).__name__} needs a dedicated typed wire contract")
 
 
+ARRAY_TYPES = {
+    1000: (16, "boolean"),
+    1005: (21, "int16"),
+    1007: (23, "int32"),
+    1016: (20, "int64"),
+    1021: (700, "float32"),
+    1022: (701, "float64"),
+    1009: (25, "text"),
+    2951: (2950, "uuid"),
+    3807: (3802, "jsonb"),
+}
+
+
+def array_reference(data, oid):
+    """Independent PostgreSQL binary result decoder: no native codec or SQL rewrite.
+
+    Keep SQL NULL flags separately from JSONB null, and preserve each axis's
+    lower bound. Byte, element and rank bounds apply before constructing cells.
+    """
+    if oid not in ARRAY_TYPES or len(data) > 8 * 1024 * 1024:
+        raise ValueError("array reference requires a supported bounded type")
+    at = 0
+
+    def take(size):
+        nonlocal at
+        if size < 0 or size > len(data) - at:
+            raise ValueError("truncated PostgreSQL binary array")
+        value = data[at : at + size]
+        at += size
+        return value
+
+    def integer():
+        return struct.unpack("!i", take(4))[0]
+
+    rank, flags, element_oid = integer(), integer(), integer()
+    element, kind = ARRAY_TYPES[oid]
+    if rank < 0 or rank > 6 or flags not in (0, 1) or element_oid != element:
+        raise ValueError("invalid PostgreSQL binary array header")
+    dimensions, count = [], 1 if rank else 0
+    for _ in range(rank):
+        length, lower = integer(), integer()
+        if length <= 0 or lower + length - 1 > 2147483647:
+            raise ValueError("invalid PostgreSQL binary array dimension")
+        count *= length
+        if count > 65536:
+            raise ValueError("array reference exceeds element budget")
+        dimensions.append({"length": length, "lower_bound": lower})
+    if count > (len(data) - at) // 4:
+        raise ValueError("truncated PostgreSQL binary array cells")
+    values, nulls = [], []
+    widths = {
+        "int16": (2, "!h"),
+        "int32": (4, "!i"),
+        "int64": (8, "!q"),
+        "float32": (4, "!f"),
+        "float64": (8, "!d"),
+    }
+    for _ in range(count):
+        length = integer()
+        if length == -1:
+            values.append(None)
+            nulls.append(True)
+            continue
+        payload = take(length)
+        nulls.append(False)
+        if kind in widths:
+            width, code = widths[kind]
+            if len(payload) != width:
+                raise ValueError("invalid PostgreSQL binary array cell width")
+            value = struct.unpack(code, payload)[0]
+            if kind.startswith("int"):
+                value = str(value)
+            elif not math.isfinite(value):
+                value = (
+                    "NaN"
+                    if math.isnan(value)
+                    else "Infinity"
+                    if value > 0
+                    else "-Infinity"
+                )
+        elif kind == "boolean":
+            if payload not in (b"\x00", b"\x01"):
+                raise ValueError("invalid PostgreSQL binary boolean")
+            value = payload == b"\x01"
+        elif kind == "uuid":
+            if len(payload) != 16:
+                raise ValueError("invalid PostgreSQL binary UUID")
+            value = str(UUID(bytes=payload))
+        else:
+            if kind == "jsonb":
+                if not payload or payload[0] != 1:
+                    raise ValueError("invalid PostgreSQL binary JSONB version")
+                payload = payload[1:]
+            text = payload.decode("utf-8")
+            if "\x00" in text:
+                raise ValueError("invalid PostgreSQL binary text")
+            value = json.loads(text) if kind == "jsonb" else text
+        values.append(value)
+    if at != len(data) or (any(nulls) and flags == 0):
+        raise ValueError("invalid PostgreSQL binary array framing")
+    return {"dimensions": dimensions, "values": values, "sql_nulls": nulls}
+
+
 def parameters(case):
     from psycopg.types.json import Jsonb
 
@@ -265,7 +370,7 @@ def execute(db, case, read=False):
 
 
 def cursor_result(cursor, case, read):
-    cursor.execute(case["sql"], parameters(case))
+    cursor.execute(case["sql"], parameters(case), binary=True)
     # DECLARE ... FOR accepts SELECT, not arbitrary mutation statements.
     tag = "SELECT" if read else cursor.statusmessage.split()[0]
     if (read and tag != "SELECT") or (
@@ -279,12 +384,33 @@ def cursor_result(cursor, case, read):
         raise ValueError("empty result does not exercise this shape")
     if not read and cursor.rowcount <= 0:
         raise ValueError("non-exercising mutation")
+    for row in rows:
+        for column, cell in zip(cursor.description, row, strict=True):
+            if isinstance(cell, list) and column.type_code not in {
+                *ARRAY_TYPES,
+                114,
+                3802,
+            }:
+                raise ValueError(
+                    "array reference requires an explicit supported element type"
+                )
     return {
         "id": case["id"],
         "columns": [column.name for column in cursor.description]
         if cursor.description
         else [],
-        "rows": [[encoded(cell) for cell in row] for row in rows],
+        "rows": [
+            [
+                array_reference(
+                    cursor.pgresult.get_value(i, j), cursor.description[j].type_code
+                )
+                if cursor.description[j].type_code in ARRAY_TYPES
+                and cursor.pgresult.get_value(i, j) is not None
+                else encoded(cell)
+                for j, cell in enumerate(row)
+            ]
+            for i, row in enumerate(rows)
+        ],
         # JSON null and SQL NULL decode to Python None; preserve the wire
         # provenance from libpq rather than guessing from decoded values.
         "sql_nulls": [
@@ -671,12 +797,21 @@ def main():
         type=Path,
         help="verify only golden IDs; never silently exclude a failing case",
     )
+    parser.add_argument(
+        "--include",
+        action="append",
+        default=[],
+        help="extend a checked golden with an exact manifest ID; existing contracts must still match",
+    )
     args = parser.parse_args()
+    if args.include and not args.check:
+        parser.error("--include requires a checked baseline golden")
     manifest = json.loads((FIXTURES / f"sql_{args.campaign}_campaign.json").read_text())
     requested = [entry["id"] for entry in manifest["entries"]]
     expected = json.loads(args.check.read_text()) if args.check else None
     if expected:
         requested = [entry["id"] for entry in expected["entries"]]
+        requested.extend(args.include)
         if expected.get("reference") != "PostgreSQL exact SQL":
             parser.error("golden must declare the PostgreSQL oracle")
     known = {entry["id"] for entry in manifest["entries"]}
@@ -708,6 +843,12 @@ def main():
     if expected:
         if result["excluded"]:
             parser.error(f"PostgreSQL rejected golden IDs: {result['excluded']}")
+        extended = deepcopy(result) if args.include else None
+        if extended:
+            old_ids = {entry["id"] for entry in expected["entries"]}
+            result["entries"] = [
+                entry for entry in result["entries"] if entry["id"] in old_ids
+            ]
         for output in (result, expected):
             output.pop("excluded", None)
             output.pop("server_version", None)
@@ -718,6 +859,9 @@ def main():
                     entry.pop("sql_nulls")
         if result != expected:
             parser.error("PostgreSQL reference drift")
+        if extended:
+            print(json.dumps(extended, indent=2, allow_nan=False))
+            return
         print(
             f"Verified {len(result['entries'])} exact PostgreSQL {args.campaign} contracts"
         )

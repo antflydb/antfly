@@ -3673,3 +3673,23 @@ and NULL arrays. PostgreSQL independently proves the producer result types and
 logical values. These are architectural contracts, not additional original-case
 disposition credit. Typed array ingress, native stored-array columns and original
 source-case reconciliation remain unfinished.
+
+### Exact-source SQL array result reconciliation
+
+The PostgreSQL read oracle now requests binary results and independently
+decodes supported SQL array OIDs into the public lossless envelope. It retains
+rank, axis lengths, lower bounds, decimal-string integer cells, non-finite float
+tokens and separate SQL NULL flags, including JSONB null versus SQL NULL.
+Rank, byte and element budgets and complete-frame checks reject malformed or
+unsupported contracts instead of silently flattening arrays into JSON lists.
+Native reference comparisons check exact element OIDs and typed array values,
+with regressions rejecting altered bounds and null provenance.
+
+The unchanged grouped multi-percentile original `sql-0561` now passes mounted
+HTTP over native typed storage and the independently reproduced PostgreSQL
+golden. All 77 pre-existing read contracts remain unchanged; the selected read
+golden contains 78 contracts. Golden extension requires a checked baseline and
+fails on existing drift, unknown/duplicate IDs or PostgreSQL rejection.
+The inventory records 359 implemented, 136 rejected, 73 superseded and 1,018
+unresolved cases. General array regressions do not create additional original
+case credit, and native stored-array columns remain unfinished.

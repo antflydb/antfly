@@ -217,8 +217,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 358 implemented, 136 rejected and 73 superseded
-cases, with 1,019 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 359 implemented, 136 rejected and 73 superseded
+cases, with 1,018 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 115 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
@@ -231,7 +231,7 @@ positive contracts. Native execution checks full persisted state as well as
 public results. Five recorded gates verify mounted execution, both PostgreSQL
 references, oracle safety/ordering contracts and pipeline allocation-fault
 regressions. This is a validated batch, not completion of either entire campaign;
-getting below 800 now requires at least 226 additional resolved dispositions.
+getting below 800 now requires at least 225 additional resolved dispositions.
 
 Eight further original cases (`sql-0220`–`sql-0222`, `sql-0284`, `sql-0302`,
 `sql-1226`, `sql-1227` and `sql-1340`) now execute typed array predicates through
@@ -629,12 +629,17 @@ allocation-fault enumeration verifies cleanup. PostgreSQL and native regressions
 cover grouped fractions, mixed ordinary/ordered aggregates, null-only requests,
 FILTER, empty input, exact discrete bigints and multidimensional fractions.
 
-Six unchanged originals (`sql-0560`, `sql-0562`–`sql-0566`) now pass the mounted
+Seven unchanged originals (`sql-0560`–`sql-0566`) now pass the mounted
 HTTP/native-storage gate and the reproducible PostgreSQL golden gate, including
 labels, type OIDs, complete values, ordering and SQL NULL flags. The required-ID
 guard prevents regeneration from silently removing them. The array-result
-original `sql-0561` remains unresolved pending exact original-case reconciliation;
-the new public typed-array contract alone does not grant disposition credit.
+original `sql-0561` is independently reconciled using PostgreSQL binary results,
+preserving dimensions, lower bounds, exact element OIDs and SQL NULL flags.
+The oracle rejects unsupported array element types instead of flattening them.
+The read golden now verifies 78 exact original contracts. `--include` can extend
+a checked golden only when every existing contract still matches; unknown or
+duplicate IDs and rejected originals fail closed. Broader array architecture
+tests do not independently grant original-case disposition credit.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

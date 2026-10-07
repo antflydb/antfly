@@ -85,6 +85,15 @@ fn postgresTypeMatches(kind: wire.SQLColumnType, oid: u32) bool {
     };
 }
 
+fn postgresColumnMatches(column: wire.SQLColumn, oid: u32) bool {
+    if (column.type != .array) return postgresTypeMatches(column.type, oid);
+    const element = column.element_type orelse return false;
+    const native: @import("antfly_local_sources").sql_array_value.ElementType = switch (element) {
+        inline else => |tag| @field(@import("antfly_local_sources").sql_array_value.ElementType, @tagName(tag)),
+    };
+    return native.arrayOid() == oid;
+}
+
 fn equivalent(a: Json, b: Json) bool {
     if (a == .float and b == .float) return std.math.approxEqRel(f64, a.float, b.float, 1e-12) or a.float == b.float;
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
@@ -126,6 +135,19 @@ fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn
         }
         var value = cell;
         switch (column.type) {
+            .array => {
+                const sources = @import("antfly_local_sources");
+                const kind: sources.sql_array_value.ElementType = switch (column.element_type orelse return false) {
+                    inline else => |tag| @field(sources.sql_array_value.ElementType, @tagName(tag)),
+                };
+                var actual_array = try sources.sql_array_wire.decode(alloc, kind, cell, .{});
+                defer actual_array.deinit();
+                var expected_array = try sources.sql_array_wire.decode(alloc, kind, want, .{});
+                defer expected_array.deinit();
+                var work: sources.sql_array_value.Budget = .{};
+                if (try actual_array.value.compare(expected_array.value, &work) != .eq) return false;
+                continue;
+            },
             .integer => if (cell == .string) {
                 value = .{ .integer = try std.fmt.parseInt(i64, cell.string, 10) };
             },
@@ -161,6 +183,28 @@ fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn
         } else if (!equivalent(value, want)) return false;
     }
     return true;
+}
+
+pub fn runArrayWireContracts(alloc: std.mem.Allocator) !void {
+    const columns = [_]wire.SQLColumn{.{ .name = "a", .type = .array, .element_type = .jsonb }};
+    try std.testing.expect(postgresColumnMatches(columns[0], 3807));
+    try std.testing.expect(!postgresColumnMatches(columns[0], 1009));
+    try std.testing.expect(!postgresColumnMatches(.{ .name = "a", .type = .array }, 3807));
+    const expected = try std.json.parseFromSlice(Json, alloc,
+        \\{"dimensions":[{"length":2,"lower_bound":-1}],"values":[null,null],"sql_nulls":[false,true]}
+    , .{});
+    defer expected.deinit();
+    try std.testing.expect(try rowMatchesWithNulls(alloc, &columns, &.{expected.value}, &.{false}, &.{expected.value}, &.{false}));
+    for ([_][]const u8{
+        \\{"dimensions":[{"length":2,"lower_bound":1}],"values":[null,null],"sql_nulls":[false,true]}
+        ,
+        \\{"dimensions":[{"length":2,"lower_bound":-1}],"values":[null,null],"sql_nulls":[true,false]}
+        ,
+    }) |json| {
+        const actual = try std.json.parseFromSlice(Json, alloc, json, .{});
+        defer actual.deinit();
+        try std.testing.expect(!try rowMatchesWithNulls(alloc, &columns, &.{actual.value}, &.{false}, &.{expected.value}, &.{false}));
+    }
 }
 
 pub fn runNumberWireContracts(alloc: std.mem.Allocator) !void {
@@ -400,7 +444,7 @@ pub fn runPostgresMutations(alloc: std.mem.Allocator, handler: anytype, tables: 
         try std.testing.expectEqual(expected.columns.len, expected.column_oids.len);
         for (result.columns, expected.columns, expected.column_oids) |column, name, oid| {
             try std.testing.expectEqualStrings(name, column.name);
-            try std.testing.expect(postgresTypeMatches(column.type, oid));
+            try std.testing.expect(postgresColumnMatches(column, oid));
         }
         try std.testing.expectEqual(expected.rows.len, result.rows.len);
         try std.testing.expectEqual(expected.rows.len, expected.sql_nulls.len);
@@ -631,7 +675,7 @@ pub fn runDocuments(alloc: std.mem.Allocator, handler: anytype, db: anytype, sou
         try std.testing.expectEqual(expected.affected, result.rows_affected);
         try std.testing.expectEqual(expected.columns.len, result.columns.len);
         try std.testing.expectEqual(expected.column_oids.len, result.columns.len);
-        for (result.columns, expected.column_oids) |column, oid| try std.testing.expect(postgresTypeMatches(column.type, oid));
+        for (result.columns, expected.column_oids) |column, oid| try std.testing.expect(postgresColumnMatches(column, oid));
         for (result.columns, expected.columns) |column, name| try std.testing.expectEqualStrings(name, column.name);
         try std.testing.expectEqual(expected.rows.len, result.rows.len);
         if (result.rows.len != 0) {
@@ -858,7 +902,7 @@ fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_id
         };
         if (matches) if (expected.column_oids) |oids| {
             try std.testing.expectEqual(result.columns.len, oids.len);
-            for (result.columns, oids) |column, oid| if (!postgresTypeMatches(column.type, oid)) {
+            for (result.columns, oids) |column, oid| if (!postgresColumnMatches(column, oid)) {
                 matches = false;
                 break;
             };
