@@ -1032,21 +1032,44 @@ fn invokeBorrowedProvider(context: *const inference_bridge.ProviderInvokeContext
         try transfer.returnToParent();
         return err;
     };
-    const ParentCheckpoint = struct {
-        fn check(raw: *anyopaque) !void {
-            const grant: *const inference_bridge.runnable_abi.Borrowed = @ptrCast(@alignCast(raw));
-            const status = grant.checkpoint(grant.context);
+    const ParentPhase = struct {
+        transfer: *inference_bridge.runnable_abi.Transfer,
+        resume_error: ?anyerror = null,
+        fn checked(status: inference_bridge.Status) !void {
             if (!status.isOk()) return inference_bridge.errorFromStatus(status);
         }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.transfer.checkpoint();
+        }
+        fn park(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const grant = self.transfer.borrow;
+            try checked(grant.park(grant.context, @backingInt(inference_bridge.runnable_abi.Wait.resource)));
+        }
+        fn reenter(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const grant = self.transfer.borrow;
+            checked(grant.enter(grant.context, @backingInt(inference_bridge.runnable_abi.Class.inference))) catch |err| {
+                // A rejected resume stops this operation. The outer caller
+                // still owns retirement; do not attempt a second transition
+                // from an unknown post-failure scheduler/authority state.
+                self.transfer.active = false;
+                self.resume_error = err;
+                return err;
+            };
+        }
     };
-    var checkpoint_scope = inference.execution_control.CheckpointScope.init(.{ .context = @constCast(borrow), .check_fn = ParentCheckpoint.check });
+    var phase = ParentPhase{ .transfer = &transfer };
+    var checkpoint_scope = inference.execution_control.CheckpointScope.init(.{ .context = &phase, .check_fn = ParentPhase.check, .wait_begin_fn = ParentPhase.park, .wait_end_fn = ParentPhase.reenter });
     const result = callback(context);
     checkpoint_scope.deinit();
     scope.deinit();
     errdefer discardProviderResponse(context);
     // Authority and original-deadline failures take precedence over a newly
     // acquired provider response; owning cleanup cannot require another grant.
-    try transfer.returnToParent();
+    if (phase.resume_error) |err| return err;
+    if (transfer.active) try transfer.returnToParent();
     try result;
 }
 
@@ -3864,4 +3887,78 @@ pub fn testCanceledHttpResponseConsumer(invoke: *const fn (*anyopaque, http_abi.
     try state.route_manifest.append(alloc, .{ .route_handle = &route, .method = .post, .path = .init(route.path), .request_body = .buffered, .streaming_response = 0 });
     try std.testing.expectError(error.Canceled, invoke(&state, .{ .context = &handler, .is_cancelled = Handler.requested }));
     try std.testing.expectEqual(@as(usize, 1), handler.calls);
+}
+
+test "runnable execution local provider parks model locks and fails closed on rejected resume" {
+    try inference.execution_control.testSynchronousResourceWait();
+    const Parent = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        reject_resume: bool = false,
+        parked: bool = false,
+        class: c_int = @backingInt(inference_bridge.runnable_abi.Class.query),
+        enters: usize = 0,
+        waits: usize = 0,
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            return .ok;
+        }
+        fn park(raw: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            self.parked = true;
+            if (self.class == @backingInt(inference_bridge.runnable_abi.Class.inference) and self.enters == 1) {
+                self.waits += 1;
+                // The competing holder releases the model gate only after
+                // the waiting invocation has surrendered its CPU grant.
+                self.gate.unlock();
+            }
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.parked);
+            if (self.reject_resume and self.enters == 1)
+                return @import("antfly_runtime_abi").error_abi.statusFromError(error.Forbidden);
+            self.enters += 1;
+            self.parked = false;
+            self.class = class;
+            return .ok;
+        }
+        fn invoke(context: *const inference_bridge.ProviderInvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.runnable.?.context));
+            const vectors = try std.testing.allocator.alloc([]f32, 1);
+            errdefer std.testing.allocator.free(vectors);
+            vectors[0] = try std.testing.allocator.dupe(f32, &.{0.5});
+            errdefer std.testing.allocator.free(vectors[0]);
+            try publishNumericProviderResponse(context, std.testing.allocator, vectors, .dense_vectors);
+            // Deliberately swallow the backend lock error: the host must still
+            // reject published output after a failed authority reacquisition.
+            (inference.InferenceExecutionControl{}).lock(&self.gate) catch return;
+            self.gate.unlock();
+        }
+    };
+    for ([_]bool{ false, true }) |reject| {
+        var parent = Parent{ .reject_resume = reject };
+        try std.testing.expect(parent.gate.tryLock());
+        const borrow = inference_bridge.runnable_abi.Borrowed{ .context = &parent, .cpu_slots = 1, .parent_class = @backingInt(inference_bridge.runnable_abi.Class.query), .checkpoint = Parent.check, .park = Parent.park, .enter = Parent.enter };
+        var response: ?*anyopaque = null;
+        var json = inference_bridge.String.init("");
+        var numeric = inference_bridge.NumericResult{};
+        const context = inference_bridge.ProviderInvokeContext{ .abi_version = inference_bridge.abi_version, .handle = undefined, .operation = @backingInt(inference_bridge.ProviderOperation.embed_dense_texts), .request_json = .init("{}"), .deadline_ns = 0, .has_deadline = 0, .out_response_handle = &response, .out_response_json = &json, .out_numeric_result = &numeric, .runnable = &borrow };
+        if (reject) {
+            try std.testing.expectError(error.Forbidden, invokeBorrowedProvider(&context, Parent.invoke));
+            try std.testing.expect(response == null and numeric.kind == .absent);
+            try std.testing.expectEqual(@as(usize, 1), parent.enters);
+        } else {
+            try invokeBorrowedProvider(&context, Parent.invoke);
+            linkedInferenceDestroyProviderResponse(response.?);
+            try std.testing.expectEqual(@as(usize, 3), parent.enters);
+            try std.testing.expectEqual(@backingInt(inference_bridge.runnable_abi.Class.query), parent.class);
+        }
+        try std.testing.expectEqual(@as(usize, 1), parent.waits);
+        try std.testing.expect(parent.gate.tryLock());
+        parent.gate.unlock();
+        try (inference.InferenceExecutionControl{}).check();
+    }
 }
