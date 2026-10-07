@@ -1543,6 +1543,8 @@ class RuntimeCacheTest(unittest.TestCase):
             self.own(f"{snowball_root}/{path.name}")
         snowball = self.root / snowball_root / "german_stemmer.zig"
 
+        # Verify committed products before regeneration can hide source drift.
+        self.build("sql-grammar-generated-check", "check-snowball")
         self.build("regen-sql-grammar", "regen-snowball")
         # Snapshot the generators' published, formatted products. Zig 0.17 also
         # stores configure metadata here (dependencies.zig), which can be
