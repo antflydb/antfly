@@ -1104,3 +1104,18 @@ latency is 0.0521 s and all thresholds pass. The
 pins commands, source/artifact hashes, logs and limits. This proves opt-in owner
 startup/shutdown across production archives, not later execution-port/inference
 lease bytes, CPU teams, sustained overload, completion stalls or defaults.
+
+### Borrowed synchronous phase transfer (2026-10-07)
+
+A checked C borrow transfers the parent's single-worker operation between
+classes without a nested admission or a new deadline. Explicit return uses the
+parent's resumption callback; the caller retains final capsule/lease ownership
+even when failed reacquisition retires the scheduler entry. Seven real scheduler
+capsule tests and 34 protocol/imported ABI tests pass on native macOS and pinned
+Nix/glibc GNU AArch64, including full ordinary demand alongside control progress,
+stale deadlines, shutdown and malformed inputs. The
+[transfer receipt](qualification/workload-pooling/receipts/2026-10-07/borrowed-transfer/README.md)
+pins source and output. Production SQL/inference propagation and backend CPU
+team enforcement are still pending; this primitive alone does not claim
+inference execution is bounded. Full API/production gates and defaults remain
+required. Parallel children must own independently admitted capsules.

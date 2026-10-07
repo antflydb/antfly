@@ -217,3 +217,74 @@ test "runnable execution consumer lease validates before retaining and refuses s
     lease.deinit();
     try owner.owner.tryDeinit();
 }
+
+test "runnable execution borrowed child transfers one weighted operation without nested admission" {
+    TestClock.now_ns = 0;
+    var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = TestClock.now };
+    defer owner.owner.deinit();
+    const port = owner.port();
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    var handle: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.query), .slots = 2, .retained_bytes = 17, .out_handle = &handle }).isOk());
+    defer port.finish(handle.?);
+    const retained = owner.owner.scheduler.stats().retained_bytes;
+    const parent = try abi.Borrowed.fromOwner(port, handle.?, 2, .query);
+    var child = try abi.Transfer.init(parent, .inference);
+    try std.testing.expectEqual(@as(usize, 1), owner.owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 2), owner.owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(retained, owner.owner.scheduler.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 2), child.borrow.cpu_slots);
+    try std.testing.expectEqual(@as(u64, 1), owner.owner.scheduler.stats().grants[2]);
+    var control: ?*anyopaque = null;
+    try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.control), .out_handle = &control }).isOk());
+    defer port.finish(control.?);
+    try child.checkpoint();
+    try child.returnToParent();
+    try std.testing.expectEqual(@as(u64, 2), owner.owner.scheduler.stats().grants[0]);
+    try std.testing.expectError(error.InvalidRunnableTransition, child.returnToParent());
+    try std.testing.expectError(error.InvalidRunnableTransition, child.checkpoint());
+}
+
+test "runnable execution borrowed child rejects stale deadlines headers and shutdown without retiring its parent" {
+    const io = std.testing.io;
+    const borrow = runtime.native_abi.IoBorrow.init(&io);
+    for (0..4) |scenario| {
+        TestClock.now_ns = 0;
+        var owner: State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = TestClock.now };
+        var handle: ?*anyopaque = null;
+        const port = owner.port();
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(abi.Class.query), .has_deadline = 1, .native_deadline = 1, .deadline_ns = 10, .out_handle = &handle }).isOk());
+        errdefer {
+            port.finish(handle.?);
+            owner.owner.deinit();
+        }
+        var parent = try abi.Borrowed.fromOwner(port, handle.?, 1, .query);
+        if (scenario == 0) {
+            parent.version += 1;
+            try std.testing.expectError(error.UnsupportedVersion, abi.Transfer.init(parent, .inference));
+            try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().grants[2]);
+        } else if (scenario == 1) {
+            TestClock.now_ns = 11;
+            try std.testing.expectError(error.DeadlineExceeded, abi.Transfer.init(parent, .inference));
+        } else {
+            var child = try abi.Transfer.init(parent, .inference);
+            if (scenario == 2) {
+                TestClock.now_ns = 11;
+                try std.testing.expectError(error.DeadlineExceeded, child.returnToParent());
+            } else {
+                owner.owner.close();
+                try std.testing.expectError(error.SchedulerClosed, child.returnToParent());
+            }
+            try std.testing.expectError(error.InvalidRunnableTransition, child.returnToParent());
+        }
+        // A failed resumed acquisition may retire its scheduler entry. The
+        // capsule and owner lease still belong to the original caller.
+        try std.testing.expectEqual(@as(usize, 1), owner.owner.borrowers);
+        try std.testing.expectError(error.InvalidRunnableTransition, owner.owner.tryDeinit());
+        port.finish(handle.?);
+        try std.testing.expectEqual(@as(usize, 0), owner.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), owner.owner.scheduler.stats().retained_bytes);
+        try owner.owner.tryDeinit();
+    }
+}
