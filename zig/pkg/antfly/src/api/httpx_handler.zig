@@ -5709,6 +5709,12 @@ pub const AntflyApiHandler = struct {
 
         fn runChecked(self: *@This()) !void {
             try self.adapter.context.ensureActive();
+            // Preparation retains its own bounded task/input owner. It borrows
+            // runnable capacity before parsing, cache access or describing, and
+            // returns it before waiting for coarse execution admission.
+            var preparation_runnable: http_server_mod.RunnableScheduler.Execution = .{};
+            defer preparation_runnable.finish();
+            try self.adapter.server.startSqlRunnable(&preparation_runnable, try self.admissionOptions(), if (self.protected_control) .control else .query);
             const prepared = @import("sql_prepared.zig");
             var resource: ?prepared.Owned = null;
             defer if (resource) |*value| value.deinit();
@@ -5790,6 +5796,7 @@ pub const AntflyApiHandler = struct {
                         .catalog => |catalog_setting| catalog_setting != .show,
                         .reset_all, .discard_all => true,
                     };
+                    preparation_runnable.finish();
                     self.preparation.release();
                     var execution = try self.adapter.server.acquireSqlExecutionWithOptions(self.is_write, try self.admissionOptions());
                     defer execution.release();
@@ -5880,6 +5887,7 @@ pub const AntflyApiHandler = struct {
                 .select, .explain => false,
                 .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
             };
+            preparation_runnable.finish();
             self.preparation.release();
             var execution = (if (self.protected_control) self.adapter.server.acquireSqlControl() else self.adapter.server.acquireSqlExecutionWithOptions(self.is_write, try self.admissionOptions())) catch |err| {
                 self.failure = err;
@@ -13398,6 +13406,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var runnable_hold: http_server_mod.RunnableScheduler.Execution = .{};
         try server.startSqlRunnable(&runnable_hold, .{ .io = std.testing.io }, .query);
         defer runnable_hold.finish();
+        const catalog_calls_before_preparation = source.calls;
         var scheduled_jobs = jobs;
         for (&scheduled_jobs) |*job| job.err = null;
         var scheduled_group: std.Io.Group = .init;
@@ -13408,9 +13417,12 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= scheduling_until.nanoseconds) return error.SchedulingWaitersDidNotStart;
             try std.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
-        try std.testing.expectEqual(@as(usize, 2), server.queryAdmissionStats().in_flight);
+        // Both protocols queue before plan preparation and coarse admission.
+        // No catalog execution can run under the occupied ordinary slot.
+        try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
+        try std.testing.expectEqual(catalog_calls_before_preparation, source.calls);
         // Authenticated ROLLBACK progresses on reserved control capacity while
-        // both ordinary protocol executions remain queued.
+        // both ordinary protocol preparations remain queued.
         const control_txn = try server.txn_sessions.beginForPrincipal(server.alloc, .{ .sql = .{ .database = "default", .namespace = "public", .mode = .read_only, .isolation = .read_committed } }, server.localSessionNodeId(), "pool-reader");
         const control_id = std.fmt.bytesToHex(control_txn.txn_id, .lower);
         var rollback_request = wire_request;

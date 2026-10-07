@@ -369,11 +369,15 @@ const OwnedRead = struct {
         const server = adapter.server;
         var preparation = server.sql_preparation_admission.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
+        var preparation_runnable: http.RunnableScheduler.Execution = .{};
+        defer preparation_runnable.finish();
+        try server.startSqlRunnable(&preparation_runnable, admissionOptions(request), .query);
         var diagnostic: compiler.Diagnostic = .{};
         var plan = try server.sqlPlanCache().acquire(server.sqlPlanCacheIo(), .{ .statement = request.statement, .principal = credential.principal, .database = request.database orelse "default", .namespace = request.namespace orelse "public" }, &diagnostic);
         var moved = false;
         defer if (!moved) plan.release(server.sqlPlanCacheIo());
         if (plan.compiled().statement != .select) return null;
+        preparation_runnable.finish();
         preparation.release();
         var admission = try server.acquireSqlExecutionWithOptions(false, admissionOptions(request));
         defer if (!moved) admission.release();
@@ -382,6 +386,11 @@ const OwnedRead = struct {
         self.alloc = alloc;
         self.runnable = .{};
         errdefer self.runnable.finish();
+        // Install the stable request before retaining its cancellation/I/O
+        // borrows in an execution entry. Setup allocations then run admitted.
+        self.identity = null;
+        self.authority = .{ .credential = credential, .identity = &self.identity, .request = request };
+        try server.startSqlRunnable(&self.runnable, admissionOptions(self.authority.request), .query);
         self.session_id = null;
         self.staged = .{};
         self.range_guards = .{};
@@ -400,7 +409,6 @@ const OwnedRead = struct {
         errdefer self.identity.?.deinit(server.alloc);
         // Statement, parameter and binding-guard data are portal-owned. Keep a
         // private request capsule so I/O borrows point to a stable address.
-        self.authority = .{ .credential = credential, .identity = &self.identity, .request = request };
         self.authority.request.statement = try arena.dupe(u8, request.statement);
         self.authority.request.database = try arena.dupe(u8, request.database orelse "default");
         self.authority.request.namespace = try arena.dupe(u8, request.namespace orelse "public");
@@ -408,7 +416,6 @@ const OwnedRead = struct {
         self.authority.request.binding_guard = if (request.binding_guard) |guard| try arena.dupe(u8, guard) else null;
         self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
-        try server.startSqlRunnable(&self.runnable, admissionOptions(self.authority.request), .query);
         self.native_adapter = .{ .runnable = if (self.runnable.entry != null) &self.runnable else null, .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         if (self.native_adapter.runnable != null) try self.native_adapter.beginReadFence();
         errdefer self.native_adapter.endReadFence();
@@ -789,6 +796,9 @@ const Job = struct {
         const preparation_owner = if (protected) &self.adapter.server.sql_control_preparation else &self.adapter.server.sql_preparation_admission;
         var preparation = preparation_owner.tryAcquireLease() orelse return error.SqlWriteCapacityUnavailable;
         defer preparation.release();
+        var preparation_runnable: http.RunnableScheduler.Execution = .{};
+        defer preparation_runnable.finish();
+        try self.adapter.server.startSqlRunnable(&preparation_runnable, admissionOptions(self.request), if (protected) .control else .query);
         var lease = @import("sql_control.zig").Plan.acquire(self.alloc, self.adapter.server.sqlPlanCache(), self.adapter.server.sqlPlanCacheIo(), .{
             .statement = self.request.statement,
             .principal = self.credential.principal,
@@ -805,17 +815,18 @@ const Job = struct {
             .insert, .update, .delete, .merge, .create_table, .drop_table, .catalog_ddl, .policy_ddl, .begin, .commit, .rollback, .savepoint, .rollback_to_savepoint, .release_savepoint, .set_constraints => true,
         };
         const server = self.adapter.server;
+        preparation_runnable.finish();
         preparation.release();
         var admission = if (protected) try server.acquireSqlControl() else try server.acquireSqlExecutionWithOptions(write, admissionOptions(self.request));
         defer admission.release();
+        var runnable: http.RunnableScheduler.Execution = .{};
+        defer runnable.finish();
+        if (!write or protected) try server.startSqlRunnable(&runnable, admissionOptions(self.request), if (protected) .control else .query);
         const identity_alloc = if (protected) server.controlAllocator() else server.alloc;
         var identity: ?http.AuthenticatedIdentity = try self.credential.identity(identity_alloc);
         defer identity.?.deinit(identity_alloc);
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
         const context = try authority.context();
-        var runnable: http.RunnableScheduler.Execution = .{};
-        defer runnable.finish();
-        if ((!write or protected) and self.kind != .describe) try server.startSqlRunnable(&runnable, admissionOptions(self.request), if (protected) .control else .query);
         var native_adapter = execution.Adapter{
             .runnable = if (runnable.entry != null) &runnable else null,
             .server = server,

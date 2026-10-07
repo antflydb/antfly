@@ -960,3 +960,17 @@ preserves the full logs. Compiler estimate overruns remain visible; corrected
 the isolated build snapshot, but Zig correctly declined the 26 GiB step against
 the Docker VM's 23.43 GiB available budget. That attempted graph is not a passing
 production qualification. Native preparation/API work is verified separately.
+
+
+SQL preparation now acquires runnable capacity before parsing, plan-cache access
+and Describe in both HTTP and pgwire. It releases that grant before coarse
+execution admission; protected controls use reserved capacity. Pgwire read setup
+uses a stable request owner before setup allocations, and ordinary Describe
+also acquires execution capacity. The mixed protocol fixture verifies queued
+preparation makes no new catalog calls while ROLLBACK progresses. All 75 selected
+native API contracts pass, with no skips/leaks and all 50 build steps successful.
+The [preparation receipt](qualification/workload-pooling/receipts/2026-10-07/sql-preparation/README.md)
+records source hashes and complete output. Linux API and complete production
+qualification remain pending. Parser quanta, exact preparation wait suspension,
+serialization ownership and broader execution classes remain separate work;
+this phase does not enable scheduler defaults.
