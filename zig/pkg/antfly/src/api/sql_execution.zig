@@ -114,6 +114,9 @@ pub const Adapter = struct {
     identity: *?http_server.AuthenticatedIdentity,
     context: operation.RequestContext,
     runnable: ?*http_server.RunnableScheduler.Execution = null,
+    /// A scheduled ordinary write owns one worker through durable completion.
+    /// It must not fan out CPU children or borrow read-only suspension hooks.
+    serial_execution: bool = false,
     read_guard: ?read_fence.Guard = null,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
@@ -654,7 +657,7 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .execution_io = if (self.runnable == null) self.server.embedding_provider_runtime.io else null, .spill_io = if (self.runnable != null) self.server.embedding_provider_runtime.io else null, .spill_wait = if (self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_io = if (self.runnable == null and !self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_io = if (self.runnable != null or self.serial_execution) self.server.embedding_provider_runtime.io else null, .spill_wait = if (self.runnable != null) .{ .ptr = self, .begin = spillWaitBegin, .end = spillWaitEnd } else null, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {

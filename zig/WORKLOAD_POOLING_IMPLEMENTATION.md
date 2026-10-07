@@ -922,8 +922,9 @@ All 269 embedded SQL, 118 coordinator SQL and 13 read-gate contracts pass on bot
 macOS and pinned Nix/glibc GNU AArch64. The six controlled event-wait schedules
 prove cancellation, expiry, shutdown, I/O failure and authority failure without
 stranding slots or metadata. They do not prove real DataServer quorum/apply delay.
-The actual owner-lock regression and retained-owner poison-callback regression
-are undergoing separate Linux verification. Three checked callback and all 25
+Actual DataServer owner-lock and retained-owner poison-callback integration also
+pass on Linux, including exact artifacts under two CPUs and 2 GiB, as recorded
+below. Native DataServer owner-lock execution remains pending. Three checked callback and all 25
 error ABI tests also pass on both platforms with exact updated catalog hashes.
 The [read-index receipt](qualification/workload-pooling/receipts/2026-10-07/read-index-waits/README.md)
 preserves initial and corrected snapshot manifests and complete logs.
@@ -933,8 +934,11 @@ the control catalog and a scheduler field passed to an unsupported serverless
 bootstrap. The export is regenerated; serverless explicitly rejects that opt-in
 policy while its execution owner awaits integration. The initial distributed
 runtime archive compiled successfully with the new wait hooks, but the complete
-CLI failed on those two configuration issues. Complete corrected production
-qualification remains pending. The Linux SQL compiler reservation reflects its
+CLI initially failed on those two configuration issues. The corrected complete
+native production build now passes all 56 steps against `7e7232ce73`; the
+[production receipt](qualification/workload-pooling/receipts/2026-10-07/sql-preparation/native-production.json)
+pins its source and installed CLI artifact hashes. Linux production qualification
+and serverless scheduler integration remain pending. The Linux SQL compiler reservation reflects its
 observed 2.31 GB peak; executor runtime limits remain unchanged.
 
 
@@ -946,8 +950,9 @@ passes again under two CPUs and 2 GiB without extra swap or a compiler; the
 verifier requires every failure marker and six tests, with no skips/leaks and a
 zero exit status. The [read-index receipt](qualification/workload-pooling/receipts/2026-10-07/read-index-waits/README.md)
 preserves the exact artifact hash, commands and complete logs. Live stalled
-quorum/apply transport, native owner-lock execution and complete corrected
-production/API qualification remain separate requirements.
+quorum/apply transport, native owner-lock execution and Linux production/API
+qualification remain separate requirements. Complete native production and the
+preparation/API snapshot are qualified separately below.
 
 
 Linux routed-read/retained-owner verification passes all 119 selected tests,
@@ -970,7 +975,30 @@ also acquires execution capacity. The mixed protocol fixture verifies queued
 preparation makes no new catalog calls while ROLLBACK progresses. All 75 selected
 native API contracts pass, with no skips/leaks and all 50 build steps successful.
 The [preparation receipt](qualification/workload-pooling/receipts/2026-10-07/sql-preparation/README.md)
-records source hashes and complete output. Linux API and complete production
-qualification remain pending. Parser quanta, exact preparation wait suspension,
+records source hashes and complete output, including a complete 56-step native
+production build. Linux API/production qualification and production qualification
+of subsequent write changes remain pending. Parser quanta, exact preparation wait suspension,
 serialization ownership and broader execution classes remain separate work;
 this phase does not enable scheduler defaults.
+
+
+Ordinary HTTP/pgwire SQL execution now acquires write-class runnable capacity,
+and HTTP settings commands acquire query/write capacity by classification.
+Writes retain their grant through worker completion and accepted durable work.
+Their native backend runs serial CPU work with spill I/O, withholding read-only
+suspension callbacks. This prevents unscheduled SQL CPU children while preserving
+durable completion. Write wait suspension, mutation quanta and independently
+owned durable completion/parallel children remain required before defaults.
+
+All 75 selected native API contracts pass with zero skips/leaks and all 50 build
+steps successful. The mixed protocol fixture verifies read-committed BEGIN and
+protected ROLLBACK grant ownership; unsupported default serializable BEGIN
+preserves 501/0A000 and retires its grant. Native HTTP INSERT/RETURNING and
+credentialed pgwire INSERT/RETURNING and DELETE/RETURNING verify write-class
+grants and zero remaining slots, operations and metadata. Existing joined UPDATE
+and normalization cases run with scheduling enabled. The
+[write receipt](qualification/workload-pooling/receipts/2026-10-07/write-runnable/README.md)
+records the initial fixture error and corrected source-pinned run. Linux
+API/runtime, production qualification of this write snapshot, and stalled
+accepted mutation schedules remain pending. Broader execution classes and
+automatic defaults remain required for the overall design.

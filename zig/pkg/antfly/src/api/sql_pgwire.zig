@@ -821,14 +821,17 @@ const Job = struct {
         defer admission.release();
         var runnable: http.RunnableScheduler.Execution = .{};
         defer runnable.finish();
-        if (!write or protected) try server.startSqlRunnable(&runnable, admissionOptions(self.request), if (protected) .control else .query);
+        // Writes retain this grant through durable completion. Do not expose
+        // the read suspension hooks to an accepted ordinary write.
+        try server.startSqlRunnable(&runnable, admissionOptions(self.request), if (protected) .control else if (write) .write else .query);
         const identity_alloc = if (protected) server.controlAllocator() else server.alloc;
         var identity: ?http.AuthenticatedIdentity = try self.credential.identity(identity_alloc);
         defer identity.?.deinit(identity_alloc);
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
         const context = try authority.context();
         var native_adapter = execution.Adapter{
-            .runnable = if (runnable.entry != null) &runnable else null,
+            .runnable = if ((!write or protected) and runnable.entry != null) &runnable else null,
+            .serial_execution = runnable.entry != null,
             .server = server,
             .identity = &identity,
             .context = context,

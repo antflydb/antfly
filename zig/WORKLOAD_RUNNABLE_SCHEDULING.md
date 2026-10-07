@@ -200,3 +200,41 @@ records source hashes and complete output. Linux API and complete production
 qualification remain pending. Parser quanta, exact preparation wait suspension,
 serialization ownership and broader execution classes remain separate work;
 this phase does not enable scheduler defaults.
+
+
+## Ordinary SQL write ownership (native API qualified)
+
+HTTP and pgwire ordinary SQL execution now acquire the write class after
+preparation and coarse operation admission, before execution setup. HTTP
+session-setting commands acquire query or write capacity according to their
+existing read/write classification. Grammar-verified terminal controls retain
+the reserved control class. Describe remains query work. Disabled scheduling
+retains the existing behavior.
+
+A scheduled ordinary write keeps its grant until the execution worker completes,
+including any accepted durable completion. Its adapter does not receive the
+read-only checkpoint/park callbacks. Serial execution disables unscheduled CPU
+children while retaining native spill I/O without wait suspension. This prevents
+new scheduling boundaries from abandoning a proposal or requiring a fresh grant
+to finish it. It does not yet release runnable capacity during write I/O or
+preempt mutation CPU work; those require a separately owned durable completion
+phase and independently admitted child execution.
+
+The mixed protocol fixture now exercises explicit read-committed BEGIN READ ONLY
+and protected ROLLBACK
+through both HTTP and pgwire, requires two additional write-class grants, and
+checks zero remaining operations, slots and retained metadata. BEGIN mutates
+session state even in a read-only transaction. Its unsupported default-serializable
+BEGIN case also requires the unchanged 501/0A000 diagnostic and retirement of
+its write grant. The existing native row-mutation
+fixture also runs with scheduling enabled; successful INSERT/RETURNING requires
+one write-class grant and zero remaining scheduler charges per statement. Its
+joined UPDATE and default-normalization cases exercise the serial native backend.
+Authenticated pgwire INSERT/RETURNING and DELETE/RETURNING also require a write
+grant and zero remaining charges, and remove their probe row before later cases.
+These fixtures do not prove a stalled accepted row-mutation schedule. All 75
+selected native API contracts and 50 build steps pass with no skips or leaks.
+The [write receipt](qualification/workload-pooling/receipts/2026-10-07/write-runnable/README.md)
+preserves the initial fixture failure and corrected complete run. Linux API/runtime
+and complete production qualification of this write slice remain pending;
+automatic defaults remain disabled.

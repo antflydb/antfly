@@ -31,9 +31,10 @@ This establishes bounded preparation concurrency, not parser preemption or
 exact plan-cache wait suspension. Preparation checkpoints, serialization
 ownership, ordinary writes, inference, background work, fan-out, complete
 production qualification and automatic defaults remain pending. Linux API
-qualification remains pending: the current GNU ARM64 storage compiler declares
-26 GiB, exceeding the available 23.43 GiB Docker VM budget. Runtime resource
-limits are unchanged.
+qualification remains pending. The whole pooling API target uses its existing
+23 GiB compiler allowance and does not link the production storage archive.
+Separate storage-linked integration/production graphs declare 26 GiB, exceeding
+the available 23.43 GiB Docker VM budget. Runtime resource limits are unchanged.
 
 Complete native production compilation now passes all 56 build steps against
 commit `7e7232ce73`, including CLI, serverless, distributed, API, storage,
@@ -43,3 +44,7 @@ command, source hashes, zero exit and installed artifact hash. This resolves the
 previous generated read-fence export/serverless bootstrap compile failures on
 macOS. It does not establish Linux production qualification, serverless
 scheduler support, or broader write scheduling (which was not in this snapshot).
+
+The same SHA-256-verified installed native CLI also exits zero for `--help`.
+`native-production-help.log` preserves that output. This is a CLI load/help
+smoke check, not a running-service workload qualification.

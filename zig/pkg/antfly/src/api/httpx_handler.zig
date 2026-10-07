@@ -5800,6 +5800,9 @@ pub const AntflyApiHandler = struct {
                     self.preparation.release();
                     var execution = try self.adapter.server.acquireSqlExecutionWithOptions(self.is_write, try self.admissionOptions());
                     defer execution.release();
+                    var runnable: http_server_mod.RunnableScheduler.Execution = .{};
+                    defer runnable.finish();
+                    try self.adapter.server.startSqlRunnable(&runnable, try self.admissionOptions(), if (self.is_write) .write else .query);
                     self.execution_entered = true;
                     self.result = try @import("sql_http_settings.zig").execute(self.workAllocator(), &self.adapter, command, self.parameters);
                     return;
@@ -5896,10 +5899,13 @@ pub const AntflyApiHandler = struct {
             defer execution.release();
             var runnable: http_server_mod.RunnableScheduler.Execution = .{};
             defer runnable.finish();
-            if (!self.is_write or self.protected_control) {
-                try self.adapter.server.startSqlRunnable(&runnable, try self.admissionOptions(), if (self.protected_control) .control else .query);
-                if (runnable.entry != null) self.adapter.runnable = &runnable;
-            }
+            // Ordinary writes share execution capacity, but keep their grant
+            // through accepted durable completion. Only read/control owners
+            // may suspend via the adapter until write completion can detach.
+            try self.adapter.server.startSqlRunnable(&runnable, try self.admissionOptions(), if (self.protected_control) .control else if (self.is_write) .write else .query);
+            if ((!self.is_write or self.protected_control) and runnable.entry != null) self.adapter.runnable = &runnable;
+            self.adapter.serial_execution = runnable.entry != null;
+            defer self.adapter.serial_execution = false;
             defer self.adapter.runnable = null;
             self.execution_entered = true;
             self.result = self.adapter.execute(self.workAllocator(), compiled, self.parameters, .{ .result_rows = self.limit }, null) catch |err| {
@@ -13324,6 +13330,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             identity: wire.Identity,
             request: wire.Request,
             use_http: bool,
+            begin_transaction: bool = false,
             err: ?anyerror = null,
             fn run(self: *@This()) void {
                 self.check() catch |err| {
@@ -13337,18 +13344,41 @@ test "httpx SQL executes one relational page with exact integer parameters" {
                 if (self.use_http) {
                     var request = try httpx.Request.init(allocator, .POST, "http://127.0.0.1/db/v1/sql");
                     defer request.deinit();
-                    request.body = "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}";
+                    request.body = if (self.begin_transaction) "{\"statement\":\"BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY\"}" else "{\"statement\":\"SELECT id, name FROM usage_records WHERE id = $1 LIMIT 1\",\"parameters\":[9007199254740993]}";
                     var ctx = httpx.Context.init(allocator, std.testing.io, &request);
                     defer ctx.deinit();
                     var response = try self.http_handler.executeSQL(&ctx);
                     defer response.deinit();
                     try std.testing.expectEqual(@as(u16, 200), response.status.code);
                     const result = try std.json.parseFromSliceLeaky(sql_wire.SQLResponse, allocator, response.body.?, .{});
+                    if (self.begin_transaction) {
+                        try std.testing.expectEqualStrings("BEGIN", result.command_tag);
+                        const session_id = result.session_id orelse return error.MissingWriteSession;
+                        var cleanup_request = try httpx.Request.init(allocator, .POST, "http://127.0.0.1/db/v1/sql");
+                        defer cleanup_request.deinit();
+                        cleanup_request.body = try std.json.Stringify.valueAlloc(allocator, .{ .statement = "ROLLBACK", .session_id = session_id }, .{});
+                        var cleanup_ctx = httpx.Context.init(allocator, std.testing.io, &cleanup_request);
+                        defer cleanup_ctx.deinit();
+                        var cleanup_response = try self.http_handler.executeSQL(&cleanup_ctx);
+                        defer cleanup_response.deinit();
+                        try std.testing.expectEqual(@as(u16, 200), cleanup_response.status.code);
+                        return;
+                    }
                     try std.testing.expectEqualStrings("9007199254740993", result.rows[0][0].string);
                     try std.testing.expectEqualStrings("exact", result.rows[0][1].string);
                 } else {
                     var result = try self.backend.vtable.execute(self.backend.context, allocator, self.identity, self.request);
                     defer result.deinit();
+                    if (self.begin_transaction) {
+                        try std.testing.expectEqualStrings("BEGIN", result.command_tag);
+                        var cleanup_request = self.request;
+                        cleanup_request.statement = "ROLLBACK";
+                        cleanup_request.session_id = result.session_id orelse return error.MissingWriteSession;
+                        var cleanup = try self.backend.vtable.execute(self.backend.context, allocator, self.identity, cleanup_request);
+                        defer cleanup.deinit();
+                        try std.testing.expectEqualStrings("ROLLBACK", cleanup.command_tag);
+                        return;
+                    }
                     try std.testing.expectEqualStrings("9007199254740993", result.rows[0][0].string);
                     try std.testing.expectEqual(wire.Type.integer, result.columns[0].type);
                     try std.testing.expectEqualStrings("exact", result.rows[0][1].string);
@@ -13450,6 +13480,52 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         for (scheduled_jobs) |job| if (job.err) |err| return err;
         try std.testing.expect(server.runnable_scheduler.?.stats().yields > 0);
         try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
+        // Both public protocols execute BEGIN in the write class, then retire
+        // the resulting sessions through protected ROLLBACK. A read-only class
+        // integration or an ordinary-write bypass cannot satisfy this receipt.
+        {
+            // This source does not implement serializable range guards. A
+            // default-isolation rejection must still retire its write grant.
+            const unsupported_grants_before = server.runnableSchedulingStats().grants[1];
+            var unsupported_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+            defer unsupported_request.deinit();
+            unsupported_request.body = "{\"statement\":\"BEGIN READ ONLY\"}";
+            var unsupported_ctx = httpx.Context.init(alloc, std.testing.io, &unsupported_request);
+            defer unsupported_ctx.deinit();
+            var unsupported_response = try handler.executeSQL(&unsupported_ctx);
+            defer unsupported_response.deinit();
+            try std.testing.expectEqual(@as(u16, 501), unsupported_response.status.code);
+            var unsupported_diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, unsupported_response.body.?, .{});
+            defer unsupported_diagnostic.deinit();
+            try std.testing.expectEqualStrings("0A000", unsupported_diagnostic.value.code);
+            try std.testing.expectEqual(unsupported_grants_before + 1, server.runnableSchedulingStats().grants[1]);
+            const unsupported_stats = server.runnable_scheduler.?.stats();
+            try std.testing.expectEqual(@as(usize, 0), unsupported_stats.operations);
+            try std.testing.expectEqual(@as(usize, 0), unsupported_stats.runnable_slots);
+            try std.testing.expectEqual(@as(u64, 0), unsupported_stats.retained_bytes);
+        }
+        const write_grants_before = server.runnableSchedulingStats().grants[1];
+        var write_jobs = jobs;
+        for (&write_jobs) |*job| {
+            job.err = null;
+            job.begin_transaction = true;
+            job.request.statement = "BEGIN ISOLATION LEVEL READ COMMITTED READ ONLY";
+            job.request.parameters = &.{};
+            job.request.parameter_types = &.{};
+            // Preserve the fixture's fail-fast, one-operation write admission.
+            try job.check();
+        }
+        try std.testing.expectEqual(write_grants_before + 2, server.runnableSchedulingStats().grants[1]);
+        const writes_done = server.runnable_scheduler.?.stats();
+        try std.testing.expectEqual(@as(usize, 0), writes_done.operations);
+        try std.testing.expectEqual(@as(usize, 0), writes_done.runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), writes_done.retained_bytes);
+        var serial_identity: ?AuthenticatedIdentity = null;
+        var serial_write_adapter: sql_execution.Adapter = .{ .server = &server, .identity = &serial_identity, .context = .{}, .serial_execution = true };
+        const serial_write_backend = serial_write_adapter.backend();
+        try std.testing.expect(serial_write_backend.execution_io == null);
+        try std.testing.expect(serial_write_backend.spill_io != null);
+        try std.testing.expect(serial_write_backend.spill_wait == null);
         try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
         try @import("sql_pgwire_socket_test.zig").qualify(&server, &storage_manager);
         try qualifyNativeH2Waiting(&server);
@@ -13963,7 +14039,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var text_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &text_db, raft_mod.read_gate.alreadyReadSafeBarrier());
         var text_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &text_db);
         var text_source: Source = .{ .schema = text_schema_json, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = text_schema_json }} };
-        var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
+        var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 } }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
         defer text_server.deinit();
         var text_handler = AntflyApiHandler{ .api_server = &text_server };
         const corpus = try std.json.parseFromSlice(std.json.Value, alloc, @import("antfly_local_sources").sql_parity_fixtures.inventory, .{});
@@ -14217,6 +14293,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             request.body = case.body;
             var ctx = httpx.Context.init(alloc, std.testing.io, &request);
             defer ctx.deinit();
+            const write_grants_before_insert = text_server.runnableSchedulingStats().grants[1];
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
             if (response.status.code != 200) std.debug.print("SQL INSERT DEFAULT: {s}\n", .{response.body orelse ""});
@@ -14224,9 +14301,62 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
             defer result.deinit();
             try std.testing.expectEqual(@as(i64, 1), result.value.rows_affected);
+            // The native INSERT and acknowledgement finish under one write
+            // grant; a query-class fallback or a write bypass fails this check.
+            try std.testing.expectEqual(write_grants_before_insert + 1, text_server.runnableSchedulingStats().grants[1]);
+            const inserted_stats = text_server.runnable_scheduler.?.stats();
+            try std.testing.expectEqual(@as(usize, 0), inserted_stats.operations);
+            try std.testing.expectEqual(@as(usize, 0), inserted_stats.runnable_slots);
+            try std.testing.expectEqual(@as(u64, 0), inserted_stats.retained_bytes);
             try std.testing.expectEqual(@as(usize, 1), result.value.rows.len);
             if (case.expected_id) |expected_id| try std.testing.expectEqualStrings(expected_id, result.value.rows[0][0].string) else try std.testing.expect(result.value.rows[0][0].string.len != 0);
             try std.testing.expectEqualStrings("reset", result.value.rows[0][1].string);
+        }
+        {
+            // Authenticated pgwire mutations use the same native write owner.
+            // Remove the probe row so subsequent corpus cases retain their
+            // original data set.
+            var write_auth = try initTestAuthManager(alloc);
+            defer write_auth.store.deinit();
+            defer write_auth.policy_store.deinit();
+            try bindTestAuthManager(alloc, &write_auth);
+            defer write_auth.manager.deinit();
+            var write_permission = try usermgr.Permission.initOwned(alloc, .@"*", "*", .admin);
+            defer write_permission.deinit(alloc);
+            var write_user = try write_auth.manager.createUser("pool-writer", "secret", &.{write_permission});
+            defer write_user.deinit(alloc);
+            text_server.cfg.user_manager = &write_auth.manager;
+            defer text_server.cfg.user_manager = null;
+            var write_pg: @import("sql_pgwire.zig").Adapter = .{ .server = &text_server };
+            const write_backend = write_pg.backend();
+            const write_identity = try write_backend.vtable.authenticate(write_backend.context, alloc, "pool-writer", "secret");
+            defer write_identity.release(write_identity.context, alloc);
+            for ([_][]const u8{
+                "INSERT INTO usage_records (id,status,quantity) VALUES ('pg_write_probe','probe',7) RETURNING id",
+                "DELETE FROM usage_records WHERE id = 'pg_write_probe' RETURNING id",
+            }) |statement| {
+                var write_arena = std.heap.ArenaAllocator.init(alloc);
+                defer write_arena.deinit();
+                var write_cancel: std.atomic.Value(bool) = .init(false);
+                const write_grants_before = text_server.runnableSchedulingStats().grants[1];
+                var written = try write_backend.vtable.execute(write_backend.context, write_arena.allocator(), write_identity, .{
+                    .statement = statement,
+                    .parameters = &.{},
+                    .limit = 1,
+                    .io = std.testing.io,
+                    .cancel_requested = &write_cancel,
+                    .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 5 * std.time.ns_per_s } },
+                });
+                defer written.deinit();
+                try std.testing.expectEqual(@as(u64, 1), written.rows_affected);
+                try std.testing.expectEqual(@as(usize, 1), written.rows.len);
+                try std.testing.expectEqualStrings("pg_write_probe", written.rows[0][0].string);
+                try std.testing.expectEqual(write_grants_before + 1, text_server.runnableSchedulingStats().grants[1]);
+                const written_stats = text_server.runnable_scheduler.?.stats();
+                try std.testing.expectEqual(@as(usize, 0), written_stats.operations);
+                try std.testing.expectEqual(@as(usize, 0), written_stats.runnable_slots);
+                try std.testing.expectEqual(@as(u64, 0), written_stats.retained_bytes);
+            }
         }
         {
             // sql-1494: DEFAULT VALUES has no SQL value cells. Native schema

@@ -154,3 +154,16 @@ owned allocation or native-thread cost must not silently enlarge a process budge
 The manifests record enforced cgroup CPU/memory/PID limits, not just YAML intent.
 Static-musl retains the original Zig signal-stack implementation and needs its
 own profile.
+
+
+Scheduled ordinary SQL writes retain a write-class grant from execution setup
+through worker completion, including accepted durable work. The existing
+operation lease, transaction/session owners and outcome/recovery obligations
+keep their original lifetimes. Read-only suspension callbacks are withheld from
+ordinary writes; their native SQL backend runs serial CPU work and retains
+spill I/O. Write waits currently continue holding runnable capacity. Releasing
+that capacity requires a verified durable completion owner that can finish
+without request cancellation or a new foreground grant. Qualification of this
+write integration passes all 75 selected native API contracts with zero skips
+or leaks. Linux API/runtime, complete production qualification and stalled
+accepted mutation schedules remain pending.

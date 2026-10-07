@@ -27,5 +27,11 @@
     "path": "zig/zig-out/bin/antfly",
     "sha256": "fbcbe6b8fc3bee895ce857bb2853462d3968c5eb48de7f706522a03e5f137edb",
     "bytes": 165058664
+  },
+  "help_smoke": {
+    "command": "zig/zig-out/bin/antfly --help",
+    "exit_code": 0,
+    "artifact_sha256": "fbcbe6b8fc3bee895ce857bb2853462d3968c5eb48de7f706522a03e5f137edb",
+    "log": "native-production-help.log"
   }
 }
