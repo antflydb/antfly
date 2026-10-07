@@ -368,6 +368,18 @@ class PostgresReferenceTest(unittest.TestCase):
                 finally:
                     self.db.execute("DEALLOCATE ALL")
 
+    def test_materialized_relation_replay_preserves_self_join_multiplicity(self):
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE items(n bigint)")
+            self.db.execute("INSERT INTO items SELECT generate_series(0,4095)")
+            self.assertEqual(
+                self.db.execute(
+                    "WITH cached AS MATERIALIZED (SELECT n FROM items) "
+                    "SELECT count(*) FROM cached a JOIN cached b ON a.n=b.n"
+                ).fetchone(),
+                (4096,),
+            )
+
     def test_typed_array_scalar_expression_contracts(self):
         import json
         from pathlib import Path

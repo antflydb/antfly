@@ -257,6 +257,19 @@ session/protocol metadata, aggregate/window/relation binding, or storage; those
 boundaries still require migration. No original inventory dispositions change
 on the strength of these supplemental component tests.
 
+Statement-invariant relation caches now use bounded replay storage rather than
+retaining an allocation per source row without a local spill boundary. Small
+inputs stay in memory with actual arena-capacity admission; larger inputs spill
+once into typed sequential blocks without a per-row disk directory. Each replay
+reader owns its position and decode arena, so interleaved materialized-CTE
+references cannot invalidate one another's borrowed rows. Readers lease their
+sealed run, prohibiting append until they close; cleanup shares the existing
+statement spill quota and cancellation machinery. A 4,096-row materialized
+self-join verifies one source capture/read and complete output, independently
+checked against PostgreSQL. This also supplies the bounded replay prerequisite
+for parameterized LATERAL apply; correlated binding, per-parent inner execution
+and the original LATERAL cases are still unfinished, not credited by this work.
+
 The mutation fixture verifies complete RETURNING rows and labels, SQL NULL
 provenance, affected rows, persisted state and untouched rows. A failed RETURNING
 projection must leave physical primary bytes, version and content digest

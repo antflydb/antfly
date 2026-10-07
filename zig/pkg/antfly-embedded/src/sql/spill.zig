@@ -603,6 +603,7 @@ const Decoder = struct {
 pub const Sequential = struct {
     file: File,
     size: u64 = 0,
+    readers: usize = 0,
     block_bytes: usize,
     buffer_bytes: ?usize = null,
     write_arena: std.heap.ArenaAllocator,
@@ -616,12 +617,14 @@ pub const Sequential = struct {
         return .{ .file = try manager.create(), .block_bytes = @max(128, @min(bytes, manager.max_record_bytes / 4)), .write_arena = .init(manager.allocator()), .read_arena = .init(manager.allocator()) };
     }
     pub fn close(self: *Sequential) void {
+        std.debug.assert(self.readers == 0);
         self.pending.deinit(self.file.manager.allocator());
         self.write_arena.deinit();
         self.read_arena.deinit();
         self.file.close();
     }
     pub fn append(self: *Sequential, row: Row, link: u64) !u64 {
+        if (self.readers != 0) return error.InvalidSqlSpill;
         if (link != none) return error.InvalidSqlSpill;
         try self.file.manager.check();
         var bytes: usize = @sizeOf(Row);
@@ -790,7 +793,38 @@ pub const Sequential = struct {
     }
     pub fn readBorrowed(self: *Sequential, offset: u64) !Decoded {
         try self.seal();
-        if (offset >= self.size) return error.InvalidSqlSpill;
+        return readState(self, &self.file, self.size, offset);
+    }
+
+    /// Independent replay positions and decoded blocks over one sealed run.
+    /// The owner remains at a stable address and outlives every reader. A
+    /// reader must not move after its first read (JSON arrays retain its arena).
+    pub const Reader = struct {
+        source: *Sequential,
+        read_arena: std.heap.ArenaAllocator,
+        read_rows: []const Row = &.{},
+        read_first: u64 = 0,
+        read_offset: u64 = 0,
+
+        pub fn readBorrowed(self: *Reader, offset: u64) !Decoded {
+            return readState(self, &self.source.file, self.source.size, offset);
+        }
+
+        pub fn deinit(self: *Reader) void {
+            self.read_arena.deinit();
+            self.source.readers -= 1;
+            self.* = undefined;
+        }
+    };
+
+    pub fn openReader(self: *Sequential) !Reader {
+        try self.seal();
+        self.readers += 1;
+        return .{ .source = self, .read_arena = .init(self.file.manager.allocator()) };
+    }
+
+    fn readState(self: anytype, file: *File, size: u64, offset: u64) !Decoded {
+        if (offset >= size) return error.InvalidSqlSpill;
         if (offset == 0 and self.read_first != 0) {
             self.read_first = 0;
             self.read_offset = 0;
@@ -801,11 +835,11 @@ pub const Sequential = struct {
             _ = self.read_arena.reset(.free_all);
             const owned = self.read_arena.allocator();
             var header: [17]u8 = undefined;
-            try self.file.readRaw(self.read_offset, &header);
+            try file.readRaw(self.read_offset, &header);
             // File records have the sentinel link's 0xff at this byte;
             // typed blocks use only 0/1. Both retain checksum validation.
             if (header[16] == 255) {
-                var record = try self.file.read(owned, self.read_offset);
+                var record = try file.read(owned, self.read_offset);
                 if (record.next != none or record.matched) return error.InvalidSqlSpill;
                 self.read_offset = record.following;
                 self.read_first = offset + 1;
@@ -814,19 +848,19 @@ pub const Sequential = struct {
                 return record;
             }
             const len = std.mem.readInt(u64, header[0..8], .little);
-            if (header[16] > 1 or len > self.file.manager.max_record_bytes or len > self.file.size -| (self.read_offset + header.len)) return error.InvalidSqlSpill;
+            if (header[16] > 1 or len > file.manager.max_record_bytes or len > file.size -| (self.read_offset + header.len)) return error.InvalidSqlSpill;
             const encoded = try owned.alloc(u8, @intCast(len));
-            try self.file.readRaw(self.read_offset + header.len, encoded);
+            try file.readRaw(self.read_offset + header.len, encoded);
             const payload = if (header[16] != 0) blk: {
-                if (try snappy.decodedLen(encoded) > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
+                if (try snappy.decodedLen(encoded) > file.manager.max_record_bytes) return error.InvalidSqlSpill;
                 break :blk try snappy.decode(owned, encoded);
             } else encoded;
             if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
-            var decoder: Decoder = .{ .manager = self.file.manager, .a = owned, .bytes = payload };
+            var decoder: Decoder = .{ .manager = file.manager, .a = owned, .bytes = payload };
             const count = try decoder.count();
             const width = try decoder.count();
             const key_width = try decoder.count();
-            if (count == 0 or count > 256 or count > self.size - offset or width > 1024 or key_width > 256) return error.InvalidSqlSpill;
+            if (count == 0 or count > 256 or count > size - offset or width > 1024 or key_width > 256) return error.InvalidSqlSpill;
             const rows = try owned.alloc(Row, count);
             for (rows) |*row| row.* = .{ .ordinal = try decoder.word(), .values = try owned.alloc(Datum, width), .keys = try owned.alloc(Datum, key_width) };
             try decodeColumns(&decoder, rows, false);

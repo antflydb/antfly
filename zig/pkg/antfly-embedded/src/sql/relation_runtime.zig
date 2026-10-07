@@ -24,6 +24,7 @@ const describe = @import("describe.zig");
 const Datum = scalar.Datum;
 const Allocator = std.mem.Allocator;
 const Worklist = @import("recursive_worklist.zig").Worklist;
+const Replay = @import("replay_rows.zig").Replay;
 
 fn dependsOn(node: *const binding.Node, id: usize) bool {
     return switch (node.operation) {
@@ -60,6 +61,63 @@ const SetTestBackend = struct {
         return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
     }
 };
+
+test "SQL materialized relation replay spills once and shares a single statement capture" {
+    const Fixture = struct {
+        offset: usize = 0,
+        captures: usize = 0,
+        closes: usize = 0,
+        cursors: [1]catalog.Cursor = undefined,
+        const count = 4096;
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
+        }
+        fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const length = @min(@as(usize, limit), count - self.offset);
+            const rows = try a.alloc(catalog.Row, length);
+            for (rows, 0..) |*row, i| {
+                var object: std.json.ObjectMap = .empty;
+                try object.put(a, "n", .{ .integer = @intCast(self.offset + i) });
+                row.* = .{ .id = "row", .version = 1, .value = .{ .object = object } };
+            }
+            self.offset += length;
+            return .{ .rows = rows, .after = if (self.offset == count) null else "more" };
+        }
+        fn capture(raw: *anyopaque, _: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), scans.len);
+            self.captures += 1;
+            self.cursors[0] = .{ .ptr = self, .next = next, .close = undefined };
+            return .{ .ptr = self, .cursors = &self.cursors, .close = close };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |to_disk| {
+        var fixture: Fixture = .{};
+        var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.checkpoint };
+        defer manager.deinit();
+        const backend: catalog.Backend = .{ .ptr = &fixture, .spill_manager = if (to_disk) &manager else null, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint, .open_statement = Fixture.capture } };
+        var compiled = try @import("compiler.zig").compile(a, "WITH cached AS MATERIALIZED (SELECT n FROM items) SELECT count(*) FROM cached a JOIN cached b ON a.n=b.n", .{});
+        defer compiled.deinit();
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 16384 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("4096", result.output.rows[0][0].string);
+        try std.testing.expectEqual(@as(usize, 1), fixture.captures);
+        try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+        try std.testing.expectEqual(@as(usize, Fixture.count), fixture.offset);
+        try std.testing.expectEqual(to_disk, manager.written_bytes > 0);
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+        try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+        std.debug.print("SQL materialized replay: input_rows=4096 captures=1 peak_memory={} spill_written={} elapsed_ns={}\n", .{ result.peakMemoryBytes(), manager.written_bytes, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+    }
+}
 
 test "SQL set operations preserve multiplicities precedence and output ordering" {
     const runtime = @import("runtime.zig");
@@ -174,7 +232,7 @@ fn Engine(comptime Context: type) type {
         visited: usize = 0,
         work: usize = 0,
         cache_arena: std.heap.ArenaAllocator,
-        static_rows: std.AutoHashMapUnmanaged(*const binding.Node, []const []const Datum) = .empty,
+        static_rows: std.AutoHashMapUnmanaged(*const binding.Node, *Replay) = .empty,
         static_hashes: std.AutoHashMapUnmanaged(*const binding.Node, *operators.HashJoin) = .empty,
         recursions: [32]?*Worklist = @splat(null),
 
@@ -188,27 +246,31 @@ fn Engine(comptime Context: type) type {
             for (self.recursions) |optional| if (optional) |worklist| worklist.deinit();
             var hashes = self.static_hashes.valueIterator();
             while (hashes.next()) |join| join.*.deinit();
+            var rows = self.static_rows.valueIterator();
+            while (rows.next()) |replay| replay.*.deinit();
             self.cache_arena.deinit();
         }
 
-        fn staticRows(self: *Self, node: *const binding.Node) anyerror![]const []const Datum {
+        fn staticRows(self: *Self, node: *const binding.Node) anyerror!*Replay {
             if (self.static_rows.get(node)) |rows| return rows;
             const owned = self.cache_arena.allocator();
+            // Reserve room for consuming operators when spill is available;
+            // memory-only backends retain their full statement admission.
+            const memory_bytes = if (self.context.spill != null) self.context.limits.retained_bytes / 16 else self.context.limits.retained_bytes;
+            const replay = try Replay.create(self.context.alloc, node.columns.len, memory_bytes, self.context.spill);
+            errdefer replay.deinit();
             const iterator = try Iterator.create(self, node);
             defer iterator.deinit();
             var scratch = std.heap.ArenaAllocator.init(self.context.alloc);
             defer scratch.deinit();
-            var rows: std.ArrayList([]const Datum) = .empty;
             while (try iterator.next(scratch.allocator())) |values| {
-                if (rows.items.len >= self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
-                const cells = try owned.alloc(Datum, values.len);
-                for (values, cells) |value, *out| out.* = try operators.cloneDatum(owned, value);
-                try rows.append(owned, cells);
+                if (replay.count >= self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                try replay.append(values);
                 _ = scratch.reset(.free_all);
             }
-            const result = try rows.toOwnedSlice(owned);
-            try self.static_rows.put(owned, node, result);
-            return result;
+            try replay.finish();
+            try self.static_rows.put(owned, node, replay);
+            return replay;
         }
 
         fn recursive(self: *Self, node: *const binding.Node) anyerror!*Worklist {
@@ -327,7 +389,7 @@ fn Engine(comptime Context: type) type {
             values_leaf: ?*Iterator = null,
             values_leaf_coerce: bool = false,
             recursive_id: ?usize = null,
-            cached_rows: ?[]const []const Datum = null,
+            cached_reader: ?*Replay.Reader = null,
             borrowed_hash: bool = false,
             flipped_join: bool = false,
 
@@ -342,11 +404,11 @@ fn Engine(comptime Context: type) type {
                 self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id };
                 errdefer self.deinit();
                 if (recursive_id) |id| if (!dependsOn(node, id)) {
-                    self.cached_rows = try engine.staticRows(node);
+                    self.cached_reader = try (try engine.staticRows(node)).openReader();
                     return self;
                 };
                 switch (node.operation) {
-                    .materialized_ref => |source| self.cached_rows = try engine.staticRows(source),
+                    .materialized_ref => |source| self.cached_reader = try (try engine.staticRows(source)).openReader(),
                     .join => |join| {
                         // Always probe the delta and build the invariant side.
                         // Keep output ordinals in the original SQL FROM order.
@@ -365,6 +427,7 @@ fn Engine(comptime Context: type) type {
                 return self;
             }
             pub fn deinit(self: *Iterator) void {
+                if (self.cached_reader) |reader| reader.close();
                 if (self.result_cursor) |cursor| cursor.close();
                 if (self.page) |page| page.deinit();
                 if (self.left) |left| left.deinit();
@@ -380,7 +443,7 @@ fn Engine(comptime Context: type) type {
             }
             fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
                 try self.engine.checkpoint();
-                if (self.cached_rows == null and self.left != null and self.node.operation == .query) {
+                if (self.cached_reader == null and self.left != null and self.node.operation == .query) {
                     const query = self.node.operation.query;
                     const decisions = @import("decision_eval.zig");
                     const eligible = blk: {
@@ -391,7 +454,7 @@ fn Engine(comptime Context: type) type {
                     };
                     if (eligible) return self.nextQueryBatch(a, maximum, query, failure);
                 }
-                if (self.cached_rows == null and self.node.operation == .scan) {
+                if (self.cached_reader == null and self.node.operation == .scan) {
                     const scan = self.node.operation.scan;
                     const cursor = self.engine.cursors[scan.index];
                     if (cursor.next_columns) |pull| {
@@ -433,12 +496,7 @@ fn Engine(comptime Context: type) type {
             }
             fn next(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
                 try self.engine.checkpoint();
-                if (self.cached_rows) |rows| {
-                    if (self.output_index == rows.len) return null;
-                    const row = rows[self.output_index];
-                    self.output_index += 1;
-                    return row;
-                }
+                if (self.cached_reader) |reader| return reader.next();
                 return switch (self.node.operation) {
                     .materialized_ref => unreachable,
                     .recursive => blk: {
