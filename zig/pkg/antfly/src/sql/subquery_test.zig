@@ -73,6 +73,18 @@ test "SQL masked Apply preserves PostgreSQL conditional subquery demand and NULL
     }
 }
 
+test "SQL scalar cardinality NULL limits retain unbounded result admission" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, parameters: []const std.json.Value = &.{} }{
+        .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o LIMIT NULL" },
+        .{ .sql = "SELECT x FROM (SELECT 1 AS x UNION ALL SELECT 2) o LIMIT $1", .parameters = &.{.null} },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlResultTooLarge, runtime.execute(std.testing.allocator, backend.backend(), &compiled, case.parameters, .{ .result_rows = 1 }));
+    }
+}
+
 test "SQL nested join buffers own borrowed text and JSON across upstream pulls" {
     const Fixture = struct {
         const Owner = @This();

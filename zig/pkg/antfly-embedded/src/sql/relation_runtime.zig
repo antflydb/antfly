@@ -373,7 +373,7 @@ fn Engine(comptime Context: type) type {
                 .query => |query| blk: {
                     const source = self.estimate(query.source);
                     if (query.statement.limit) |limit| {
-                        const count = self.context.count(limit, 0) catch break :blk source;
+                        const count = query.statement.capRows(self.context.count(limit, std.math.maxInt(usize)) catch break :blk source);
                         break :blk if (source) |rows| @min(rows, count) else count;
                     }
                     break :blk source;
@@ -383,7 +383,14 @@ fn Engine(comptime Context: type) type {
             };
         }
         fn preferLeftBuild(self: *Self, left: *const binding.Node, right: *const binding.Node) bool {
-            if (self.estimate(left)) |l| if (self.estimate(right)) |r| return l < r;
+            if (self.estimate(left)) |l| {
+                if (self.estimate(right)) |r| return l < r;
+                // A compiler-owned singleton/constant frame is a bounded
+                // build even when a physical source has no row estimate.
+                // Building the unknown side would eagerly consume the entire
+                // source before a scalar/EXISTS/LIMIT consumer can stop it.
+                if (l <= 1) return true;
+            }
             // Compressed source bytes are a secondary estimate, used only when
             // neither side provides snapshot-local cardinality information.
             if (left.operation == .scan and right.operation == .scan) {
@@ -438,6 +445,7 @@ fn Engine(comptime Context: type) type {
             values_leaf_coerce: bool = false,
             recursive_id: ?usize = null,
             apply_mode: bool = false,
+            batch_demand: ?usize = null,
             cached_reader: ?*Replay.Reader = null,
             borrowed_hash: bool = false,
             flipped_join: bool = false,
@@ -500,6 +508,9 @@ fn Engine(comptime Context: type) type {
                 self.engine.context.alloc.destroy(self);
             }
             fn nextBatch(self: *Iterator, a: Allocator, maximum: usize, failure: ?*?anyerror) anyerror!@import("execution_batch.zig").Batch {
+                const previous_demand = self.batch_demand;
+                self.batch_demand = if (previous_demand) |prior| @min(prior, maximum) else maximum;
+                defer self.batch_demand = previous_demand;
                 try self.engine.checkpoint();
                 if (self.cached_reader == null and self.left != null and self.node.operation == .query) {
                     const query = self.node.operation.query;
@@ -792,7 +803,7 @@ fn Engine(comptime Context: type) type {
                     for (query.statement.columns, fields) |column, *field| field.* = if (column.expression != null) "" else column.field;
                     self.query_fields = fields;
                     self.query_skip = try context.count(query.statement.offset, 0);
-                    self.query_remaining = try context.count(query.statement.limit, std.math.maxInt(usize));
+                    self.query_remaining = query.statement.capRows(try context.count(query.statement.limit, std.math.maxInt(usize)));
                 }
                 while (self.query_remaining != 0) {
                     _ = self.scratch.reset(.free_all);
@@ -899,7 +910,7 @@ fn Engine(comptime Context: type) type {
                     for (query.statement.columns, fields) |column, *field| field.* = if (column.expression != null) "" else column.field;
                     self.query_fields = fields;
                     self.query_skip = try context.count(query.statement.offset, 0);
-                    self.query_remaining = try context.count(query.statement.limit, std.math.maxInt(usize));
+                    self.query_remaining = query.statement.capRows(try context.count(query.statement.limit, std.math.maxInt(usize)));
                 }
                 if (self.query_remaining == 0) return null;
                 while (self.query_buffer_index == self.query_buffer.len) {
@@ -1123,7 +1134,7 @@ fn Engine(comptime Context: type) type {
                 if (self.probe_source_exhausted) return false;
                 _ = self.probe_arena.reset(.free_all);
                 const a = self.probe_arena.allocator();
-                const count = @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.left.?.node.columns.len * @sizeOf(Datum) * 16)));
+                const count = @min(self.batch_demand orelse std.math.maxInt(usize), @min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.left.?.node.columns.len * @sizeOf(Datum) * 16))));
                 self.probe_payload = self.left.?.nextBatch(a, count, &self.probe_input_error) catch |err| blk: {
                     self.probe_input_error = err;
                     break :blk .{ .rows = &.{} };

@@ -378,8 +378,14 @@ const Builder = struct {
     }
 
     fn inferShape(self: *Builder, statement: ast.Select, expected: []const ast.ColumnType) !void {
-        const root = try self.querySource(statement, &.{}, 0);
-        const expressions = try self.constrainSelect(root, try self.lower(root, statement));
+        // RETURNING/assignment inference enters directly, before describe's
+        // ordinary SELECT normalization. Use the same relational boundary so
+        // parameters inside scalar children (including LIMIT) are constrained
+        // in their own domain instead of compiling $scalar as a scalar builtin.
+        const subqueries = @import("subquery_lowering.zig");
+        const normalized = if (subqueries.accepts(statement)) try subqueries.lower(self.alloc, statement) else statement;
+        const root = try self.querySource(normalized, &.{}, 0);
+        const expressions = try self.constrainSelect(root, try self.lower(root, normalized));
         if (expected.len != 0) {
             if (expressions.len != expected.len) return error.InvalidSqlParameters;
             for (expressions, expected) |expression_, kind| try self.constraints.append(self.alloc, .{ .expression = expression_, .expected = kind });

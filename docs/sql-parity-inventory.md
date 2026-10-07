@@ -411,7 +411,7 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 45 result contracts and eleven error
+The shared PostgreSQL/native fixture checks 49 result contracts and twelve error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused
@@ -443,10 +443,31 @@ non-equality predicates. Catalog-bound aggregate-level admission rejects
 outer-owned aggregates until their enclosing-query lifting is implemented;
 PostgreSQL reference tests record the required single outer result, and native
 tests reject incorrect per-parent execution before capture. Global aggregates
-that project outer constants, second-row streaming cardinality cutoff,
+that project outer constants,
 post-group output demand, top-level LIMIT demand and distributed concurrent
 snapshot correctness still need separate work. No original inventory
 disposition is changed by these shared-operator fixtures.
+
+Scalar producers now apply a compiler-owned two-row result bound after validating
+the original LIMIT. Literal/parameter limits, NULL, OFFSET, grouping, ordering,
+windows and buffered/streaming relation paths share that bound. Query shape
+inference normalizes scalar children before constraining their parameters;
+RETURNING's child LIMIT no longer reaches the scalar-function binder as `$scalar`.
+NULL LIMIT retains unbounded admission for ordinary result sets instead of
+silently truncating at the configured result quota, and NULL OFFSET means zero.
+
+Probe batches retain their caller's demand, and a known one-row frame builds
+against an unestimated input rather than eagerly building that entire source.
+A native 4,096-target mutation with a million-row scalar limit reads exactly two
+source rows, reports cardinality error, closes one captured read and publishes
+no mutations. A direct scalar read against an unestimated million-row source
+also reads exactly two rows. Separate PostgreSQL/native regressions check that a later value
+error is not exposed after two valid scalar rows. Value programs stay inside
+their correlated demand instead of being eagerly evaluated for unused groups;
+safe column/literal equality decorrelation retains its grouped fast path.
+This is not a claim that sorts, aggregates or windows can skip input required
+by their own semantics. Post-sort projection demand, cross-level aggregate
+lifting and output staging remain separate unfinished work.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

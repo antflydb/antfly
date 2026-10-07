@@ -1143,8 +1143,8 @@ const Parser = struct {
         const result = try self.value();
         switch (result) {
             .integer => |v| if (v < 0) return self.fail(error.InvalidSqlSyntax, "row bound must be nonnegative"),
-            .parameter => {},
-            else => return self.fail(error.InvalidSqlSyntax, "row bound must be an integer or parameter"),
+            .parameter, .null => {},
+            else => return self.fail(error.InvalidSqlSyntax, "row bound must be an integer, NULL or parameter"),
         }
         return result;
     }

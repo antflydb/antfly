@@ -516,8 +516,8 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_conditional_subquery_reference.json"
             ).read_text()
         )
-        self.assertEqual(45, len(fixture["entries"]))
-        self.assertEqual(11, len(fixture["errors"]))
+        self.assertEqual(49, len(fixture["entries"]))
+        self.assertEqual(12, len(fixture["errors"]))
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 self.assertEqual(
@@ -530,6 +530,41 @@ class PostgresReferenceTest(unittest.TestCase):
                     with self.db.transaction(force_rollback=True):
                         self.db.execute(case["sql"]).fetchall()
                 self.assertEqual(case["code"], error.exception.sqlstate)
+
+    def test_scalar_cardinality_stops_before_third_row_value_errors(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE scalar_cardinality_source(delta bigint)")
+            self.db.execute(
+                "INSERT INTO scalar_cardinality_source VALUES (10),(20),(30)"
+            )
+            for suffix, parameters in [
+                ("", []),
+                (" LIMIT 1000", []),
+                (" LIMIT $1", [1000]),
+                (" LIMIT $1", [None]),
+            ]:
+                sql = (
+                    "SELECT (SELECT CASE WHEN delta=30 THEN 1/(delta-30) ELSE delta END "
+                    "FROM scalar_cardinality_source" + suffix + ")"
+                )
+                with self.subTest(suffix=suffix, parameters=parameters):
+                    with self.assertRaises(
+                        psycopg.errors.CardinalityViolation
+                    ) as error:
+                        with self.db.transaction(force_rollback=True):
+                            with psycopg.RawCursor(self.db) as cursor:
+                                cursor.execute(sql, parameters)
+                                cursor.fetchall()
+                    self.assertEqual("21000", error.exception.sqlstate)
+            self.assertEqual(
+                [(0,), (None,)],
+                self.db.execute(
+                    "SELECT (SELECT 1/(s.delta-20) FROM scalar_cardinality_source s WHERE s.delta=o.x) "
+                    "FROM (VALUES (10),(11)) o(x) ORDER BY o.x"
+                ).fetchall(),
+            )
 
     def test_correlated_aggregate_ownership_requires_outer_query_execution(self):
         # These are still native admission boundaries, not resolved parity

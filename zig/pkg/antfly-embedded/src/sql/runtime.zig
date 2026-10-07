@@ -327,8 +327,14 @@ pub const Context = struct {
     pub fn count(self: Context, input: ?ast.Value, default: usize) !usize {
         const node = input orelse return default;
         const parsed = try self.value(node, .{ .name = "limit", .path = "limit", .type = .integer });
+        if (parsed == .null) return default;
         if (parsed != .integer or parsed.integer < 0) return error.InvalidSqlLimit;
         return std.math.cast(usize, parsed.integer) orelse error.InvalidSqlLimit;
+    }
+
+    pub fn hasRowLimit(self: Context, input: ?ast.Value) !bool {
+        const value_ = input orelse return false;
+        return (try self.value(value_, .{ .name = "limit", .path = "limit", .type = .integer })) != .null;
     }
 
     const BoundPredicates = struct {
@@ -403,16 +409,19 @@ pub const Context = struct {
         if (output.terms.items.len > 256) return error.SqlProgramLimitExceeded;
     }
 
-    pub fn select(unscoped: Context, statement: ast.Select) anyerror!Output {
+    pub fn select(unscoped: Context, requested: ast.Select) anyerror!Output {
         var self = unscoped;
         self.backend = @import("decision_eval.zig").scopedBackend(self.backend, self.binding);
         try @import("decision_eval.zig").validateStatement(self.arena, self.backend.decision_provider, self.binding, self.parameters);
+        var statement = requested;
+        if (statement.limit != null and !try self.hasRowLimit(statement.limit))
+            statement.limit = if (statement.scalar_cardinality_limit) .{ .integer = 2 } else null;
         if (self.binding.relation != null) return @import("relation_runtime.zig").execute(self);
         if (self.binding.window != null) return @import("window_runtime.zig").execute(self, statement);
         if (self.binding.aggregate != null) return @import("aggregate_runtime.zig").execute(self, statement);
         const table_def = self.binding.table orelse return self.constantSelect(statement);
         const predicates = try self.conditions(table_def, statement.predicate);
-        const limit = try self.count(statement.limit, self.limits.result_rows);
+        const limit = statement.capRows(try self.count(statement.limit, self.limits.result_rows));
         const offset = try self.count(statement.offset, 0);
         if (limit > self.limits.result_rows or offset > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
         var fields: std.ArrayList([]const u8) = .empty;
@@ -720,7 +729,7 @@ pub const Context = struct {
     }
 
     fn constantSelect(self: Context, statement: ast.Select) !Output {
-        const limit = try self.count(statement.limit, self.limits.result_rows);
+        const limit = statement.capRows(try self.count(statement.limit, self.limits.result_rows));
         const offset = try self.count(statement.offset, 0);
         if (limit > self.limits.result_rows or offset > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
         const columns = self.binding.columns;

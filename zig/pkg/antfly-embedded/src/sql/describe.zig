@@ -497,6 +497,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
     for ([_]?ast.Value{ statement.limit, statement.offset }) |optional| if (optional) |node| {
         switch (node) {
             .integer => |integer| if (integer < 0) return error.InvalidSqlLimit,
+            .null => {},
             .parameter => |slot| {
                 if (slot == 0 or slot > parameters.len) return error.InvalidSqlParameters;
                 if (parameters[slot - 1]) |kind| if (kind != .integer) return error.ConflictingSqlParameterTypes;
@@ -606,6 +607,7 @@ const Context = struct {
         try self.value(node, .{ .name = "limit", .path = "limit", .type = .integer }, false);
         switch (node) {
             .integer => |value_| if (value_ < 0) return error.InvalidSqlLimit,
+            .null => {},
             .parameter => {},
             else => return error.InvalidSqlLimit,
         }

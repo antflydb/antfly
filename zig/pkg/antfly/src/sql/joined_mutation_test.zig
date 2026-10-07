@@ -409,6 +409,62 @@ test "SQL masked Apply correlated producers reuse captured inputs under mixed de
     }
 }
 
+test "SQL scalar cardinality stops before later value errors and never commits" {
+    for ([_]struct { sql: []const u8, parameters: []const std.json.Value = &.{} }{
+        .{ .sql = "UPDATE target SET cold='new' RETURNING (SELECT CASE WHEN delta=30 THEN 1/(delta-30) ELSE delta END FROM source LIMIT 1000)" },
+        .{ .sql = "UPDATE target SET cold='new' RETURNING CASE WHEN TRUE THEN (SELECT CASE WHEN delta=30 THEN 1/(delta-30) ELSE delta END FROM source) ELSE 0 END" },
+        .{ .sql = "UPDATE target SET cold='new' RETURNING (SELECT CASE WHEN delta=30 THEN 1/(delta-30) ELSE delta END FROM source LIMIT $1)", .parameters = &.{.{ .integer = 1000 }} },
+        .{ .sql = "UPDATE target SET cold='new' RETURNING (SELECT CASE WHEN delta=30 THEN 1/(delta-30) ELSE delta END FROM source LIMIT $1)", .parameters = &.{.null} },
+    }) |case| {
+        var backend: Backend = .{ .returning_mode = true, .row_count = 3 };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &compiled, case.parameters, .{ .page_rows = 2 }));
+        try std.testing.expectEqual(@as(usize, 5), backend.rows_read);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+}
+
+test "SQL scalar cardinality value programs run only for demanded correlation matches" {
+    var backend: Backend = .{ .returning_mode = true };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=n+9,cold='new' RETURNING n,(SELECT 1/(s.delta-20) FROM source s WHERE s.delta=t.n)", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+    try std.testing.expectEqualStrings("0", result.output.rows[0][1].string);
+    try std.testing.expect(result.output.sql_nulls.?[1][1]);
+    try std.testing.expectEqual(@as(usize, 4), backend.rows_read);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.closes);
+    try std.testing.expectEqual(@as(usize, 1), backend.commits);
+}
+
+test "SQL scalar cardinality bounds million-row requests by actual demand" {
+    const count = 4096;
+    var backend: Backend = .{ .returning_mode = true, .row_count = count };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET cold='new' RETURNING (SELECT delta FROM source LIMIT $1)", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .integer = 1_000_000 }}, .{ .page_rows = 2, .result_rows = count }));
+    try std.testing.expectEqual(@as(usize, count + 2), backend.rows_read);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.closes);
+    try std.testing.expectEqual(@as(usize, 0), backend.commits);
+}
+
+test "SQL scalar cardinality reads two rows from an unestimated million-row source" {
+    var backend: Backend = .{ .returning_mode = true, .row_count = 1_000_000 };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT delta FROM source LIMIT $1)", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .integer = 1_000_000 }}, .{ .page_rows = 2 }));
+    try std.testing.expectEqual(@as(usize, 2), backend.rows_read);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.closes);
+    try std.testing.expectEqual(@as(usize, 0), backend.commits);
+}
+
 test "SQL bounded scalar producers retain one capture and reusable correlation builds" {
     const count = 512;
     for ([_][]const u8{
@@ -443,9 +499,9 @@ test "SQL masked Apply unwinds allocation faults across demanded and bypassed pr
             defer {
                 if (backend.captures != backend.closes) @panic("masked Apply capture leaked");
             }
-            var compiled = try compiler.compile(a, "UPDATE target t SET n=n+9,cold='new' RETURNING n,CASE WHEN n=10 THEN (SELECT delta FROM source s WHERE s.delta=t.n ORDER BY s.delta DESC LIMIT 1) ELSE -1 END", .{});
+            var compiled = try compiler.compile(a, "UPDATE target t SET n=n+9,cold='new' RETURNING n,CASE WHEN n=10 THEN (SELECT delta FROM source s WHERE s.delta=t.n ORDER BY s.delta DESC LIMIT $1) ELSE -1 END", .{});
             defer compiled.deinit();
-            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{.{ .integer = 1 }}, .{});
             defer result.deinit();
             try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
             try std.testing.expectEqual(@as(usize, 1), backend.commits);

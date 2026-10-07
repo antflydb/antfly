@@ -107,6 +107,13 @@ pub const Select = struct {
     order_aliases_expanded: bool = false,
     limit: ?Value = null,
     offset: ?Value = null,
+    /// Compiler-only scalar-query demand, applied after validating the user's
+    /// LIMIT and after the child's ordering/OFFSET/grouping semantics.
+    scalar_cardinality_limit: bool = false,
+
+    pub fn capRows(self: Select, requested: usize) usize {
+        return if (self.scalar_cardinality_limit) @min(requested, 2) else requested;
+    }
 };
 pub const NamedWindow = struct { name: []const u8, window: Window };
 pub const SetKind = enum { @"union", intersect, except };

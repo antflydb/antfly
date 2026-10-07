@@ -45,7 +45,11 @@
     {"sql": "SELECT (SELECT SUM(i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x GROUP BY i.k) FROM (SELECT 1 AS x) o", "rows": [2]},
     {"sql": "SELECT (SELECT ROW_NUMBER() OVER (ORDER BY i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x) FROM (SELECT 1 AS x) o", "rows": [1]},
     {"sql": "SELECT (SELECT x+1) FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", "rows": [2,3]},
-    {"sql": "SELECT (SELECT o.x) FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", "rows": [1,2]}
+    {"sql": "SELECT (SELECT o.x) FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", "rows": [1,2]},
+    {"sql": "SELECT 1 LIMIT NULL", "rows": [1]},
+    {"sql": "SELECT o.x FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x LIMIT NULL OFFSET NULL", "rows": [1,2]},
+    {"sql": "SELECT (SELECT i.x FROM (SELECT 1 AS x UNION ALL SELECT 2) i ORDER BY i.x LIMIT 1 OFFSET NULL)", "rows": [1]},
+    {"sql": "SELECT (SELECT i.x FROM (SELECT 1 AS x) i LIMIT NULL)", "rows": [1]}
   ],
   "errors": [
     {"sql": "SELECT CASE WHEN TRUE THEN (SELECT 1 UNION ALL SELECT 2) ELSE 7 END", "code": "21000"},
@@ -58,6 +62,7 @@
     {"sql": "SELECT SUM((SELECT 1 UNION ALL SELECT 2)) FILTER (WHERE TRUE)", "code": "21000"},
     {"sql": "SELECT SUM((SELECT 1)) FILTER (WHERE (SELECT TRUE UNION ALL SELECT FALSE))", "code": "21000"},
     {"sql": "SELECT (SELECT i.y FROM (SELECT 1 AS y UNION ALL SELECT 2) i WHERE i.y>=o.x ORDER BY i.y LIMIT 2) FROM (SELECT 1 AS x) o", "code": "21000"},
-    {"sql": "SELECT (SELECT i.y FROM (SELECT 1 AS y,2 AS z UNION ALL SELECT 2,3) i GROUP BY i.z HAVING i.z=o.x) FROM (SELECT 2 AS x) o", "code": "42803"}
+    {"sql": "SELECT (SELECT i.y FROM (SELECT 1 AS y,2 AS z UNION ALL SELECT 2,3) i GROUP BY i.z HAVING i.z=o.x) FROM (SELECT 2 AS x) o", "code": "42803"},
+    {"sql": "SELECT (SELECT i.x FROM (SELECT 1 AS x UNION ALL SELECT 2) i LIMIT NULL)", "code": "21000"}
   ]
 }

@@ -771,9 +771,15 @@ const Builder = struct {
         self.serial += 1;
         if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
         try self.outer.put(self.alloc, alias, {});
+        const bounded = try self.alloc.create(ast.Select);
+        bounded.* = original.*;
+        bounded.scalar_cardinality_limit = true;
+        // An explicit internal bound also disables ordinary unbounded-result
+        // overflow sentinels. Parameter limits are validated before capping.
+        if (bounded.limit == null) bounded.limit = .{ .integer = 2 };
         const query = try self.alloc.create(ast.Select);
         query.* = .{
-            .source = try self.relation(.{ .derived = .{ .query = original, .alias = "$scalar_input", .columns = &.{"$value"} } }),
+            .source = try self.relation(.{ .derived = .{ .query = bounded, .alias = "$scalar_input", .columns = &.{"$value"} } }),
             .columns = try self.alloc.dupe(ast.Projection, &.{
                 .{ .alias = "$count", .expression = try self.scalar(.{ .call = .{ .name = "count", .args = &.{}, .star = true } }) },
                 .{ .alias = "$value", .expression = try self.call("min", &.{try self.field("$scalar_input", "$value")}) },
@@ -794,12 +800,16 @@ const Builder = struct {
 
     fn scalarNeedsApply(self: *Builder, query: ast.Select) !bool {
         if (scalarBoundary(query)) return true;
+        if (query.predicate == null and (query.source != null or query.table != null)) return true;
         var local: Names = .empty;
         if (query.source) |source| try aliases(self.alloc, source, &local) else if (query.table) |table| try local.put(self.alloc, table.table, {});
         for (query.columns) |projection| {
             if (projection.wildcard) continue;
             const value = projection.expression orelse try self.scalar(.{ .column = projection.field });
             if (self.referencesOuter(value, local)) return true;
+            // Value programs can fail or call a provider. Do not evaluate
+            // unused groups/rows through an eager MIN summary before demand.
+            if (value.* != .column and value.* != .literal) return true;
             // A source-free child has no local columns. Resolve any names in
             // its actual outer frame, including unqualified references, rather
             // than treating them as inputs to an uncorrelated aggregate.

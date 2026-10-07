@@ -532,8 +532,9 @@ pub const Stream = struct {
         }
         self.fields = fields.items;
         self.skip = try self.context.count(statement.offset, 0);
-        self.remaining = try self.context.count(statement.limit, std.math.maxInt(usize));
-        if (self.skip > limits.scan_rows or (statement.limit != null and self.remaining > limits.scan_rows)) return error.SqlProgramLimitExceeded;
+        self.remaining = statement.capRows(try self.context.count(statement.limit, std.math.maxInt(usize)));
+        const explicit_limit = try self.context.hasRowLimit(statement.limit);
+        if (self.skip > limits.scan_rows or (explicit_limit and self.remaining > limits.scan_rows)) return error.SqlProgramLimitExceeded;
         self.after = null;
         self.visited = 0;
         self.pages = 0;
