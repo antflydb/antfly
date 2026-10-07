@@ -678,6 +678,17 @@ fn forwardImpl(
         null;
     defer if (row_segments) |rows| rows.deinit(allocator);
 
+    // One request-owned position upload, retained across all encoder layers.
+    // No cross-request cache or new synchronization boundary is introduced.
+    const fusion_positions: ?CT = if (cb.kind() == .metal and !config.rope_interleaved and
+        config.checkpoint_layout == .huggingface_fused_qkv_no_bias and
+        !@import("antfly_platform").env.getenvBool("TERMITE_METAL_DISABLE_GLINER_QKV_ROPE"))
+    blk: {
+        const rows = row_segments orelse break :blk null;
+        break :blk try cb.fromInt32Shape(rows.positions, &.{@intCast(rows.tokens)});
+    } else null;
+    defer if (fusion_positions) |positions| cb.free(positions);
+
     var hidden = if (row_segments) |rows|
         try embeddingsBlock(cb, config, zero_bias, rows.ids, rows.tokens, resident_slots)
     else
@@ -704,6 +715,7 @@ fn forwardImpl(
             branches,
             capture,
             row_segments,
+            fusion_positions,
         );
         cb.free(hidden);
         hidden = new_hidden;
@@ -805,6 +817,7 @@ fn encoderLayer(
     branches: ?Branches,
     capture: ?Capture,
     row_segments: ?RowSegments,
+    fusion_positions: ?CT,
 ) !CT {
     const H: usize = @intCast(config.hidden_size);
     const num_heads: usize = @intCast(config.num_attention_heads);
@@ -846,6 +859,8 @@ fn encoderLayer(
         total,
         H,
         if (resident_slots) modernBertLinearSlot(layer_idx, .qkv) else null,
+        fusion_positions,
+        rope_theta,
         &name_buf,
     );
     defer cb.free(qkv.q);
@@ -856,16 +871,16 @@ fn encoderLayer(
     // split-half rotation; the legacy checkpoint retains interleaved pairs.
     // rope_dim == head_dim: the full head dimension is rotated.
     const rope_positions: ?[]const i64 = if (packed_row) |row| row.positions else if (row_segments) |rows| rows.rope_positions else null;
-    const Q = if (rope_positions) |positions|
+    const Q = if (qkv.rotated) qkv.q else if (rope_positions) |positions|
         try ropeAtPositions(cb, allocator, qkv.q, positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
     else
         try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
-    defer cb.free(Q);
-    const K = if (rope_positions) |positions|
+    defer if (!qkv.rotated) cb.free(Q);
+    const K = if (qkv.rotated) qkv.k else if (rope_positions) |positions|
         try ropeAtPositions(cb, allocator, qkv.k, positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
     else
         try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
-    defer cb.free(K);
+    defer if (!qkv.rotated) cb.free(K);
 
     if (capture) |c| try captureLayer(cb, allocator, c.keys, c.values, c.key_tensors, c.value_tensors, layer_idx, K, qkv.v, total, H);
     var joined: [2]?CT = .{ null, null };
@@ -932,7 +947,15 @@ fn encoderLayer(
 
     // Residual: add the projected attention output to the *original* (pre-norm)
     // hidden state — pre-norm residual pattern.
-    const hidden_after_attn = try cb.add(attn_proj, hidden);
+    const mlp_ln_w = try getLayerWeight(cb, layer_idx, "mlp_norm.weight", &name_buf);
+    defer cb.free(mlp_ln_w);
+    const mlp_ln_b = if (zero_bias) |bias| bias else try getLayerWeight(cb, layer_idx, "mlp_norm.bias", &name_buf);
+    defer if (zero_bias == null) cb.free(mlp_ln_b);
+    const fused_norm = if (cb.kind() == .metal)
+        try cb.addLayerNormSumCentered(attn_proj, hidden, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps)
+    else
+        null;
+    const hidden_after_attn = if (fused_norm) |fused| fused.sum else try cb.add(attn_proj, hidden);
     defer cb.free(hidden_after_attn);
 
     // -----------------------------------------------------------------------
@@ -940,17 +963,12 @@ fn encoderLayer(
     // -----------------------------------------------------------------------
 
     // Pre-FFN LayerNorm
-    const mlp_ln_w = try getLayerWeight(cb, layer_idx, "mlp_norm.weight", &name_buf);
-    defer cb.free(mlp_ln_w);
-    const normed_ffn = if (try slottedLayerNorm(cb, hidden_after_attn, if (resident_slots) modernBertNormSlot(layer_idx, .mlp) else null, config)) |normed|
+    const normed_ffn = if (fused_norm) |fused| fused.normed else if (try slottedLayerNorm(cb, hidden_after_attn, if (resident_slots) modernBertNormSlot(layer_idx, .mlp) else null, config)) |normed|
         normed
     else if (zero_bias) |bias|
         try cb.layerNorm(hidden_after_attn, mlp_ln_w, bias, H, config.layer_norm_eps)
-    else blk: {
-        const mlp_ln_b = try getLayerWeight(cb, layer_idx, "mlp_norm.bias", &name_buf);
-        defer cb.free(mlp_ln_b);
-        break :blk try cb.layerNorm(hidden_after_attn, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps);
-    };
+    else
+        try cb.layerNorm(hidden_after_attn, mlp_ln_w, mlp_ln_b, H, config.layer_norm_eps);
     defer cb.free(normed_ffn);
 
     // GeGLU feed-forward (Wi and Wo both have no bias in ModernBERT's MLP)
@@ -981,6 +999,7 @@ const QkvProjection = struct {
     q: CT,
     k: CT,
     v: CT,
+    rotated: bool = false,
 };
 
 fn projectQkv(
@@ -991,6 +1010,8 @@ fn projectQkv(
     rows: usize,
     hidden_size: usize,
     slot: ?usize,
+    fusion_positions: ?CT,
+    rope_theta: f32,
     name_buf: *[256]u8,
 ) !QkvProjection {
     if (config.checkpoint_layout == .huggingface_fused_qkv_no_bias) {
@@ -1006,6 +1027,10 @@ fn projectQkv(
             slot,
         );
         defer cb.free(qkv);
+        if (fusion_positions) |positions| {
+            if (try cb.packedQkvRope(qkv, positions, hidden_size, hidden_size / config.num_attention_heads, rope_theta)) |fused|
+                return .{ .q = fused.first, .k = fused.second, .v = fused.third, .rotated = true };
+        }
         // Use direct slices instead of splitLastDim3: Metal's generic split
         // has a GLiNER-only device gate, while sliceLastDim is device-resident
         // for every dense [rows, columns] ModernBERT activation.

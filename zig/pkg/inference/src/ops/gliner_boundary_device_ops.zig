@@ -331,6 +331,10 @@ pub const Kind = enum(u32) {
     laya_decisions = 47,
     laya_exact_gelu = 48,
     laya_logits = 49,
+    /// Packed [rows, 3 * hidden] -> [3, rows, hidden], split-half Q/K RoPE.
+    packed_qkv_rope = 50,
+    /// Centered-variance norm(a+b), optionally followed by its residual sum.
+    add_norm_centered = 51,
 };
 
 pub const Params = extern struct {
@@ -386,6 +390,24 @@ pub fn layoutFor(kind: Kind, d: [8]u32, scalars: [4]f32) !Layout {
     var r = Layout{};
     for (scalars) |v| if (!std.math.isFinite(v)) return error.InvalidBoundaryDeviceShape;
     switch (kind) {
+        .packed_qkv_rope => { // rows, hidden, head_dim; explicit int32 positions
+            if (d[2] == 0 or d[1] % d[2] != 0 or d[2] % 2 != 0 or scalars[0] <= 0) return error.InvalidBoundaryDeviceShape;
+            r.output_elements = try shape(&.{ d[0], d[1], 3 });
+            r.input_elements[0] = r.output_elements;
+            r.input_elements[1] = d[0];
+            r.integer_inputs = 1 << 1;
+        },
+        .add_norm_centered => { // rows, hidden, retain_sum
+            if (d[2] > 1 or d[1] > 4096 or scalars[0] <= 0) return error.InvalidBoundaryDeviceShape;
+            const elements = try mul(d[0..2]);
+            r.input_elements[0] = elements;
+            r.input_elements[1] = elements;
+            r.input_elements[2] = d[1];
+            r.input_elements[3] = d[1];
+            r.output_elements = try shape(&.{ elements, @as(usize, d[2]) + 1 });
+            r.work_items = try shape(&.{ d[0], 32 });
+            r.simd_groups = true;
+        },
         .laya_qkv => { // rows,hidden,heads,sequence,part,rotate
             if (d[2] == 0 or d[1] % d[2] != 0 or (d[1] / d[2]) % 2 != 0 or d[3] == 0 or d[4] > 2 or d[5] > 1 or (d[5] == 1 and scalars[0] <= 0)) return error.InvalidBoundaryDeviceShape;
             r.output_elements = try mul(d[0..2]);

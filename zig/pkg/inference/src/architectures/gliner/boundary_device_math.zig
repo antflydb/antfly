@@ -540,6 +540,20 @@ pub const Context = struct {
         return self.kernel(.norm, &.{ rows, width }, &.{ input, w, b }, eps);
     }
 
+    pub fn addNormEps(self: *Context, input: CT, residual: CT, rows: usize, width: usize, prefix: []const u8, eps: f32) !CT {
+        if (self.resident_weights and self.encoder_precision == .f32 and self.cb.kind() == .metal and
+            !platform.env.getenvBool("TERMITE_METAL_DISABLE_GLINER_ADD_NORM"))
+        {
+            var name: [256]u8 = undefined;
+            const w = try self.weight(try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), &.{@intCast(width)});
+            const b = try self.weight(try std.fmt.bufPrint(&name, "{s}.bias", .{prefix}), &.{@intCast(width)});
+            return self.kernel(.add_norm_centered, &.{ rows, width, 0 }, &.{ input, residual, w, b }, eps);
+        }
+        const sum = try self.kernel(.add, &.{rows * width}, &.{ input, residual }, 0);
+        defer self.drop(sum);
+        return self.normEps(sum, rows, width, prefix, eps);
+    }
+
     fn validateDownload(self: *Context, tensor: CT, elements: usize, proposal: bool) !usize {
         try self.check();
         const nbytes = try bytes(elements);

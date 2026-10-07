@@ -23505,6 +23505,97 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(output);
     }
 
+    fn denseDeviceF32(input: CT) ?MetalTensor {
+        const buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(buf) or buf.lazy_multiply != null or buf.view_index_map != null or
+            buf.view_strides != null or buf.logical_view_strides != null or buf.view_base_offset != 0) return null;
+        const tensor = buf.metal_tensor orelse return null;
+        if (!tensor.isDevice() or tensor.dtype != .f32) return null;
+        return tensor;
+    }
+
+    fn ownedDeviceView(self: *MetalCompute, tensor: *const MetalTensor, offset: usize, bytes: usize, shape: []const i32) !CT {
+        var view = try tensor.retainedView(offset, bytes, shape);
+        errdefer view.deinit();
+        return self.ctFromOwnedMetalTensor(view);
+    }
+
+    fn packedQkvRopeOp(ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?ops.SplitLastDim3Result {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (getenvBool("TERMITE_METAL_DISABLE_GLINER_QKV_ROPE")) return null;
+        const source = denseDeviceF32(input) orelse return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        const position_buf = toBuf(positions);
+        const bounds = position_buf.resident_index_bounds orelse return null;
+        if (bounds.minimum < 0) return null;
+        const position_tensor = self.residentTrainingTensor(positions, .i32, .{}) catch |err| switch (err) {
+            error.ForeignResidentTrainingTensor, error.UnsupportedResidentTrainingPrimitive, error.ResidentTrainingRequiresDeviceTensor => return null,
+            else => return err,
+        };
+        const rows = position_tensor.elemCount();
+        if (rows == 0 or rows > std.math.maxInt(i32) or hidden > std.math.maxInt(i32) or head_dim > std.math.maxInt(i32)) return null;
+        const request = ops.gliner_boundary_device.Kernel{
+            .kind = .packed_qkv_rope,
+            .dims = .{ @intCast(rows), @intCast(hidden), @intCast(head_dim), 0, 0, 0, 0, 0 },
+            .scalars = .{ theta, 0, 0, 0 },
+        };
+        const layout = try request.layout();
+        if (source.elemCount() != layout.input_elements[0]) return null;
+        var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        inputs[0] = source;
+        inputs[1] = position_tensor;
+        const plane_bytes = rows * hidden * @sizeOf(f32);
+        var output = try MetalTensor.deviceAllocate(runtime, plane_bytes * 3, .private, &.{ 3, @intCast(rows), @intCast(hidden) });
+        defer output.deinit();
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output)) return error.MetalKernelDispatchFailed;
+        const shape = [_]i32{ @intCast(rows), @intCast(hidden) };
+        const q = try self.ownedDeviceView(&output, 0, plane_bytes, &shape);
+        errdefer freeOp(ctx, q);
+        const k = try self.ownedDeviceView(&output, plane_bytes, plane_bytes, &shape);
+        errdefer freeOp(ctx, k);
+        const v = try self.ownedDeviceView(&output, 2 * plane_bytes, plane_bytes, &shape);
+        return .{ .first = q, .second = k, .third = v };
+    }
+
+    fn addLayerNormSumCenteredOp(ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?ops.AddLayerNormSumResult {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (getenvBool("TERMITE_METAL_DISABLE_GLINER_ADD_NORM")) return null;
+        const left = denseDeviceF32(a) orelse return null;
+        const right = denseDeviceF32(b) orelse return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        if (dim == 0 or dim > 4096 or left.elemCount() == 0 or left.elemCount() % dim != 0 or left.elemCount() != right.elemCount()) return null;
+        const rows = left.elemCount() / dim;
+        if (rows > std.math.maxInt(i32)) return null;
+        if (bufHasAnyQuantizedStorage(toBuf(gamma)) or bufHasAnyQuantizedStorage(toBuf(beta))) return null;
+        if (bufElemCount(toBuf(gamma)) != dim or bufElemCount(toBuf(beta)) != dim) return null;
+        var weight = try self.ownedDeviceMetalTensorFromCt(gamma);
+        defer weight.deinit();
+        var bias = try self.ownedDeviceMetalTensorFromCt(beta);
+        defer bias.deinit();
+        const request = ops.gliner_boundary_device.Kernel{
+            .kind = .add_norm_centered,
+            .dims = .{ @intCast(rows), @intCast(dim), 1, 0, 0, 0, 0, 0 },
+            .scalars = .{ eps, 0, 0, 0 },
+        };
+        const layout = try request.layout();
+        var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        inputs[0] = left;
+        inputs[1] = right;
+        inputs[2] = weight;
+        inputs[3] = bias;
+        const bytes = left.elemCount() * @sizeOf(f32);
+        var output = try MetalTensor.deviceAllocate(runtime, layout.output_elements * 4, .private, &.{ 2, @intCast(rows), @intCast(dim) });
+        defer output.deinit();
+        if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output)) return error.MetalKernelDispatchFailed;
+        const shape = [_]i32{ @intCast(rows), @intCast(dim) };
+        const normed = try self.ownedDeviceView(&output, 0, bytes, &shape);
+        errdefer freeOp(ctx, normed);
+        const sum = try self.ownedDeviceView(&output, bytes, bytes, &shape);
+        return .{ .sum = sum, .normed = normed };
+    }
+
     fn packedGegluExactOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (rows == 0 or width == 0 or rows > std.math.maxInt(i32) or width > std.math.maxInt(i32)) return null;
@@ -31057,6 +31148,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.gelu = geluOp;
         vt.geluExact = geluExactOp;
         vt.packedGegluExact = packedGegluExactOp;
+        vt.packedQkvRope = packedQkvRopeOp;
+        vt.addLayerNormSumCentered = addLayerNormSumCenteredOp;
         vt.geluNew = geluNewOp;
         vt.relu = reluOp;
         vt.silu = siluOp;
@@ -40125,5 +40218,129 @@ test "metal_compute: segment attention matches the host reference across ranges,
                 return err;
             };
         }
+    }
+}
+
+test "metal GLiNER fused QKV RoPE matches separate split and rotations" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 1, 7, 40, 87, 198 }) |rows| {
+        const hidden: usize = if (rows == 7) 18 else 1792;
+        const head: usize = if (rows == 7) 6 else 64;
+        const data = try a.alloc(f32, rows * hidden * 3);
+        defer a.free(data);
+        for (data, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.13);
+        const positions = try a.alloc(i32, rows);
+        defer a.free(positions);
+        const axes = try a.alloc(u32, rows * 3);
+        defer a.free(axes);
+        for (positions, 0..) |*p, i| {
+            p.* = @intCast((i * 137) % 7999);
+            for (0..3) |axis| axes[axis * rows + i] = @intCast(p.*);
+        }
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ @intCast(rows), @intCast(hidden * 3) }));
+        defer cb.free(input);
+        const device_positions = (try cb.fromInt32Shape(positions, &.{@intCast(rows)})).?;
+        defer cb.free(device_positions);
+        // Both operations join the caller's frame; neither submits it.
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        errdefer cb.decoderRuntimeCancelFrame() catch {};
+        const submissions = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
+        const result = (try cb.packedQkvRope(input, device_positions, hidden, head, 160000)).?;
+        defer cb.free(result.first);
+        defer cb.free(result.second);
+        defer cb.free(result.third);
+        var reference: [3]CT = undefined;
+        for (&reference, 0..) |*target, part| {
+            const slice = try cb.sliceLastDim(input, part * hidden, (part + 1) * hidden);
+            if (part < 2) {
+                defer cb.free(slice);
+                target.* = (try cb.mrope(slice, rows, head, 160000, 1, axes, .{ @intCast(head / 2), 0, 0 })).?;
+            } else target.* = slice;
+        }
+        defer for (reference) |tensor| cb.free(tensor);
+        try std.testing.expect(cb.decoderRuntimeHasActiveFrame());
+        try std.testing.expectEqual(submissions, cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        for ([_]CT{ result.first, result.second, result.third }, reference, 0..) |actual, expected, part| {
+            const got = try cb.toFloat32(actual, a);
+            defer a.free(got);
+            const want = try cb.toFloat32(expected, a);
+            defer a.free(want);
+            for (got, want) |x, y| try std.testing.expectApproxEqAbs(y, x, @as(f32, if (part == 2) 0 else 2e-5));
+        }
+        positions[0] = -1;
+        const negative_positions = (try cb.fromInt32Shape(positions, &.{@intCast(rows)})).?;
+        defer cb.free(negative_positions);
+        try std.testing.expect(try cb.packedQkvRope(input, negative_positions, hidden, head, 160000) == null);
+    }
+}
+
+test "metal GLiNER centered residual norm preserves sum and low variance" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var store = testMetalWeightStoreInit(a);
+    defer deinitSharedNativeProvider(&store);
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 7, 64, 768, 1792 }) |hidden| {
+        const rows = 3;
+        const values = try a.alloc(f32, rows * hidden);
+        defer a.free(values);
+        const residual = try a.alloc(f32, rows * hidden);
+        defer a.free(residual);
+        const gamma = try a.alloc(f32, hidden);
+        defer a.free(gamma);
+        const beta = try a.alloc(f32, hidden);
+        defer a.free(beta);
+        for (gamma, beta, 0..) |*g, *b, i| {
+            g.* = 1 + @as(f32, @floatFromInt(i % 5)) * 0.1;
+            b.* = -0.2;
+        }
+        for (values, residual, 0..) |*v, *r, i| {
+            v.* = if (i / hidden == 1) 10000 + (if (i % 2 == 0) @as(f32, 0.25) else -0.25) else @sin(@as(f32, @floatFromInt(i)) * 0.17);
+            r.* = 0.25;
+        }
+        const x = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(values, &.{ rows, @intCast(hidden) }));
+        defer cb.free(x);
+        const r = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(residual, &.{ rows, @intCast(hidden) }));
+        defer cb.free(r);
+        const g = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(gamma, &.{@intCast(hidden)}));
+        defer cb.free(g);
+        const b = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(beta, &.{@intCast(hidden)}));
+        defer cb.free(b);
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        errdefer cb.decoderRuntimeCancelFrame() catch {};
+        const submissions = cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits;
+        const fused = (try cb.addLayerNormSumCentered(x, r, g, b, hidden, 1e-5)).?;
+        defer cb.free(fused.sum);
+        defer cb.free(fused.normed);
+        // Compare with the precise boundary norm, which uses centered variance.
+        const sum = try cb.add(x, r);
+        defer cb.free(sum);
+        const kernel = ops.gliner_boundary_device.Kernel{ .kind = .norm, .dims = .{ rows, @intCast(hidden), 0, 0, 0, 0, 0, 0 }, .scalars = .{ 1e-5, 0, 0, 0 } };
+        var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        inputs[0] = MetalCompute.toBuf(sum).metal_tensor.?;
+        inputs[1] = MetalCompute.toBuf(g).metal_tensor.?;
+        inputs[2] = MetalCompute.toBuf(b).metal_tensor.?;
+        var expected = (try metal_runtime_mod.decoderRuntimeGlinerBoundaryDevice(compute.provider_impl, a, kernel, inputs)).?;
+        defer expected.deinit();
+        try std.testing.expectEqual(submissions, cb.debugTimingSnapshot().provider.decoder_runtime_frame_submits);
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        const actual = try cb.toFloat32(fused.normed, a);
+        defer a.free(actual);
+        const wanted = try expected.toHostSlice();
+        for (actual, wanted) |got, want| try std.testing.expectApproxEqAbs(want, got, 2e-5);
+        const actual_sum = try cb.toFloat32(fused.sum, a);
+        defer a.free(actual_sum);
+        for (actual_sum, values, residual) |got, left, right| try std.testing.expectEqual(left + right, got);
     }
 }

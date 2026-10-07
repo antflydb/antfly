@@ -200,10 +200,8 @@ fn encoderLayer(math: *math_mod.Context, hidden: CT, relative: CT, relative_ids:
     math.drop(kr);
     const projected = try math.linear(attended, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.output.dense", .{layer}));
     math.drop(attended);
-    const residual = try math.kernel(.add, &.{rows * h}, &.{ hidden, projected }, 0);
+    const attention_norm = try math.addNormEps(hidden, projected, rows, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.output.LayerNorm", .{layer}), e.layer_norm_eps);
     math.drop(projected);
-    const attention_norm = try math.normEps(residual, rows, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.output.LayerNorm", .{layer}), e.layer_norm_eps);
-    math.drop(residual);
     try math.traceLayerStage(layer, .output, stage_started_ns, stage_started_dispatches);
     stage_started_ns = math.traceNow();
     stage_started_dispatches = math.stats.device_dispatches;

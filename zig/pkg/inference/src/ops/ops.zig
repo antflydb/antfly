@@ -1980,6 +1980,9 @@ pub const ComputeBackend = struct {
         /// callers fall back to add + layerNorm.
         addLayerNorm: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?CT = null,
         addLayerNormSum: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?AddLayerNormSumResult = null,
+        /// Strict centered variance for GLiNER/ModernBERT; no E[x²]-E[x]² substitution.
+        addLayerNormSumCentered: ?*const fn (ctx: *anyopaque, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) anyerror!?AddLayerNormSumResult = null,
+        packedQkvRope: ?*const fn (ctx: *anyopaque, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
         ensureDeviceResident: ?*const fn (ctx: *anyopaque, tensor: CT) anyerror!?CT = null,
         conv1dIm2col: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, in_channels: usize, time_steps: usize, kernel_size: usize, stride: usize, padding: usize, time_major: bool) anyerror!?CT = null,
         whisperLogitsStatsEncode: ?*const fn (ctx: *anyopaque, logits: CT, params: *const WhisperLogitsParams, suppress_ids: []const i32) anyerror!bool = null,
@@ -3854,6 +3857,16 @@ pub const ComputeBackend = struct {
     /// no fused kernel or an input is not device resident.
     pub fn addLayerNormSum(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?AddLayerNormSumResult {
         if (self.vtable.addLayerNormSum) |f| return f(self.ptr, a, b, gamma, beta, dim, eps);
+        return null;
+    }
+
+    pub fn addLayerNormSumCentered(self: *const ComputeBackend, a: CT, b: CT, gamma: CT, beta: CT, dim: usize, eps: f32) !?AddLayerNormSumResult {
+        if (self.vtable.addLayerNormSumCentered) |f| return f(self.ptr, a, b, gamma, beta, dim, eps);
+        return null;
+    }
+
+    pub fn packedQkvRope(self: *const ComputeBackend, input: CT, positions: CT, hidden: usize, head_dim: usize, theta: f32) !?SplitLastDim3Result {
+        if (self.vtable.packedQkvRope) |f| return f(self.ptr, input, positions, hidden, head_dim, theta);
         return null;
     }
 

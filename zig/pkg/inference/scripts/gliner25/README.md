@@ -171,3 +171,18 @@ resident-weight ownership and admission limits are unchanged.
 `ANTFLY_INFERENCE_DISABLE_SHORT_SEGMENT_ATTENTION=1` support diagnostic controls.
 The campaign clears experimental inference flags; runs with injected profiling
 or alternate dispatch must be marked `diagnostic_only` and cannot qualify.
+
+The Metal encoder also has optional packed-QKV/split-half-RoPE and centered
+residual-add/LayerNorm hooks. The former writes Q, K and V into one allocation
+with independently retained device views and reuses one request-owned position
+vector uploaded once for all encoder layers.
+The latter preserves centered FP32 variance and returns both the normalized
+activation and residual stream for ModernBERT; multilingual boundary attention
+uses its norm-only form. Other backends and unsupported layouts retain the
+existing operations. Neither hook changes the two-layer cancellation cadence.
+
+For same-binary controls, pass `--diagnostic-disable qkv-rope` and/or
+`--diagnostic-disable add-norm` to `benchmark_decide_service.py`. The runner
+records these controls and marks their receipts ineligible for performance
+acceptance. They map to `TERMITE_METAL_DISABLE_GLINER_QKV_ROPE=1` and
+`TERMITE_METAL_DISABLE_GLINER_ADD_NORM=1`; normal paired campaigns clear them.

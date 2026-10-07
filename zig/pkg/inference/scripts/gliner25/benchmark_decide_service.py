@@ -24,6 +24,8 @@ def main() -> int:
     parser.add_argument('--backend', choices=('metal', 'native'), required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=300)
+    parser.add_argument('--diagnostic-disable', action='append', default=[], choices=('qkv-rope', 'add-norm'),
+                        help='same-binary fusion control; marks the receipt ineligible for acceptance')
     args = parser.parse_args()
     binary, model, output = (p.resolve() for p in (args.binary, args.model_dir, args.output))
     build = json.loads(args.build_receipt.read_text())
@@ -54,6 +56,9 @@ def main() -> int:
     env = {k: v for k, v in os.environ.items() if not k.startswith(
         ('TERMITE_', 'ANTFLY_TEST_', 'ANTFLY_METAL_', 'ANTFLY_GLINER_', 'ANTFLY_GLINER25_', 'ANTFLY_INFERENCE_'))}
     env.update({key: '2' for key in perf.THREAD_VARIABLES})
+    diagnostic_flags = {'qkv-rope': 'TERMITE_METAL_DISABLE_GLINER_QKV_ROPE',
+                        'add-norm': 'TERMITE_METAL_DISABLE_GLINER_ADD_NORM'}
+    env.update({diagnostic_flags[name]: '1' for name in args.diagnostic_disable})
     env.update(
         ANTFLY_GLINER25_PERF_OUTPUT_DIR=str(output),
         ANTFLY_GLINER25_PERF_SOURCE_HEAD=source['head'],
@@ -66,6 +71,9 @@ def main() -> int:
                'decide-bench', args.backend, str(models)]
     receipt = dict(source=source, binary=str(binary), binary_sha256=digest,
                    build_receipt=str(args.build_receipt.resolve()), command=command, started_utc=perf.utc_now(), host_before=perf.host_context(), status='running')
+    receipt.update(diagnostic_only=bool(args.diagnostic_disable),
+                   diagnostic_disabled_fusions=args.diagnostic_disable,
+                   performance_qualification=not bool(args.diagnostic_disable))
     path = output / 'receipt.json'
     path.write_text(json.dumps(receipt, indent=2) + '\n')
     started = time.monotonic()
