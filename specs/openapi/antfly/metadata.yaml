@@ -9335,6 +9335,7 @@ components:
                   - required: [evaluate]
                   - required: [join]
                   - required: [foreign_sources]
+                  - required: [remote_snapshot]
       properties:
         remote_snapshot:
           type: string
