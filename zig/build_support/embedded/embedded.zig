@@ -533,6 +533,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi inference options are prefix compatible and reject unknown flags and reserved bits",
         "capi inference calls reject null, closed, and database handles",
         "capi inference lists models and reports route errors",
+        "capi inference decide validates requests and preserves error bodies",
         "capi inference embeds text with a local model",
         "capi inference reranks documents with a local model",
         "capi inference chunks text without a model",

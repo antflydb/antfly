@@ -45,10 +45,21 @@ pub const Source = union(enum) {
         length: u64,
         read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
         close: *const fn (*anyopaque) void,
+        /// Advisory bounded lookahead; errors belong to subsequent required reads.
+        prefetch: ?*const fn (*anyopaque, u64, u64) void = null,
         checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32 = null,
         retained_bytes: ?*const fn (*anyopaque) usize = null,
+        /// Bind an independent query capability without changing the shared source.
+        bind_read_context: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!Source = null,
+        seal_read_context: ?*const fn (*anyopaque) void = null,
+        quiesce_read_context: ?*const fn (*anyopaque) void = null,
         resource_manager: ?*resources.ResourceManager = null,
     },
+
+    /// Stop query-owned work before its borrowed capability is released.
+    pub fn quiesceReadContext(self: Source) void {
+        if (self == .ranges) if (self.ranges.quiesce_read_context) |quiesce| quiesce(self.ranges.ptr);
+    }
 
     pub fn resourceManager(self: Source) ?*resources.ResourceManager {
         return switch (self) {
@@ -73,6 +84,11 @@ pub const Source = union(enum) {
             .contiguous => |bytes| @memcpy(out, bytes[@intCast(offset)..][0..out.len]),
             .ranges => |range| try range.read_into(range.ptr, offset, out),
         }
+    }
+
+    pub fn prefetch(self: Source, offset: u64, length: u64) void {
+        if (offset > self.len() or length > self.len() - offset or length == 0) return;
+        if (self == .ranges) if (self.ranges.prefetch) |hint| hint(self.ranges.ptr, offset, length);
     }
 
     pub fn retainedBytes(self: Source) usize {
@@ -217,9 +233,13 @@ pub const BlockCache = struct {
     /// Borrowed adapter for decoders. Closing it does not close the cache or
     /// parent source; the cache must remain at a stable address until use ends.
     pub fn borrowedSource(self: *BlockCache) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .resource_manager = self.source.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .prefetch = if (self.source == .ranges and self.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.source.resourceManager() } };
     }
 
+    fn prefetchAdapter(ptr: *anyopaque, offset: u64, length: u64) void {
+        const self: *BlockCache = @ptrCast(@alignCast(ptr));
+        self.source.prefetch(offset, length);
+    }
     fn readAdapter(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *BlockCache = @ptrCast(@alignCast(ptr));
         try self.readInto(offset, out);
@@ -339,7 +359,11 @@ pub const ConcurrentBlockCache = struct {
     }
 
     pub fn borrowedSource(self: *ConcurrentBlockCache) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .resource_manager = self.cache.source.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .prefetch = if (self.cache.source == .ranges and self.cache.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.cache.source.resourceManager() } };
+    }
+    fn prefetchAdapter(ptr: *anyopaque, offset: u64, length: u64) void {
+        const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));
+        self.cache.source.prefetch(offset, length);
     }
     fn readAdapter(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));

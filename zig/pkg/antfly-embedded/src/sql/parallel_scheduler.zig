@@ -115,7 +115,10 @@ pub const Scheduler = struct {
         admission.* = .{ .scheduler = self, .bytes = bytes };
         const Worker = struct {
             fn run(control: *Admission, arguments: @TypeOf(args)) Result {
-                defer control.release();
+                defer {
+                    control.release();
+                    control.completed.store(true, .release);
+                }
                 return @call(.auto, function, arguments);
             }
         };
@@ -139,6 +142,7 @@ const Admission = struct {
     scheduler: *Scheduler,
     bytes: usize,
     released: std.atomic.Value(bool) = .init(false),
+    completed: std.atomic.Value(bool) = .init(false),
     fn release(self: *Admission) void {
         if (!self.released.swap(true, .acq_rel)) self.scheduler.release(self.bytes);
     }
@@ -156,6 +160,11 @@ pub fn Task(comptime Result: type) type {
                 self.transient = null;
             } else self.scheduler.release(self.bytes);
             self.future = null;
+        }
+        /// Completion is independent of joining and execution admission.
+        /// Only transient tasks expose this nonblocking readiness contract.
+        pub fn isComplete(self: *const @This()) bool {
+            return if (self.transient) |admission| admission.completed.load(.acquire) else self.future == null;
         }
         pub fn await(self: *@This(), io: std.Io) Result {
             defer self.release();

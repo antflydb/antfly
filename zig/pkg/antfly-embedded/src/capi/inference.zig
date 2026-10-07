@@ -241,6 +241,11 @@ pub export fn antfly_inference_rewrite_json(h: ?*anyopaque, request_json: capi.S
     return invoke(h, .post, "rewrite", request_json.bytes(), out);
 }
 
+/// Uses the model-independent DecideRequest/DecideResponse contract.
+pub export fn antfly_inference_decide_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
+    return invoke(h, .post, "decide", request_json.bytes(), out);
+}
+
 pub export fn antfly_inference_extract_json(h: ?*anyopaque, request_json: capi.Slice, out: ?*capi.Buffer) capi.ErrorCode {
     return invoke(h, .post, "extract", request_json.bytes(), out);
 }
@@ -726,6 +731,33 @@ test "capi inference calls reject null, closed, and database handles" {
     antfly_inference_close(handle);
     antfly_inference_close(handle);
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_list_models_json(handle, &out));
+}
+
+test "capi inference decide validates requests and preserves error bodies" {
+    var out: capi.Buffer = .{ .ptr = @constCast("x".ptr), .len = 1 };
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_decide_json(null, testSlice("{}"), &out));
+    try std.testing.expectEqual(capi.Buffer{}, out);
+    if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
+    var test_tmp = try db.TestDirectoryType.init("capi-decide");
+    defer test_tmp.cleanup();
+    var options: capi.InferenceOptions = .{ .models_dir = testSlice(test_tmp.path()) };
+    var handle: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(&options, &handle));
+    defer antfly_inference_close(handle);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_decide_json(handle, testSlice("{}"), &out));
+    try std.testing.expect(std.mem.indexOf(u8, testBuffer(out), "INVALID_REQUEST") != null);
+    db.antfly_buffer_free(&out);
+    const request =
+        \\{"model":"nobody/no-such-model","state":"Refund requested","questions":{"refund":{"type":"noul","instructions":"Does this ask for a refund?"}}}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.not_found, antfly_inference_decide_json(handle, testSlice(request), &out));
+    defer db.antfly_buffer_free(&out);
+    try std.testing.expect(std.mem.indexOf(u8, testBuffer(out), "MODEL_NOT_FOUND") != null);
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_decide_json(handle, testSlice(request), null));
+    antfly_inference_close(handle);
+    var closed: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_decide_json(handle, testSlice(request), &closed));
+    try std.testing.expectEqual(capi.Buffer{}, closed);
 }
 
 test "capi inference lists models and reports route errors with the runtime JSON" {

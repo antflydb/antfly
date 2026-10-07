@@ -3703,6 +3703,18 @@ pub const PostingsIterator = struct {
             try self.payload_buffer.ensureTotalCapacityPrecise(self.alloc, meta.doc_ctrl_len);
             self.payload_buffer.items.len = meta.doc_ctrl_len;
             try view.readInto(payload_offset, self.payload_buffer.items);
+            // Warm only the next document chunk. Streamed layouts interleave
+            // positions; never assume the bytes after this chunk are documents.
+            if (view.source == .ranges and view.source.ranges.prefetch != null and index + 1 < self.chunk_meta_count) lookahead: {
+                const next_meta = self.chunkMeta(index + 1) catch break :lookahead;
+                const next_offset: u64 = if (self.hasStreamedRecords()) blk2: {
+                    const record = self.streamedRecord(index + 1) catch break :lookahead;
+                    break :blk2 std.mem.readInt(u64, record[8..16], .little);
+                } else next_meta.doc_ctrl_off;
+                if (next_offset <= view.length and next_meta.doc_ctrl_len <= view.length - next_offset)
+                    view.source.prefetch(view.offset + next_offset, next_meta.doc_ctrl_len);
+            }
+
             break :blk self.payload_buffer.items;
         } else self.payload_data[@intCast(payload_offset)..][0..meta.doc_ctrl_len];
         var payload_cursor: usize = 0;
@@ -8197,7 +8209,7 @@ pub const ScopedInvertedIndexReader = struct {
         const context = try allocator.create(Context);
         context.* = .{ .allocator = allocator, .view = backing, .options = options, .navigation = std.heap.ArenaAllocator.init(allocator), .dictionary = @import("../segment_source.zig").Scratch.init(allocator, options.dictionary_retained_bytes) };
         errdefer context.destroy();
-        const source = @import("../segment_source.zig").Source{ .ranges = .{ .ptr = context, .length = backing.length, .read_into = Context.read, .close = Context.closeBorrow } };
+        const source = @import("../segment_source.zig").Source{ .ranges = .{ .ptr = context, .length = backing.length, .read_into = Context.read, .close = Context.closeBorrow, .prefetch = if (backing.source == .ranges and backing.source.ranges.prefetch != null) Context.prefetch else null } };
         context.cache = try @import("../segment_source.zig").BlockCache.init(allocator, source, options.cache_bytes);
         context.native = try RangeInvertedIndexReader.init(allocator, try @import("../segment_source.zig").View.init(context.cache.?.borrowedSource(), 0, view.length), options.dictionary_block_bytes);
         return .{ .context = context, .doc_count = context.native.doc_count, .total_field_len = context.native.total_field_len, .chunk_size = context.native.chunk_size, .version = context.native.version };
@@ -8535,6 +8547,11 @@ pub const ScopedInvertedIndexReader = struct {
         fn read(ptr: *anyopaque, offset: u64, output: []u8) !void {
             const self: *Context = @ptrCast(@alignCast(ptr));
             try self.view.readInto(offset, output);
+        }
+
+        fn prefetch(ptr: *anyopaque, offset: u64, length: u64) void {
+            const self: *Context = @ptrCast(@alignCast(ptr));
+            self.view.source.prefetch(self.view.offset + offset, length);
         }
 
         fn closeBorrow(_: *anyopaque) void {}
@@ -8970,4 +8987,44 @@ test "append merge uses fixed scratch for sparse document spaces and deletion ra
     }
     try std.testing.expectEqual(peaks[0], peaks[1]);
     std.debug.print("APPEND_MERGE sparse_spaces=2053,200005 scratch_peaks={d},{d}\n", .{ peaks[0], peaks[1] });
+}
+
+test "native scoped postings preserve prefetch through caches and translate section offsets" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    for (0..2048) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 1 }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const prefix = 137;
+    const backing = try a.alloc(u8, prefix + bytes.len);
+    defer a.free(backing);
+    @memset(backing[0..prefix], 0);
+    @memcpy(backing[prefix..], bytes);
+    const State = struct {
+        bytes: []const u8,
+        hints: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn prefetch(raw: *anyopaque, offset: u64, length: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(offset >= prefix and offset + length <= self.bytes.len);
+            self.hints += 1;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state: State = .{ .bytes = backing };
+    const sources = @import("../segment_source.zig");
+    const source: sources.Source = .{ .ranges = .{ .ptr = &state, .length = backing.len, .read_into = State.read, .close = State.close, .prefetch = State.prefetch } };
+    var concurrent = try sources.ConcurrentBlockCache.init(a, source, 64 * 1024);
+    defer concurrent.deinit();
+    var scoped = try ScopedInvertedIndexReader.initRanges(a, try sources.View.init(concurrent.borrowedSource(), prefix, bytes.len), .{});
+    defer scoped.deinit();
+    const lookup = (try scoped.lookup("common")).?;
+    var iterator = try lookup.iterator(a);
+    defer iterator.deinit();
+    _ = try iterator.next();
+    try std.testing.expect(state.hints != 0);
 }

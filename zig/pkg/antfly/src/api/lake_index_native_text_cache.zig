@@ -316,6 +316,7 @@ const Entry = struct {
     writer: ?local.index.IndexWriter = null,
     seekable: bool = false,
     analysis: local.introducer.TextAnalysisConfig = .{},
+    selected_field: ?[]const u8 = null,
     schema: ?local.storage_schema.TableSchema = null,
     name: []const u8 = "",
     allocator: A,
@@ -327,6 +328,10 @@ const Entry = struct {
         defer schema.deinit(a);
         self.schema = try local.schema_mod.deriveRuntimeTableSchema(a, schema);
         self.analysis = try local.storage_db_catalog_index_manager.parseTextAnalysisForIndexConfig(a, root.config_json, self.schema);
+        const config = try std.json.parseFromSliceLeaky(std.json.Value, a, root.config_json, .{ .allocate = .alloc_always });
+        if (config == .object) if (config.object.get("field")) |field| {
+            if (field == .string) self.selected_field = field.string;
+        };
         self.name = try a.dupe(u8, name);
         self.writer = if (base) |prior| try prior.writer.?.forkImmutable() else try local.index.IndexWriter.init(self.allocator);
         var removed: std.ArrayList(u64) = .empty;
@@ -399,6 +404,12 @@ const Entry = struct {
         try self.writer.?.shareImmutableSegments(shared.items);
         if (removed.items.len != 0 or replacements.len != 0) try self.writer.?.replaceSegmentsManyData(removed.items, replacements);
         loaded = 0; // writer owns every replacement after atomic publication
+        for (replacements) |replacement| {
+            if (replacement.data == .native and replacement.data.native == .ranges) {
+                const range = replacement.data.native.ranges;
+                if (range.seal_read_context) |seal| seal(range.ptr);
+            }
+        }
         const ordered_ids = try self.allocator.alloc(u64, root.segments.len);
         defer self.allocator.free(ordered_ids);
         for (root.segments, ordered_ids) |segment, *id| id.* = self.segments.get(segment.artifact_id).?.id;
@@ -431,11 +442,11 @@ const Entry = struct {
         }
     };
     fn source(self: *Entry, store: stores.ArtifactStore, cached: artifacts.CachedRead, context: Context, cancellation: Cancellation) !local.storage_db_query_search_exec.PinnedTextSource {
-        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .owner = self, .release_owner = releaseSource };
+        if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = self, .release_owner = releaseSource };
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
         lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation } };
-        return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .owner = lease, .release_owner = QueryLease.release };
+        return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {
         const self: *Entry = @ptrCast(@alignCast(raw));

@@ -732,30 +732,83 @@ census, using the same durable continuation and collection cutoff. Legacy
 nonce staging cleanup and private checkpoint reclamation run after the durable
 completion receipt; they cannot prevent a completed collection from advancing.
 
-Native text corpus version 3 separates authenticated segment metadata from
-64 KiB posting blocks. Opening a corpus reads dictionaries, norms, identities
-and typed values, while exact term lookup and dictionary expansion fetch only
-the intersecting posting blocks. Absent terms need no posting reads. The local
-WAND/phrase/filter kernels and global BM25 statistics are shared with ordinary
-native segments. Concurrent queries share immutable segment storage and block
-flights, but each receives its own snapshot view and current store capability,
-deadline, cancellation and reader lease. Posting read failures propagate as
-errors, never as absent terms. Persistent immutable caching applies to metadata
-and posting blocks; decoded segment storage remains under the corpus heap
-budget. This reduces cold I/O without removing corpus memory admission limits.
-GC traverses every metadata and posting reference; retained version 1 and 2
-roots remain understood during upgrade. Reader/topology protocol 29 fences
-publication of the new format during rolling upgrades. The coordinator sees
-older publication protocols and refreshes them automatically; text queries wait
-for the new publication rather than interpreting the previous layout.
+Native text corpus version 4 publishes authenticated 64 KiB ranges across the
+native segment. Readers use the shared native range codecs, retaining bounded
+navigation and decoder scratch instead of allocating and zeroing a segment-sized
+heap buffer. Term-frequency probes read dictionary addresses and posting headers;
+Required WAND reads fetch the document chunks they visit, while bounded lookahead
+may warm subsequent chunks. Scoped field views and both block-cache adapters
+forward advisory hints, translating section-relative offsets at the field boundary. Position records are decoded when phrase consumers
+request them. A block checksum may bring neighboring
+bytes into cache, so the minimum read unit remains 64 KiB. Each query binds its
+current store capability, deadline, cancellation and reader lease to a private
+native reader. Query binding borrows the already admitted field navigation,
+collection statistics, and atomic page-validation states; it performs no metadata
+reads. The physical segment pin outlives every borrowed view, while identity and
+decoder caches remain query-local. Immutable composition normalizes query-bound
+entries to their physical base reader, so it never copies query ownership or
+retains another execution's authority. The shared corpus drops opening-request
+authority after admission. Bounded artifact reads pin verified RAM blocks or disk
+mappings instead of allocating and copying an entire block for each small read.
+Pinned RAM remains charged and cannot be evicted until released; current deadline,
+cancellation and reader-lease checks still run on warm hits. Large contiguous
+segment leases keep their disk-first policy for clean-page reclamation. GC traverses all range references and still understands retained
+version 1–3 roots. Reader/topology protocol 30 triggers automatic republication of
+older corpora during rolling upgrades.
 
-Automatic ordered-index access now enumerates eligible definitions, proves
-partial predicates and covering columns, and counts candidate ranges through
-authenticated B+tree subtree counts. It compares selective gathers and covering
-reads with a sequential Parquet scan. The initial cost model uses conservative
-relative work units (random hydration costs more than sequential rows), with an
-ordering benefit; it does not yet estimate physical clustering or LIMIT-aware
-residual selectivity. Explicit index requests retain their required semantics.
+Native text readers hint the next document chunk using its authenticated native
+metadata, including explicit offsets in layouts that interleave position records.
+Up to four 64 KiB blocks per query source warm through the shared process scheduler;
+its worker and byte limits arbitrate with Parquet and other parallel consumers.
+A full speculative queue yields, required reads recycle consumed slots, and close
+cancels and joins every worker before releasing capabilities or physical owners.
+Releasing a pinned query source quiesces its bound readers even when a caller has
+retained the snapshot for immutable composition; later bound reads are canceled.
+Speculative failures do not become query errors until a required read reaches the
+failed block. Workers use independent scratch and current query cancellation.
+Term-frequency and BM25 bound-table caches belong to the exact immutable snapshot:
+query facades retain its cache owner, while cold frequency reads still use their
+own bound capability. Publishing a changed corpus starts new scoring caches.
+
+Automatic ordered-index access enumerates eligible definitions, proves partial
+predicates and covering columns, and counts ranges using authenticated B+tree
+subtree counts. Costing includes projected compressed column bytes and a
+conservative estimate of touched row groups. An explicit SQL OFFSET + LIMIT is an
+advisory row goal when the index proves the full ordering and every filter is
+represented by its equality prefix and next-key lower/upper bounds. SQL binding
+marks disjunctions, scalar predicates and other unbound residuals as incomplete.
+Covered-column residuals and duplicate bounds with uncertain selectivity retain
+full-range costing. The goal never limits scan pages or changes residual semantics.
+Covering row-index windows preserve spill dictionary identities through their
+batch callbacks and selected lanes. Column-major residual evaluation memoizes each
+surviving dictionary identity per predicate, retaining separate SQL NULL and JSON
+null identities and exact integer values; only result delivery expands rows.
+Covering blocks use the shared bounded decoded-artifact cache: singleflight
+decoding retains validated wire buffers, dictionaries and column views under a
+lease. Candidate windows borrow these values across pagination and query reuse;
+no query arena owns a cached payload. Scope and authenticated identity fence
+reuse, while deadlines and cancellation remain query-local.
+Unknown residual selectivity costs the entire candidate range. Actual page clustering
+statistics remain a possible future refinement; explicit index requests retain
+their required semantics.
+
+Build replay writes bounded columnar spill blocks directly from native vectors,
+without an intermediate row matrix or decimal coordinate strings. Consumer
+cursors retain compact spill blocks and preserve numeric/string dictionary IDs
+while borrowing payloads until the next batch. The spill codec exports typed
+columns directly: strings and string dictionaries borrow decoded buffers, numeric
+wire values decode into typed arrays, nulls come directly from packed flags, and
+only dictionary IDs require widening for native scan consumers. It does not build
+intermediate Datum dictionaries. Legacy scalar records retain the same typed
+fallback and reject incompatible logical types. Independent per-file cursors seek
+to physical record boundaries and share the same bounded spill owner.
+
+The `iceberg_integration` E2E uses PyIceberg commits and PyArrow Parquet files,
+including partitioned manifests, append snapshots, field-ID-preserving rename,
+copy-on-write deletion, pinned history, HTTP SQL, pgwire, and cold restart.
+`e2e-full` installs the lake and Iceberg writer extras and runs it; base E2E
+excludes it like PostgreSQL integration. Missing full-suite writer dependencies
+are a failure, not a silently skipped test.
 
 Aggregate contribution construction runs bounded waves of independent file
 reducers through the shared scheduler once replay capture is complete. Workers
@@ -766,3 +819,64 @@ construction. Without replay, construction keeps the serial path rather than
 sharing mutable source discovery state across workers. Recursive join spill
 partitioning now selects typed blocks into child files, reusing key scratch and
 preserving physical ordinals without materializing payload row matrices.
+
+Remote native search attaches highlights through the same per-index analysis and
+fragment helper as local search, after final hit selection and before response
+encoding. Deferred projections retain original source until that final encoder,
+avoiding a second hydration for highlight fields. Projected or omitted source is hydrated in bounded, delete-aware batches
+from the same leased snapshot for highlighting, without widening returned source.
+Named full-text clauses retain their own index analysis and selected-field
+provenance. Highlight extraction shares the build projection path, including
+explicit field indexes that override general table text mapping. Vector-only requests do
+not synthesize text highlights. Real Parquet E2Es cover projected highlight fields
+and repeat the request after a cold restart.
+
+Small native disk blocks also share verified mapping owners under an independent
+8 MiB/128-entry LRU bound. Active leases prevent eviction and keep the disk inode
+pinned; saturated admission returns a private required-read lease. Mapping hits
+avoid reopening, remapping and rehashing the same immutable cache inode. New
+owners still validate the header, identity, length and complete payload digest;
+eviction/restart requires verification again. This does not change large
+contiguous segment reclamation. Mapping owners drain before the disk cache closes.
+
+Remote search compiles physical hydration dependencies once before retrieval:
+returned includes, field sorting and highlight source paths form one union.
+Default highlighting follows each index's selected-field or schema provenance,
+including document type discriminators and dynamic source prefixes. Deferred
+wire projection does not force decoding unrelated columns. Omitted source loads
+only highlight dependencies. Exclusion-only/full-source requests, schema-less
+or unrestricted dynamic highlighting, and consumers without a finite dependency
+contract (evaluation, reranking, hierarchy and residual filters) retain full
+source. Final public projection still controls the returned document.
+
+
+Native lookahead owns a rolling bounded task set. Shared scheduler completion
+is observable independently of joining or admission release. Each new hint
+reaps completed tasks, including ranges skipped by WAND, and remembers recently
+warmed pages to avoid resubmitting work for every small decoder read. Failures
+remain speculative until a required read, and close still cancels and joins
+all outstanding work before releasing the query capability.
+
+Disk-cache quota pressure can reclaim idle verified mapping owners, even when
+the independent mapping LRU has spare capacity. The disk worker calls this
+consumer hook without holding its inventory mutex. Only mappings with zero
+active leases are retired; active query mappings remain pinned. Cache shutdown
+flushes the worker before destroying the table borrowed by this hook.
+
+Source-independent remote retrieval, including named text/vector fusion, now
+hydrates the final hit page into owned typed source values. Physical hydration
+still batches 256 identities and applies the same snapshot/delete/lease checks;
+key lookup uses a batch map rather than repeatedly scanning all requested keys.
+Shared highlighting borrows the typed source and public field projection
+operates on values directly. The public response is the first JSON encoding of
+the document. Typed sources participate in hit cloning, release, and retained
+memory accounting. Source omitted from the response may still be retained for
+highlighting, without leaking dependency fields into `_source`.
+
+An explicit shared dependency contract keeps encoded hydration for evaluation,
+reranking, hierarchy, document-bound filters, and other source-dependent
+operators. Ordinary native identity/score ordering can use typed delivery;
+field sorting and cursor continuations retain their established execution path.
+This preserves response projection, exact integers, source omission, and
+highlight behavior while removing document encode/parse cycles from the common
+retrieval path.

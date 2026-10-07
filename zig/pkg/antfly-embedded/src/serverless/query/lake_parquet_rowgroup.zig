@@ -286,6 +286,10 @@ pub const PersistentObjectRangeCacheEnqueueResult = enum {
 };
 
 pub const PersistentObjectRangeCacheResources = struct {
+    /// Called without the disk-cache mutex when eviction is blocked by pins.
+    /// Release one idle consumer lease and return true only on progress.
+    /// The callback owner must outlive the write worker.
+    reclaim_idle: ?struct { ptr: *anyopaque, reclaim_one: *const fn (*anyopaque) bool } = null,
     /// Optional node-wide memory and storage envelope. The manager must
     /// outlive the cache. Queue memory is charged to
     /// `lake_range_cache_queue`; if the manager has a CapacitySource, each
@@ -341,6 +345,7 @@ pub const PersistentObjectRangeCache = struct {
             .policy = policy,
             .io = io,
             .resource_manager = resources.resource_manager,
+            .reclaim_idle = resources.reclaim_idle,
         };
         errdefer if (state.owner_lock) |file| file.close(io);
         try state.initializeInventory();
@@ -567,6 +572,7 @@ const PersistentObjectRangeCacheState = struct {
     policy: PersistentObjectRangeCachePolicy,
     io: std.Io,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    reclaim_idle: @FieldType(PersistentObjectRangeCacheResources, "reclaim_idle") = null,
     mutex: std.Io.Mutex = .init,
     condition: std.Io.Condition = .init,
     worker: ?std.Io.Future(void) = null,
@@ -994,7 +1000,10 @@ const PersistentObjectRangeCacheState = struct {
     fn makeCapacityFor(self: *PersistentObjectRangeCacheState, disk_bytes: usize, protected: bool) bool {
         if (disk_bytes > self.policy.max_total_bytes) return false;
         while (!self.hasCapacityFor(disk_bytes)) {
-            if (!self.evictOne(protected)) return false;
+            if (!self.evictOne(protected)) {
+                const reclaim = self.reclaim_idle orelse return false;
+                if (!reclaim.reclaim_one(reclaim.ptr)) return false;
+            }
         }
         return true;
     }

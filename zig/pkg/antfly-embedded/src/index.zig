@@ -59,6 +59,7 @@ fn spinOrYield() void {
 
 /// An entry in a snapshot: one segment plus optional deletion bitmap.
 pub const SegmentReader = segment_mod.SegmentReader;
+pub const SegmentSource = @import("segment_source.zig").Source;
 pub const PostingsLoader = segment_mod.PostingsLoader;
 pub const SegmentData = union(enum) {
     native: @import("segment_source.zig").Source,
@@ -574,6 +575,10 @@ pub const SegmentEntry = struct {
     reader: segment_mod.SegmentReader,
     layout_stats: segment_mod.SegmentLayoutStats = .{},
     shared: *SegmentShared,
+    // Query-bound native readers borrow the same physical segment pin but own
+    // their decoder/navigation state and capability-bound source separately.
+    query_base_reader: ?segment_mod.SegmentReader = null,
+    query_source: ?SegmentSource = null,
 
     pub fn typedMergeWorkingSetBytes(self: *const SegmentEntry) !u64 {
         const cached = self.shared.typed_merge_estimate.load(.acquire);
@@ -623,6 +628,16 @@ pub const SegmentEntry = struct {
         _ = self.shared.active_mapped_readers.fetchSub(1, .acq_rel);
     }
 
+    /// Composition shares physical immutable state, never another execution's
+    /// capability or its private decoder/cache allocations.
+    fn physical(self: SegmentEntry) SegmentEntry {
+        var result = self;
+        if (self.query_base_reader) |base| result.reader = base;
+        result.query_base_reader = null;
+        result.query_source = null;
+        return result;
+    }
+
     fn retain(self: *const SegmentEntry) void {
         _ = @atomicRmw(u32, &self.shared.ref_count, .Add, 1, .monotonic);
     }
@@ -631,6 +646,13 @@ pub const SegmentEntry = struct {
     /// resources, runs its retired cleanup (if any), and destroys the
     /// shared cell.
     fn releaseRef(self: *SegmentEntry) void {
+        if (self.query_base_reader) |base| {
+            self.reader.deinit();
+            self.query_source.?.close();
+            self.reader = base;
+            self.query_base_reader = null;
+            self.query_source = null;
+        }
         if (@atomicRmw(u32, &self.shared.ref_count, .Sub, 1, .acq_rel) != 1) return;
         const alloc = self.reader.alloc;
         const seg_id = self.id;
@@ -908,10 +930,24 @@ pub const IndexSnapshot = struct {
     term_doc_freq_cache_misses: u64,
     bm25_bound_table_cache_mu: std.atomic.Mutex,
     bm25_bound_table_cache: BM25BoundTableCache,
+    /// Query facades share scoring state only with this exact immutable corpus.
+    /// The owner contains no query capability; cache misses use this facade.
+    scoring_owner: ?*IndexSnapshot = null,
+
+    fn scoringCache(self: *const IndexSnapshot) *IndexSnapshot {
+        return self.scoring_owner orelse @constCast(self);
+    }
+
     /// Increment reference count. Returns self for chaining.
     pub fn retain(self: *IndexSnapshot) *IndexSnapshot {
         _ = @atomicRmw(u32, &self.ref_count, .Add, 1, .monotonic);
         return self;
+    }
+
+    /// A retained snapshot pins immutable data, not the opening query's
+    /// authority. Stop capability-bound work before releasing that authority.
+    pub fn quiesceReadContext(self: *IndexSnapshot) void {
+        for (self.segments) |segment| if (segment.query_source) |source| source.quiesceReadContext();
     }
 
     /// Decrement reference count. Frees the snapshot when the count reaches
@@ -953,6 +989,7 @@ pub const IndexSnapshot = struct {
             self.bm25_bound_table_cache.deinit(alloc);
         }
         self.global_total_field_len.deinit(alloc);
+        if (self.scoring_owner) |owner| owner.release();
         alloc.destroy(self);
     }
 
@@ -966,7 +1003,7 @@ pub const IndexSnapshot = struct {
             .k1_bits = @bitCast(config.k1),
             .b_bits = @bitCast(config.b),
         };
-        const mutable = @constCast(self);
+        const mutable = self.scoringCache();
         const cache_mu = &mutable.bm25_bound_table_cache_mu;
         while (!cache_mu.tryLock()) spinOrYield();
         defer cache_mu.unlock();
@@ -974,10 +1011,10 @@ pub const IndexSnapshot = struct {
         if (mutable.bm25_bound_table_cache.get(key)) |table| return table;
         if (mutable.bm25_bound_table_cache.count() >= max_bm25_bound_tables_per_snapshot) return null;
 
-        const table = try self.alloc.create(inverted.BM25BoundTable);
-        errdefer self.alloc.destroy(table);
+        const table = try mutable.alloc.create(inverted.BM25BoundTable);
+        errdefer mutable.alloc.destroy(table);
         table.* = inverted.BM25BoundTable.init(avg_doc_len, config);
-        try mutable.bm25_bound_table_cache.put(self.alloc, key, table);
+        try mutable.bm25_bound_table_cache.put(mutable.alloc, key, table);
         return table;
     }
 
@@ -1358,7 +1395,7 @@ pub const IndexSnapshot = struct {
 
     pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
         if (self.liveDocCount() == 0) return 0;
-        const mutable = @constCast(self);
+        const mutable = self.scoringCache();
         const adapted = TermDocFreqAdapted{ .field = field, .term = term };
         const adapted_ctx = TermDocFreqAdaptedCtx{};
         const cache_mu = &mutable.term_doc_freq_cache_mu;
@@ -1385,9 +1422,9 @@ pub const IndexSnapshot = struct {
         if (key_bytes > max_term_doc_freq_cache_key_bytes) return total;
         // Cache admission is optional. Memory pressure must not turn an
         // otherwise successful exact frequency read into a query failure.
-        const storage = self.alloc.alloc(u8, key_bytes) catch return total;
-        mutable.term_doc_freq_cache.ensureUnusedCapacity(self.alloc, 1) catch {
-            self.alloc.free(storage);
+        const storage = mutable.alloc.alloc(u8, key_bytes) catch return total;
+        mutable.term_doc_freq_cache.ensureUnusedCapacity(mutable.alloc, 1) catch {
+            mutable.alloc.free(storage);
             return total;
         };
         while (mutable.term_doc_freq_cache.count() >= max_term_doc_freq_cache_entries or
@@ -1406,7 +1443,7 @@ pub const IndexSnapshot = struct {
             const evicted = victim.key_ptr.*;
             _ = mutable.term_doc_freq_cache.remove(evicted);
             mutable.term_doc_freq_cache_key_bytes -= evicted.storage.len;
-            self.alloc.free(evicted.storage);
+            mutable.alloc.free(evicted.storage);
         }
         @memcpy(storage[0..field.len], field);
         @memcpy(storage[field.len..], term);
@@ -1660,18 +1697,33 @@ pub const IndexWriter = struct {
     pub fn acquireSnapshotWithReadContext(self: *IndexWriter, context: *anyopaque) !*IndexSnapshot {
         const old = self.acquireSnapshot();
         defer old.release();
+        var transferred = false;
         const segments = try self.alloc.dupe(SegmentEntry, old.segments);
-        errdefer self.alloc.free(segments);
+        errdefer if (!transferred) self.alloc.free(segments);
         var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
-        errdefer totals.deinit(self.alloc);
+        errdefer if (!transferred) totals.deinit(self.alloc);
         const empty = try IndexWriter.init(self.alloc);
         const snapshot_ref = empty.current;
         snapshot_ref.segments = segments;
         snapshot_ref.global_total_field_len = totals;
         snapshot_ref.epoch = old.epoch;
+        transferred = true;
+        for (segments) |*segment| segment.retain();
+        errdefer snapshot_ref.release();
+        snapshot_ref.scoring_owner = old.scoringCache().retain();
         for (segments) |*segment| {
-            segment.retain();
             if (segment.reader.postings_loader) |*loader| loader.context = context;
+            if (segment.data == .native and segment.data.native == .ranges) {
+                const range = segment.data.native.ranges;
+                if (range.bind_read_context) |bind| {
+                    var source = try bind(range.ptr, self.alloc, context);
+                    errdefer source.close();
+                    const reader = try segment.reader.bindSource(self.alloc, source);
+                    segment.query_base_reader = segment.reader;
+                    segment.query_source = source;
+                    segment.reader = reader;
+                }
+            }
         }
         return snapshot_ref;
     }
@@ -1695,7 +1747,7 @@ pub const IndexWriter = struct {
         for (sources, segments[old.segments.len..]) |source, *target| {
             if (source.snapshot.alloc.ptr != self.alloc.ptr or source.snapshot.alloc.vtable != self.alloc.vtable) return error.InvalidSegment;
             if (source.ordinal >= source.snapshot.segments.len) return error.InvalidSegment;
-            const segment = source.snapshot.segments[source.ordinal];
+            const segment = source.snapshot.segments[source.ordinal].physical();
             if (segment.shared.deleted_count.load(.acquire) != 0) return error.InvalidSegment;
             target.* = segment;
             target.id = source.target_id;
@@ -3614,4 +3666,101 @@ test "snapshot frequency cache allocation failures preserve successful reads" {
         try std.testing.expectEqual(@as(u32, 0), snapshot.term_doc_freq_cache.count());
         try std.testing.expectEqual(@as(usize, 0), snapshot.term_doc_freq_cache_key_bytes);
     }
+}
+
+fn boundNativeSnapshotScenario(a: Allocator) !void {
+    const bytes = try buildTestSegmentWithIds(std.testing.allocator, &.{.{ .id = "one", .terms = &.{.{ .term = "common", .freq = 2, .norm = 2 }} }});
+    defer std.testing.allocator.free(bytes);
+    const State = struct {
+        const Self = @This();
+        bytes: []const u8,
+        closed: bool = false,
+        reads: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closed = true;
+        }
+        const Query = struct {
+            a: Allocator,
+            state: *Self,
+            fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.state.closed) return error.TestReadAfterClose;
+                try Self.read(self.state, offset, out);
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.a.destroy(self);
+            }
+        };
+        fn bind(raw: *anyopaque, alloc: Allocator, _: *anyopaque) !SegmentSource {
+            const bound_state: *@This() = @ptrCast(@alignCast(raw));
+            const query = try alloc.create(Query);
+            query.* = .{ .a = alloc, .state = bound_state };
+            return .{ .ranges = .{ .ptr = query, .length = bound_state.bytes.len, .read_into = Query.read, .close = Query.close } };
+        }
+    };
+    var state: State = .{ .bytes = bytes };
+    var writer = try IndexWriter.init(a);
+    var writer_open = true;
+    defer if (writer_open) writer.deinit();
+    try writer.addSegmentWithIdData(1, .fromNative(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close, .bind_read_context = State.bind } }));
+    const admission_reads = state.reads;
+    const bound = try writer.acquireSnapshotWithReadContext(&state);
+    var bound_open = true;
+    defer if (bound_open) bound.release();
+    try std.testing.expectEqual(admission_reads, state.reads);
+    try std.testing.expect(bound.segments[0].reader.fields.ptr == writer.snapshot().segments[0].reader.fields.ptr);
+    var composed = try IndexWriter.init(a);
+    defer composed.deinit();
+    try composed.shareImmutableSegments(&.{.{ .snapshot = bound, .ordinal = 0, .target_id = 2 }});
+    try std.testing.expect(composed.snapshot().segments[0].query_source == null);
+    const rebound = try composed.acquireSnapshotWithReadContext(&state);
+    defer rebound.release();
+    writer.deinit();
+    writer_open = false;
+    bound.release();
+    bound_open = false;
+    try std.testing.expect(!state.closed);
+    var footer: [4]u8 = undefined;
+    try rebound.segments[0].query_source.?.readInto(bytes.len - 4, &footer);
+    try std.testing.expectEqualSlices(u8, bytes[bytes.len - 4 ..], &footer);
+}
+
+test "external lake query-bound native snapshots retain their source and unwind every allocation failure" {
+    try boundNativeSnapshotScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, boundNativeSnapshotScenario, .{});
+}
+
+test "external lake query scoring caches share only the exact immutable generation" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "one", .terms = &.{.{ .term = "common", .freq = 2, .norm = 2 }} }});
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    var context: u8 = 0;
+    const first = try writer.acquireSnapshotWithReadContext(&context);
+    defer first.release();
+    try std.testing.expectEqual(@as(u32, 1), try first.termDocFreq(a, "body", "common"));
+    const table = (try first.bm25BoundTable(2, .{})).?;
+    const second = try writer.acquireSnapshotWithReadContext(&context);
+    defer second.release();
+    try std.testing.expectEqual(table, (try second.bm25BoundTable(2, .{})).?);
+    const owner = first.scoringCache();
+    try std.testing.expectEqual(@as(u64, 1), owner.term_doc_freq_cache_misses);
+    try std.testing.expectEqual(@as(u32, 1), try second.termDocFreq(a, "body", "common"));
+    try std.testing.expectEqual(@as(u64, 1), owner.term_doc_freq_cache_hits);
+    // Publishing a changed corpus must not inherit the old frequency cache.
+    try writer.addSegment(bytes);
+    const changed = try writer.acquireSnapshotWithReadContext(&context);
+    defer changed.release();
+    try std.testing.expect(changed.scoringCache() != owner);
+    try std.testing.expectEqual(@as(u32, 2), try changed.termDocFreq(a, "body", "common"));
+    try std.testing.expectEqual(@as(u32, 1), try first.termDocFreq(a, "body", "common"));
 }

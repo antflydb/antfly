@@ -88,15 +88,27 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.private_digests = metadata.private_digests;
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
+    owner.hydration_fields = try owner.planHydration(effective);
+    owner.typed_delivery = canDeliverTypedSource(effective);
+    var execution_req = effective;
+    // Retrieval/ranking for these requests needs identities and scores only.
+    // Hydrate the final page once, after all result movement, into owned values.
+    if (owner.typed_delivery) execution_req.include_stored = false;
     const started = @import("antfly_platform").time.monotonicNs();
-    var result = if (effective.full_text_queries.len != 0 or effective.sparse_queries.len != 0 or effective.dense_queries.len != 0)
-        try search.searchComposed(a, effective, .{ .ctx = &owner, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
-    else if (effective.dense) |dense| try Execution.searchDense(&owner, a, effective, dense) else if (effective.sparse) |sparse| try Execution.searchSparse(&owner, a, effective, sparse) else if (effective.full_text) |text| try Execution.searchText(&owner, a, effective, text) else try Execution.dispatchText(&owner, a, effective);
+    var result = if (execution_req.full_text_queries.len != 0 or execution_req.sparse_queries.len != 0 or execution_req.dense_queries.len != 0)
+        try search.searchComposed(a, execution_req, .{ .ctx = &owner, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
+    else if (execution_req.dense) |dense| try Execution.searchDense(&owner, a, execution_req, dense) else if (execution_req.sparse) |sparse| try Execution.searchSparse(&owner, a, execution_req, sparse) else if (execution_req.full_text) |text| try Execution.searchText(&owner, a, execution_req, text) else try Execution.dispatchText(&owner, a, execution_req);
     defer result.deinit();
+    if (!owner.typed_delivery) try owner.attachHighlights(a, effective, &result);
     try context.ensureActive();
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
     try @import("table_reads.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
+    if (owner.typed_delivery) {
+        if (!effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, result.hits);
+        try owner.attachHighlights(a, effective, &result);
+    }
+    meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms);
     return try local.api_query.encodeQueryResponses(a, table.name, effective, meta, result);
 }
 const Execution = struct {
@@ -109,6 +121,8 @@ const Execution = struct {
     context: Context,
     request: local.api_operation.RequestContext,
     schema_json: []const u8,
+    hydration_fields: ?[]const []const u8 = null,
+    typed_delivery: bool = false,
     arena: A,
     result_allocator: A = std.heap.page_allocator,
     files: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -174,6 +188,90 @@ const Execution = struct {
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.InvalidNativeLakeTextCorpus;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
         return try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation);
+    }
+    fn attachHighlights(self: *Execution, a: A, req: types.SearchRequest, result: *types.SearchResult) !void {
+        const options = req.highlight orelse return;
+        if (req.defer_hierarchy_child_hydration or result.hits.len == 0) return;
+        if (req.full_text == null and req.full_text_queries.len == 0) return;
+        try self.context.ensureActive();
+        var pins: std.ArrayList(search.PinnedTextSource) = .empty;
+        defer {
+            for (pins.items) |*pin| pin.deinit();
+            pins.deinit(a);
+        }
+        var queries: std.ArrayList(search.HighlightQuery) = .empty;
+        defer queries.deinit(a);
+        if (req.full_text_queries.len != 0) {
+            for (req.full_text_queries) |named| {
+                var pin = (try acquire(self, named.index_name)) orelse continue;
+                pins.append(a, pin) catch |err| {
+                    pin.deinit();
+                    return err;
+                };
+                try queries.append(a, .{ .query = named.query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
+            }
+        } else if (req.full_text) |query| {
+            var pin = (try acquire(self, req.primary_text_index_name orelse req.index_name)) orelse return;
+            pins.append(a, pin) catch |err| {
+                pin.deinit();
+                return err;
+            };
+            try queries.append(a, .{ .query = query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
+        }
+        if (queries.items.len == 0) return;
+        // Highlight the original source even when result shaping projected it
+        // away. Hydration keeps the same snapshot, deletes and reader lease.
+        var sources: ?[]?[]u8 = null;
+        defer if (sources) |items| {
+            for (items) |bytes| if (bytes) |owned| a.free(owned);
+            a.free(items);
+        };
+        if (!self.typed_delivery and (!req.include_stored or (!req.include_all_fields and !req.defer_stored_projection))) {
+            const keys = try a.alloc([]const u8, result.hits.len);
+            defer a.free(keys);
+            for (result.hits, keys) |hit, *key| key.* = hit.id;
+            sources = try loadManySelected(self, a, keys, self.hydration_fields);
+        }
+        try search.attachHighlightsWithIndexQueries(a, options, queries.items, result.hits, sources);
+        try self.context.ensureActive();
+    }
+    fn hydrateTyped(self: *Execution, a: A, hits: []types.SearchHit) !void {
+        const keys = try a.alloc([]const u8, hits.len);
+        defer a.free(keys);
+        for (hits, keys) |hit, *key| key.* = hit.id;
+        const values = try loadSelected(std.json.Value, self, a, keys, self.hydration_fields);
+        defer {
+            for (values) |*value| if (value.*) |*owned| types.deinitJsonValue(a, owned);
+            a.free(values);
+        }
+        for (hits, values) |*hit, *value| {
+            std.debug.assert(hit.stored_data == null and hit.source_value == null);
+            hit.source_value = value.* orelse return error.StoredDocMissing;
+            value.* = null;
+        }
+    }
+    fn planHydration(self: *Execution, req: types.SearchRequest) !?[]const []const u8 {
+        const projected = (try projectionColumns(self.arena, self.table, req)) orelse return null;
+        var fields: std.ArrayList([]const u8) = .empty;
+        try fields.appendSlice(self.arena, projected);
+        for (req.order_by) |order| try appendHydrationPath(self.arena, self.table, &fields, order.field);
+        const options = req.highlight orelse return fields.items;
+        if (req.full_text == null and req.full_text_queries.len == 0) return fields.items;
+        try appendHydrationPath(self.arena, self.table, &fields, "_type");
+        if (options.fields.len != 0) {
+            for (options.fields) |path| try appendHydrationPath(self.arena, self.table, &fields, path);
+        } else if (req.full_text_queries.len != 0) {
+            for (req.full_text_queries) |named| {
+                var pin = (try acquire(self, named.index_name)) orelse continue;
+                defer pin.deinit();
+                if (!try appendIndexHydration(self.arena, self.table, &fields, pin)) return null;
+            }
+        } else {
+            var pin = (try acquire(self, req.primary_text_index_name orelse req.index_name)) orelse return fields.items;
+            defer pin.deinit();
+            if (!try appendIndexHydration(self.arena, self.table, &fields, pin)) return null;
+        }
+        return fields.items;
     }
     fn noLocal(_: ?*anyopaque, _: ?[]const u8) !?*local.storage_db_catalog_index_manager.IndexManager.TextIndex {
         return null;
@@ -333,12 +431,17 @@ const Execution = struct {
         return loadManySelected(raw, a, keys, null);
     }
     fn loadManySelected(raw: ?*anyopaque, a: A, keys: []const []const u8, selected_fields: ?[]const []const u8) ![]?[]u8 {
+        return loadSelected([]u8, raw, a, keys, selected_fields);
+    }
+    fn loadSelected(comptime T: type, raw: ?*anyopaque, a: A, keys: []const []const u8, selected_fields: ?[]const []const u8) ![]?T {
         const self = from(raw);
         try self.context.ensureActive();
-        const result = try a.alloc(?[]u8, keys.len);
+        const result = try a.alloc(?T, keys.len);
         @memset(result, null);
         errdefer {
-            for (result) |value| if (value) |bytes| a.free(bytes);
+            for (result) |*value| if (value.*) |*owned| {
+                if (T == std.json.Value) types.deinitJsonValue(a, owned) else a.free(owned.*);
+            };
             a.free(result);
         }
         var first: usize = 0;
@@ -357,6 +460,12 @@ const Execution = struct {
                 const file = self.files.get(key[6..70]) orelse return error.ExternalLakeSnapshotMismatch;
                 ref.* = .{ .external = .{ .source_id = self.source.inventory.source_id, .snapshot_id = self.source.inventory.snapshot_id, .file_id = file, .row_group_ordinal = std.fmt.parseUnsigned(u32, key[71..79], 16) catch return error.ExternalLakeSnapshotMismatch, .row_ordinal = std.fmt.parseUnsigned(u64, key[80..96], 16) catch return error.ExternalLakeSnapshotMismatch } };
             }
+            var by_key: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
+            for (canonical, first..) |key, position| {
+                const entry = try by_key.getOrPut(ca, key);
+                if (!entry.found_existing) entry.value_ptr.* = .empty;
+                try entry.value_ptr.append(ca, position);
+            }
             const fields = if (selected_fields) |selected| selected else all: {
                 const all_fields = try ca.alloc([]const u8, self.table.columns.len);
                 for (all_fields, self.table.columns) |*field, column| field.* = column.path;
@@ -369,10 +478,13 @@ const Execution = struct {
             while (true) {
                 const page = try cursor.next(cursor.ptr, a, 256);
                 defer page.deinit();
-                for (page.rows) |row| for (canonical, first..) |key, position| if (std.mem.eql(u8, row.id, key)) {
-                    if (result[position] != null) return error.InvalidSqlBackendResponse;
-                    result[position] = try std.json.Stringify.valueAlloc(a, row.value, .{});
-                };
+                for (page.rows) |row| {
+                    const positions = by_key.get(row.id) orelse return error.InvalidSqlBackendResponse;
+                    for (positions.items) |position| {
+                        if (result[position] != null) return error.InvalidSqlBackendResponse;
+                        result[position] = if (T == std.json.Value) try types.cloneJsonValue(a, row.value) else try std.json.Stringify.valueAlloc(a, row.value, .{});
+                    }
+                }
                 if (page.after == null) break;
             }
         }
@@ -381,7 +493,7 @@ const Execution = struct {
     }
     fn loadProjected(raw: ?*anyopaque, a: A, req: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
         const self = from(raw);
-        const fields = try projectionColumns(self.arena, self.table, req);
+        const fields = self.hydration_fields;
         const result = try loadManySelected(raw, a, keys, fields);
         errdefer {
             for (result) |bytes| if (bytes) |value| a.free(value);
@@ -398,6 +510,9 @@ const Execution = struct {
         return null;
     }
     fn project(raw: ?*anyopaque, a: A, req: types.SearchRequest, key: []const u8, bytes: []const u8) ![]u8 {
+        // Match the local DB contract: highlighting and other postprocessing
+        // consume original source; the public encoder applies deferred fields.
+        if (req.defer_stored_projection) return a.dupe(u8, bytes);
         return local.storage_db_query_projection.projectStoredBytesForSearch(a, req, key, bytes, .{ .ctx = raw, .load_chunks = absent, .load_embeddings = absent, .load_artifacts = absent });
     }
     fn visible(raw: ?*anyopaque, _: A, _: types.SearchHit) !bool {
@@ -415,10 +530,32 @@ const Execution = struct {
     }
 };
 
+/// Late hydration is an explicit dependency contract: source-dependent
+/// operators keep the encoded provider path. Independent native retrieval
+/// hands owned typed sources directly to highlights and the public encoder.
+fn canDeliverTypedSource(req: types.SearchRequest) bool {
+    for (req.order_by) |order| if (!std.mem.eql(u8, order.field, "_score") and !std.mem.eql(u8, order.field, "_id")) return false;
+    return !requiresEncodedSource(req) and req.search_after.len == 0 and req.search_before.len == 0 and
+        req.evaluation_limit == 0 and req.pruner == null and req.return_mode == .parent and !req.hierarchy_grouped_matches and req.hierarchy_group_level == .source and
+        req.hierarchy_children == null and !req.defer_hierarchy_child_hydration and !req.hierarchy_include_source and !req.hierarchy_include_unit and
+        req.hierarchy_match_include_all_fields and req.hierarchy_source_include_all_fields and req.hierarchy_unit_include_all_fields;
+}
+
+fn requiresEncodedSource(req: types.SearchRequest) bool {
+    return req.hasHitEvaluation() or req.reranker != null or req.defer_hierarchy_child_hydration or
+        req.hierarchy_children != null or req.hierarchy_include_source or req.hierarchy_include_unit or
+        !req.hierarchy_match_include_all_fields or !req.hierarchy_source_include_all_fields or !req.hierarchy_unit_include_all_fields or
+        req.doc_filter_bindings.len != 0 or req.query != .match_all or req.filter_query_json.len != 0 or
+        req.exclusion_query_json.len != 0 or req.authorization_filter_query_json.len != 0;
+}
+
 /// Compile public include patterns to physical dependencies once per hydration
 /// call. Exclusion-only projections still mean the complete source document.
 fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequest) !?[]const []const u8 {
-    if (req.defer_stored_projection) return null;
+    // Deferred wire projection does not require unrelated physical columns.
+    // Consumers without an explicit dependency contract retain full source.
+    if (requiresEncodedSource(req)) return null;
+    if (!req.include_stored) return &.{};
     if (req.fields.len == 0) return if (req.include_all_fields) null else &.{};
     var positive = false;
     for (req.fields) |field| if (field.len == 0 or field[0] != '-') {
@@ -435,6 +572,34 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
     };
     return names.items;
 }
+fn appendHydrationPath(a: A, table: local.sql_catalog.Table, fields: *std.ArrayList([]const u8), path: []const u8) !void {
+    for (table.columns) |column| {
+        if (!projectionMayUse(path, column.path)) continue;
+        const present = for (fields.items) |field| {
+            if (std.mem.eql(u8, field, column.path)) break true;
+        } else false;
+        if (!present) try fields.append(a, column.path);
+    }
+}
+fn appendIndexHydration(a: A, table: local.sql_catalog.Table, fields: *std.ArrayList([]const u8), pin: search.PinnedTextSource) !bool {
+    if (pin.selected_field) |path| {
+        try appendHydrationPath(a, table, fields, path);
+        return true;
+    }
+    if (pin.runtime_schema) |schema| if (schema.full_text_documents.len != 0) {
+        if (schema.dynamic_templates.len != 0) return false;
+        for (schema.full_text_documents) |document| {
+            for (document.fields) |field| try appendHydrationPath(a, table, fields, field.path);
+            for (document.dynamic_rules) |rule| try appendHydrationPath(a, table, fields, rule.parent_path);
+            for (document.open_dynamic_paths) |path| try appendHydrationPath(a, table, fields, path);
+            for (document.infer_type_dynamic_paths) |path| try appendHydrationPath(a, table, fields, path);
+        }
+        return true;
+    };
+    // Schema-less text extraction can depend on any source field.
+    return false;
+}
+
 fn projectionMayUse(pattern: []const u8, path: []const u8) bool {
     var patterns = std.mem.tokenizeScalar(u8, pattern, '.');
     var parts = std.mem.tokenizeScalar(u8, path, '.');
@@ -459,8 +624,62 @@ test "external lake hydration projection narrows includes and retains exclusion 
     try std.testing.expect((try projectionColumns(arena.allocator(), table, .{ .fields = &.{"-body"} })) == null);
     try std.testing.expect((try projectionColumns(arena.allocator(), table, .{})) == null);
     try std.testing.expectEqual(@as(usize, 0), (try projectionColumns(arena.allocator(), table, .{ .include_all_fields = false })).?.len);
-    try std.testing.expect((try projectionColumns(arena.allocator(), table, .{ .fields = &.{"amount"}, .defer_stored_projection = true })) == null);
+    try std.testing.expectEqualSlices([]const u8, &.{"amount"}, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{"amount"}, .defer_stored_projection = true })).?);
     try std.testing.expect(projectionMayUse("*", "body"));
     try std.testing.expect(projectionMayUse("nested", "nested.value"));
     try std.testing.expect(!projectionMayUse("different.*", "nested.value"));
+}
+
+test "external lake deferred search projection retains highlight fields until public encoding" {
+    const a = std.testing.allocator;
+    const raw = "{\"body\":\"a needle in the source\",\"label\":\"row\"}";
+    var req: types.SearchRequest = .{ .fields = &.{"label"}, .include_all_fields = false, .defer_stored_projection = true };
+    const deferred = try Execution.project(null, a, req, "row", raw);
+    defer a.free(deferred);
+    try std.testing.expectEqualStrings(raw, deferred);
+    req.defer_stored_projection = false;
+    const projected = try Execution.project(null, a, req, "row", raw);
+    defer a.free(projected);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, projected, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("row", parsed.value.object.get("label").?.string);
+    try std.testing.expect(parsed.value.object.get("body") == null);
+}
+
+test "external lake hydration unions returned and highlight fields without unrelated columns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var owner: Execution = undefined;
+    owner.arena = arena.allocator();
+    owner.table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "label", .path = "label", .type = .string },
+        .{ .name = "body", .path = "body", .type = .string },
+        .{ .name = "unrelated", .path = "unrelated", .type = .string },
+    } };
+    var req: types.SearchRequest = .{ .fields = &.{"label"}, .include_all_fields = false, .defer_stored_projection = true, .full_text = .{ .match = .{ .field = "body", .text = "needle" } }, .highlight = .{ .fields = &.{"body"} } };
+    try std.testing.expectEqualSlices([]const u8, &.{ "label", "body" }, (try owner.planHydration(req)).?);
+    req.include_stored = false;
+    try std.testing.expectEqualSlices([]const u8, &.{"body"}, (try owner.planHydration(req)).?);
+    req.include_stored = true;
+    req.highlight = null;
+    req.order_by = &.{.{ .field = "body" }};
+    try std.testing.expectEqualSlices([]const u8, &.{ "label", "body" }, (try owner.planHydration(req)).?);
+    req.filter_query_json = "{}";
+    try std.testing.expect((try owner.planHydration(req)) == null);
+}
+
+test "external lake typed delivery defers only source-independent native retrieval" {
+    var req: types.SearchRequest = .{ .full_text = .{ .match = .{ .field = "body", .text = "needle" } }, .fields = &.{"label"}, .highlight = .{ .fields = &.{"body"} } };
+    try std.testing.expect(canDeliverTypedSource(req));
+    req.filter_query_json = "{}";
+    try std.testing.expect(!canDeliverTypedSource(req));
+    req.filter_query_json = "";
+    req.order_by = &.{.{ .field = "amount" }};
+    try std.testing.expect(!canDeliverTypedSource(req));
+    req.order_by = &.{};
+    req.hierarchy_include_source = true;
+    try std.testing.expect(!canDeliverTypedSource(req));
+    req.hierarchy_include_source = false;
+    req.evaluation_limit = 1;
+    try std.testing.expect(!canDeliverTypedSource(req));
 }
