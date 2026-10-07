@@ -320,6 +320,35 @@ the test process's minidump (`POST /dump`), CPU/memory use and database size
 (`GET /ntdll`). These endpoints must remain private; dumps and logs can contain
 test data.
 
+The broader filesystem suite can be compiled directly with the overlay:
+
+```sh
+zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
+  --test-filter filesystem -femit-bin=/path/to/filesystem-test.exe \
+  lib/objectstore/src/filesystem.zig
+```
+
+Nested listing and prefix download pass after object-key normalization.
+CrossOver still fails the two open-reader replacement tests with `AccessDenied`;
+see the qualification report. They need native Windows execution.
+
+The existing rejected vector-block cleanup regression has a focused root:
+
+```sh
+zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
+  --test-filter 'owned staged base removes blocks after pre-CURRENT rejection' \
+  -femit-bin=/path/to/vector-cleanup-test.exe \
+  --dep antfly_source_root=root --dep antfly_hash --dep antfly_platform \
+  --dep antfly_runtime_fs --dep antfly_vectorindex --dep antfly_test_error_logs \
+  --dep antfly_vector -Mroot=pkg/antfly-embedded/src/local/windows_vector_test.zig \
+  -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
+  --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
+  --dep antfly_hash --dep antfly_platform --dep antfly_vector \
+  -Mantfly_vectorindex=lib/vectorindex/src/mod.zig \
+  -Mantfly_test_error_logs=pkg/antfly-embedded/src/local/test_error_logs.zig \
+  -Mantfly_vector=lib/vector/src/mod.zig
+```
+
 ## Prior native Windows qualification
 
 On a GCE `windows-2022` VM: `lite init`, `lite serve`, table creation, batch

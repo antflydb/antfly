@@ -152,6 +152,41 @@ with valid prefix/file size 2,150,400, zero tail bytes and no issue. Its native
 snapshot has the HTTP handler awaiting batch completion, idle executor
 workers, and metadata/maintenance threads waiting on the Lite store mutex.
 
+## Follow-up code review
+
+Review found the same executor reconstruction in HTTP SQL execution and the
+pgwire statement, stream and disconnect paths. They now use the imported
+durable executor and protect the completion join from caller cancellation.
+New dispatch regressions distinguish the raw and imported executors and reject
+an explicitly unavailable imported view without falling back to raw I/O.
+All 18 focused SQL/pgwire/imported-view tests pass on macOS. The production
+Windows ReleaseFast API archive builds successfully (14/14 steps). These SQL
+changes have not been rerun through the native Windows application.
+
+Two existing Windows object-store tests fail before path normalization:
+pagination returns no nested entries, and prefix download returns
+`InvalidObjectKey`. Directory walker paths are now converted to '/' object
+keys before prefix matching and download lookup. Both tests pass afterward.
+The Windows filesystem suite has eight passes and two remaining failures
+under CrossOver; the macOS filesystem suite has 14 passes and one Windows-only
+skip. No filesystem test is skipped to conceal these failures.
+
+Vector-block abort cleanup constructed a native Windows '\\' path while
+publication used a Lite-compatible '/' path, leaving rejected blocks behind.
+Cleanup now uses the publication path constructor. The existing
+`owned staged base removes blocks after pre-CURRENT rejection` regression
+fails under CrossOver with the original code and passes with the fix. It also
+passes on macOS. `windows_vector_test.zig` provides a focused test root.
+
+The two remaining CrossOver filesystem failures are `filesystem get pins
+metadata and body across atomic path replacement` and `filesystem GET keeps
+one generation when publication replaces or deletes the object`. Replacing a
+file while its reader remains open returns `AccessDenied`. Zig already requests
+`FILE_RENAME_POSIX_SEMANTICS`, whose [Windows contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information)
+allows existing readers to retain the replaced file. [Wine's implementation](https://github.com/wine-mirror/wine/blob/master/server/fd.c)
+rejects an open destination. These are observable Wine limitations; native
+Windows object-store snapshot/replacement behavior remains to be qualified.
+
 ## Cleanup
 
 The disposable VM, auto-delete boot disk, artifact bucket, service account,
