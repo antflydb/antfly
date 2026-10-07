@@ -70,6 +70,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "bounded admission",
         "runnable scheduler",
         "runnable execution",
+        "decision functions remote transport",
         "runnable metrics",
         "workload envelope",
         "workload deadline",

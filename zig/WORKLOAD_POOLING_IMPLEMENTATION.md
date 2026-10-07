@@ -1104,3 +1104,19 @@ latency is 0.0521 s and all thresholds pass. The
 pins commands, source/artifact hashes, logs and limits. This proves opt-in owner
 startup/shutdown across production archives, not later execution-port/inference
 lease bytes, CPU teams, sustained overload, completion stalls or defaults.
+
+### Remote provider resource waits (2026-10-07, native API gate passed)
+
+Decision provider remote HTTP calls now park a scheduled read parent's CPU grant
+while retaining operation/memory/deadline ownership. The SQL adapter reuses its
+read-fence resumption path; failed reacquisition or authority validation discards
+the response. Real HTTP tests verify another query and control work progress
+during the wait and successful, rejected, HTTP 429, shutdown and disconnected
+transport outcomes all retire charges. All 47 native steps and 25 focused tests
+pass; GNU also passes all 44 steps and 25 tests under two CPUs and 4 GiB
+without extra swap. The [resource wait receipt](qualification/workload-pooling/receipts/2026-10-07/provider-resource-waits/README.md)
+retains source hashes and full logs. The combined native API gate also passes
+all 50 steps and 85 tests (39 embedded, 46 coordinator), with no skips/leaks,
+including actual adapter callback wiring and the real transport fixture. Local inference grant transfer,
+backend CPU teams, background scheduling and default qualification are still
+required. Ordinary accepted writes do not attach the cancellable read callbacks.

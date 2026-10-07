@@ -163,7 +163,11 @@ pub const Adapter = struct {
                     .registry = &config.registry,
                     .io = self.server.embedding_provider_runtime.io,
                     .parallel_work = self.runnable == null and !self.serial_execution,
-                    .parent_execution = if (self.runnable != null) .{ .ptr = self, .checkpoint = checkpoint } else null,
+                    .parent_execution = if (self.runnable != null) .{
+                        .ptr = self,
+                        .checkpoint = checkpoint,
+                        .resource_wait = .{ .begin = spillWaitBegin, .end = spillWaitEnd },
+                    } else null,
                     .http = try self.server.embedding_provider_runtime.httpClient(),
                     .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation },
                     .secret_store = self.server.cfg.secret_store,
