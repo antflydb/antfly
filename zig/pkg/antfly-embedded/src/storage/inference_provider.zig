@@ -875,12 +875,17 @@ fn invokeLocalInferenceRoute(
             return inference_bridge.errorFromStatus(status);
         }
     }
-    try lifetime.check();
-    const owned_response = response_handle orelse return error.InferenceRuntimeResponseMissing;
+    const owned_response = response_handle orelse {
+        try lifetime.check();
+        return error.InferenceRuntimeResponseMissing;
+    };
     defer if (comptime inline_inference_codegen)
         inference_host.impl.linkedInferenceDestroyHttpResponse(owned_response)
     else
         functions.?.destroy_http_response(owned_response);
+    // The host has transferred ownership. Retire its response even if the
+    // original cancellation/deadline fence rejects publication to the caller.
+    try lifetime.check();
 
     var response: inference_connection_abi.InvokeResponse = .{
         .status = response_view.status,
