@@ -2250,6 +2250,7 @@ pub const MergeScratchOptions = struct {
     resource_manager: ?*@import("storage/resource_manager.zig").ResourceManager = null,
     external_sort_chunk_bytes: usize = 256 * 1024,
     external_sort_chunk_documents: usize = 1024,
+    external_sort_fan_in: usize = 4,
 };
 
 pub const MergeOptions = struct {
@@ -3167,7 +3168,31 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
     return metadata_length;
 }
 
+fn copyableSortedStoredBlockDocs(inputs: []const MergeInput, records: SortedRecords, position: usize, ref: MergeDocRef) !?u32 {
+    const count = (try copyableStoredBlockDocs(inputs[ref.input_idx], ref.doc_id)) orelse return null;
+    if (count > records.len - position) return null;
+    var buffer: [64]SortedMergeDoc = undefined;
+    var offset: usize = 0;
+    while (offset < count) {
+        const batch = try records.batch(position + offset, buffer[0..@min(buffer.len, count - offset)]);
+        for (batch, 0..) |record, i| if (record.ref.input_idx != ref.input_idx or record.ref.doc_id != ref.doc_id + offset + i) return null;
+        offset += batch.len;
+    }
+    return count;
+}
+
 fn writeMergedStoredFieldsInOrder(
+    alloc: Allocator,
+    sink: *SegmentSink,
+    inputs: []const MergeInput,
+    records_arg: anytype,
+    doc_count: u32,
+) !u64 {
+    return writeMergedStoredFieldsInOrderWithReuse(true, alloc, sink, inputs, records_arg, doc_count);
+}
+
+fn writeMergedStoredFieldsInOrderWithReuse(
+    comptime reuse_blocks: bool,
     alloc: Allocator,
     sink: *SegmentSink,
     inputs: []const MergeInput,
@@ -3180,7 +3205,7 @@ fn writeMergedStoredFieldsInOrder(
     try rejectMixedStoredFieldModes(inputs);
     try sink.appendByte(stored_fields_version_block_compressed);
     try sinkAppendU32LE(sink, doc_count);
-    const num_blocks = try countStoredBlocksInOrder(inputs, records);
+    const num_blocks = try countStoredBlocksInOrder(reuse_blocks, inputs, records);
     try sinkAppendU32LE(sink, num_blocks);
     try sinkAppendU32LE(sink, stored_fields_block_doc_target);
     const id_bytes_len_pos = sink.len();
@@ -3217,6 +3242,17 @@ fn writeMergedStoredFieldsInOrder(
 
     var record_iterator_2 = records.iterator();
     while (try record_iterator_2.next()) |record| {
+        if (reuse_blocks and chunk.items.len == 0) {
+            if (try copyableSortedStoredBlockDocs(inputs, records, record_iterator_2.position - 1, record.ref)) |count| {
+                const copied = (try copyMergedStoredBlockIfPossible(sink, inputs[record.ref.input_idx], record.ref.doc_id, block_idx, &table, block_offsets_start, block_checksums_start, data_start)) orelse return error.InvalidSegment;
+                if (copied != count) return error.InvalidSegment;
+                record_iterator_2.position += count - 1;
+                record_iterator_2.used = 0;
+                record_iterator_2.length = 0;
+                block_idx += 1;
+                continue;
+            }
+        }
         const stored = (try stored_cursor.get(inputs[record.ref.input_idx].reader, record.ref.doc_id)) orelse return error.InvalidSegment;
         if (chunk.items.len > 0 and (docs_in_block >= stored_fields_block_doc_target or chunk.items.len +| 4 +| stored.data.len > stored_fields_block_raw_target)) {
             try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, block_checksums_start, data_start, block_idx);
@@ -3238,13 +3274,22 @@ fn writeMergedStoredFieldsInOrder(
     return metadata_length;
 }
 
-fn countStoredBlocksInOrder(inputs: []const MergeInput, records_arg: anytype) !u32 {
+fn countStoredBlocksInOrder(comptime reuse_blocks: bool, inputs: []const MergeInput, records_arg: anytype) !u32 {
     const records = asSortedRecords(records_arg);
     var blocks: u32 = 0;
     var docs_in_block: u32 = 0;
     var raw_bytes: usize = 0;
     var record_iterator_1 = records.iterator();
     while (try record_iterator_1.next()) |record| {
+        if (reuse_blocks and raw_bytes == 0) {
+            if (try copyableSortedStoredBlockDocs(inputs, records, record_iterator_1.position - 1, record.ref)) |count| {
+                record_iterator_1.position += count - 1;
+                record_iterator_1.used = 0;
+                record_iterator_1.length = 0;
+                blocks += 1;
+                continue;
+            }
+        }
         const length = (try inputs[record.ref.input_idx].reader.storedDocLength(record.ref.doc_id)) orelse return error.InvalidSegment;
         const doc_raw_bytes = @as(usize, 4) +| length;
         if (raw_bytes > 0 and (docs_in_block >= stored_fields_block_doc_target or raw_bytes +| doc_raw_bytes > stored_fields_block_raw_target)) {
@@ -3507,14 +3552,15 @@ fn buildUnsortedMergePlanAlloc(
 
 /// Historical segments may advertise an index sort without physically sorted
 /// documents. Sort byte-bounded chunks, then binary-carry their coordinate
-/// runs. Extract source keys once into sequential scratch records; only two
-/// decoded heads survive a carry, and no document-sized heap table is retained.
+/// runs. Extract source keys once into sequential scratch records; carries
+/// retain up to four byte-bounded heads, with binary fallback for large keys.
 const ExternalCoordinateSort = struct {
-    const Range = struct { start: usize, end: usize, count: usize };
+    const Range = struct { start: usize, end: usize, count: usize, max_record_bytes: usize = 0 };
     allocator: Allocator,
     spool: *FileSortedPlan.Run,
     fields: []const SegmentIndexSortField,
-    levels: [64]?Range = @splat(null),
+    levels: [64][3]?Range = @splat(@splat(null)),
+    fan_in: usize = 4,
     const Cursor = struct {
         sorter: *ExternalCoordinateSort,
         range: Range,
@@ -3653,53 +3699,88 @@ const ExternalCoordinateSort = struct {
         try self.spool.appendSlice(&length);
         try self.spool.appendSlice(bytes);
     }
-    fn merge(self: *@This(), left: Range, right: Range) !Range {
+    fn merge(self: *@This(), ranges: []const Range) !Range {
+        var head_bytes: usize = 0;
+        for (ranges) |range| head_bytes +|= range.max_record_bytes;
+        if (ranges.len > 2 and head_bytes > 256 * 1024) {
+            var current = ranges[0];
+            for (ranges[1..]) |range| current = try self.merge(&.{ current, range });
+            return current;
+        }
         const start = self.spool.len();
-        var cursors: [2]Cursor = .{ Cursor.init(self, left), Cursor.init(self, right) };
-        defer for (&cursors) |*cursor| cursor.deinit();
-        for (&cursors) |*cursor| try cursor.next();
-        while (cursors[0].current != null or cursors[1].current != null) {
-            const selected: usize = if (cursors[0].current == null) 1 else if (cursors[1].current == null) 0 else if (sortedMergeRecordLessThan(self.fields, cursors[1].current.?, cursors[0].current.?)) 1 else 0;
-            try self.appendEncoded(cursors[selected].encoded);
-            try cursors[selected].next();
+        var cursors: [4]Cursor = undefined;
+        for (ranges, 0..) |range, i| cursors[i] = Cursor.init(self, range);
+        defer for (cursors[0..ranges.len]) |*cursor| cursor.deinit();
+        for (cursors[0..ranges.len]) |*cursor| try cursor.next();
+        while (true) {
+            var selected: ?usize = null;
+            for (cursors[0..ranges.len], 0..) |cursor, i| if (cursor.current) |record| {
+                if (selected == null or sortedMergeRecordLessThan(self.fields, record, cursors[selected.?].current.?)) selected = i;
+            };
+            const i = selected orelse break;
+            try self.appendEncoded(cursors[i].encoded);
+            try cursors[i].next();
         }
         try self.spool.seal(start);
-        const result = Range{ .start = start, .end = self.spool.len(), .count = try std.math.add(usize, left.count, right.count) };
-        self.spool.releaseRange(left.start);
-        self.spool.releaseRange(right.start);
+        var count: usize = 0;
+        var maximum: usize = 0;
+        for (ranges) |range| {
+            count = try std.math.add(usize, count, range.count);
+            maximum = @max(maximum, range.max_record_bytes);
+            self.spool.releaseRange(range.start);
+        }
         try self.spool.compact();
-        return result;
+        return .{ .start = start, .end = self.spool.len(), .count = count, .max_record_bytes = maximum };
     }
     fn push(self: *@This(), records: []SortedMergeRecord) !void {
         if (records.len == 0) return;
         std.sort.pdq(SortedMergeRecord, records, self.fields, sortedMergeRecordLessThan);
         const start = self.spool.len();
-        for (records) |record| try self.appendRecord(record);
+        var maximum: usize = 0;
+        for (records) |record| {
+            const before = self.spool.len();
+            try self.appendRecord(record);
+            maximum = @max(maximum, self.spool.len() - before);
+        }
         try self.spool.seal(start);
-        var range = Range{ .start = start, .end = self.spool.len(), .count = records.len };
-        for (&self.levels) |*slot| {
-            if (slot.*) |previous| {
-                slot.* = null;
-                range = try self.merge(previous, range);
-            } else {
+        var range = Range{ .start = start, .end = self.spool.len(), .count = records.len, .max_record_bytes = maximum };
+        for (&self.levels) |*level| {
+            for (level[0 .. self.fan_in - 1]) |*slot| if (slot.* == null) {
                 slot.* = range;
                 return;
+            };
+            var ranges: [4]Range = undefined;
+            for (level[0 .. self.fan_in - 1], 0..) |*slot, i| {
+                ranges[i] = slot.*.?;
+                slot.* = null;
             }
+            ranges[self.fan_in - 1] = range;
+            range = try self.merge(ranges[0..self.fan_in]);
         }
         return error.Overflow;
     }
     fn finish(self: *@This()) !?Range {
         var range: ?Range = null;
-        for (&self.levels) |*slot| if (slot.*) |previous| {
-            slot.* = null;
-            range = if (range) |current| try self.merge(previous, current) else previous;
-        };
+        for (&self.levels) |*level| {
+            var ranges: [4]Range = undefined;
+            var count: usize = 0;
+            for (level[0 .. self.fan_in - 1]) |*slot| if (slot.*) |previous| {
+                ranges[count] = previous;
+                count += 1;
+                slot.* = null;
+            };
+            if (range) |current| {
+                ranges[count] = current;
+                count += 1;
+            }
+            range = if (count == 0) null else if (count == 1) ranges[0] else try self.merge(ranges[0..count]);
+        }
         return range;
     }
 };
 
 fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fields: []const SegmentIndexSortField, scratch: MergeScratchOptions) !SortedMergePlan {
-    if (scratch.external_sort_chunk_bytes == 0 or scratch.external_sort_chunk_documents == 0) return error.InvalidSegment;
+    if (scratch.external_sort_chunk_bytes == 0 or scratch.external_sort_chunk_documents == 0 or scratch.external_sort_fan_in < 2 or scratch.external_sort_fan_in > 4) return error.InvalidSegment;
     const file = try FileSortedPlan.create(alloc, inputs, scratch);
     errdefer file.deinit();
     try file.enableUnordered();
@@ -3707,7 +3788,7 @@ fn buildExternalSortedMergePlan(alloc: Allocator, inputs: []const MergeInput, fi
     defer spool.deinit();
     var reads = TypedReadScope.init(alloc);
     defer reads.deinit();
-    var sorter = ExternalCoordinateSort{ .allocator = alloc, .spool = spool, .fields = fields };
+    var sorter = ExternalCoordinateSort{ .allocator = alloc, .spool = spool, .fields = fields, .fan_in = scratch.external_sort_fan_in };
     var chunk = std.ArrayListUnmanaged(SortedMergeRecord).empty;
     defer chunk.deinit(alloc);
     var chunk_payloads = @import("segment_source.zig").Scratch.init(alloc, scratch.external_sort_chunk_bytes);
@@ -8647,4 +8728,138 @@ test "wide interleaved stored cache retains all fitting blocks" {
     };
     try std.testing.checkAllAllocationFailures(a, Scenario.run, .{readers[0..]});
     std.debug.print("LITE_WIDE_CACHE sources=8 documents_per_source=32 decodes={d} distinct_blocks=8 cached_bytes={d} budget=1048576\n", .{ cache.decode_count, cache.live_bytes });
+}
+
+test "large positional output chunks remain bounded and preserve fixed chunk framing" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    var text = inverted.InvertedIndexBuilder.init(a, inverted.productionIndexConfig());
+    defer text.deinit();
+    var positions: [16384]u32 = undefined;
+    for (&positions, 0..) |*position, i| position.* = @intCast(i);
+    for (0..256) |doc| {
+        var name: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&name, "doc-{d:0>6}", .{(doc * 7919) % 256}), "{}");
+        try text.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 16384, .norm = 16384, .positions = &positions }});
+    }
+    const postings = try text.build();
+    defer a.free(postings);
+    try writer.addSection(try writer.addField("body"), .inverted_text, postings);
+    const fields = [_]SegmentIndexSortField{.{ .field = "_id", .desc = false }};
+    try writer.addIndexSortMetadata(&fields);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var source = try SegmentReader.init(a, bytes);
+    defer source.deinit();
+    var second = try SegmentReader.init(a, bytes);
+    defer second.deinit();
+    for ([_]bool{ false, true }) |sorted| {
+        const inputs = [_]MergeInput{ .{ .reader = &source }, .{ .reader = &second } };
+        const expected_docs: u32 = if (sorted) 256 else 512;
+        var output = MemorySegmentSink.init(a);
+        defer output.deinit();
+        var sink = output.sink();
+        var budget = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 10 * 1024 * 1024 };
+        try writeMergedSegmentToSinkWithOptions(budget.allocator(), &sink, inputs[0..if (sorted) 1 else 2], .{ .index_sort = if (sorted) &fields else &.{}, .scratch = .{ .io = std.testing.io, .directory = directory, .in_memory_plan_bytes = 0 } });
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        var merged = try SegmentReader.init(a, output.out.items);
+        defer merged.deinit();
+        const section = (try merged.getSection("body", .inverted_text)) orelse return error.TestExpectedEqual;
+        const index = try inverted.InvertedIndexReader.init(a, section);
+        const result = index.lookup("common") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(expected_docs, result.docFreq());
+        try std.testing.expectEqual(@as(u64, expected_docs) * 16384, index.total_field_len);
+        var iterator = try result.iterator(a);
+        defer iterator.deinit();
+        var count: u32 = 0;
+        while (try iterator.next()) |hit| {
+            try std.testing.expectEqual(count, hit.doc_id);
+            try std.testing.expectEqualSlices(u32, &positions, hit.positions);
+            count += 1;
+        }
+        try std.testing.expectEqual(expected_docs, count);
+        std.debug.print("LITE_LARGE_POSITION_CHUNK documents={d} positions_per_doc=16384 result=success budget=10485760 sorted={} peak={d}\n", .{ expected_docs, sorted, budget.peak });
+    }
+}
+
+test "multiway spill sorting reduces rewrite bytes with bounded view heads" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    const Spill = @import("spill_sort.zig");
+    var rewritten: [2]usize = undefined;
+    for ([_]usize{ 2, 4 }, 0..) |fan_in, trial| {
+        var budget = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 2 * 1024 * 1024 };
+        var sorter = try Spill.Sorter.init(budget.allocator(), .{ .io = std.testing.io, .directory = directory, .fan_in = fan_in });
+        const start = platform_time.monotonicNs();
+        for (0..65536) |i| {
+            const key = (i * 7919) % 65536;
+            var payload: [64]u8 = @splat('p');
+            std.mem.writeInt(u64, payload[0..8], key, .little);
+            try sorter.add(key, &payload);
+        }
+        const range = (try sorter.finish()).?;
+        rewritten[trial] = sorter.merged_bytes;
+        var cursor = Spill.Cursor.init(budget.allocator(), sorter.run, range);
+        var expected: u64 = 0;
+        while (try cursor.nextView()) |record| {
+            try std.testing.expectEqual(expected, record.key);
+            var payload: [8]u8 = undefined;
+            try record.payload.readInto(0, &payload);
+            try std.testing.expectEqual(expected, std.mem.readInt(u64, &payload, .little));
+            expected += 1;
+        }
+        try std.testing.expectEqual(@as(u64, 65536), expected);
+        cursor.deinit();
+        std.debug.print("LITE_MULTIWAY records=65536 fan_in={d} merged_bytes={d} peak={d} elapsed_ns={d}\n", .{ fan_in, sorter.merged_bytes, budget.peak, platform_time.monotonicNs() - start });
+        sorter.deinit();
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expect(rewritten[1] <= rewritten[0] / 2);
+}
+
+test "sorted intact stored blocks copy compressed bytes and reduce scratch" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    var body: [4092]u8 = @splat('b');
+    @memcpy(body[0..9], "{\"body\":\"");
+    @memcpy(body[4090..], "\"}");
+    for (0..2048) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d:0>6}", .{doc}), &body);
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const records = try a.alloc(SortedMergeDoc, 2048);
+    defer a.free(records);
+    for (records, 0..) |*record, i| record.* = .{ .ref = .{ .input_idx = 0, .doc_id = @intCast(i) } };
+    var baseline = MemorySegmentSink.init(a);
+    defer baseline.deinit();
+    var baseline_sink = baseline.sink();
+    var old = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 8 * 1024 * 1024 };
+    const old_start = platform_time.monotonicNs();
+    _ = try writeMergedStoredFieldsInOrderWithReuse(false, old.allocator(), &baseline_sink, &.{.{ .reader = &reader }}, records, 2048);
+    const old_ns = platform_time.monotonicNs() - old_start;
+    var copied = MemorySegmentSink.init(a);
+    defer copied.deinit();
+    var copied_sink = copied.sink();
+    var new = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 2 * 1024 * 1024 };
+    const new_start = platform_time.monotonicNs();
+    _ = try writeMergedStoredFieldsInOrder(new.allocator(), &copied_sink, &.{.{ .reader = &reader }}, records, 2048);
+    const new_ns = platform_time.monotonicNs() - new_start;
+    try std.testing.expectEqualSlices(u8, baseline.out.items, copied.out.items);
+    try std.testing.expectEqual(@as(usize, 0), old.live);
+    try std.testing.expectEqual(@as(usize, 0), new.live);
+    try std.testing.expect(new.peak < old.peak / 4);
+    std.debug.print("LITE_SORTED_STORED_COPY docs=2048 body_bytes=4092 old_peak={d} new_peak={d} old_allocations={d} new_allocations={d} old_ns={d} new_ns={d}\n", .{ old.peak, new.peak, old.alloc_calls, new.alloc_calls, old_ns, new_ns });
 }

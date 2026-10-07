@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Byte-bounded sorting of private variable-length records. Binary carries
-//! preserve logical run coordinates; only two records are decoded at a time.
+//! Byte-bounded sorting of private variable-length records. Multiway carries
+//! preserve logical run coordinates; payloads are copied in bounded windows.
 const std = @import("std");
 const Run = @import("postings_run.zig").Run;
 const Scratch = @import("segment_source.zig").Scratch;
@@ -26,6 +26,7 @@ pub const Options = struct {
     resource_manager: ?*@import("storage/resource_manager.zig").ResourceManager = null,
     chunk_bytes: usize = 256 * 1024,
     chunk_records: usize = 1024,
+    fan_in: usize = 4,
 };
 pub const Record = struct { key: u64, payload: []const u8 };
 pub const Range = struct { start: usize, end: usize, count: usize };
@@ -37,10 +38,13 @@ pub const Sorter = struct {
     chunk: std.ArrayListUnmanaged(Record) = .empty,
     payloads: Scratch,
     chunk_bytes: usize = 0,
-    levels: [64]?Range = @splat(null),
+    levels: [64][7]?Range = @splat(@splat(null)),
+    input_bytes: usize = 0,
+    merged_bytes: usize = 0,
+    merge_passes: usize = 0,
 
     pub fn init(allocator: Allocator, options: Options) !Sorter {
-        if (options.chunk_bytes == 0 or options.chunk_records == 0) return error.InvalidData;
+        if (options.chunk_bytes == 0 or options.chunk_records == 0 or options.fan_in < 2 or options.fan_in > 8) return error.InvalidData;
         return .{ .allocator = allocator, .options = options, .run = try Run.createWithResources(allocator, options.io, options.directory, options.resource_manager), .payloads = .init(allocator, options.chunk_bytes) };
     }
     pub fn deinit(self: *Sorter) void {
@@ -54,6 +58,7 @@ pub const Sorter = struct {
         const owned = try self.payloads.allocator().dupe(u8, payload);
         try self.chunk.append(self.allocator, .{ .key = key, .payload = owned });
         self.chunk_bytes = try std.math.add(usize, self.chunk_bytes, @sizeOf(Record) + payload.len);
+        self.input_bytes = try std.math.add(usize, self.input_bytes, try std.math.add(usize, 16, payload.len));
     }
     fn append(self: *Sorter, record: Record) !void {
         var header: [16]u8 = undefined;
@@ -75,44 +80,85 @@ pub const Sorter = struct {
         self.chunk.clearRetainingCapacity();
         self.payloads.reset();
         self.chunk_bytes = 0;
-        for (&self.levels) |*slot| {
-            if (slot.*) |previous| {
-                slot.* = null;
-                range = try self.merge(previous, range);
-            } else {
-                slot.* = range;
-                return;
+        for (&self.levels) |*level| {
+            for (level[0 .. self.options.fan_in - 1]) |*slot| {
+                if (slot.* == null) {
+                    slot.* = range;
+                    return;
+                }
             }
+            var ranges: [8]Range = undefined;
+            for (level[0 .. self.options.fan_in - 1], 0..) |*slot, i| {
+                ranges[i] = slot.*.?;
+                slot.* = null;
+            }
+            ranges[self.options.fan_in - 1] = range;
+            range = try self.merge(ranges[0..self.options.fan_in]);
         }
         return error.Overflow;
     }
-    fn merge(self: *Sorter, left: Range, right: Range) !Range {
+    fn merge(self: *Sorter, ranges: []const Range) !Range {
         const start = self.run.len();
-        var cursors = [_]Cursor{ Cursor.init(self.allocator, self.run, left), Cursor.init(self.allocator, self.run, right) };
-        defer for (&cursors) |*cursor| cursor.deinit();
-        var heads = [_]?Record{ try cursors[0].next(), try cursors[1].next() };
-        while (heads[0] != null or heads[1] != null) {
-            const selected: usize = if (heads[0] == null) 1 else if (heads[1] == null) 0 else if (heads[1].?.key < heads[0].?.key) 1 else 0;
-            try self.append(heads[selected].?);
-            heads[selected] = try cursors[selected].next();
+        var cursors: [8]Cursor = undefined;
+        var heads: [8]?RecordView = @splat(null);
+        for (ranges, 0..) |range, i| cursors[i] = Cursor.init(self.allocator, self.run, range);
+        defer for (cursors[0..ranges.len]) |*cursor| cursor.deinit();
+        for (cursors[0..ranges.len], 0..) |*cursor, i| heads[i] = try cursor.nextView();
+        var copied: [16 * 1024]u8 = undefined;
+        while (true) {
+            var selected: ?usize = null;
+            for (heads[0..ranges.len], 0..) |head, i| if (head) |record| {
+                if (selected == null or record.key < heads[selected.?].?.key) selected = i;
+            };
+            const i = selected orelse break;
+            const record = heads[i].?;
+            var header: [16]u8 = undefined;
+            std.mem.writeInt(u64, header[0..8], record.key, .little);
+            std.mem.writeInt(u64, header[8..16], record.payload.length, .little);
+            try self.run.appendSlice(&header);
+            var offset: usize = 0;
+            while (offset < record.payload.length) {
+                const take: usize = @intCast(@min(copied.len, record.payload.length - offset));
+                try record.payload.readInto(offset, copied[0..take]);
+                try self.run.appendSlice(copied[0..take]);
+                offset += take;
+            }
+            heads[i] = try cursors[i].nextView();
         }
         try self.run.seal(start);
-        const result = Range{ .start = start, .end = self.run.len(), .count = try std.math.add(usize, left.count, right.count) };
-        self.run.releaseRange(left.start);
-        self.run.releaseRange(right.start);
+        var count: usize = 0;
+        for (ranges) |range| {
+            count = try std.math.add(usize, count, range.count);
+            self.run.releaseRange(range.start);
+        }
+        const result = Range{ .start = start, .end = self.run.len(), .count = count };
+        self.merged_bytes = try std.math.add(usize, self.merged_bytes, result.end - result.start);
+        self.merge_passes += 1;
         try self.run.compact();
         return result;
     }
     pub fn finish(self: *Sorter) !?Range {
         try self.flush();
         var range: ?Range = null;
-        for (&self.levels) |*slot| if (slot.*) |previous| {
-            slot.* = null;
-            range = if (range) |current| try self.merge(previous, current) else previous;
-        };
+        for (&self.levels) |*level| {
+            var ranges: [8]Range = undefined;
+            var count: usize = 0;
+            for (level[0 .. self.options.fan_in - 1]) |*slot| if (slot.*) |previous| {
+                ranges[count] = previous;
+                count += 1;
+                slot.* = null;
+            };
+            if (range) |current| {
+                ranges[count] = current;
+                count += 1;
+            }
+            range = if (count == 0) null else if (count == 1) ranges[0] else try self.merge(ranges[0..count]);
+        }
         return range;
     }
 };
+
+pub const RecordView = struct { key: u64, payload: @import("segment_source.zig").View };
 
 pub const Cursor = struct {
     run: *Run,
@@ -127,8 +173,7 @@ pub const Cursor = struct {
         self.payloads.deinit();
         self.* = undefined;
     }
-    pub fn next(self: *Cursor) !?Record {
-        self.payloads.reset();
+    pub fn nextView(self: *Cursor) !?RecordView {
         if (self.remaining == 0) {
             if (self.position != self.range.end) return error.InvalidData;
             return null;
@@ -140,10 +185,16 @@ pub const Cursor = struct {
         self.position += 16;
         const length = std.math.cast(usize, std.mem.readInt(u64, header[8..16], .little)) orelse return error.InvalidData;
         if (length > self.range.end - self.position) return error.InvalidData;
-        const payload = try self.payloads.allocator().alloc(u8, length);
-        try view.readInto(self.position, payload);
+        const payload = try @import("segment_source.zig").View.init(view.source, view.offset + self.position, length);
         self.position += length;
         self.remaining -= 1;
         return .{ .key = std.mem.readInt(u64, header[0..8], .little), .payload = payload };
+    }
+    pub fn next(self: *Cursor) !?Record {
+        self.payloads.reset();
+        const record = (try self.nextView()) orelse return null;
+        const payload = try self.payloads.allocator().alloc(u8, @intCast(record.payload.length));
+        try record.payload.readInto(0, payload);
+        return .{ .key = record.key, .payload = payload };
     }
 };
