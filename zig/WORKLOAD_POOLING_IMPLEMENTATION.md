@@ -1049,3 +1049,17 @@ separate archive execution and whole-production startup/shutdown of the new
 wiring remain pending. Inference/background execution admission, inherited
 provider grants across the inference boundary, completion ownership, pressure
 qualification and automatic defaults remain required.
+
+### Shared owner GNU production and small clients (2026-10-07)
+
+Frozen f9e1e0c37d passes all 53 GNU AArch64 production build steps with pinned
+Nix/glibc Zig and seven independently compiled archives. Its explicit compiler
+scheduling budget is 26 GiB on the unchanged 23.43 GiB Docker VM. The exact
+artifact passes authenticated small-client qualification with a two-slot shared
+node owner: 32 HTTP/32 pgwire connections, held cursors/extended portals, recovery
+and clean SIGINT shutdown, under two CPUs and 2 GiB without extra swap. Control
+latency is 0.0521 s and all thresholds pass. The
+[production receipt](qualification/workload-pooling/receipts/2026-10-07/shared-node-owner-production/README.md)
+pins commands, source/artifact hashes, logs and limits. This proves opt-in owner
+startup/shutdown across production archives, not later execution-port/inference
+lease bytes, CPU teams, sustained overload, completion stalls or defaults.

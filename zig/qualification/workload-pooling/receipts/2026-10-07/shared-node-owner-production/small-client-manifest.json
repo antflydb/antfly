@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "name": "linux-shared-node-owner-small-f9e1e0c37d",
+  "http_connections": 32,
+  "pgwire_connections": 32,
+  "samples": 5,
+  "sample_interval_seconds": 0.2,
+  "recovery_seconds": 3,
+  "thresholds": {
+    "idle_rss_growth_bytes": 134217728,
+    "idle_thread_growth": 160,
+    "idle_fd_growth": 80,
+    "control_latency_seconds": 2,
+    "recovery_fd_growth": 8,
+    "recovery_rss_growth_bytes": 134217728
+  },
+  "pgwire_mode": "authenticated",
+  "held_cursors": 16,
+  "fixture_rows": 9,
+  "process_limits": {
+    "cpu_count": 2,
+    "max_fds": 512
+  },
+  "container_limits": {
+    "cpu_count": 2,
+    "memory_bytes": 2147483648,
+    "pids": 512
+  },
+  "configuration": {
+    "pgwire": {
+      "max_connections": 32
+    },
+    "admission": {
+      "query": {
+        "max_concurrent_requests": 4
+      },
+      "write": {
+        "max_concurrent_requests": 2
+      }
+    }
+  },
+  "candidate_configuration": {
+    "admission": {
+      "max_request_memory_bytes": 67108864,
+      "max_retained_memory_bytes": 67108864,
+      "query": {
+        "max_concurrent_requests": 4,
+        "waiting": {
+          "max_queued_requests": 4,
+          "max_queued_bytes": 1048576,
+          "max_wait_ms": 250
+        }
+      },
+      "runnable": {
+        "slots": 2,
+        "checkpoint_budget": 16
+      }
+    }
+  },
+  "extended_portals": 2
+}
