@@ -700,6 +700,10 @@ fn encoderLayer(
         total,
         H,
         if (resident_slots) modernBertLinearSlot(layer_idx, .qkv) else null,
+        if (!config.rope_interleaved and packed_row == null and row_segments == null and branches == null)
+            .{ .sequence = seq_len, .heads = num_heads, .theta = rope_theta }
+        else
+            null,
         &name_buf,
     );
     defer cb.free(qkv.q);
@@ -710,16 +714,16 @@ fn encoderLayer(
     // split-half rotation; the legacy checkpoint retains interleaved pairs.
     // rope_dim == head_dim: the full head dimension is rotated.
     const rope_positions: ?[]const i64 = if (packed_row) |row| row.positions else if (row_segments) |rows| rows.rope_positions else null;
-    const Q = if (rope_positions) |positions|
+    const Q = if (qkv.rotated) qkv.q else if (rope_positions) |positions|
         try ropeAtPositions(cb, allocator, qkv.q, positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
     else
         try cb.rope(qkv.q, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
-    defer cb.free(Q);
-    const K = if (rope_positions) |positions|
+    defer if (!qkv.rotated) cb.free(Q);
+    const K = if (qkv.rotated) qkv.k else if (rope_positions) |positions|
         try ropeAtPositions(cb, allocator, qkv.k, positions, num_heads, head_dim, rope_theta, config.rope_interleaved)
     else
         try cb.rope(qkv.k, seq_len, head_dim, head_dim, rope_theta, 1.0, 0, config.rope_interleaved);
-    defer cb.free(K);
+    defer if (!qkv.rotated) cb.free(K);
 
     if (capture) |c| try captureLayer(cb, allocator, c.keys, c.values, c.key_tensors, c.value_tensors, layer_idx, K, qkv.v, total, H);
     var joined: [2]?CT = .{ null, null };
@@ -835,6 +839,13 @@ const QkvProjection = struct {
     q: CT,
     k: CT,
     v: CT,
+    rotated: bool = false,
+};
+
+const QkvRope = struct {
+    sequence: usize,
+    heads: usize,
+    theta: f32,
 };
 
 fn projectQkv(
@@ -845,6 +856,7 @@ fn projectQkv(
     rows: usize,
     hidden_size: usize,
     slot: ?usize,
+    rope: ?QkvRope,
     name_buf: *[256]u8,
 ) !QkvProjection {
     if (config.checkpoint_layout == .huggingface_fused_qkv_no_bias) {
@@ -860,6 +872,12 @@ fn projectQkv(
             slot,
         );
         defer cb.free(qkv);
+        if (rope) |rotation| {
+            if (rotation.sequence == 0 or rotation.heads == 0 or rows % rotation.sequence != 0 or hidden_size % rotation.heads != 0) return error.InvalidShape;
+            if (try cb.splitQkvRope(qkv, rows / rotation.sequence, rotation.sequence, rotation.heads, hidden_size / rotation.heads, rotation.theta)) |parts| {
+                return .{ .q = parts.first, .k = parts.second, .v = parts.third, .rotated = true };
+            }
+        }
         // Use direct slices instead of splitLastDim3: Metal's generic split
         // has a GLiNER-only device gate, while sliceLastDim is device-resident
         // for every dense [rows, columns] ModernBERT activation.

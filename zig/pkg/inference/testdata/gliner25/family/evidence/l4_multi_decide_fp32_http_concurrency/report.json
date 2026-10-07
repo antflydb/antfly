@@ -1,0 +1,22 @@
+{
+  "status": "complete",
+  "qualification": false,
+  "scope": "real_loopback_http_correctness_and_admission_cleanup",
+  "model": "multi_decide",
+  "precision": "fp32",
+  "concurrency": [
+    1,
+    4,
+    16
+  ],
+  "distinct_requests": 16,
+  "serial_response_identity": true,
+  "admission_leases_released": true,
+  "leaks": 0,
+  "test": "GLiNER family CUDA typed decisions through concurrent HTTP sockets",
+  "raw_capture": {
+    "path": "test.log",
+    "sha256": "7c671d4831ac1246d4f18b318663def363620a087a9f210766d2459003c1ec77"
+  },
+  "note": "Debug test build, cold FP32 preload excluded from socket deadline; no serving performance claim."
+}

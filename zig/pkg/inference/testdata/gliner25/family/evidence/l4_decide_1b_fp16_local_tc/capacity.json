@@ -1,0 +1,3653 @@
+{
+  "model_id": "fastino/GLiNER2.5-Decide-1B",
+  "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+  "backend": "cuda",
+  "precision": "fp16",
+  "qualification": false,
+  "cases": [
+    {
+      "id": "tokens_128_batch_1",
+      "max_confidence_error": 2.384185791015625e-07,
+      "batch_size": 1,
+      "token_ids_sha256": "0f8aed0e267b4c0aa42b22fd322178ac8755914f1a8d575dcd1551cf7f6dd8de",
+      "decisions": [
+        {
+          "raw_logits": [
+            4.557917594909668,
+            -4.804130554199219,
+            -5.0695576667785645
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 4.557917594909668,
+                  "probability": 0.9998481273651123
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 33840,
+        "d2h_bytes": 48,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_128_batch_8",
+      "max_confidence_error": 0.0004177689552307129,
+      "batch_size": 8,
+      "token_ids_sha256": "407bff0b63660fdd895555815d0b5cf24939696607cd576fb35c371f161fb10c",
+      "decisions": [
+        {
+          "raw_logits": [
+            4.557917594909668,
+            -4.804130554199219,
+            -5.0695576667785645
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 4.557917594909668,
+                  "probability": 0.9998481273651123
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.1681073904037476,
+            1.0741064548492432,
+            -1.620690107345581
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 1.0741064548492432,
+                  "probability": 0.8519489765167236
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -3.987375497817993,
+            -4.561405181884766,
+            3.4162373542785645
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 3.4162373542785645,
+                  "probability": 0.9990487694740295
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            3.0635342597961426,
+            -3.5465104579925537,
+            -3.6424121856689453
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 3.0635342597961426,
+                  "probability": 0.9974362254142761
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.0597405433654785,
+            0.900564432144165,
+            -1.3478714227676392
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.900564432144165,
+                  "probability": 0.8023236989974976
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.5365138053894043,
+            -2.8982784748077393,
+            2.1990976333618164
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.1990976333618164,
+                  "probability": 0.9853286147117615
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2817258834838867,
+            -2.597123146057129,
+            -2.776066541671753
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2817258834838867,
+                  "probability": 0.9862269759178162
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8053041100502014,
+            0.591968297958374,
+            -1.0384520292282104
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.591968297958374,
+                  "probability": 0.6929441690444946
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 70016,
+        "d2h_bytes": 384,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_512_batch_1",
+      "max_confidence_error": 1.1920928955078125e-06,
+      "batch_size": 1,
+      "token_ids_sha256": "52e3f6113ace95eaa12216e41b5c542e4351f503d7beeff57bcf05acc56ab6f8",
+      "decisions": [
+        {
+          "raw_logits": [
+            3.469550848007202,
+            -3.913198232650757,
+            -4.347721576690674
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 3.469550848007202,
+                  "probability": 0.998976469039917
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 49200,
+        "d2h_bytes": 48,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_512_batch_8",
+      "max_confidence_error": 0.0005242228507995605,
+      "batch_size": 8,
+      "token_ids_sha256": "5738c2527882a071f739726374cd6bc02e0e1a719c9313e1f26ac01b58720c04",
+      "decisions": [
+        {
+          "raw_logits": [
+            3.469550848007202,
+            -3.913198232650757,
+            -4.347721576690674
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 3.469550848007202,
+                  "probability": 0.998976469039917
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8969157934188843,
+            0.5931960940361023,
+            -1.5335434675216675
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.5931960940361023,
+                  "probability": 0.7437306046485901
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -3.099733829498291,
+            -3.4943196773529053,
+            2.527815580368042
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.527815580368042,
+                  "probability": 0.9940142035484314
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.7150993347167969,
+            -2.107325553894043,
+            -2.6387412548065186
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.7150993347167969,
+                  "probability": 0.9664338231086731
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.9179579019546509,
+            0.6151537299156189,
+            -1.4721870422363281
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.6151537299156189,
+                  "probability": 0.7463357448577881
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.6099600791931152,
+            -1.9852848052978516,
+            1.2388532161712646
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.2388532161712646,
+                  "probability": 0.9109931588172913
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            0.8345487117767334,
+            -1.2371903657913208,
+            -1.8416038751602173
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 0.8345487117767334,
+                  "probability": 0.8369644284248352
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6912700533866882,
+            0.31590795516967773,
+            -1.2334703207015991
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.31590795516967773,
+                  "probability": 0.6338629126548767
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 512,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 192896,
+        "d2h_bytes": 384,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_2048_batch_1",
+      "max_confidence_error": 4.0531158447265625e-06,
+      "batch_size": 1,
+      "token_ids_sha256": "c2feb0aa17ac6520d1572df37ff13d5d7504c3eb10a265aa9da3a3034b718797",
+      "decisions": [
+        {
+          "raw_logits": [
+            2.6777775287628174,
+            -3.50232195854187,
+            -3.9777324199676514
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.6777775287628174,
+                  "probability": 0.9966541528701782
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 110640,
+        "d2h_bytes": 48,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_2048_batch_8",
+      "max_confidence_error": 0.0010877251625061035,
+      "batch_size": 8,
+      "token_ids_sha256": "1abd19b1c68b393b28898617a510f0c77b67f74583130ad8fcfe76467eaa1f2f",
+      "decisions": [
+        {
+          "raw_logits": [
+            2.6777775287628174,
+            -3.50232195854187,
+            -3.9777324199676514
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.6777775287628174,
+                  "probability": 0.9966541528701782
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.844810962677002,
+            0.07874921709299088,
+            -1.3759262561798096
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.07874921709299088,
+                  "probability": 0.6132791042327881
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.5626822710037231,
+            -1.7289823293685913,
+            0.6890941262245178
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 0.6890941262245178,
+                  "probability": 0.8373070955276489
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            0.658777117729187,
+            -1.4172215461730957,
+            -1.803267478942871
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 0.658777117729187,
+                  "probability": 0.8259742856025696
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.9553472995758057,
+            0.21789813041687012,
+            -1.4430137872695923
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.21789813041687012,
+                  "probability": 0.6669659614562988
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.1682387590408325,
+            -1.2876962423324585,
+            0.23542149364948273
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 0.23542149364948273,
+                  "probability": 0.6831874847412109
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            0.2428838461637497,
+            -1.077479362487793,
+            -1.4995280504226685
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 0.2428838461637497,
+                  "probability": 0.6934159398078918
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.7755701541900635,
+            -0.035407792776823044,
+            -1.2488372325897217
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": -0.035407792776823044,
+                  "probability": 0.563630223274231
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 2048,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 684416,
+        "d2h_bytes": 384,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_128_batch_32",
+      "max_confidence_error": 0.0004883408546447754,
+      "batch_size": 32,
+      "token_ids_sha256": "aa06229a329671c9c77e5f6dd19f15d3c6d52d2d42da9446bf5cc0caa10f0993",
+      "decisions": [
+        {
+          "raw_logits": [
+            4.557917594909668,
+            -4.804130554199219,
+            -5.0695576667785645
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 4.557917594909668,
+                  "probability": 0.9998481273651123
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.1681073904037476,
+            1.0741064548492432,
+            -1.620690107345581
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 1.0741064548492432,
+                  "probability": 0.8519489765167236
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -3.987375497817993,
+            -4.561405181884766,
+            3.4162373542785645
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 3.4162373542785645,
+                  "probability": 0.9990487694740295
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            3.0635342597961426,
+            -3.5465104579925537,
+            -3.6424121856689453
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 3.0635342597961426,
+                  "probability": 0.9974362254142761
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.0597405433654785,
+            0.900564432144165,
+            -1.3478714227676392
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.900564432144165,
+                  "probability": 0.8023236989974976
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.5365138053894043,
+            -2.8982784748077393,
+            2.1990976333618164
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.1990976333618164,
+                  "probability": 0.9853286147117615
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2817258834838867,
+            -2.597123146057129,
+            -2.776066541671753
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2817258834838867,
+                  "probability": 0.9862269759178162
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8053041100502014,
+            0.591968297958374,
+            -1.0384520292282104
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.591968297958374,
+                  "probability": 0.6929441690444946
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.4674103260040283,
+            -2.8068087100982666,
+            2.1790661811828613
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.1790661811828613,
+                  "probability": 0.9838363528251648
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.127267360687256,
+            -2.4020962715148926,
+            -2.4915950298309326
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.127267360687256,
+                  "probability": 0.9797663688659668
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.886090099811554,
+            0.6742448806762695,
+            -1.1188808679580688
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.6742448806762695,
+                  "probability": 0.7264776229858398
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.5417513847351074,
+            -2.925100326538086,
+            2.342372417449951
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.342372417449951,
+                  "probability": 0.9874374270439148
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.9839367866516113,
+            -2.1847758293151855,
+            -2.35691499710083
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.9839367866516113,
+                  "probability": 0.9722920060157776
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8142877817153931,
+            0.6018742322921753,
+            -1.1178923845291138
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.6018742322921753,
+                  "probability": 0.7033578753471375
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.257424831390381,
+            -2.660177230834961,
+            2.024458408355713
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.024458408355713,
+                  "probability": 0.9774667620658875
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2762887477874756,
+            -2.49174427986145,
+            -2.6443700790405273
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2762887477874756,
+                  "probability": 0.9844540953636169
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8797171115875244,
+            0.6424963474273682,
+            -1.1624078750610352
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.6424963474273682,
+                  "probability": 0.7232129573822021
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.361297845840454,
+            -2.7348458766937256,
+            2.144942283630371
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.144942283630371,
+                  "probability": 0.9817025661468506
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.0709896087646484,
+            -2.266629219055176,
+            -2.437614917755127
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.0709896087646484,
+                  "probability": 0.9764848351478577
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8026919364929199,
+            0.5692391991615295,
+            -1.088739037513733
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.5692391991615295,
+                  "probability": 0.6924534440040588
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.2890892028808594,
+            -2.6286075115203857,
+            2.0532445907592773
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.0532445907592773,
+                  "probability": 0.9782171249389648
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.0076498985290527,
+            -2.218425750732422,
+            -2.3304364681243896
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.0076498985290527,
+                  "probability": 0.9730739593505859
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6407766342163086,
+            0.38949859142303467,
+            -0.8904369473457336
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.38949859142303467,
+                  "probability": 0.6116343140602112
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.7151973247528076,
+            -2.0856003761291504,
+            1.584881067276001
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.584881067276001,
+                  "probability": 0.9413142800331116
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.1390538215637207,
+            -2.3505382537841797,
+            -2.5134623050689697
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.1390538215637207,
+                  "probability": 0.9796594977378845
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6565490365028381,
+            0.4016379117965698,
+            -0.9329407811164856
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.4016379117965698,
+                  "probability": 0.6209816336631775
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.0947675704956055,
+            -2.5153627395629883,
+            1.9232138395309448
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.9232138395309448,
+                  "probability": 0.9710605144500732
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2180683612823486,
+            -2.431706190109253,
+            -2.6254539489746094
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2180683612823486,
+                  "probability": 0.9828559756278992
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.7872308492660522,
+            0.5398916602134705,
+            -1.0385998487472534
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.5398916602134705,
+                  "probability": 0.6795668601989746
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.0513617992401123,
+            -2.386151075363159,
+            1.870224118232727
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.870224118232727,
+                  "probability": 0.9671337008476257
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.91231107711792,
+            -2.0694820880889893,
+            -2.2873263359069824
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.91231107711792,
+                  "probability": 0.9674423933029175
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6133178472518921,
+            0.35085397958755493,
+            -0.8612126708030701
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.35085397958755493,
+                  "probability": 0.5956349968910217
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 194048,
+        "d2h_bytes": 1536,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_128_batch_64",
+      "max_confidence_error": 0.0005553364753723145,
+      "batch_size": 64,
+      "token_ids_sha256": "ea03b849095a1657f3936ac573b378998fd37204940b39b68d620ffbc2f169b0",
+      "decisions": [
+        {
+          "raw_logits": [
+            4.557917594909668,
+            -4.804130554199219,
+            -5.0695576667785645
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 4.557917594909668,
+                  "probability": 0.9998481273651123
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.1681073904037476,
+            1.0741064548492432,
+            -1.620690107345581
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 1.0741064548492432,
+                  "probability": 0.8519489765167236
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -3.987375497817993,
+            -4.561405181884766,
+            3.4162373542785645
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 3.4162373542785645,
+                  "probability": 0.9990487694740295
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            3.0635342597961426,
+            -3.5465104579925537,
+            -3.6424121856689453
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 3.0635342597961426,
+                  "probability": 0.9974362254142761
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.0597405433654785,
+            0.900564432144165,
+            -1.3478714227676392
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.900564432144165,
+                  "probability": 0.8023236989974976
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.5365138053894043,
+            -2.8982784748077393,
+            2.1990976333618164
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.1990976333618164,
+                  "probability": 0.9853286147117615
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2817258834838867,
+            -2.597123146057129,
+            -2.776066541671753
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2817258834838867,
+                  "probability": 0.9862269759178162
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8053041100502014,
+            0.591968297958374,
+            -1.0384520292282104
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.591968297958374,
+                  "probability": 0.6929441690444946
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.4674103260040283,
+            -2.8068087100982666,
+            2.1790661811828613
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.1790661811828613,
+                  "probability": 0.9838363528251648
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.127267360687256,
+            -2.4020962715148926,
+            -2.4915950298309326
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.127267360687256,
+                  "probability": 0.9797663688659668
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.886090099811554,
+            0.6742448806762695,
+            -1.1188808679580688
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.6742448806762695,
+                  "probability": 0.7264776229858398
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.5417513847351074,
+            -2.925100326538086,
+            2.342372417449951
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.342372417449951,
+                  "probability": 0.9874374270439148
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.9839367866516113,
+            -2.1847758293151855,
+            -2.35691499710083
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.9839367866516113,
+                  "probability": 0.9722920060157776
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8142877817153931,
+            0.6018742322921753,
+            -1.1178923845291138
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.6018742322921753,
+                  "probability": 0.7033578753471375
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.257424831390381,
+            -2.660177230834961,
+            2.024458408355713
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.024458408355713,
+                  "probability": 0.9774667620658875
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2762887477874756,
+            -2.49174427986145,
+            -2.6443700790405273
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2762887477874756,
+                  "probability": 0.9844540953636169
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8797171115875244,
+            0.6424963474273682,
+            -1.1624078750610352
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.6424963474273682,
+                  "probability": 0.7232129573822021
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.361297845840454,
+            -2.7348458766937256,
+            2.144942283630371
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.144942283630371,
+                  "probability": 0.9817025661468506
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.0709896087646484,
+            -2.266629219055176,
+            -2.437614917755127
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.0709896087646484,
+                  "probability": 0.9764848351478577
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.8026919364929199,
+            0.5692391991615295,
+            -1.088739037513733
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.5692391991615295,
+                  "probability": 0.6924534440040588
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.2890892028808594,
+            -2.6286075115203857,
+            2.0532445907592773
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.0532445907592773,
+                  "probability": 0.9782171249389648
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.0076498985290527,
+            -2.218425750732422,
+            -2.3304364681243896
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.0076498985290527,
+                  "probability": 0.9730739593505859
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6407766342163086,
+            0.38949859142303467,
+            -0.8904369473457336
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.38949859142303467,
+                  "probability": 0.6116343140602112
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.7151973247528076,
+            -2.0856003761291504,
+            1.584881067276001
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.584881067276001,
+                  "probability": 0.9413142800331116
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.1390538215637207,
+            -2.3505382537841797,
+            -2.5134623050689697
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.1390538215637207,
+                  "probability": 0.9796594977378845
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6565490365028381,
+            0.4016379117965698,
+            -0.9329407811164856
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.4016379117965698,
+                  "probability": 0.6209816336631775
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.0947675704956055,
+            -2.5153627395629883,
+            1.9232138395309448
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.9232138395309448,
+                  "probability": 0.9710605144500732
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2180683612823486,
+            -2.431706190109253,
+            -2.6254539489746094
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2180683612823486,
+                  "probability": 0.9828559756278992
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.7872308492660522,
+            0.5398916602134705,
+            -1.0385998487472534
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.5398916602134705,
+                  "probability": 0.6795668601989746
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.0513617992401123,
+            -2.386151075363159,
+            1.870224118232727
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.870224118232727,
+                  "probability": 0.9671337008476257
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.91231107711792,
+            -2.0694820880889893,
+            -2.2873263359069824
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.91231107711792,
+                  "probability": 0.9674423933029175
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6133178472518921,
+            0.35085397958755493,
+            -0.8612126708030701
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.35085397958755493,
+                  "probability": 0.5956349968910217
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.5523678064346313,
+            -1.910244345664978,
+            1.4251986742019653
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.4251986742019653,
+                  "probability": 0.9203734993934631
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.982964277267456,
+            -2.1510026454925537,
+            -2.345053195953369
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.982964277267456,
+                  "probability": 0.9716162085533142
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.605385959148407,
+            0.34080082178115845,
+            -0.8643872141838074
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.34080082178115845,
+                  "probability": 0.5924682021141052
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.3539320230484009,
+            -1.645449161529541,
+            1.198127031326294
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.198127031326294,
+                  "probability": 0.8801746368408203
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.8824756145477295,
+            -2.0643012523651123,
+            -2.242110013961792
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.8824756145477295,
+                  "probability": 0.9657291173934937
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6364692449569702,
+            0.38096776604652405,
+            -0.8850871324539185
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.38096776604652405,
+                  "probability": 0.6084716320037842
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.88417387008667,
+            -2.2171483039855957,
+            1.6978784799575806
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.6978784799575806,
+                  "probability": 0.9544183611869812
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2572665214538574,
+            -2.5276756286621094,
+            -2.7296245098114014
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2572665214538574,
+                  "probability": 0.9850454926490784
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6758807897567749,
+            0.42777106165885925,
+            -0.9737770557403564
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.42777106165885925,
+                  "probability": 0.6337645053863525
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.7687710523605347,
+            -2.1631295680999756,
+            1.5706990957260132
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.5706990957260132,
+                  "probability": 0.9439688920974731
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.349452018737793,
+            -2.5465986728668213,
+            -2.795883893966675
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.349452018737793,
+                  "probability": 0.9868720769882202
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6591134667396545,
+            0.3907072842121124,
+            -0.9397175312042236
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.3907072842121124,
+                  "probability": 0.6194384098052979
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.0074894428253174,
+            -2.3990979194641113,
+            1.7585123777389526
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.7585123777389526,
+                  "probability": 0.9626591801643372
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.211071014404297,
+            -2.419651746749878,
+            -2.6811795234680176
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.211071014404297,
+                  "probability": 0.9830403923988342
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6575037837028503,
+            0.38490504026412964,
+            -0.9199889898300171
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.38490504026412964,
+                  "probability": 0.6158372759819031
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.7804672718048096,
+            -2.059068441390991,
+            1.5301556587219238
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.5301556587219238,
+                  "probability": 0.9397497177124023
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.9724159240722656,
+            -2.1242125034332275,
+            -2.328205108642578
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.9724159240722656,
+                  "probability": 0.9706958532333374
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.5657991170883179,
+            0.2859642207622528,
+            -0.8238787651062012
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.2859642207622528,
+                  "probability": 0.569387674331665
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.5873256921768188,
+            -1.927211046218872,
+            1.3758186101913452
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.3758186101913452,
+                  "probability": 0.9187564253807068
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2185659408569336,
+            -2.4041025638580322,
+            -2.6013541221618652
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2185659408569336,
+                  "probability": 0.9824205636978149
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.5796598792076111,
+            0.30998262763023376,
+            -0.8863824009895325
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.30998262763023376,
+                  "probability": 0.5837392807006836
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.6486619710922241,
+            -1.9636948108673096,
+            1.3530714511871338
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.3530714511871338,
+                  "probability": 0.9208350777626038
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.2749154567718506,
+            -2.422104597091675,
+            -2.62800931930542
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.2749154567718506,
+                  "probability": 0.9837221503257751
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.649968147277832,
+            0.36697667837142944,
+            -0.925197184085846
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.36697667837142944,
+                  "probability": 0.6111082434654236
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.983612298965454,
+            -2.3221116065979004,
+            1.6804405450820923
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.6804405450820923,
+                  "probability": 0.9579485654830933
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.5981481075286865,
+            -2.7517471313476562,
+            -3.0017294883728027
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.5981481075286865,
+                  "probability": 0.9916236996650696
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.6537951231002808,
+            0.4004681706428528,
+            -0.9975778460502625
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.4004681706428528,
+                  "probability": 0.6267516613006592
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.8283442258834839,
+            -2.2249364852905273,
+            1.5114221572875977
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 1.5114221572875977,
+                  "probability": 0.9440321326255798
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.7114269733428955,
+            -2.788832187652588,
+            -3.0643186569213867
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.7114269733428955,
+                  "probability": 0.9928638339042664
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -0.7101612687110901,
+            0.47495922446250916,
+            -1.0696845054626465
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.47495922446250916,
+                  "probability": 0.6582857370376587
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -2.336376667022705,
+            -2.824335813522339,
+            2.0104007720947266
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.0104007720947266,
+                  "probability": 0.9795305132865906
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            2.4685516357421875,
+            -2.711310386657715,
+            -2.9359781742095947
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.4685516357421875,
+                  "probability": 0.9899764657020569
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 128,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 359424,
+        "d2h_bytes": 3072,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_4096_batch_1",
+      "max_confidence_error": 1.0848045349121094e-05,
+      "batch_size": 1,
+      "token_ids_sha256": "13e90b39c37c795f6281cd9d0ac238a18266dcf27cd7e5c7850b9060e5b602a5",
+      "decisions": [
+        {
+          "raw_logits": [
+            1.0958008766174316,
+            -2.4973669052124023,
+            -2.803834915161133
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.0958008766174316,
+                  "probability": 0.954416811466217
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 4096,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 192560,
+        "d2h_bytes": 48,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "tokens_7999_batch_1",
+      "max_confidence_error": 0.0001195073127746582,
+      "batch_size": 1,
+      "token_ids_sha256": "70d8f1f44348c7c931c23717aac0ab7f3bdc115cc6209041aff97ed2ffc0739b",
+      "decisions": [
+        {
+          "raw_logits": [
+            -0.9276772737503052,
+            -1.6512023210525513,
+            -1.607522964477539
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": -0.9276772737503052,
+                  "probability": 0.5020748972892761
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 7999,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 348680,
+        "d2h_bytes": 48,
+        "downloads": 4
+      }
+    }
+  ],
+  "scope": "capacity",
+  "native_binary_sha256": "256d4d437d8f0e6a62f7037ba26de302c4019d5c4fa9945493a8a5680f2c9908",
+  "build_mode": "debug",
+  "timing_qualification": false
+}

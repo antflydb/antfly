@@ -2274,6 +2274,7 @@ pub const ComputeBackend = struct {
         encoderLocalAttention: ?*const fn (ctx: *anyopaque, Q: CT, K: CT, V: CT, mask: []const i64, batch: usize, seq_len: usize, num_heads: usize, head_dim: usize, radius: usize) anyerror!CT = null,
         layaActionFeatures: ?*const fn (ctx: *anyopaque, request: *const LayaActionFeaturesRequest) anyerror!CT = null,
         packedGegluExact: ?*const fn (ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT = null,
+        splitQkvRope: ?*const fn (ctx: *anyopaque, input: CT, batch: usize, seq: usize, heads: usize, dim: usize, theta: f32) anyerror!?SplitLastDim3Result = null,
 
         /// Optional Qwen3-VL vision-attention route. It has the same unmasked,
         /// unbiased semantics as scaledDotProductAttention with an empty mask,
@@ -4084,6 +4085,14 @@ pub const ComputeBackend = struct {
     pub fn packedGegluExact(self: *const ComputeBackend, input: CT, rows: usize, width: usize) !?CT {
         const op = self.vtable.packedGegluExact orelse return null;
         return op(self.ptr, input, rows, width);
+    }
+
+    /// Optional split of packed [batch*seq, 3*heads*dim] QKV, applying full-head
+    /// split-half RoPE to Q/K at positions 0..seq-1 in each batch row. Returns
+    /// three independently owned tensors; V is copied without rotation.
+    pub fn splitQkvRope(self: *const ComputeBackend, input: CT, batch: usize, seq: usize, heads: usize, dim: usize, theta: f32) !?SplitLastDim3Result {
+        const op = self.vtable.splitQkvRope orelse return null;
+        return op(self.ptr, input, batch, seq, heads, dim, theta);
     }
 
     pub fn layaActionFeatures(self: *const ComputeBackend, request: *const LayaActionFeaturesRequest) !?CT {

@@ -355,6 +355,7 @@ pub const ModelManifest = struct {
     /// (e.g. GLiNER2.5-Decide). Its classification runs the upstream
     /// `classifier` head on the schema_version:2 route.
     gliner_span_declared: bool = false,
+    gliner_span_encoder: ?@import("gliner_encoder.zig").Config = null,
     /// The config declares a valid ModernBERT Laya decision head.
     laya_declared: bool = false,
     gliner_default_labels: [][]const u8 = &.{},
@@ -499,6 +500,15 @@ pub const ModelManifest = struct {
         for (self.tasks) |candidate| {
             if (std.mem.eql(u8, candidate, task)) return true;
         }
+        return false;
+    }
+
+    /// Declared routing only; boundary requests still require exact live-artifact
+    /// qualification before any learned operation.
+    pub fn isGlinerDecisionModel(self: *const ModelManifest) bool {
+        if (self.gliner_architecture != .boundary and
+            !(self.gliner_architecture == .span and self.gliner_span_declared)) return false;
+        for (self.capabilities) |cap| if (std.mem.eql(u8, cap, "typed_decisions")) return true;
         return false;
     }
 
@@ -1217,7 +1227,9 @@ fn parseSpanEncoderConfigFromCatalog(
         return;
     };
     defer allocator.free(bytes);
-    const config = try deberta.parseConfig(allocator, bytes);
+    const encoder = try @import("gliner_encoder.zig").parse(allocator, bytes);
+    manifest.gliner_span_encoder = encoder;
+    const config = encoder.geometry();
     manifest.hidden_size = config.hidden_size;
     manifest.intermediate_size = config.intermediate_size;
     manifest.num_hidden_layers = config.num_hidden_layers;
@@ -1437,9 +1449,9 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         defer allocator.free(at_bytes);
         try ignoreNonResourceMetadataError(parseAddedTokens(&manifest, at_bytes));
     }
-    // Decide's small tokenizer config declares [L] and [SEP_STRUCT] IDs.
-    // Discovery needs these IDs to validate the explicit head without
-    // materializing the multi-megabyte tokenizer.json on every request.
+    // Small tokenizer metadata may declare marker IDs. Ettin lists strings
+    // only; full loading validates its IDs from tokenizer.json. Discovery
+    // avoids materializing that multi-megabyte file on every request.
     if (manifest.gliner_classification_head == .label_marker_mlp) {
         if (try catalog.readOptional("tokenizer_config.json")) |tokenizer_config_bytes| {
             defer allocator.free(tokenizer_config_bytes);
@@ -1472,7 +1484,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
 
     try applyImplicitSparseOutputLayout(&manifest, &catalog);
     try applySentenceTransformersTaskSidecars(&manifest, allocator, &catalog);
-    try applyImplicitModelTypeHints(&manifest, model_dir_path);
+    try applyModelTypeHints(&manifest, model_dir_path, false);
     try finalizeEmbeddingProfile(&manifest);
 
     return manifest;
@@ -1530,6 +1542,17 @@ fn isListingCandidateRejection(err: anyerror) bool {
 fn applyListingGlinerHint(manifest: *ModelManifest, allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !void {
     if (manifest.gliner_model_type.len > 0) return;
     if (!std.mem.eql(u8, manifest.config_model_arch, "extractor") and !hasGlinerPathHint(catalog.model_dir_path)) return;
+
+    // Ettin Decide declares its span architecture and label-marker head, but
+    // publishes its marker IDs only in tokenizer.json. Discovery must not
+    // require the legacy special_tokens_map sidecar; full loading still
+    // validates every required marker and the consumed weight layout.
+    if (manifest.gliner_span_declared and manifest.gliner_classification_head == .label_marker_mlp and
+        std.mem.eql(u8, manifest.config_model_arch, "extractor"))
+    {
+        manifest.gliner_model_type = try allocator.dupe(u8, "gliner2");
+        return;
+    }
 
     if (try catalog.readOptional("special_tokens_map.json")) |tokens_bytes| {
         defer allocator.free(tokens_bytes);
@@ -1678,6 +1701,10 @@ fn applySentenceTransformersPrompts(
 }
 
 fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8) !void {
+    return applyModelTypeHints(manifest, model_dir_path, true);
+}
+
+fn applyModelTypeHints(manifest: *ModelManifest, model_dir_path: []const u8, validate_token_ids: bool) !void {
     if (inferGlinerModelType(manifest, model_dir_path)) |gliner_type| {
         if (manifest.gliner_model_type.len > 0 and !std.mem.eql(u8, manifest.gliner_model_type, gliner_type)) {
             manifest.allocator.free(manifest.gliner_model_type);
@@ -1690,7 +1717,7 @@ fn applyImplicitModelTypeHints(manifest: *ModelManifest, model_dir_path: []const
 
     if (manifest.gliner_classification_head == .label_marker_mlp) {
         if (!std.mem.eql(u8, manifest.gliner_model_type, "gliner2") or
-            manifest.gliner_token_l == 0 or manifest.gliner_token_sep_struct == 0)
+            (validate_token_ids and (manifest.gliner_token_l == 0 or manifest.gliner_token_sep_struct == 0)))
             return error.InvalidModelManifest;
         if (!manifest.hasCapability("classification") or !manifest.hasTask("extract") or
             manifest.capabilities.len > 2 or manifest.tasks.len > 2 or
@@ -4193,8 +4220,44 @@ test "Decide listing reads small marker sidecar for declared classification head
     try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, listing.gliner_classification_head);
     try std.testing.expectEqual(@as(i32, 128007), listing.gliner_token_l);
     try std.testing.expectEqual(@as(i32, 128001), listing.gliner_token_sep_struct);
+    // Ettin's tokenizer_config lists token strings without numeric IDs.
+    // Listing preserves the declared head; full loading validates tokenizer.json.
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"additional_special_tokens\":[\"[L]\",\"[SEP_STRUCT]\"]}" });
+    var without_ids = try loadListingFromDir(a, path);
+    defer without_ids.deinit();
+    try std.testing.expectEqual(GlinerClassificationHead.label_marker_mlp, without_ids.gliner_classification_head);
+    try std.testing.expectEqual(@as(i32, 0), without_ids.gliner_token_l);
+    try std.testing.expectError(error.InvalidModelManifest, loadFromDir(a, path));
     try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "[]" });
     try std.testing.expectError(error.InvalidTokenizerConfig, loadListingFromDir(a, path));
+}
+
+test "Decide listing accepts explicit span head without legacy marker sidecars" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
+        \\{"model_type":"extractor","architecture":"span","config_version":3,"architecture_version":1,"architectures":["SpanExtractor"],"span_head":{"span_mode":"markerV0"}}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data =
+        \\{"type":"extractor","tasks":["extract","decide"],"capabilities":["classification","typed_decisions"],"inputs":["text"],"gliner_classification_head":"label_marker_mlp"}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data =
+        \\{"additional_special_tokens":["[L]","[SEP_STRUCT]"]}
+    });
+    const path = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(path);
+    var listing = try loadListingFromDir(a, path);
+    defer listing.deinit();
+    try std.testing.expect(listing.isGlinerDecisionModel());
+    try std.testing.expectEqualStrings("gliner2", listing.gliner_model_type);
+    try std.testing.expectEqual(@as(i32, 0), listing.gliner_token_l);
+    try std.testing.expectError(error.InvalidModelManifest, loadFromDir(a, path));
+
+    // A head declaration alone cannot turn an unrelated extractor into GLiNER.
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
+    try std.testing.expectError(error.InvalidModelManifest, loadListingFromDir(a, path));
 }
 
 test "GLiNER tokenizer metadata keeps classification and schema separator markers distinct" {

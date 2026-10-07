@@ -757,6 +757,8 @@ from .inference_decide_answer import InferenceDecideAnswer
 from .inference_decide_answer_legend import InferenceDecideAnswerLegend
 from .inference_decide_answer_probabilities import InferenceDecideAnswerProbabilities
 from .inference_decide_answer_type import InferenceDecideAnswerType
+from .inference_decide_long_document import InferenceDecideLongDocument
+from .inference_decide_long_document_mode import InferenceDecideLongDocumentMode
 from .inference_decide_question import InferenceDecideQuestion
 from .inference_decide_question_criteria_type_0 import InferenceDecideQuestionCriteriaType0
 from .inference_decide_question_type import InferenceDecideQuestionType
@@ -835,6 +837,7 @@ from .inference_model_info import InferenceModelInfo
 from .inference_model_kind import InferenceModelKind
 from .inference_model_quantization import InferenceModelQuantization
 from .inference_model_ref import InferenceModelRef
+from .inference_model_ref_cuda_precision import InferenceModelRefCudaPrecision
 from .inference_models_response import InferenceModelsResponse
 from .inference_models_response_chunkers import InferenceModelsResponseChunkers
 from .inference_models_response_data_item import InferenceModelsResponseDataItem
@@ -2171,6 +2174,8 @@ __all__ = (
     "InferenceDecideAnswerLegend",
     "InferenceDecideAnswerProbabilities",
     "InferenceDecideAnswerType",
+    "InferenceDecideLongDocument",
+    "InferenceDecideLongDocumentMode",
     "InferenceDecideQuestion",
     "InferenceDecideQuestionCriteriaType0",
     "InferenceDecideQuestionType",
@@ -2249,6 +2254,7 @@ __all__ = (
     "InferenceModelKind",
     "InferenceModelQuantization",
     "InferenceModelRef",
+    "InferenceModelRefCudaPrecision",
     "InferenceModelsResponse",
     "InferenceModelsResponseChunkers",
     "InferenceModelsResponseDataItem",

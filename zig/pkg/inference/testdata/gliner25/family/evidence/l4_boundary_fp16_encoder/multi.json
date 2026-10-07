@@ -1,0 +1,1677 @@
+{
+  "model_id": "fastino/gliner2.5-multi-v1",
+  "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+  "backend": "cuda",
+  "precision": "fp16",
+  "attention_only": false,
+  "qualification": false,
+  "status": "complete",
+  "expected_cases": 10,
+  "cases": [
+    {
+      "id": "mixed_tasks",
+      "max_confidence_error": 0.0010785460472106934,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 0,
+        "case_id": "mixed_tasks",
+        "cuda_transfers": {
+          "h2d_bytes": 4440,
+          "d2h_bytes": 14744,
+          "kernel_launches": 362,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          57
+        ],
+        "output": {
+          "entities": [
+            {
+              "name": "person",
+              "dtype": "list",
+              "values": [
+                {
+                  "text": "John",
+                  "confidence": 0.9991174340248108,
+                  "source": {
+                    "start": 0,
+                    "end": 4,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 0,
+                    "byte_end": 4
+                  },
+                  "token_span": {
+                    "start": 0,
+                    "end": 1
+                  },
+                  "derived": false,
+                  "attributes": []
+                },
+                {
+                  "text": "Alice",
+                  "confidence": 0.9979254007339478,
+                  "source": {
+                    "start": 21,
+                    "end": 26,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 21,
+                    "byte_end": 26
+                  },
+                  "token_span": {
+                    "start": 5,
+                    "end": 6
+                  },
+                  "derived": false,
+                  "attributes": []
+                }
+              ]
+            },
+            {
+              "name": "organization",
+              "dtype": "list",
+              "values": [
+                {
+                  "text": "Apple",
+                  "confidence": 0.9981125593185425,
+                  "source": {
+                    "start": 14,
+                    "end": 19,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 14,
+                    "byte_end": 19
+                  },
+                  "token_span": {
+                    "start": 3,
+                    "end": 4
+                  },
+                  "derived": false,
+                  "attributes": []
+                },
+                {
+                  "text": "Google",
+                  "confidence": 0.9979379773139954,
+                  "source": {
+                    "start": 36,
+                    "end": 42,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 36,
+                    "byte_end": 42
+                  },
+                  "token_span": {
+                    "start": 8,
+                    "end": 9
+                  },
+                  "derived": false,
+                  "attributes": []
+                }
+              ]
+            }
+          ],
+          "classifications": [
+            {
+              "name": "sentiment",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "positive",
+                  "confidence": 0.9460124373435974
+                }
+              ]
+            }
+          ],
+          "relations": [
+            {
+              "name": "works_for",
+              "head": {
+                "text": "John",
+                "confidence": 0.6687285304069519,
+                "source": {
+                  "start": 0,
+                  "end": 4,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 0,
+                  "byte_end": 4
+                },
+                "token_span": null,
+                "derived": false,
+                "attributes": []
+              },
+              "tail": {
+                "text": "Apple",
+                "confidence": 0.6687285304069519,
+                "source": {
+                  "start": 14,
+                  "end": 19,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 14,
+                  "byte_end": 19
+                },
+                "token_span": null,
+                "derived": false,
+                "attributes": []
+              },
+              "confidence": 0.6687285304069519,
+              "derived": false,
+              "head_entity_type": null,
+              "tail_entity_type": null,
+              "schema_index": 0
+            },
+            {
+              "name": "works_for",
+              "head": {
+                "text": "John",
+                "confidence": 0.6541317701339722,
+                "source": {
+                  "start": 0,
+                  "end": 4,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 0,
+                  "byte_end": 4
+                },
+                "token_span": null,
+                "derived": false,
+                "attributes": []
+              },
+              "tail": {
+                "text": "Google",
+                "confidence": 0.6541317701339722,
+                "source": {
+                  "start": 36,
+                  "end": 42,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 36,
+                  "byte_end": 42
+                },
+                "token_span": null,
+                "derived": false,
+                "attributes": []
+              },
+              "confidence": 0.6541317701339722,
+              "derived": false,
+              "head_entity_type": null,
+              "tail_entity_type": null,
+              "schema_index": 0
+            },
+            {
+              "name": "works_for",
+              "head": {
+                "text": "Alice",
+                "confidence": 0.5523704886436462,
+                "source": {
+                  "start": 21,
+                  "end": 26,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 21,
+                  "byte_end": 26
+                },
+                "token_span": null,
+                "derived": false,
+                "attributes": []
+              },
+              "tail": {
+                "text": "Apple",
+                "confidence": 0.5523704886436462,
+                "source": {
+                  "start": 14,
+                  "end": 19,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 14,
+                  "byte_end": 19
+                },
+                "token_span": null,
+                "derived": false,
+                "attributes": []
+              },
+              "confidence": 0.5523704886436462,
+              "derived": false,
+              "head_entity_type": null,
+              "tail_entity_type": null,
+              "schema_index": 0
+            },
+            {
+              "name": "works_for",
+              "head": {
+                "text": "Alice",
+                "confidence": 0.6972894072532654,
+                "source": {
+                  "start": 21,
+                  "end": 26,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 21,
+                  "byte_end": 26
+                },
+                "token_span": null,
+                "derived": false,
+                "attributes": []
+              },
+              "tail": {
+                "text": "Google",
+                "confidence": 0.6972894072532654,
+                "source": {
+                  "start": 36,
+                  "end": 42,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 36,
+                  "byte_end": 42
+                },
+                "token_span": null,
+                "derived": false,
+                "attributes": []
+              },
+              "confidence": 0.6972894072532654,
+              "derived": false,
+              "head_entity_type": null,
+              "tail_entity_type": null,
+              "schema_index": 0
+            }
+          ],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "65ad89586ffe7a5ce0f92b7e4b4cd11cc385b79a24f759a31f1aa4eede83bcf0"
+      }
+    },
+    {
+      "id": "unicode_offsets",
+      "max_confidence_error": 0.0003235340118408203,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 1,
+        "case_id": "unicode_offsets",
+        "cuda_transfers": {
+          "h2d_bytes": 4044,
+          "d2h_bytes": 17152,
+          "kernel_launches": 334,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          52
+        ],
+        "output": {
+          "entities": [
+            {
+              "name": "person",
+              "dtype": "list",
+              "values": [
+                {
+                  "text": "Alice",
+                  "confidence": 0.9907604455947876,
+                  "source": {
+                    "start": 29,
+                    "end": 34,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 37,
+                    "byte_end": 42
+                  },
+                  "token_span": {
+                    "start": 8,
+                    "end": 9
+                  },
+                  "derived": false,
+                  "attributes": []
+                },
+                {
+                  "text": "\u0130pek",
+                  "confidence": 0.9825230836868286,
+                  "source": {
+                    "start": 0,
+                    "end": 4,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 0,
+                    "byte_end": 5
+                  },
+                  "token_span": {
+                    "start": 0,
+                    "end": 1
+                  },
+                  "derived": false,
+                  "attributes": []
+                }
+              ]
+            },
+            {
+              "name": "location",
+              "dtype": "list",
+              "values": [
+                {
+                  "text": "\u6771\u4eac",
+                  "confidence": 0.9875509142875671,
+                  "source": {
+                    "start": 23,
+                    "end": 25,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 24,
+                    "byte_end": 30
+                  },
+                  "token_span": {
+                    "start": 5,
+                    "end": 6
+                  },
+                  "derived": false,
+                  "attributes": []
+                },
+                {
+                  "text": "caf\u00e9 e\u0301",
+                  "confidence": 0.9658456444740295,
+                  "source": {
+                    "start": 42,
+                    "end": 49,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 50,
+                    "byte_end": 59
+                  },
+                  "token_span": {
+                    "start": 10,
+                    "end": 13
+                  },
+                  "derived": false,
+                  "attributes": []
+                },
+                {
+                  "text": "Apple",
+                  "confidence": 0.9326196908950806,
+                  "source": {
+                    "start": 14,
+                    "end": 19,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 15,
+                    "byte_end": 20
+                  },
+                  "token_span": {
+                    "start": 3,
+                    "end": 4
+                  },
+                  "derived": false,
+                  "attributes": []
+                }
+              ]
+            }
+          ],
+          "classifications": [],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "2659697802e1743fc9472e5647d4f3efb85a4fc60d97a5f582ea5e22917e25b6"
+      }
+    },
+    {
+      "id": "entity_attributes",
+      "max_confidence_error": 0.00046432018280029297,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 2,
+        "case_id": "entity_attributes",
+        "cuda_transfers": {
+          "h2d_bytes": 4284,
+          "d2h_bytes": 17560,
+          "kernel_launches": 368,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          48
+        ],
+        "output": {
+          "entities": [
+            {
+              "name": "product",
+              "dtype": "list",
+              "values": [
+                {
+                  "text": "iPhone camera",
+                  "confidence": 0.9891111254692078,
+                  "source": {
+                    "start": 4,
+                    "end": 17,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 4,
+                    "byte_end": 17
+                  },
+                  "token_span": {
+                    "start": 1,
+                    "end": 3
+                  },
+                  "derived": false,
+                  "attributes": [
+                    {
+                      "name": "sentiment",
+                      "multi_label": false,
+                      "labels": [
+                        {
+                          "label": "positive",
+                          "confidence": 0.8678727149963379
+                        }
+                      ]
+                    },
+                    {
+                      "name": "condition",
+                      "multi_label": true,
+                      "labels": []
+                    }
+                  ]
+                },
+                {
+                  "text": "battery",
+                  "confidence": 0.9730446338653564,
+                  "source": {
+                    "start": 31,
+                    "end": 38,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 31,
+                    "byte_end": 38
+                  },
+                  "token_span": {
+                    "start": 7,
+                    "end": 8
+                  },
+                  "derived": false,
+                  "attributes": [
+                    {
+                      "name": "sentiment",
+                      "multi_label": false,
+                      "labels": [
+                        {
+                          "label": "negative",
+                          "confidence": 0.949507474899292
+                        }
+                      ]
+                    },
+                    {
+                      "name": "condition",
+                      "multi_label": true,
+                      "labels": [
+                        {
+                          "label": "broken",
+                          "confidence": 0.8445901870727539
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "classifications": [],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "5a7578c22611208b74ce4607ff1c167fd112a5e9b485c912b00f86300a114e81"
+      }
+    },
+    {
+      "id": "legacy_structure",
+      "max_confidence_error": 5.5849552154541016e-05,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 3,
+        "case_id": "legacy_structure",
+        "cuda_transfers": {
+          "h2d_bytes": 3612,
+          "d2h_bytes": 12992,
+          "kernel_launches": 334,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          27
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [],
+          "relations": [],
+          "structures": [
+            {
+              "name": "employment",
+              "instances": [
+                {
+                  "confidence": null,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "John",
+                          "confidence": 0.9891762137413025,
+                          "source": {
+                            "start": 0,
+                            "end": 4,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 0,
+                            "byte_end": 4
+                          },
+                          "token_span": {
+                            "start": 0,
+                            "end": 1
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "list",
+                      "values": [
+                        {
+                          "text": "Google",
+                          "confidence": 0.990691602230072,
+                          "source": {
+                            "start": 36,
+                            "end": 42,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 36,
+                            "byte_end": 42
+                          },
+                          "token_span": {
+                            "start": 8,
+                            "end": 9
+                          },
+                          "derived": false,
+                          "attributes": []
+                        },
+                        {
+                          "text": "Apple",
+                          "confidence": 0.9893378019332886,
+                          "source": {
+                            "start": 14,
+                            "end": 19,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 14,
+                            "byte_end": 19
+                          },
+                          "token_span": {
+                            "start": 3,
+                            "end": 4
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": null
+                }
+              ]
+            }
+          ],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "a7e62a87cdeec9f8bee30eb1b5d06d8fbefe061fd5bdfcf6053c676f4f427e8d"
+      }
+    },
+    {
+      "id": "record_natural",
+      "max_confidence_error": 0.001355290412902832,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 4,
+        "case_id": "record_natural",
+        "cuda_transfers": {
+          "h2d_bytes": 4512,
+          "d2h_bytes": 37852,
+          "kernel_launches": 341,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          27
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [],
+          "relations": [],
+          "structures": [
+            {
+              "name": "employment",
+              "instances": [
+                {
+                  "confidence": 0.9891762137413025,
+                  "anchor": {
+                    "start": 0,
+                    "end": 4,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 0,
+                    "byte_end": 4
+                  },
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "John",
+                          "confidence": 0.9891762137413025,
+                          "source": {
+                            "start": 0,
+                            "end": 4,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 0,
+                            "byte_end": 4
+                          },
+                          "token_span": {
+                            "start": 0,
+                            "end": 1
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Apple",
+                          "confidence": 0.8651502132415771,
+                          "source": {
+                            "start": 14,
+                            "end": 19,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 14,
+                            "byte_end": 19
+                          },
+                          "token_span": {
+                            "start": 3,
+                            "end": 4
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 0,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 0,
+                      "end": 4,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 0,
+                      "byte_end": 4
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.9824929237365723,
+                  "anchor": {
+                    "start": 21,
+                    "end": 26,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 21,
+                    "byte_end": 26
+                  },
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Alice",
+                          "confidence": 0.9824929237365723,
+                          "source": {
+                            "start": 21,
+                            "end": 26,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 21,
+                            "byte_end": 26
+                          },
+                          "token_span": {
+                            "start": 5,
+                            "end": 6
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Google",
+                          "confidence": 0.5841110348701477,
+                          "source": {
+                            "start": 36,
+                            "end": 42,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 36,
+                            "byte_end": 42
+                          },
+                          "token_span": {
+                            "start": 8,
+                            "end": 9
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 2,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 21,
+                      "end": 26,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 21,
+                      "byte_end": 26
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "a7e62a87cdeec9f8bee30eb1b5d06d8fbefe061fd5bdfcf6053c676f4f427e8d"
+      }
+    },
+    {
+      "id": "record_latent",
+      "max_confidence_error": 0.0015638470649719238,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 5,
+        "case_id": "record_latent",
+        "cuda_transfers": {
+          "h2d_bytes": 4072,
+          "d2h_bytes": 62712,
+          "kernel_launches": 341,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          27
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [],
+          "relations": [],
+          "structures": [
+            {
+              "name": "employment",
+              "instances": [
+                {
+                  "confidence": 0.5339247584342957,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": []
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Google",
+                          "confidence": 0.6543193459510803,
+                          "source": {
+                            "start": 36,
+                            "end": 42,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 36,
+                            "byte_end": 42
+                          },
+                          "token_span": {
+                            "start": 8,
+                            "end": 9
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 47,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 11,
+                      "end": 43,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 11,
+                      "byte_end": 43
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.5337707996368408,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": []
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Google",
+                          "confidence": 0.5910396575927734,
+                          "source": {
+                            "start": 36,
+                            "end": 42,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 36,
+                            "byte_end": 42
+                          },
+                          "token_span": {
+                            "start": 8,
+                            "end": 9
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 37,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 33,
+                      "end": 43,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 33,
+                      "byte_end": 43
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.5156089663505554,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Alice",
+                          "confidence": 0.5212749242782593,
+                          "source": {
+                            "start": 21,
+                            "end": 26,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 21,
+                            "byte_end": 26
+                          },
+                          "token_span": {
+                            "start": 5,
+                            "end": 6
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": []
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 53,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 11,
+                      "end": 13,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 11,
+                      "byte_end": 13
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.5138778686523438,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "John",
+                          "confidence": 0.9891762137413025,
+                          "source": {
+                            "start": 0,
+                            "end": 4,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 0,
+                            "byte_end": 4
+                          },
+                          "token_span": {
+                            "start": 0,
+                            "end": 1
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": []
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 20,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 0,
+                      "end": 43,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 0,
+                      "byte_end": 43
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.5119661688804626,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": []
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Google",
+                          "confidence": 0.8788095712661743,
+                          "source": {
+                            "start": 36,
+                            "end": 42,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 36,
+                            "byte_end": 42
+                          },
+                          "token_span": {
+                            "start": 8,
+                            "end": 9
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 50,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 42,
+                      "end": 43,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 42,
+                      "byte_end": 43
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.5119169354438782,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "John",
+                          "confidence": 0.6121661067008972,
+                          "source": {
+                            "start": 0,
+                            "end": 4,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 0,
+                            "byte_end": 4
+                          },
+                          "token_span": {
+                            "start": 0,
+                            "end": 1
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Apple",
+                          "confidence": 0.7868402600288391,
+                          "source": {
+                            "start": 14,
+                            "end": 19,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 14,
+                            "byte_end": 19
+                          },
+                          "token_span": {
+                            "start": 3,
+                            "end": 4
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 28,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 14,
+                      "end": 43,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 14,
+                      "byte_end": 43
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.5107498168945312,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": []
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Google",
+                          "confidence": 0.8655550479888916,
+                          "source": {
+                            "start": 36,
+                            "end": 42,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 36,
+                            "byte_end": 42
+                          },
+                          "token_span": {
+                            "start": 8,
+                            "end": 9
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 48,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 19,
+                      "end": 43,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 19,
+                      "byte_end": 43
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.5097425580024719,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": []
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Google",
+                          "confidence": 0.8039512038230896,
+                          "source": {
+                            "start": 36,
+                            "end": 42,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 36,
+                            "byte_end": 42
+                          },
+                          "token_span": {
+                            "start": 8,
+                            "end": 9
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 19,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 36,
+                      "end": 43,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 36,
+                      "byte_end": 43
+                    }
+                  }
+                },
+                {
+                  "confidence": 0.503049373626709,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "person",
+                      "dtype": "str",
+                      "values": []
+                    },
+                    {
+                      "name": "organization",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "Google",
+                          "confidence": 0.5407893657684326,
+                          "source": {
+                            "start": 36,
+                            "end": 42,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 36,
+                            "byte_end": 42
+                          },
+                          "token_span": {
+                            "start": 8,
+                            "end": 9
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": {
+                    "source_instance": 42,
+                    "seed_field": 0,
+                    "seed_source": {
+                      "start": 5,
+                      "end": 43,
+                      "unit": "unicode_codepoints",
+                      "byte_start": 5,
+                      "byte_end": 43
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "a7e62a87cdeec9f8bee30eb1b5d06d8fbefe061fd5bdfcf6053c676f4f427e8d"
+      }
+    },
+    {
+      "id": "record_anchorless",
+      "max_confidence_error": 0,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 6,
+        "case_id": "record_anchorless",
+        "cuda_transfers": {
+          "h2d_bytes": 4072,
+          "d2h_bytes": 27456,
+          "kernel_launches": 345,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          27
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "a7e62a87cdeec9f8bee30eb1b5d06d8fbefe061fd5bdfcf6053c676f4f427e8d"
+      }
+    },
+    {
+      "id": "enum_field",
+      "max_confidence_error": 1.0728836059570312e-06,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 7,
+        "case_id": "enum_field",
+        "cuda_transfers": {
+          "h2d_bytes": 3916,
+          "d2h_bytes": 18200,
+          "kernel_launches": 368,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          33
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [],
+          "relations": [],
+          "structures": [
+            {
+              "name": "review",
+              "instances": [
+                {
+                  "confidence": null,
+                  "anchor": null,
+                  "fields": [
+                    {
+                      "name": "product",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "iPhone camera",
+                          "confidence": 0.9970675110816956,
+                          "source": {
+                            "start": 4,
+                            "end": 17,
+                            "unit": "unicode_codepoints",
+                            "byte_start": 4,
+                            "byte_end": 17
+                          },
+                          "token_span": {
+                            "start": 10,
+                            "end": 12
+                          },
+                          "derived": false,
+                          "attributes": []
+                        }
+                      ]
+                    },
+                    {
+                      "name": "sentiment",
+                      "dtype": "str",
+                      "values": [
+                        {
+                          "text": "positive",
+                          "confidence": 0.9999814033508301,
+                          "source": null,
+                          "token_span": {
+                            "start": 4,
+                            "end": 5
+                          },
+                          "derived": true,
+                          "attributes": []
+                        }
+                      ]
+                    }
+                  ],
+                  "occurrence": null
+                }
+              ]
+            }
+          ],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "f47dcfc2be320ed372dc8c3b426acdbd9e012dcb315eb2fd78282f90cc55e76a"
+      }
+    },
+    {
+      "id": "constrained_classification",
+      "max_confidence_error": 0.00016740416710692152,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 8,
+        "case_id": "constrained_classification",
+        "cuda_transfers": {
+          "h2d_bytes": 600,
+          "d2h_bytes": 16,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          35
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "delete",
+                  "confidence": 0.9989292025566101
+                }
+              ]
+            },
+            {
+              "name": "effects",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "delete",
+                  "confidence": 0.9885593056678772
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": {
+            "status": "optimal",
+            "visited_nodes": 4,
+            "utility": 6.27979302406311,
+            "exhausted": false
+          },
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "806e9ff86879badd3510f52242fe25af7d3103dac81b9340a4049f0db8db1bff"
+      }
+    },
+    {
+      "id": "joint_ie",
+      "max_confidence_error": 0.0011868406437861578,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 9,
+        "case_id": "joint_ie",
+        "cuda_transfers": {
+          "h2d_bytes": 4420,
+          "d2h_bytes": 14768,
+          "kernel_launches": 392,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          43
+        ],
+        "output": {
+          "entities": [
+            {
+              "name": "person",
+              "dtype": "list",
+              "values": [
+                {
+                  "text": "John",
+                  "confidence": 0.9999749064445496,
+                  "source": {
+                    "start": 0,
+                    "end": 4,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 0,
+                    "byte_end": 4
+                  },
+                  "token_span": {
+                    "start": 0,
+                    "end": 1
+                  },
+                  "derived": false,
+                  "attributes": []
+                },
+                {
+                  "text": "Alice",
+                  "confidence": 0.9999516606330872,
+                  "source": {
+                    "start": 21,
+                    "end": 26,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 21,
+                    "byte_end": 26
+                  },
+                  "token_span": {
+                    "start": 5,
+                    "end": 6
+                  },
+                  "derived": false,
+                  "attributes": []
+                }
+              ]
+            },
+            {
+              "name": "organization",
+              "dtype": "list",
+              "values": [
+                {
+                  "text": "Apple",
+                  "confidence": 0.9998487830162048,
+                  "source": {
+                    "start": 14,
+                    "end": 19,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 14,
+                    "byte_end": 19
+                  },
+                  "token_span": {
+                    "start": 3,
+                    "end": 4
+                  },
+                  "derived": false,
+                  "attributes": []
+                },
+                {
+                  "text": "Google",
+                  "confidence": 0.9997977018356323,
+                  "source": {
+                    "start": 36,
+                    "end": 42,
+                    "unit": "unicode_codepoints",
+                    "byte_start": 36,
+                    "byte_end": 42
+                  },
+                  "token_span": {
+                    "start": 8,
+                    "end": 9
+                  },
+                  "derived": false,
+                  "attributes": []
+                }
+              ]
+            }
+          ],
+          "classifications": [],
+          "relations": [
+            {
+              "name": "works_for",
+              "head": {
+                "text": "John",
+                "confidence": 0.9999749064445496,
+                "source": {
+                  "start": 0,
+                  "end": 4,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 0,
+                  "byte_end": 4
+                },
+                "token_span": {
+                  "start": 0,
+                  "end": 1
+                },
+                "derived": false,
+                "attributes": []
+              },
+              "tail": {
+                "text": "Apple",
+                "confidence": 0.9998487830162048,
+                "source": {
+                  "start": 14,
+                  "end": 19,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 14,
+                  "byte_end": 19
+                },
+                "token_span": {
+                  "start": 3,
+                  "end": 4
+                },
+                "derived": false,
+                "attributes": []
+              },
+              "confidence": 0.6465238928794861,
+              "derived": false,
+              "head_entity_type": 0,
+              "tail_entity_type": 1,
+              "schema_index": null
+            },
+            {
+              "name": "works_for",
+              "head": {
+                "text": "Alice",
+                "confidence": 0.9999516606330872,
+                "source": {
+                  "start": 21,
+                  "end": 26,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 21,
+                  "byte_end": 26
+                },
+                "token_span": {
+                  "start": 5,
+                  "end": 6
+                },
+                "derived": false,
+                "attributes": []
+              },
+              "tail": {
+                "text": "Google",
+                "confidence": 0.9997977018356323,
+                "source": {
+                  "start": 36,
+                  "end": 42,
+                  "unit": "unicode_codepoints",
+                  "byte_start": 36,
+                  "byte_end": 42
+                },
+                "token_span": {
+                  "start": 8,
+                  "end": 9
+                },
+                "derived": false,
+                "attributes": []
+              },
+              "confidence": 0.7184727191925049,
+              "derived": false,
+              "head_entity_type": 0,
+              "tail_entity_type": 1,
+              "schema_index": null
+            }
+          ],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": {
+            "status": "feasible",
+            "visited_nodes": 86,
+            "utility": 39.372539043426514,
+            "exhausted": false
+          },
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "125c1c000952447b0de0788753820c863126011a6f6b372c5547cbbfa932d0d2"
+      }
+    }
+  ],
+  "native_binary_sha256": "4741bb09032c76905c6eeeda56e018d446e241ec6fd47fe7c4bcc0f865c379d2",
+  "cases_sha256": "175c137e9c65f7438d973325782d9a0f279ebdd1e7b5b7e2e08c4a067c68f2e2",
+  "oracle_sha256": "8d431ae4337bdc2e83103f2dad900864dbedc8dc560b4eac8bfb3e0dab372d79",
+  "scope": "diagnostic_quality_only",
+  "native_worker": {
+    "backend": "cuda",
+    "cuda_runtime": {
+      "device_name": "NVIDIA L4",
+      "driver_version": 13000,
+      "compute_major": 8,
+      "compute_minor": 9
+    },
+    "build_mode": "fast",
+    "precision": "fp16",
+    "compute_policy": "fp16_encoder_matrices_and_attention",
+    "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+    "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup"
+  },
+  "source_fixtures": {
+    "multi_requests.json": "175c137e9c65f7438d973325782d9a0f279ebdd1e7b5b7e2e08c4a067c68f2e2",
+    "multi/cases.json": "747a0ebcd29c706cdb20f4de4a9109efb80e2270827780bbad098c242368c551",
+    "multi/oracle_fp32.jsonl": "8d431ae4337bdc2e83103f2dad900864dbedc8dc560b4eac8bfb3e0dab372d79"
+  }
+}

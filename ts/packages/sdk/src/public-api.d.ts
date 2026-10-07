@@ -18742,9 +18742,27 @@ export interface components {
         InferenceDecideRequest: {
             model: string;
             state: string;
+            long_document?: components["schemas"]["InferenceDecideLongDocument"];
             questions: {
                 [key: string]: components["schemas"]["InferenceDecideQuestion"];
             };
+        };
+        /** @description Explicit windowing for qualified boundary decision models. Span decision models use their native context and reject window mode. Omission preserves rejection of over-limit text. */
+        InferenceDecideLongDocument: {
+            /**
+             * @default reject
+             * @enum {string}
+             */
+            mode?: "reject" | "window";
+            /** @default 1024 */
+            window_words?: number;
+            /**
+             * @description Must be smaller than window_words. Only valid in window mode.
+             * @default 32
+             */
+            overlap_words?: number;
+            /** @default 128 */
+            max_windows?: number;
         };
         InferenceDecideQuestion: {
             /** @enum {string} */
@@ -19314,6 +19332,14 @@ export interface components {
              */
             name: string;
             backend?: components["schemas"]["InferenceModelBackend"];
+            /**
+             * @description Per-model GLiNER CUDA inference precision for extractor preloads. Requires
+             *     CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests
+             *     fail closed until the exact model/profile has release qualification.
+             *     Precision is part of the loaded-session cache identity.
+             * @enum {string}
+             */
+            cuda_precision?: "auto" | "fp32" | "fp16" | "bf16";
             format?: components["schemas"]["InferenceModelFormat"];
             quantization?: components["schemas"]["InferenceModelQuantization"];
             /**

@@ -45,6 +45,7 @@ const RunConfig = struct {
         kind: []const u8,
         name: []const u8,
         backend: ?[]const u8 = null,
+        cuda_precision: @FieldType(inference.server.WarmModel, "cuda_precision") = null,
         format: ?[]const u8 = null,
         quantization: ?[]const u8 = null,
         residency_mode: ?inference.ops.A4bResidencyMode = null,
@@ -272,6 +273,7 @@ fn preloadModelsFromConfig(allocator: std.mem.Allocator, values: []const RunConf
             .kind = parsePreloadModelKind(value.kind) orelse return error.InvalidArguments,
             .name = value.name,
             .backend = try parseOptionalBackendType(value.backend),
+            .cuda_precision = value.cuda_precision,
             .format = value.format,
             .quantization = value.quantization,
             .residency_mode = value.residency_mode,
@@ -1107,4 +1109,17 @@ test "run max concurrent request parser accepts zero as unlimited" {
     try std.testing.expectError(error.InvalidCharacter, parseAdmissionLimit("six"));
     try std.testing.expectEqual(@as(u64, 137438953472), try parsePositiveU64("137438953472"));
     try std.testing.expectError(error.InvalidArguments, parsePositiveU64("0"));
+}
+
+test "run config preserves per-model GLiNER CUDA precision" {
+    const a = std.testing.allocator;
+    const parsed = try parseRunConfig(a,
+        \\{"preload":[{"kind":"extractor","name":"fastino/GLiNER2.5-Decide-1B","backend":"cuda","cuda_precision":"fp32"},{"kind":"extractor","name":"default"}]}
+    );
+    defer parsed.deinit();
+    const models = try preloadModelsFromConfig(a, parsed.value.preload);
+    defer a.free(models);
+    try std.testing.expectEqual(.fp32, models[0].cuda_precision.?);
+    try std.testing.expect(models[1].cuda_precision == null);
+    try std.testing.expect(models[0].a4bRequest() == null);
 }

@@ -843,6 +843,52 @@ pub const DecideAnswer = struct {
     }
 };
 
+/// Explicit windowing for qualified boundary decision models. Span decision models use their native context and reject window mode. Omission preserves rejection of over-limit text.
+pub const DecideLongDocument = struct {
+    mode: ?[]const u8 = null,
+    window_words: ?i64 = null,
+    /// Must be smaller than window_words. Only valid in window mode.
+    overlap_words: ?i64 = null,
+    max_windows: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", true },
+        .{ "window_words", "window_words", true },
+        .{ "overlap_words", "overlap_words", true },
+        .{ "max_windows", "max_windows", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.mode) |value| {
+            try jw.objectField("mode");
+            try jw.write(value);
+        }
+        if (self.window_words) |value| {
+            try jw.objectField("window_words");
+            try jw.write(value);
+        }
+        if (self.overlap_words) |value| {
+            try jw.objectField("overlap_words");
+            try jw.write(value);
+        }
+        if (self.max_windows) |value| {
+            try jw.objectField("max_windows");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const DecideQuestion = struct {
     type: []const u8,
     instructions: []const u8,
@@ -881,7 +927,39 @@ pub const DecideQuestion = struct {
 pub const DecideRequest = struct {
     model: []const u8,
     state: []const u8,
+    long_document: ?DecideLongDocument = null,
     questions: std.json.ArrayHashMap(DecideQuestion),
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "model", "model", false },
+        .{ "state", "state", false },
+        .{ "long_document", "long_document", true },
+        .{ "questions", "questions", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("model");
+        try jw.write(self.model);
+        try jw.objectField("state");
+        try jw.write(self.state);
+        if (self.long_document) |value| {
+            try jw.objectField("long_document");
+            try jw.write(value);
+        }
+        try jw.objectField("questions");
+        try jw.write(self.questions);
+        try jw.endObject();
+    }
 };
 
 pub const DecideResponse = struct {
@@ -2965,6 +3043,8 @@ pub const ModelRef = struct {
     /// Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
     name: []const u8,
     backend: ?ModelBackend = null,
+    /// Per-model GLiNER CUDA inference precision for extractor preloads. Requires CUDA; omitted or auto currently selects FP32. FP16 and BF16 requests fail closed until the exact model/profile has release qualification. Precision is part of the loaded-session cache identity.
+    cuda_precision: ?[]const u8 = null,
     format: ?ModelFormat = null,
     quantization: ?ModelQuantization = null,
     /// Load-time residency policy for the qualified Gemma 4 26B-A4B Q4_0 Metal or CUDA runtime. On qualified SM89 CUDA, auto resolves to resident and fails closed unless its envelope fits. Other model geometries reject this field.
@@ -2977,6 +3057,7 @@ pub const ModelRef = struct {
         .{ "kind", "kind", false },
         .{ "name", "name", false },
         .{ "backend", "backend", true },
+        .{ "cuda_precision", "cuda_precision", true },
         .{ "format", "format", true },
         .{ "quantization", "quantization", true },
         .{ "residency_mode", "residency_mode", true },
@@ -2999,6 +3080,10 @@ pub const ModelRef = struct {
         try jw.write(self.name);
         if (self.backend) |value| {
             try jw.objectField("backend");
+            try jw.write(value);
+        }
+        if (self.cuda_precision) |value| {
+            try jw.objectField("cuda_precision");
             try jw.write(value);
         }
         if (self.format) |value| {

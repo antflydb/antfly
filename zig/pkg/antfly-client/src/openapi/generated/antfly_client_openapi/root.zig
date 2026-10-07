@@ -487,6 +487,7 @@ pub const InferenceContentPart = types.InferenceContentPart;
 pub const InferenceContentSecurityConfig = types.InferenceContentSecurityConfig;
 pub const InferenceCredentials = types.InferenceCredentials;
 pub const InferenceDecideAnswer = types.InferenceDecideAnswer;
+pub const InferenceDecideLongDocument = types.InferenceDecideLongDocument;
 pub const InferenceDecideQuestion = types.InferenceDecideQuestion;
 pub const InferenceDecideRequest = types.InferenceDecideRequest;
 pub const InferenceDecideResponse = types.InferenceDecideResponse;

@@ -461,6 +461,12 @@ fn runConfiguredWarmModel(model: common_config.Config.InferenceConfig.WarmModelC
         .kind = parsePreloadModelKind(model.kind) orelse return error.InvalidArguments,
         .name = model.name,
         .backend = try parseOptionalBackendType(model.backend),
+        .cuda_precision = if (model.cuda_precision) |value| switch (value) {
+            .auto => .auto,
+            .fp32 => .fp32,
+            .fp16 => .fp16,
+            .bf16 => .bf16,
+        } else null,
         .format = model.format,
         .quantization = model.quantization,
         .residency_mode = if (model.residency_mode) |mode| switch (mode) {
@@ -515,6 +521,7 @@ fn resolveRunModelSettings(alloc: std.mem.Allocator, config: ?*const common_conf
                 if (configured.kind != warm.kind or configured.backend != warm.backend) continue;
                 if (matched) return error.AmbiguousPreloadModelConfig;
                 matched = true;
+                warm.cuda_precision = warm.cuda_precision orelse configured.cuda_precision;
                 warm.residency_mode = warm.residency_mode orelse configured.residency_mode;
                 warm.memory_budget_mb = warm.memory_budget_mb orelse configured.memory_budget_mb;
             }
@@ -1168,6 +1175,20 @@ test "inference run config resolves flat operator and canonical model settings" 
         try std.testing.expectEqualStrings("gguf", settings.preload[0].format.?);
         try std.testing.expectEqualStrings("Q4_K", settings.preload[0].quantization.?);
     }
+}
+
+test "inference run config preserves CUDA precision across CLI model selection" {
+    const alloc = std.testing.allocator;
+    var config = try parseRunConfig(alloc,
+        \\{"inference":{"preload":[{"kind":"extractor","name":"fastino/GLiNER2.5-Decide-1B","backend":"cuda","cuda_precision":"fp32"}]}}
+    );
+    defer config.deinit();
+    const settings = try resolveRunModelSettings(alloc, &config, .{
+        .preload = &.{try parsePreloadModelFlag("extractor:cuda:fastino/GLiNER2.5-Decide-1B")},
+    });
+    defer alloc.free(settings.preload);
+    try std.testing.expectEqual(@as(usize, 1), settings.preload.len);
+    try std.testing.expectEqual(.fp32, settings.preload[0].cuda_precision.?);
 }
 
 test "inference run config CLI overrides nested config which overrides flat fields" {

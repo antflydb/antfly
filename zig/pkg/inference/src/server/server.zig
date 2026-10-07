@@ -1410,6 +1410,7 @@ pub const WarmModel = struct {
     kind: WarmModelKind = .generator,
     name: []const u8,
     backend: ?backends_mod.BackendType = null,
+    cuda_precision: ?session_factory.GlinerCudaPrecision = null,
     format: ?[]const u8 = null,
     quantization: ?[]const u8 = null,
     residency_mode: ?ops.A4bResidencyMode = null,
@@ -1445,6 +1446,18 @@ pub const WarmModel = struct {
         };
     }
 };
+
+fn validateWarmModelCudaPrecision(model: WarmModel) !void {
+    if (model.cuda_precision == null) return;
+    if (model.kind != .extractor or (model.backend != null and model.backend.? != .cuda) or model.a4bRequest() != null)
+        return error.InvalidGlinerCudaPrecisionPolicy;
+}
+
+test "GLiNER preload precision requires a CUDA extractor" {
+    try validateWarmModelCudaPrecision(.{ .name = "decide", .kind = .extractor, .cuda_precision = .fp32 });
+    try std.testing.expectError(error.InvalidGlinerCudaPrecisionPolicy, validateWarmModelCudaPrecision(.{ .name = "decide", .kind = .extractor, .backend = .native, .cuda_precision = .auto }));
+    try std.testing.expectError(error.InvalidGlinerCudaPrecisionPolicy, validateWarmModelCudaPrecision(.{ .name = "generator", .cuda_precision = .fp32 }));
+}
 
 fn validatedWarmModelA4bRequest(model: WarmModel) !?ops.A4bInferenceRequest {
     const request = model.a4bRequest();
@@ -5705,6 +5718,7 @@ pub const Node = struct {
     }
 
     pub fn warmModel(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
+        try validateWarmModelCudaPrecision(model);
         if (model.startup_strategy == .prefetch)
             return self.prefetchWarmModel(allocator, model);
         const a4b_request = try validatedWarmModelA4bRequest(model);
@@ -5932,7 +5946,10 @@ pub const Node = struct {
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, task_dir);
-        var model_handle = if (model.backend) |backend|
+        defer self.allocator.free(model_path);
+        var model_handle = if (model.cuda_precision) |precision|
+            try self.model_manager.acquireFromDirWithGlinerCudaPrecision(model_path, precision)
+        else if (model.backend) |backend|
             try self.model_manager.acquireFromDirWithPreferredBackends(model_path, singleBackendPreference(backend), false)
         else
             try self.model_manager.acquireFromDir(model_path);
@@ -8985,6 +9002,7 @@ pub const Node = struct {
         // Reject unqualified bundles at the model gate before the boundary
         // schema preflight reports a feature error for a model we cannot run.
         if (!test_qualification and !manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return error.UnsupportedGlinerBoundaryRuntime;
+        if (manifest.isGlinerDecisionModel()) try decision_executor.preflightClassification(&request, true);
         try boundary_executor.preflight(&request, execution_options);
         // The model manager owns a separate allocator and resource lifetime.
         // A previous recoverable request-heap failure cannot label its OOM as
@@ -8998,7 +9016,7 @@ pub const Node = struct {
         defer handle.release();
         const loaded = handle.get();
         const backend = loaded.session.backend();
-        if (backend != .native and backend != .metal) return error.UnsupportedExtractionBackend;
+        if (backend != .native and backend != .metal and backend != .cuda) return error.UnsupportedExtractionBackend;
         const config = try session_factory.getGlinerBoundaryConfig(loaded.session);
         execution_options.identity = try session_factory.getGlinerBoundaryIdentity(loaded.session);
         if (backend == .metal and session_factory.isGlinerBoundaryResidentReady(loaded.session))
@@ -9006,7 +9024,11 @@ pub const Node = struct {
         if (!test_qualification) {
             // Reject exact artifact/backend/features before creating request
             // device state. Geometry is mandatory in executeQualified below.
-            _ = try @import("../extractors/gliner_boundary_qualification.zig").Gate.init(execution_options.identity.?, if (backend == .metal) .metal else .native, &request, control);
+            _ = try @import("../extractors/gliner_boundary_qualification.zig").Gate.init(execution_options.identity.?, switch (backend) {
+                .metal => .metal,
+                .cuda => .cuda,
+                else => .native,
+            }, &request, control);
         }
         // This pass uses the held immutable tokenizer and exact prepared items
         // and windows under the existing request heap. Observe its real CPU
@@ -9024,6 +9046,15 @@ pub const Node = struct {
         } else 0;
         const execution_mutex = loaded.targetInferenceExecutionMutex();
         const effective = control orelse InferenceExecutionControl{};
+        // A waiting CUDA boundary request cannot use the session workspace
+        // yet. Admit its device ceiling only when it reaches the front of the
+        // model queue; otherwise concurrent waiters reserve duplicate device
+        // capacity and fail before the already-serialized execution can drain.
+        // This is distinct from the execution/provider lock: admission may
+        // evict other models and must remain outside those locks.
+        const admission_mutex = if (backend == .cuda) &loaded.gliner_boundary_admission_lock else null;
+        if (admission_mutex) |mutex| try effective.lock(mutex);
+        defer if (admission_mutex) |mutex| mutex.unlock();
         while (true) {
             try effective.check();
             var workspace_plan: ?session_factory.GlinerBoundaryWorkspacePlan = null;
@@ -9039,7 +9070,7 @@ pub const Node = struct {
             defer if (workspace_permit) |*owned| owned.release();
             var device_lease: ?runtime.tier.memory.AdmissionLease = null;
             defer if (device_lease) |*owned| owned.release();
-            if (backend == .metal) {
+            if (backend == .metal or backend == .cuda) {
                 const device_limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
                 const full_device_bytes = try boundary_executor.deviceScratchUpperBound(execution_options);
                 if (workspace_plan) |plan| {
@@ -19187,8 +19218,8 @@ pub const Node = struct {
         const path = try self.resolveRequestModelPath(a, io, request.model, "extractors");
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
-        if (!manifest.hasCapability("typed_decisions")) return error.UnsupportedDecideModel;
-        const gliner = manifest.gliner_architecture == .span and manifest.gliner_span_declared;
+        const gliner = manifest.isGlinerDecisionModel();
+        if (!gliner and !manifest.hasCapability("typed_decisions")) return error.UnsupportedDecideModel;
         if (!gliner and !manifest.laya_declared) return error.UnsupportedDecideModel;
         const extraction_input = try decide_mod.extractionInput(a, request, gliner);
         const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
@@ -19214,7 +19245,9 @@ pub const Node = struct {
     fn decideFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return switch (err) {
             error.DecideRequestLimitExceeded => ctx.status(413).json(.{ .@"error" = "REQUEST_TOO_LARGE", .message = @errorName(err) }),
-            error.InvalidDecideRequest => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
+            error.InvalidDecideRequest,
+            error.UnsupportedDecisionWindowing,
+            => ctx.status(400).json(.{ .@"error" = "INVALID_REQUEST", .message = @errorName(err) }),
             error.ModelNotFound => ctx.status(404).json(.{ .@"error" = "MODEL_NOT_FOUND", .message = @errorName(err) }),
             error.InvalidModelIdentifier,
             error.ModelOutsideModelsDir,
@@ -20670,6 +20703,7 @@ test {
     _ = @import("gliner_boundary_socket_test.zig");
     _ = @import("gliner_boundary_concurrency_test.zig");
     _ = @import("gliner_boundary_metal_socket_test.zig");
+    _ = @import("gliner_family_cuda_socket_test.zig");
     _ = @import("gliner_boundary_queued_cancellation_test.zig");
     _ = @import("embed_direct_vs_http_bench_test.zig");
 }

@@ -1,0 +1,3608 @@
+{
+  "model_id": "fastino/GLiNER2.5-multi-Decide",
+  "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+  "backend": "cuda",
+  "precision": "fp16",
+  "attention_only": false,
+  "qualification": false,
+  "status": "complete",
+  "expected_cases": 18,
+  "cases": [
+    {
+      "id": "support_intent",
+      "max_confidence_error": 1.1622905731201172e-05,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 0,
+        "case_id": "support_intent",
+        "cuda_transfers": {
+          "h2d_bytes": 1400,
+          "d2h_bytes": 36,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          79
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund_request",
+                  "confidence": 0.9917620420455933
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "c1f83d7a6a6bd8bf289bc99399521b51edd1ef0dfa7422cc17413c85d16b3f3d"
+      }
+    },
+    {
+      "id": "travel",
+      "max_confidence_error": 6.431341171264648e-05,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 1,
+        "case_id": "travel",
+        "cuda_transfers": {
+          "h2d_bytes": 1056,
+          "d2h_bytes": 28,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          58
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "request",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "change",
+                  "confidence": 0.9755725860595703
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "0f942798de70db018c7dfd62e0b6f6a48a6aa410c5bbee583827a0ab0b28bd94"
+      }
+    },
+    {
+      "id": "hotel_multi_task",
+      "max_confidence_error": 0.0008712708950042725,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 2,
+        "case_id": "hotel_multi_task",
+        "cuda_transfers": {
+          "h2d_bytes": 2320,
+          "d2h_bytes": 68,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          132
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "checkout",
+                  "confidence": 0.4818698465824127
+                }
+              ]
+            },
+            {
+              "name": "priority",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "high",
+                  "confidence": 0.3165854513645172
+                }
+              ]
+            },
+            {
+              "name": "needs_human",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "yes",
+                  "confidence": 0.5938330292701721
+                }
+              ]
+            },
+            {
+              "name": "topics",
+              "multi_label": true,
+              "labels": [
+                {
+                  "label": "hvac",
+                  "confidence": 0.9445449709892273
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "d1fdbf240d61f1c19dfa1348333cae7e2dd6eea52438cb4f1a664bf7c81241bb"
+      }
+    },
+    {
+      "id": "passage_question",
+      "max_confidence_error": 2.014636993408203e-05,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 3,
+        "case_id": "passage_question",
+        "cuda_transfers": {
+          "h2d_bytes": 1016,
+          "d2h_bytes": 8,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          57
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "answer",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "yes",
+                  "confidence": 0.9932817220687866
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "51be12b7ee826caba94682a8ec8509f750082af404012f9e9ab6a2f4ee0bc9d1"
+      }
+    },
+    {
+      "id": "described_labels",
+      "max_confidence_error": 1.710653305053711e-05,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 4,
+        "case_id": "described_labels",
+        "cuda_transfers": {
+          "h2d_bytes": 1632,
+          "d2h_bytes": 12,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          96
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "card_pin_change",
+                  "confidence": 0.98475581407547
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "723414b07cba761b8dd2cfc68f425ec94f0596923de09510ff64ea162e4fac43"
+      }
+    },
+    {
+      "id": "ordinal",
+      "max_confidence_error": 0.00011295080184936523,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 5,
+        "case_id": "ordinal",
+        "cuda_transfers": {
+          "h2d_bytes": 1268,
+          "d2h_bytes": 44,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          70
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "rating",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "10",
+                  "confidence": 0.1259162276983261
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "3d287e198b6b9478b7126ff6e40dc11616683acaceecc0870a2b7836574b3bcc"
+      }
+    },
+    {
+      "id": "book_genre",
+      "max_confidence_error": 0.00014922022819519043,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 6,
+        "case_id": "book_genre",
+        "cuda_transfers": {
+          "h2d_bytes": 1264,
+          "d2h_bytes": 24,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          70
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "genre",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "history",
+                  "confidence": 0.27450042963027954
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "661fb75e73eef834a52f0a60a4a43746a8671dbeb11c1ee3009d0a56165d8a50"
+      }
+    },
+    {
+      "id": "sentiment_multi",
+      "max_confidence_error": 0.0005123615264892578,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 7,
+        "case_id": "sentiment_multi",
+        "cuda_transfers": {
+          "h2d_bytes": 988,
+          "d2h_bytes": 32,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          56
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "sentiment",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "negative",
+                  "confidence": 0.9478331804275513
+                }
+              ]
+            },
+            {
+              "name": "aspects",
+              "multi_label": true,
+              "labels": [
+                {
+                  "label": "service",
+                  "confidence": 0.7358332276344299
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "ba54fcf3713f35ce9bf4c189fb5047b157100578b226043df3ceaa96e5d4f70c"
+      }
+    },
+    {
+      "id": "distinct_multilingual",
+      "max_confidence_error": 0.0004936456680297852,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 8,
+        "case_id": "distinct_multilingual",
+        "cuda_transfers": {
+          "h2d_bytes": 2756,
+          "d2h_bytes": 128,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 8,
+        "encoder_shape": [
+          8,
+          33
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.9969225525856018
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": [
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9969225525856018
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel_subscription",
+                    "confidence": 0.9994308352470398
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "login_problem",
+                    "confidence": 0.9385284781455994
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9746023416519165
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel_subscription",
+                    "confidence": 0.9980827569961548
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel_subscription",
+                    "confidence": 0.9995071887969971
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "login_problem",
+                    "confidence": 0.8855999112129211
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "other",
+                    "confidence": 0.6210440397262573
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          }
+        ],
+        "input_ids_sha256": "48f0cbde0111579d4ad4d4255d9f1f98a2dcef2f61f68023e9cded2502b155eb"
+      }
+    },
+    {
+      "id": "ragged_descriptions",
+      "max_confidence_error": 0.00012743473052978516,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 9,
+        "case_id": "ragged_descriptions",
+        "cuda_transfers": {
+          "h2d_bytes": 2060,
+          "d2h_bytes": 24,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 2,
+        "encoder_shape": [
+          2,
+          77
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.9833801984786987
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": [
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9833801984786987
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "technical_support",
+                    "confidence": 0.9787555932998657
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          }
+        ],
+        "input_ids_sha256": "1d27ba2b7044628f33d2b013664ccacd07d429b9b524ad2d1737df16594a3cca"
+      }
+    },
+    {
+      "id": "tokens_128_batch_1",
+      "max_confidence_error": 3.814697265625e-06,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 10,
+        "case_id": "tokens_128_batch_1",
+        "cuda_transfers": {
+          "h2d_bytes": 2508,
+          "d2h_bytes": 12,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          128
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.9988738894462585
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "f68e250ad93ede5ef7e4cc04b8ad20350cf8c2a334b34a8194ae7ba223222209"
+      }
+    },
+    {
+      "id": "tokens_128_batch_8",
+      "max_confidence_error": 0.000164031982421875,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 11,
+        "case_id": "tokens_128_batch_8",
+        "cuda_transfers": {
+          "h2d_bytes": 12924,
+          "d2h_bytes": 96,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 8,
+        "encoder_shape": [
+          8,
+          128
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.9988738894462585
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": [
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9988738894462585
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.985630452632904
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.7665866017341614
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9804401993751526
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9598731398582458
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.8696953058242798
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.983123242855072
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9626854658126831
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          }
+        ],
+        "input_ids_sha256": "b1d3a442a99bec42f588ccd97a341c4cee33b2861fb844cef56d6706a44e4215"
+      }
+    },
+    {
+      "id": "tokens_512_batch_1",
+      "max_confidence_error": 0.0001347661018371582,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 12,
+        "case_id": "tokens_512_batch_1",
+        "cuda_transfers": {
+          "h2d_bytes": 10188,
+          "d2h_bytes": 12,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          512
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.9742106199264526
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "25937daa871b3c4c5fcc7660aad624708af81a2dbdd93ee1418e33ef214700ee"
+      }
+    },
+    {
+      "id": "tokens_512_batch_8",
+      "max_confidence_error": 0.0003255009651184082,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 13,
+        "case_id": "tokens_512_batch_8",
+        "cuda_transfers": {
+          "h2d_bytes": 52860,
+          "d2h_bytes": 96,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 8,
+        "encoder_shape": [
+          8,
+          512
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.9742106199264526
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": [
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9742106199264526
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.8845714926719666
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.7562428116798401
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9211509823799133
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.82403963804245
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.8556089997291565
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9129012227058411
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.7853897213935852
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          }
+        ],
+        "input_ids_sha256": "52d8874e790851bd590637e54a753cf9c8b8893f955cb236abe511248b86c5c8"
+      }
+    },
+    {
+      "id": "tokens_2048_batch_1",
+      "max_confidence_error": 0.0004850029945373535,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 14,
+        "case_id": "tokens_2048_batch_1",
+        "cuda_transfers": {
+          "h2d_bytes": 40908,
+          "d2h_bytes": 12,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 1,
+        "encoder_shape": [
+          1,
+          2048
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.6287808418273926
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": null,
+        "input_ids_sha256": "85dd17e847df2baf611ea0fc3bada9cbc1a79de2c43860ea8d06b88afbb58fe1"
+      }
+    },
+    {
+      "id": "tokens_2048_batch_8",
+      "max_confidence_error": 0.00048542022705078125,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 15,
+        "case_id": "tokens_2048_batch_8",
+        "cuda_transfers": {
+          "h2d_bytes": 212604,
+          "d2h_bytes": 96,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 8,
+        "encoder_shape": [
+          8,
+          2048
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.6287809610366821
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": [
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.6287809610366821
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.5341308116912842
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.5921794176101685
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.533381462097168
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.5047879219055176
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.6965980529785156
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.5264115929603577
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.48388907313346863
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          }
+        ],
+        "input_ids_sha256": "15d89f86ed0b0a37dafea5396c5b4052023bc059562fd3cdfcd6f00a702dca61"
+      }
+    },
+    {
+      "id": "tokens_128_batch_32",
+      "max_confidence_error": 0.00044590234756469727,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 16,
+        "case_id": "tokens_128_batch_32",
+        "cuda_transfers": {
+          "h2d_bytes": 48636,
+          "d2h_bytes": 384,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 32,
+        "encoder_shape": [
+          32,
+          128
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.9988738894462585
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": [
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9988738894462585
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.985630452632904
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.7665866017341614
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9804401993751526
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9598731398582458
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.8696953058242798
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.983123242855072
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9626854658126831
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9215490818023682
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9827916026115417
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.964373767375946
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9301542043685913
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9809196591377258
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9643216729164124
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9336487650871277
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9768034219741821
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9609795808792114
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.929977297782898
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9745939373970032
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9668894410133362
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9352731704711914
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.970454216003418
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9670392274856567
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9379437565803528
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9689269065856934
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9638693332672119
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9292191863059998
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9684279561042786
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9683647751808167
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9275385737419128
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.968035101890564
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9675314426422119
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          }
+        ],
+        "input_ids_sha256": "e6abc56f506a1a93b5de5cce7d898b7eb1e7ec56adbd4832dfbb71b680b71405"
+      }
+    },
+    {
+      "id": "tokens_128_batch_64",
+      "max_confidence_error": 0.0004457235336303711,
+      "native": {
+        "event": "result",
+        "arm": "native",
+        "request_id": 17,
+        "case_id": "tokens_128_batch_64",
+        "cuda_transfers": {
+          "h2d_bytes": 96252,
+          "d2h_bytes": 768,
+          "kernel_launches": 274,
+          "host_fallback_calls": 0
+        },
+        "batch_size": 64,
+        "encoder_shape": [
+          64,
+          128
+        ],
+        "output": {
+          "entities": [],
+          "classifications": [
+            {
+              "name": "intent",
+              "multi_label": false,
+              "labels": [
+                {
+                  "label": "refund",
+                  "confidence": 0.9988738894462585
+                }
+              ]
+            }
+          ],
+          "relations": [],
+          "structures": [],
+          "classification_solver": null,
+          "joint_solver": null,
+          "record_solver": null,
+          "long_document": null
+        },
+        "outputs": [
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9988738894462585
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.985630452632904
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.7665866017341614
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9804401993751526
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9598731398582458
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.8696953058242798
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.983123242855072
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9626854658126831
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9215490818023682
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9827916026115417
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.964373767375946
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9301542043685913
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9809196591377258
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9643216729164124
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9336487650871277
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9768034219741821
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9609795808792114
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.929977297782898
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9745939373970032
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9668894410133362
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9352731704711914
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.970454216003418
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9670392274856567
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9379437565803528
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9689269065856934
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9638693332672119
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9292191863059998
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9684279561042786
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9683647751808167
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9275385737419128
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.968035101890564
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9675314426422119
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9324657320976257
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9658171534538269
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9666187167167664
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9378033876419067
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9642624855041504
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9684703946113586
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9296088218688965
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9662989974021912
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9698836207389832
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9358282089233398
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9656436443328857
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9720550775527954
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9429415464401245
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9667129516601562
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.971774160861969
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9414669275283813
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.96933513879776
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9733150005340576
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9404751062393188
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9680757522583008
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9745559096336365
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9393309950828552
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.967652440071106
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9757965803146362
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9440791010856628
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9705787301063538
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.976005494594574
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9521373510360718
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9688465595245361
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "support",
+                    "confidence": 0.9765625596046448
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "cancel",
+                    "confidence": 0.9558240175247192
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          },
+          {
+            "entities": [],
+            "classifications": [
+              {
+                "name": "intent",
+                "multi_label": false,
+                "labels": [
+                  {
+                    "label": "refund",
+                    "confidence": 0.9685478210449219
+                  }
+                ]
+              }
+            ],
+            "relations": [],
+            "structures": [],
+            "classification_solver": null,
+            "joint_solver": null,
+            "record_solver": null,
+            "long_document": null
+          }
+        ],
+        "input_ids_sha256": "a1095cb9ab98978c278a19694cb872324654eece684a6e1f5977a4db972ed170"
+      }
+    }
+  ],
+  "native_binary_sha256": "4741bb09032c76905c6eeeda56e018d446e241ec6fd47fe7c4bcc0f865c379d2",
+  "cases_sha256": "06b7262b8937b4975a4fc26feae2dd50c2fcea172d7d1dcc4b461774828986ff",
+  "oracle_sha256": "ed72221c8d5b01d2b91fb57a19dae506dc23a0335c2651401c76712218ff44e2",
+  "scope": "diagnostic_quality_only",
+  "native_worker": {
+    "backend": "cuda",
+    "cuda_runtime": {
+      "device_name": "NVIDIA L4",
+      "driver_version": 13000,
+      "compute_major": 8,
+      "compute_minor": 9
+    },
+    "build_mode": "fast",
+    "precision": "fp16",
+    "compute_policy": "fp16_encoder_matrices_and_attention",
+    "synchronization_policy": "cuda_stream_before_start_and_after_extract_v1",
+    "timing_boundary": "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup"
+  },
+  "source_fixtures": {
+    "decision_cases.json": "348d9ccf7b57739ef6a7b7a592c7894ecff156be87160f2c2df6f23d2e09b1f0",
+    "multi_decide/capacity_requests.json": "b9b2d37785d6cf2f9d6c45c6280e7d3645df07af435c37acb2bf008a1f563be9",
+    "multi_decide/cases.json": "9c738a7f156f8c30674a56e2bc8a217e30c5600cc525d730395eaf4925ee3e49",
+    "multi_decide/capacity_cases.json": "e9695bc64faf84825a45001a23139f460b82a2dcfad12cacd931755cba5757bc",
+    "multi_decide/oracle_fp32.jsonl": "5df57040e5605ff86599b8bdb9cb4cc051b54e52b76c6f62de7d17b1defa456b",
+    "multi_decide/capacity_oracle_fp32.jsonl": "2b2aa91a0a91d4dfc09709357c1be6c4bf02fb7c2eb13150f4885435553b4478"
+  },
+  "fixture_composition": "Short classification cases followed by capacity cases; concatenate each cases array and oracle responses in that order, retaining the first oracle ready row."
+}

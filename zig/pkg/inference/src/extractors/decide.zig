@@ -17,6 +17,7 @@
 const std = @import("std");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
+const extraction = @import("extraction_v2.zig");
 
 pub const Kind = enum { choice, score, noul };
 pub const Question = struct {
@@ -30,6 +31,7 @@ pub const Request = struct {
     model: []const u8,
     state: []const u8,
     questions: []Question,
+    long_document: extraction.LongDocument = .{},
 };
 
 fn object(v: Value) !std.json.ObjectMap {
@@ -62,7 +64,11 @@ pub fn parse(a: Allocator, json: []const u8) !Request {
     };
     // The request owns parsed strings through the caller's request arena.
     const root = try object(parsed.value);
-    try onlyKeys(root, &.{ "model", "state", "questions" });
+    try onlyKeys(root, &.{ "model", "state", "questions", "long_document" });
+    const long_document = if (root.get("long_document")) |raw| blk: {
+        try onlyKeys(try object(raw), &.{ "mode", "window_words", "overlap_words", "max_windows" });
+        break :blk extraction.parseLongDocument(raw) catch return error.InvalidDecideRequest;
+    } else extraction.LongDocument{};
     const model = try nonempty(root.get("model") orelse return error.InvalidDecideRequest);
     const state = try nonempty(root.get("state") orelse return error.InvalidDecideRequest);
     if (state.len > 1024 * 1024) return error.DecideRequestLimitExceeded;
@@ -109,7 +115,7 @@ pub fn parse(a: Allocator, json: []const u8) !Request {
         }
         question.* = .{ .name = name, .kind = kind, .instructions = instructions, .labels = labels, .descriptions = descriptions };
     }
-    return .{ .model = model, .state = state, .questions = out };
+    return .{ .model = model, .state = state, .questions = out, .long_document = long_document };
 }
 
 fn put(a: Allocator, map: *std.json.ObjectMap, key: []const u8, value: Value) !void {
@@ -127,6 +133,7 @@ pub const ExtractionInput = struct {
 /// Produce an extraction v2 request and the exact serialized schema size used
 /// by inference.limits.max_schema_bytes. GLiNER's top_k includes every option.
 pub fn extractionInput(a: Allocator, request: Request, gliner: bool) !ExtractionInput {
+    if (!gliner and request.long_document.mode == .window) return error.UnsupportedDecisionWindowing;
     var root: std.json.ObjectMap = .empty;
     try put(a, &root, "schema_version", .{ .integer = 2 });
     try put(a, &root, "model", string(request.model));
@@ -165,6 +172,14 @@ pub fn extractionInput(a: Allocator, request: Request, gliner: bool) !Extraction
     if (gliner) {
         var options: std.json.ObjectMap = .empty;
         try put(a, &options, "include_confidence", .{ .bool = true });
+        if (request.long_document.mode == .window) {
+            var windows: std.json.ObjectMap = .empty;
+            try put(a, &windows, "mode", string("window"));
+            try put(a, &windows, "window_words", .{ .integer = @intCast(request.long_document.window_words) });
+            try put(a, &windows, "overlap_words", .{ .integer = @intCast(request.long_document.overlap_words) });
+            try put(a, &windows, "max_windows", .{ .integer = @intCast(request.long_document.max_windows) });
+            try put(a, &options, "long_document", .{ .object = windows });
+        }
         try put(a, &root, "options", .{ .object = options });
     }
     return .{
@@ -180,6 +195,27 @@ fn number(v: Value) !f64 {
         .number_string => std.fmt.parseFloat(f64, v.number_string) catch return error.InvalidDecideOutput,
         else => error.InvalidDecideOutput,
     };
+}
+
+test "typed decide windowing preserves extraction geometry and rejects invalid options" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const prefix = "{\"model\":\"multi-decide\",\"state\":\"hello\",\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"Relevant?\"}},\"long_document\":";
+    const request = try parse(a, prefix ++ "{\"mode\":\"window\",\"window_words\":64,\"overlap_words\":8,\"max_windows\":4}}");
+    const input = try extractionInput(a, request, true);
+    const json = try std.json.parseFromSlice(Value, a, input.json, .{});
+    const options = try extraction.parseOptions(json.value.object.get("options").?);
+    try std.testing.expectEqualDeep(request.long_document, options.long_document);
+    try std.testing.expectError(error.UnsupportedDecisionWindowing, extractionInput(a, request, false));
+    for ([_][]const u8{
+        "null",                                                     "{\"mode\":\"window\",\"window_words\":32,\"overlap_words\":32}",
+        "{\"mode\":\"window\",\"max_windows\":129}",                "{\"mode\":\"reject\",\"window_words\":64}",
+        "{\"mode\":\"window\",\"record_identity\":\"occurrence\"}",
+    }) |invalid| {
+        const bytes = try std.fmt.allocPrint(a, "{s}{s}}}", .{ prefix, invalid });
+        try std.testing.expectError(error.InvalidDecideRequest, parse(a, bytes));
+    }
 }
 
 fn tokenCount(v: Value) !Value {

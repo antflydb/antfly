@@ -142,6 +142,10 @@ pub const HfTokenizer = struct {
     /// Only ever set from a `BertNormalizer` block (not `Lowercase`).
     handle_chinese_chars: bool,
     replace_space_with: ?[]const u8,
+    /// A standalone NFC normalizer is applied before BPE pre-tokenization,
+    /// after protecting added tokens. In particular, NFC decomposes canonical
+    /// composition exclusions such as Devanagari letters with nukta.
+    bpe_nfc: bool = false,
     unigram_normalizer: unicode_normalizer.Profile = .{},
     unigram_min_score: f64 = std.math.inf(f64),
     // A generic unsupported normalizer keeps the complete legacy encoding
@@ -1451,6 +1455,14 @@ pub const HfTokenizer = struct {
     }
 
     fn parseNormalizer(self: *HfTokenizer, obj: std.json.ObjectMap, strict_unigram: bool) anyerror!void {
+        if (self.model_type == .bpe) {
+            if (obj.get("type")) |kind| {
+                if (kind == .string and std.mem.eql(u8, kind.string, "NFC")) {
+                    self.bpe_nfc = true;
+                    return;
+                }
+            }
+        }
         if (self.model_type == .unigram) {
             // Parse transactionally. A legacy Sequence may have supported
             // steps before Precompiled/Lowercase; retaining just that prefix
@@ -3300,6 +3312,7 @@ pub const HfTokenizer = struct {
             self.model_type != .bpe or
             self.pre_tokenizer_type != .byte_level or
             self.byte_level_pretokenizer != .gpt2 or
+            self.bpe_nfc or
             self.do_lowercase or
             self.replace_space_with != null or
             self.end_of_word_suffix.len != 0)
@@ -3876,7 +3889,7 @@ pub const HfTokenizer = struct {
         if (self.added_tokens.count() == 0) {
             return switch (self.model_type) {
                 .word_piece => self.encodeWordPiece(allocator, text, ids),
-                .bpe => self.encodeBpeWithMetaspaceScheme(allocator, text, metaspace_scheme_override, ids),
+                .bpe => self.encodeNormalizedBpe(allocator, text, metaspace_scheme_override, ids),
                 .unigram => self.encodeUnigramWithMetaspaceScheme(allocator, text, metaspace_scheme_override, ids),
             };
         }
@@ -3887,7 +3900,7 @@ pub const HfTokenizer = struct {
         if (self.matchAddedTokenAt(text) == null and self.findNextAddedToken(text, 0) == null) {
             return switch (self.model_type) {
                 .word_piece => self.encodeWordPiece(allocator, text, ids),
-                .bpe => self.encodeBpeWithMetaspaceScheme(allocator, text, metaspace_scheme_override, ids),
+                .bpe => self.encodeNormalizedBpe(allocator, text, metaspace_scheme_override, ids),
                 .unigram => self.encodeUnigramWithMetaspaceScheme(allocator, text, metaspace_scheme_override, ids),
             };
         }
@@ -3909,7 +3922,7 @@ pub const HfTokenizer = struct {
                     metaspace_scheme_override;
                 try switch (self.model_type) {
                     .word_piece => self.encodeWordPiece(allocator, segment, ids),
-                    .bpe => self.encodeBpeWithMetaspaceScheme(allocator, segment, segment_metaspace_override, ids),
+                    .bpe => self.encodeNormalizedBpe(allocator, segment, segment_metaspace_override, ids),
                     .unigram => self.encodeUnigramWithMetaspaceScheme(allocator, segment, segment_metaspace_override, ids),
                 };
             }
@@ -3921,6 +3934,25 @@ pub const HfTokenizer = struct {
         id: i32,
         len: usize,
     };
+
+    fn encodeNormalizedBpe(
+        self: *HfTokenizer,
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        metaspace_override: ?MetaspacePrependScheme,
+        ids: *std.ArrayListUnmanaged(i32),
+    ) !void {
+        if (!self.bpe_nfc)
+            return self.encodeBpeWithMetaspaceScheme(allocator, text, metaspace_override, ids);
+        const ascii = for (text) |byte| {
+            if (byte >= 0x80) break false;
+        } else true;
+        if (ascii)
+            return self.encodeBpeWithMetaspaceScheme(allocator, text, metaspace_override, ids);
+        const normalized = try unicode_normalizer.nfc(allocator, text);
+        defer allocator.free(normalized);
+        return self.encodeBpeWithMetaspaceScheme(allocator, normalized, metaspace_override, ids);
+    }
 
     fn matchAddedTokenAt(self: *const HfTokenizer, text: []const u8) ?AddedTokenMatch {
         return self.added_trie.longestPrefixMatch(text);
@@ -11341,6 +11373,44 @@ test "clip byte-level bpe honors split pretokenizer array merges and end suffix"
 
     try std.testing.expectEqualSlices(i32, &.{ 49406, 320, 17025, 49407, 49407, 49407 }, encoded.ids);
     try std.testing.expectEqualSlices(i32, &.{ 1, 1, 1, 1, 0, 0 }, encoded.attention_mask);
+}
+
+test "NFC byte-level BPE preserves added tokens and canonical composition exclusions" {
+    const a = std.testing.allocator;
+    const tok = try HfTokenizer.loadFromBytes(a,
+        \\{"model":{"type":"BPE","vocab":{"à":1,"¤":2,"¡":3,"¼":4,"Ã":5,"©":6,"Ġ":7,"<é>":20},"merges":[]},
+        \\ "normalizer":{"type":"NFC"},
+        \\ "pre_tokenizer":{"type":"ByteLevel","add_prefix_space":false,"use_regex":true},
+        \\ "added_tokens":[{"id":20,"content":"<é>","special":true,"normalized":false}]}
+    );
+    defer tok.deinitSelf();
+    const text = "e\u{0301}<e\u{0301}>\u{095c}";
+    // é is C3 A9; U+095C normalizes to U+0921 U+093C (E0 A4 A1 E0 A4 BC).
+    const expected = [_]i32{ 5, 6, 20, 1, 2, 3, 1, 2, 4 };
+    const raw = try tok.encode(a, text);
+    defer a.free(raw);
+    try std.testing.expectEqualSlices(i32, &expected, raw);
+    var ids = std.ArrayListUnmanaged(i32).empty;
+    defer ids.deinit(a);
+    try tok.encodeInto(a, text, &ids);
+    try std.testing.expectEqualSlices(i32, &expected, ids.items);
+    var model = try tok.tokenizer().encodeForModel(a, text, expected.len);
+    defer model.deinit();
+    try std.testing.expectEqualSlices(i32, &expected, model.ids);
+    var generation = try tok.tokenizer().encodeForGenerationConfigured(a, text, expected.len, false);
+    defer generation.deinit();
+    try std.testing.expectEqualSlices(i32, &expected, generation.ids);
+
+    // Force parallel eligibility by size. Normalization must still happen
+    // before byte-level regex segmentation, including combining sequences.
+    const count = HfTokenizer.parallel_bpe_min_bytes / 4 + 1;
+    const large = try a.alloc(u8, count * 4);
+    defer a.free(large);
+    for (0..count) |i| @memcpy(large[i * 4 ..][0..4], "e\u{0301} ");
+    ids.clearRetainingCapacity();
+    try tok.tokenizer().encodeIntoParallel(std.testing.io, a, large, &ids, 4);
+    try std.testing.expectEqual(count * 3, ids.items.len);
+    for (0..count) |i| try std.testing.expectEqualSlices(i32, &.{ 5, 6, 7 }, ids.items[i * 3 ..][0..3]);
 }
 
 test "sequence normalizer applies lowercase before byte-level bpe" {

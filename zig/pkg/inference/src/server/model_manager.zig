@@ -2382,6 +2382,10 @@ pub const LoadedModel = struct {
     /// state within a loaded model. Keep one model-local lane while allowing
     /// independent models to overlap.
     target_inference_run_lock: std.atomic.Mutex = .unlocked,
+    /// CUDA boundary requests execute serially on this session. Queue before
+    /// reserving their full device scratch ceiling, without holding a provider
+    /// lock during admission/eviction. Every waiter retains a ModelHandle.
+    gliner_boundary_admission_lock: std.atomic.Mutex = .unlocked,
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,
@@ -6642,6 +6646,13 @@ pub const ModelManager = struct {
         );
     }
 
+    /// Explicit GLiNER precision is immutable and part of both the resident
+    /// variant and in-flight load identity. Later ordinary requests may reuse
+    /// the default alias published by this startup preload.
+    pub fn acquireFromDirWithGlinerCudaPrecision(self: *ModelManager, model_dir: []const u8, precision: session_factory.GlinerCudaPrecision) !ModelHandle {
+        return self.loadFromDirCoordinated(model_dir, &.{.cuda}, true, .{ .gliner_cuda_precision = precision, .accept_default_alias = false }, null);
+    }
+
     /// Acquire a model using an immutable A4B policy for this load. Explicit
     /// policies do not accept an existing unqualified alias: the qualified
     /// cache key must match before a model can be reused. A newly qualified
@@ -6748,11 +6759,12 @@ pub const ModelManager = struct {
         for (preferred_backends) |backend| {
             if (!backend.supportsDirectSessionLoad()) continue;
             if (modelBackendIsUnhealthy(self, model_dir, backend)) continue;
-            const variant_key = try backendVariantCacheKey(
+            const variant_key = try backendVariantCacheKeyWithPrecision(
                 self.allocator,
                 model_dir,
                 backend,
                 policy.a4b_request,
+                policy.gliner_cuda_precision,
             );
             defer self.allocator.free(variant_key);
             if (self.loaded.get(variant_key)) |model| return model;
@@ -6809,10 +6821,12 @@ pub const ModelManager = struct {
                 },
             );
         defer self.allocator.free(prefix);
-        const key = try self.allocator.alloc(u8, prefix.len + preferred_backends.len);
-        @memcpy(key[0..prefix.len], prefix);
+        const precision_prefix = try std.fmt.allocPrint(self.allocator, "{s}gliner_cuda_precision={s}:", .{ prefix, if (policy.gliner_cuda_precision) |value| @tagName(value) else "none" });
+        defer self.allocator.free(precision_prefix);
+        const key = try self.allocator.alloc(u8, precision_prefix.len + preferred_backends.len);
+        @memcpy(key[0..precision_prefix.len], precision_prefix);
         for (preferred_backends, 0..) |backend, idx| {
-            key[prefix.len + idx] = @intCast(@backingInt(backend));
+            key[precision_prefix.len + idx] = @intCast(@backingInt(backend));
         }
         return key;
     }
@@ -7141,6 +7155,7 @@ pub const ModelManager = struct {
         );
         session_manager.io = coordination_io;
         session_manager.a4b_inference_request = policy.a4b_request;
+        session_manager.gliner_cuda_precision = policy.gliner_cuda_precision;
         task.* = .{
             .manager = self,
             .flight = flight,
@@ -7506,7 +7521,7 @@ pub const ModelManager = struct {
 
         if (control) |active| try active.check();
         unpublished_model_owned = false;
-        return self.publishLoadedModel(model, cache_default_alias, a4b_request);
+        return self.publishLoadedModel(model, cache_default_alias, a4b_request, sm.gliner_cuda_precision);
     }
 
     /// Publish a fully constructed model with only a short map critical section.
@@ -7518,6 +7533,7 @@ pub const ModelManager = struct {
         model: *LoadedModel,
         cache_default_alias: bool,
         a4b_request: ?backend_contracts.A4bInferenceRequest,
+        gliner_cuda_precision: ?session_factory.GlinerCudaPrecision,
     ) !ModelHandle {
         var model_owned = true;
         errdefer if (model_owned) {
@@ -7526,11 +7542,12 @@ pub const ModelManager = struct {
             _ = platform.allocator.reclaimUnusedProcessMemory();
         };
 
-        const variant_key = try backendVariantCacheKey(
+        const variant_key = try backendVariantCacheKeyWithPrecision(
             self.allocator,
             model.model_dir,
             model.session.backend(),
             a4b_request,
+            gliner_cuda_precision,
         );
         var variant_key_owned = true;
         defer if (variant_key_owned) self.allocator.free(variant_key);
@@ -7622,6 +7639,7 @@ fn modelCacheHasPublicationCapacity(loaded_count: usize, max_loaded_models: usiz
 }
 
 const ModelLoadCachePolicy = struct {
+    gliner_cuda_precision: ?session_factory.GlinerCudaPrecision = null,
     a4b_request: ?backend_contracts.A4bInferenceRequest = null,
     accept_default_alias: bool = true,
     /// Policy-free acquisition consumes the model's explicitly published
@@ -7723,6 +7741,123 @@ fn modelBackendIsUnhealthy(
     if (now_ns < retry_after_ns) return true;
     _ = self.unhealthy_model_backends.remove(key);
     return false;
+}
+
+fn backendVariantCacheKeyWithPrecision(allocator: std.mem.Allocator, model_dir: []const u8, backend: backends.BackendType, a4b_request: ?backend_contracts.A4bInferenceRequest, precision: ?session_factory.GlinerCudaPrecision) ![]u8 {
+    const base = try backendVariantCacheKey(allocator, model_dir, backend, a4b_request);
+    if (precision) |value| {
+        defer allocator.free(base);
+        return std.fmt.allocPrint(allocator, "{s}\ngliner_cuda_precision={s}", .{ base, @tagName(value) });
+    }
+    return base;
+}
+
+test "GLiNER CUDA precision isolates resident and in-flight loads" {
+    const a = std.testing.allocator;
+    const base = try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, null);
+    defer a.free(base);
+    var manager: ModelManager = undefined;
+    manager.allocator = a;
+    const values = [_]session_factory.GlinerCudaPrecision{ .auto, .fp32, .fp16, .bf16 };
+    for (values, 0..) |value, index| {
+        const key = try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, value);
+        defer a.free(key);
+        try std.testing.expect(!std.mem.eql(u8, base, key));
+        const flight = try manager.loadFlightKey("model", &.{.cuda}, true, .{ .gliner_cuda_precision = value, .accept_default_alias = false });
+        defer a.free(flight);
+        for (values[0..index]) |other| {
+            const other_key = try backendVariantCacheKeyWithPrecision(a, "model", .cuda, null, other);
+            defer a.free(other_key);
+            try std.testing.expect(!std.mem.eql(u8, key, other_key));
+            const other_flight = try manager.loadFlightKey("model", &.{.cuda}, true, .{ .gliner_cuda_precision = other, .accept_default_alias = false });
+            defer a.free(other_flight);
+            try std.testing.expect(!std.mem.eql(u8, flight, other_flight));
+        }
+    }
+}
+
+test "GLiNER CUDA managed Ettin full context retains admission and recovers after denial" {
+    if (!build_options.enable_cuda) return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return error.SkipZigTest;
+    const precision = std.meta.stringToEnum(session_factory.GlinerCudaPrecision, platform.env.getenv("ANTFLY_GLINER25_FAMILY_CUDA_PRECISION") orelse "fp32") orelse return error.InvalidPrecision;
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.initWithIo(a, std.testing.io));
+    manager.session_manager.test_allow_unqualified_gliner_cuda_precision = true;
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    defer manager.deinit();
+    var handle = try manager.acquireFromDirWithGlinerCudaPrecision(directory, precision);
+    defer handle.release();
+    const loaded = handle.get();
+    try qualifyGlinerEttinForTest(&manager, loaded, directory, precision);
+}
+
+/// Reused by the socket qualification test after its cold preload. Keeping
+/// the same owner also verifies serving survives the failed managed runs.
+pub fn qualifyGlinerEttinForTest(manager: *ModelManager, loaded: *LoadedModel, directory: []const u8, precision: session_factory.GlinerCudaPrecision) !void {
+    if (!builtin.is_test) @compileError("GLiNER managed qualification is test-only");
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(.cuda, loaded.session.backend());
+    try std.testing.expect(loaded.session.run_admission != null);
+    var alias = try manager.acquireFromDir(directory);
+    defer alias.release();
+    try std.testing.expectEqual(loaded, alias.get());
+    var pipeline = loaded.glinerPipeline(a);
+    try std.testing.expectEqual(@as(u32, 7999), pipeline.config.max_length);
+    const bytes = try @import("../architectures/gliner/boundary_parity_test.zig").fixtureBytes(a, "family/decide_1b/capacity_cases.json");
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, bytes, .{});
+    defer parsed.deinit();
+    const cases = parsed.value.object.get("cases").?.array.items;
+    const text = cases[cases.len - 1].object.get("texts").?.array.items[0].string;
+    const gliner = @import("../pipelines/gliner.zig");
+    const labels = [_]gliner.DecisionLabel{ .{ .name = "refund" }, .{ .name = "support" }, .{ .name = "cancel" } };
+    const tasks = [_]gliner.DecisionTask{.{ .name = "intent", .labels = &labels }};
+    const requests = [_]gliner.DecisionRequest{.{ .text = text, .tasks = &tasks }};
+    const watchdog = try HardCancellationWatchdog.create(a);
+    defer watchdog.destroy();
+    try watchdog.start(std.testing.io);
+    const Cancellation = struct {
+        session: backends.Session,
+        cancelled: bool = false,
+        after_launch: ?usize = null,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+            if (comptime session_factory.CudaRuntimeStats != void) {
+                if (self.after_launch) |limit| {
+                    if (session_factory.getCudaRuntimeStats(self.session).?.kernel_launches >= limit) return error.Cancelled;
+                }
+            }
+        }
+    };
+    var cancellation = Cancellation{ .session = loaded.session };
+    pipeline.execution_control = .{ .ptr = &cancellation, .check_fn = Cancellation.check, .hard_cancellation = watchdog.boundary(), .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s };
+    manager.configureForcedRunAdmissionDenialsForTesting(1);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, pipeline.decideBatch(&requests));
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().scratchTotalBytes());
+    cancellation.cancelled = true;
+    try std.testing.expectError(error.Cancelled, pipeline.decideBatch(&requests));
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().scratchTotalBytes());
+    cancellation.cancelled = false;
+    if (comptime session_factory.CudaRuntimeStats != void) {
+        const limit = session_factory.getCudaRuntimeStats(loaded.session).?.kernel_launches + 8;
+        cancellation.after_launch = limit;
+        try std.testing.expectError(error.Cancelled, pipeline.decideBatch(&requests));
+        try std.testing.expect(session_factory.getCudaRuntimeStats(loaded.session).?.kernel_launches >= limit);
+        try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().scratchTotalBytes());
+        cancellation.after_launch = null;
+    }
+    const results = try pipeline.decideBatch(&requests);
+    defer {
+        for (results) |*result| result.deinit(a);
+        a.free(results);
+    }
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqual(@as(usize, 7999), results[0].prompt_tokens);
+    try std.testing.expectEqual(@as(usize, 0), results[0].tasks[0].selections[0].label_index);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5019554), results[0].tasks[0].selections[0].probability, if (precision == .auto or precision == .fp32) @as(f32, 5e-4) else @as(f32, 5e-3));
+    try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().scratchTotalBytes());
+    std.debug.print("family_cuda_managed: precision={s} tokens=7999 denial_recovered=true cancellation_recovered=true leases_released=true\n", .{@tagName(precision)});
 }
 
 fn backendVariantCacheKey(
@@ -8122,7 +8257,7 @@ test "loaded model snapshot final retired observation keeps protected cleanup an
     try manager.ensureResourceOwnerReady();
     var probe = TeardownTestProbe{};
     const model = try teardownTestModel(&manager, &probe);
-    var inference = try manager.publishLoadedModel(model, true, null);
+    var inference = try manager.publishLoadedModel(model, true, null, null);
     defer inference.release();
     var snapshot = try manager.acquireLoadedModelSnapshot(allocator);
     defer snapshot.deinit();
@@ -8428,6 +8563,8 @@ fn sessionManagerForPreferredBackends(
         .kernel_jit = source.kernel_jit,
         .kernel_jit_load_context = source.kernel_jit_load_context,
         .a4b_inference_request = source.a4b_inference_request,
+        .gliner_cuda_precision = source.gliner_cuda_precision,
+        .test_allow_unqualified_gliner_cuda_precision = source.test_allow_unqualified_gliner_cuda_precision,
         .onnx_execution_provider = source.onnx_execution_provider,
         .onnx_cuda_memory_limit_bytes = source.onnx_cuda_memory_limit_bytes,
         .io = source.io,
@@ -8444,6 +8581,18 @@ test "session manager load clones preserve process isolation policy" {
         &source,
     );
     try std.testing.expect(!clone.process_isolation_available);
+}
+
+test "GLiNER CUDA load clones retain per-manager qualification policy" {
+    var source = backends.SessionManager.init(std.testing.allocator);
+    const ordinary = sessionManagerForPreferredBackends(std.testing.allocator, &.{.cuda}, &source);
+    try std.testing.expect(!ordinary.test_allow_unqualified_gliner_cuda_precision);
+    source.gliner_cuda_precision = .fp16;
+    source.test_allow_unqualified_gliner_cuda_precision = true;
+    const candidate = sessionManagerForPreferredBackends(std.testing.allocator, &.{.cuda}, &source);
+    try std.testing.expect(candidate.test_allow_unqualified_gliner_cuda_precision);
+    try std.testing.expectEqual(.fp16, candidate.gliner_cuda_precision.?);
+    try std.testing.expect(!ordinary.test_allow_unqualified_gliner_cuda_precision);
 }
 
 pub const ManagedSession = struct {
@@ -9238,6 +9387,7 @@ fn loadSessionForPreferredBackends(
     var laya_resident_attempted = false;
     const laya_packed = man.hasCapability("typed_decisions") and session_factory.isPackedLayaModel(manager.allocator, model_dir);
     for (effective_backends) |backend| {
+        if (source_session_manager.gliner_cuda_precision != null and backend != .cuda) continue;
         // Once opted-in Metal residency is attempted, preserve its actionable
         // admission/load error rather than silently publishing a CPU session.
         if (laya_resident_attempted) return first_err orelse error.UnsupportedLayaArtifact;
@@ -13116,7 +13266,7 @@ test "model manager teardown supervised child fixture" {
             optional.ticket.?.close_timeout_ns = 100 * std.time.ns_per_ms;
             var cached = TeardownCacheProbe{ .primary = &probe, .optional = &optional, .block = true };
             try cached.attach(model);
-            var handle = try manager.publishLoadedModel(model, true, null);
+            var handle = try manager.publishLoadedModel(model, true, null, null);
             handle.release();
             std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
             manager.evictExpiredAt(model.last_used_ns + 2 * std.time.ns_per_ms);
@@ -13124,7 +13274,7 @@ test "model manager teardown supervised child fixture" {
             std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
             manager.destroyLoadedModel(model);
         } else {
-            var handle = try manager.publishLoadedModel(model, true, null);
+            var handle = try manager.publishLoadedModel(model, true, null, null);
             std.debug.print("teardown-fixture operation-start:{s}\n", .{mode});
             if (std.mem.eql(u8, mode, "retired")) {
                 manager.retireLoadedModel(model);

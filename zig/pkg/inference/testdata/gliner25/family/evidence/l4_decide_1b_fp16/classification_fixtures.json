@@ -1,0 +1,769 @@
+{
+  "model_id": "fastino/GLiNER2.5-Decide-1B",
+  "revision": "688cd7ba8917a0855ad3ce929cba5a9998932e79",
+  "backend": "cuda",
+  "precision": "fp16",
+  "qualification": false,
+  "cases": [
+    {
+      "id": "support_intent",
+      "max_confidence_error": 2.682209014892578e-06,
+      "batch_size": 1,
+      "token_ids_sha256": "b78bc2cd378f3bdbc9df22ce4924d5062ab883c8db50050502231f5f44a63ded",
+      "decisions": [
+        {
+          "raw_logits": [
+            -4.171472549438477,
+            2.3551876544952393,
+            -3.152270793914795,
+            -3.630018949508667,
+            -4.829333782196045,
+            -5.087401866912842,
+            -4.947912693023682,
+            -4.555704116821289,
+            -3.663766622543335
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 9
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 2.3551876544952393,
+                  "probability": 0.9866967797279358
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 77,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 31896,
+        "d2h_bytes": 144,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "travel",
+      "max_confidence_error": 0.00043082237243652344,
+      "batch_size": 1,
+      "token_ids_sha256": "07d02753d1a42b9b36dda7b79b61d374971fba7d3be0f2f65496d29ca06626b2",
+      "decisions": [
+        {
+          "raw_logits": [
+            -2.4538471698760986,
+            0.20102527737617493,
+            -5.520053386688232,
+            -2.854736566543579,
+            1.1738829612731934,
+            -6.501611709594727,
+            -5.631270408630371
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 7
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 4,
+                  "logit": 1.1738829612731934,
+                  "probability": 0.7016622424125671
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 55,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 30984,
+        "d2h_bytes": 112,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "hotel_multi_task",
+      "max_confidence_error": 0.000752866268157959,
+      "batch_size": 1,
+      "token_ids_sha256": "cfe688d1ef6071f0aa92cca85b6c4acea877111828b984351324867757a3a750",
+      "decisions": [
+        {
+          "raw_logits": [
+            -2.2297475337982178,
+            -0.601253092288971,
+            -0.35524114966392517,
+            -5.301342487335205,
+            -3.562269687652588,
+            -2.9991188049316406,
+            -0.9478157162666321,
+            -1.046565294265747,
+            -1.2384816408157349,
+            -1.2255728244781494,
+            -0.09901127964258194,
+            0.1226707249879837,
+            2.577139139175415,
+            -3.65614652633667,
+            -1.3594231605529785,
+            -3.010021448135376,
+            -1.8689125776290894
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 6
+            },
+            {
+              "task_index": 1,
+              "start": 6,
+              "end": 10
+            },
+            {
+              "task_index": 2,
+              "start": 10,
+              "end": 12
+            },
+            {
+              "task_index": 3,
+              "start": 12,
+              "end": 17
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": -0.35524114966392517,
+                  "probability": 0.4868510365486145
+                }
+              ]
+            },
+            {
+              "task_index": 1,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": -0.9478157162666321,
+                  "probability": 0.2931506037712097
+                }
+              ]
+            },
+            {
+              "task_index": 2,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.1226707249879837,
+                  "probability": 0.555194616317749
+                }
+              ]
+            },
+            {
+              "task_index": 3,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.577139139175415,
+                  "probability": 0.9293756484985352
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 119,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 33704,
+        "d2h_bytes": 272,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "passage_question",
+      "max_confidence_error": 1.1324882507324219e-05,
+      "batch_size": 1,
+      "token_ids_sha256": "0b085bdd73775d9562815f891cc02df394c369380acfaed44f79894d823a1490",
+      "decisions": [
+        {
+          "raw_logits": [
+            2.5689728260040283,
+            -2.408465623855591
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 2
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.5689728260040283,
+                  "probability": 0.9931554198265076
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 49,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 30664,
+        "d2h_bytes": 32,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "described_labels",
+      "max_confidence_error": 1.3470649719238281e-05,
+      "batch_size": 1,
+      "token_ids_sha256": "d17e8da776a929b23c0473a05a8df2be6d6dfc164874b8da82d4a1d069dfe486",
+      "decisions": [
+        {
+          "raw_logits": [
+            1.1920565366744995,
+            -1.678066372871399,
+            -3.0862865447998047
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.1920565366744995,
+                  "probability": 0.93409264087677
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 88,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 32240,
+        "d2h_bytes": 48,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "ordinal",
+      "max_confidence_error": 1.9863247871398926e-05,
+      "batch_size": 1,
+      "token_ids_sha256": "bfaa83d46783b3c1b35b9e687928925f548f685f634658da93ea6253792c52d3",
+      "decisions": [
+        {
+          "raw_logits": [
+            -2.8978703022003174,
+            -2.5714707374572754,
+            -2.085970878601074,
+            -2.150236129760742,
+            -1.969075083732605,
+            -1.9288783073425293,
+            -1.9853174686431885,
+            -1.9973958730697632,
+            -1.99211847782135,
+            -2.387052297592163,
+            -2.7345385551452637
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 11
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 5,
+                  "logit": -1.9288783073425293,
+                  "probability": 0.11878041177988052
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 58,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 31168,
+        "d2h_bytes": 176,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "book_genre",
+      "max_confidence_error": 0.00018224120140075684,
+      "batch_size": 1,
+      "token_ids_sha256": "c81244559bf4168e4ba7ac502e85f4568dacbcbe2f9014e92916391133bac174",
+      "decisions": [
+        {
+          "raw_logits": [
+            -1.4937232732772827,
+            -2.3422391414642334,
+            -0.6108052730560303,
+            -2.0644211769104004,
+            -1.707375168800354,
+            -1.8046852350234985
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 6
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": -0.6108052730560303,
+                  "probability": 0.40627509355545044
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 64,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 31328,
+        "d2h_bytes": 96,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "sentiment_multi",
+      "max_confidence_error": 8.45193862915039e-05,
+      "batch_size": 1,
+      "token_ids_sha256": "445129e6b29767d922d025de65f5fae7e6fd694b89b8bd58d9a9dbab7100f16f",
+      "decisions": [
+        {
+          "raw_logits": [
+            -1.7476469278335571,
+            0.7286821007728577,
+            -1.6763765811920166,
+            -3.3527021408081055,
+            0.6815463304519653,
+            1.1596635580062866,
+            -3.0325520038604736,
+            -2.184006452560425
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            },
+            {
+              "task_index": 1,
+              "start": 4,
+              "end": 8
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 0.7286821007728577,
+                  "probability": 0.8394927978515625
+                }
+              ]
+            },
+            {
+              "task_index": 1,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 0.6815463304519653,
+                  "probability": 0.66408371925354
+                },
+                {
+                  "label_index": 1,
+                  "logit": 1.1596635580062866,
+                  "probability": 0.7612715363502502
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 51,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 30840,
+        "d2h_bytes": 128,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "distinct_multilingual",
+      "max_confidence_error": 0.0002021193504333496,
+      "batch_size": 8,
+      "token_ids_sha256": "abffda1d18bb28dd0041eba9e8f86f4f729a9f6522aa64fea8fdb0ae7b158e5c",
+      "decisions": [
+        {
+          "raw_logits": [
+            2.5950818061828613,
+            -3.943218946456909,
+            -3.77962064743042,
+            -3.199350595474243
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 2.5950818061828613,
+                  "probability": 0.993842601776123
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 29,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -3.6838717460632324,
+            2.71597957611084,
+            -3.9125161170959473,
+            -3.4802985191345215
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 2.71597957611084,
+                  "probability": 0.9950041174888611
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 33,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -4.149720191955566,
+            -4.533267021179199,
+            2.52658748626709,
+            -2.942399740219116
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": 2.52658748626709,
+                  "probability": 0.9937050938606262
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 33,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            1.352755069732666,
+            -2.807382106781006,
+            -2.7378785610198975,
+            -1.7564774751663208
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.352755069732666,
+                  "probability": 0.9285315871238708
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 39,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -3.1108572483062744,
+            1.75139319896698,
+            -2.8031582832336426,
+            -2.5987393856048584
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 1.75139319896698,
+                  "probability": 0.9697839617729187
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 38,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -4.943991661071777,
+            3.7426741123199463,
+            -4.671297550201416,
+            -4.295360088348389
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 3.7426741123199463,
+                  "probability": 0.9992870688438416
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 32,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.3483335971832275,
+            -0.8684675097465515,
+            -0.13794469833374023,
+            -1.9921000003814697
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 2,
+                  "logit": -0.13794469833374023,
+                  "probability": 0.516442596912384
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 36,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.3299068212509155,
+            -0.8671678304672241,
+            -1.0735570192337036,
+            -1.038344383239746
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 4
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": -0.8671678304672241,
+                  "probability": 0.30434489250183105
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 22,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 41664,
+        "d2h_bytes": 512,
+        "downloads": 4
+      }
+    },
+    {
+      "id": "ragged_descriptions",
+      "max_confidence_error": 3.731250762939453e-05,
+      "batch_size": 2,
+      "token_ids_sha256": "5b57b9625c2da2bca340d70b322043c17a8d05f41a4654f30555578010895fc3",
+      "decisions": [
+        {
+          "raw_logits": [
+            1.5561013221740723,
+            -2.2214136123657227,
+            -2.2689437866210938
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 0,
+                  "logit": 1.5561013221740723,
+                  "probability": 0.957215428352356
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 44,
+          "execution_chunks": 1
+        },
+        {
+          "raw_logits": [
+            -1.941564679145813,
+            1.0150146484375,
+            -1.6263787746429443
+          ],
+          "task_ranges": [
+            {
+              "task_index": 0,
+              "start": 0,
+              "end": 3
+            }
+          ],
+          "tasks": [
+            {
+              "task_index": 0,
+              "selections": [
+                {
+                  "label_index": 1,
+                  "logit": 1.0150146484375,
+                  "probability": 0.8902671337127686
+                }
+              ]
+            }
+          ],
+          "prompt_tokens": 69,
+          "execution_chunks": 1
+        }
+      ],
+      "cuda_transfers": {
+        "kernel_launches": 1700,
+        "h2d_bytes": 34288,
+        "d2h_bytes": 96,
+        "downloads": 4
+      }
+    }
+  ],
+  "scope": "classification_fixtures",
+  "native_binary_sha256": "60b4585a5f05aa0ef8d298f73874e386b1f20a726244dfda32f63b6277af548d",
+  "build_mode": "debug",
+  "timing_qualification": false
+}

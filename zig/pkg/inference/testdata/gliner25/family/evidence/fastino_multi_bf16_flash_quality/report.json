@@ -1,0 +1,101 @@
+{
+  "reference": {
+    "event": "ready",
+    "arm": "fastino_cuda",
+    "model_id": "fastino/gliner2.5-multi-v1",
+    "revision": "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
+    "model_files": {
+      "config.json": {
+        "size_bytes": 3151,
+        "sha256": "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 857,
+        "sha256": "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716"
+      },
+      "model.safetensors": {
+        "size_bytes": 1149461028,
+        "sha256": "c1ff4ec0bc00031c15530b8f3c33d3677f27949e6a0cb52e1247a6224b6c5395"
+      },
+      "tokenizer.json": {
+        "size_bytes": 16035853,
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 645,
+        "sha256": "0bf3ea0873234bd9bfdd3853c440395009ac6365a925b91654daed5396d655e1"
+      }
+    },
+    "packages": {
+      "gliner2": "2.0.0",
+      "torch": "2.14.0",
+      "transformers": "5.17.0",
+      "tokenizers": "0.23.2",
+      "safetensors": "0.8.0",
+      "flashdeberta": "0.0.8",
+      "triton": "3.8.0"
+    },
+    "dtype": "bf16",
+    "attention": "flashdeberta",
+    "device": "NVIDIA L4",
+    "cuda": "13.0",
+    "gliner2_commit": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf",
+    "timing_boundary": "public_batch_api_loaded_model",
+    "qualification": false
+  },
+  "oracle_sha256": "8d431ae4337bdc2e83103f2dad900864dbedc8dc560b4eac8bfb3e0dab372d79",
+  "qualification": false,
+  "cases": [
+    {
+      "id": "mixed_tasks",
+      "passed": true,
+      "error": null
+    },
+    {
+      "id": "unicode_offsets",
+      "passed": true,
+      "error": null
+    },
+    {
+      "id": "entity_attributes",
+      "passed": false,
+      "error": "reference output cardinality changed"
+    },
+    {
+      "id": "legacy_structure",
+      "passed": false,
+      "error": "reference selected label changed"
+    },
+    {
+      "id": "record_natural",
+      "passed": false,
+      "error": "reference confidence outside FP32 tolerance"
+    },
+    {
+      "id": "record_latent",
+      "passed": false,
+      "error": "reference output cardinality changed"
+    },
+    {
+      "id": "record_anchorless",
+      "passed": true,
+      "error": null
+    },
+    {
+      "id": "enum_field",
+      "passed": true,
+      "error": null
+    },
+    {
+      "id": "constrained_classification",
+      "passed": true,
+      "error": null
+    },
+    {
+      "id": "joint_ie",
+      "passed": true,
+      "error": null
+    }
+  ],
+  "all_cases_passed": false
+}

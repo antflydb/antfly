@@ -1,0 +1,57 @@
+{
+  "status": "complete",
+  "qualification": false,
+  "scope": "real_loopback_http_correctness_admission_and_queued_cancellation",
+  "model": {
+    "model_id": "fastino/GLiNER2.5-multi-Decide",
+    "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+    "files": {
+      "config.json": {
+        "size_bytes": 3152,
+        "sha256": "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf"
+      },
+      "encoder_config/config.json": {
+        "size_bytes": 858,
+        "sha256": "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83"
+      },
+      "model.safetensors": {
+        "size_bytes": 1149461028,
+        "sha256": "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e"
+      },
+      "tokenizer.json": {
+        "size_bytes": 16035853,
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a"
+      },
+      "tokenizer_config.json": {
+        "size_bytes": 646,
+        "sha256": "fd4a31dc2f1f17e31638c5f0e783b81cdb2fbe6bddd116a8d9e5d50d78148cf1"
+      }
+    },
+    "architecture": "boundary",
+    "tasks": [
+      "classification",
+      "typed_decisions",
+      "windowing"
+    ]
+  },
+  "precision": "fp32",
+  "concurrency": [
+    1,
+    4,
+    16
+  ],
+  "distinct_requests": 16,
+  "serial_response_identity": true,
+  "admission_leases_released": true,
+  "queued_disconnect_drained": true,
+  "queued_device_admission_unchanged": true,
+  "queued_kernel_launches": 0,
+  "retry_response_identity": true,
+  "leaks": 0,
+  "native_binary_sha256": "ad337e3330025e7126eb6401874953a6c2cc81ee014d770d9194343df271b8ee",
+  "raw_capture": {
+    "path": "test.log",
+    "sha256": "972bf9056d670d0f6ab49e862f227a0d3c2df311b5f1908b57d9eccbf352f969"
+  },
+  "note": "Isolated debug model-backed test. Cold preload excluded from socket deadlines. No serving performance claim."
+}

@@ -440,6 +440,8 @@ pub const CapabilityProfile = enum {
     deberta_reranker,
     gliner2,
     gliner2_training,
+    gliner25_boundary,
+    gliner25_modern_bert,
     florence2,
     gemma4,
     gemma4_training,
@@ -455,7 +457,8 @@ fn jitModelProfile(profile: CapabilityProfile) kernels_mod.JitModelProfile {
         .bert_encoder => .bert_encoder,
         .laya => .laya,
         .deberta_reranker => .deberta_reranker,
-        .gliner2, .gliner2_training => .gliner2,
+        .gliner2, .gliner2_training, .gliner25_boundary => .gliner2,
+        .gliner25_modern_bert => .laya,
         .florence2 => .florence2,
         .gemma4, .gemma4_training => .gemma4,
         .qwen3_embedding => .qwen3_embedding,
@@ -1520,6 +1523,9 @@ pub const RuntimeStats = struct {
     prefill_profile_q4_pair_us: u64 = 0,
     prefill_profile_q4_gated_down_us: u64 = 0,
     prefill_profile_bf16_linear_us: u64 = 0,
+    prefill_profile_f16_linear_us: u64 = 0,
+    gliner_boundary_wide_attention_launches: usize = 0,
+    gliner_boundary_compact_attention_launches: usize = 0,
     prefill_profile_bf16_qkv_us: u64 = 0,
     prefill_profile_bf16_pair_us: u64 = 0,
     prefill_profile_attention_us: u64 = 0,
@@ -2124,9 +2130,31 @@ test "CUDA Q4 route census aggregates by full launch identity" {
 }
 
 pub const CudaCompute = struct {
+    pub fn launchGlinerBoundaryKernel(self: *CudaCompute, inputs: [10]buffer_mod.DeviceBuffer, output: buffer_mod.DeviceBuffer, descriptor: ops.gliner_boundary_device.Params, work: usize) !void {
+        var profile = if (descriptor.kind == 30)
+            beginPrefillProfile(self, .attention, @as(usize, descriptor.dims[0]) * descriptor.dims[1])
+        else
+            null;
+        defer if (profile) |*scope| scope.end();
+        try self.kernels.launchGliner25Boundary(&self.ctx, inputs, output, descriptor, work, self.gliner_boundary_inference, self.gliner_mixed_attention);
+        if (self.gliner_boundary_inference and self.gliner_mixed_attention and descriptor.kind == 30 and
+            descriptor.dims[3] == 64 and descriptor.dims[1] >= 512 and
+            self.kernels.gliner_boundary_attention_f32 != null and
+            (self.kernels.gliner_boundary_attention_tc_f16_m64 != null or
+                (descriptor.dims[1] >= 2048 and self.kernels.gliner_boundary_attention_tc_f16_compact != null)))
+            self.stats.gliner_boundary_wide_attention_launches += 1;
+        if (self.gliner_boundary_inference and self.gliner_mixed_attention and descriptor.kind == 30 and
+            descriptor.dims[3] == 64 and descriptor.dims[1] >= 2048 and self.kernels.gliner_boundary_attention_f32 != null and
+            self.kernels.gliner_boundary_attention_tc_f16_compact != null)
+            self.stats.gliner_boundary_compact_attention_launches += 1;
+    }
+
     /// Laya parity requires FP32 execution even for reduced-storage source tensors.
     strict_f32_weights: bool = false,
     laya_optimizations: bool = false,
+    gliner_encoder_attention: bool = false,
+    gliner_mixed_attention: bool = false,
+    gliner_boundary_inference: bool = false,
     laya_fusion: bool = false,
     boundary_scope: ops.gliner_boundary_device.ScopeAccounting = .{},
     /// Training retains many small gradients alongside large model tensors.
@@ -2136,6 +2164,9 @@ pub const CudaCompute = struct {
     ctx: context_mod.CudaContext,
     kernels: kernels_mod.KernelModule,
     resident_weights: std.StringHashMapUnmanaged(CudaTensor) = .{},
+    /// Diagnostic boundary compute mirrors. Original artifact tensors retain
+    /// their FP32 identity; these buffers are owned for the model lifetime.
+    gliner_boundary_f16_mirrors: std.AutoHashMapUnmanaged(driver_mod.CUdeviceptr, buffer_mod.DeviceBuffer) = .{},
     /// Frozen load-time contract for the qualified resident Gemma 4 A4B path.
     /// A non-null value is fail-closed: generic MoE fallback is not permitted.
     a4b_inference: ?backend_contracts.A4bInferenceConfig = null,
@@ -2474,6 +2505,9 @@ pub const CudaCompute = struct {
         var pair_mirror_it = self.bf16_pair_mirror_cache.valueIterator();
         while (pair_mirror_it.next()) |buf| buf.free(&self.ctx);
         self.bf16_pair_mirror_cache.deinit(self.allocator);
+        var boundary_mirrors = self.gliner_boundary_f16_mirrors.valueIterator();
+        while (boundary_mirrors.next()) |buf| buf.free(&self.ctx);
+        self.gliner_boundary_f16_mirrors.deinit(self.allocator);
         var it = self.resident_weights.iterator();
         while (it.next()) |entry| {
             var tensor = entry.value_ptr.*;
@@ -2588,6 +2622,8 @@ pub const CudaCompute = struct {
             .deberta_reranker => self.kernels.hasDebertaRerankerPrimitives(),
             .gliner2 => self.kernels.hasGliner2Primitives(),
             .gliner2_training => self.kernels.hasGliner2TrainingPrimitives(),
+            .gliner25_boundary => self.kernels.hasGliner25InferencePrimitives(),
+            .gliner25_modern_bert => self.kernels.hasLayaPrimitives() and self.kernels.gliner_encoder_attention_f32 != null,
             .florence2 => self.kernels.hasFlorence2Primitives(),
             .gemma4 => self.kernels.hasQuantMatmulMvpPrimitives() and
                 self.kernels.hasBf16WeightPrimitives() and
@@ -3608,6 +3644,31 @@ pub const CudaCompute = struct {
             .owns_shape = false,
             .owned_by_tensor = false,
         });
+    }
+
+    /// Attach only encoder projection mirrors, after authenticating and
+    /// uploading the original weight. Embeddings, norms and heads stay FP32.
+    pub fn prepareGlinerBoundaryF16Mirror(self: *CudaCompute, name: []const u8, source: *const tensor_mod.Tensor) !void {
+        if (!self.gliner_boundary_inference or !self.gliner_mixed_attention) return error.InvalidCudaState;
+        if (source.shape.len != 2 or !std.mem.startsWith(u8, name, "encoder.layer.") or !std.mem.endsWith(u8, name, ".weight")) return;
+        const weight = self.resident_weights.get(name) orelse return error.MissingWeight;
+        if (source.dtype != .f32 or weight.dtype != .f32 or weight.quant_type != null or
+            !std.mem.eql(i64, source.shape, weight.shape)) return error.UnsupportedTensorType;
+        if (self.gliner_boundary_f16_mirrors.contains(weight.buffer.ptr)) return error.DuplicateWeight;
+        const values = source.asFloat32();
+        if (values.len != weight.elem_count) return error.InvalidShape;
+        const half = try self.allocator.alloc(f16, values.len);
+        defer self.allocator.free(half);
+        for (values, half) |value, *reduced| {
+            reduced.* = @floatCast(value);
+            if (!std.math.isFinite(reduced.*)) return error.UnsupportedGlinerCudaPrecision;
+        }
+        var device = try allocDeviceBuffer(self, std.mem.sliceAsBytes(half).len);
+        errdefer device.free(&self.ctx);
+        try copyFromHostTracked(self, device, std.mem.sliceAsBytes(half));
+        try synchronizeAndDrainDeferredDeviceFrees(self);
+        try self.gliner_boundary_f16_mirrors.put(self.allocator, weight.buffer.ptr, device);
+        self.stats.resident_weight_bytes += device.len;
     }
 
     pub fn insertBf16WeightFromF32Tensor(self: *CudaCompute, owned_key: []const u8, tensor: *const tensor_mod.Tensor) !void {
@@ -7842,6 +7903,7 @@ const CudaPrefillProfileCategory = enum {
     q4_pair,
     q4_gated_down,
     bf16_linear,
+    f16_linear,
     bf16_qkv,
     bf16_pair,
     attention,
@@ -8062,6 +8124,7 @@ fn notePrefillProfileUs(self: *CudaCompute, category: CudaPrefillProfileCategory
         .q4_pair => self.stats.prefill_profile_q4_pair_us += elapsed_us,
         .q4_gated_down => self.stats.prefill_profile_q4_gated_down_us += elapsed_us,
         .bf16_linear => self.stats.prefill_profile_bf16_linear_us += elapsed_us,
+        .f16_linear => self.stats.prefill_profile_f16_linear_us += elapsed_us,
         .bf16_qkv => self.stats.prefill_profile_bf16_qkv_us += elapsed_us,
         .bf16_pair => self.stats.prefill_profile_bf16_pair_us += elapsed_us,
         .attention => self.stats.prefill_profile_attention_us += elapsed_us,
@@ -8129,6 +8192,7 @@ fn prefillProfileCategoryForLinearNoBias(weight: *const CudaTensor, rows: usize,
     if (rows <= 1) return null;
     if (isKnownQuant(weight, .Q4_0)) return if (weight.bf16_mirror.ptr != 0) .bf16_linear else .q4_linear;
     if (isBf16Weight(weight)) return .bf16_linear;
+    if (isF16Weight(weight)) return .f16_linear;
     if (weight.quant_type == null and weight.dtype == .f32 and in_dim == 2560 and out_dim == 10752) return .ple_dense;
     return null;
 }
@@ -13588,10 +13652,29 @@ fn simtQMatmulFallbackVariant(variant: kernels_mod.QMatmulVariant) kernels_mod.Q
     return if (variant == .tc_hmma) .fast_r4c4 else variant;
 }
 
+// Read-only view: the mirror is model-owned and never changes the FP32
+// resident tensor used by extraction layouts, identity checks or task heads.
+fn boundaryMixedWeight(self: *CudaCompute, weight: *const CudaTensor) ?CudaTensor {
+    if (!self.gliner_boundary_inference or !self.gliner_mixed_attention or weight.dtype != .f32) return null;
+    const mirror = self.gliner_boundary_f16_mirrors.get(weight.buffer.ptr) orelse return null;
+    var view = weight.*;
+    view.buffer = mirror;
+    view.dtype = .f16;
+    view.bf16_mirror = .{};
+    view.owns_buffer = false;
+    view.owns_shape = false;
+    view.owned_by_tensor = false;
+    return view;
+}
+
 fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    if (boundaryMixedWeight(self, weight_tensor)) |reduced| {
+        var view = reduced;
+        return linear(ctx, input, @ptrCast(&view), bias, rows, in_dim, out_dim);
+    }
     const bias_tensor = tensorFromCt(bias);
     try ensureF32(input_tensor);
     try ensureF32F16Bf16OrQuantized(weight_tensor);
@@ -13625,6 +13708,9 @@ fn linear(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim:
         return result;
     }
     if (isF16Weight(weight_tensor)) {
+        // Keep FP32 bias addition separate from the FP16 matmul. A fused
+        // cuBLASLt epilogue selects different algorithms and failed the
+        // multilingual classification agreement gate.
         const result = try linearNoBias(ctx, input, weight, rows, in_dim, out_dim);
         errdefer freeTensor(ctx, result);
         const result_tensor = tensorFromCt(result);
@@ -13743,6 +13829,10 @@ fn linearRelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    if (boundaryMixedWeight(self, weight_tensor)) |reduced| {
+        var view = reduced;
+        return linearRelu(ctx, input, @ptrCast(&view), bias, rows, in_dim, out_dim);
+    }
     const bias_tensor = tensorFromCt(bias);
     try ensureF32(input_tensor);
     try ensureF32(bias_tensor);
@@ -13807,6 +13897,7 @@ fn linearGelu(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    if (boundaryMixedWeight(self, weight_tensor) != null) return null;
     const bias_tensor = tensorFromCt(bias);
     const q8_variant = if (isKnownQuant(weight_tensor, .Q8_0)) mxbaiQ8Variant(rows, in_dim, out_dim) else null;
     const q4_variant = if (isKnownQuant(weight_tensor, .Q4_K)) mxbaiQ4Variant(rows, in_dim, out_dim) else null;
@@ -13851,6 +13942,7 @@ fn linearAdd(ctx: *anyopaque, input: CT, weight: CT, bias: CT, residual: CT, row
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    if (boundaryMixedWeight(self, weight_tensor) != null) return null;
     const bias_tensor = tensorFromCt(bias);
     const residual_tensor = tensorFromCt(residual);
     try ensureF32(input_tensor);
@@ -14170,6 +14262,12 @@ fn linearNoBiasWithPolicy(ctx: *anyopaque, input: CT, weight: CT, rows: usize, i
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     const input_tensor = tensorFromCt(input);
     const weight_tensor = tensorFromCt(weight);
+    if (!primitive_training) {
+        if (boundaryMixedWeight(self, weight_tensor)) |reduced| {
+            var view = reduced;
+            return linearNoBiasWithPolicy(ctx, input, @ptrCast(&view), rows, in_dim, out_dim, false);
+        }
+    }
     try ensureF32(input_tensor);
     try ensureF32F16Bf16OrQuantized(weight_tensor);
     const input_expected = try checkedMul(rows, in_dim);
@@ -18365,6 +18463,34 @@ fn layaWarpEligible(self: *const CudaCompute, batch: usize, seq: usize, dim: usi
         (dim == 64 or dim == 128) and self.kernels.laya_attention_warp_f32 != null;
 }
 
+// GLiNER's ModernBERT profile uses uniform, full-head split-half RoPE.
+// Packed/branched and other model profiles retain their existing operations.
+fn splitQkvRope(ctx: *anyopaque, input: CT, batch: usize, seq: usize, heads: usize, dim: usize, theta: f32) anyerror!?ops.SplitLastDim3Result {
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (!self.gliner_encoder_attention or self.kernels.gliner_qkv_rope_f32 == null) return null;
+    if (batch == 0 or seq == 0 or heads == 0 or dim == 0 or dim % 2 != 0 or !std.math.isFinite(theta) or theta <= 0) return error.InvalidShape;
+    const rows = try checkedMul(batch, seq);
+    const width = try checkedMul(heads, dim);
+    const count = try checkedMul(rows, width);
+    const tensor = tensorFromCt(input);
+    try ensureF32(tensor);
+    try ensureCount(tensor, try checkedMul(count, 3));
+    var parts: [3]CT = undefined;
+    var initialized: usize = 0;
+    errdefer for (parts[0..initialized]) |part| freeTensor(ctx, part);
+    for (&parts) |*part| {
+        const shape = try allocShape2(self.allocator, rows, width);
+        errdefer self.allocator.free(shape);
+        var device = try allocDeviceBuffer(self, try checkedMul(count, @sizeOf(f32)));
+        errdefer device.free(&self.ctx);
+        part.* = try createTensor(self, device, shape, count);
+        initialized += 1;
+    }
+    try self.kernels.launchGlinerQkvRopeF32(&self.ctx, tensorFromCt(parts[0]).buffer, tensorFromCt(parts[1]).buffer, tensorFromCt(parts[2]).buffer, tensor.buffer, batch, seq, heads, dim, theta);
+    self.stats.launch_other += 1;
+    return .{ .first = parts[0], .second = parts[1], .third = parts[2] };
+}
+
 fn packedGegluExact(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (!self.laya_fusion or self.kernels.laya_packed_geglu_f32 == null) return null;
@@ -18395,7 +18521,13 @@ fn encoderLocalAttention(ctx: *anyopaque, q: CT, k: CT, v: CT, mask: []const i64
     errdefer self.allocator.free(shape);
     var device = try allocDeviceBuffer(self, count * @sizeOf(f32));
     errdefer device.free(&self.ctx);
-    if (layaWarpEligible(self, batch, seq, dim)) {
+    if (self.gliner_mixed_attention and dim == 64) {
+        var profile = beginPrefillProfile(self, .attention, batch * seq);
+        defer if (profile) |*scope| scope.end();
+        try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+    } else if (self.gliner_encoder_attention) {
+        try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
+    } else if (layaWarpEligible(self, batch, seq, dim)) {
         try self.kernels.launchLayaAttentionWarpF32(&self.ctx, device, tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, mask_device, batch, seq, heads, dim, radius);
         self.stats.laya_warp_attention += 1;
     } else {
@@ -18469,7 +18601,16 @@ fn sdpaLaunch(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, mask: ?[]const i64,
     errdefer device.free(&self.ctx);
     var prefill_profile_scope = beginPrefillProfile(self, .attention, token_count);
     defer if (prefill_profile_scope) |*scope| scope.end();
-    if (has_mask and bias_mode == 0 and layaWarpEligible(self, batch, seq_len, head_dim)) {
+    // Mixed candidates retain F32 softmax/output accumulation and use F16
+    // attention operands even when encoder matrix weights are BF16.
+    if (self.gliner_mixed_attention and has_mask and bias_mode == 0 and head_dim == 64) {
+        try self.kernels.launchGlinerEncoderAttentionTcF16(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
+        self.stats.launch_attention += 1;
+        return createTensor(self, device, shape, count);
+    }
+    if (self.gliner_encoder_attention and has_mask and bias_mode == 0) {
+        try self.kernels.launchGlinerEncoderAttentionF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
+    } else if (has_mask and bias_mode == 0 and layaWarpEligible(self, batch, seq_len, head_dim)) {
         try self.kernels.launchLayaAttentionWarpF32(&self.ctx, device, q_tensor.buffer, k_tensor.buffer, v_tensor.buffer, mask_device, batch, seq_len, num_heads, head_dim, seq_len);
         self.stats.laya_warp_attention += 1;
     } else {
@@ -23321,6 +23462,7 @@ const vtable = ops.ComputeBackend.VTable{
     .encoderLocalAttention = &encoderLocalAttention,
     .layaActionFeatures = &layaActionFeatures,
     .packedGegluExact = &packedGegluExact,
+    .splitQkvRope = &splitQkvRope,
     .scaledDotProductAttentionQwen3VlVision = &sdpaQwen3VlVision,
     .scaledDotProductAttentionFull = &sdpaFull,
     .causalSelfAttention = &causalSelfAttention,

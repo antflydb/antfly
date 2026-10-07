@@ -28,6 +28,7 @@ pub const ContentPart = types.ContentPart;
 pub const ContentSecurityConfig = types.ContentSecurityConfig;
 pub const Credentials = types.Credentials;
 pub const DecideAnswer = types.DecideAnswer;
+pub const DecideLongDocument = types.DecideLongDocument;
 pub const DecideQuestion = types.DecideQuestion;
 pub const DecideRequest = types.DecideRequest;
 pub const DecideResponse = types.DecideResponse;

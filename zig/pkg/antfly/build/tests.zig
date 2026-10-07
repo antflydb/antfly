@@ -4825,7 +4825,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
-    lib_standalone_runtime_test_step.dependOn(&b.addRunArtifact(inference_host_tests).step);
+    const run_inference_host_tests = b.addRunArtifact(inference_host_tests);
+    lib_standalone_runtime_test_step.dependOn(&run_inference_host_tests.step);
+    b.step("antfly-inference-host-test", "Run inference host ABI and preload conversion regressions")
+        .dependOn(&run_inference_host_tests.step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
     // object. Compile this narrow integration slice independently so adding
     // restore coverage does not inflate every standalone runtime test build.
