@@ -674,6 +674,7 @@ const StandaloneHealthSource = struct {
         try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
+        try antfly.common.request_admission.runnable_metrics.appendPrometheusMetrics(writer, handler.runnable);
         try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, .{
             .capacity = handler.query_capacity,
             .in_flight = handler.query_in_flight,
@@ -5197,6 +5198,7 @@ pub fn runFromIterator(
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .runnable_policy = if (loaded_config) |*cfg| cfg.admission.runnable else null,
             .request_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_request_memory_bytes) else 256 << 20,
             .retained_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_retained_memory_bytes) else 256 << 20,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},

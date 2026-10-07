@@ -1007,12 +1007,77 @@ components:
           minimum: 1048576
           default: 268435456
           description: Aggregate API request, response, SQL plan, and in-memory transaction allocation envelope. One eighth, capped at 16 MiB, is reserved for verified SQL control work. Storage, inference, transport, and durable completion retain separate envelopes.
+        runnable:
+          $ref: "#/components/schemas/RunnableSchedulingConfig"
         query:
           $ref: "#/components/schemas/QueryAdmissionConfig"
         write:
           $ref: "#/components/schemas/WriteAdmissionConfig"
         inference:
           $ref: "#/components/schemas/InferenceAdmissionConfig"
+
+    RunnableSchedulingConfig:
+      type: object
+      nullable: true
+      additionalProperties: false
+      description: Opt-in fixed runnable scheduling for SQL reads. Omit or set null to preserve existing dispatch. Outstanding operation admission and retained memory remain separately bounded. Automatic defaults are not qualified.
+      properties:
+        slots:
+          type: integer
+          minimum: 2
+          maximum: 65535
+          default: 8
+        control_slots:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Reserved within slots; must be smaller than slots.
+        weights:
+          type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+          default: [4, 2, 1, 1]
+          description: Query, write, inference and background slot-service weights. Only read integration is currently enabled.
+        max_operations:
+          type: integer
+          minimum: 2
+          default: 128
+        max_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 8388608
+          description: Caller-declared scheduling metadata bytes across queued, running and blocked operations; not a whole-process heap limit.
+        control_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 65536
+          description: Protected scheduling metadata bytes reserved within max_bytes. Up to four operation entries, capped at half max_operations, are also reserved for controls.
+        max_wait_ms:
+          type: integer
+          minimum: 1
+          maximum: 60000
+          default: 250
+        max_backfills:
+          type: integer
+          minimum: 0
+          maximum: 65535
+          default: 8
+        quantum_ms:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 2
+        checkpoint_budget:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          default: 64
 
     GraphExecutionConfig:
       type: object

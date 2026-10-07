@@ -314,7 +314,10 @@ test "SQL plan cache failures preserve diagnostics and reclaim all admission" {
 }
 
 test "SQL plan cache bounds actual live allocation through byte-driven eviction" {
-    var backing: Budget = .{ .backing = std.testing.allocator, .limit = 8192 };
+    // SafeAllocator's in-place growth changes during eviction churn. Keep
+    // allocation sizes deterministic while testing the same hard byte bounds.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    var backing: Budget = .{ .backing = no_resize.allocator(), .limit = 8192 };
     var cache = Cache.init(backing.allocator(), .{ .max_entries = 8, .max_bytes = 8192, .max_compile_bytes = 4096 });
     defer cache.deinit(std.testing.io);
     var diagnostic: compiler.Diagnostic = .{};

@@ -2528,6 +2528,7 @@ pub const HealthSource = struct {
                 .rejected_total = http.rejected_requests_total,
             };
             try antfly.common.request_admission.appendPrometheusMetrics(writer, .query, query_stats);
+            try antfly.common.request_admission.runnable_metrics.appendPrometheusMetrics(writer, if (self.data_server.http_server) |*api| api.runnableSchedulingStats() else .{});
             try antfly.common.request_admission.appendPrometheusMetrics(writer, .write, .{
                 .capacity = http.max_active_writes,
                 .in_flight = http.active_writes,
@@ -31042,6 +31043,7 @@ pub fn runFromIterator(
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
+            .runnable_policy = if (loaded_config) |*cfg| cfg.admission.runnable else null,
             .request_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_request_memory_bytes) else 256 << 20,
             .retained_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_retained_memory_bytes) else 256 << 20,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},

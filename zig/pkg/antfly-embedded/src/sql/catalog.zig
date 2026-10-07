@@ -253,6 +253,10 @@ pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed,
 
 pub const Backend = struct {
     execution_io: ?std.Io = null,
+    /// Serial spill I/O is independent of parallel compute ownership. A
+    /// scheduled single-worker adapter can retain spilling without launching
+    /// children that share its mutable execution capsule.
+    spill_io: ?std.Io = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,

@@ -19,6 +19,7 @@ pub const AdmissionConfig = struct {
     max_retained_memory_bytes: ?u64 = null,
     /// Aggregate API request, response, SQL plan, and in-memory transaction allocation envelope. One eighth, capped at 16 MiB, is reserved for verified SQL control work. Storage, inference, transport, and durable completion retain separate envelopes.
     max_request_memory_bytes: ?u64 = null,
+    runnable: OpenApiOptionalNullable(std.meta.Child(RunnableSchedulingConfig)) = .absent,
     query: ?QueryAdmissionConfig = null,
     write: ?WriteAdmissionConfig = null,
     inference: ?InferenceAdmissionConfig = null,
@@ -27,6 +28,7 @@ pub const AdmissionConfig = struct {
     pub const openApiFieldMetadata = .{
         .{ "max_retained_memory_bytes", "max_retained_memory_bytes", true },
         .{ "max_request_memory_bytes", "max_request_memory_bytes", true },
+        .{ "runnable", "runnable", false },
         .{ "query", "query", true },
         .{ "write", "write", true },
         .{ "inference", "inference", true },
@@ -49,6 +51,17 @@ pub const AdmissionConfig = struct {
         if (self.max_request_memory_bytes) |value| {
             try jw.objectField("max_request_memory_bytes");
             try jw.write(value);
+        }
+        switch (self.runnable) {
+            .absent => {},
+            .null_value => {
+                try jw.objectField("runnable");
+                try jw.write(@as(?u8, null));
+            },
+            .value => |value| {
+                try jw.objectField("runnable");
+                try jw.write(value);
+            },
         }
         if (self.query) |value| {
             try jw.objectField("query");
@@ -2212,6 +2225,93 @@ pub const QueryAdmissionWaiting = struct {
     }
 };
 
+pub const RunnableSchedulingConfigValue = struct {
+    slots: ?i64 = null,
+    /// Reserved within slots; must be smaller than slots.
+    control_slots: ?i64 = null,
+    /// Query, write, inference and background slot-service weights. Only read integration is currently enabled.
+    weights: ?[]const i64 = null,
+    max_operations: ?i64 = null,
+    /// Caller-declared scheduling metadata bytes across queued, running and blocked operations; not a whole-process heap limit.
+    max_bytes: ?u64 = null,
+    /// Protected scheduling metadata bytes reserved within max_bytes. Up to four operation entries, capped at half max_operations, are also reserved for controls.
+    control_bytes: ?u64 = null,
+    max_wait_ms: ?i64 = null,
+    max_backfills: ?i64 = null,
+    quantum_ms: ?i64 = null,
+    checkpoint_budget: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "slots", "slots", true },
+        .{ "control_slots", "control_slots", true },
+        .{ "weights", "weights", true },
+        .{ "max_operations", "max_operations", true },
+        .{ "max_bytes", "max_bytes", true },
+        .{ "control_bytes", "control_bytes", true },
+        .{ "max_wait_ms", "max_wait_ms", true },
+        .{ "max_backfills", "max_backfills", true },
+        .{ "quantum_ms", "quantum_ms", true },
+        .{ "checkpoint_budget", "checkpoint_budget", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.slots) |value| {
+            try jw.objectField("slots");
+            try jw.write(value);
+        }
+        if (self.control_slots) |value| {
+            try jw.objectField("control_slots");
+            try jw.write(value);
+        }
+        if (self.weights) |value| {
+            try jw.objectField("weights");
+            try jw.write(value);
+        }
+        if (self.max_operations) |value| {
+            try jw.objectField("max_operations");
+            try jw.write(value);
+        }
+        if (self.max_bytes) |value| {
+            try jw.objectField("max_bytes");
+            try jw.write(value);
+        }
+        if (self.control_bytes) |value| {
+            try jw.objectField("control_bytes");
+            try jw.write(value);
+        }
+        if (self.max_wait_ms) |value| {
+            try jw.objectField("max_wait_ms");
+            try jw.write(value);
+        }
+        if (self.max_backfills) |value| {
+            try jw.objectField("max_backfills");
+            try jw.write(value);
+        }
+        if (self.quantum_ms) |value| {
+            try jw.objectField("quantum_ms");
+            try jw.write(value);
+        }
+        if (self.checkpoint_budget) |value| {
+            try jw.objectField("checkpoint_budget");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Opt-in fixed runnable scheduling for SQL reads. Omit or set null to preserve existing dispatch. Outstanding operation admission and retained memory remain separately bounded. Automatic defaults are not qualified.
+pub const RunnableSchedulingConfig = ?RunnableSchedulingConfigValue;
+
 pub const S3ExternalIoConfig = struct {
     protocol: []const u8,
     /// S3-compatible endpoint override.
@@ -2702,6 +2802,51 @@ pub const WriteAdmissionConfig = struct {
         try jw.endObject();
     }
 };
+
+/// Presence-aware representation of an optional OpenAPI property that also permits JSON null.
+pub fn OpenApiOptionalNullable(comptime T: type) type {
+    return union(enum) {
+        absent,
+        null_value,
+        value: T,
+
+        pub fn fromNullable(value: ?T) @This() {
+            return if (value) |item| .{ .value = item } else .null_value;
+        }
+
+        pub fn isPresent(self: @This()) bool {
+            return self != .absent;
+        }
+
+        pub fn valueOrNull(self: @This()) ?T {
+            return switch (self) {
+                .absent, .null_value => null,
+                .value => |item| item,
+            };
+        }
+
+        pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+            if (try source.peekNextTokenType() == .null) {
+                _ = try source.next();
+                return .null_value;
+            }
+            return .{ .value = try std.json.innerParse(T, allocator, source, options) };
+        }
+
+        pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+            if (source == .null) return .null_value;
+            return .{ .value = try std.json.parseFromValueLeaky(T, allocator, source, options) };
+        }
+
+        pub fn jsonStringify(self: @This(), jw: anytype) !void {
+            switch (self) {
+                .absent => return error.OptionalNullablePropertyAbsent,
+                .null_value => try jw.write(@as(?u8, null)),
+                .value => |value| try jw.write(value),
+            }
+        }
+    };
+}
 
 /// Parse an OpenAPI object without materializing a second JSON tree while
 /// rejecting explicit null for optional properties whose schemas are non-nullable.

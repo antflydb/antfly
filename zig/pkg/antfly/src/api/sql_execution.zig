@@ -112,6 +112,7 @@ pub const Adapter = struct {
     server: *http_server.ApiHttpServer,
     identity: *?http_server.AuthenticatedIdentity,
     context: operation.RequestContext,
+    runnable: ?*http_server.RunnableScheduler.Execution = null,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
@@ -520,7 +521,7 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_io = if (self.runnable == null) self.server.embedding_provider_runtime.io else null, .spill_io = if (self.runnable != null) self.server.embedding_provider_runtime.io else null, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -584,6 +585,7 @@ pub const Adapter = struct {
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.context.ensureActive();
+        if (self.runnable) |execution| try execution.checkpoint();
     }
 
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -741,7 +743,7 @@ pub const Adapter = struct {
 
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
-            try self.adapter.context.ensureActive();
+            try checkpoint(self.adapter);
             var page = try self.view.next(alloc, limit);
             errdefer page.deinit();
             if (page.rows.len > limit) return error.InvalidSqlBackendResponse;

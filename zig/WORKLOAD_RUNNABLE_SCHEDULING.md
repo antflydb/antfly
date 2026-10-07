@@ -1,8 +1,10 @@
 # Runnable workload scheduling
 
-Status: scheduler core implemented and tested; production HTTP/pgwire integration,
-cooperative query quanta, remote-attempt accounting, qualification and default
-selection remain required. The whole delivery goal remains safe sharing across
+Status: scheduler core and opt-in HTTP/pgwire SQL read integration pass native
+protocol qualification; full Linux API and runtime metrics endpoint checks remain
+pending. Genuine backend wait suspension, parallel child ownership,
+remote-attempt accounting, qualification and default selection remain required.
+The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
 session semantics, correctness, durability and control progress under overload.
 
@@ -43,6 +45,23 @@ finite. Control slots are reserved within the total slot envelope and are not
 lent to ordinary work. Identifying protected controls remains an authenticated,
 grammar-verified responsibility of the adapter, not a label clients can select.
 
+Control also has protected outstanding metadata: `control_bytes` is reserved
+inside `max_bytes`, and up to four entries (at most half `max_operations`) are
+reserved inside the operation bound. Filling ordinary outstanding limits cannot
+consume those reservations. An authenticated completion drain can promote its
+already parked entry to the control class without reserving new metadata; its
+original metadata charge remains ordinary until retirement. This changes where
+the entry runs, not who owns its retained state or durable obligations.
+
+Telemetry separates configured capacity, active slots, outstanding owners,
+declared metadata bytes, queue/resource/output waiting, grants by class and
+cooperative yields. Protected metadata counters describe the original reservation,
+so promoting a parked ordinary owner does not fabricate a control metadata charge.
+Disabled scheduling reports zero capacity. The primitive snapshot crosses the
+versioned API bridge; both data-node and standalone metrics paths use the same
+formatter. Focused snapshot/formatting tests pass, while full runtime endpoint
+qualification remains pending with protocol verification.
+
 Small jobs can backfill behind a head whose demand cannot fit. Every such grant
 increments the blocked head's bypass count. At the configured bound, the oldest
 blocked head becomes a barrier: ordinary work drains until that head can run.
@@ -50,9 +69,29 @@ Control work remains independent. A large job must fit its class's total capacit
 or submission rejects it atomically. This protects against an unfulfillable
 barrier and starvation from a continuing stream of smaller jobs.
 
-The core schedules explicit declared slot demand. Real execution cost estimates,
-time/work-based quantum enforcement, expensive-query demotion and per-tenant
-weights are subsequent integration work; the current tests do not prove those.
+The core schedules explicit declared slot demand. Its stable, single-worker
+execution capsule yields after `checkpoint_budget` checkpoints or `quantum_ms`
+elapsed time, whichever comes first at a checkpoint. These are cooperative
+limits: an uninterrupted backend call can exceed the quantum. Real execution
+cost estimates, expensive-query demotion and per-tenant weights remain subsequent
+integration work; the current tests do not prove those.
+
+The opt-in SQL adapter owns one capsule per operation. HTTP and pgwire reads use
+the node's shared scheduler; pgwire page streams park between pulls and retain
+their operation, snapshot and memory owners. Scheduled SQL currently uses serial
+backend execution because parallel children need independent runnable ownership
+before sharing an adapter. Serial execution retains a separate spill I/O
+capability: sorting, grouping and window continuations still spool to disk, while
+all spill CPU submissions pass through a manager gate that declines parallel
+work. The six-case continuation fixture passes in both serial and parallel modes
+on macOS and Nix/glibc GNU Linux. This temporary restriction must be resolved
+before selecting defaults. Ordinary mutations retain their existing admission path;
+only already verified protected controls use reserved runnable capacity.
+
+No adapter may label a whole backend call resource-blocked just because it may
+perform I/O: it can also execute substantial CPU work. Releasing its runnable
+permit requires a genuine wait boundary and reacquisition before execution
+resumes. That integration remains outstanding.
 
 ## Integration order and completion requirements
 

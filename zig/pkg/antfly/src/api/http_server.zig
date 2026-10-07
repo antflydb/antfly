@@ -1423,6 +1423,8 @@ fn restoreWorkerAuthorityMatches(
 
 /// Process-local admission shared by every protocol adapter that invokes the
 /// public application operations below.
+pub const RunnableScheduler = @import("antfly_local_sources").common_request_admission.runnable_scheduler;
+
 pub const RequestAdmission = @import("antfly_local_sources").common_request_admission.RequestAdmission;
 
 pub const HotStandbyMutationPolicySnapshot = struct {
@@ -1643,6 +1645,7 @@ pub const ApiHttpServerConfig = struct {
     /// Node-local public database-query admission capacity. Zero is unlimited.
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     query_waiting: @import("antfly_local_sources").common_bounded_admission.Waiting = .{},
+    runnable_policy: ?RunnableScheduler.Config = null,
     /// Aggregate API request/backend-response/transaction-state allocation cap.
     /// Control work receives a separate partition within this envelope.
     request_memory_bytes: usize = 256 << 20,
@@ -3872,6 +3875,7 @@ pub const ApiHttpServer = struct {
     transport_memory_reserved: usize = 0,
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
+    runnable_scheduler: ?RunnableScheduler.Scheduler = null,
     sql_preparation_admission: RequestAdmission,
     sql_control_preparation: RequestAdmission = RequestAdmission.init(4),
     sql_control_admission: RequestAdmission = RequestAdmission.init(4),
@@ -4121,6 +4125,7 @@ pub const ApiHttpServer = struct {
             .state_alloc = state_alloc,
             .cfg = cfg,
             .query_admission = RequestAdmission.initConfigured(cfg.query_max_concurrent_requests, cfg.query_waiting) catch @panic("invalid query waiting policy"),
+            .runnable_scheduler = if (cfg.runnable_policy) |policy| RunnableScheduler.Scheduler.init(policy) catch @panic("invalid runnable scheduling policy") else null,
             .sql_preparation_admission = RequestAdmission.init(@max(1, cfg.sql_max_concurrent_preparations)),
             .write_admission = RequestAdmission.init(cfg.write_max_concurrent_requests),
             .inference_admission = RequestAdmission.init(cfg.inference_max_concurrent_requests),
@@ -4355,6 +4360,15 @@ pub const ApiHttpServer = struct {
         return self.sql_control_admission.tryAcquireLease() orelse error.SqlWriteCapacityUnavailable;
     }
 
+    pub fn startSqlRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, options: @import("antfly_local_sources").common_bounded_admission.Options, class: RunnableScheduler.Class) !void {
+        try execution.start(if (self.runnable_scheduler) |*scheduler| scheduler else null, options, class);
+    }
+
+    pub fn runnableSchedulingStats(self: *const ApiHttpServer) @import("antfly_runtime_abi").RunnableStats {
+        const mutable = @constCast(self);
+        return @import("antfly_local_sources").common_request_admission.runnable_metrics.snapshot(if (mutable.runnable_scheduler) |*scheduler| scheduler else null);
+    }
+
     pub fn sqlControlIo(self: *ApiHttpServer) !std.Io {
         const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
         if (runtime.borrowed_io != null or runtime.lane_limits.worker_capacity < 10)
@@ -4378,7 +4392,7 @@ pub const ApiHttpServer = struct {
     /// completion and control lanes. Reserve it before publishing SQL work.
     pub fn sqlExecutionIo(self: *ApiHttpServer) !std.Io {
         const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        if (self.cfg.query_waiting.max_wait_ms == 0 or runtime.borrowed_io != null or
+        if ((self.cfg.query_waiting.max_wait_ms == 0 and self.cfg.runnable_policy == null) or runtime.borrowed_io != null or
             self.cfg.query_max_concurrent_requests == 0 or self.cfg.write_max_concurrent_requests == 0)
             return runtime.io() orelse error.SqlWriteCapacityUnavailable;
         _ = try self.sqlControlIo();
@@ -4629,6 +4643,7 @@ pub const ApiHttpServer = struct {
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
         var effective_cfg = cfg;
+        if (cfg.runnable_policy) |policy| try policy.validate();
         if (cfg.request_memory_bytes < 1 << 20 or cfg.retained_memory_bytes < 1 << 20) return error.InvalidApiServerConfig;
         const backing = if (builtin.is_test)
             alloc
@@ -4810,6 +4825,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        if (self.runnable_scheduler) |*scheduler| scheduler.close();
         self.query_admission.close();
         self.write_admission.close();
         self.inference_admission.close();

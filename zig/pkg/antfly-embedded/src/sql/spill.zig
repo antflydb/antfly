@@ -44,6 +44,7 @@ pub const Manager = struct {
     read_bytes: u64 = 0,
     buffer_bytes: usize = 4096,
     async_writes: bool = true,
+    parallel_work: bool = true,
     compression: enum { none, snappy } = .snappy,
     compressed_records: u64 = 0,
     dir: ?std.Io.Dir = null,
@@ -53,6 +54,12 @@ pub const Manager = struct {
     files: usize = 0,
     mutex: std.atomic.Mutex = .unlocked,
     allocation_mutex: std.atomic.Mutex = .unlocked,
+    /// All spill CPU children pass through this gate. Serial spill I/O must
+    /// never imply permission to share a parent's runnable execution capsule.
+    pub fn submit(self: *Manager, bytes: usize, comptime function: anytype, args: anytype) ?@import("parallel_scheduler.zig").Task(@TypeOf(@call(.auto, function, args))) {
+        if (!self.parallel_work) return null;
+        return @import("parallel_scheduler.zig").global().submit(self.io, bytes, function, args);
+    }
     fn lock(self: *Manager) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -220,7 +227,7 @@ pub const File = struct {
         if (self.write_len == 0) return;
         try self.awaitWrite();
         try self.manager.check();
-        if (self.manager.async_writes and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
+        if (self.manager.async_writes and self.manager.parallel_work and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
             const job = self.prepareAsync() orelse {
                 try self.file.writePositionalAll(self.manager.io, self.write_buffer[0..self.write_len], self.write_start);
                 self.manager.increment("write_calls", 1);
@@ -228,7 +235,7 @@ pub const File = struct {
                 return;
             };
             job.* = .{ .io = self.manager.io, .file = self.file, .buffer = self.write_buffer, .len = self.write_len, .offset = self.write_start };
-            const future = @import("parallel_scheduler.zig").global().submit(self.manager.io, job.buffer.len, WriteJob.write, .{job}) orelse {
+            const future = self.manager.submit(job.buffer.len, WriteJob.write, .{job}) orelse {
                 try WriteJob.write(job);
                 self.manager.increment("write_calls", 1);
                 self.write_len = 0;
@@ -889,7 +896,7 @@ pub const Sort = struct {
     pub fn init(a: Allocator, manager: *Manager, orders: []const operators.Order, memory_bytes: usize) Sort {
         _ = a;
         const backing = manager.allocator();
-        return .{ .manager = manager, .a = backing, .orders = orders, .memory_bytes = memory_bytes, .arena = std.heap.ArenaAllocator.init(backing) };
+        return .{ .manager = manager, .a = backing, .orders = orders, .memory_bytes = memory_bytes, .parallel_runs = manager.parallel_work, .arena = std.heap.ArenaAllocator.init(backing) };
     }
     pub fn deinit(self: *Sort) void {
         if (self.pending_run) |job| {
@@ -992,10 +999,10 @@ pub const Sort = struct {
     fn flush(self: *Sort) !void {
         try self.collectRun();
         if (self.rows.items.len == 0) return;
-        if (self.parallel_runs and self.memory_bytes >= 128 * 1024) {
+        if (self.parallel_runs and self.manager.parallel_work and self.memory_bytes >= 128 * 1024) {
             const job = try self.a.create(RunJob);
             job.* = .{ .sort = .{ .manager = self.manager, .a = self.a, .orders = self.orders, .memory_bytes = self.memory_bytes / 2, .arena = self.arena, .rows = self.rows, .parallel_runs = false } };
-            if (@import("parallel_scheduler.zig").global().submit(self.manager.io, self.estimated +| self.blockBytes() * 4, RunJob.run, .{job})) |task| {
+            if (self.manager.submit(self.estimated +| self.blockBytes() * 4, RunJob.run, .{job})) |task| {
                 job.task = task;
                 self.pending_run = job;
                 self.parallel_runs_started += 1;
@@ -1147,7 +1154,7 @@ pub const Sort = struct {
                     self.runs[index] = null;
                 }
                 claimed += width;
-                job.task = @import("parallel_scheduler.zig").global().submit(self.manager.io, self.memory_bytes / 2, MergeJob.run, .{job});
+                job.task = self.manager.submit(self.memory_bytes / 2, MergeJob.run, .{job});
                 if (job.task != null) self.parallel_merges_started += 1;
             }
             var failure: ?anyerror = null;

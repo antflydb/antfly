@@ -734,3 +734,64 @@ macOS and pinned Nix glibc GNU Linux ReleaseSafe. The shutdown/block race was
 corrected before final verification. The [core receipt](qualification/workload-pooling/receipts/2026-10-06/runnable-core/README.md)
 preserves source hashes and complete outputs. The expanded whole API pooling
 target has not yet been executed for this scheduler change.
+
+The next integration adds a stable single-worker execution capsule, cooperative
+time/checkpoint quanta, and reserved control metadata inside the total scheduling
+envelope. Thirteen named scheduler fixtures plus the import fixture pass on
+macOS and pinned Nix glibc GNU Linux ReleaseSafe; the [execution-core receipt](qualification/workload-pooling/receipts/2026-10-06/runnable-execution-core/README.md)
+records those results separately from the earlier core receipt. The source
+boundary audit still passes for 734 sources.
+
+Canonical opt-in configuration and node-owned HTTP/pgwire SQL read integration
+are implemented in the current worktree and under whole-pooling-suite
+verification. Page streams park between pulls while retaining their operation,
+snapshot and memory owners. Verified protected controls use reserved runnable
+capacity. Scheduled SQL temporarily uses serial backend execution until parallel
+children have independent runnable ownership. Genuine backend wait suspension,
+other query adapters, ordinary writes, inference/background scheduling, remote
+attempt accounting, release qualification and automatic defaults remain required.
+The core test receipt does not establish production protocol behavior.
+
+The exported scheduler plus telemetry now passes sixteen tests on both macOS
+and pinned Nix/glibc GNU Linux, using the real runtime ABI root. The local pooling
+shard separately passes all 31 selected tests, including canonical runnable-policy
+parsing. The [telemetry receipt](qualification/workload-pooling/receipts/2026-10-06/runnable-metrics/README.md)
+records tested source hashes, complete outputs, compiler provenance and the
+735-source authored boundary audit. Telemetry is wired through API ABI version 22
+to data-node and standalone metrics. Full protocol/endpoint verification is still
+pending; the new protected rollback fixture's retained-state allocator mismatch
+was corrected before its current rebuild. These results do not qualify defaults.
+
+
+Scheduled reads now retain serial disk spilling independently of parallel CPU
+execution. The blocking continuation fixture passes sorting, grouped aggregation
+and window queries in both modes on macOS and Nix/glibc GNU Linux; bounded pages,
+retained-memory limits, cancellation and spool cleanup remain checked. All spill
+CPU submissions use the manager's parallel-work gate. The first full native SQL
+run passed 263 of 264 tests without leaks, exposing nondeterministic in-place
+allocator growth in the exhaustive pull-stream fault test; its focused rerun
+reproduces that failure. The API protocol rebuild and corrected exhaustive SQL
+verification remain pending. This evidence does not qualify automatic defaults.
+
+
+The corrected pull-stream allocation sweep passes in the full 264-test local SQL
+shard on macOS without leaks. Linux passes both that shard and all 118 server SQL
+tests; its clean full-target rerun passes all nine build steps. Compiler memory
+estimates now reflect measured peaks of 1.93 GB on macOS and 1.95 GB on Linux,
+without changing executor runtime budgets. The macOS server shard exposes a
+plan-cache fixture whose allocator growth varies during eviction; deterministic
+growth passes a standalone reproduction at the original cache/compile bounds.
+The full native API pooling target passes 33 local and 38 API contracts but reports
+an eight-byte leak in the new rollback fixture. Its caller arena ownership is
+corrected and the rebuild is pending. The [serial-spill receipt](qualification/workload-pooling/receipts/2026-10-07/serial-spill/README.md)
+preserves initial failures, corrections and complete verification outputs.
+
+
+The corrected native API artifact passes all 38 selected contracts with loopback
+sockets enabled and no skips, failures or leaks; the local pooling shard passes
+all 33 contracts. The full native SQL target passes all 264 local and 118 server
+SQL tests without leaks and succeeds in all ten build steps. The cache eviction
+fixture keeps its original hard bounds with deterministic allocate/copy growth.
+These checks qualify opt-in native SQL read integration; full Linux API and
+runtime metrics endpoints remain required, alongside genuine backend waits,
+parallel child ownership, wider workload coverage and automatic default sizing.

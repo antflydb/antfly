@@ -82,7 +82,7 @@ pub const Grouped = struct {
         _ = a;
         const orders = try backing.alloc(operators.Order, key_count);
         @memset(orders, .{});
-        return .{ .a = backing, .sort = spill.Sort.init(backing, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(backing), .read_arena = std.heap.ArenaAllocator.init(backing), .bytes = bytes, .partitioned = bytes >= 64 * 1024 and for (specs) |spec| {
+        return .{ .a = backing, .parallel = manager.parallel_work, .sort = spill.Sort.init(backing, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(backing), .read_arena = std.heap.ArenaAllocator.init(backing), .bytes = bytes, .partitioned = bytes >= 64 * 1024 and for (specs) |spec| {
             if (spec.distinct or !(spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and spec.input_type == .integer))) break false;
         } else true };
     }
@@ -178,7 +178,7 @@ pub const Grouped = struct {
                 job.child.partitions[0] = self.partitions[index];
                 self.partitions[index] = null;
                 job.output = try @import("parallel_output.zig").Pipe.create(self.sort.manager, self.bytes / 128);
-                job.task = @import("parallel_scheduler.zig").global().submit(self.sort.manager.io, self.bytes / 2, Reduction.run, .{job});
+                job.task = self.sort.manager.submit(self.bytes / 2, Reduction.run, .{job});
                 if (job.task == null) {
                     job.output.?.close();
                     job.output = null;

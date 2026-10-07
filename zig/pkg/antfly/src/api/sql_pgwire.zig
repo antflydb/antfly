@@ -351,6 +351,7 @@ const OwnedRead = struct {
     identity: ?http.AuthenticatedIdentity,
     authority: Authority,
     native_adapter: execution.Adapter,
+    runnable: http.RunnableScheduler.Execution,
     decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null,
     session_id: ?[]u8 = null,
     staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
@@ -379,6 +380,8 @@ const OwnedRead = struct {
         const self = try alloc.create(OwnedRead);
         errdefer alloc.destroy(self);
         self.alloc = alloc;
+        self.runnable = .{};
+        errdefer self.runnable.finish();
         self.session_id = null;
         self.staged = .{};
         self.range_guards = .{};
@@ -405,7 +408,8 @@ const OwnedRead = struct {
         self.authority.request.binding_guard = if (request.binding_guard) |guard| try arena.dupe(u8, guard) else null;
         self.authority.request.setting_overlay = try cloneSettingOverlay(arena, request.setting_overlay);
         self.authority.request.session_id = self.session_id;
-        self.native_adapter = .{ .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        try server.startSqlRunnable(&self.runnable, admissionOptions(self.authority.request), .query);
+        self.native_adapter = .{ .runnable = if (self.runnable.entry != null) &self.runnable else null, .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
@@ -431,6 +435,7 @@ const OwnedRead = struct {
         // prepared epoch on that same snapshot before binding or reading rows.
         const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
         if (opened == null) {
+            self.runnable.finish();
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
             self.staged.deinit(alloc);
@@ -466,6 +471,7 @@ const OwnedRead = struct {
         self.columns = columns;
         self.plan = plan;
         self.admission = admission;
+        try self.runnable.park(.output_blocked);
         moved = true;
         return .{ .context = self, .columns = columns, .next = next, .close = close, .detach = detach, .validate = validate };
     }
@@ -510,6 +516,8 @@ const OwnedRead = struct {
     fn pull(self: *OwnedRead, alloc: std.mem.Allocator, request: wire.Request, limit: u32) !wire.StreamPage {
         const state_alloc = if (request.completion_drain) self.adapter.server.controlAllocator() else self.adapter.server.alloc;
         if (self.detached) return error.InvalidSqlBackendResponse;
+        try self.runnable.enter(if (request.completion_drain) .control else .query);
+        defer self.runnable.park(.output_blocked) catch {};
         try request.check();
         // Retained snapshots have a hard initial statement deadline, even if
         // later Execute messages carry a newer per-request deadline.
@@ -571,6 +579,7 @@ const OwnedRead = struct {
         self.detached = true;
         self.stream.close();
         self.plan.release(self.adapter.server.sqlPlanCacheIo());
+        self.runnable.finish();
         self.admission.release();
         self.staged.deinit(self.alloc);
         self.range_guards.deinit(self.adapter.server.alloc);
@@ -801,7 +810,11 @@ const Job = struct {
         defer identity.?.deinit(identity_alloc);
         var authority = Authority{ .credential = self.credential, .identity = &identity, .request = self.request };
         const context = try authority.context();
+        var runnable: http.RunnableScheduler.Execution = .{};
+        defer runnable.finish();
+        if ((!write or protected) and self.kind != .describe) try server.startSqlRunnable(&runnable, admissionOptions(self.request), if (protected) .control else .query);
         var native_adapter = execution.Adapter{
+            .runnable = if (runnable.entry != null) &runnable else null,
             .server = server,
             .identity = &identity,
             .context = context,
@@ -1026,6 +1039,10 @@ const GuardedCatalog = struct {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
         try self.authority.checkpoint();
         try self.native.vtable.checkpoint(self.native.ptr);
+        // A native checkpoint may relinquish execution and wait. Authority
+        // checked before that wait cannot authorize the resumed operation.
+        try self.authority.checkpoint();
+        try self.authority.credential.validate();
     }
     fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -1376,6 +1393,7 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
         counts: usize = 0,
         splits: usize = 0,
         closes: usize = 0,
+        rotate_manager: ?*usermgr.UserManager = null,
         fn open(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
             return cursor(ptr);
         }
@@ -1413,7 +1431,13 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.closes += 1;
         }
-        fn checkpoint(_: *anyopaque) !void {}
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.rotate_manager) |rotation_store| {
+                self.rotate_manager = null;
+                try rotation_store.updatePassword("alice", "rotated-during-checkpoint");
+            }
+        }
     };
     var native_cursor: NativeCursor = .{};
     var identity: ?http.AuthenticatedIdentity = admitted;
@@ -1506,6 +1530,11 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     var replacement_identity = try replacement.identity(alloc);
     defer replacement_identity.deinit(alloc);
     try std.testing.expect(!(try http.tablePermissionCurrentlyAllowed(replacement_identity, "docs", .read)));
+    authority.credential = replacement;
+    native_cursor.rotate_manager = &manager;
+    try std.testing.expectError(error.Unauthorized, backend.vtable.checkpoint(backend.ptr));
+    try std.testing.expect(native_cursor.rotate_manager == null);
+    try std.testing.expectError(error.Unauthorized, replacement.validate());
 }
 
 test "SQL pgwire native adapter admits sessions for principal scoped native validation" {

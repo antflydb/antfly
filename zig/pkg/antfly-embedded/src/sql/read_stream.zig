@@ -204,7 +204,12 @@ fn allocationScenario(alloc: std.mem.Allocator) !void {
 }
 
 test "SQL pull stream unwinds every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
+    try allocationScenario(std.testing.allocator);
+    // In-place SafeAllocator growth depends on prior bucket allocations. Force
+    // allocate/copy growth so each fault run visits the same allocation sites,
+    // while retaining the backing allocator's leak and ownership checks.
+    var no_resize = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(no_resize.allocator(), allocationScenario, .{});
 }
 
 const Spool = @import("result_cursor.zig").Cursor;
@@ -448,7 +453,7 @@ pub const Stream = struct {
             };
             if (binding.aggregate) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
             if (binding.window) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
-            if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
+            if (external or (backend.execution_io == null and backend.spill_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
                 if (self.settings) |view| view.deinit();
                 self.arena.deinit();
                 alloc.destroy(self);
@@ -456,7 +461,7 @@ pub const Stream = struct {
             }
             const owner = try self.budget.allocator().create(Spool);
             errdefer self.budget.allocator().destroy(owner);
-            owner.manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+            owner.manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_io orelse backend.spill_manager.?.io, .parallel_work = backend.execution_io != null, .async_writes = backend.execution_io != null, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
             owner.shared = backend.spill_manager;
             const manager = owner.shared orelse &owner.manager;
             errdefer if (owner.shared == null) owner.manager.deinit();
@@ -1031,48 +1036,52 @@ test "SQL decision pull streams carry trusted source routing" {
 }
 
 test "SQL blocking results transfer sorted operators and deliver bounded continuation pages" {
-    for ([_][]const u8{
-        "SELECT n FROM docs ORDER BY n DESC",
-        "SELECT n % 37 AS k, count(*) AS c FROM docs GROUP BY n % 37 ORDER BY k",
-        "SELECT n, row_number() OVER (ORDER BY n DESC) AS r FROM docs ORDER BY n DESC",
-    }, [_]usize{ 1000, 37, 1000 }) |sql, expected| {
-        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
-        defer compiled.deinit();
-        var fixture: Fixture = .{ .count = 1000 };
-        var backend = fixture.backend();
-        backend.execution_io = std.testing.io;
-        const stream = (try Stream.open(std.heap.page_allocator, backend, &compiled, &.{}, .{ .result_rows = 2, .page_rows = 16, .retained_bytes = 256 * 1024 })).?;
-        defer stream.close();
-        try std.testing.expect(stream.spool != null);
-        if (std.mem.indexOf(u8, sql, "row_number()") != null) {
-            try std.testing.expect(stream.spool.?.sorted == null);
-            try std.testing.expectEqual(expected, @as(usize, @intCast(stream.spool.?.rows.size)));
-        } else {
-            try std.testing.expect(stream.spool.?.sorted != null);
-            try std.testing.expectEqual(@as(usize, 0), @as(usize, @intCast(stream.spool.?.rows.size)));
-        }
-        const reads = fixture.calls;
-        var seen: usize = 0;
-        while (true) {
-            var result = try stream.next(7);
-            defer result.deinit();
-            try std.testing.expect(result.output.rows.len <= 7);
-            if (expected == 1000) {
-                for (result.output.rows) |row| {
-                    try std.testing.expectEqual(@as(i64, @intCast(999 - seen)), row[0].integer);
-                    seen += 1;
-                }
+    for ([_]bool{ false, true }) |serial| {
+        for ([_][]const u8{
+            "SELECT n FROM docs ORDER BY n DESC",
+            "SELECT n % 37 AS k, count(*) AS c FROM docs GROUP BY n % 37 ORDER BY k",
+            "SELECT n, row_number() OVER (ORDER BY n DESC) AS r FROM docs ORDER BY n DESC",
+        }, [_]usize{ 1000, 37, 1000 }) |sql, expected| {
+            var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+            defer compiled.deinit();
+            var fixture: Fixture = .{ .count = 1000 };
+            var backend = fixture.backend();
+            if (serial) backend.spill_io = std.testing.io else backend.execution_io = std.testing.io;
+            const stream = (try Stream.open(std.heap.page_allocator, backend, &compiled, &.{}, .{ .result_rows = 2, .page_rows = 16, .retained_bytes = 256 * 1024 })).?;
+            defer stream.close();
+            try std.testing.expect(stream.spool != null);
+            try std.testing.expectEqual(!serial, stream.spool.?.manager.parallel_work);
+            try std.testing.expectEqual(!serial, stream.spool.?.manager.async_writes);
+            if (std.mem.indexOf(u8, sql, "row_number()") != null) {
+                try std.testing.expect(stream.spool.?.sorted == null);
+                try std.testing.expectEqual(expected, @as(usize, @intCast(stream.spool.?.rows.size)));
             } else {
-                seen += result.output.rows.len;
+                try std.testing.expect(stream.spool.?.sorted != null);
+                try std.testing.expectEqual(@as(usize, 0), @as(usize, @intCast(stream.spool.?.rows.size)));
             }
-            if (result.exhausted) break;
+            const reads = fixture.calls;
+            var seen: usize = 0;
+            while (true) {
+                var result = try stream.next(7);
+                defer result.deinit();
+                try std.testing.expect(result.output.rows.len <= 7);
+                if (expected == 1000) {
+                    for (result.output.rows) |row| {
+                        try std.testing.expectEqual(@as(i64, @intCast(999 - seen)), row[0].integer);
+                        seen += 1;
+                    }
+                } else {
+                    seen += result.output.rows.len;
+                }
+                if (result.exhausted) break;
+            }
+            try std.testing.expectEqual(expected, seen);
+            try std.testing.expectEqual(reads, fixture.calls);
+            try std.testing.expect(stream.budget.peak <= 256 * 1024);
+            fixture.cancel = true;
+            try std.testing.expectError(error.QueryCanceled, stream.next(1));
+            try std.testing.expect(stream.spool == null);
         }
-        try std.testing.expectEqual(expected, seen);
-        try std.testing.expectEqual(reads, fixture.calls);
-        try std.testing.expect(stream.budget.peak <= 256 * 1024);
-        fixture.cancel = true;
-        try std.testing.expectError(error.QueryCanceled, stream.next(1));
-        try std.testing.expect(stream.spool == null);
     }
 }
 

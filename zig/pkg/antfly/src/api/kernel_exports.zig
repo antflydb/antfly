@@ -224,6 +224,12 @@ pub fn writeAdmissionStats(context: *const CallContext) callconv(.c) abi.Status 
     return .ok;
 }
 
+pub fn runnableSchedulingStats(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, abi.RunnableStats, context)) |failure| return failure;
+    output(abi.RunnableStats, context).* = serverState(context).server.runnableSchedulingStats();
+    return .ok;
+}
+
 pub fn inferenceAdmissionStats(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, server_mod.RequestAdmission.Stats, context)) |failure| return failure;
     output(server_mod.RequestAdmission.Stats, context).* = serverState(context).server.inferenceAdmissionStats();
@@ -393,6 +399,7 @@ pub fn handlerStats(context: *const CallContext) callconv(.c) abi.Status {
         .query_suspended = query.suspended,
         .query_quiescent = query.quiescent,
         .query_sql_waiting_enabled = query.sql_waiting_enabled orelse false,
+        .runnable = handler.api_server.runnableSchedulingStats(),
         .memory = .{ memoryAbi(memory.foreground), memoryAbi(memory.control), memoryAbi(memory.retained) },
     };
     return .ok;
@@ -581,6 +588,7 @@ const function_table: abi.FunctionTable = .{
     .request_stats = &requestStats,
     .configure_http_transport = &configureHttpTransport,
     .query_admission_stats = &queryAdmissionStats,
+    .runnable_scheduling_stats = &runnableSchedulingStats,
     .write_admission_stats = &writeAdmissionStats,
     .set_provider = &setProvider,
     .set_ha_executor = &setHotStandbyExecutor,

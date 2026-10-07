@@ -188,6 +188,7 @@ pub fn runFromIterator(
         .enrichment_enabled = cli.enrichment_enabled orelse try parseEnvBoolOrDefault(init.environ_map, "ANTFLY_SERVERLESS_ENRICHMENT_ENABLED", true),
         .remote_content = if (remote_content) |*cfg| cfg else null,
         .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
+        .runnable_policy = if (loaded_config) |*cfg| cfg.admission.runnable else null,
         .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
         .write_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.write.max_concurrent_requests else antfly.common.config.default_write_max_concurrent_requests,
         .graph_metric_max_parallelism = cli.graph_metric_max_parallelism orelse try parseEnvIntOrDefault(

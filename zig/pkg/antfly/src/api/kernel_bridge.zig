@@ -130,6 +130,12 @@ const OpaqueApiHttpServer = struct {
         return out;
     }
 
+    pub fn runnableSchedulingStats(self: *const OpaqueApiHttpServer) abi.RunnableStats {
+        var out: abi.RunnableStats = undefined;
+        callInfallible(void, abi.RunnableStats, self.functions.runnable_scheduling_stats, self.opaque_handle, null, &out);
+        return out;
+    }
+
     pub fn writeAdmissionStats(self: *const OpaqueApiHttpServer) AdmissionStats {
         var out: AdmissionStats = undefined;
         callInfallible(void, AdmissionStats, self.functions.write_admission_stats, self.opaque_handle, null, &out);
@@ -594,6 +600,7 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
         const write = handler.api_server.writeAdmissionStats();
         const inference = handler.api_server.inferenceAdmissionStats();
         const query_body = handler.query_body_admission.stats();
+        const memory = handler.api_server.workloadMemoryStats();
         return .{
             .query_capacity = query.capacity,
             .query_in_flight = query.in_flight,
@@ -611,6 +618,27 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
             .query_body_in_flight = query_body.in_flight,
             .query_body_peak_in_flight = query_body.peak_in_flight,
             .query_body_rejected_total = query_body.rejected_total,
+            .query_configured_capacity = query.configured_capacity,
+            .query_queued = query.queued,
+            .query_queued_bytes = query.queued_bytes,
+            .query_waited_total = query.waited_total,
+            .query_wait_ns_total = query.wait_ns_total,
+            .query_wait_completed_total = query.wait_completed_total,
+            .query_wait_buckets = query.wait_buckets,
+            .query_expired_total = query.expired_total,
+            .query_cancelled_total = query.cancelled_total,
+            .query_queue_capacity = query.waiting.max_queued_requests,
+            .query_queue_bytes = query.waiting.max_queued_bytes,
+            .query_wait_ms = query.waiting.max_wait_ms,
+            .query_policy_version = query.policy_version,
+            .query_policy_retired_total = query.policy_retired_total,
+            .query_retiring_waiters = query.retiring_waiters,
+            .query_draining = query.draining,
+            .query_suspended = query.suspended,
+            .query_quiescent = query.quiescent,
+            .query_sql_waiting_enabled = query.sql_waiting_enabled orelse false,
+            .runnable = handler.api_server.runnableSchedulingStats(),
+            .memory = .{ memoryAbi(memory.foreground), memoryAbi(memory.control), memoryAbi(memory.retained) },
         };
     }
     return handler.stats();
@@ -618,6 +646,11 @@ pub fn handlerStats(handler: *const HttpxHandler) HandlerStats {
 
 pub fn deinitHandler(handler: *HttpxHandler) void {
     if (comptime direct_codegen) handler.deinitRuntime() else handler.deinit();
+}
+
+fn memoryAbi(stats: anytype) abi.WorkloadMemoryStats {
+    if (stats) |value| return .{ .enabled = true, .limit_bytes = value.limit_bytes, .used_bytes = value.used_bytes, .peak_bytes = value.peak_bytes, .rejected_total = value.rejected_total };
+    return .{ .enabled = false, .limit_bytes = 0, .used_bytes = 0, .peak_bytes = 0, .rejected_total = 0 };
 }
 
 pub fn setAntflyProvider(server: *ApiHttpServer, provider: ?managed_embedder.AntflyProvider) void {

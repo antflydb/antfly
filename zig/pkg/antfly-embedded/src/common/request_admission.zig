@@ -27,6 +27,7 @@ pub const PrometheusClass = enum {
 /// Shared operation owner. Legacy calls remain fail-fast; contextual query
 /// calls can opt into fixed, bounded waiting.
 pub const runnable_scheduler = @import("runnable_scheduler.zig");
+pub const runnable_metrics = @import("runnable_metrics.zig");
 
 pub const bounded_admission = @import("bounded_admission.zig");
 pub const RequestAdmission = bounded_admission.Controller;
@@ -164,4 +165,5 @@ test "request admission metrics use the shared admission namespace" {
 
 test {
     _ = runnable_scheduler;
+    _ = runnable_metrics;
 }

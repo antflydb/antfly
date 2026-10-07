@@ -154,14 +154,14 @@ pub const Join = struct {
                 slot.* = child;
                 if (self.evaluation != null) {
                     child.output = try @import("parallel_output.zig").Pipe.create(self.manager, child.limits.bytes / 64);
-                    child.output_task = @import("parallel_scheduler.zig").global().submit(self.manager.io, child.limits.bytes, Join.executePartition, .{child});
+                    child.output_task = self.manager.submit(child.limits.bytes, Join.executePartition, .{child});
                     if (child.output_task == null) {
                         child.output.?.close();
                         child.output = null;
                         _ = try child.prepare();
                     } else self.parallel_builds_started += 1;
                 } else {
-                    task.* = @import("parallel_scheduler.zig").global().submit(self.manager.io, child.limits.bytes, Join.prepare, .{child});
+                    task.* = self.manager.submit(child.limits.bytes, Join.prepare, .{child});
                     if (task.* == null) _ = try child.prepare() else self.parallel_builds_started += 1;
                 }
                 break;
@@ -206,7 +206,7 @@ pub const Join = struct {
         const target = @max(@as(usize, 1), bytes / 16);
         const wanted = @min(@as(u64, 16), @max(@as(u64, 2), build_bytes / target + 1));
         const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
-        self.* = .{ .a = a, .manager = manager, .limits = .{ .bytes = @max(8192, bytes / 2), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 };
+        self.* = .{ .a = a, .manager = manager, .limits = .{ .bytes = @max(8192, bytes / 2), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 and manager.parallel_work };
         return self;
     }
     pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {

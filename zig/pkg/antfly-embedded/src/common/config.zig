@@ -96,6 +96,7 @@ pub const Config = struct {
     };
 
     pub const AdmissionConfig = struct {
+        runnable: ?@import("runnable_scheduler.zig").Config = null,
         max_request_memory_bytes: u64 = 256 << 20,
         max_retained_memory_bytes: u64 = 256 << 20,
         query: RequestAdmissionConfig = .{ .max_concurrent_requests = default_query_max_concurrent_requests },
@@ -754,14 +755,26 @@ pub const Config = struct {
         };
         var canonical_inference_max_concurrent_requests: ?u32 = null;
         var query_waiting: @import("bounded_admission.zig").Waiting = .{};
+        var runnable_policy: ?@import("runnable_scheduler.zig").Config = null;
         var max_request_memory_bytes: u64 = 256 << 20;
         var max_retained_memory_bytes: u64 = 256 << 20;
         if (root.get("admission")) |admission_value| {
-            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "max_request_memory_bytes", "max_retained_memory_bytes" });
+            try validateObjectMemberFields(root, "admission", &.{ "query", "write", "inference", "runnable", "max_request_memory_bytes", "max_retained_memory_bytes" });
             const admission_object = switch (admission_value) {
                 .object => |object| object,
                 else => return error.InvalidConfig,
             };
+            if (admission_object.get("runnable")) |value| {
+                if (value != .null) {
+                    var policy = std.json.parseFromValue(@import("runnable_scheduler.zig").Config, alloc, value, .{}) catch |err| switch (err) {
+                        error.OutOfMemory => return err,
+                        else => return error.InvalidConfig,
+                    };
+                    defer policy.deinit();
+                    policy.value.validate() catch return error.InvalidConfig;
+                    runnable_policy = policy.value;
+                }
+            }
             max_request_memory_bytes = try optionalU64Field(admission_object, "max_request_memory_bytes") orelse 256 << 20;
             max_retained_memory_bytes = try optionalU64Field(admission_object, "max_retained_memory_bytes") orelse 256 << 20;
             if (max_retained_memory_bytes < 1 << 20 or max_retained_memory_bytes > std.math.maxInt(usize)) return error.InvalidConfig;
@@ -944,6 +957,7 @@ pub const Config = struct {
             } else null,
             .cors = if (validated.value.cors) |cors| try corsFromOpenApi(alloc, cors) else null,
             .admission = .{
+                .runnable = runnable_policy,
                 .max_request_memory_bytes = max_request_memory_bytes,
                 .max_retained_memory_bytes = max_retained_memory_bytes,
                 .query = .{ .max_concurrent_requests = if (validated.value.admission) |admission|
@@ -3920,4 +3934,42 @@ test "common config parses ChatGPT connector policy and rejects misspellings" {
         defer a.free(raw);
         try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, raw));
     }
+}
+
+test "config runnable scheduler validates canonical opt-in policy" {
+    const alloc = std.testing.allocator;
+    var legacy = try Config.parseFromSlice(alloc, "{}");
+    defer legacy.deinit();
+    try std.testing.expect(legacy.admission.runnable == null);
+    var disabled = try Config.parseFromSlice(alloc, "{\"admission\":{\"runnable\":null}}");
+    defer disabled.deinit();
+    try std.testing.expect(disabled.admission.runnable == null);
+    var enabled = try Config.parseFromSlice(alloc,
+        \\{"admission":{"runnable":{"slots":3,"control_slots":1,"weights":[2,1,1,1],"max_operations":20,"max_bytes":65536,"control_bytes":8192,"max_wait_ms":500,"max_backfills":2,"quantum_ms":1,"checkpoint_budget":8}}}
+    );
+    defer enabled.deinit();
+    const policy = enabled.admission.runnable.?;
+    try std.testing.expectEqual(@as(usize, 3), policy.slots);
+    try std.testing.expectEqual(@as(u32, 8), policy.checkpoint_budget);
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .admission = .{ .runnable = policy } }, .{});
+    defer alloc.free(body);
+    var reopened = try Config.parseFromSlice(alloc, body);
+    defer reopened.deinit();
+    try std.testing.expectEqualDeep(policy, reopened.admission.runnable.?);
+    for ([_][]const u8{
+        \\{"admission":{"runnable":{"slots":1}}}
+        ,
+        \\{"admission":{"runnable":{"control_slots":8}}}
+        ,
+        \\{"admission":{"runnable":{"max_operations":1}}}
+        ,
+        \\{"admission":{"runnable":{"max_bytes":65536,"control_bytes":65536}}}
+        ,
+        \\{"admission":{"runnable":{"weights":[1,0,1,1]}}}
+        ,
+        \\{"admission":{"runnable":{"quantum_ms":0}}}
+        ,
+        \\{"admission":{"runnable":{"unknown":1}}}
+        ,
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, invalid));
 }

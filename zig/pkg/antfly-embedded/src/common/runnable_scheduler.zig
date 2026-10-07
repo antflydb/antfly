@@ -27,12 +27,16 @@ pub const Config = struct {
     weights: [4]u16 = .{ 4, 2, 1, 1 },
     max_operations: usize = 128,
     max_bytes: u64 = 8 << 20,
+    control_bytes: u64 = 64 << 10,
     max_wait_ms: u32 = 250,
     max_backfills: u16 = 8,
+    quantum_ms: u32 = 2,
+    checkpoint_budget: u32 = 64,
 
     pub fn validate(self: Config) !void {
         if (self.slots < 2 or self.slots > 65535 or self.control_slots == 0 or self.control_slots >= self.slots or
-            self.max_operations == 0 or self.max_bytes == 0 or self.max_wait_ms == 0)
+            self.max_operations < 2 or self.max_bytes == 0 or self.control_bytes == 0 or self.control_bytes >= self.max_bytes or self.max_wait_ms == 0 or self.max_wait_ms > 60000 or
+            self.quantum_ms == 0 or self.quantum_ms > 100 or self.checkpoint_budget == 0 or self.checkpoint_budget > 1048576)
             return error.InvalidRunnablePolicy;
         for (self.weights) |weight| if (weight == 0) return error.InvalidRunnablePolicy;
     }
@@ -55,6 +59,7 @@ pub const Entry = struct {
     bypasses: u16 = 0,
     queued_since_ns: u64 = 0,
     waited: bool = false,
+    reserved_control: bool = false,
 };
 
 const Queue = struct { head: ?*Entry = null, tail: ?*Entry = null };
@@ -74,6 +79,8 @@ pub const Scheduler = struct {
     pub const Stats = struct {
         operations: usize = 0,
         retained_bytes: u64 = 0,
+        control_operations: usize = 0,
+        control_retained_bytes: u64 = 0,
         queued: usize = 0,
         runnable_slots: usize = 0,
         control_slots: usize = 0,
@@ -198,11 +205,20 @@ pub const Scheduler = struct {
         const capacity = if (e.class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
         if (self.closed) return error.SchedulerClosed;
         if (e.slots == 0 or e.slots > capacity) return error.InvalidRunnableDemand;
-        if (self.metrics.operations >= self.config.max_operations or
-            e.bytes > self.config.max_bytes - self.metrics.retained_bytes)
-        {
+        const control = e.class == .control;
+        const control_count = @min(@as(usize, 4), self.config.max_operations / 2);
+        const count_limit = if (control) control_count else self.config.max_operations - control_count;
+        const count_used = if (control) self.metrics.control_operations else self.metrics.operations - self.metrics.control_operations;
+        const byte_limit = if (control) self.config.control_bytes else self.config.max_bytes - self.config.control_bytes;
+        const byte_used = if (control) self.metrics.control_retained_bytes else self.metrics.retained_bytes - self.metrics.control_retained_bytes;
+        if (count_used >= count_limit or e.bytes > byte_limit - byte_used) {
             self.metrics.rejected +|= 1;
             return error.SchedulerFull;
+        }
+        e.reserved_control = control;
+        if (control) {
+            self.metrics.control_operations += 1;
+            self.metrics.control_retained_bytes += e.bytes;
         }
         // Registry/count/bytes cover queued, running AND blocked operations.
         // Resume never needs another reservation or allocation.
@@ -340,6 +356,19 @@ pub const Scheduler = struct {
         self.dispatch();
         e.waited = e.state == .queued;
     }
+    /// Only trusted adapters may promote a parked read for protected drain.
+    /// Classification is never taken from client-provided scheduling labels.
+    pub fn reclassifyBlocked(self: *Scheduler, e: *Entry, class: Class) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (e.scheduler != self) return error.InvalidRunnableTransition;
+        if (self.closed) return error.SchedulerClosed;
+        if (e.state != .resource_blocked and e.state != .output_blocked) return error.InvalidRunnableTransition;
+        const capacity = if (class == .control) self.config.control_slots else self.config.slots - self.config.control_slots;
+        if (e.slots > capacity) return error.InvalidRunnableDemand;
+        e.class = class;
+    }
+
     pub fn finish(self: *Scheduler, e: *Entry) void {
         self.lock();
         defer self.mutex.unlock();
@@ -358,6 +387,10 @@ pub const Scheduler = struct {
         e.all_previous = null;
         self.metrics.operations -= 1;
         self.metrics.retained_bytes -= e.bytes;
+        if (e.reserved_control) {
+            self.metrics.control_operations -= 1;
+            self.metrics.control_retained_bytes -= e.bytes;
+        }
         e.state = .finished;
         e.scheduler = null;
         self.dispatch();
@@ -390,12 +423,61 @@ pub const Scheduler = struct {
     }
 };
 
+/// Stable, single-worker execution capsule. Parallel children must get their
+/// own ownership before sharing this capsule's adapter; it is not a gang lease.
+pub const Execution = struct {
+    entry: ?Entry = null,
+    quantum_start_ns: u64 = 0,
+    checkpoints: u32 = 0,
+
+    pub fn start(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class) !void {
+        std.debug.assert(self.entry == null);
+        const owner = scheduler orelse return;
+        self.entry = .{ .options = options, .class = class, .bytes = options.retained_bytes };
+        errdefer self.finish();
+        try owner.submit(&self.entry.?);
+        try owner.wait(&self.entry.?);
+        self.quantum_start_ns = options.now();
+    }
+    pub fn checkpoint(self: *Execution) !void {
+        const e = if (self.entry) |*entry| entry else return;
+        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        if (owner.state(e) != .running) return error.InvalidRunnableTransition;
+        try e.options.check();
+        self.checkpoints +|= 1;
+        if (self.checkpoints < owner.config.checkpoint_budget and
+            e.options.now() -| self.quantum_start_ns < @as(u64, owner.config.quantum_ms) * std.time.ns_per_ms) return;
+        try owner.yield(e);
+        try owner.wait(e);
+        self.quantum_start_ns = e.options.now();
+        self.checkpoints = 0;
+    }
+    pub fn park(self: *Execution, reason: State) !void {
+        const e = if (self.entry) |*entry| entry else return;
+        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        try owner.block(e, reason);
+    }
+    pub fn enter(self: *Execution, class: Class) !void {
+        const e = if (self.entry) |*entry| entry else return;
+        const owner = e.scheduler orelse return error.InvalidRunnableTransition;
+        try owner.reclassifyBlocked(e, class);
+        try owner.unblock(e);
+        try owner.wait(e);
+        self.quantum_start_ns = e.options.now();
+        self.checkpoints = 0;
+    }
+    pub fn finish(self: *Execution) void {
+        if (self.entry) |*e| if (e.scheduler) |owner| owner.finish(e);
+        self.entry = null;
+    }
+};
+
 fn testEntry(class: Class, slots: usize, bytes: u64) Entry {
     return .{ .options = .{ .io = std.testing.io }, .class = class, .slots = slots, .bytes = bytes };
 }
 
 test "runnable scheduler preserves blocked ownership and protected capacity" {
-    var s = try Scheduler.init(.{ .slots = 4, .control_slots = 1, .max_operations = 3, .max_bytes = 30 });
+    var s = try Scheduler.init(.{ .slots = 4, .control_slots = 1, .max_operations = 3, .max_bytes = 40, .control_bytes = 10 });
     var read = testEntry(.query, 3, 10);
     var next = testEntry(.write, 3, 10);
     var control = testEntry(.control, 1, 10);
@@ -587,7 +669,7 @@ test "runnable scheduler rejects invalid policy and oversized demand atomically"
         .{ .max_operations = 0 },        .{ .max_bytes = 0 }, .{ .max_wait_ms = 0 },
         .{ .weights = .{ 1, 0, 1, 1 } },
     }) |cfg| try std.testing.expectError(error.InvalidRunnablePolicy, Scheduler.init(cfg));
-    var s = try Scheduler.init(.{ .slots = 2, .max_bytes = 4 });
+    var s = try Scheduler.init(.{ .slots = 2, .max_bytes = 4, .control_bytes = 1 });
     var bytes = testEntry(.query, 1, 5);
     var slots = testEntry(.query, 2, 4);
     try std.testing.expectError(error.SchedulerFull, s.submit(&bytes));
@@ -608,4 +690,75 @@ test "runnable scheduler shutdown racing a new block cannot strand an owner" {
     try std.testing.expectError(error.SchedulerClosed, s.unblock(&live));
     s.finish(&live);
     try std.testing.expectEqual(@as(usize, 0), s.stats().operations);
+}
+
+test "runnable scheduler execution quanta preserve deadline and parked ownership" {
+    VirtualClock.value = 0;
+    var s = try Scheduler.init(.{ .slots = 2, .quantum_ms = 2, .checkpoint_budget = 64 });
+    var exec: Execution = .{};
+    try exec.start(&s, .{ .io = std.testing.io, .native_now_ns = VirtualClock.now, .deadline_ns = 10 * std.time.ns_per_ms, .retained_bytes = 17 }, .query);
+    defer exec.finish();
+    try exec.checkpoint();
+    try std.testing.expectEqual(@as(u64, 0), s.stats().yields);
+    VirtualClock.value = 3 * std.time.ns_per_ms;
+    try exec.checkpoint();
+    try std.testing.expectEqual(@as(u64, 1), s.stats().yields);
+    try exec.park(.output_blocked);
+    try std.testing.expectEqual(@as(usize, 0), s.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 17), s.stats().retained_bytes);
+    var other: Execution = .{};
+    try other.start(&s, .{ .io = std.testing.io }, .query);
+    defer other.finish();
+    // Verified completion drain uses reserved control slots at full foreground.
+    try exec.enter(.control);
+    try std.testing.expectEqual(@as(usize, 2), s.stats().runnable_slots);
+    try std.testing.expectEqual(@as(usize, 1), s.stats().control_slots);
+    VirtualClock.value = 11 * std.time.ns_per_ms;
+    try std.testing.expectError(error.DeadlineExceeded, exec.checkpoint());
+    try std.testing.expectEqual(@as(?u64, 10 * std.time.ns_per_ms), exec.entry.?.options.deadline_ns);
+}
+
+test "runnable scheduler checkpoint work budget and disabled execution" {
+    var disabled: Execution = .{};
+    try disabled.start(null, .{ .io = std.testing.io }, .query);
+    try disabled.checkpoint();
+    try disabled.park(.resource_blocked);
+    try disabled.enter(.query);
+    disabled.finish();
+    var s = try Scheduler.init(.{ .slots = 2, .checkpoint_budget = 2, .quantum_ms = 100 });
+    var exec: Execution = .{};
+    try exec.start(&s, .{ .io = std.testing.io }, .query);
+    defer exec.finish();
+    try exec.checkpoint();
+    try exec.checkpoint();
+    try std.testing.expectEqual(@as(u64, 1), s.stats().yields);
+}
+
+test "runnable scheduler reserves control metadata at full ordinary outstanding limits" {
+    var s = try Scheduler.init(.{ .slots = 2, .max_operations = 3, .max_bytes = 30, .control_bytes = 10 });
+    var first = testEntry(.query, 1, 10);
+    var second = testEntry(.query, 1, 10);
+    var control = testEntry(.control, 1, 10);
+    try s.submit(&first);
+    try s.block(&first, .output_blocked);
+    try s.submit(&second);
+    try s.block(&second, .resource_blocked);
+    defer s.finish(&first);
+    defer s.finish(&second);
+    defer s.finish(&control);
+    var excess = testEntry(.query, 1, 0);
+    try std.testing.expectError(error.SchedulerFull, s.submit(&excess));
+    try s.submit(&control);
+    try s.wait(&control);
+    try std.testing.expectEqual(@as(usize, 3), s.stats().operations);
+    try std.testing.expectEqual(@as(u64, 30), s.stats().retained_bytes);
+    try std.testing.expectEqual(@as(usize, 1), s.stats().control_operations);
+    // Promotion retains the read's original metadata reservation. It needs no
+    // new control metadata, even though that partition is completely full.
+    try s.reclassifyBlocked(&first, .control);
+    try s.unblock(&first);
+    s.finish(&control);
+    try s.wait(&first);
+    try std.testing.expectEqual(@as(usize, 0), s.stats().control_operations);
+    try std.testing.expectEqual(@as(usize, 1), s.stats().control_slots);
 }

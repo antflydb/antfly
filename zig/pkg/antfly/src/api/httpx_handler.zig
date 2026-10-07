@@ -5886,6 +5886,13 @@ pub const AntflyApiHandler = struct {
                 return;
             };
             defer execution.release();
+            var runnable: http_server_mod.RunnableScheduler.Execution = .{};
+            defer runnable.finish();
+            if (!self.is_write or self.protected_control) {
+                try self.adapter.server.startSqlRunnable(&runnable, try self.admissionOptions(), if (self.protected_control) .control else .query);
+                if (runnable.entry != null) self.adapter.runnable = &runnable;
+            }
+            defer self.adapter.runnable = null;
             self.execution_entered = true;
             self.result = self.adapter.execute(self.workAllocator(), compiled, self.parameters, .{ .result_rows = self.limit }, null) catch |err| {
                 self.failure = err;
@@ -13258,12 +13265,17 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         .memory_accounting = .{ .ptr = &storage_manager, .reserve_fn = Accounting.reserve, .release_fn = Accounting.release },
         .backend_runtime = backend_runtime.ptr(),
         .session_store = &prepared_durable,
-        .query_max_concurrent_requests = 1,
+        .query_max_concurrent_requests = 4,
         .write_max_concurrent_requests = 1,
         .sql_max_concurrent_preparations = 2,
+        .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 },
         .query_waiting = .{ .max_queued_requests = 4, .max_queued_bytes = 65536, .max_wait_ms = 5000 },
     }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
     defer server.deinit();
+    // Live policy changes stay within the configured admission ceiling. Start
+    // with one operation slot for queue tests, then restore four to isolate
+    // the runnable scheduler from coarse operation admission.
+    try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
     var handler = AntflyApiHandler{ .api_server = &server };
     {
         // Real native rows through both adapters, sharing one queue owner.
@@ -13380,15 +13392,70 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().in_flight);
         try std.testing.expectEqual(@as(usize, 0), server.queryAdmissionStats().queued);
         try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().peak_in_flight);
+        // Two admitted native operations share the same one-slot scheduler,
+        // rather than being serialized by the coarse admission gate.
+        try server.query_admission.update(server.queryAdmissionStats().policy_version, 4, server.cfg.query_waiting, false);
+        var runnable_hold: http_server_mod.RunnableScheduler.Execution = .{};
+        try server.startSqlRunnable(&runnable_hold, .{ .io = std.testing.io }, .query);
+        defer runnable_hold.finish();
+        var scheduled_jobs = jobs;
+        for (&scheduled_jobs) |*job| job.err = null;
+        var scheduled_group: std.Io.Group = .init;
+        defer scheduled_group.cancel(std.testing.io);
+        for (&scheduled_jobs) |*job| try scheduled_group.concurrent(std.testing.io, MixedJob.run, .{job});
+        const scheduling_until = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+        while (server.runnable_scheduler.?.stats().queued != 2) {
+            if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= scheduling_until.nanoseconds) return error.SchedulingWaitersDidNotStart;
+            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(@as(usize, 2), server.queryAdmissionStats().in_flight);
+        // Authenticated ROLLBACK progresses on reserved control capacity while
+        // both ordinary protocol executions remain queued.
+        const control_txn = try server.txn_sessions.beginForPrincipal(server.alloc, .{ .sql = .{ .database = "default", .namespace = "public", .mode = .read_only, .isolation = .read_committed } }, server.localSessionNodeId(), "pool-reader");
+        const control_id = std.fmt.bytesToHex(control_txn.txn_id, .lower);
+        var rollback_request = wire_request;
+        rollback_request.statement = "ROLLBACK";
+        rollback_request.parameters = &.{};
+        rollback_request.parameter_types = &.{};
+        rollback_request.session_id = &control_id;
+        // Wire metadata belongs to the caller arena; Result.deinit releases
+        // the native result owner before that enclosing arena is reclaimed.
+        var rollback_arena = std.heap.ArenaAllocator.init(alloc);
+        defer rollback_arena.deinit();
+        var rollback = try backend.vtable.execute(backend.context, rollback_arena.allocator(), identity, rollback_request);
+        defer rollback.deinit();
+        try std.testing.expectEqualStrings("ROLLBACK", rollback.command_tag);
+        try std.testing.expectEqual(@as(usize, 2), server.runnable_scheduler.?.stats().queued);
+        const control_stats = server.runnableSchedulingStats();
+        try std.testing.expect(control_stats.enabled);
+        try std.testing.expectEqual(@as(u64, 2), control_stats.capacity_slots);
+        try std.testing.expectEqual(@as(u64, 1), control_stats.control_capacity_slots);
+        try std.testing.expectEqual(@as(u64, 2), control_stats.queued);
+        try std.testing.expectEqual(@as(u64, 0), control_stats.control_slots);
+        try std.testing.expect(control_stats.grants[4] > 0);
+        runnable_hold.finish();
+        try scheduled_group.await(std.testing.io);
+        for (scheduled_jobs) |job| if (job.err) |err| return err;
+        try std.testing.expect(server.runnable_scheduler.?.stats().yields > 0);
+        try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().operations);
+        try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
         try @import("sql_pgwire_socket_test.zig").qualify(&server, &storage_manager);
         try qualifyNativeH2Waiting(&server);
         // Live native streams retain coarse admission until actual close.
         const stream = (try backend.vtable.open_stream.?(backend.context, alloc, identity, wire_request)).?;
         defer stream.close(stream.context);
         try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
+        try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
+        const parked_stats = server.runnableSchedulingStats();
+        try std.testing.expectEqual(@as(u64, 1), parked_stats.operations);
+        try std.testing.expectEqual(@as(u64, 0), parked_stats.runnable_slots);
+        try std.testing.expectEqual(@as(u64, 1), parked_stats.output_blocked);
         var page = try stream.next(stream.context, alloc, wire_request, 1);
         defer page.result.deinit();
         try std.testing.expectEqualStrings("exact", page.result.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 0), server.runnable_scheduler.?.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), server.runnable_scheduler.?.stats().output_blocked);
         cancel.store(true, .release);
         try std.testing.expectError(error.QueryCanceled, stream.next(stream.context, alloc, wire_request, 1));
         try std.testing.expectEqual(@as(usize, 1), server.queryAdmissionStats().in_flight);
@@ -14252,7 +14319,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer grant.deinit(alloc);
         var user = try manager.createUser("cursor_reader", "secret", &.{grant});
         defer user.deinit(alloc);
-        var pg_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .user_manager = &manager }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
+        var pg_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable, .user_manager = &manager, .runnable_policy = .{ .slots = 2, .checkpoint_budget = 1, .max_wait_ms = 5000 } }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, reads.source(), null);
         defer pg_server.deinit();
         var pg_adapter: @import("sql_pgwire.zig").Adapter = .{ .server = &pg_server };
         const wire_backend = pg_adapter.backend();

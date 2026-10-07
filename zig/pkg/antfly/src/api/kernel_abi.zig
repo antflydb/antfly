@@ -28,7 +28,7 @@ pub const StatusDetail = error_abi.Detail;
 /// Version of the API-kernel control structs below. This is intentionally
 /// independent of the status ABI: adding flags/reserved fields must invalidate
 /// an older context before the callee reads beyond its layout.
-pub const abi_version: u32 = 21;
+pub const abi_version: u32 = 22;
 pub const statusFromError = error_abi.statusFromError;
 pub const errorFromStatus = error_abi.errorFromStatus;
 
@@ -196,7 +196,10 @@ pub const HandlerStats = extern struct {
     query_quiescent: bool,
     query_sql_waiting_enabled: bool,
     memory: [3]WorkloadMemoryStats,
+    runnable: RunnableStats,
 };
+
+pub const RunnableStats = @import("antfly_runtime_abi").RunnableStats;
 
 pub const WorkloadMemoryStats = extern struct {
     enabled: bool,
@@ -228,6 +231,7 @@ pub const FunctionTable = extern struct {
     destroy: *const fn (*anyopaque) callconv(.c) void,
     request_stats: *const fn (*const CallContext) callconv(.c) Status,
     query_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
+    runnable_scheduling_stats: *const fn (*const CallContext) callconv(.c) Status,
     write_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     set_provider: *const fn (*const CallContext) callconv(.c) Status,
     set_ha_executor: *const fn (*const CallContext) callconv(.c) Status,
