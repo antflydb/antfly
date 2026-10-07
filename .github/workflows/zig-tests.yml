@@ -290,7 +290,7 @@ jobs:
             zig/lib/httpx \
             zig/lib/objectstore \
             zig/pkg/antfly/src/api/backups.zig \
-            zig/pkg/antfly-embedded/src/local/serverless/remote_uri.zig \
+            zig/pkg/antfly-embedded/src/serverless/remote_uri.zig \
             .github/workflows/zig-tests.yml
           then
             echo "backup_s3=false" >> "$GITHUB_OUTPUT"
@@ -316,7 +316,7 @@ jobs:
             ':(glob)scripts/tla-*.py' \
             ':(glob)zig/pkg/antfly/src/tracing/**' \
             ':(glob)zig/pkg/antfly/src/raft/**' \
-            ':(glob)zig/pkg/antfly-embedded/src/local/storage/db/**' \
+            ':(glob)zig/pkg/antfly-embedded/src/storage/db/**' \
             ':(glob)zig/lib/raft/**' \
             Makefile \
             zig/build.zig \
@@ -445,10 +445,10 @@ jobs:
       - name: Run StreamVByte codec tests
         run: |
           set -euo pipefail
-          zig test zig/pkg/antfly-embedded/src/local/encoding/streamvbyte.zig
-          zig test -O fast zig/pkg/antfly-embedded/src/local/encoding/streamvbyte.zig
-          zig test zig/pkg/antfly-embedded/src/local/encoding/chunked_coder.zig
-          zig test -O fast zig/pkg/antfly-embedded/src/local/encoding/chunked_coder.zig
+          zig test zig/pkg/antfly-embedded/src/encoding/streamvbyte.zig
+          zig test -O fast zig/pkg/antfly-embedded/src/encoding/streamvbyte.zig
+          zig test zig/pkg/antfly-embedded/src/encoding/chunked_coder.zig
+          zig test -O fast zig/pkg/antfly-embedded/src/encoding/chunked_coder.zig
 
       - name: Check shared checksum usage
         run: make zig-checksums-check
@@ -482,7 +482,6 @@ jobs:
       # Admit the 22 GiB storage compile while leaving 2 GiB for the runner
       # and build driver. Keep this scoped to the heavy build jobs.
       ANTFLY_ZIG_MAX_RSS: "23622320128"
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -512,6 +511,9 @@ jobs:
 
       - name: Restore ARC Zig cache dirs
         run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
           local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
@@ -579,6 +581,7 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
+          tools/test_test_cache_lifetime.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
@@ -647,13 +650,11 @@ jobs:
       - name: Release completed pre-unit test artifacts
         if: needs.changes.outputs.zig_tests == 'true'
         run: |
-          # The checks above compile and run several standalone test binaries
-          # into the same job-local cache. Release completed test link inputs
-          # before the aggregate unit suite so late partitions retain disk
-          # headroom without invalidating cached executables.
-          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          # All earlier consumers have exited. Retire outputs and manifests
+          # together: self-hosted debug emits no disposable link objects.
+          cache="$ZIG_LOCAL_CACHE_DIR"
           du -sh "$cache"
-          python3 zig/tools/prune_completed_test_cache.py "$cache"
+          python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
           df -i "$cache"
 
@@ -929,7 +930,6 @@ jobs:
     env:
       # Same 22 GiB build budget / 2 GiB runner headroom as zig-base-tests.
       ANTFLY_ZIG_MAX_RSS: "23622320128"
-      ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -968,6 +968,9 @@ jobs:
 
       - name: Restore ARC Zig cache dirs
         run: |
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
           local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
@@ -990,6 +993,7 @@ jobs:
           tools/test_run_bounded_zig_build.py
           tools/test_fixture_workspace.py
           tools/test_prune_completed_test_cache.py
+          tools/test_test_cache_lifetime.py
           tools/test_analyze_zig_import_graph.py
           tools/test_audit_storage_test_shards.py
           tools/test_audit_test_selection.py
@@ -1023,6 +1027,15 @@ jobs:
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
           echo "max_rss=$(python3 zig/tools/run_bounded_zig_build.py --print-max-rss --max-rss-cap 23622320128)" >> "$GITHUB_OUTPUT"
+
+      - name: Release completed pre-unit test artifacts
+        run: |
+          # Generated-source/tooling checks have finished using this cache.
+          cache="$ZIG_LOCAL_CACHE_DIR"
+          du -sh "$cache"
+          python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
+          df -h "$cache"
+          df -i "$cache"
 
       - name: Prepare bounded correctness-fixture workspace
         run: python3 zig/tools/fixture_workspace.py prepare
@@ -1067,7 +1080,7 @@ jobs:
           # The completed phase owns this private cache. Self-hosted debug
           # emits no disposable link objects; retire outputs and manifests
           # together before the next phase. Global dependencies and zig-out stay.
-          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          cache="$ZIG_LOCAL_CACHE_DIR"
           du -sh "$cache"
           python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
@@ -1110,7 +1123,7 @@ jobs:
           # The completed phase owns this private cache. Self-hosted debug
           # emits no disposable link objects; retire outputs and manifests
           # together before the next phase. Global dependencies and zig-out stay.
-          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          cache="$ZIG_LOCAL_CACHE_DIR"
           du -sh "$cache"
           python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
@@ -1152,7 +1165,7 @@ jobs:
           # The completed phase owns this private cache. Self-hosted debug
           # emits no disposable link objects; retire outputs and manifests
           # together before the next phase. Global dependencies and zig-out stay.
-          cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          cache="$ZIG_LOCAL_CACHE_DIR"
           du -sh "$cache"
           python3 zig/tools/prune_completed_test_cache.py --release-phase "$cache"
           df -h "$cache"
@@ -1185,7 +1198,7 @@ jobs:
       - name: Remove job compiler cache
         if: always()
         run: |
-          rm -rf -- "/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          rm -rf -- "$ZIG_LOCAL_CACHE_DIR"
 
   zig-build-cache-tests:
     if: >-

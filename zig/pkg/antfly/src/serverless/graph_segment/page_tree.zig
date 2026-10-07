@@ -1028,7 +1028,7 @@ fn allocationExercise(alloc: Allocator) !void {
 }
 
 test "serverless graph page tree releases every allocation on failed build update and scan" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationExercise, .{});
 }
 
 test "serverless graph page tree interrupted uploads never change the published root" {

@@ -315,7 +315,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // envelope so the scheduler does not reject a successful compile.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -406,7 +406,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = lib_api_auth_runtime_filters,
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -447,7 +447,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &authorization_sink_filters,
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -477,7 +477,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db managed algebraic admission builds and reopens",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -495,7 +495,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage maintenance append allocation failure does not wedge coordinator",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -527,7 +527,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "include param parsing",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -629,7 +629,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "cluster restore repository errors preserve operational failure semantics",
         }),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -647,7 +647,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const retained_quota_tests = b.addTest(.{
         .root_module = api_session_maintenance_test_mod,
         .filters = &.{ "retained quota", "api http server routes table batches through the batch commit hook", "api http client preserves public batch retry safety classifications", "internal routed batch preserves typed validation across the HTTP forwarding hop", "typed routed batch preserves forwarding cancellation and identity conflicts", "httpx antfly reads preserve availability and terminal failures" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-retained-quota-test", "Run retained-effects pressure outcome and retry contracts").dependOn(&addFilteredTestRunArtifact(b, retained_quota_tests).step);
     const lib_api_session_maintenance_tests = b.addTest(.{
@@ -679,7 +679,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http server keeps session maintenance off internal request paths",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -905,7 +905,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned query runtime db rejects stale identity namespace",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -973,7 +973,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "internal transaction operations preserve pre-decision leader unavailability",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1102,7 +1102,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "write cache retires shared HA generation stale entries before reuse",
         }),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1216,7 +1216,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "system catalog parallel hosted candidate fanout sends only owned keys",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1258,7 +1258,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "public document artifact reprocess handler returns accepted",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1268,7 +1268,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "transition runtime fails closed when doc identity reassignment callback is missing",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1281,7 +1281,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"serverless module compiles"}, lib_serverless_docid_runtime_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1329,7 +1329,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed metric postprocessing enforces the complete candidate ceiling",
         }),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1341,7 +1341,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, lib_api_graph_wire_runtime_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1361,7 +1361,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = api_table_reads_docid_test_mod,
         .filters = lib_api_distributed_query_availability_runtime_filters,
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1379,7 +1379,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "api http client preserves remote storage read contention",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1388,21 +1388,21 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "api-internal-routed-batch-tests",
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{"typed routed batch preserves forwarding cancellation and identity conflicts"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-internal-routed-batch-test", "Run exact private batch routing and rollback authority regressions").dependOn(&api_internal_routed_batch_tests.run(b).step);
     const api_internal_batch_outcome_tests = @import("linked_tests.zig").add(b, .{
         .name = "api-internal-batch-outcome-tests",
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{"api http client requires explicit not-proposed marker and tracks delivery phase"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-internal-batch-outcome-test", "Run forwarded batch outcome and admission classification regressions")
         .dependOn(&api_internal_batch_outcome_tests.run(b).step);
     const api_aborted_prepare_unavailability_tests = b.addTest(.{
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{"distributed txn coordinator aborts only participants that may have begun"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-aborted-prepare-unavailability-test", "Run durable-abort retryability classification regression")
         .dependOn(&addFilteredTestRunArtifact(b, api_aborted_prepare_unavailability_tests).step);
@@ -1441,6 +1441,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "derived coverage aggregation rejects mixed config observations",
             "derived coverage embedding activity aggregation is order independent and phase authoritative",
             "derived coverage ready full text status reports complete progress",
+            "derived coverage artifact projections use source readiness without vector counters",
             "readiness observation completion requires convergence and full topology",
             "late source target notification cannot revoke an already observed target",
             "late exact index notification preserves completed observation and reduction authority",
@@ -1604,7 +1605,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "startup configured indexes separate physical indexes from reserved metadata",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -1624,7 +1625,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = write_implementation_module,
         .filters = &.{"api.table_reads.implementationTests."},
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);
     const run_api_table_reads_docid_tests = @import("linked_tests.zig").runPair(b, api_table_reads_linked_tests, write_implementation_tests);
@@ -1638,27 +1639,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "api-aggregation-tests",
         .root_module = api_table_reads_docid_test_mod,
         .filters = &.{ "aggregation-only collection", "aggregation completeness", "aggregation context", "aggregation full-result rerun", "aggregation domain", "encode vector-only query does not create a match-all text component", "api query contract keeps filter carriers out of vector fusion" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
     const rewrite_admission_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn rewrite admission", "relational integrity restore staging rewrite intent" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-rewrite-admission-contract-test", "Verify scoped rewrite admission and durable intent binding")
         .dependOn(&addFilteredTestRunArtifact(b, rewrite_admission_contract_tests).step);
     const row_semantics_codec_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn prepare preserves JSON null", "distributed txn prepare JSON null", "internal batch JSON null", "distributed txn range guard wire" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-row-semantics-codec-test", "Verify fail-closed row semantics envelopes and allocation failure cleanup")
         .dependOn(&addFilteredTestRunArtifact(b, row_semantics_codec_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-transactions-test", "Run transaction coordinator and participant contracts").dependOn(&addFilteredTestRunArtifact(b, api_transaction_contract_tests).step);
     const run_api_public_table_http_docid_tests = addFilteredTestRunArtifact(b, api_public_table_http_docid_tests);
@@ -1666,38 +1667,38 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const api_relational_row_contract_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{ "relational mutation", "relational row query", "relational declarations", "ordinary schema update rejects unacknowledged FK generation", "FK generation publication coordinator", "FK initial create coordinator", "SQL TRUNCATE" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
     const restore_lookup_authority_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope", "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-lookup-authority-test", "Run private restore lookup authority parsing and compiled wire regressions").dependOn(&addFilteredTestRunArtifact(b, restore_lookup_authority_tests).step);
     const api_index_maintenance_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{ "index maintenance", "hot-standby mutation" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-index-maintenance-test", "Run generation-fenced index maintenance admission and recovery contracts").dependOn(&addFilteredTestRunArtifact(b, api_index_maintenance_tests).step);
     const api_storage_capability_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{"serverless capabilities"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-storage-capabilities-test", "Run backend relational capability admission contracts").dependOn(&addFilteredTestRunArtifact(b, api_storage_capability_tests).step);
     const api_relational_index_status_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
         .filters = &.{"relational index status"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-relational-index-status-test", "Run unified relational index readiness and owner coverage contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_index_status_tests).step);
     const api_relational_topology_contract_tests = @import("linked_tests.zig").addPair(b, .{
         .name = "api-relational-topology-tests",
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{ "internal batch topology control", "relational backup cohort" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-relational-topology-test", "Run private lifecycle control and backup cohort contracts").dependOn(&api_relational_topology_contract_tests.run(b).step);
     const run_raft_transition_runtime_docid_tests = addFilteredTestRunArtifact(b, raft_transition_runtime_docid_tests);
@@ -1940,7 +1941,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "api-restore-provisioning-tests",
         .root_module = api_table_writes_docid_test_mod,
         .filters = &.{"restore staging private provisioning"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-restore-provisioning-test", "Run private hidden owner reservation and writer-cache admission").dependOn(&restore_provisioning_tests.run(b).step);
     const hosted_batch_tests = @import("linked_tests.zig").addPair(b, .{
@@ -1950,7 +1951,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hosted remote batch prefers routed Raft protocol with safe legacy fallback",
             "range tracking activation uses a fenced owner-routed Raft command",
         },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-hosted-batch-test", "Run hosted batch forwarding authority and canonical wire regressions").dependOn(&hosted_batch_tests.run(b).step);
     const run_api_table_writes_production_regression_unit_tests = api_table_writes_production_regression_tests.run(b);
@@ -1969,7 +1970,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "replica retirement journal distinguishes active retained and committed removal",
             "private initial child retirement requires canceled local publication",
         },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-replica-retirement-batch-test", "Run the durable replica-retirement batch decoder regression").dependOn(&replica_retirement_batch_tests.run(b).step);
     const api_create_structural_retry_tests = @import("linked_tests.zig").addPair(b, .{
@@ -1980,7 +1981,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "provisioned create retries a retired cache lease before structural publication",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     }, write_implementation_tests);
@@ -2002,7 +2003,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "native backup never reclaims an old attempt with a live lease",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     }, write_implementation_tests);
@@ -2055,7 +2056,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // Keep it compile-only so the lifecycle selection remains unchanged.
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, lib_docid_lifecycle_runtime_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -2075,31 +2076,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_fk_placement_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{"hosted relational parent placement opens a real Raft owner"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-fk-placement-test", "Run mounted metadata and relational parent owner placement regression")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_placement_tests).step);
     const sql_rewrite_receipt_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{ "SQL rewrite response retains admitted and uncertain restore handles", "SQL DDL receipt status distinguishes unknown admission", "SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute", "relational UUID preparation canonicalizes before durable row and index extraction", "relational UUID ingress shares canonical typed bytes and semantic hash", "initial foreign-key create distinguishes unknown admission from accepted work", "primary key schema lowering rejects deferred timing and empty keys", "relational primary keys cannot defer enforcement", "restore immutable rewrite failures are terminal but transport pressure is retryable", "httpx restore owner accepts bounded rewrite source chunks above legacy control limit" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-sql-rewrite-receipt-test", "Run SQL rewrite receipt and unknown-admission response regression")
         .dependOn(&addFilteredTestRunArtifact(b, sql_rewrite_receipt_tests).step);
     const sql_uuid_catalog_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{"SQL UUID prepared CREATE TABLE commits and replays catalog topology only on execute"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-sql-uuid-catalog-test", "Run prepared SQL UUID catalog and owner publication regression")
         .dependOn(&addFilteredTestRunArtifact(b, sql_uuid_catalog_tests).step);
     const pk_failure_abi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/runtime_failure_abi.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/runtime_failure_abi.zig"),
         .target = target,
         .optimize = optimize,
     });
     const pk_failure_identity_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/runtime_failure_identity.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/runtime_failure_identity.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -2107,7 +2108,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const pk_failure_identity_tests = b.addTest(.{
         .root_module = pk_failure_identity_mod,
         .filters = &.{"registered storage-kernel errors are unique and round trip without losing identity"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-pk-restore-error-identity-test", "Run exact native invalid-row restore error identity regression")
         .dependOn(&addFilteredTestRunArtifact(b, pk_failure_identity_tests).step);
@@ -2132,7 +2133,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sql_primary_key_rewrite_tests = b.addTest(.{
         .root_module = sql_primary_key_rewrite_test_mod,
         .filters = &.{"mounted SQL ADD PRIMARY KEY publishes only validated fresh generation"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-sql-primary-key-rewrite-test", "Run mounted SQL primary-key rewrite publication and failure cases")
         .dependOn(&addFilteredTestRunArtifact(b, sql_primary_key_rewrite_tests).step);
@@ -2159,28 +2160,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_initial_fk_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations", "mounted initial MATCH PARTIAL publication enforces constraints across restart", "hosted initial FK real services and facade retain all required capabilities" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-initial-fk-test", "Run mounted hosted initial-FK owner publication regression")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_tests).step);
     const hosted_initial_fk_fault_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial FK lost replies and cold owner restart before release", "hosted initial FK real services and facade retain all required capabilities" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-initial-fk-fault-test", "Run hosted initial CREATE lost-reply and cold owner release recovery")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_fault_tests).step);
     const hosted_initial_fk_transfer_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial FK hidden three voter owner transfers before release", "hosted initial FK real services and facade retain all required capabilities" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-initial-fk-transfer-test", "Run hidden initial-child three-voter Raft leadership transfer")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_transfer_tests).step);
     const hosted_initial_fk_offline_tests = b.addTest(.{
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial FK canceled offline replica returns and signs exact unlink ACK", "mounted initial FK published obsolete released replica retires without canceling current owner", "hosted initial FK real services and facade retain all required capabilities" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-initial-fk-offline-test", "Run canceled and published obsolete initial-child offline physical retirement")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_initial_fk_offline_tests).step);
@@ -2189,7 +2190,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "antfly-hosted-initial-fk-recovery",
         .root_module = hosted_initial_fk_test_mod,
         .filters = &.{ "mounted initial", "hosted initial FK real services and facade retain all required capabilities", "FK plan table and range descriptors survive snapshot release", "initial FK plan waits for all external parent schema migrations" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const hosted_fk_drop_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_fk_drop_test_root.zig"),
@@ -2214,7 +2215,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_fk_drop_tests = b.addTest(.{
         .root_module = hosted_fk_drop_test_mod,
         .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation", "empty activation page validates source catalog without probing external parents" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-fk-drop-test", "Run mounted external-parent FK DROP retirement and restart")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_fk_drop_tests).step);
@@ -2223,7 +2224,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_graph_truncate_tests = b.addTest(.{
         .root_module = hosted_fk_drop_test_mod,
         .filters = &.{"mounted hosted graph TRUNCATE"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-graph-truncate-test", "Run public graph TRUNCATE seal and cold-restart recovery")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_graph_truncate_tests).step);
@@ -2231,7 +2232,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "antfly-hosted-truncate-fk-recovery",
         .root_module = hosted_fk_drop_test_mod,
         .filters = &.{ "mounted hosted external-parent FK DROP publishes after parent ACK", "mounted hosted external-parent FK TRUNCATE", "mounted hosted graph TRUNCATE", "owner catalog busy without index debt keeps provisioning retry until full reconciliation", "empty activation page validates source catalog without probing external parents" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const hosted_self_fk_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_hosted_self_fk_test_root.zig"),
@@ -2256,42 +2257,42 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const hosted_self_fk_retry_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"self-FK retries only a proven durable precommit abort"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-self-fk-retry-test", "Run self-FK proven durable precommit retry regression")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_retry_tests).step);
     const hosted_self_fk_diagnostic_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"mounted hosted self-FK ADD DROP restart"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-self-fk-test", "Run mounted public self-FK ADD/DROP/restart")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_diagnostic_tests).step);
     const hosted_cte_runtime_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{ "mounted hosted prepared CTE mutations and recursive read retain owner fences", "hosted CTE MERGE retries only proven precommit read unavailability", "SQL pgwire MERGE completion reports committed affected rows" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-cte-runtime-test", "Run linked hosted prepared CTE and recursive owner-snapshot regression")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_cte_runtime_tests).step);
     const hosted_self_fk_fault_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"mounted hosted self-FK publication resumes after lost owner and metadata replies"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-self-fk-fault-test", "Run mounted self-FK publication lost-reply recovery")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_fault_tests).step);
     const hosted_self_fk_metadata_restart_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-self-fk-metadata-restart-test", "Run mounted self-FK metadata and owner cold restart at parent ACK")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_metadata_restart_tests).step);
     const hosted_self_fk_leader_transfer_tests = b.addTest(.{
         .root_module = hosted_self_fk_test_mod,
         .filters = &.{"mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-hosted-self-fk-leader-transfer-test", "Run mounted three-voter self-FK ADD/DROP owner leadership transfer")
         .dependOn(&addFilteredTestRunArtifact(b, hosted_self_fk_leader_transfer_tests).step);
@@ -2300,7 +2301,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = hosted_self_fk_test_mod,
         // Exact positive proofs: never include the old guard-on assertions.
         .filters = &.{ "mounted hosted self-FK ADD DROP restart", "mounted hosted self-FK publication resumes after lost owner and metadata replies", "mounted hosted self-FK resumes after metadata and owner cold restart at parent ACK", "mounted hosted self-FK survives three-voter owner leadership transfer at ADD and DROP ACK" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const hosted_recovery_tests = [_]*std.Build.Step.Compile{ hosted_initial_fk_recovery_tests, hosted_self_fk_recovery_tests, hosted_truncate_fk_recovery_tests };
     const hosted_recovery_step = b.step("antfly-api-hosted-recovery-test", "Run native hosted owner recovery integration tests");
@@ -2359,7 +2360,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "restore ownership backoff is interruptible without polling",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -2367,49 +2368,49 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const staged_restore_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{ "busy staged restore owner retains its pinned attempt", "restore cutover lost begin reply waits for the same fence to drain", "staged restore published metadata wins cancellation only after every owner opens", "staged restore worker publishes a dependency complete mixed native cohort", "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged restore worker recovers lost acknowledgements across owner restart matrix", "staged restore worker preserves generated mixed cohorts across HTTP owner faults", "staged table restore worker uses shared dependency complete cohort", "staged restore worker preserves migration mappings and indexes after restart", "staged restore worker measures bounded LSM native and portable work" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-driver-test", "Run bounded staged restore publication and cancellation driver regressions").dependOn(&addFilteredTestRunArtifact(b, staged_restore_driver_tests).step);
     const staged_restore_proof_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{ "staged restore worker rebuilds a dependency complete mixed portable cohort", "staged table restore worker uses shared dependency complete cohort" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-proof-test", "Run portable accepted-generation and table-cohort restore regressions").dependOn(&addFilteredTestRunArtifact(b, staged_restore_proof_tests).step);
     const staged_restore_portable_fk_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{"staged restore worker rebuilds a dependency complete mixed portable cohort"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-portable-fk-test", "Run portable accepted-generation restore regression").dependOn(&addFilteredTestRunArtifact(b, staged_restore_portable_fk_tests).step);
     const portable_fk_restore_admission_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{ "public portable foreign-key restore rejects a new job without losing an exact retry", "portable foreign-key worker guard is terminal and not a corrupt archive" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-portable-fk-restore-admission-test", "Run fail-closed public portable FK restore admission regression").dependOn(&addFilteredTestRunArtifact(b, portable_fk_restore_admission_tests).step);
     const staged_restore_benchmark_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{"staged restore worker measures bounded LSM native and portable work"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-benchmark-test", "Measure bounded native and portable LSM restore work").dependOn(&addFilteredTestRunArtifact(b, staged_restore_benchmark_tests).step);
     const staged_restore_portable_terminal_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{"staged portable restore proves terminal correctness with a bounded extended budget"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-staged-restore-portable-terminal-test", "Prove large portable staged restore reaches durable publication").dependOn(&addFilteredTestRunArtifact(b, staged_restore_portable_terminal_tests).step);
     const rewrite_driver_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{ "rewrite shared job", "staged restore native handoff", "staged restore worker rewrites retained acknowledged writes and reopens hidden mixed owners", "restore immutable rewrite failures are terminal", "restore cutover readiness waits without exponential retry" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-rewrite-driver-test", "Run real retained-source rewrite, hidden owner recovery and failed-tail cancellation").dependOn(&addFilteredTestRunArtifact(b, rewrite_driver_tests).step);
     const generated_restore_tests = b.addTest(.{
         .root_module = api_backup_restore_test_mod,
         .filters = &.{"staged restore worker preserves generated mixed cohorts across HTTP owner faults"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-generated-restore-test", "Run generated mixed-table restore through HTTP owner faults").dependOn(&addFilteredTestRunArtifact(b, generated_restore_tests).step);
     const lib_api_standalone_backup_restore_test_step = b.step("antfly-api-standalone-backup-restore-test", "Run the focused standalone-like backup/restore e2e test");

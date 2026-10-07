@@ -688,7 +688,7 @@ fn exerciseOwnedTensor(a: std.mem.Allocator) !void {
 
 test "safetensors tensor bounds and owned shape allocation failures are safe" {
     try exerciseOwnedTensor(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseOwnedTensor, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseOwnedTensor, .{});
 }
 
 fn exerciseBorrowedSnapshot(a: std.mem.Allocator) !void {
@@ -711,7 +711,7 @@ fn exerciseBorrowedSnapshot(a: std.mem.Allocator) !void {
 
 test "safetensors borrowed immutable snapshot keeps caller bytes and zero-copy aligned tensors through allocation failures" {
     try exerciseBorrowedSnapshot(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseBorrowedSnapshot, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseBorrowedSnapshot, .{});
 }
 
 test "safetensors unaligned mapped payload becomes an aligned owned tensor" {

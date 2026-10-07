@@ -82,7 +82,7 @@ pub fn add(
                     }
                 else
                     &.{b.fmt("storage.{s}.", .{std.fs.path.stem(test_sources[index])})},
-                .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+                .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
             });
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
@@ -116,7 +116,7 @@ pub fn add(
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = physical_module,
         .filters = &.{"storage owner handoff receipt survives shared-context hidden to public reopen"},
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|

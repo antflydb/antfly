@@ -24,9 +24,9 @@ pub fn attach(consumer: *std.Build.Module) void {
     const b = consumer.owner;
     const root = consumer.root_source_file orelse return;
     const path = @import("../antfly/source_paths.zig").authored(b, root) orelse return;
-    if (std.mem.indexOf(u8, path, "pkg/antfly-embedded/src/local/") != null) return;
+    if (std.mem.indexOf(u8, path, "pkg/antfly-embedded/src/") != null) return;
     const local = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/source_catalog.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/source_catalog.zig"),
         .target = consumer.resolved_target,
         .optimize = consumer.optimize,
     });
@@ -41,6 +41,12 @@ pub fn attach(consumer: *std.Build.Module) void {
 /// same declarations as the consumer's, rather than a second configuration.
 pub fn finalize(b: *std.Build) void {
     for (bindings.items) |binding| {
+        // Unused literal imports also enter Zig's cache key. Select a catalog
+        // that cannot declare physical inputs for this compilation profile.
+        binding.local.root_source_file = b.path(if (@import("../antfly/test_partitions.zig").controlOnly(binding.consumer))
+            "pkg/antfly-embedded/src/source_catalog_control.zig"
+        else
+            "pkg/antfly-embedded/src/source_catalog.zig");
         var imports = binding.consumer.import_table.iterator();
         while (imports.next()) |entry| {
             if (std.mem.eql(u8, entry.key_ptr.*, "antfly_source_root") or

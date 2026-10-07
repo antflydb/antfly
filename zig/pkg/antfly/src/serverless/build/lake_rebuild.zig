@@ -3006,7 +3006,7 @@ test "serverless lake graph aliases bootstrap one projection without replay on i
                 try std.testing.expect(completed[1]);
             }
         };
-        try std.testing.checkAllAllocationFailures(a, Failures.run, .{ plan.operations, first });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Failures.run, .{ plan.operations, first });
     }
 }
 

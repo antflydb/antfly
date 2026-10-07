@@ -99,22 +99,6 @@ def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
     wait_ready("model_b", 1)
     assert nearest("model_a", [0, 0, 1]) == ["a"]
     assert nearest("model_b", [1, 0]) == ["a"]
-    api.restart_server()
-    assert api.get_table(table)["storage"]["dense_embeddings"] == mode
-    if mode == "vector_store":
-        # Accounting must survive startup writer retirement, before any query
-        # or write happens to reacquire a live writer for this table.
-        assert wait_until(
-            lambda: (
-                api.get_table(table).get("storage_status", {}).get("source_vectors")
-            ),
-            timeout_s=30,
-            interval_s=0.5,
-        )
-    assert wait_until(
-        lambda: nearest("model_a", [0, 0, 1]) == ["a"], timeout_s=90, interval_s=1
-    )
-    assert nearest("model_b", [1, 0]) == ["a"]
     if mode == "vector_store":
 
         def source_stats():
@@ -137,16 +121,37 @@ def test_vector_source_models_updates_deletes_and_restart(stateful_api, mode):
                 return stats
             return None
 
-        # Reopen restores retained accounting before this owner has collected.
-        # Zero pending bytes alone also describes a collection not yet started;
-        # Require a completed liveness check and its counts in one snapshot.
-        # A validated checkpoint receipt proves the same ownership without
-        # rewriting an already reclaimed source generation after restart.
-        stats = wait_until(reclaimed_source_stats, timeout_s=30, interval_s=0.5)
+        # Prove collection while its writer owns these process-local counters.
+        # Reopen restores durable accounting, not a completed collection event.
+        # Allow the collector's cooldown and bounded maintenance passes, just
+        # as index visibility allows asynchronous maintenance to finish above.
+        stats = wait_until(reclaimed_source_stats, timeout_s=90, interval_s=0.5)
         assert stats is not None, source_stats()
         assert stats["retained_payloads"] == 2
         assert stats["retained_payload_bytes"] == 20
         assert stats["live_payloads_at_collection"] == 2
+    api.restart_server()
+    assert api.get_table(table)["storage"]["dense_embeddings"] == mode
+    if mode == "vector_store":
+        # Validate durable accounting before queries reacquire a writer. A new
+        # owner need not have collected to report the already reclaimed source.
+        stats = wait_until(
+            source_stats,
+            ready_when=lambda stats: bool(
+                stats
+                and stats.get("retained_payloads") == 2
+                and stats.get("retained_payload_bytes") == 20
+                and stats.get("collection_pending_bytes") == 0
+            ),
+            timeout_s=30,
+            interval_s=0.5,
+        )
+        assert stats is not None, source_stats()
+    assert wait_until(
+        lambda: nearest("model_a", [0, 0, 1]) == ["a"], timeout_s=90, interval_s=1
+    )
+    assert nearest("model_b", [1, 0]) == ["a"]
+    if mode == "vector_store":
         # Removing all ANN consumers must preserve the table's two sources.
         api.delete_index(table, "model_a")
         api.delete_index(table, "model_b")

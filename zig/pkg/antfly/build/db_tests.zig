@@ -31,6 +31,18 @@ pub const AddTestsResult = struct {
 
 pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const antfly_test_mod = options.antfly_test_mod;
+    const producer_receipt_filters = [_][]const u8{
+        "producer readiness",
+        "derived coverage outcome transitions are exclusive and idempotent",
+        "graph projection preserves numeric literals in enrichment metadata and templates",
+    };
+    const producer_receipt_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &producer_receipt_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-storage-producer-receipts-test", "Run primary revision receipt and cached graph publication regressions")
+        .dependOn(&addCuratedTestRunArtifact(b, producer_receipt_tests, &producer_receipt_filters).step);
     const relationship_identity_filters = [_][]const u8{
         "db graph endpoint cleanup pages",
         "derived worker pause",
@@ -85,7 +97,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const relationship_identity_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &relationship_identity_filters,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_relationship_identity_tests = addCuratedTestRunArtifact(b, relationship_identity_tests, &relationship_identity_filters);
     b.step("antfly-storage-graph-identity-test", "Run relationship ownership, lifecycle, snapshot and replay regressions").dependOn(&run_relationship_identity_tests.step);
@@ -98,28 +110,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const worker_lifecycle_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &worker_lifecycle_filters,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_worker_lifecycle_tests = addCuratedTestRunArtifact(b, worker_lifecycle_tests, &worker_lifecycle_filters);
     b.step("antfly-storage-index-worker-lifecycle-test", "Run derived worker pause, replay retention, visibility and catalog retirement regressions").dependOn(&run_worker_lifecycle_tests.step);
     const direct_vector_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "online direct vector", "online graph snapshot", "retained transaction vector", "api module compiles", "metadata module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-online-direct-vector-test", "Run ordered direct vector snapshot, retention, and repair regressions")
         .dependOn(&addFilteredTestRunArtifact(b, direct_vector_tests).step);
     const retirement_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "db cold initial FK retirement", "api module compiles", "metadata module compiles" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-cold-fk-retirement-test", "Run terminal local publication cancellation durability tests")
         .dependOn(&addFilteredTestRunArtifact(b, retirement_tests).step);
     const ordered_artifact_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "db dense target reads atomic artifact and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-ordered-artifact-test", "Run ordered artifact inventory, wire, and durable owner regressions")
         .dependOn(&addFilteredTestRunArtifact(b, ordered_artifact_tests).step);
@@ -131,11 +143,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "db dense shadow activation rejects surplus candidate coverage",
             "db paused dense repair resumes its durable candidate after restart",
         },
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-storage-repair-activation-test", "Run bounded index activation, coverage, and candidate-resume regressions")
         .dependOn(&addFilteredTestRunArtifact(b, repair_activation_tests).step);
     const db_enrichment_filters: []const []const u8 = &.{
+        "db public artifact reprocess accepts durable work despite unrelated provider retries",
+        "db document extraction manifest inspection and reprocess API",
+        "db generic artifact repair queue",
+        "db shared repair completion",
+        "db repair completion cannot clear debt behind terminal coverage",
         "db resolver workers recover pending journal targets after reopen without new writes",
         "db resolver worker resumes durable backfill after deferred activation and reopen",
         "db managed resolver changes fence in-flight replay and reset durable cursors",
@@ -218,6 +235,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "budgeted document download composes with materialization accounting",
         "retained document collection allocations compose with the hard working-set cap",
         "document replay payloads are admitted before persistent allocation",
+        "document extraction accepts validated reader no-text results without hiding invalid output",
+        "document extraction generated OCR rejects empty punctuation and prompt echoes on empty pages",
+        "document extraction generated OCR preserves short scan text and quality warnings transactionally",
         "document extraction generated OCR bypasses unsupported native batch",
         "document extraction generated OCR rejects malformed envelopes before apply",
         "document extraction generated OCR applies unit updates transactionally",
@@ -622,7 +642,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = &lib_db_query_default_filters,
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -641,7 +661,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const highlight_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &highlight_filters,
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_highlight_tests = b.addRunArtifact(highlight_tests);
     addRuntimeTestFilters(b, run_highlight_tests, &highlight_filters);
@@ -654,7 +674,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "text late visibility",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
@@ -708,7 +728,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "hierarchy stored-value sanitizer always removes the unit fingerprint",
         },
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });

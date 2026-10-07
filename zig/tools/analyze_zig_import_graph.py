@@ -597,11 +597,8 @@ def source_group(path: Path, repo_root: Path = REPO_ROOT) -> str:
     parts = path.relative_to(repo_root).parts
     if parts[:4] == ("zig", "pkg", "antfly", "src") and len(parts) > 4:
         return f"zig/pkg/antfly/src/{parts[4]}"
-    if (
-        parts[:5] == ("zig", "pkg", "antfly-embedded", "src", "local")
-        and len(parts) > 5
-    ):
-        return f"zig/pkg/antfly-embedded/src/local/{parts[5]}"
+    if parts[:4] == ("zig", "pkg", "antfly-embedded", "src") and len(parts) > 4:
+        return f"zig/pkg/antfly-embedded/src/{parts[4]}"
     if parts[:2] == ("zig", "lib") and len(parts) > 2:
         return f"zig/lib/{parts[2]}"
     if parts[:2] == ("zig", "pkg") and len(parts) > 2:

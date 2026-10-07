@@ -355,7 +355,7 @@ test "boundary qualification source words preserve Unicode and release every fai
             try std.testing.expectError(error.InvalidUtf8, sourceWords(a, "\xff", .{}));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Exercise.run, .{});
     try std.testing.expectError(error.BoundaryTextLimitExceeded, sourceWords(std.testing.allocator, "a b c", .{ .max_text_words = 2 }));
     const Bounded = @import("../runtime/bounded_allocator.zig").BoundedAllocator;
     var bounded = Bounded{ .backing = std.testing.allocator, .limit = 1 };

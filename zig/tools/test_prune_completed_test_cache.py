@@ -194,6 +194,30 @@ class PruneTests(unittest.TestCase):
                     release_completed_phase(path)
             self.assertEqual((target / "keep").read_text(), "keep")
 
+    def test_phase_validation_normalizes_parent_components_without_removing_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            (root / "nested").mkdir()
+            cache = root / "zig-local"
+            cache.mkdir()
+            marker = cache / "manifest"
+            marker.write_text("keep until release")
+            path = root / "nested" / ".." / "zig-local"
+            self.assertEqual(_module.validate_phase_cache(path), cache)
+            self.assertEqual(marker.read_text(), "keep until release")
+            release_completed_phase(path)
+            self.assertEqual(list(cache.iterdir()), [])
+
+    def test_phase_validation_rejects_redirected_parent_traversal(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root).resolve()
+            outside = root / "outside"
+            (outside / "nested").mkdir(parents=True)
+            (root / "nested").symlink_to(outside / "nested", target_is_directory=True)
+            path = root / "nested" / ".." / "zig-local"
+            with self.assertRaises(ValueError):
+                _module.validate_phase_cache(path)
+
     def test_missing_cache_is_harmless(self):
         with tempfile.TemporaryDirectory() as root:
             self.assertEqual(prune(Path(root) / "missing"), 0)
