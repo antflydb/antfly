@@ -295,13 +295,7 @@ fn discardStagedBlocksAt(
     staged: []const StagedBlock,
 ) void {
     for (staged) |receipt| {
-        const separator = if (std.mem.endsWith(u8, root_dir, std.fs.path.sep_str)) "" else std.fs.path.sep_str;
-        const path = std.fmt.allocPrint(alloc, "{s}{s}block-{d}-{d}.afvb", .{
-            root_dir,
-            separator,
-            receipt.generation,
-            receipt.shard_id,
-        }) catch continue;
+        const path = checkpointBlockPathAlloc(alloc, root_dir, receipt.generation, receipt.shard_id) catch continue;
         defer alloc.free(path);
         storage.deleteFileAbsolute(path) catch {};
     }
