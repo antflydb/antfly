@@ -219,7 +219,7 @@ test "SQL exact original rejection contracts fail before backend access" {
     const cases = [_]struct { id: []const u8, expected: compiler.Error }{
         .{ .id = "sql-0378", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0382", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0672", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0672", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0673", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0699", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0700", .expected = error.InvalidSqlSyntax },
@@ -240,7 +240,7 @@ test "SQL exact original rejection contracts fail before backend access" {
         .{ .id = "sql-0789", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0790", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0791", .expected = error.UnsupportedSqlShape },
-        .{ .id = "sql-0792", .expected = error.InvalidSqlSyntax },
+        .{ .id = "sql-0792", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0793", .expected = error.UnsupportedSqlShape },
         .{ .id = "sql-0794", .expected = error.InvalidSqlSyntax },
         .{ .id = "sql-0795", .expected = error.UnsupportedSqlShape },
@@ -299,7 +299,10 @@ test "SQL exact original rejection contracts fail before backend access" {
         const case = try corpus.get(expected.id);
         try std.testing.expectEqualStrings("rejection", case.source_expectation);
         var diagnostic: compiler.Diagnostic = .{};
-        try std.testing.expectError(expected.expected, compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic));
+        std.testing.expectError(expected.expected, compiler.compileDiagnostic(std.testing.allocator, case.sql, .{}, &diagnostic)) catch |err| {
+            std.debug.print("rejection contract {s}: {s}\n", .{ case.id, diagnostic.message });
+            return err;
+        };
         try std.testing.expect(diagnostic.message.len > 0);
         try std.testing.expect(diagnostic.start <= diagnostic.end);
         try std.testing.expect(diagnostic.end <= case.sql.len);

@@ -86,6 +86,64 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute("SELECT " + case["expression"]).fetchone()[0],
                 )
 
+    def test_expression_defaults_and_stored_generation_assignment_contract(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TABLE exprs (g integer GENERATED ALWAYS AS "
+                "(CASE WHEN n IS NULL THEN 0 ELSE CAST(n AS integer)+1 END) STORED, "
+                "n smallint DEFAULT (2+3), overflow smallint DEFAULT (32767+1), "
+                "label text DEFAULT lower('READY'), "
+                "slug text GENERATED ALWAYS AS (lower(label)||'-ok') STORED, "
+                "h smallint GENERATED ALWAYS AS (n+1) STORED)"
+            )
+            self.assertEqual(
+                (5, 6, 6, "ready", "ready-ok"),
+                self.db.execute(
+                    "INSERT INTO exprs(overflow) VALUES (1) RETURNING n,g,h,label,slug"
+                ).fetchone(),
+            )
+            self.db.execute(
+                "ALTER TABLE exprs ALTER COLUMN n SET DEFAULT "
+                "CASE WHEN true THEN 8 ELSE 9 END"
+            )
+            self.assertEqual(
+                (8, 9, 9),
+                self.db.execute(
+                    "INSERT INTO exprs(overflow) VALUES (1) RETURNING n,g,h"
+                ).fetchone(),
+            )
+            self.assertEqual(
+                (None, 0, None),
+                self.db.execute(
+                    "INSERT INTO exprs(n,overflow) VALUES (NULL,1) RETURNING n,g,h"
+                ).fetchone(),
+            )
+            for sql in (
+                "INSERT INTO exprs DEFAULT VALUES",
+                "INSERT INTO exprs(n,overflow) VALUES (2,1),(32767,1)",
+            ):
+                with self.assertRaises(psycopg.Error) as failure:
+                    with self.db.transaction():
+                        self.db.execute(sql)
+                self.assertEqual("22003", failure.exception.sqlstate)
+            self.assertEqual(3, self.db.execute("SELECT COUNT(*) FROM exprs").fetchone()[0])
+            self.db.execute("ALTER TABLE exprs ADD COLUMN extra integer DEFAULT (4*5) NOT NULL")
+            self.assertEqual([(20,), (20,), (20,)], self.db.execute("SELECT extra FROM exprs").fetchall())
+            for sql in (
+                "ALTER TABLE exprs ADD COLUMN bad integer GENERATED ALWAYS AS (g+1) STORED",
+                "ALTER TABLE exprs ADD COLUMN bad integer GENERATED ALWAYS AS (bad+1) STORED",
+            ):
+                with self.assertRaises(psycopg.Error) as failure:
+                    with self.db.transaction():
+                        self.db.execute(sql)
+                self.assertEqual("42P17", failure.exception.sqlstate)
+            with self.assertRaises(psycopg.Error) as failure:
+                with self.db.transaction():
+                    self.db.execute("ALTER TABLE exprs ALTER COLUMN g SET DEFAULT 5")
+            self.assertEqual("42601", failure.exception.sqlstate)
+
     def test_durable_numeric_expression_builtin_domains(self):
         import json
         import psycopg
@@ -1072,6 +1130,22 @@ class PostgresReferenceTest(unittest.TestCase):
                         with self.db.transaction(force_rollback=True):
                             self.db.execute(case["sql"])
                     self.assertEqual(error.exception.sqlstate, "0A000")
+
+    def test_original_generated_subqueries_are_not_postgres_features(self):
+        import json
+        import psycopg
+
+        entries = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())["entries"]
+        selected = [case for case in entries if case["id"] in ("sql-0672", "sql-0673")]
+        self.assertEqual(2, len(selected))
+        for case in selected:
+            with self.subTest(id=case["id"]), self.db.transaction(force_rollback=True):
+                if case["sql"].startswith("ALTER"):
+                    self.db.execute("CREATE TABLE generated_usage_records(id text)")
+                with self.assertRaises(psycopg.errors.FeatureNotSupported) as failure:
+                    with self.db.transaction():
+                        self.db.execute(case["sql"])
+                self.assertEqual("0A000", failure.exception.sqlstate)
 
     def case(self, sql, params=()):
         return {"id": "sql-0001", "sql": sql, "params": params}

@@ -95,6 +95,20 @@ fn requirePrimaryColumns(alloc: std.mem.Allocator, schema: *Value, columns: []co
 }
 
 pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
+    var staging = std.heap.ArenaAllocator.init(alloc);
+    defer staging.deinit();
+    var candidate = try value(staging.allocator(), schema.*);
+    const changed = try applyCandidate(staging.allocator(), &candidate, ddl);
+    // Candidate allocations, including failed binding scratch, are never
+    // retained by the caller. Successful result storage belongs to its schema
+    // arena, as do the other JSON schema-builder operations in this module.
+    if (changed) schema.* = try value(alloc, candidate);
+    return changed;
+}
+
+/// In-place builder for an already unpublished schema, allowing CREATE's
+/// constraint batch to avoid cloning the entire schema for every constraint.
+pub fn applyCandidate(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !bool {
     const change = ddl.schema_change orelse return error.InvalidSqlSyntax;
     if (schema.* != .object) return error.InvalidSqlBackendResponse;
     switch (change) {
@@ -204,20 +218,32 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
             if (std.mem.eql(u8, column_name, "_id")) return error.UnsupportedSqlShape;
             if (change == .add_column) {
                 if (properties.object.contains(column_name)) return error.DuplicateSqlColumn;
-                const single = try @import("ddl_runtime.zig").createSchemaAlloc(alloc, .{ .table = ddl.name, .columns = &.{change.add_column} });
-                const generated = try std.json.parseFromSliceLeaky(Value, alloc, single, .{ .parse_numbers = false });
-                const definition = generated.object.get("document_schemas").?.object.get("row").?.object.get("schema").?;
-                try properties.object.put(alloc, try alloc.dupe(u8, column_name), definition.object.get("properties").?.object.get(column_name).?);
+                const column = change.add_column;
+                if (column.default_expression != null and column.generated_expression != null) return error.InvalidSqlSyntax;
+                try properties.object.put(alloc, try alloc.dupe(u8, column_name), try @import("ddl_runtime.zig").columnProperty(alloc, column, column.nullable));
                 if (!change.add_column.nullable) {
                     const required = try list(row, alloc, "required");
                     try required.append(.{ .string = try alloc.dupe(u8, column_name) });
                 }
-                if (change.add_column.default_value != null) {
+                if (column.default_expression) |expression| {
                     const defaults = try list(schema, alloc, "column_defaults");
-                    try defaults.append(generated.object.get("column_defaults").?.array.items[0]);
+                    const lowered = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, expression, column, false);
+                    try defaults.append(try value(alloc, .{ .column = column_name, .expression = lowered }));
+                }
+                if (column.generated_expression) |expression| {
+                    const generated = try list(schema, alloc, "generated_columns");
+                    const lowered = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, expression, column, true);
+                    try generated.append(try value(alloc, .{ .column = column_name, .expression = lowered }));
                 }
             } else {
                 const property = properties.object.get(column_name) orelse return error.UndefinedColumn;
+                if (schema.object.getPtr("generated_columns")) |generated| {
+                    if (generated.* != .array) return error.InvalidSqlBackendResponse;
+                    if (named(generated.array.items, column_name, "column")) |i| {
+                        if (change != .drop_column) return error.InvalidSqlSyntax;
+                        _ = generated.array.orderedRemove(i);
+                    }
+                }
                 if (change == .drop_column) {
                     _ = properties.object.swapRemove(column_name);
                     if (row.object.getPtr("required")) |required| {
@@ -232,7 +258,7 @@ pub fn apply(alloc: std.mem.Allocator, schema: *Value, ddl: ast.CatalogDdl) !boo
                     const column = try @import("schema_columns.zig").column(column_name, property);
                     const element = column.element_type;
                     const column_type = column.type;
-                    const expression = try @import("ddl_runtime.zig").defaultExpression(alloc, change.set_default.value, column_type, element);
+                    const expression = try @import("schema_expression.zig").lowerAssignment(alloc, schema.*, change.set_default.expression, .{ .name = column_name, .type = column_type, .element_type = element }, false);
                     replacement = try value(alloc, .{ .column = column_name, .expression = expression });
                 }
                 const defaults = try list(schema, alloc, "column_defaults");

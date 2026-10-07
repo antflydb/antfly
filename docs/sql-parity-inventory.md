@@ -58,7 +58,7 @@ type OIDs, labels and NULL flags against PostgreSQL, including nonempty witnesse
 
 Catalog discovery separately exercises all 479 original `ddl`/`unsupported_ddl`
 cases, including the already-dispositioned negative contracts. The current
-compiler admits 74, principally catalog operations, transactions and policy
+compiler admits 76, principally catalog operations, transactions and policy
 commands; that is not proof of authorization, durable publication, populated
 schema rewrites or constraint activation. Enable per-case diagnostics with
 `ANTFLY_SQL_CATALOG_DISCOVERY=1` and run `zig build sql-test
@@ -76,6 +76,17 @@ Their dispositions remain unchanged: discovery and rejection evidence do not
 inflate implemented-case counts. Mounted HTTP regression tests verify the
 malformed-request and unsupported-default diagnostics with zero catalog calls,
 so neither a truncated request nor a request-bound default reaches publication.
+
+SQL CREATE/ALTER now bind scalar expression defaults and STORED generated
+columns against the complete candidate schema. Defaults cannot capture rows;
+generated expressions can reference forward base columns but not themselves or
+other generated columns. Numeric assignments retain checked builtin widths and
+write-time overflow, including atomic batch rollback. Populated ADD operations
+use the existing metadata-owned staged schema rewrite, even for nullable
+generated columns. Native LSM reopen, portable restore and cold-column rewrite
+tests cover these programs; this component evidence does not change original
+case dispositions. Exact-decimal arithmetic, volatile producers, identity
+allocation, array DDL and virtual generated columns remain guarded gaps.
 
 Typed arrays have a distinct immutable value layer (`array_value.zig`), not a
 JSON-list approximation. It preserves element widths, up to six dimensions,

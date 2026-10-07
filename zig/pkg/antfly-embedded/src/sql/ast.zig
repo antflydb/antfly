@@ -253,7 +253,8 @@ pub const Column = struct {
     /// retained here. Durable schema admission must not infer this from rows.
     element_type: ?@import("array_value.zig").ElementType = null,
     nullable: bool = true,
-    default_value: ?Value = null,
+    default_expression: ?*const Scalar = null,
+    generated_expression: ?*const Scalar = null,
 };
 pub const CreateTable = struct { table: Name, columns: []const Column, constraints: []const SchemaChange = &.{}, if_not_exists: bool = false, tablespace: ?[]const u8 = null };
 pub const DropTable = struct { table: Name, if_exists: bool = false };
@@ -290,7 +291,7 @@ pub const SchemaChange = union(enum) {
     drop_index: []const u8,
     add_column: Column,
     drop_column: []const u8,
-    set_default: struct { column: []const u8, value: Value },
+    set_default: struct { column: []const u8, expression: *const Scalar },
     drop_default: []const u8,
 };
 pub const PolicyDdl = struct {

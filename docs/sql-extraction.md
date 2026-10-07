@@ -9,6 +9,19 @@ The implementation now includes scalar and aggregate execution, joins and CTEs,
 native catalog DDL, durable READ COMMITTED sessions/savepoints, and public SQL
 interfaces. It does not yet reproduce the mega branch's complete SQL behavior.
 
+SQL expression DDL now lowers immutable scalar defaults and STORED generated
+columns into the shared durable expression VM. Binding sees the complete
+candidate schema, including forward base columns, but SQL rejects generated
+self/cross references and request-bound parameters. Checked numeric assignment
+casts retain write-time overflow and atomic batch rollback. Populated ADD uses
+the metadata-owned staged rewrite rather than publishing nullable generated
+columns without backfill; rewrite preparation projects only expression inputs.
+Failed candidate edits leave the original schema untouched. Tests cover
+allocation faults, LSM reopen and portable restore, alongside a PostgreSQL
+oracle. This is component activation, not original-case completion credit.
+Exact-decimal arithmetic, volatile defaults/sequence authority, virtual columns
+and array DDL remain explicit gaps.
+
 ### Current capability reconciliation (2026-10-06)
 
 Reviewed against main `09b78df97`, after lake integration, Loadscape fixes,

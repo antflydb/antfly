@@ -94,8 +94,8 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
         return .{ .mutation_outcome = if (publication.state == .admission_unknown) null else .committed_pending, .receipt = receipt };
     }
     if (ddl.schema_change) |change| switch (change) {
-        .add_column => |column| if (!column.nullable or column.default_value != null)
-            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_value != null) &.{column.name} else &.{}),
+        .add_column => |column| if (!column.nullable or column.default_expression != null or column.generated_expression != null)
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_expression != null) &.{column.name} else &.{}),
         .add_unique => |constraint| if (constraint.primary)
             return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}),
         else => {},
@@ -569,6 +569,15 @@ test "SQL catalog ALTER submits native schema CAS without client generations" {
     const checked = try execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = check.statement.catalog_ddl });
     try std.testing.expectEqual(catalog.MutationOutcome.committed_pending, checked.mutation_outcome);
     try std.testing.expectEqual(@as(usize, 5), source.updates);
+    for ([_][]const u8{
+        "ALTER TABLE items ADD COLUMN n integer DEFAULT (2+3)",
+        "ALTER TABLE items ADD COLUMN g bigint GENERATED ALWAYS AS (id+1) STORED",
+    }) |sql| {
+        var compiled = try @import("antfly_local_sources").sql_compiler.compile(alloc, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlSchemaRewriteRequiresMetadataOwner, execute(&server, null, .{}, "default", "public", result_arena.allocator(), .{ .catalog_ddl = compiled.statement.catalog_ddl }));
+        try std.testing.expectEqual(@as(usize, 5), source.updates);
+    }
 }
 
 test "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes" {

@@ -36,7 +36,7 @@ pub fn lower(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scal
     return (try lowerTyped(alloc, schema, expression, expected)).expression;
 }
 
-const Lowered = struct { expression: Json, type: ast.ColumnType };
+const Lowered = struct { expression: Json, type: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType };
 
 pub fn lowerTyped(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, expected: ?ast.ColumnType) !Lowered {
     const properties = try @import("schema_columns.zig").properties(schema);
@@ -59,6 +59,14 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
         // widths, however, travel with each operation rather than disappearing
         // into its coarse physical integer/number result kind.
         if (kind == .array) return error.UnsupportedSqlShape;
+        if (kind == .number and instruction.type.element_type == null) switch (instruction.operation) {
+            .binary => |part| switch (part.op) {
+                .add, .subtract, .multiply, .divide => return error.UnsupportedSqlShape,
+                else => {},
+            },
+            .unary => |part| if (part.op == .negative) return error.UnsupportedSqlShape,
+            else => {},
+        };
         out.* = switch (instruction.operation) {
             .literal => |literal| try json(alloc, .{ .op = "literal", .type = if (kind == .uuid) "string" else @tagName(kind), .value = literal }),
             .column => |ordinal| try json(alloc, .{ .op = "column", .column = columns[ordinal].name }),
@@ -151,7 +159,69 @@ pub fn lowerColumns(alloc: std.mem.Allocator, columns: []const scalar.Column, ex
             try out.object.put(alloc, "sql_type", .{ .string = @tagName(identity) });
         };
     }
-    return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch };
+    return .{ .expression = values[program.root], .type = program.output_type.kind orelse return error.SqlTypeMismatch, .element_type = program.output_type.element_type };
+}
+
+/// Persist an assignment program, not its current result. Arithmetic and casts
+/// retain write-time failures, while literal input coercion uses the same
+/// declared-type admission as existing defaults. Callers provide the complete
+/// candidate schema so forward base-column references bind deterministically.
+pub fn lowerAssignment(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar, column: ast.Column, generated: bool) !Json {
+    if (generated) try rejectGeneratedReferences(schema, column.name, expression);
+    if (expression.* == .literal) return @import("ddl_runtime.zig").defaultExpression(alloc, expression.literal, column.type, column.element_type);
+    const lowered = (if (generated)
+        lowerTyped(alloc, schema, expression, column.type)
+    else
+        lowerColumns(alloc, &.{}, expression, column.type)) catch |err| switch (err) {
+        error.UnknownColumn => return error.UndefinedColumn,
+        else => return err,
+    };
+    if (column.type == .integer or column.type == .number) {
+        if (lowered.type != .integer and lowered.type != .number) return error.SqlAssignmentTypeMismatch;
+        // Untyped SQL decimal arithmetic requires an exact decimal value
+        // domain; never persist binary-float evaluation under that contract.
+        if (lowered.type == .number and lowered.element_type == null) return error.UnsupportedSqlShape;
+        const target: @import("array_value.zig").ElementType = column.element_type orelse if (column.type == .integer) .int64 else .float64;
+        return json(alloc, .{ .op = "cast", .type = @tagName(column.type), .sql_type = @tagName(target), .args = &[_]Json{lowered.expression} });
+    }
+    if (lowered.type != column.type) return error.SqlAssignmentTypeMismatch;
+    return lowered.expression;
+}
+
+fn rejectGeneratedReferences(schema: Json, name: []const u8, expression: *const ast.Scalar) anyerror!void {
+    switch (expression.*) {
+        .column => |reference| {
+            if (std.mem.eql(u8, name, reference)) return error.SqlInvalidGenerationExpression;
+            if (schema.object.get("generated_columns")) |definitions| {
+                if (definitions != .array) return error.InvalidSqlBackendResponse;
+                for (definitions.array.items) |definition| {
+                    if (definition != .object) return error.InvalidSqlBackendResponse;
+                    const generated = definition.object.get("column") orelse return error.InvalidSqlBackendResponse;
+                    if (generated != .string) return error.InvalidSqlBackendResponse;
+                    if (std.mem.eql(u8, generated.string, reference)) return error.SqlInvalidGenerationExpression;
+                }
+            }
+        },
+        .unary => |part| try rejectGeneratedReferences(schema, name, part.operand),
+        .binary => |part| {
+            try rejectGeneratedReferences(schema, name, part.left);
+            try rejectGeneratedReferences(schema, name, part.right);
+        },
+        .cast => |part| try rejectGeneratedReferences(schema, name, part.operand),
+        .call => |part| for (part.args) |arg| try rejectGeneratedReferences(schema, name, arg),
+        .case_when => |part| {
+            for (part.branches) |branch| {
+                try rejectGeneratedReferences(schema, name, branch.condition);
+                try rejectGeneratedReferences(schema, name, branch.value);
+            }
+            if (part.otherwise) |other| try rejectGeneratedReferences(schema, name, other);
+        },
+        .in_list => |part| {
+            try rejectGeneratedReferences(schema, name, part.operand);
+            for (part.values) |item| try rejectGeneratedReferences(schema, name, item);
+        },
+        .literal => {},
+    }
 }
 
 pub fn lowerIndexPredicate(alloc: std.mem.Allocator, schema: Json, expression: *const ast.Scalar) ![]const Json {

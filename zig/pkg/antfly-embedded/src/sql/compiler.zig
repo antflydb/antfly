@@ -1755,9 +1755,12 @@ const Parser = struct {
                     if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
                     null_seen = true;
                 } else if (self.keyword(.default)) {
-                    if (default_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column default");
-                    definition.default_value = try self.schemaDefault();
+                    if (default_seen or definition.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting column default");
+                    definition.default_expression = try self.schemaDefault();
                     default_seen = true;
+                } else if (self.ddlWord("generated")) {
+                    if (default_seen or definition.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting generated column");
+                    definition.generated_expression = try self.generatedExpression();
                 } else if (self.keyword(.primary)) {
                     try self.expectKeyword(.key);
                     definition.nullable = false;
@@ -1819,11 +1822,24 @@ const Parser = struct {
                 _ = self.keyword(.column);
                 const column_name = try self.identifier();
                 var column = try self.columnDefinition(column_name);
-                if (self.keyword(.not)) {
-                    try self.expectKeyword(.null);
-                    column.nullable = false;
+                var null_seen = false;
+                while (true) {
+                    if (self.keyword(.not)) {
+                        if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
+                        try self.expectKeyword(.null);
+                        column.nullable = false;
+                        null_seen = true;
+                    } else if (self.keyword(.null)) {
+                        if (null_seen) return self.fail(error.InvalidSqlSyntax, "duplicate column nullability");
+                        null_seen = true;
+                    } else if (self.keyword(.default)) {
+                        if (column.default_expression != null or column.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting column default");
+                        column.default_expression = try self.schemaDefault();
+                    } else if (self.ddlWord("generated")) {
+                        if (column.default_expression != null or column.generated_expression != null) return self.fail(error.InvalidSqlSyntax, "duplicate or conflicting generated column");
+                        column.generated_expression = try self.generatedExpression();
+                    } else break;
                 }
-                if (self.keyword(.default)) column.default_value = try self.schemaDefault();
                 ddl.action = .alter_schema;
                 ddl.schema_change = .{ .add_column = column };
             } else if (kind == .table and self.keyword(.drop)) {
@@ -1841,7 +1857,7 @@ const Parser = struct {
                 ddl.action = .alter_schema;
                 if (self.keyword(.set)) {
                     try self.expectKeyword(.default);
-                    ddl.schema_change = .{ .set_default = .{ .column = column_name, .value = try self.schemaDefault() } };
+                    ddl.schema_change = .{ .set_default = .{ .column = column_name, .expression = try self.schemaDefault() } };
                 } else {
                     try self.expectKeyword(.drop);
                     try self.expectKeyword(.default);
@@ -1959,7 +1975,7 @@ const Parser = struct {
         return .{ .kind = .table, .action = .alter_schema, .name = table_name, .conditional = conditional, .schema_change = .{ .create_index = .{ .name = index_name, .keys = try keys.toOwnedSlice(self.alloc), .include_columns = try included.toOwnedSlice(self.alloc), .unique = unique, .predicate = partial_predicate } } };
     }
 
-    fn schemaDefault(self: *Parser) Error!ast.Value {
+    fn schemaDefault(self: *Parser) Error!*const ast.Scalar {
         // Persistent defaults cannot capture a request's parameter values or
         // run a subquery. Keep CREATE and both ALTER paths consistent before
         // any catalog admission or physical schema publication.
@@ -1967,9 +1983,54 @@ const Parser = struct {
         while (probe < self.tokens.len and self.tokens[probe].kind == .lparen) probe += 1;
         if (probe > self.pos and probe < self.tokens.len and (self.tokens[probe].isKeyword(.select) or self.tokens[probe].isKeyword(.with)))
             return self.fail(error.UnsupportedSqlShape, "subqueries are not allowed in schema defaults");
-        const result = try self.value();
-        if (result == .parameter) return self.fail(error.UnsupportedSqlShape, "schema defaults cannot contain execution parameters");
+        const result = try self.scalar(0, 0);
+        try self.checkScalarDepth(result, 0);
+        try self.persistentExpression(result, false);
         return result;
+    }
+
+    fn generatedExpression(self: *Parser) Error!*const ast.Scalar {
+        if (!self.ddlWord("always")) return self.fail(error.UnsupportedSqlShape, "only GENERATED ALWAYS AS stored expressions are supported");
+        try self.expectKeyword(.as);
+        if (self.ddlWord("identity")) return self.fail(error.UnsupportedSqlShape, "identity columns require a durable sequence allocator");
+        try self.expect(.lparen);
+        const result = try self.scalar(0, 0);
+        try self.expect(.rparen);
+        if (!self.ddlWord("stored")) return self.fail(error.UnsupportedSqlShape, "virtual generated columns require read-time expression evaluation");
+        try self.checkScalarDepth(result, 0);
+        try self.persistentExpression(result, true);
+        return result;
+    }
+
+    // The bounded owned tree, not a token prefix, determines whether durable
+    // state could capture request parameters, subqueries or row references.
+    fn persistentExpression(self: *Parser, expression: *const ast.Scalar, generated: bool) Error!void {
+        switch (expression.*) {
+            .literal => |value_| if (value_ == .parameter) return self.fail(error.UnsupportedSqlShape, if (generated) "schema expressions cannot contain execution parameters" else "schema defaults cannot contain execution parameters"),
+            .column => if (!generated) return self.fail(error.UnsupportedSqlShape, "column references are not allowed in schema defaults"),
+            .unary => |part| try self.persistentExpression(part.operand, generated),
+            .binary => |part| {
+                try self.persistentExpression(part.left, generated);
+                try self.persistentExpression(part.right, generated);
+            },
+            .cast => |part| try self.persistentExpression(part.operand, generated),
+            .call => |part| {
+                if (part.subquery != null or part.star or part.distinct or part.filter != null or part.window != null or part.within_group != null)
+                    return self.fail(error.UnsupportedSqlShape, "subqueries, aggregates and windows are not allowed in schema expressions");
+                for (part.args) |arg| try self.persistentExpression(arg, generated);
+            },
+            .case_when => |part| {
+                for (part.branches) |branch| {
+                    try self.persistentExpression(branch.condition, generated);
+                    try self.persistentExpression(branch.value, generated);
+                }
+                if (part.otherwise) |other| try self.persistentExpression(other, generated);
+            },
+            .in_list => |part| {
+                try self.persistentExpression(part.operand, generated);
+                for (part.values) |value_| try self.persistentExpression(value_, generated);
+            },
+        }
     }
 
     fn ddlWord(self: *Parser, word: []const u8) bool {
@@ -2566,11 +2627,56 @@ test "compiler DDL literal defaults and count" {
     defer ddl.deinit();
     try std.testing.expect(ddl.statement.create_table.if_not_exists);
     try std.testing.expect(!ddl.statement.create_table.columns[0].nullable);
-    try std.testing.expectEqual(@as(i64, 0), ddl.statement.create_table.columns[1].default_value.?.integer);
+    try std.testing.expectEqual(@as(i64, 0), ddl.statement.create_table.columns[1].default_expression.?.literal.integer);
     var count = try compile(std.testing.allocator, "SELECT count(*) AS total FROM t", .{});
     defer count.deinit();
     try std.testing.expect(count.statement.select.count_all);
     try std.testing.expectEqualStrings("total", count.statement.select.count_alias.?);
+}
+
+test "compiler durable defaults and stored generated columns own complete scalar trees" {
+    const alloc = std.testing.allocator;
+    var created = try compile(alloc, "CREATE TABLE exprs (g integer GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 0 ELSE n+1 END) STORED NOT NULL, n smallint DEFAULT (2+3) NOT NULL, label text DEFAULT lower('READY'))", .{});
+    defer created.deinit();
+    const columns = created.statement.create_table.columns;
+    try std.testing.expect(columns[0].generated_expression.?.* == .case_when);
+    try std.testing.expect(!columns[0].nullable);
+    try std.testing.expect(columns[1].default_expression.?.* == .binary);
+    try std.testing.expect(columns[2].default_expression.?.* == .call);
+    var added = try compile(alloc, "ALTER TABLE exprs ADD COLUMN g2 bigint GENERATED ALWAYS AS (n*2) STORED NOT NULL", .{});
+    defer added.deinit();
+    try std.testing.expect(added.statement.catalog_ddl.schema_change.?.add_column.generated_expression.?.* == .binary);
+    var changed = try compile(alloc, "ALTER TABLE exprs ALTER COLUMN n SET DEFAULT CASE WHEN true THEN 7 ELSE 9 END", .{});
+    defer changed.deinit();
+    try std.testing.expect(changed.statement.catalog_ddl.schema_change.?.set_default.expression.* == .case_when);
+}
+
+test "compiler persistent expression guards inspect nested parameters subqueries and references" {
+    for ([_][]const u8{
+        "CREATE TABLE t (n integer DEFAULT coalesce(1,$1))",
+        "ALTER TABLE t ADD COLUMN n integer DEFAULT (1+$1)",
+        "ALTER TABLE t ALTER COLUMN n SET DEFAULT CASE WHEN true THEN 1 ELSE $1 END",
+        "CREATE TABLE t (n integer DEFAULT coalesce(1,(SELECT 2)))",
+        "ALTER TABLE t ADD COLUMN n integer DEFAULT n+1",
+        "CREATE TABLE t (n integer, g integer GENERATED ALWAYS AS (n+$1) STORED)",
+        "CREATE TABLE t (n integer, g integer GENERATED ALWAYS AS ((SELECT 1)) STORED)",
+        "CREATE TABLE t (n integer GENERATED ALWAYS AS (1) VIRTUAL)",
+    }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, sql, .{}));
+    for ([_][]const u8{
+        "CREATE TABLE t (n integer DEFAULT 1 GENERATED ALWAYS AS (2) STORED)",
+        "ALTER TABLE t ADD COLUMN n integer GENERATED ALWAYS AS (1) STORED DEFAULT 2",
+        "ALTER TABLE t ADD COLUMN n integer DEFAULT 1 DEFAULT 2",
+    }) |sql| try std.testing.expectError(error.InvalidSqlSyntax, compile(std.testing.allocator, sql, .{}));
+}
+
+test "compiler durable expression trees unwind every allocation fault" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var compiled = try compile(a, "CREATE TABLE exprs (g integer GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 0 ELSE n+1 END) STORED, n smallint DEFAULT (2+3), label text DEFAULT lower('READY'))", .{});
+            defer compiled.deinit();
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "compiler array DDL retains PostgreSQL builtin element identity without dimension constraints" {

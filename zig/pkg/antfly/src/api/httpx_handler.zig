@@ -13561,6 +13561,72 @@ test "httpx SQL numeric expression schemas preserve deferred defaults atomic wri
     }
 }
 
+test "httpx SQL expression DDL defaults generated mutations and restore" {
+    const alloc = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var compiled = try sources.sql_compiler.compile(a, "CREATE TABLE exprs (g integer GENERATED ALWAYS AS (CASE WHEN n IS NULL THEN 0 ELSE CAST(n AS integer)+1 END) STORED, n smallint DEFAULT (2+3), overflow smallint DEFAULT (32767+1), label text DEFAULT lower('READY'), slug text GENERATED ALWAYS AS (lower(label)||'-ok') STORED, h smallint GENERATED ALWAYS AS (n+1) STORED)", .{});
+    defer compiled.deinit();
+    const schema = try sources.sql_ddl_runtime.createSchemaAlloc(a, compiled.statement.create_table);
+    var directory = try sources.common_test_directory.TestDirectory.init("sql-expression-ddl");
+    defer directory.cleanup();
+    var target = try sources.common_test_directory.TestDirectory.init("sql-expression-ddl-restore");
+    defer target.cleanup();
+    var archive: std.ArrayListUnmanaged(u8) = .empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema);
+        try db.batch(.{ .writes = &.{ .{ .key = "original", .value = "{\"overflow\":1}" }, .{ .key = "null", .value = "{\"n\":null,\"overflow\":1}" } } });
+        var candidate = try std.json.parseFromSliceLeaky(std.json.Value, a, schema, .{});
+        var altered = try sources.sql_compiler.compile(a, "ALTER TABLE exprs ALTER COLUMN n SET DEFAULT CASE WHEN true THEN 8 ELSE 9 END", .{});
+        defer altered.deinit();
+        try std.testing.expect(try sources.sql_schema_ddl.apply(a, &candidate, altered.statement.catalog_ddl));
+        // Publication creates a new immutable schema epoch, just as catalog CAS does.
+        try candidate.object.put(a, "version", .{ .integer = 2 });
+        try db.setSchemaJson(alloc, try std.json.Stringify.valueAlloc(a, candidate, .{}));
+        try db.batch(.{ .writes = &.{.{ .key = "changed", .value = "{\"overflow\":1}" }} });
+        for ([_][]const u8{ "{}", "{\"n\":32767,\"overflow\":1}" }) |bad| {
+            try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{ .{ .key = "not-committed", .value = "{\"n\":2,\"overflow\":1}" }, .{ .key = "bad", .value = bad } } }));
+            try std.testing.expect((try db.get(alloc, "not-committed")) == null);
+        }
+        try sources.storage_portable_backup.exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer restored.close();
+    for ([_]*db_mod.DB{ &reopened, &restored }, 0..) |db, i| {
+        if (i == 1) try db.importPortableIntoEmpty(alloc, archive.items, sources.storage_db_doc_identity.default_namespace);
+        try std.testing.expect(db.core.schema.?.requires_typed_expressions);
+        for ([_][]const u8{ "original", "changed", "null" }, [_]?i64{ 5, 8, null }) |key, expected| {
+            const bytes = (try db.get(alloc, key)).?;
+            defer alloc.free(bytes);
+            const row = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+            try std.testing.expectEqualStrings("ready", row.object.get("label").?.string);
+            try std.testing.expectEqualStrings("ready-ok", row.object.get("slug").?.string);
+            try std.testing.expectEqual(if (expected) |n| n + 1 else @as(i64, 0), row.object.get("g").?.integer);
+            if (expected) |n| {
+                try std.testing.expectEqual(n, row.object.get("n").?.integer);
+                try std.testing.expectEqual(n + 1, row.object.get("h").?.integer);
+            } else {
+                try std.testing.expect(row.object.get("n").? == .null);
+                try std.testing.expect(row.object.get("h").? == .null);
+            }
+        }
+        try db.batch(.{ .writes = &.{.{ .key = "after-recovery", .value = "{\"overflow\":1}" }} });
+        const bytes = (try db.get(alloc, "after-recovery")).?;
+        defer alloc.free(bytes);
+        const row = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+        try std.testing.expectEqual(@as(i64, 8), row.object.get("n").?.integer);
+        try std.testing.expectEqual(@as(i64, 9), row.object.get("g").?.integer);
+        try std.testing.expectError(error.RelationalExpressionOverflow, db.batch(.{ .writes = &.{.{ .key = "bad-default", .value = "{}" }} }));
+    }
+}
+
 test "httpx SQL PostgreSQL mutations capture native source relations and complete storage" {
     // Exact-source non-key mutations. Logical PK/index-owner activation is
     // deliberately not claimed by this fixture: sql-0012, sql-0013,
