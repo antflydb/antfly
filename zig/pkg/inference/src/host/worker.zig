@@ -95,7 +95,7 @@ const ForwardControl = struct {
     }
 
     fn view(self: *@This()) rpc.Control {
-        return .{ .ptr = self, .check = check, .event = event, .phase = if (self.phase_handoff) phase else null };
+        return .{ .ptr = self, .check = check, .event = event, .phase = if (self.phase_handoff) phase else null, .fence_on_error = self.phase_handoff };
     }
 };
 
