@@ -61,6 +61,123 @@ class ReferenceExtensionTest(unittest.TestCase):
                 server.assert_not_called()
 
 
+class CatalogReferenceTest(unittest.TestCase):
+    def test_original_catalog_commands_and_native_diagnostic_contracts(self):
+        import json
+        import psycopg
+
+        campaign = json.loads((FIXTURES / "sql_catalog_campaign.json").read_text())
+        original = {
+            case["id"]: case
+            for case in json.loads(
+                (FIXTURES / "sql_parity_inventory.json").read_text()
+            )["entries"]
+        }
+        ids = [
+            "sql-0095",
+            "sql-0101",
+            "sql-0102",
+            "sql-0103",
+            "sql-0104",
+            "sql-0106",
+            "sql-0108",
+            "sql-0157",
+            "sql-0159",
+            "sql-0676",
+        ]
+        self.assertEqual(ids, [case["id"] for case in campaign["entries"]])
+
+        def reset(db):
+            # This connection is owned by postgres(), never a user database.
+            db.execute("DROP TABLE IF EXISTS usage_records, usage_stage CASCADE")
+            db.execute("DROP SCHEMA IF EXISTS tenant_ops CASCADE")
+            db.execute("DROP SCHEMA IF EXISTS tenant_ops_archive CASCADE")
+            db.execute("DROP DATABASE IF EXISTS tenant_ops")
+
+        def identity(db, kind, name):
+            if kind == "namespace":
+                row = db.execute(
+                    "SELECT oid FROM pg_namespace WHERE nspname=%s", (name,)
+                ).fetchone()
+            elif kind == "database":
+                row = db.execute(
+                    "SELECT oid FROM pg_database WHERE datname=%s", (name,)
+                ).fetchone()
+            elif kind == "table":
+                row = db.execute(
+                    "SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=%s",
+                    (name,),
+                ).fetchone()
+            else:
+                self.fail("unexpected catalog campaign kind")
+            return row[0] if row else None
+
+        with postgres() as db:
+            for case in campaign["entries"]:
+                with self.subTest(case=case["id"]):
+                    reset(db)
+                    for sql in case["setup"]:
+                        db.execute(sql)
+                    source = original[case["id"]]
+                    self.assertEqual([], source["params"])
+                    prior = identity(
+                        db, case["kind"], case.get("prior_name", case["name"])
+                    )
+                    cursor = db.execute(source["sql"])
+                    self.assertEqual(case["command_tag"], cursor.statusmessage)
+                    observed = identity(db, case["kind"], case["name"])
+                    self.assertEqual(case["present"], observed is not None)
+                    if case.get("unchanged") or case.get("prior_name"):
+                        self.assertEqual(prior, observed)
+                    if case.get("prior_name"):
+                        self.assertIsNone(
+                            identity(db, case["kind"], case["prior_name"])
+                        )
+                    if case.get("repeat_noop"):
+                        self.assertEqual(
+                            case["command_tag"], db.execute(source["sql"]).statusmessage
+                        )
+                        self.assertIsNone(identity(db, case["kind"], case["name"]))
+                    if case["kind"] == "table" and case["present"]:
+                        self.assertEqual(
+                            [
+                                ("tenant_id", "text", "NO"),
+                                ("id", "uuid", "NO"),
+                                ("status", "text", "YES"),
+                            ],
+                            db.execute(
+                                "SELECT column_name,data_type,is_nullable FROM information_schema.columns WHERE table_schema='public' AND table_name='usage_stage' ORDER BY ordinal_position"
+                            ).fetchall(),
+                        )
+            for setup, sql, code in (
+                (["CREATE SCHEMA tenant_ops"], "CREATE SCHEMA tenant_ops", "42P06"),
+                (["CREATE DATABASE tenant_ops"], "CREATE DATABASE tenant_ops", "42P04"),
+                (
+                    ["CREATE TABLE usage_records(id uuid)"],
+                    "CREATE TABLE usage_records(id uuid)",
+                    "42P07",
+                ),
+                ([], "DROP SCHEMA tenant_ops", "3F000"),
+                ([], "DROP DATABASE tenant_ops", "3D000"),
+                ([], "DROP TABLE usage_records", "42P01"),
+                (
+                    [
+                        "CREATE SCHEMA tenant_ops",
+                        "CREATE TABLE tenant_ops.child(id uuid)",
+                    ],
+                    "DROP SCHEMA tenant_ops",
+                    "2BP01",
+                ),
+            ):
+                with self.subTest(sql=sql):
+                    reset(db)
+                    for statement in setup:
+                        db.execute(statement)
+                    with self.assertRaises(psycopg.Error) as caught:
+                        db.execute(sql)
+                    self.assertEqual(code, caught.exception.sqlstate)
+
+
 class PostgresReferenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

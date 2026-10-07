@@ -64,6 +64,20 @@ schema rewrites or constraint activation. Enable per-case diagnostics with
 `ANTFLY_SQL_CATALOG_DISCOVERY=1` and run `zig build sql-test
 -Dtest-filter='SQL catalog campaign discovery'` from `zig/`.
 
+The separate strict catalog campaign keeps ten original commands unchanged and
+routes them through mounted SQL HTTP, production catalog admission and committed
+metadata Raft apply. It checks command tags, conditional no-op publication,
+resource identity, physical table/range topology, native relational schema,
+metadata reopen and snapshot installation. A disposable PostgreSQL server
+independently checks the same commands and seven duplicate/missing/nonempty
+object diagnostics. The SQL adapter translates resource-neutral catalog errors
+to target-specific SQLSTATEs only after handling atomic conditional outcomes;
+this adds neither existence preflights nor mutation retries. Lost replies after
+commit must remain non-retryable `40003`, with the committed object recoverable.
+This is single-owner durability evidence, not a distributed quorum or readiness
+fault campaign. It does not activate populated database retirement, CASCADE,
+routine/sequence/view catalogs, identity allocation or broader schema rewrites.
+
 The catalog boundary now tests 6,585 original-source request truncations, with
 bounded diagnostic positions and no missing-token dereferences. Targeted
 allocation-fault tests cover incomplete CREATE definitions. CREATE defaults,

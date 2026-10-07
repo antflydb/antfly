@@ -2,6 +2,11 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-native-catalog-campaign": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL catalog"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-original-typed-array-reads": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL original stored array reads preserve typed column semantics"],
       "cwd": "zig",
@@ -931,8 +936,12 @@
     },
     {
       "id": "sql-0095",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0096",
@@ -961,23 +970,39 @@
     },
     {
       "id": "sql-0101",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0102",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0103",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0104",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0105",
@@ -986,8 +1011,12 @@
     },
     {
       "id": "sql-0106",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0107",
@@ -997,7 +1026,11 @@
     {
       "id": "sql-0108",
       "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "reason": "The unchanged empty-database command passes PostgreSQL and strict native publication/reopen/snapshot gates. Populated database retirement is still guarded by DatabaseNotEmpty and does not yet satisfy PostgreSQL DROP DATABASE semantics; no completion credit is claimed.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0109",
@@ -1241,8 +1274,12 @@
     },
     {
       "id": "sql-0157",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0158",
@@ -1251,8 +1288,12 @@
     },
     {
       "id": "sql-0159",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0160",
@@ -6555,8 +6596,12 @@
     },
     {
       "id": "sql-0676",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original command executes through mounted SQL HTTP, production metadata admission and committed native Raft apply. PostgreSQL verifies the command tag and logical catalog outcome. Native tests verify stable rename identity, conditional no-op publication, table/range topology and relational schema as applicable, metadata reopen and snapshot installation. The created relational table additionally provisions a real data owner and retains UUID normalization and NOT NULL enforcement across reopen.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-native-catalog-campaign"},
+        {"path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig", "test": "httpx SQL catalog originals commit through native authority and recover topology", "gate": "sql-postgres-oracle-contracts"}
+      ]
     },
     {
       "id": "sql-0677",

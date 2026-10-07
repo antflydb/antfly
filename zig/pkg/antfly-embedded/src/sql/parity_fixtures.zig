@@ -14,6 +14,7 @@
 // limitations under the License.
 
 pub const inventory = @embedFile("fixtures/sql_parity_inventory.json");
+pub const catalog_campaign = @embedFile("fixtures/sql_catalog_campaign.json");
 pub const dispositions = @embedFile("fixtures/sql_parity_dispositions.json");
 pub const read_rows = @embedFile("fixtures/sql_read_reference_rows.json");
 pub const read_reference = @embedFile("fixtures/sql_read_reference.json");

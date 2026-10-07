@@ -423,6 +423,21 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
             .policy_ddl => unreachable,
         }
         if (err == error.MetadataMutationOutcomeUnknown) return error.SqlMutationOutcomeUnknown;
+        // Native catalog errors are intentionally resource-neutral. SQL's
+        // diagnostic identity depends on the admitted target kind; translate
+        // only after atomic conditional outcomes and uncertain commits.
+        if (err == error.CatalogAlreadyExists) return switch (kind) {
+            .database => error.SqlDuplicateDatabase,
+            .namespace => error.SqlDuplicateNamespace,
+            .tablespace => error.SqlDuplicateTablespace,
+            .table => err,
+        };
+        if (err == error.CatalogNotFound) return switch (kind) {
+            .database => error.DatabaseNotFound,
+            .namespace => error.NamespaceNotFound,
+            .tablespace => error.TablespaceNotFound,
+            .table => err,
+        };
         return err;
     };
     defer alloc.free(response);
