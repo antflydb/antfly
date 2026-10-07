@@ -1,9 +1,10 @@
 # Runnable workload scheduling
 
-Status: scheduler core and opt-in HTTP/pgwire SQL read integration pass native
-protocol qualification; full Linux API and runtime metrics endpoint checks remain
-pending. Private spill read/write suspension is implemented and under API verification;
-other backend waits, parallel child ownership,
+Status: scheduler core, opt-in HTTP/pgwire SQL read integration, and private
+spill read/write suspension pass native and Nix/glibc Linux API qualification.
+Shared managed-policy/catalog resume fences pass focused checks on both platforms
+and the expanded native API suite; their expanded Linux API run is pending.
+Runtime metrics endpoint checks, other backend waits, parallel child ownership,
 remote-attempt accounting, qualification and default selection remain required.
 The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
@@ -97,7 +98,36 @@ stable buffers and their quota owners across the wait. Reacquisition runs on I/O
 failure as well as success; backend checkpoints run before successful data is
 decoded. Ten stalled read/write schedules pass on both platforms, including
 cancellation, expiry, shutdown and I/O errors. Storage/RPC and directory waits
-remain outstanding, as do fresh policy/catalog fences and parallel child owners.
+remain outstanding, as do parallel child owners.
+
+## Read authority after resumption
+
+Scheduled HTTP SELECT/EXPLAIN and retained PG SELECT operations capture a bounded
+read guard before their first source read. Each successful runnable grant advances
+an execution generation; yields and resource/output resumes invalidate the prior
+check. Results also force validation before handoff, including when no yield
+occurred. The guard owns at most 64 immutable logical/physical bindings, schema
+versions, catalog revisions, effective user filters and native RLS serving
+generations. A failed check cannot mark a generation valid.
+
+Validation resolves the pinned catalog generation and serving policy, then reads
+current managed user/API-key policy under one mutation lock. Current permission
+must intersect admitted permission; an opened query cannot acquire a different
+filter or interpretation of native protected roles/metadata. Account replacement
+and API-key expiry/deletion stop the read. Pending policy installation can retain
+prior serving authority; serving transitions or changed generations stop it.
+Logical-to-physical projection retains explicit null filter overrides. This is
+read-only integration; mutation execution and accepted durable completion keep
+their existing ownership paths.
+
+The [read-resume receipt](qualification/workload-pooling/receipts/2026-10-07/read-resume-fences/README.md)
+records 22 coordinator schedules, three embedded ownership/fault fixtures, and
+full native API qualification. Fresh externally issued credential leases remain
+required. Validation itself can perform catalog I/O, so future storage/RPC wait
+hooks must reacquire capacity before decoding and avoid recursively validating a
+guard already in validation. A permit may not remain borrowed across the wait,
+and a successful wait may not publish an owned result after failed reacquisition.
+General backend calls must retain CPU ownership for their non-waiting work.
 
 ## Integration order and completion requirements
 

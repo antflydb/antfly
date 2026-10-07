@@ -843,3 +843,19 @@ and exhaustive allocation-failure cleanup. The [policy-snapshot receipt](qualifi
 records the source and test evidence. Full HTTP/PG resume integration, fresh
 catalog fencing, broader backend waits, independent parallel-child ownership,
 all-workload scheduling, and automatic defaults remain required.
+
+
+Shared read authority now covers scheduled HTTP SELECT/EXPLAIN and retained PG
+SELECT initial reads, cooperative resumes, private spill resumes and result
+handoff. Immutable bounded pins retain table/schema/catalog and native RLS serving
+generations; current managed credentials are checked against admitted scope.
+API-key ingress preserves persistent account identity, and physical projection
+preserves explicit null user-filter overrides. Three embedded guard fixtures and
+22 coordinator schedules pass on macOS and pinned Nix/glibc GNU AArch64 alongside
+UserManager/adapter/archive tests. The full expanded native API target passes all
+75 selected tests and 50 build steps without skips or leaks. Full expanded Linux
+API qualification is running separately. The [read-resume receipt](qualification/workload-pooling/receipts/2026-10-07/read-resume-fences/README.md)
+records exact source hashes and platform evidence. General storage/RPC/directory
+waits, external credential refresh, parallel children, preparation/serialization,
+all-workload scheduling, remote attempt completion and automatic defaults remain
+required for the full design.
