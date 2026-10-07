@@ -40,6 +40,135 @@ class PostgresReferenceTest(unittest.TestCase):
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
 
+    def test_array_common_types_precede_set_identity(self):
+        cases = (
+            (
+                "SELECT count(*) FROM (SELECT ARRAY[1,NULL]::int2[] a UNION SELECT ARRAY[1,NULL]::int8[]) q",
+                [(1,)],
+            ),
+            (
+                "SELECT count(*) FROM (SELECT ARRAY[1]::int4[] a INTERSECT SELECT ARRAY[1]::float8[]) q",
+                [(1,)],
+            ),
+            (
+                "SELECT count(*) FROM (SELECT ARRAY[1]::int4[] a EXCEPT SELECT ARRAY[1]::float8[]) q",
+                [(0,)],
+            ),
+            (
+                "SELECT cardinality(a),2.5=ANY(a) FROM (VALUES(ARRAY[1]::int2[]),(ARRAY[2.5]::float4[])) q(a) ORDER BY 1,2",
+                [(1, False), (1, True)],
+            ),
+            (
+                "SELECT count(*) FROM ((SELECT ARRAY[16777216]::int8[] a UNION SELECT ARRAY[16777217]::int8[]) UNION ALL SELECT ARRAY[1]::float4[]) q",
+                [(3,)],
+            ),
+            (
+                "SELECT count(*) FROM (SELECT ARRAY[16777216]::int8[] a UNION SELECT ARRAY[16777217]::float4[]) q",
+                [(1,)],
+            ),
+            (
+                "SELECT cardinality(a),1=ANY(a) FROM (SELECT '{1,NULL}' a UNION SELECT ARRAY[1,NULL]::int4[]) q",
+                [(2, True)],
+            ),
+            (
+                "SELECT count(*) FROM (SELECT NULL::int2[] a UNION SELECT NULL::float8[]) q",
+                [(1,)],
+            ),
+            (
+                "SELECT x FROM (VALUES(NULL),(NULL),(1)) q(x) ORDER BY x",
+                [(1,), (None,), (None,)],
+            ),
+        )
+        for sql, expected in cases:
+            with self.subTest(sql=sql):
+                self.assertEqual(expected, self.db.execute(sql).fetchall())
+
+    def test_pairwise_set_parameter_domains(self):
+        cases = (
+            ("SELECT $1 AS x UNION SELECT 1 UNION SELECT 1.5", "{integer}"),
+            ("SELECT 1.5 AS x UNION SELECT 1 UNION SELECT $1", "{numeric}"),
+            ("SELECT 1 AS x UNION SELECT NULL UNION SELECT $1", "{integer}"),
+            ("SELECT d.x FROM (SELECT $1::bigint AS x) d UNION SELECT 1", "{bigint}"),
+        )
+        for sql, expected in cases:
+            with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                self.db.execute("PREPARE common_type_probe AS " + sql)
+                actual = self.db.execute(
+                    "SELECT parameter_types::text FROM pg_prepared_statements "
+                    "WHERE name='common_type_probe'"
+                ).fetchone()[0]
+                self.assertEqual(expected, actual)
+                self.db.execute("DEALLOCATE common_type_probe")
+
+    def test_set_unknown_and_derived_boundaries_reject_invalid_promotion(self):
+        import psycopg
+
+        cases = (
+            "SELECT NULL UNION SELECT NULL UNION SELECT 1",
+            "SELECT '1'::text UNION SELECT 1",
+            "SELECT ARRAY[1]::int4[] UNION SELECT ARRAY[TRUE]::boolean[]",
+            "SELECT ARRAY[1]::int4[] UNION SELECT ARRAY['1']::text[]",
+            "SELECT ARRAY[1]::int4[] UNION SELECT 1",
+            "SELECT x FROM (SELECT NULL x) q UNION SELECT 1",
+            "SELECT d.x FROM (SELECT $1 AS x) d UNION SELECT 1",
+            "WITH a AS (SELECT $1 AS x) SELECT d.x FROM (SELECT x FROM a) d UNION SELECT 1",
+            "SELECT NULL AS x UNION SELECT NULL UNION SELECT $1 UNION SELECT 1",
+            "SELECT $1 AS x UNION SELECT NULL UNION SELECT 1",
+            "SELECT COALESCE($1,NULL) AS x UNION SELECT 1",
+            "WITH n AS (SELECT NULL AS x) SELECT COALESCE(n.x,$1) AS x FROM n UNION SELECT 1",
+        )
+        for sql in cases:
+            with self.subTest(sql=sql), self.assertRaises(psycopg.Error) as error:
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute("PREPARE invalid_type_probe AS " + sql)
+            self.assertEqual(
+                "42846" if "UNION SELECT ARRAY[" in sql else "42804",
+                error.exception.sqlstate,
+            )
+
+    def test_assignment_and_recursive_unknown_boundaries(self):
+        import psycopg
+
+        cases = (
+            (
+                "INSERT INTO assignment_type_probe (_id,n,j) SELECT 'a',COALESCE($1,NULL),'null'::jsonb",
+                "42804",
+            ),
+            (
+                "INSERT INTO assignment_type_probe (_id,n,j) SELECT 'a',$1,'null'::jsonb UNION ALL SELECT 'b',$1,'null'::jsonb",
+                "42804",
+            ),
+            (
+                "INSERT INTO assignment_type_probe (_id,n,j) SELECT 'a',9007199254740993,NULL UNION ALL SELECT 'b',9007199254740993,NULL",
+                "42804",
+            ),
+            (
+                "INSERT INTO assignment_type_probe (_id,n,j) WITH q AS(SELECT 'a' k,9007199254740993 n,NULL j) SELECT k,n,j FROM q",
+                "42804",
+            ),
+            (
+                "INSERT INTO assignment_type_probe (_id,n) VALUES('a',(SELECT $1)),('b',8)",
+                "42804",
+            ),
+            (
+                "WITH RECURSIVE r(n) AS (SELECT $1 UNION ALL SELECT n+1 FROM r WHERE n<$2) SELECT n FROM r",
+                "42883",
+            ),
+            (
+                "SELECT (SELECT $1 FROM (SELECT 1 AS y) i WHERE i.y=o.x)+1 FROM (SELECT $2 AS x) o WHERE o.x=1",
+                "42883",
+            ),
+        )
+        with self.db.transaction(force_rollback=True):
+            self.db.execute(
+                "CREATE TEMP TABLE assignment_type_probe (_id text,n bigint,j jsonb)"
+            )
+            for sql, state in cases:
+                with self.subTest(sql=sql), self.assertRaises(psycopg.Error) as error:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute("PREPARE assignment_type_statement AS " + sql)
+                self.assertEqual(state, error.exception.sqlstate)
+
     def test_ordered_set_streaming_reducer_rank_and_tie_contracts(self):
         for direction in ("ASC", "DESC"):
             with self.subTest(direction=direction):

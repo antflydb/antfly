@@ -136,7 +136,7 @@ test "SQL recursive worklists preserve delta UNION ALL and distinct cycle semant
 
 test "SQL recursive typing infers parameters and distinguishes JSON null in visited sets" {
     var fixture: Fixture = .{};
-    var compiled = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT $1 UNION ALL SELECT n+1 FROM r WHERE n<$2) SELECT n FROM r", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "WITH RECURSIVE r(n) AS (SELECT $1::bigint UNION ALL SELECT n+1 FROM r WHERE n<$2) SELECT n FROM r", .{});
     defer compiled.deinit();
     var result = try runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{ .{ .integer = 1 }, .{ .integer = 3 } }, .{});
     defer result.deinit();

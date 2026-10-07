@@ -1724,7 +1724,7 @@ test "SQL INSERT VALUES scalar subqueries prepare a bounded source before writin
         }
     };
     for ([_]struct { sql: []const u8, params: []const Json }{
-        .{ .sql = "INSERT INTO things (_id,n) VALUES ('a',(SELECT $1)),('b',(SELECT 8))", .params = &.{.{ .integer = 7 }} },
+        .{ .sql = "INSERT INTO things (_id,n) VALUES ('a',(SELECT $1::bigint)),('b',(SELECT 8))", .params = &.{.{ .integer = 7 }} },
         .{ .sql = "INSERT INTO things (_id,n) VALUES ('a',(SELECT 7)),('b','8')", .params = &.{} },
         .{ .sql = "INSERT INTO things (_id,n,created_at,payload) VALUES ('a',(SELECT 7),'2026-01-01T00:00:00Z','hello'),('b','8','2026-01-02T00:00:00Z','world')", .params = &.{} },
     }) |case| {

@@ -641,7 +641,7 @@ const Context = struct {
         }
         if (statement.count_all) {
             const columns = try self.allocator.alloc(Column, 1);
-            columns[0] = .{ .name = try self.allocator.dupe(u8, statement.count_alias orelse "count"), .type = .integer };
+            columns[0] = .{ .name = try self.allocator.dupe(u8, statement.count_alias orelse "count"), .type = .integer, .element_type = .int64 };
             return columns;
         }
         if (statement.columns.len == 0) {
@@ -825,6 +825,11 @@ pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, k
     if (kind == .array and (!raw.sql_null or element_type == null)) return error.SqlTypeMismatch;
     var result = raw;
     result.value = try coerceAlloc(alloc, raw.value, kind);
+    if (!result.sql_null) if (element_type) |element| {
+        const casts = @import("builtin_cast.zig");
+        if (kind == .integer and casts.integral(element)) result.value = .{ .integer = try casts.checkedInteger(result.value.integer, element) };
+        if (kind == .number and element == .float32) result.value = .{ .float = try casts.floatValue(f32, result.value) };
+    };
     return result;
 }
 
@@ -968,17 +973,17 @@ test "SQL describe rejects conflicting parameter contexts and incompatible expli
 
 test "SQL whole shape infers nested derived CTE set and assignment parameters before emission" {
     const cases = [_][]const u8{
-        "SELECT d.x FROM (SELECT $1 AS x) d UNION SELECT 1",
-        "SELECT d.x FROM (SELECT e.x FROM (SELECT $1 AS x) e) d UNION SELECT 1",
-        "WITH a AS (SELECT $1 AS x), b AS (SELECT x FROM a) SELECT x FROM b UNION SELECT 1",
-        "WITH a(x) AS (SELECT $1) SELECT l.x FROM a l JOIN a r ON l.x=r.x UNION SELECT 1",
-        "SELECT d.x FROM (SELECT $1 AS x) d WHERE d.x=1",
-        "SELECT d.x FROM (SELECT $1 AS x) d ORDER BY d.x+1",
-        "SELECT d.x FROM (SELECT $1 AS x) d LIMIT $1",
-        "SELECT d.x FROM (SELECT $1 AS x) d JOIN things t ON d.x=t.age",
-        "SELECT d.x FROM (SELECT $1 AS x UNION SELECT $2) d UNION SELECT 1",
-        "INSERT INTO things (_id,age) SELECT 'a',d.x FROM (SELECT $1 AS x) d",
-        "INSERT INTO things (_id,age) WITH a AS (SELECT $1 AS x), b AS (SELECT x FROM a) SELECT 'a',x FROM b",
+        "SELECT d.x FROM (SELECT $1::bigint AS x) d UNION SELECT 1",
+        "SELECT d.x FROM (SELECT e.x FROM (SELECT $1::bigint AS x) e) d UNION SELECT 1",
+        "WITH a AS (SELECT $1::bigint AS x), b AS (SELECT x FROM a) SELECT x FROM b UNION SELECT 1",
+        "WITH a(x) AS (SELECT $1::bigint) SELECT l.x FROM a l JOIN a r ON l.x=r.x UNION SELECT 1",
+        "SELECT d.x FROM (SELECT $1::bigint AS x) d WHERE d.x=1",
+        "SELECT d.x FROM (SELECT $1::bigint AS x) d ORDER BY d.x+1",
+        "SELECT d.x FROM (SELECT $1::bigint AS x) d LIMIT $1",
+        "SELECT d.x FROM (SELECT $1::bigint AS x) d JOIN things t ON d.x=t.age",
+        "SELECT d.x FROM (SELECT $1::bigint AS x UNION SELECT $2) d UNION SELECT 1",
+        "INSERT INTO things (_id,age) SELECT 'a',d.x FROM (SELECT $1::bigint AS x) d",
+        "INSERT INTO things (_id,age) WITH a AS (SELECT $1::bigint AS x), b AS (SELECT x FROM a) SELECT 'a',x FROM b",
     };
     for (cases) |sql| {
         errdefer std.debug.print("shape inference query: {s}\n", .{sql});
@@ -994,6 +999,30 @@ test "SQL whole shape infers nested derived CTE set and assignment parameters be
     }
 }
 
+test "SQL set description cannot infer through resolved text boundaries" {
+    for ([_][]const u8{
+        "SELECT d.x FROM (SELECT $1 AS x) d UNION SELECT 1",
+        "WITH a AS (SELECT $1 AS x) SELECT d.x FROM (SELECT x FROM a) d UNION SELECT 1",
+        "SELECT NULL AS x UNION SELECT NULL UNION SELECT $1 UNION SELECT 1",
+        "SELECT $1 AS x UNION SELECT NULL UNION SELECT 1",
+        "SELECT COALESCE($1,NULL) AS x UNION SELECT 1",
+        "WITH n AS (SELECT NULL AS x) SELECT COALESCE(n.x,$1) AS x FROM n UNION SELECT 1",
+    }) |sql| {
+        var fake: FakeBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.SqlTypeMismatch, describe(std.testing.allocator, fake.backend(), &compiled, &.{}));
+    }
+    for ([_][]const u8{ "SELECT $1 AS x UNION SELECT 1 UNION SELECT 1.5", "SELECT 1.5 AS x UNION SELECT 1 UNION SELECT $1" }, 0..) |sql, index| {
+        var fake: FakeBackend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try describe(std.testing.allocator, fake.backend(), &compiled, &.{});
+        defer result.deinit();
+        try std.testing.expectEqual(if (index == 0) ast.ColumnType.integer else ast.ColumnType.number, result.binding.parameter_types[0].?);
+    }
+}
+
 test "SQL shape binding releases partial allocations" {
     const Check = struct {
         fn run(alloc: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
@@ -1002,7 +1031,7 @@ test "SQL shape binding releases partial allocations" {
             defer result.deinit();
         }
     };
-    var compiled = try compiler.compile(std.testing.allocator, "WITH a AS (SELECT $1 AS x) SELECT d.x FROM (SELECT x FROM a) d UNION SELECT 1", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "WITH a AS (SELECT $1::bigint AS x) SELECT d.x FROM (SELECT x FROM a) d UNION SELECT 1", .{});
     defer compiled.deinit();
     // Force deterministic growth rather than depending on whether the backing
     // allocator happens to resize an arena chunk at a particular address.

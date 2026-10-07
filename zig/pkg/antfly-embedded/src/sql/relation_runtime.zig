@@ -203,6 +203,56 @@ test "SQL typed blocking query boundaries unwind allocation failures" {
     for ([_]bool{ false, true }) |with_io| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{with_io});
 }
 
+test "SQL common array types are applied before pairwise set identity and VALUES emission" {
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]bool{ false, true }) |with_io| {
+        var fixture: SetTestBackend = .{};
+        var backend = fixture.backend();
+        backend.execution_io = if (with_io) std.testing.io else null;
+        for ([_]Case{
+            .{ .sql = "SELECT count(*) FROM (SELECT ARRAY[1,NULL]::int2[] a UNION SELECT ARRAY[1,NULL]::int8[]) q", .expected = "[[\"1\"]]" },
+            .{ .sql = "SELECT count(*) FROM (SELECT ARRAY[1]::int4[] a INTERSECT SELECT ARRAY[1]::float8[]) q", .expected = "[[\"1\"]]" },
+            .{ .sql = "SELECT count(*) FROM (SELECT ARRAY[1]::int4[] a EXCEPT SELECT ARRAY[1]::float8[]) q", .expected = "[[\"0\"]]" },
+            .{ .sql = "SELECT cardinality(a),2.5=ANY(a) FROM (VALUES(ARRAY[1]::int2[]),(ARRAY[2.5]::float4[])) q(a) ORDER BY 1,2", .expected = "[[\"1\",false],[\"1\",true]]" },
+            .{ .sql = "SELECT count(*) FROM ((SELECT ARRAY[16777216]::int8[] a UNION SELECT ARRAY[16777217]::int8[]) UNION ALL SELECT ARRAY[1]::float4[]) q", .expected = "[[\"3\"]]" },
+            .{ .sql = "SELECT count(*) FROM (SELECT ARRAY[16777216]::int8[] a UNION SELECT ARRAY[16777217]::float4[]) q", .expected = "[[\"1\"]]" },
+            .{ .sql = "SELECT cardinality(a),1=ANY(a) FROM (SELECT '{1,NULL}' a UNION SELECT ARRAY[1,NULL]::int4[]) q", .expected = "[[\"2\",true]]" },
+            .{ .sql = "SELECT count(*) FROM (SELECT NULL::int2[] a UNION SELECT NULL::float8[]) q", .expected = "[[\"1\"]]" },
+            .{ .sql = "SELECT x FROM (VALUES(NULL),(NULL),(1)) q(x) ORDER BY x", .expected = "[[\"1\"],[null],[null]]" },
+        }) |case| {
+            errdefer std.debug.print("common type query: {s}, io: {}\n", .{ case.sql, with_io });
+            var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+            defer compiled.deinit();
+            var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+            defer std.testing.allocator.free(encoded);
+            try std.testing.expectEqualStrings(case.expected, encoded);
+        }
+    }
+}
+
+test "SQL common array coercions release every partial set and VALUES allocation" {
+    const Fixture = struct {
+        fn run(a: Allocator, with_io: bool) !void {
+            var fixture: SetTestBackend = .{};
+            var backend = fixture.backend();
+            backend.execution_io = if (with_io) std.testing.io else null;
+            for ([_][]const u8{
+                "SELECT cardinality(a) FROM (SELECT ARRAY[1,NULL]::int2[] a UNION SELECT ARRAY[1,NULL]::int8[]) q",
+                "SELECT cardinality(a) FROM (VALUES(ARRAY[1,NULL]::int2[]),(ARRAY[1,NULL]::float8[])) q(a)",
+            }) |sql| {
+                var compiled = try @import("compiler.zig").compile(a, sql, .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1 });
+                defer result.deinit();
+                try std.testing.expect(result.output.rows.len != 0);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |with_io| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{with_io});
+}
+
 test "SQL materialized relation replay spills once and shares a single statement capture" {
     const Fixture = struct {
         offset: usize = 0,
@@ -290,7 +340,7 @@ test "SQL set operations preserve multiplicities precedence and output ordering"
     }
 }
 
-test "SQL set inference is arm-order independent and delays unknown NULL typing" {
+test "SQL set inference respects pairwise and derived type boundaries" {
     const runtime = @import("runtime.zig");
     const compiler = @import("compiler.zig");
     var backend: SetTestBackend = .{};
@@ -299,10 +349,10 @@ test "SQL set inference is arm-order independent and delays unknown NULL typing"
         "SELECT 1 AS x UNION SELECT $1",
         "(SELECT $1 AS x) UNION SELECT 1",
         "(SELECT $1 AS x LIMIT 1) UNION SELECT 1",
-        "SELECT COALESCE($1, NULL) AS x UNION SELECT 1",
-        "SELECT NULL AS x UNION SELECT NULL UNION SELECT $1 UNION SELECT 1",
-        "SELECT CASE WHEN TRUE THEN SUM($1) ELSE 0 END AS x UNION SELECT 1",
-        "WITH n AS (SELECT NULL AS x) SELECT COALESCE(n.x,$1) AS x FROM n UNION SELECT 1",
+        "SELECT COALESCE($1::bigint, NULL) AS x UNION SELECT 1",
+        "SELECT NULL::bigint AS x UNION SELECT NULL UNION SELECT $1 UNION SELECT 1",
+        "SELECT CASE WHEN TRUE THEN SUM($1::bigint) ELSE 0 END AS x UNION SELECT 1",
+        "WITH n AS (SELECT NULL::bigint AS x) SELECT COALESCE(n.x,$1) AS x FROM n UNION SELECT 1",
     }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
@@ -316,10 +366,10 @@ test "SQL set inference is arm-order independent and delays unknown NULL typing"
     defer predicate_result.deinit();
     try std.testing.expectEqual(@as(usize, 2), predicate_result.output.rows.len);
     try std.testing.expectEqual(@import("ast.zig").ColumnType.number, predicate_result.output.columns[0].type);
-    for ([_][]const u8{ "SELECT $1 AS x UNION SELECT 1 UNION SELECT 1.5", "SELECT 1.5 AS x UNION SELECT 1 UNION SELECT $1" }) |sql| {
+    for ([_][]const u8{ "SELECT $1 AS x UNION SELECT 1 UNION SELECT 1.5", "SELECT 1.5 AS x UNION SELECT 1 UNION SELECT $1" }, 0..) |sql, index| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .float = 2.5 }}, .{});
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{if (index == 0) .{ .integer = 2 } else .{ .float = 2.5 }}, .{});
         defer result.deinit();
         try std.testing.expectEqual(@import("ast.zig").ColumnType.number, result.output.columns[0].type);
         try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
@@ -353,10 +403,25 @@ test "SQL set admission rejects incompatible shapes and enforces the shared memo
     const runtime = @import("runtime.zig");
     const compiler = @import("compiler.zig");
     var backend: SetTestBackend = .{};
-    for ([_][]const u8{ "SELECT 1 UNION SELECT TRUE", "SELECT 1 UNION SELECT 1, 2" }) |sql| {
+    for ([_][]const u8{
+        "SELECT 1 UNION SELECT TRUE",
+        "SELECT 1 UNION SELECT 1, 2",
+        "SELECT NULL UNION SELECT NULL UNION SELECT 1",
+        "SELECT '1'::text UNION SELECT 1",
+        "SELECT ARRAY[1]::int4[] UNION SELECT 1",
+        "SELECT x FROM (SELECT NULL x) q UNION SELECT 1",
+    }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
         try std.testing.expectError(error.SqlTypeMismatch, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+    }
+    for ([_][]const u8{
+        "SELECT ARRAY[1]::int4[] UNION SELECT ARRAY[TRUE]::boolean[]",
+        "SELECT ARRAY[1]::int4[] UNION SELECT ARRAY['1']::text[]",
+    }) |sql| {
+        var incompatible = try compiler.compile(std.testing.allocator, sql, .{});
+        defer incompatible.deinit();
+        try std.testing.expectError(error.SqlCannotCoerce, runtime.execute(std.testing.allocator, backend.backend(), &incompatible, &.{}, .{}));
     }
     var compiled = try compiler.compile(std.testing.allocator, "SELECT 'long retained payload' AS x UNION SELECT 'another retained payload'", .{});
     defer compiled.deinit();

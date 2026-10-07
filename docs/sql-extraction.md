@@ -3544,3 +3544,30 @@ subqueries. The engine exercises memory and spill modes, including array values,
 NULL elements and allocation-failure cleanup; the mounted HTTP gate checks the
 same seven query shapes, complete wire rows, column types and SQL-null flags.
 These contracts do not activate unrelated original cases or publish raw arrays.
+
+### Common set and VALUES row types (2026-10-07)
+
+Set binding now retains complete element descriptors and resolves binary
+UNION/INTERSECT/EXCEPT nodes before their parents. Each arm is coerced before
+the node compares, hashes or emits it. In particular, an outer float4 widening
+cannot collapse two bigint arrays before an inner DISTINCT has run. Numeric
+widths, NULL arrays and unknown string literals participate in the same bound
+coercion programs; incompatible concrete array types fail with cannot-coerce
+rather than silently converting through JSON placeholders.
+
+Standalone VALUES uses the existing bounded flat row-source machinery. VALUES
+selects one common type across all rows, not a pairwise set-operation chain.
+Literal rows retain their grouped fast path and allocation-free literal type
+inspection. Nontrivial coercions use compiled expressions. Both binding and
+execution preserve derived/CTE boundaries: unknown results become text inside
+their producer and cannot subsequently infer a numeric parameter from an outer
+set or assignment. Tests that previously assumed otherwise now use explicit
+inner casts, with independent PostgreSQL negatives retaining the original
+invalid forms. Bare target-context INSERT parameters remain a separate valid
+assignment path.
+
+This advances the internal type architecture, not original-case activation.
+Public raw-array and pgwire descriptors/codecs, typed mutation capture and the
+broader scalar common-type/overload catalog remain unfinished. The original
+inventory remains 358 implemented, 136 rejected, 73 superseded and 1,019
+unresolved until exact-source mounted execution earns additional dispositions.

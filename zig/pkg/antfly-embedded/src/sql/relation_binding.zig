@@ -266,7 +266,6 @@ const Builder = struct {
     nodes: usize = 0,
     node_limit: usize = 256,
     prepared: std.AutoHashMapUnmanaged(*const ast.Select, Prepared) = .empty,
-    inferred_sets: std.AutoHashMapUnmanaged(*const ast.Select, void) = .empty,
     shape_only: bool = false,
     shape_expression_nodes: usize = 0,
     shape_columns: std.ArrayList(scalar.Column) = .empty,
@@ -283,7 +282,7 @@ const Builder = struct {
     const RecursiveFrame = struct { id: usize, query: *const ast.Select, columns: []const Column, parent: ?*const RecursiveFrame };
     const Constraint = struct { expression: *const ast.Scalar, expected: ?ast.ColumnType = null };
 
-    const Prepared = struct { source: *const Node, lowered: ast.Select, expressions: []const *const ast.Scalar, types: []?ast.ColumnType };
+    const Prepared = struct { source: *const Node, lowered: ast.Select, expressions: []const *const ast.Scalar, types: []scalar.Type };
 
     fn inferenceExpression(self: *Builder, expression_: *const ast.Scalar, columns: []const Column) anyerror!*const ast.Scalar {
         if (expression_.* == .column) for (columns) |column| {
@@ -428,47 +427,40 @@ const Builder = struct {
 
     fn collectSet(self: *Builder, query: *const ast.Select, scope: []const ast.Cte, leaves: *std.ArrayList(*const ast.Select), depth: usize) anyerror!void {
         if (depth > 32) return error.SqlProgramLimitExceeded;
-        if (query.set_operation) |set| {
-            try self.inferred_sets.put(self.alloc, set.left, {});
-            const ctes = try self.alloc.alloc(ast.Cte, scope.len + query.ctes.len);
-            @memcpy(ctes[0..scope.len], scope);
-            @memcpy(ctes[scope.len..], query.ctes);
-            try self.collectSet(set.left, ctes, leaves, depth + 1);
-            try self.collectSet(set.right, ctes, leaves, depth + 1);
-        } else {
-            const source = try self.querySource(query.*, scope, depth + 1);
-            const lowered = try self.lower(source, query.*);
-            const expressions = try self.alloc.alloc(*const ast.Scalar, if (lowered.count_all) 1 else lowered.columns.len);
-            if (lowered.count_all) {
-                expressions[0] = try self.scalarNode(.{ .literal = .{ .integer = 0 } });
-            } else for (lowered.columns, expressions) |projection, *out| {
-                out.* = try self.inferenceExpression(projection.expression orelse try self.scalarNode(.{ .column = projection.field }), source.columns);
-            }
-            const types = try self.alloc.alloc(?ast.ColumnType, expressions.len);
-            @memset(types, null);
-            try self.prepared.put(self.alloc, query, .{ .source = source, .lowered = lowered, .expressions = expressions, .types = types });
-            try leaves.append(self.alloc, query);
+        const source = try self.querySource(query.*, scope, depth + 1);
+        const lowered = try self.lower(source, query.*);
+        const expressions = try self.alloc.alloc(*const ast.Scalar, if (lowered.count_all) 1 else lowered.columns.len);
+        if (lowered.count_all) {
+            expressions[0] = try self.scalarNode(.{ .literal = .{ .integer = 0 } });
+        } else for (lowered.columns, expressions) |projection, *out| {
+            out.* = try self.inferenceExpression(projection.expression orelse try self.scalarNode(.{ .column = projection.field }), source.columns);
         }
+        const types = try self.alloc.alloc(scalar.Type, expressions.len);
+        @memset(types, .{});
+        try self.prepared.put(self.alloc, query, .{ .source = source, .lowered = lowered, .expressions = expressions, .types = types });
+        try leaves.append(self.alloc, query);
     }
 
     fn inferSet(self: *Builder, query: ast.Select, scope: []const ast.Cte, depth: usize) anyerror!void {
-        if (self.inferred_sets.contains(query.set_operation.?.left)) return;
         var leaves: std.ArrayList(*const ast.Select) = .empty;
-        try self.collectSet(&query, scope, &leaves, depth);
+        const ctes = try self.alloc.alloc(ast.Cte, scope.len + query.ctes.len);
+        @memcpy(ctes[0..scope.len], scope);
+        @memcpy(ctes[scope.len..], query.ctes);
+        // Resolve each binary node before its parent. Coercing every leaf to
+        // the root's type would change inner DISTINCT/INTERSECT/EXCEPT keys.
+        try self.collectSet(query.set_operation.?.left, ctes, &leaves, depth + 1);
+        try self.collectSet(query.set_operation.?.right, ctes, &leaves, depth + 1);
         const width = self.prepared.get(leaves.items[0]).?.expressions.len;
-        const common = try self.alloc.alloc(?ast.ColumnType, width);
+        const common = try self.alloc.alloc(scalar.Type, width);
         for (leaves.items) |leaf| if (self.prepared.get(leaf).?.expressions.len != width) return error.SqlTypeMismatch;
         for (0..self.parameters.len + 2) |_| {
-            @memset(common, null);
+            @memset(common, .{});
             // All arms contribute before any unknown slot is constrained.
             for (leaves.items) |leaf| {
                 const prepared = self.prepared.get(leaf).?;
                 const columns = try self.scalarColumns(prepared.source.columns);
                 for (prepared.expressions, common) |expression_, *kind| {
-                    const inferred = (try scalar.inferOutput(self.alloc, expression_, columns, self.parameters)).kind orelse continue;
-                    if (kind.* == null) kind.* = inferred else if (kind.* != inferred) {
-                        if ((kind.* == .integer or kind.* == .number) and (inferred == .integer or inferred == .number)) kind.* = .number else return error.SqlTypeMismatch;
-                    }
+                    try mergeInferredType(kind, try self.setType(expression_, columns));
                 }
             }
             var changed = false;
@@ -480,34 +472,58 @@ const Builder = struct {
                     changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{}) or changed;
                 }
                 for (prepared.expressions, common, prepared.types) |expression_, kind, *output| {
-                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, kind, .{}) or changed;
-                    output.* = kind;
+                    const resolved = resolveUnknown(kind);
+                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, resolved.kind, .{}) or changed;
+                    output.* = resolved;
                 }
             }
             if (!changed) break;
         }
     }
 
-    fn mergeInferredType(current: *?ast.ColumnType, inferred: ?ast.ColumnType) !void {
-        const kind = inferred orelse return;
-        if (current.* == null) {
-            current.* = kind;
-        } else if (current.* != kind) {
-            if ((current.* == .integer or current.* == .number) and (kind == .integer or kind == .number)) current.* = .number else return error.SqlTypeMismatch;
-        }
-    }
-
-    fn literalType(value: ast.Value) ?ast.ColumnType {
-        return switch (value) {
-            .integer => .integer,
-            .number => .number,
-            .boolean => .boolean,
-            .string => .string,
-            .null, .parameter => null,
+    fn setType(self: *Builder, expression_: *const ast.Scalar, columns: []const scalar.Column) !scalar.Type {
+        // A bare SQL string is unknown here; a text cast or a derived text
+        // column is concrete. NULL/unknown arms adopt the selected type.
+        if (expression_.* == .literal) switch (expression_.literal) {
+            .null => return .{},
+            .string => return .{ .nullable = false },
+            .integer => return .{ .kind = .integer, .nullable = false },
+            .number => return .{ .kind = .number, .nullable = false },
+            .boolean => return .{ .kind = .boolean, .nullable = false },
+            .parameter => {},
         };
+        return scalar.inferOutput(self.alloc, expression_, columns, self.parameters);
     }
 
-    fn inferValues(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror![]const ?ast.ColumnType {
+    fn resolveUnknown(kind: scalar.Type) scalar.Type {
+        var resolved = kind;
+        if (resolved.kind == null) resolved.kind = .string;
+        return resolved;
+    }
+
+    fn mergeInferredType(current: *scalar.Type, inferred: scalar.Type) !void {
+        if (inferred.kind == null) return;
+        if (current.kind == null) {
+            current.* = inferred;
+            if (current.element_type == null) {
+                if (current.kind == .integer) current.element_type = .int64;
+                if (current.kind == .number) current.element_type = .float64;
+            }
+            return;
+        }
+        const casts = @import("builtin_cast.zig");
+        if (current.kind == .array and inferred.kind == .array) {
+            const left = current.element_type orelse return error.InvalidSqlProgram;
+            const right = inferred.element_type orelse return error.InvalidSqlProgram;
+            current.element_type = if (left == right) left else casts.commonNumeric(left, right) catch return error.SqlCannotCoerce;
+        } else if ((current.kind == .integer or current.kind == .number) and (inferred.kind == .integer or inferred.kind == .number)) {
+            current.element_type = try casts.commonNumeric(current.element_type orelse (if (current.kind == .integer) .int64 else .float64), inferred.element_type orelse (if (inferred.kind == .integer) .int64 else .float64));
+            current.kind = if (casts.integral(current.element_type.?)) .integer else .number;
+        } else if (current.kind != inferred.kind) return error.SqlTypeMismatch;
+        current.nullable = current.nullable or inferred.nullable;
+    }
+
+    fn inferValues(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror![]const scalar.Type {
         const width = statement.values_arms[0].columns.len;
         var leaves: std.ArrayList(*const ast.Select) = .empty;
         for (statement.values_arms, 0..) |arm, index| {
@@ -515,20 +531,20 @@ const Builder = struct {
             if (arm.columns.len != width) return error.SqlTypeMismatch;
             if (!literalValuesArm(arm)) try self.collectSet(arm, scope, &leaves, depth + 1);
         }
-        const common = try self.alloc.alloc(?ast.ColumnType, width);
+        const common = try self.alloc.alloc(scalar.Type, width);
         for (0..self.parameters.len + 2) |_| {
-            @memset(common, null);
+            @memset(common, .{});
             for (statement.values_arms, 0..) |arm, index| {
                 if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
                 if (literalValuesArm(arm)) {
                     for (arm.columns, common) |projection, *kind| {
                         const expression_ = projection.expression orelse return error.InvalidSqlBackendResponse;
-                        try mergeInferredType(kind, literalType(expression_.literal));
+                        try mergeInferredType(kind, try self.setType(expression_, &.{}));
                     }
                 } else {
                     const prepared = self.prepared.get(arm) orelse return error.InvalidSqlBackendResponse;
                     const columns = try self.scalarColumns(prepared.source.columns);
-                    for (prepared.expressions, common) |expression_, *kind| try mergeInferredType(kind, (try scalar.inferOutput(self.alloc, expression_, columns, self.parameters)).kind);
+                    for (prepared.expressions, common) |expression_, *kind| try mergeInferredType(kind, try self.setType(expression_, columns));
                 }
             }
             var changed = false;
@@ -540,12 +556,14 @@ const Builder = struct {
                     changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, .boolean, .{}) or changed;
                 }
                 for (prepared.expressions, common, prepared.types) |expression_, kind, *output| {
-                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, kind, .{}) or changed;
-                    output.* = kind;
+                    const resolved = resolveUnknown(kind);
+                    changed = try scalar.inferParameters(self.alloc, expression_, columns, self.parameters, resolved.kind, .{}) or changed;
+                    output.* = resolved;
                 }
             }
             if (!changed) break;
         }
+        for (common) |*kind| kind.* = resolveUnknown(kind.*);
         return common;
     }
 
@@ -776,10 +794,10 @@ const Builder = struct {
         return result;
     }
 
-    fn valuesOrigin(self: *Builder, arms: []const *const Node, index: usize) anyerror!*const ast.Scalar {
-        if (arms.len == 1) return arms[0].columns[index].origin orelse error.InvalidSqlBackendResponse;
+    fn valuesOrigin(self: *Builder, arms: []const *const Node, index: usize, common: scalar.Type) anyerror!*const ast.Scalar {
+        if (arms.len == 1) return self.scalarNode(.{ .cast = .{ .operand = arms[0].columns[index].origin orelse return error.InvalidSqlBackendResponse, .type = common.kind.?, .element_type = common.element_type } });
         const middle = arms.len / 2;
-        const arguments = try self.alloc.dupe(*const ast.Scalar, &.{ try self.valuesOrigin(arms[0..middle], index), try self.valuesOrigin(arms[middle..], index) });
+        const arguments = try self.alloc.dupe(*const ast.Scalar, &.{ try self.valuesOrigin(arms[0..middle], index, common), try self.valuesOrigin(arms[middle..], index, common) });
         return self.scalarNode(.{ .call = .{ .name = "coalesce", .args = arguments } });
     }
 
@@ -789,6 +807,12 @@ const Builder = struct {
             const expression_ = projection.expression orelse return false;
             if (expression_.* != .literal or expression_.literal == .parameter) return false;
         }
+        return true;
+    }
+
+    fn literalValuesCompatible(query: *const ast.Select, common: []const scalar.Type) bool {
+        if (!literalValuesArm(query)) return false;
+        for (query.columns, common) |projection, kind| if (projection.expression.?.literal == .string and kind.kind != .string) return false;
         return true;
     }
 
@@ -871,9 +895,9 @@ const Builder = struct {
             while (arm_index < statement.values_arms.len) {
                 if (arm_index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
                 const leaf = statement.values_arms[arm_index];
-                if (!self.shape_only and literalValuesArm(leaf)) {
+                if (!self.shape_only and literalValuesCompatible(leaf, common)) {
                     const first = arm_index;
-                    while (arm_index < statement.values_arms.len and literalValuesArm(statement.values_arms[arm_index])) : (arm_index += 1) {
+                    while (arm_index < statement.values_arms.len and literalValuesCompatible(statement.values_arms[arm_index], common)) : (arm_index += 1) {
                         if (arm_index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
                     }
                     const columns = try self.alloc.alloc(Column, leaf.columns.len);
@@ -881,20 +905,26 @@ const Builder = struct {
                         .name = projection.alias orelse return error.InvalidSqlBackendResponse,
                         .internal = try self.internal(),
                         .qualifier = "",
-                        .type = kind orelse .string,
+                        .type = kind.kind orelse .string,
+                        .element_type = kind.element_type,
                         .nullable = true,
-                        .untyped_null = kind == null,
+                        .untyped_null = kind.kind == null,
                     };
                     const rows = try self.alloc.alloc([]const scalar.Datum, arm_index - first);
                     for (statement.values_arms[first..arm_index], rows, 0..) |row_query, *row, index| {
                         if (index % 64 == 0) try self.backend.vtable.checkpoint(self.backend.ptr);
                         const values = try self.alloc.alloc(scalar.Datum, row_query.columns.len);
-                        for (row_query.columns, values) |projection, *value| value.* = try literalDatum(projection.expression orelse return error.InvalidSqlBackendResponse);
+                        for (row_query.columns, values, common) |projection, *value, kind| value.* = try describe.coerceDatum(self.alloc, try literalDatum(projection.expression orelse return error.InvalidSqlBackendResponse), kind.kind.?, kind.element_type);
                         row.* = values;
                     }
                     try grouped.append(self.alloc, try self.node(columns, .{ .literal_rows = rows }));
                 } else {
-                    try grouped.append(self.alloc, try self.derived(leaf, "", &.{}, ctes, depth + 1));
+                    if (!self.shape_only and literalValuesArm(leaf)) {
+                        var leaves: std.ArrayList(*const ast.Select) = .empty;
+                        try self.collectSet(leaf, ctes, &leaves, depth + 1);
+                        @memcpy(self.prepared.get(leaf).?.types, common);
+                    }
+                    try grouped.append(self.alloc, try self.derivedContext(leaf, "", &.{}, ctes, depth + 1, false));
                     arm_index += 1;
                 }
             }
@@ -905,9 +935,7 @@ const Builder = struct {
                 for (columns, arm.columns) |*column, other| {
                     if (self.shape_only) {
                         column.type = .string;
-                    } else if (column.untyped_null) column.type = other.type else if (!other.untyped_null and column.type != other.type) {
-                        if ((column.type == .integer and other.type == .number) or (column.type == .number and other.type == .integer)) column.type = .number else return error.SqlTypeMismatch;
-                    }
+                    } else if (column.type != other.type or column.element_type != other.element_type) return error.SqlTypeMismatch;
                     column.nullable = column.nullable or other.nullable;
                     column.untyped_null = column.untyped_null and other.untyped_null;
                 }
@@ -915,7 +943,15 @@ const Builder = struct {
             for (columns, 0..) |*column, index| {
                 column.internal = try self.internal();
                 if (self.shape_only) {
-                    column.origin = try self.valuesOrigin(arms, index);
+                    // VALUES selects one common type across every row, unlike
+                    // binary set operations. Resolve before balancing the
+                    // symbolic tree so unknown-only prefixes stay unknown.
+                    var inferred: scalar.Type = .{};
+                    for (arms) |arm| try mergeInferredType(&inferred, try self.setType(arm.columns[index].origin.?, self.shape_columns.items));
+                    inferred = resolveUnknown(inferred);
+                    column.type = inferred.kind.?;
+                    column.element_type = inferred.element_type;
+                    column.origin = try self.valuesOrigin(arms, index, inferred);
                     try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
                 }
             }
@@ -923,19 +959,22 @@ const Builder = struct {
         }
         if (statement.set_operation) |set| {
             if (!self.shape_only) try self.inferSet(statement, scope, depth + 1);
-            defer _ = self.inferred_sets.remove(set.left);
-            const left = try self.derived(set.left, "", &.{}, ctes, depth + 1);
-            const right = try self.derived(set.right, "", &.{}, ctes, depth + 1);
+            const left = try self.derivedContext(set.left, "", &.{}, ctes, depth + 1, false);
+            const right = try self.derivedContext(set.right, "", &.{}, ctes, depth + 1, false);
             if (left.columns.len != right.columns.len) return error.SqlTypeMismatch;
             const columns = try self.alloc.dupe(Column, left.columns);
-            for (columns, right.columns, 0..) |*column, other, index| {
+            for (columns, right.columns) |*column, other| {
                 if (self.shape_only) {
-                    const args = try self.alloc.dupe(*const ast.Scalar, &.{ column.origin.?, other.origin.? });
+                    var common: scalar.Type = .{};
+                    try mergeInferredType(&common, try self.setType(column.origin.?, self.shape_columns.items));
+                    try mergeInferredType(&common, try self.setType(other.origin.?, self.shape_columns.items));
+                    common = resolveUnknown(common);
+                    const args = try self.alloc.dupe(*const ast.Scalar, &.{ try self.scalarNode(.{ .cast = .{ .operand = column.origin.?, .type = common.kind.?, .element_type = common.element_type } }), try self.scalarNode(.{ .cast = .{ .operand = other.origin.?, .type = common.kind.?, .element_type = common.element_type } }) });
                     column.origin = try self.scalarNode(.{ .call = .{ .name = "coalesce", .args = args } });
+                    column.type = common.kind.?;
+                    column.element_type = common.element_type;
                     try self.constraints.append(self.alloc, .{ .expression = column.origin.? });
-                } else if (untypedNull(left, index)) column.type = other.type else if (!untypedNull(right, index) and column.type != other.type) {
-                    if ((column.type == .integer and other.type == .number) or (column.type == .number and other.type == .integer)) column.type = .number else return error.SqlTypeMismatch;
-                }
+                } else if (column.type != other.type or column.element_type != other.element_type) return error.SqlTypeMismatch;
                 column.internal = try self.internal();
                 column.nullable = column.nullable or other.nullable;
                 column.untyped_null = column.untyped_null and other.untyped_null;
@@ -977,10 +1016,14 @@ const Builder = struct {
     }
 
     fn derived(self: *Builder, query: *const ast.Select, alias: []const u8, names: []const []const u8, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
+        return self.derivedContext(query, alias, names, scope, depth, true);
+    }
+
+    fn derivedContext(self: *Builder, query: *const ast.Select, alias: []const u8, names: []const []const u8, scope: []const ast.Cte, depth: usize, resolve_unknown: bool) anyerror!*const Node {
         if (@import("subquery_lowering.zig").accepts(query.*)) {
             const rewritten = try self.alloc.create(ast.Select);
             rewritten.* = try @import("subquery_lowering.zig").lower(self.alloc, query.*);
-            return self.derived(rewritten, alias, names, scope, depth + 1);
+            return self.derivedContext(rewritten, alias, names, scope, depth + 1, resolve_unknown);
         }
         const prepared: ?Prepared = if (self.prepared.fetchRemove(query)) |entry| entry.value else null;
         var child = if (prepared) |entry| entry.source else try self.querySource(query.*, scope, depth + 1);
@@ -998,7 +1041,7 @@ const Builder = struct {
                     .type = output.kind orelse .string,
                     .element_type = output.element_type,
                     .nullable = true,
-                    .origin = expression_,
+                    .origin = if (resolve_unknown and (output.kind == null or (expression_.* == .literal and expression_.literal == .string))) try self.scalarNode(.{ .cast = .{ .operand = expression_, .type = .string } }) else expression_,
                 };
             }
             return self.node(columns, .singleton);
@@ -1006,9 +1049,10 @@ const Builder = struct {
         if (prepared) |entry| if (!lowered.count_all) {
             const projections = try self.alloc.dupe(ast.Projection, lowered.columns);
             const column_types = try self.scalarColumns(child.columns);
-            for (projections, entry.expressions, entry.types) |*projection, expression_, kind| if (kind) |known| {
-                if ((try scalar.inferOutput(self.alloc, expression_, column_types, self.parameters)).kind == null and projection.expression != null)
-                    projection.expression = try self.scalarNode(.{ .cast = .{ .operand = projection.expression.?, .type = known } });
+            for (projections, entry.expressions, entry.types) |*projection, expression_, kind| if (kind.kind) |known| {
+                const actual = try scalar.inferOutput(self.alloc, expression_, column_types, self.parameters);
+                if (actual.kind != known or actual.element_type != kind.element_type)
+                    projection.expression = try self.scalarNode(.{ .cast = .{ .operand = projection.expression orelse try self.scalarNode(.{ .column = projection.field }), .type = known, .element_type = kind.element_type } });
             };
             lowered.columns = projections;
         };
@@ -1034,7 +1078,7 @@ const Builder = struct {
                     untyped = untyped or source_column.untyped_null;
                 };
             }
-            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .nullable = true, .untyped_null = untyped };
+            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .nullable = true, .untyped_null = !resolve_unknown and untyped };
         }
         const constants = try self.alloc.alloc(Node.ConstantRef, lowered.invocation_constants.len);
         for (lowered.invocation_constants, constants) |name, *reference| {
@@ -1318,10 +1362,6 @@ fn sideLocal(columns: []const Column, input: *const ast.Scalar) bool {
 fn hasInternal(columns: []const Column, name: []const u8) bool {
     for (columns) |column| if (std.mem.eql(u8, column.internal, name)) return true;
     return false;
-}
-
-fn untypedNull(node: *const Node, index: usize) bool {
-    return index < node.columns.len and node.columns[index].untyped_null;
 }
 
 pub fn outputUntypedNull(bound: Bound, index: usize) bool {

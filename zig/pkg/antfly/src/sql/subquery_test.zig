@@ -860,7 +860,7 @@ test "SQL decorrelation unwinds every allocation and enforces shared memory admi
 
 test "SQL correlated scalar parameter constraints propagate through join and result domains" {
     var backend: Backend = .{};
-    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT $1 FROM (SELECT 1 AS y) i WHERE i.y=o.x)+1 FROM (SELECT $2 AS x) o WHERE o.x=1", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT $1::bigint FROM (SELECT 1 AS y) i WHERE i.y=o.x)+1 FROM (SELECT $2::bigint AS x) o WHERE o.x=1", .{});
     defer compiled.deinit();
     var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
     defer description.deinit();

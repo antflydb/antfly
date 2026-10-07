@@ -732,6 +732,15 @@ pub fn runInternalArrayQueries(alloc: std.mem.Allocator, handler: anytype) !void
         .{ .sql = "SELECT cardinality(p), array_length(p,1), 1.5 = ANY(p), 2.5 = ANY(p), 2.0 = ANY(p) FROM (SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) p FROM (SELECT 1.0 x UNION ALL SELECT 3.0 x) t) q", .rows = "[[\"3\",\"3\",true,true,null]]", .types = &.{ .integer, .integer, .boolean, .boolean, .boolean } },
         .{ .sql = "SELECT cardinality(a), row_number() OVER (ORDER BY cardinality(a)) FROM (SELECT ARRAY[1,2]::bigint[] a UNION ALL SELECT ARRAY[3]::bigint[]) q ORDER BY 1", .rows = "[[\"1\",\"1\"],[\"2\",\"2\"]]", .types = &.{ .integer, .integer } },
         .{ .sql = "SELECT cardinality((SELECT ARRAY[1,NULL,3]::bigint[]))", .rows = "[[\"3\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT count(*) FROM (SELECT ARRAY[1,NULL]::int2[] a UNION SELECT ARRAY[1,NULL]::int8[]) q", .rows = "[[\"1\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT count(*) FROM (SELECT ARRAY[1]::int4[] a INTERSECT SELECT ARRAY[1]::float8[]) q", .rows = "[[\"1\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT count(*) FROM (SELECT ARRAY[1]::int4[] a EXCEPT SELECT ARRAY[1]::float8[]) q", .rows = "[[\"0\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT cardinality(a),2.5=ANY(a) FROM (VALUES(ARRAY[1]::int2[]),(ARRAY[2.5]::float4[])) q(a) ORDER BY 1,2", .rows = "[[\"1\",false],[\"1\",true]]", .types = &.{ .integer, .boolean } },
+        .{ .sql = "SELECT count(*) FROM ((SELECT ARRAY[16777216]::int8[] a UNION SELECT ARRAY[16777217]::int8[]) UNION ALL SELECT ARRAY[1]::float4[]) q", .rows = "[[\"3\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT count(*) FROM (SELECT ARRAY[16777216]::int8[] a UNION SELECT ARRAY[16777217]::float4[]) q", .rows = "[[\"1\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT cardinality(a),1=ANY(a) FROM (SELECT '{1,NULL}' a UNION SELECT ARRAY[1,NULL]::int4[]) q", .rows = "[[\"2\",true]]", .types = &.{ .integer, .boolean } },
+        .{ .sql = "SELECT count(*) FROM (SELECT NULL::int2[] a UNION SELECT NULL::float8[]) q", .rows = "[[\"1\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT x FROM (VALUES(NULL),(NULL),(1)) q(x) ORDER BY x", .rows = "[[\"1\"],[null],[null]]", .types = &.{.integer} },
     };
     for (cases) |entry| {
         const case: fixtures.Corpus.Case = .{ .id = "internal-array-query-contract", .name = entry.sql, .family = "array", .sql = entry.sql, .params = &.{}, .source_expectation = "success" };
@@ -752,7 +761,7 @@ pub fn runInternalArrayQueries(alloc: std.mem.Allocator, handler: anytype) !void
             for (row, nulls) |cell, is_null| try std.testing.expectEqual(cell == .null, is_null);
         }
     }
-    std.debug.print("SQL public internal-array query contracts: 7 passed; no original disposition credit\n", .{});
+    std.debug.print("SQL public internal-array query contracts: {d} passed; no original disposition credit\n", .{cases.len});
 }
 
 pub fn runReference(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {

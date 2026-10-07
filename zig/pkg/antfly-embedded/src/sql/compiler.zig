@@ -909,6 +909,34 @@ const Parser = struct {
         return self.selectFinish(try self.selectCore());
     }
 
+    // VALUES shares the flat, bounded row-source representation used by
+    // INSERT sources; it is not a chain of pairwise UNION coercions.
+    fn valuesCore(self: *Parser) Error!ast.Select {
+        var arms: std.ArrayList(*const ast.Select) = .empty;
+        var width: ?usize = null;
+        while (true) {
+            if (arms.items.len >= self.limits.max_insert_rows) return self.fail(error.SqlLimitExceeded, "VALUES row budget exceeded");
+            try self.expect(.lparen);
+            var projections: std.ArrayList(ast.Projection) = .empty;
+            while (true) {
+                try self.node();
+                const expression = try self.scalar(0, 0);
+                try self.checkScalarDepth(expression, 0);
+                try projections.append(self.alloc, .{ .alias = try std.fmt.allocPrint(self.alloc, "column{d}", .{projections.items.len + 1}), .expression = expression });
+                if (!self.take(.comma)) break;
+            }
+            try self.expect(.rparen);
+            if (width) |expected| {
+                if (projections.items.len != expected) return self.fail(error.InvalidSqlSyntax, "VALUES rows must have equal width");
+            } else width = projections.items.len;
+            const leaf = try self.alloc.create(ast.Select);
+            leaf.* = .{ .columns = try projections.toOwnedSlice(self.alloc), .generated_values = true };
+            try arms.append(self.alloc, leaf);
+            if (!self.take(.comma)) break;
+        }
+        return .{ .values_arms = try arms.toOwnedSlice(self.alloc), .generated_values = true };
+    }
+
     fn selectFinish(self: *Parser, first: ast.Select) Error!ast.Select {
         var result = try self.setTail(first, 1, 0);
         result.order_by = try self.selectOrder();
@@ -969,8 +997,12 @@ const Parser = struct {
                 right = statement_value.select;
                 try self.expect(.rparen);
             } else {
-                try self.expectKeyword(.select);
-                right = try self.selectCore();
+                if (self.keyword(.values)) {
+                    right = try self.valuesCore();
+                } else {
+                    try self.expectKeyword(.select);
+                    right = try self.selectCore();
+                }
             }
             right = try self.setTail(right, precedence + 1, depth + 1);
             try self.node();
@@ -2172,6 +2204,7 @@ const Parser = struct {
             return .{ .select = try self.selectFinish(.{ .source = source }) };
         }
         if (self.keyword(.select)) return .{ .select = try self.select() };
+        if (self.keyword(.values)) return .{ .select = try self.selectFinish(try self.valuesCore()) };
         if (self.keyword(.insert)) return .{ .insert = try self.insert() };
         if (self.keyword(.update)) return .{ .update = try self.update() };
         if (self.keyword(.delete)) {

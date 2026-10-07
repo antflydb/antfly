@@ -856,8 +856,7 @@ fn common(left: Type, right: Type) !Type {
         var element = chosen.element_type.?;
         if (other.kind == .array and other.element_type != element) {
             const right_element = other.element_type orelse return error.SqlTypeMismatch;
-            if (!(builtin_cast.integral(element) or builtin_cast.floating(element)) or !(builtin_cast.integral(right_element) or builtin_cast.floating(right_element))) return error.SqlTypeMismatch;
-            element = if (element == .float64 or right_element == .float64) .float64 else if (element == .float32 or right_element == .float32) .float32 else if (element == .int64 or right_element == .int64) .int64 else if (element == .int32 or right_element == .int32) .int32 else .int16;
+            element = try builtin_cast.commonNumeric(element, right_element);
         }
         return .{ .kind = .array, .element_type = element, .nullable = left.nullable or right.nullable };
     }
@@ -1162,6 +1161,12 @@ const Binder = struct {
                         _ = try self.infer(arg, depth + 1);
                     },
                 }
+                // These constructs select their own result type before an
+                // enclosing expression can supply a coercion context.
+                if (merged.kind == null) switch (function) {
+                    .coalesce, .nullif, .greatest, .least => merged.kind = .string,
+                    else => {},
+                };
                 if (function == .abs or function == .ceil or function == .floor or function == .round or function == .trunc or function == .sign or function == .sqrt or function == .power or function == .mod) {
                     if (merged.kind != null and !numeric(merged.kind)) return error.SqlTypeMismatch;
                 }
@@ -1182,6 +1187,7 @@ const Binder = struct {
                     if (condition.kind != null and condition.kind != .boolean) return error.SqlTypeMismatch;
                     merged = try common(merged, try self.infer(branch.value, depth + 1));
                 }
+                if (merged.kind == null) merged.kind = .string;
                 break :blk merged;
             },
             .in_list => |list| blk: {

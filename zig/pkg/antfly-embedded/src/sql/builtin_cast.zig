@@ -24,6 +24,13 @@ pub fn floating(kind: Kind) bool {
     return kind == .float32 or kind == .float64;
 }
 
+/// PostgreSQL's implicit numeric promotion chain, including array elements.
+/// Explicit casts such as text-to-integer must not participate in resolution.
+pub fn commonNumeric(left: Kind, right: Kind) !Kind {
+    if (!(integral(left) or floating(left)) or !(integral(right) or floating(right))) return error.SqlTypeMismatch;
+    return if (left == .float64 or right == .float64) .float64 else if (left == .float32 or right == .float32) .float32 else if (left == .int64 or right == .int64) .int64 else if (left == .int32 or right == .int32) .int32 else .int16;
+}
+
 pub fn allowed(source: Kind, target: Kind) bool {
     if (source == target or source == .text or target == .text) return true;
     if ((integral(source) or floating(source)) and (integral(target) or floating(target))) return true;
