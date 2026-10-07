@@ -47,6 +47,10 @@ def module(root, dependencies, tail):
 
 
 SUITES = {
+    "dns": (
+        ["Windows DNS "],
+        module("tools/windows/dns_test.zig", ["antfly_platform"], PLATFORM),
+    ),
     "io-namespace": (
         ["platform Io "],
         module(

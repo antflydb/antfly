@@ -13174,7 +13174,6 @@ fn netSendOneWindows(
     flags: net.SendFlags,
 ) net.Socket.SendError!void {
     _ = t;
-    _ = flags;
     const iovecs: [1]windows.AFD.WSABUF(.@"const") = .{.{
         .buf = message.data_ptr,
         .len = std.math.cast(std.os.windows.ULONG, message.data_len) orelse
@@ -13182,6 +13181,12 @@ fn netSendOneWindows(
     }};
     var storage: PosixAddress = undefined;
     const addr_len = addressToPosix(message.address, &storage);
+    const compat = @import("windows_native.zig");
+    if (compat.isWine()) {
+        try Thread.checkCancel();
+        message.data_len = try compat.sendDatagram(socket_handle, &iovecs, std.mem.asBytes(&storage)[0..addr_len], flags, waitSocketEvent);
+        return;
+    }
     switch ((try deviceIoControl(&.{
         .file = .{ .handle = socket_handle, .flags = .{ .nonblocking = true } },
         .code = windows.IOCTL.AFD.SEND_DATAGRAM,
@@ -13443,6 +13448,20 @@ fn netReceiveOneWindows(
     }};
     var storage: PosixAddress = undefined;
     var addr_len: windows.ULONG = @sizeOf(PosixAddress);
+    const compat = @import("windows_native.zig");
+    if (compat.isWine()) {
+        try Thread.checkCancel();
+        var from_len: i32 = @sizeOf(PosixAddress);
+        var receive_flags: u32 = (if (flags.oob) @as(u32, 1) else 0) | (if (flags.peek) @as(u32, 2) else 0);
+        const received = try compat.receiveDatagram(socket_handle, &iovecs, std.mem.asBytes(&storage), &from_len, &receive_flags, waitSocketEvent);
+        message.* = .{
+            .from = addressFromPosix(&storage),
+            .data = data_buffer[0..received],
+            .control = &.{},
+            .flags = .{ .eor = false, .trunc = false, .ctrunc = false, .oob = receive_flags & 1 != 0, .errqueue = false },
+        };
+        return;
+    }
     const iosb = try deviceIoControl(&.{
         .file = .{ .handle = socket_handle, .flags = .{ .nonblocking = true } },
         .code = windows.IOCTL.AFD.RECEIVE_DATAGRAM,
@@ -14043,6 +14062,11 @@ fn netLookupFallible(
         if (native_os == .linux) return t.lookupDnsSearch(host_name, resolved, options);
 
         comptime assert(is_windows);
+        const compat = @import("windows_native.zig");
+        if (compat.isWine()) {
+            try Thread.checkCancel();
+            return compat.lookupHostWine(t_io, host_name, resolved, options, waitSocketEvent);
+        }
         var DnsQueryEx = t.dl.DnsQueryEx.load(.acquire);
         //var DnsCancelQuery = t.dl.DnsCancelQuery.load(.acquire);
         var DnsFree = t.dl.DnsFree.load(.acquire);
@@ -14054,7 +14078,7 @@ fn netLookupFallible(
                 try Thread.checkCancel();
                 var dnsapi_dll: *anyopaque = undefined;
                 switch (windows.ntdll.LdrLoadDll(null, null, &.init(
-                    &.{ 'd', 'n', 's', 'a', 'p', 'i', '.', 'd', 'l', 'l' },
+                    std.unicode.utf8ToUtf16LeStringLiteral("dnsapi.dll"),
                 ), &dnsapi_dll)) {
                     .SUCCESS => {},
                     .DLL_NOT_FOUND => return error.Unexpected,
@@ -14068,7 +14092,7 @@ fn netLookupFallible(
                 }
             };
             switch (windows.ntdll.LdrGetProcedureAddress(dnsapi_dll, &.init(
-                &.{ 'D', 'n', 's', 'Q', 'u', 'e', 'r', 'y', 'E', 'x' },
+                "DnsQueryEx",
             ), 0, @ptrCast(&DnsQueryEx))) {
                 .SUCCESS => t.dl.DnsQueryEx.store(DnsQueryEx, .release),
                 else => |status| return windows.unexpectedStatus(status),
@@ -14080,7 +14104,7 @@ fn netLookupFallible(
             //    else => |status| return windows.unexpectedStatus(status),
             //}
             switch (windows.ntdll.LdrGetProcedureAddress(dnsapi_dll, &.init(
-                &.{ 'D', 'n', 's', 'F', 'r', 'e', 'e' },
+                "DnsFree",
             ), 0, @ptrCast(&DnsFree))) {
                 .SUCCESS => t.dl.DnsFree.store(DnsFree, .release),
                 else => |status| return windows.unexpectedStatus(status),
@@ -15028,11 +15052,11 @@ fn lookupHosts(
 ) !void {
     const path_w = if (is_windows) path_w: {
         var path_w_buf: [windows.PATH_MAX_WIDE:0]u16 = undefined;
-        const system_dir = windows.getSystemDirectoryWtf16Le();
+        const system_dir = @import("windows_native.zig").systemDirectory(&path_w_buf) catch return error.DetectingNetworkConfigurationFailed;
         const suffix = [_]u16{
             '\\', 'd', 'r', 'i', 'v', 'e', 'r', 's', '\\', 'e', 't', 'c', '\\', 'h', 'o', 's', 't', 's',
         };
-        @memcpy(path_w_buf[0..system_dir.len], system_dir);
+        if (system_dir.len + suffix.len >= path_w_buf.len) return error.DetectingNetworkConfigurationFailed;
         @memcpy(path_w_buf[system_dir.len..][0..suffix.len], &suffix);
         path_w_buf[system_dir.len + suffix.len] = 0;
         break :path_w wToPrefixedFileW(null, &path_w_buf, .{}) catch |err| switch (err) {
@@ -17058,10 +17082,11 @@ const WindowsCommandLineCache = struct {
         return self.script_cmd_line.?;
     }
 
-    fn cmdExePath(self: *WindowsCommandLineCache) Allocator.Error![:0]u16 {
+    fn cmdExePath(self: *WindowsCommandLineCache) (Allocator.Error || error{Unexpected})![:0]u16 {
         if (self.cmd_exe_path == null) {
             // Remove trailing slash from system directory path; we'll re-add it below
-            const system_dir = std.mem.trimEnd(u16, windows.getSystemDirectoryWtf16Le(), &.{ '/', '\\' });
+            var system_dir_buf: [windows.PATH_MAX_WIDE:0]u16 = undefined;
+            const system_dir = std.mem.trimEnd(u16, try @import("windows_native.zig").systemDirectory(&system_dir_buf), &.{ '/', '\\' });
             const suffix = std.unicode.utf8ToUtf16LeStringLiteral("\\cmd.exe");
             const buf = try self.allocator.allocSentinel(u16, system_dir.len + suffix.len, 0);
             errdefer comptime unreachable;

@@ -288,6 +288,10 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = json_mod,
     });
     const run_lib_json_tests = b.addRunArtifact(lib_json_tests);
+    const standalone_json_consumer = b.addSystemCommand(&.{"python3"});
+    standalone_json_consumer.addFileArg(b.path("lib/json/tests/test_standalone_consumer.py"));
+    standalone_json_consumer.addArg(b.graph.zig_exe);
+    run_lib_json_tests.step.dependOn(&standalone_json_consumer.step);
     const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
     lib_json_test_step.dependOn(&run_lib_json_tests.step);
 
@@ -393,6 +397,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const run_httpx_tests = b.addRunArtifact(httpx_tests);
     const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
+    const httpx_consumer_test = b.addSystemCommand(&.{"python3"});
+    httpx_consumer_test.addFileArg(b.path("lib/httpx/tests/test_standalone_consumer.py"));
+    httpx_consumer_test.addArg(b.graph.zig_exe);
+    lib_httpx_test_step.dependOn(&httpx_consumer_test.step);
     lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
     const httpx_client_lifecycle_tests = b.addTest(.{
@@ -414,6 +422,10 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     const run_objectstore_tests = b.addRunArtifact(objectstore_tests);
     const lib_objectstore_test_step = b.step("lib-objectstore-test", "Run standalone lib/objectstore tests");
+    const objectstore_standalone_build = b.addSystemCommand(&.{"python3"});
+    objectstore_standalone_build.addFileArg(b.path("lib/objectstore/tests/test_standalone_build.py"));
+    objectstore_standalone_build.addArg(b.graph.zig_exe);
+    lib_objectstore_test_step.dependOn(&objectstore_standalone_build.step);
     lib_objectstore_test_step.dependOn(&run_objectstore_tests.step);
 
     const httpx_transport_regression_tests = b.addTest(.{

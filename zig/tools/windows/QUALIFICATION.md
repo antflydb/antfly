@@ -856,3 +856,43 @@ Windows executable SHA-256:
 `9beb1ef5ae44f2932e2a8d53331a6127b99eab95cf9f247006a96e48c706e1d4`.
 Logs and hashes use `/private/tmp/pr987-main1003-*`. No new native Windows VM
 was created for this merge.
+
+## Standalone consumers, Wine DNS and PJRT regression (2026-10-07)
+
+Standalone platform bindings preserve each artifact's libc policy. JSON's
+actual external consumers compile without libc for Linux and freestanding
+WASM. Raft and structlog use platform clocks and compile their Linux unit
+suites without libc. The public `Clock.real()` consumer also compiles without
+libc, retaining the Linux syscall path instead of calling a C clock symbol.
+
+HTTPX exports one module with explicit target/optimization and its JSON import.
+A Windows consumer verifies that its borrowed observer and HTTP runtime share
+one platform executor type. Objectstore forwards target/optimization to every
+standalone dependency and binds one platform module across the resulting graph;
+its normal test steps include Windows Debug and Linux ReleaseFast compilation.
+The standalone and composed native objectstore suites each pass 77 tests with
+three capability/integration skips. Platform's 22 build steps pass, including
+public clock checks and 13 Python process checks.
+
+Windows system-directory lookup uses `GetSystemDirectoryW`, avoiding private
+PEB fields that Wine omits. Wine datagrams use owned overlapped Winsock requests
+with cancellation and completion draining. Its external DNS lookup uses native
+`GetAddrInfoW` workers: canceled requests own provider storage independently of
+caller tasks/executors, with admission capped at 32 outstanding requests,
+including canceled work still completing. Native Windows retains `DnsQueryEx`.
+The DNS DLL/procedure names are terminated, and canonical-name conversion checks
+length and character range before copying into the caller's fixed buffer.
+
+CrossOver Debug and ReleaseFast each pass five namespace tests (including DNS
+cancellation, executor teardown, admission bounds, and datagram reuse), two
+external DNS tests, and the public real-clock test. These checks do not extend
+native Windows/NTFS qualification to this source snapshot; earlier native
+results remain pinned to the binaries documented above.
+
+The fresh review also reproduced the PJRT unit-broadcast failure on main
+`0c3b38667a`. The implementation correctly reshapes an all-unit tensor to a
+scalar before broadcasting it; the older regression assumed a direct broadcast
+at a fixed instruction index. It now follows the multiplication operands and
+verifies the scalar reshape, empty broadcast dimensions, output shape and
+source operand. The standalone PJRT suites pass 25/25 tests. A PJRT plugin is
+not installed, so this is builder/unit qualification, not plugin execution.

@@ -50,9 +50,7 @@ pub fn format(
 }
 
 fn writeTimestamp(writer: *std.Io.Writer) !void {
-    var ts: platform.c.timespec = undefined;
-    _ = platform.c.clock_gettime(.REALTIME, &ts);
-    const epoch_secs: i64 = ts.sec;
+    const epoch_secs: i64 = @intCast(platform.time.realtimeNs() / std.time.ns_per_s);
     const epoch_day: i32 = @intCast(@divFloor(epoch_secs, 86400));
     const day_secs: u32 = @intCast(@mod(epoch_secs, 86400));
 

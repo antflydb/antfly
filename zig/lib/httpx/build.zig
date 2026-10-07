@@ -19,18 +19,16 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     defer @import("antfly_platform").bindBuild(b);
 
-    const httpx_module = b.createModule(.{
+    const httpx_module = b.addModule("httpx", .{
         .root_source_file = b.path("src/httpx.zig"),
+        .target = target,
+        .optimize = optimize,
     });
     httpx_module.addImport("antfly-json", b.createModule(.{
         .root_source_file = b.path("../json/src/mod.zig"),
         .target = target,
         .optimize = optimize,
     }));
-
-    _ = b.addModule("httpx", .{
-        .root_source_file = b.path("src/httpx.zig"),
-    });
 
     const examples = [_]struct { name: []const u8, path: []const u8, skip_run_all: bool = false }{
         .{ .name = "simple_get", .path = "examples/simple_get.zig" },
@@ -102,6 +100,12 @@ pub fn build(b: *std.Build) void {
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
+    const consumer_test = b.addSystemCommand(&.{"python3"});
+    consumer_test.addFileArg(b.path("tests/test_standalone_consumer.py"));
+    consumer_test.addArg(b.graph.zig_exe);
+    b.step("test-standalone-consumer", "Compile a Windows consumer sharing HTTPX and platform")
+        .dependOn(&consumer_test.step);
+    test_step.dependOn(&consumer_test.step);
 
     // Only run tests when target matches host; otherwise build test artifact only.
     if (target.result.os.tag == builtin.os.tag and target.result.cpu.arch == builtin.cpu.arch) {

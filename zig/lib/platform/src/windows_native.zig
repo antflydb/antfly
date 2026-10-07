@@ -35,6 +35,7 @@ extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyo
 extern "kernel32" fn GetModuleHandleW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn FreeLibrary(module: *anyopaque) callconv(.winapi) BOOL;
+extern "kernel32" fn GetSystemDirectoryW(buffer: [*]u16, size: u32) callconv(.winapi) u32;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn UnmapViewOfFile(base: *const anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn ReadFile(file: std.os.windows.HANDLE, buffer: [*]u8, len: u32, read: ?*u32, overlapped: ?*Overlapped) callconv(.winapi) BOOL;
@@ -59,6 +60,20 @@ extern "ws2_32" fn getpeername(socket: usize, address: [*]u8, len: *i32) callcon
 extern "ws2_32" fn WSAIoctl(socket: usize, code: u32, input: *const anyopaque, input_len: u32, output: *anyopaque, output_len: u32, returned: *u32, overlapped: ?*Overlapped, completion: ?*anyopaque) callconv(.winapi) c_int;
 extern "ws2_32" fn WSASend(socket: usize, buffers: *const anyopaque, count: u32, sent: *u32, flags: u32, overlapped: ?*anyopaque, completion: ?*anyopaque) callconv(.winapi) c_int;
 extern "ws2_32" fn WSARecv(socket: usize, buffers: *const anyopaque, count: u32, received: *u32, flags: *u32, overlapped: ?*anyopaque, completion: ?*anyopaque) callconv(.winapi) c_int;
+extern "ws2_32" fn WSASendTo(socket: usize, buffers: *const anyopaque, count: u32, sent: ?*u32, flags: u32, address: [*]const u8, address_len: i32, overlapped: *Overlapped, completion: ?*anyopaque) callconv(.winapi) c_int;
+extern "ws2_32" fn WSARecvFrom(socket: usize, buffers: *const anyopaque, count: u32, received: ?*u32, flags: *u32, address: [*]u8, address_len: *i32, overlapped: *Overlapped, completion: ?*anyopaque) callconv(.winapi) c_int;
+const AddrInfoW = extern struct {
+    flags: c_int = 0,
+    family: c_int = 0,
+    socktype: c_int = 0,
+    protocol: c_int = 0,
+    address_len: usize = 0,
+    canonical_name: ?[*:0]const u16 = null,
+    address: ?[*]const u8 = null,
+    next: ?*AddrInfoW = null,
+};
+extern "ws2_32" fn GetAddrInfoW(name: [*:0]const u16, service: ?[*:0]const u16, hints: *const AddrInfoW, result: *?*AddrInfoW) callconv(.winapi) c_int;
+extern "ws2_32" fn FreeAddrInfoW(result: *AddrInfoW) callconv(.winapi) void;
 extern "ws2_32" fn shutdown(socket: usize, how: i32) callconv(.winapi) c_int;
 
 const Overlapped = extern struct {
@@ -84,6 +99,16 @@ pub fn isWine() bool {
     // repeat the lookup, then publish the same value without a lock.
     wine_status.store(if (wine) 2 else 1, .monotonic);
     return wine;
+}
+
+/// Use the documented API rather than private PEB data, which Wine omits.
+/// The returned path borrows the caller's buffer and excludes the terminator.
+pub fn systemDirectory(buffer: []u16) error{Unexpected}![]const u16 {
+    const len = GetSystemDirectoryW(buffer.ptr, std.math.cast(u32, buffer.len) orelse return error.Unexpected);
+    if (len == 0) return windows.unexpectedError(@fromBackingInt(GetLastError()));
+    // An insufficient buffer returns the required length including NUL.
+    if (len >= buffer.len) return error.Unexpected;
+    return buffer[0..len];
 }
 
 fn wineNtdll() ?*anyopaque {
@@ -127,7 +152,7 @@ fn socketError() error{ SystemResources, Unexpected } {
     return unexpectedSocketError(code);
 }
 
-pub fn openSocket(family: i32, mode: i32, protocol: i32) !windows.HANDLE {
+fn ensureWinsock() error{NetworkDown}!void {
     if (!winsock_ready.load(.acquire)) {
         AcquireSRWLockExclusive(&winsock_init_lock);
         defer ReleaseSRWLockExclusive(&winsock_init_lock);
@@ -139,9 +164,152 @@ pub fn openSocket(family: i32, mode: i32, protocol: i32) !windows.HANDLE {
             winsock_ready.store(true, .release);
         }
     }
+}
+
+pub fn openSocket(family: i32, mode: i32, protocol: i32) !windows.HANDLE {
+    try ensureWinsock();
     const socket = WSASocketW(family, mode, protocol, null, 0, 0x01 | 0x80);
     if (socket == std.math.maxInt(usize)) return socketError();
     return @ptrFromInt(socket);
+}
+
+// Wine's GetAddrInfoExCancel is a stub. A provider call therefore owns its
+// storage independently of the waiting executor. Cancellation releases only
+// the caller reference; completion frees the result/event/request. Admission
+// remains charged until both owners release, bounding detached work and memory.
+const max_dns_requests = 32;
+var dns_requests: std.atomic.Value(usize) = .init(0);
+const DnsRequest = struct {
+    references: std.atomic.Value(u8) = .init(2),
+    event: windows.HANDLE,
+    name: [std.Io.net.HostName.max_len:0]u16,
+    hints: AddrInfoW,
+    result: ?*AddrInfoW = null,
+    status: c_int = 0,
+
+    fn release(self: *DnsRequest) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        if (self.result) |result| FreeAddrInfoW(result);
+        windows.CloseHandle(self.event);
+        std.heap.page_allocator.destroy(self);
+        _ = dns_requests.fetchSub(1, .release);
+    }
+
+    fn run(self: *DnsRequest) void {
+        defer self.release();
+        self.status = if (@import("builtin").is_test and DnsTesting.provider != null)
+            DnsTesting.provider.?()
+        else
+            GetAddrInfoW(&self.name, null, &self.hints, &self.result);
+        signalIoEvent(self.event);
+    }
+};
+
+pub const DnsTesting = if (@import("builtin").is_test) struct {
+    /// Set only while no provider request is running; restore after draining.
+    pub var provider: ?*const fn () c_int = null;
+    pub fn pending() usize {
+        return dns_requests.load(.acquire);
+    }
+    pub fn enabled() bool {
+        return isWine();
+    }
+    pub fn cancelAtSubmission() !void {
+        const Cancel = struct {
+            fn wait(_: windows.HANDLE) error{Canceled}!void {
+                return error.Canceled;
+            }
+        };
+        var buffer: [16]std.Io.net.HostName.LookupResult = undefined;
+        var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&buffer);
+        return lookupHostWine(std.testing.io, try .init("request.invalid"), &queue, .{ .port = 80 }, Cancel.wait);
+    }
+} else void;
+
+pub fn lookupHostWine(io: std.Io, host: std.Io.net.HostName, resolved: *std.Io.Queue(std.Io.net.HostName.LookupResult), options: std.Io.net.HostName.LookupOptions, comptime wait: anytype) (std.Io.net.HostName.LookupError || std.Io.QueueClosedError)!void {
+    try ensureWinsock();
+    var count = dns_requests.load(.monotonic);
+    while (true) {
+        if (count >= max_dns_requests) return error.SystemResources;
+        count = dns_requests.cmpxchgWeak(count, count + 1, .acquire, .monotonic) orelse break;
+    }
+    const request = std.heap.page_allocator.create(DnsRequest) catch {
+        _ = dns_requests.fetchSub(1, .release);
+        return error.SystemResources;
+    };
+    const event = createIoEvent() catch |err| {
+        std.heap.page_allocator.destroy(request);
+        _ = dns_requests.fetchSub(1, .release);
+        return err;
+    };
+    request.* = .{
+        .event = event,
+        .name = undefined,
+        .hints = .{
+            .family = if (options.family) |family| switch (family) {
+                .ip4 => 2,
+                .ip6 => 23,
+            } else 0,
+            .socktype = 1,
+            .protocol = 6,
+            .flags = if (options.canonical_name_buffer != null) 2 else 0,
+        },
+    };
+    defer request.release();
+    const name_len = std.unicode.utf8ToUtf16Le(&request.name, host.bytes) catch unreachable;
+    request.name[name_len] = 0;
+    const worker = std.Thread.spawn(.{}, DnsRequest.run, .{request}) catch {
+        request.release(); // No provider took its reference.
+        return error.SystemResources;
+    };
+    worker.detach();
+    try wait(request.event);
+    switch (request.status) {
+        0 => {},
+        11001, 11004 => return error.UnknownHostName,
+        11002, 11003, 10060 => return error.NameServerFailure,
+        8, 10055 => return error.SystemResources,
+        10050, 10093 => return error.NetworkDown,
+        else => |code| return unexpectedSocketError(code),
+    }
+    const backend = @import("threaded_windows.zig");
+    var next = request.result;
+    var addresses: usize = 0;
+    // Match HostName.lookup's bounded-queue guarantee, reserving the final slot
+    // for a canonical name when requested.
+    const limit: usize = if (options.canonical_name_buffer != null) 15 else 16;
+    while (next) |info| : (next = info.next) {
+        const size: usize = switch (info.family) {
+            2 => @sizeOf(std.posix.sockaddr.in),
+            23 => @sizeOf(std.posix.sockaddr.in6),
+            else => continue,
+        };
+        if (info.address_len < size or info.address == null) return error.Unexpected;
+        var storage: backend.PosixAddress = std.mem.zeroes(backend.PosixAddress);
+        @memcpy(std.mem.asBytes(&storage)[0..size], info.address.?[0..size]);
+        var address = backend.addressFromPosix(&storage);
+        address.setPort(options.port);
+        try resolved.putOne(io, .{ .address = address });
+        addresses += 1;
+        if (addresses == limit) break;
+    }
+    if (addresses == 0) return error.NoAddressReturned;
+    if (options.canonical_name_buffer) |buffer| {
+        const canonical: []const u8 = if (request.result.?.canonical_name) |name| canonical: {
+            // HostName accepts ASCII DNS labels. Check the provider's length
+            // and character range before copying into the caller's fixed buffer.
+            var len: usize = 0;
+            while (name[len] != 0) : (len += 1) {
+                if (len == buffer.len or name[len] > 0x7f) return error.InvalidDnsCnameRecord;
+                buffer[len] = @intCast(name[len]);
+            }
+            break :canonical buffer[0..len];
+        } else canonical: {
+            @memcpy(buffer[0..host.bytes.len], host.bytes);
+            break :canonical buffer[0..host.bytes.len];
+        };
+        try resolved.putOne(io, .{ .canonical_name = std.Io.net.HostName.init(canonical) catch return error.InvalidDnsCnameRecord });
+    }
 }
 
 pub fn closeSocket(socket: windows.HANDLE) void {
@@ -300,6 +468,81 @@ pub fn receiveBuffers(socket: windows.HANDLE, buffers: []const windows.AFD.WSABU
     return completeSocketOperation(socket, &operation, wait);
 }
 
+/// Datagram address storage, buffers and OVERLAPPED remain owned until the
+/// request completes or cancellation has been drained. Even immediate success
+/// is queried through Winsock so byte counts come from the completion result.
+pub fn sendDatagram(socket: windows.HANDLE, buffers: []const windows.AFD.WSABUF(.@"const"), address: []const u8, flags: std.Io.net.SendFlags, comptime wait: anytype) std.Io.net.Socket.SendError!usize {
+    var operation: Overlapped = .{ .event = try createIoEvent() };
+    defer windows.CloseHandle(operation.event.?);
+    const send_flags: u32 = (if (flags.oob) @as(u32, 1) else 0) | (if (flags.dont_route) @as(u32, 4) else 0);
+    if (WSASendTo(@intFromPtr(socket), buffers.ptr, @intCast(buffers.len), null, send_flags, address.ptr, @intCast(address.len), &operation, null) != 0) {
+        const code = WSAGetLastError();
+        if (code != 997) return datagramSendError(code);
+        try waitAndDrainSocketOperation(socket, &operation, wait);
+    }
+    var sent: u32 = 0;
+    var result_flags: u32 = 0;
+    if (WSAGetOverlappedResult(@intFromPtr(socket), &operation, &sent, 0, &result_flags) == 0) return datagramSendError(WSAGetLastError());
+    return sent;
+}
+
+pub fn receiveDatagram(socket: windows.HANDLE, buffers: []const windows.AFD.WSABUF(.@"var"), address: []u8, address_len: *i32, flags: *u32, comptime wait: anytype) std.Io.net.Socket.ReceiveError!usize {
+    var operation: Overlapped = .{ .event = try createIoEvent() };
+    defer windows.CloseHandle(operation.event.?);
+    if (WSARecvFrom(@intFromPtr(socket), buffers.ptr, @intCast(buffers.len), null, flags, address.ptr, address_len, &operation, null) != 0) {
+        const code = WSAGetLastError();
+        if (code != 997) return datagramReceiveError(code);
+        try waitAndDrainSocketOperation(socket, &operation, wait);
+    }
+    var received: u32 = 0;
+    if (WSAGetOverlappedResult(@intFromPtr(socket), &operation, &received, 0, flags) == 0) return datagramReceiveError(WSAGetLastError());
+    return received;
+}
+
+fn datagramSendError(code: c_int) std.Io.net.Socket.SendError {
+    return switch (code) {
+        995, 10004 => error.Canceled,
+        10013 => error.AccessDenied,
+        10040 => error.MessageOversize,
+        10047 => error.AddressFamilyUnsupported,
+        10050 => error.NetworkDown,
+        10051 => error.NetworkUnreachable,
+        10053, 10054 => error.ConnectionResetByPeer,
+        10055 => error.SystemResources,
+        10057, 10058 => error.SocketUnconnected,
+        10060 => error.ConnectionTimedOut,
+        10061 => error.ConnectionRefused,
+        10064, 10065 => error.HostUnreachable,
+        else => unexpectedSocketError(code),
+    };
+}
+
+fn datagramReceiveError(code: c_int) std.Io.net.Socket.ReceiveError {
+    return switch (code) {
+        995, 10004 => error.Canceled,
+        10040 => error.MessageOversize,
+        10050 => error.NetworkDown,
+        10053 => error.ConnectionResetByPeer,
+        10054 => error.PortUnreachable,
+        10055 => error.SystemResources,
+        10057, 10058 => error.SocketUnconnected,
+        10060 => error.ConnectionTimedOut,
+        else => unexpectedSocketError(code),
+    };
+}
+
+// Cancel only this request and drain even when completion races cancellation.
+// The event, OVERLAPPED, address and data buffers cannot be freed before then.
+fn waitAndDrainSocketOperation(socket: windows.HANDLE, operation: *Overlapped, comptime wait: anytype) error{ Canceled, Unexpected }!void {
+    wait(operation.event.?) catch |err| {
+        var transferred: u32 = 0;
+        var flags: u32 = 0;
+        _ = CancelIoEx(socket, operation);
+        _ = WSAGetOverlappedResult(@intFromPtr(socket), operation, &transferred, 1, &flags);
+        return err;
+    };
+}
+
 pub fn createIoEvent() error{ SystemResources, Unexpected }!windows.HANDLE {
     return CreateEventW(null, 1, 0, null) orelse switch (GetLastError()) {
         8, 14, 1450 => error.SystemResources,
@@ -329,13 +572,7 @@ pub fn waitIoEvent(event: windows.HANDLE, cancellation: ?windows.HANDLE) error{U
 fn completeSocketOperation(socket: windows.HANDLE, operation: *Overlapped, comptime wait: anytype) error{ Canceled, ConnectionResetByPeer, ConnectionTimedOut, SystemResources, Unexpected }!usize {
     var transferred: u32 = 0;
     var flags: u32 = 0;
-    wait(operation.event.?) catch |err| {
-        // Cancel only this request. A completion racing cancellation is valid;
-        // either way, drain before the event, buffers or OVERLAPPED go away.
-        _ = CancelIoEx(socket, operation);
-        _ = WSAGetOverlappedResult(@intFromPtr(socket), operation, &transferred, 1, &flags);
-        return err;
-    };
+    try waitAndDrainSocketOperation(socket, operation, wait);
     if (WSAGetOverlappedResult(@intFromPtr(socket), operation, &transferred, 0, &flags) == 0) return streamSocketError(WSAGetLastError());
     return transferred;
 }

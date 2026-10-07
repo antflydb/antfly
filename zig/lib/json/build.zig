@@ -25,4 +25,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const consumer_test = b.addSystemCommand(&.{"python3"});
+    consumer_test.addFileArg(b.path("tests/test_standalone_consumer.py"));
+    consumer_test.addArg(b.graph.zig_exe);
+    b.step("test-standalone-consumer", "Compile libc-free Linux and freestanding WASM consumers")
+        .dependOn(&consumer_test.step);
 }

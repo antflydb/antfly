@@ -17,6 +17,7 @@
 const std = @import("std");
 const windows = @import("windows_native.zig");
 const is_windows = @import("builtin").os.tag == .windows;
+pub const dns_testing = if (is_windows and @import("builtin").is_test) windows.DnsTesting else void;
 pub const socket_testing = if (is_windows and @import("builtin").is_test) windows.SocketTesting else void;
 
 pub const CLOCK = if (is_windows) windows.clockid_t else std.posix.CLOCK;

@@ -130,6 +130,29 @@ pub fn addTests(b: *std.Build, options: struct {
         .optimize = optimize,
         .link_libc = link_libc,
     });
+    const public_clocks = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "tests/clock_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+        .imports = &.{.{ .name = "antfly_platform", .module = io_platform }},
+    }) });
+    const run_public_clocks = b.addRunArtifact(public_clocks);
+    const linux_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    const linux_platform = createModule(b, .{
+        .root_source_file = options.root.path(b, "src/root.zig"),
+        .filesystem_capacity_source_file = options.root.path(b, "src/filesystem_capacity.c"),
+        .target = linux_target,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+    const public_clocks_nolibc = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "tests/clock_test.zig"),
+        .target = linux_target,
+        .optimize = optimize,
+        .link_libc = false,
+        .imports = &.{.{ .name = "antfly_platform", .module = linux_platform }},
+    }) });
     const io_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = options.root.path(b, "tests/io_namespace_test.zig"),
         .target = target,
@@ -164,6 +187,8 @@ pub fn addTests(b: *std.Build, options: struct {
     const run_unit = b.addRunArtifact(unit);
     run_unit.step.dependOn(&run_io_tests.step);
     run_unit.step.dependOn(&run_clocks.step);
+    run_unit.step.dependOn(&run_public_clocks.step);
+    run_unit.step.dependOn(&public_clocks_nolibc.step);
     run_unit.step.dependOn(&syscall_clocks.step);
     run_unit.step.dependOn(&run_atomic_tests.step);
     run_unit.step.dependOn(&run_entropy_tests.step);

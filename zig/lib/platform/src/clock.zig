@@ -85,12 +85,7 @@ pub const ManualClock = struct {
 };
 
 fn realNowRealtimeNs(_: ?*anyopaque) u64 {
-    var ts: @import("root.zig").c.timespec = undefined;
-    switch (std.posix.errno(@import("root.zig").c.clock_gettime(.REALTIME, &ts))) {
-        .SUCCESS => {},
-        else => unreachable,
-    }
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return @import("time.zig").realtimeNs();
 }
 
 fn realSleepMs(_: ?*anyopaque, ms: u64) void {

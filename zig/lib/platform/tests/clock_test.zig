@@ -13,18 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-.{
-    .name = .antfly_json,
-    .version = "0.0.1",
-    .fingerprint = 0x1e032fe902c38c48,
-    .minimum_zig_version = "0.17.0",
-    .dependencies = .{ .antfly_platform = .{ .path = "../platform" } },
-    .paths = .{
-        "build.zig",
-        "build.zig.zon",
-        "src",
-        "tests",
-        "bench",
-        "JSON.md",
-    },
+const std = @import("std");
+const platform = @import("antfly_platform");
+
+test "public real clock uses the platform wall clock and can sleep" {
+    const clock = platform.clock.Clock.real();
+    try std.testing.expect(clock.isReal());
+    try std.testing.expect(clock.nowRealtimeNs() > 0);
+    clock.sleepMs(1);
+    // Wall time can be adjusted while sleeping; it need not be monotonic.
+    try std.testing.expect(clock.nowRealtimeMs() > 0);
 }

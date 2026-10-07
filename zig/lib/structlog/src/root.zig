@@ -94,11 +94,7 @@ pub fn logFn(
 }
 
 fn writeTimestamp(writer: *std.Io.Writer) !void {
-    var ts: platform.c.timespec = undefined;
-    const epoch_secs: i64 = switch (std.posix.errno(platform.c.clock_gettime(.REALTIME, &ts))) {
-        .SUCCESS => ts.sec,
-        else => 0,
-    };
+    const epoch_secs: i64 = @intCast(platform.time.realtimeNs() / std.time.ns_per_s);
     const epoch_day: i32 = @intCast(@divFloor(epoch_secs, 86400));
     const day_secs: u32 = @intCast(@mod(epoch_secs, 86400));
 

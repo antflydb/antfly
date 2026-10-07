@@ -89,6 +89,8 @@ fn bindStandaloneModule(b: *std.Build, module: *std.Build.Module) void {
     const dependency = b.dependency("antfly_platform", .{
         .target = module.resolved_target orelse b.graph.host,
         .optimize = module.optimize orelse .debug,
+        // Binding an executor must not impose libc on a pure Zig library.
+        .link_libc = module.link_libc orelse false,
     });
     bindPlatform(module, dependency.module("antfly_platform"));
 }
