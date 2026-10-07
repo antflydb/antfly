@@ -128,9 +128,16 @@ class PostgresReferenceTest(unittest.TestCase):
                     with self.db.transaction():
                         self.db.execute(sql)
                 self.assertEqual("22003", failure.exception.sqlstate)
-            self.assertEqual(3, self.db.execute("SELECT COUNT(*) FROM exprs").fetchone()[0])
-            self.db.execute("ALTER TABLE exprs ADD COLUMN extra integer DEFAULT (4*5) NOT NULL")
-            self.assertEqual([(20,), (20,), (20,)], self.db.execute("SELECT extra FROM exprs").fetchall())
+            self.assertEqual(
+                3, self.db.execute("SELECT COUNT(*) FROM exprs").fetchone()[0]
+            )
+            self.db.execute(
+                "ALTER TABLE exprs ADD COLUMN extra integer DEFAULT (4*5) NOT NULL"
+            )
+            self.assertEqual(
+                [(20,), (20,), (20,)],
+                self.db.execute("SELECT extra FROM exprs").fetchall(),
+            )
             for sql in (
                 "ALTER TABLE exprs ADD COLUMN bad integer GENERATED ALWAYS AS (g+1) STORED",
                 "ALTER TABLE exprs ADD COLUMN bad integer GENERATED ALWAYS AS (bad+1) STORED",
@@ -1135,7 +1142,9 @@ class PostgresReferenceTest(unittest.TestCase):
         import json
         import psycopg
 
-        entries = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())["entries"]
+        entries = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
         selected = [case for case in entries if case["id"] in ("sql-0672", "sql-0673")]
         self.assertEqual(2, len(selected))
         for case in selected:
