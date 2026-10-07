@@ -1164,3 +1164,18 @@ Linux; the [broker receipt](qualification/workload-pooling/receipts/2026-10-07/b
 pins source and full logs. Production owner/CPU wiring, parent wait handoff,
 complete retained-memory accounting and whole-inference qualification remain
 pending. This boundary alone does not bound production inference execution.
+
+### Inference owner adapter and real handoff gate (2026-10-07)
+
+A broker provider now acquires checked inference capsules and installs a
+one-CPU native scope on the executing worker. Collective cancellation retains
+per-member deadlines; completion restores scope and retires the capsule.
+Both platforms pass 22 adapter/broker and 8 real owner/integration tests;
+[adapter receipts](qualification/workload-pooling/receipts/2026-10-07/inference-owner-adapter/README.md)
+pin source, arguments and full output. The real scheduler proves parent parking,
+inference admission, concurrent control progress and parent reacquisition.
+Production Node/host installation requires propagating that handoff first:
+current embedded calls retain the SQL grant and nested admission could deadlock.
+Worker-process transfer, other backend teams, complete memory accounting and
+full production/default qualification are still required. The adapter is not
+installed by production yet.
