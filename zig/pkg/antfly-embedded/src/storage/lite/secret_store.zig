@@ -712,6 +712,9 @@ test "lite secret metadata listing seeks its scope without loading unrelated cat
     defer alloc.free(path);
     var docs = try docstore.Store.create(alloc, path, true);
     defer docs.close();
+    // This file-wide counter includes background retirement reads. Keep the
+    // foreground seek bound independent of maintenance scheduling.
+    docs.maintenance_start_suppressed = true;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const mutations = try arena.allocator().alloc(native.CatalogMutation, 2048);
@@ -730,5 +733,7 @@ test "lite secret metadata listing seeks its scope without loading unrelated cat
     defer listing.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), listing.entries.len);
     try std.testing.expectEqualStrings("token", listing.entries[0].key);
-    try std.testing.expect(docs.file.test_page_reads.load(.monotonic) - before <= 24);
+    const foreground_reads = docs.file.test_page_reads.load(.monotonic) - before;
+    std.debug.print("LITE_SECRET_SCOPE_READS unrelated=2048 foreground_reads={d}\n", .{foreground_reads});
+    try std.testing.expect(foreground_reads <= 24);
 }
