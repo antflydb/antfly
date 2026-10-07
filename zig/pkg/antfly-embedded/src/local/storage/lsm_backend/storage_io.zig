@@ -3349,6 +3349,15 @@ const NativeStreamingAtomicWriteSink = struct {
         return try self.staged.crc32Range(offset, range_len);
     }
 
+    fn deleteStagingFile(self: *NativeStreamingAtomicWriteSink) void {
+        const io = self.staged.io;
+        // Cleanup must run even when cancellation arrives just before abort.
+        // Restore protection before deinit can release an owned I/O runtime.
+        const previous = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(previous);
+        deleteFilePathWithIo(io, self.tmp_path) catch {};
+    }
+
     fn finish(ptr: *anyopaque) !void {
         const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
@@ -3358,7 +3367,7 @@ const NativeStreamingAtomicWriteSink = struct {
         self.staged.sync() catch |err| {
             self.staged.file.close(io);
             self.file_open = false;
-            deleteFilePathWithIo(io, self.tmp_path) catch {};
+            self.deleteStagingFile();
             if (self.state) |state| state.invalidatePath(self.tmp_path);
             return err;
         };
@@ -3367,7 +3376,7 @@ const NativeStreamingAtomicWriteSink = struct {
         if (self.state) |state| state.invalidateRename(self.tmp_path, self.final_path);
         defer if (self.state) |state| state.invalidateRename(self.tmp_path, self.final_path);
         renamePathWithIo(io, self.tmp_path, self.final_path) catch |err| {
-            deleteFilePathWithIo(io, self.tmp_path) catch {};
+            self.deleteStagingFile();
             return err;
         };
         try syncParentPathWithIo(io, self.final_path);
@@ -3378,7 +3387,7 @@ const NativeStreamingAtomicWriteSink = struct {
         self.staged.file.close(self.staged.io);
         self.file_open = false;
         if (self.state) |state| state.invalidatePath(self.tmp_path);
-        deleteFilePathWithIo(self.staged.io, self.tmp_path) catch {};
+        self.deleteStagingFile();
         if (self.state) |state| state.invalidatePath(self.tmp_path);
         self.deinit();
     }
@@ -5522,6 +5531,51 @@ test "native streaming atomic write sink bounds memory and abort preserves publi
     }
     try std.testing.expectEqual(@as(usize, 1), names.len);
     try std.testing.expectEqualStrings(std.fs.path.basename(path), names[0]);
+}
+
+test "native streaming atomic abort removes staging despite pending cancellation" {
+    if (!supports_native_storage or builtin.os.tag == .wasi) return error.SkipZigTest;
+    var test_tmp = try TestDirectory.init("canceled_staging");
+    defer test_tmp.cleanup();
+    var pool = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    const State = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(i: std.Io, self: *@This(), path: []const u8) void {
+            var sink = NativeStreamingAtomicWriteSink.createBorrowed(std.testing.allocator, path, i) catch |err| {
+                self.failure = err;
+                self.started.set(i);
+                return;
+            };
+            self.started.set(i);
+            // Leave cancellation pending until abort starts. A cancellable
+            // gate would consume it before the cleanup we need to exercise.
+            self.release.waitUncancelable(i);
+            sink.abort();
+        }
+        fn releaseChild(i: std.Io, self: *@This()) void {
+            i.sleep(.fromMilliseconds(50), .awake) catch {};
+            self.release.set(i);
+        }
+    };
+    var state: State = .{};
+    var child = try io.concurrent(State.run, .{ io, &state, test_tmp.path() });
+    try state.started.wait(io);
+    var release = try io.concurrent(State.releaseChild, .{ io, &state });
+    child.cancel(io);
+    release.await(io);
+    if (state.failure) |err| return err;
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+    const names = try native.storage().listFileNamesAlloc(std.testing.allocator, std.fs.path.dirname(test_tmp.path()).?);
+    defer {
+        for (names) |name| std.testing.allocator.free(name);
+        std.testing.allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 0), names.len);
 }
 
 test "Windows borrowed executor atomic writes bound memory and preserve I/O authority" {
