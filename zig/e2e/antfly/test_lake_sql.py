@@ -1056,8 +1056,21 @@ def test_native_remote_ordered_index_exact_bounds_and_restart(tmp_path, covering
                     f"SELECT amount, COUNT(*) FROM lake_ordered WHERE amount = {base + 17} GROUP BY amount"
                 )
                 assert cursor.fetchall() == [(base + 17, 12)]
+        def check_filtered_limits():
+            # OFFSET crosses an indexed value boundary; covered-column
+            # residuals must still run before LIMIT on either access path.
+            bounds = f"amount >= {base + 17} AND amount < {base + 19}"
+            assert call("POST", "/sql", {"statement":
+                f"SELECT amount FROM lake_ordered WHERE {bounds} ORDER BY amount LIMIT 3 OFFSET 11"
+            })["rows"] == [[str(base + 17)], [str(base + 18)], [str(base + 18)]]
+            assert call("POST", "/sql", {"statement":
+                f"SELECT amount FROM lake_ordered WHERE {bounds} AND label = 'row-82' ORDER BY amount LIMIT 1"
+            })["rows"] == [[str(base + 17)]]
+
+        check_filtered_limits()
         previous_cursor = collected[0]["cursor"]
         server.restart()
+        check_filtered_limits()
         body["after"] = previous_cursor
         resumed = call("POST", "/tables/lake_ordered/rows/query", body, lines=True)
         assert resumed and resumed[0]["_id"] == collected[1]["_id"]
@@ -1200,9 +1213,32 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             "row-2055",
         }
         assert all(hit["_score"] > 0 for hit in hits)
-        prefix_request = dict(
-            request, full_text_search={"prefix": "need", "field": "body"}
-        )
+        # Highlight from the pinned original document, including fields omitted
+        # from the result projection. Returned source must stay projected.
+        highlight_request = dict(request, fields=["label"], highlight={"fields": ["body"]})
+        def assert_highlights(response, include_source=True):
+            highlighted = response["hits"]["hits"]
+            assert [hit["_id"] for hit in highlighted] == [hit["_id"] for hit in hits], response
+            for hit in highlighted:
+                if include_source:
+                    assert set(hit["_source"]) == {"label"}, hit
+                else:
+                    assert not hit.get("_source"), hit
+                fragments = hit["_highlights"]["body"]
+                assert fragments and any(
+                    fragment["text"][span["start"]:span["end"]].lower() == "needle"
+                    for fragment in fragments for span in fragment["spans"]), hit
+        assert_highlights(call("POST", "/tables/lake_text/query", highlight_request))
+        assert_highlights(call("POST", "/tables/lake_text/query", dict(highlight_request, highlight={})))
+        assert_highlights(call("POST", "/tables/lake_text/query", dict(highlight_request, highlight={}, fields=[])),
+                          include_source=False)
+        assert_highlights(call("POST", "/tables/lake_text/query",
+                               dict(highlight_request, full_text_index="all_text")))
+        assert_highlights(call("POST", "/tables/lake_text/query", dict(highlight_request, fields=[])),
+                          include_source=False)
+        all_highlighted = call("POST", "/tables/lake_text/query", dict(request, highlight={}))
+        assert all(hit["_highlights"]["body"] for hit in all_highlighted["hits"]["hits"]), all_highlighted
+        prefix_request = dict(request, full_text_search={"prefix": "need", "field": "body"})
         prefix_result = call("POST", "/tables/lake_text/query", prefix_request)
         assert {hit["_id"] for hit in prefix_result["hits"]["hits"]} == {
             hit["_id"] for hit in hits
@@ -1280,15 +1316,22 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             indexes=["dense_native", "sparse_native"],
         )
         mixed_result = call("POST", "/tables/lake_text/query", mixed_request)
-        assert {hit["_source"]["label"] for hit in mixed_result["hits"]["hits"]} >= {
-            "row-17",
-            "row-18",
-            "row-129",
-            "row-2055",
-        }, mixed_result
-        assert all(hit["_score"] > 0 for hit in mixed_result["hits"]["hits"]), (
-            mixed_result
-        )
+        assert {hit["_source"]["label"] for hit in mixed_result["hits"]["hits"]} >= {"row-17", "row-18", "row-129", "row-2055"}, mixed_result
+        assert all(hit["_score"] > 0 for hit in mixed_result["hits"]["hits"]), mixed_result
+        # Final-page typed hydration must preserve exact source values and
+        # keep highlight-only dependencies out of the public projection,
+        # including after text/dense/sparse fusion.
+        typed_request = dict(request, fields=["label", "amount"], highlight={"fields": ["body"]})
+        def assert_typed_page(response):
+            for hit in response["hits"]["hits"]:
+                source = hit["_source"]
+                assert set(source) == {"label", "amount"}, hit
+                assert source["amount"] == base + int(source["label"].removeprefix("row-")), hit
+                if source["label"] in {"row-17", "row-18", "row-129", "row-2055"}:
+                    assert hit["_highlights"]["body"], hit
+        assert_typed_page(call("POST", "/tables/lake_text/query", typed_request))
+        assert_typed_page(call("POST", "/tables/lake_text/query",
+                              dict(mixed_request, fields=["label", "amount"], highlight={"fields": ["body"]})))
         ordered_request = dict(request, order_by=[{"field": "_score", "desc": True}])
         ordered_first = call(
             "POST", "/tables/lake_text/query", dict(ordered_request, limit=1)
@@ -1346,9 +1389,9 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             (hit["_id"], hit["_score"]) for hit in dense_reopened["hits"]["hits"]
         ] == [(hit["_id"], hit["_score"]) for hit in dense_result["hits"]["hits"]]
         sparse_reopened = call("POST", "/tables/lake_text/query", sparse_request)
-        assert [
-            (hit["_id"], hit["_score"]) for hit in sparse_reopened["hits"]["hits"]
-        ] == [(hit["_id"], hit["_score"]) for hit in sparse_result["hits"]["hits"]]
+        assert [(hit["_id"], hit["_score"]) for hit in sparse_reopened["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in sparse_result["hits"]["hits"]]
+        assert_highlights(call("POST", "/tables/lake_text/query", highlight_request))
+        assert_typed_page(call("POST", "/tables/lake_text/query", typed_request))
         warm = call("POST", "/tables/lake_text/query", request)
         assert [(hit["_id"], hit["_score"]) for hit in warm["hits"]["hits"]] == [
             (hit["_id"], hit["_score"]) for hit in hits

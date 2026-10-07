@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Leased native row-index consumption. Seek candidates in bounded windows,
 //! hydrate physical vectors, then apply deletes and residuals before delivery.
 const std = @import("std");
@@ -29,6 +42,7 @@ const Owner = struct {
     child_exhausted: bool = false,
     window: std.heap.ArenaAllocator,
     cover_arena: std.heap.ArenaAllocator,
+    cover_lease: ?@import("lake_index_decoded_metadata.zig").Owned(local.sql_spill.ColumnarBlock) = null,
     cover_candidates: []const ordered.Reader.Entry = &.{},
     cover_candidate_offset: usize = 0,
     cursor_header: ?[local.storage_db_relational_row_cursor.identity_len]u8 = null,
@@ -55,6 +69,7 @@ const Owner = struct {
         if (self.lease) |lease| lease.deinit();
         if (self.ordered_store) |*store| store.deinit();
         self.window.deinit();
+        if (self.cover_lease) |owned| owned.release();
         self.cover_arena.deinit();
         self.arena.deinit();
         self.store.deinit();
@@ -175,6 +190,19 @@ const Owner = struct {
         const covered = self.covered_blocks[row];
         return covered.block.cell(covered.row, column);
     }
+    fn coveredIdentity(raw: *anyopaque, row: usize, column: usize) !?u64 {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        const covered = self.covered_blocks[row];
+        return covered.block.dictionaryIdentity(covered.row, column, false);
+    }
+    fn coveredDictionary(raw: *anyopaque, a: A, column: usize) !?local.sql_execution_batch.Batch {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        // Each covering window belongs to exactly one authenticated block.
+        const dictionary = (try self.covered_blocks[0].block.dictionaryColumn(a, column, false)) orelse return null;
+        const indices = try a.alloc(u32, self.covered_blocks.len);
+        for (indices, self.covered_blocks) |*id, covered| id.* = dictionary.dictionary.indices[covered.row];
+        return .{ .dictionary = .{ .values = dictionary.dictionary.values, .indices = indices } };
+    }
     fn nextCovered(self: *Owner, limit: u32) !catalog.ColumnPage {
         if (limit == 0) return error.InvalidRelationalRowsRequest;
         try self.read_context.ensureActive();
@@ -186,6 +214,8 @@ const Owner = struct {
                 self.cover_candidate_offset = 0;
                 if (self.cover_candidates.len == 0) return .{ .selection = &.{} };
             }
+            if (self.cover_lease) |owned| owned.release();
+            self.cover_lease = null;
             _ = self.cover_arena.reset(.retain_capacity);
             const a = self.cover_arena.allocator();
             const begin = self.cover_candidate_offset;
@@ -198,8 +228,14 @@ const Owner = struct {
             self.covered_entries = self.cover_candidates[begin..end];
             self.cover_candidate_offset = end;
             try @import("../serverless/artifacts/store.zig").chargeReadBudget(&self.reader.remaining_reads, cover.block.byte_len);
-            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, self.reader.cached);
-            const block = try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            const block = if (self.reader.cached) |cached| cached_block: {
+                const owned = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.artifacts, cover.block, self.reader.pages.cancellation);
+                self.cover_lease = owned;
+                break :cached_block owned.value.*;
+            } else uncached: {
+                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, null);
+                break :uncached try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            };
             if (block.values.len != self.reader.root.cover.len or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
             const covered = try a.alloc(@typeInfo(@TypeOf(self.covered_blocks)).pointer.child, self.covered_entries.len);
             for (self.covered_entries, covered) |entry, *position| {
@@ -210,11 +246,37 @@ const Owner = struct {
                 position.* = .{ .block = block, .row = candidate.row };
             }
             self.covered_blocks = covered;
-            self.covered_batch = .{ .reader = .{ .ptr = self, .read = coveredCell, .count = covered.len, .width = self.reader.root.cover.len } };
+            self.covered_batch = .{ .reader = .{ .ptr = self, .read = coveredCell, .read_identity = coveredIdentity, .read_dictionary = coveredDictionary, .count = covered.len, .width = self.reader.root.cover.len } };
             var selected: std.ArrayList(usize) = .empty;
-            for (covered, 0..) |_, row| {
+            const mask = try a.alloc(bool, covered.len);
+            @memset(mask, true);
+            // Evaluate each predicate once per dictionary identity. Surviving
+            // lanes alone participate, preserving short-circuit error behavior.
+            for (self.request.conditions) |condition| {
+                var results: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+                defer results.deinit(a);
+                var column: ?usize = null;
+                for (self.reader.root.cover, 0..) |name, i| if (std.mem.eql(u8, name, condition.column)) {
+                    column = i;
+                    break;
+                };
+                for (mask, 0..) |*keep, row| {
+                    if (!keep.*) continue;
+                    const one: catalog.ColumnPage = .{ .native = .{ .values = &self.covered_batch, .names = self.reader.root.cover }, .selection = &.{row} };
+                    const identity = if (column) |c| try self.covered_batch.dictionaryIdentity(row, c) else null;
+                    if (identity) |id| {
+                        if (results.get(id)) |cached| {
+                            keep.* = cached;
+                            continue;
+                        }
+                    }
+                    keep.* = try local.sql_lake_cursor.matchesColumns(one, a, self.table, &.{condition});
+                    if (identity) |id| try results.put(a, id, keep.*);
+                }
+            }
+            for (mask, 0..) |keep, row| {
+                if (!keep) continue;
                 const one: catalog.ColumnPage = .{ .native = .{ .values = &self.covered_batch, .names = self.reader.root.cover }, .selection = &.{row} };
-                if (!try local.sql_lake_cursor.matchesColumns(one, a, self.table, self.request.conditions)) continue;
                 if (self.dynamic) |filter| {
                     const values = try a.alloc(local.sql_scalar.Datum, filter.columns.len);
                     defer a.free(values);
@@ -575,9 +637,19 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
         var source_rows: u64 = 0;
         for (source.inventory.files) |file| source_rows +|= file.row_count;
         source_rows = @max(source_rows, if (root.page) |page| page.records else 0);
-        cost.* = accessCost(candidates, owner.covered, order_satisfied);
-        // Broad non-covering ranges prefer sequential physical page decoding.
-        const scan_cost = source_rows *| @as(u64, if (order_satisfied) 2 else 1);
+        var physical_bytes: u64 = 0;
+        var row_groups: u64 = 0;
+        for (source.inventory.files) |file| {
+            for (file.row_groups) |group| {
+                row_groups +|= 1;
+                for (group.column_chunks) |chunk| {
+                    if (covers(request.fields, chunk.column_id)) physical_bytes +|= chunk.compressed_len;
+                }
+            }
+        }
+        const goal = if (rangeEnforcesConditions(definition, request, equal_count)) request.row_goal else null;
+        cost.* = estimatedAccessCost(candidates, owner.covered, order_satisfied, goal, physical_bytes, row_groups);
+        const scan_cost = (source_rows +| (physical_bytes / 1024)) *| @as(u64, if (order_satisfied) 2 else 1);
         if (cost.* > scan_cost and candidates != 0) return null;
     }
     keep = true;
@@ -638,9 +710,91 @@ fn accessCost(candidates: u64, covered: bool, ordered_access: bool) u64 {
     return (row_cost +| 32) / @as(u64, if (ordered_access) 2 else 1);
 }
 
+// chooseAccess emits an equality prefix plus at most one lower/upper bound
+// on its next key. Only that shape can consume OFFSET+LIMIT candidates without
+// assuming selectivity for a residual, covered column or overwritten bound.
+fn rangeEnforcesConditions(index: local.storage_relational_index.RelationalIndexDefinition, request: catalog.Scan, equal_count: usize) bool {
+    for (request.conditions, 0..) |condition, ordinal| {
+        const key = for (index.keys, 0..) |candidate, position| {
+            if (candidate.expression_json == null and candidate.collation == null and std.mem.eql(u8, candidate.column, condition.column)) break position;
+        } else return false;
+        const lower = condition.op == .gt or condition.op == .gte;
+        const upper = condition.op == .lt or condition.op == .lte;
+        if (condition.op == .eq) {
+            if (key >= equal_count) return false;
+        } else if ((!lower and !upper) or key != equal_count) return false;
+        for (request.conditions[0..ordinal]) |previous| {
+            if (!std.mem.eql(u8, previous.column, condition.column)) continue;
+            const previous_lower = previous.op == .gt or previous.op == .gte;
+            const previous_upper = previous.op == .lt or previous.op == .lte;
+            if (condition.op == .eq or (lower and previous_lower) or (upper and previous_upper)) return false;
+        }
+    }
+    return true;
+}
+
+fn estimatedAccessCost(candidates: u64, covered: bool, ordered_access: bool, row_goal: ?u64, projected_bytes: u64, row_groups: u64) u64 {
+    const consumed = if (ordered_access) if (row_goal) |goal| @min(candidates, goal) else candidates else candidates;
+    var cost = accessCost(consumed, covered, ordered_access);
+    // Random candidates may touch one decode region each until all groups
+    // are visited. Unknown clustering uses this conservative upper estimate.
+    if (!covered and row_groups != 0) cost +|= ((projected_bytes / row_groups) *| @min(consumed, row_groups)) / 1024;
+    return cost;
+}
+
+test "external lake access costs SQL row goals only under proven order and charges projected locality" {
+    const broad = estimatedAccessCost(100000, false, true, null, 10000000, 1000);
+    const top_one = estimatedAccessCost(100000, false, true, 1, 10000000, 1000);
+    try std.testing.expect(top_one < broad / 100);
+    try std.testing.expectEqual(estimatedAccessCost(100000, false, false, null, 10000000, 1000), estimatedAccessCost(100000, false, false, 1, 10000000, 1000));
+    try std.testing.expect(estimatedAccessCost(10, false, false, null, 10000000, 1) > estimatedAccessCost(10, false, false, null, 10000000, 1000));
+    try std.testing.expectEqual(estimatedAccessCost(10, true, false, null, 10000000, 1), estimatedAccessCost(10, true, false, null, 10000000, 1000));
+}
+
 test "external lake access cost favors selective and covering ranges" {
     try std.testing.expect(accessCost(10, false, false) < 1000);
     try std.testing.expect(accessCost(900, false, false) > 1000);
     try std.testing.expect(accessCost(900, true, false) < 1000);
     try std.testing.expect(accessCost(900, true, true) < accessCost(900, true, false));
+}
+
+test "external lake filtered row goals require every predicate to be enforced by tuple bounds" {
+    const index: local.storage_relational_index.RelationalIndexDefinition = .{ .name = "tenant_ts", .owner_kind = .table, .owner_name = "tenant_ts", .access_method = .ordered_tuple, .keys = &.{ .{ .column = "tenant" }, .{ .column = "ts" } } };
+    var request: catalog.Scan = .{ .fields = &.{"ts"}, .limit = 256, .row_goal = 3, .conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "ts", .op = .gte, .value = .{ .integer = 1 } }, .{ .column = "ts", .op = .lt, .value = .{ .integer = 10 } } } };
+    try std.testing.expect(rangeEnforcesConditions(index, request, 1));
+    request.conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "covered_residual", .op = .eq, .value = .{ .integer = 1 } } };
+    try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
+    request.conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "ts", .op = .gte, .value = .{ .integer = 1 } }, .{ .column = "ts", .op = .gt, .value = .{ .integer = 5 } } };
+    try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
+}
+
+test "external lake covering batch preserves dictionary identity across reordered candidates and null domains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Datum = local.sql_scalar.Datum;
+    var cells: [32][1]Datum = undefined;
+    var rows: [32]local.sql_operators.Row = undefined;
+    for (&cells, &rows, 0..) |*cell, *row, i| {
+        cell[0] = if (i == 0) .{} else if (i == 1) Datum.json(.null) else Datum.json(.{ .string = if (i % 2 == 0) "a repeated covering payload" else "another repeated covering payload" });
+        row.* = .{ .values = cell, .keys = &.{}, .ordinal = i };
+    }
+    const bytes = try local.sql_spill.encodeColumnarBlockAlloc(a, &rows, 1024 * 1024);
+    const block = try local.sql_spill.decodeColumnarBlockInArena(a, bytes, 1024 * 1024);
+    const positions = try a.alloc(@typeInfo(@TypeOf(@as(Owner, undefined).covered_blocks)).pointer.child, 5);
+    for (positions, [_]u16{ 31, 0, 1, 3, 2 }) |*position, row| position.* = .{ .block = block, .row = row };
+    var owner: Owner = undefined;
+    owner.covered_blocks = positions;
+    const batch: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &owner, .read = Owner.coveredCell, .read_identity = Owner.coveredIdentity, .read_dictionary = Owner.coveredDictionary, .count = positions.len, .width = 1 } };
+    try std.testing.expectEqual(try batch.dictionaryIdentity(0, 0), try batch.dictionaryIdentity(3, 0));
+    try std.testing.expect((try batch.dictionaryIdentity(1, 0)).? != (try batch.dictionaryIdentity(2, 0)).?);
+    const selected = try batch.select(a, &.{ 2, 4, 1, 0 });
+    const dictionary = (try selected.dictionaryColumn(a, 0)).?;
+    for (0..selected.len()) |i| {
+        const expected = try selected.cell(a, i, 0);
+        const actual = try dictionary.cell(a, i, 0);
+        try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+        try std.testing.expectEqual(std.meta.activeTag(expected.value), std.meta.activeTag(actual.value));
+        if (expected.value == .string) try std.testing.expectEqualStrings(expected.value.string, actual.value.string);
+    }
 }

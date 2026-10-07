@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Immutable native text corpora. Segment construction uses the same field
 //! projection, analyzers, positions, typed values and WAND blocks as local text
 //! indexes; the root authenticates every segment in one global scoring corpus.
@@ -14,7 +27,7 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
-pub const metadata_version: u16 = 3;
+pub const metadata_version: u16 = 4;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 8192;
 pub const FileGroup = struct { file: state.File, segments: []const artifacts.ChunkRef };
@@ -139,6 +152,12 @@ pub fn loadWriter(a: A, store: stores.ArtifactStore, root: Root, cancellation: C
     }
     try cancellation.check();
     if (replacements.len != 0) try writer.replaceSegmentsManyData(&.{}, replacements);
+    for (replacements) |replacement| {
+        if (replacement.data == .native and replacement.data.native == .ranges) {
+            const range = replacement.data.native.ranges;
+            if (range.seal_read_context) |seal| seal(range.ptr);
+        }
+    }
     return writer;
 }
 pub fn build(a: A, out: A, table: local.common_topology_records.TableRecord, source: *local.serverless_query_lake_serving.ServingSource, base: local.serverless_manifest_base_source.BaseSourceDescriptor, store: *stores.ArtifactStore, provider: *@import("lake_index_row_source.zig").Provider, cancellation: Cancellation, reusable: []const Declared) ![]const Declared {
@@ -167,7 +186,7 @@ pub fn buildIncremental(a: A, out: A, table: local.common_topology_records.Table
             for (paths, runtime.relational_columns) |*path, column| path.* = column.name;
             binding.column_bindings = paths;
         }
-        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v3:{s}", .{want.binding.index_config_hash});
+        binding.index_config_hash = try std.fmt.allocPrint(ca, "native-text-corpus-v4:{s}", .{want.binding.index_config_hash});
         const recipe = state.recipe(table, spec.config_json);
         const prior = for (reusable) |declaration| {
             if (declaration.artifact.kind == .text_segment and declaration.artifact.metadata_version == metadata_version and std.mem.eql(u8, declaration.name, want.name) and rebuild.bindingsEqual(declaration.binding, binding)) break declaration;

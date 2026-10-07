@@ -415,3 +415,21 @@ func TestInferenceGenerateStreamLocalModel(t *testing.T) {
 		}
 	})
 }
+
+func TestInferenceDecideErrors(t *testing.T) {
+	inf, err := OpenInference(&InferenceOptions{ModelsDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inf.Close()
+	for _, tc := range []struct{ request, code string }{
+		{`{}`, "INVALID_REQUEST"},
+		{`{"model":"no/such-model","state":"Refund requested","questions":{"refund":{"type":"noul","instructions":"Does this ask for a refund?"}}}`, "MODEL_NOT_FOUND"},
+	} {
+		_, err := inf.Decide([]byte(tc.request))
+		var infErr *InferenceError
+		if !errors.As(err, &infErr) || infErr.API.Code != tc.code {
+			t.Fatalf("Decide: err=%v, want %s", err, tc.code)
+		}
+	}
+}

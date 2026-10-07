@@ -120,6 +120,9 @@ pub const Scan = struct {
     };
     /// A request, never proof. Providers explicitly attest the entire order.
     order: []const Order = &.{},
+    /// Advisory SQL OFFSET + LIMIT for costing only. Never a scan stop bound.
+    /// Absent when residual selectivity is unknown. Page size remains limit.
+    row_goal: ?u64 = null,
     index_range: ?IndexRange = null,
     fields: []const []const u8,
     /// Mutation-only full document preimage; ordinary reads remain projected.

@@ -42,14 +42,20 @@ pub fn projectLookupJsonValue(
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
 
-    if (parsed.value != .object) {
+    return try projectLookupValue(alloc, parsed.value, opts);
+}
+
+/// Project an already decoded source without a JSON encode/parse round trip.
+/// The returned tree owns its keys and values; root remains borrowed.
+pub fn projectLookupValue(alloc: Allocator, root: std.json.Value, opts: types.LookupOptions) !std.json.Value {
+    if (root != .object) {
         if (opts.fields.len == 0 and opts.include_all_fields) {
-            return try cloneJsonValue(alloc, parsed.value);
+            return try cloneJsonValue(alloc, root);
         }
         return std.json.Value{ .object = std.json.ObjectMap.empty };
     }
 
-    return try projectValue(alloc, parsed.value, opts);
+    return try projectValue(alloc, root, opts);
 }
 
 fn projectValue(alloc: Allocator, root: std.json.Value, opts: types.LookupOptions) !std.json.Value {

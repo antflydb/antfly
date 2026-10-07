@@ -1,5 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
 //! Artifact construction for one native catalog-fenced lake index attempt.
 //! The coordinator commits the returned state with a full definition CAS;
 //! successful uploads alone never make an index ready.
@@ -286,7 +299,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         defer warm.deinit();
         const warm_snapshot = warm.acquireSnapshot();
         defer warm_snapshot.release();
-        for (warm_snapshot.segments) |segment| try std.testing.expect(segment.reader.postings_loader != null);
+        for (warm_snapshot.segments) |segment| try std.testing.expect(segment.reader.native != null);
         const warm_results = try warm_snapshot.search(a, "body", &.{"first"}, 10);
         defer a.free(warm_results.hits);
         try std.testing.expectEqual(results.total_count, warm_results.total_count);
