@@ -215,8 +215,8 @@ pub const Collector = struct {
         if (!fresh) return;
         try stores.chargeReadBudget(&self.remaining_reads, ref.byte_len);
         const directory = try @import("lake_index_seekable_text.zig").loadDirectory(a, .{ .store = self.store, .cache = null, .context = .{}, .cancellation = self.cancellation() }, ref);
-        for (directory.metadata) |piece| _ = try self.mark(piece.ref);
-        for (directory.blocks) |piece| _ = try self.mark(piece.ref);
+        for (directory.metadata) |piece| _ = try self.mark(piece.retainedArtifact());
+        for (directory.blocks) |piece| _ = try self.mark(piece.retainedArtifact());
     }
     pub fn markArtifact(self: *Collector, a: A, ref: local.serverless_manifest_artifact_ref.ArtifactRef) !void {
         const root_chunk: artifacts.ChunkRef = .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len };
@@ -514,4 +514,37 @@ test "external lake native GC retains shared aggregate blocks and durable reader
     const text_bytes = try store.getVerifiedAllocWithCancellation(text_segment.artifact_id, text_segment.byte_len, text_segment.checksum, .none);
     defer a.free(text_bytes);
     try std.testing.expectEqualStrings("authenticated native text child", text_bytes);
+}
+
+test "external lake native GC marks physical text packs instead of range cache identities" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var directory = try local.common_test_directory.TestDirectory.init("packed-native-text-gc");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const identity: [32]u8 = @splat(4);
+    const namespace: [32]u8 = @splat(8);
+    const domain = @import("lake_index_publication.zig").uploadDomainWithNamespace(4, identity, namespace);
+    store.upload_scope = try stores.UploadScope.forPublication(domain, 1, std.testing.io);
+    const bytes = try ca.alloc(u8, 1024 * 1024 + 11);
+    @memset(bytes, 7);
+    const seekable = @import("lake_index_seekable_text.zig");
+    const root = try seekable.publish(ca, ca, &store, bytes, .none);
+    var collector: Collector = .{ .a = a, .table = 4, .authority = undefined, .store = store, .identity = identity, .context = .{}, .token = @splat(1), .expires_ms = std.math.maxInt(u64), .authority_deadline = std.math.maxInt(u64), .remaining_reads = 16 * 1024 * 1024, .namespace = namespace };
+    defer {
+        var keys = collector.marked.keyIterator();
+        while (keys.next()) |key| a.free(key.*);
+        collector.marked.deinit(a);
+    }
+    try collector.markTextDirectory(ca, root);
+    const decoded = try seekable.loadDirectory(ca, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, root);
+    try std.testing.expectEqual(@as(u32, 3), collector.marked.count());
+    for (decoded.blocks) |piece| {
+        try std.testing.expect(collector.marked.contains(piece.pack.?.artifact_id));
+        if (!std.mem.eql(u8, piece.ref.artifact_id, piece.pack.?.artifact_id)) try std.testing.expect(!collector.marked.contains(piece.ref.artifact_id));
+    }
 }

@@ -53,6 +53,8 @@ pub const Source = union(enum) {
         seal_read_context: ?*const fn (*anyopaque) void = null,
         quiesce_read_context: ?*const fn (*anyopaque) void = null,
         resource_manager: ?*resources.ResourceManager = null,
+        read_io: ?std.Io = null,
+        check_read_context: ?*const fn (*anyopaque) anyerror!void = null,
     },
 
     /// Stop query-owned work before its borrowed capability is released.
