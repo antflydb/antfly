@@ -10,21 +10,32 @@ call and PyTorch CPU operator fallback is forbidden.
 from __future__ import annotations
 
 import argparse
+import base64
+from collections.abc import Mapping
+import csv
 import contextlib
 import datetime as dt
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
 import platform
+import re
 import statistics
+import struct
+import subprocess
 import sys
 import tempfile
 import time
+import types
+import unicodedata
 from typing import Any, Callable
 import warnings
+
+import verify_family_contract as family
 
 
 HERE = Path(__file__).resolve().parent
@@ -36,6 +47,8 @@ WARMUPS = 3
 SAMPLES = 20
 THREADS = 2
 MAX_WORDS = 4096
+PREFLIGHT_MAX_WORDS = 128
+MAX_ENCODED_TOKENS = 512
 OUTPUT_TOLERANCE = 5e-4
 RAW_LOGIT_TOLERANCE = 2e-3
 MPS_FALLBACK_WARNING = (
@@ -63,12 +76,6 @@ CAPTURES = {
         "602e6e4470163308de6b139ae829b11321adfdcb8371d64e6a3266dea431733b",
         "requests",
         ("spanish_entities",),
-    ),
-    ("multi_v1", "decide"): (
-        "multi_v1_decide_capture.json",
-        "ea52610f882b9607a97e0ac2dbb918a57b22d893eae9a9257ddbd6e3ca7a2957",
-        "requests",
-        ("described_prompt_choice", "choice_score_noul"),
     ),
     ("multi_decide", "extract"): (
         "multi_decide_capture.json",
@@ -105,6 +112,361 @@ def sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def git(source: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(source), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+    )
+    if result.returncode:
+        raise BenchmarkError(f"cannot verify upstream checkout: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def verify_source(source: Path, contract: dict[str, Any]) -> dict[str, str]:
+    source = source.expanduser().resolve()
+    if not (source / "gliner2" / "__init__.py").is_file():
+        raise BenchmarkError(f"not a GLiNER2 checkout: {source}")
+    if Path(git(source, "rev-parse", "--show-toplevel")).resolve() != source:
+        raise BenchmarkError("upstream path must be the checkout root")
+    expected = contract["upstream_python"]
+    commit = git(source, "rev-parse", "HEAD")
+    if commit != expected["revision"]:
+        raise BenchmarkError(f"upstream commit {commit} != pinned {expected['revision']}")
+    if git(source, "status", "--porcelain=v1", "--untracked-files=all"):
+        raise BenchmarkError("upstream checkout is dirty")
+    if git(source, "ls-files", "--others", "--ignored", "--exclude-standard"):
+        raise BenchmarkError("upstream checkout contains ignored files")
+    return {"repo": expected["repo"], "revision": commit, "checkout": str(source)}
+
+
+def runtime_identity(contract: dict[str, Any]) -> dict[str, Any]:
+    expected = contract["oracle_runtime"]
+    actual = {
+        "python": platform.python_version(),
+        "unicode": unicodedata.unidata_version,
+        "packages": {
+            name: importlib.metadata.version(name) for name in expected["packages"]
+        },
+        "absent_packages": expected.get("absent_packages", []),
+    }
+    present = [name for name in actual["absent_packages"] if importlib.util.find_spec(name)]
+    if present:
+        raise BenchmarkError(f"oracle runtime requires absent packages: {present!r}")
+    if not family._same_json(actual, expected):
+        raise BenchmarkError(f"oracle runtime differs: actual={actual!r}")
+    return actual
+
+
+def install_inference_peft_shim() -> dict[str, Any]:
+    """Satisfy GLiNER2's serving-only eager trainer type imports.
+
+    The pinned runtime deliberately has no PEFT installation.  Public boundary
+    extraction lazily imports ``ExtractorCollator`` from the training module,
+    whose two top-level PEFT imports are used only by trainer/LoRA paths.  A
+    minimal type-only module keeps that unrelated optional dependency out of
+    the oracle while leaving every executed inference object untouched.
+    """
+    if importlib.util.find_spec("peft") is not None:
+        raise BenchmarkError("PEFT compatibility shim requires peft to be absent")
+    peft = types.ModuleType("peft")
+    tuners = types.ModuleType("peft.tuners")
+    lora = types.ModuleType("peft.tuners.lora")
+    layer = types.ModuleType("peft.tuners.lora.layer")
+
+    class InactivePeftModel:
+        pass
+
+    class InactiveLoraLayer:
+        pass
+
+    peft.PeftModel = InactivePeftModel
+    layer.LoraLayer = InactiveLoraLayer
+    sys.modules.update({
+        "peft": peft,
+        "peft.tuners": tuners,
+        "peft.tuners.lora": lora,
+        "peft.tuners.lora.layer": layer,
+    })
+    return {
+        "name": "inference_only_peft_type_import_shim",
+        "reason": "pinned GLiNER2 ExtractorCollator eagerly imports trainer-only PEFT types",
+        "classes": ["PeftModel", "LoraLayer"],
+        "executed_peft_code": False,
+    }
+
+
+def jsonable(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "tolist"):
+        return jsonable(value.tolist())
+    raise BenchmarkError(f"cannot serialize oracle value {type(value).__name__}")
+
+
+def encoded_evidence(model: Any, text: str, schema: Any, *, boundary: bool) -> dict[str, Any]:
+    words = list(model.processor.word_splitter(text, lower=False))
+    if len(words) > PREFLIGHT_MAX_WORDS:
+        raise BenchmarkError(f"request exceeds {PREFLIGHT_MAX_WORDS} words")
+    raw = schema.build() if hasattr(schema, "build") else schema
+    batch = model.processor.collate_fn_inference(
+        [(text, raw)],
+        max_len=PREFLIGHT_MAX_WORDS,
+        error_policy="raise",
+        architecture="boundary" if boundary else "span",
+        build_targets=False,
+        on_capacity_exceeded="raise",
+    )
+    input_ids = batch.input_ids.detach().cpu().tolist()
+    if len(input_ids) != 1 or not 0 < len(input_ids[0]) <= MAX_ENCODED_TOKENS:
+        raise BenchmarkError("encoded request is outside the bounded token contract")
+    return {
+        "input_ids": input_ids[0],
+        "attention_mask": batch.attention_mask.detach().cpu().tolist()[0],
+        "text_tokens": jsonable(batch.text_tokens[0]),
+        "schema_tokens": jsonable(batch.schema_tokens_list[0]),
+        "start_mappings": jsonable(batch.start_mappings[0]),
+        "end_mappings": jsonable(batch.end_mappings[0]),
+    }
+
+
+def canonical_labels(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, dict) and "value" in value:
+        chosen = value["value"] if isinstance(value["value"], list) else [value["value"]]
+        probabilities = value.get("probabilities", {})
+        return [
+            {"label": label, "confidence": probabilities.get(label, value.get("confidence"))}
+            for label in chosen
+        ]
+    items = value if isinstance(value, list) else [value]
+    return [
+        {"label": item.get("label", item.get("value")), "confidence": item["confidence"]}
+        for item in items
+    ]
+
+
+def canonical_values(value: Any, attributes: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    items = value if isinstance(value, list) else [value]
+    return [
+        {
+            "text": item["text"],
+            "confidence": item["confidence"],
+            "source": (
+                {"start": item["start"], "end": item["end"]}
+                if "start" in item
+                else None
+            ),
+            "attributes": [
+                {"name": name, "labels": canonical_labels(item[name])}
+                for name in attributes
+                if name in item
+            ],
+        }
+        for item in items
+    ]
+
+
+def canonical_expected(
+    request: dict[str, Any], native_schema: dict[str, Any], output: dict[str, Any]
+) -> dict[str, Any]:
+    expected: dict[str, list[Any]] = {
+        "entities": [],
+        "classifications": [],
+        "structures": [],
+        "relations": [],
+    }
+    for entity in native_schema.get("entities", []):
+        expected["entities"].append({
+            "name": entity,
+            "values": canonical_values(
+                output.get("entities", {}).get(entity),
+                tuple(native_schema.get("entity_attributes", {})),
+            ),
+        })
+    for task in native_schema.get("classifications", []):
+        expected["classifications"].append({
+            "name": task["name"],
+            "labels": canonical_labels(output.get(task["name"])),
+        })
+    for name, structure in native_schema.get("structures", {}).items():
+        instances = [
+            {
+                "fields": [
+                    {"name": field, "values": canonical_values(record.get(field))}
+                    for field in structure["fields"]
+                ]
+            }
+            for record in output.get(name, [])
+        ]
+        if instances:
+            expected["structures"].append({"name": name, "instances": instances})
+    for relation, edges in output.get("relation_extraction", {}).items():
+        for edge in edges:
+            head = canonical_values(edge["head"])[0]
+            tail = canonical_values(edge["tail"])[0]
+            expected["relations"].append({
+                "name": relation,
+                "head": head,
+                "tail": tail,
+                "confidence": edge.get("confidence", edge["head"]["confidence"]),
+            })
+    return expected
+
+
+def normalized(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def verify_record_tree(runtime_dir: Path, expected_tree_sha256: str | None) -> dict[str, Any]:
+    """Verify every isolated-runtime file against wheel RECORD identities."""
+    runtime_dir = runtime_dir.resolve()
+    listed: set[Path] = set()
+    records = sorted(runtime_dir.glob("*.dist-info/RECORD"))
+    if not records:
+        raise BenchmarkError("isolated runtime has no wheel RECORD files")
+    for record in records:
+        with record.open(newline="", encoding="utf-8") as stream:
+            for row in csv.reader(stream):
+                if len(row) != 3:
+                    raise BenchmarkError(f"malformed wheel RECORD row in {record.name}")
+                path = (runtime_dir / row[0]).resolve()
+                if not path.is_relative_to(runtime_dir) or path in listed:
+                    raise BenchmarkError("wheel RECORD path escapes or is duplicated")
+                listed.add(path)
+                if not path.is_file():
+                    raise BenchmarkError(f"wheel RECORD file is absent: {row[0]}")
+                if path == record:
+                    if row[1] or row[2]:
+                        raise BenchmarkError("wheel RECORD self-row must be unhashed")
+                    continue
+                if not row[1].startswith("sha256=") or not row[2].isdigit():
+                    raise BenchmarkError(f"wheel RECORD identity is incomplete: {row[0]}")
+                if path.stat().st_size != int(row[2]):
+                    raise BenchmarkError(f"wheel RECORD size differs: {row[0]}")
+                encoded = base64.urlsafe_b64encode(bytes.fromhex(sha256(path))).decode().rstrip("=")
+                if encoded != row[1][len("sha256="):]:
+                    raise BenchmarkError(f"wheel RECORD hash differs: {row[0]}")
+    actual = {path.resolve() for path in runtime_dir.rglob("*") if path.is_file()}
+    if actual != listed:
+        extra = sorted(str(path.relative_to(runtime_dir)) for path in actual - listed)
+        raise BenchmarkError(f"isolated runtime contains unrecorded files: {extra!r}")
+    tree = hashlib.sha256()
+    for path in sorted(actual):
+        relative = str(path.relative_to(runtime_dir)).encode()
+        tree.update(relative + b"\0" + bytes.fromhex(sha256(path)))
+        tree.update(struct.pack("<Q", path.stat().st_size))
+    digest = tree.hexdigest()
+    if expected_tree_sha256 is not None and digest != expected_tree_sha256:
+        raise BenchmarkError("isolated runtime tree identity differs")
+    return {"files": len(actual), "record_files": len(records), "tree_sha256": digest}
+
+
+def verify_runtime_dir(runtime_dir: Path, contract: dict[str, Any]) -> dict[str, Any]:
+    runtime_dir = runtime_dir.expanduser().resolve()
+    expected = contract["oracle_runtime_decide_1b"]
+    actual_python = platform.python_version()
+    actual_unicode = __import__("unicodedata").unidata_version
+    if actual_python != expected["python"] or actual_unicode != expected["unicode"]:
+        raise BenchmarkError(
+            f"1B Python/Unicode runtime differs: {actual_python}/{actual_unicode}"
+        )
+    if not runtime_dir.is_dir():
+        raise BenchmarkError(f"isolated runtime directory is absent: {runtime_dir}")
+    actual = {
+        normalized(dist.metadata["Name"]): dist.version
+        for dist in importlib.metadata.distributions(path=[str(runtime_dir)])
+    }
+    wanted = {normalized(name): version for name, version in expected["isolated_packages"].items()}
+    if actual != wanted:
+        raise BenchmarkError(
+            f"isolated runtime inventory differs: actual={actual!r} expected={wanted!r}"
+        )
+    info = runtime_dir / "transformers-5.17.0.dist-info"
+    distribution = expected["transformers_distribution"]
+    for name, key in (("METADATA", "installed_metadata_sha256"), ("RECORD", "installed_record_sha256")):
+        path = info / name
+        if not path.is_file() or sha256(path) != distribution[key]:
+            raise BenchmarkError(f"isolated Transformers {name} identity differs")
+    tree = verify_record_tree(runtime_dir, expected["runtime_tree_sha256"])
+    external = {
+        name: importlib.metadata.version(name)
+        for name in expected["external_packages"]
+    }
+    if external != expected["external_packages"]:
+        raise BenchmarkError(f"external runtime differs: actual={external!r}")
+    return {
+        "python": actual_python,
+        "unicode": actual_unicode,
+        "isolated_packages": actual,
+        "external_packages": external,
+        "transformers_distribution": distribution,
+        "verified_tree": tree,
+        "runtime_dir": str(runtime_dir),
+    }
+
+
+def activate(runtime_dir: Path, upstream: Path) -> None:
+    # The exact isolated target must win over globally installed Transformers.
+    sys.path.insert(0, str(runtime_dir.expanduser().resolve()))
+    sys.path.insert(1, str(upstream.expanduser().resolve()))
+
+
+def tensor_sha256(tensor: Any) -> str:
+    values = tensor.detach().cpu().to(dtype=__import__("torch").float32).tolist()
+    return hashlib.sha256(struct.pack(f"<{len(values)}f", *values)).hexdigest()
+
+
+def verify_rope(model_dir: Path, contract: dict[str, Any], encoder: Any | None = None) -> dict[str, Any]:
+    import torch
+    from transformers import AutoConfig
+    from transformers.models.modernbert.modeling_modernbert import ModernBertRotaryEmbedding
+
+    spec = contract["oracle_runtime_decide_1b"]["rope_contract"]
+    config = AutoConfig.from_pretrained(
+        str(model_dir / "encoder_config" / "config.json"), local_files_only=True
+    )
+    expected_params = {
+        layer_type: {"rope_theta": spec["rope_theta"], "rope_type": spec["rope_type"]}
+        for layer_type in spec["layer_types"]
+    }
+    if config.rope_parameters != expected_params:
+        raise BenchmarkError(f"ModernBERT rope_parameters differ: {config.rope_parameters!r}")
+    if config.hidden_size // config.num_attention_heads != spec["head_dim"]:
+        raise BenchmarkError("ModernBERT head dimension differs")
+    rotary = ModernBertRotaryEmbedding(config) if encoder is None else encoder.rotary_emb
+    expected = 1.0 / (
+        spec["rope_theta"]
+        ** (torch.arange(0, spec["head_dim"], 2, dtype=torch.float32) / spec["head_dim"])
+    )
+    layers: dict[str, Any] = {}
+    for layer_type in spec["layer_types"]:
+        actual = getattr(rotary, f"{layer_type}_inv_freq").detach().cpu().float()
+        if not torch.equal(actual, expected):
+            raise BenchmarkError(f"{layer_type} does not honor the pinned RoPE theta")
+        digest = tensor_sha256(actual)
+        if digest != spec["inv_freq_sha256_f32le"]:
+            raise BenchmarkError(f"{layer_type} RoPE frequency identity differs")
+        layers[layer_type] = {
+            "rope_theta": spec["rope_theta"],
+            "inv_freq_count": actual.numel(),
+            "inv_freq_sha256_f32le": digest,
+            "first": actual[0].item(),
+            "last": actual[-1].item(),
+        }
+    return {"head_dim": spec["head_dim"], "layers": layers}
 
 
 def strict_json(path: Path) -> dict[str, Any]:
@@ -315,11 +677,11 @@ def ordered_decide_schema(row: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def prepare_extract(model: Any, row: dict[str, Any], common: Any) -> tuple[Callable[[], Any], Callable[[Any], None]]:
+def prepare_extract(model: Any, row: dict[str, Any]) -> tuple[Callable[[], Any], Callable[[Any], None]]:
     from gliner2 import Schema
 
     schema = Schema.from_dict(ordered_extract_schema(row))
-    encoded = common.encoded_evidence(model, row["text"], schema, boundary=True)
+    encoded = encoded_evidence(model, row["text"], schema, boundary=True)
     if encoded["input_ids"] != row["encoded"]["input_ids"]:
         raise BenchmarkError(f"{row['id']}: prepared token IDs differ")
 
@@ -335,19 +697,19 @@ def prepare_extract(model: Any, row: dict[str, Any], common: Any) -> tuple[Calla
         )
 
     def validate(output: Any) -> None:
-        canonical = common.canonical_expected(
-            row, row["native_schema"], common.jsonable(output)
+        canonical = canonical_expected(
+            row, row["native_schema"], jsonable(output)
         )
         compare(row["native_expected"], canonical)
 
     return execute, validate
 
 
-def prepare_decide(model: Any, row: dict[str, Any], common: Any) -> tuple[Callable[[], Any], Callable[[Any], None]]:
+def prepare_decide(model: Any, row: dict[str, Any]) -> tuple[Callable[[], Any], Callable[[Any], None]]:
     from gliner2.classification import Classifier, ClassificationConfig, ClassificationSchema
 
     initial = Classifier(model).compile_schema(ClassificationSchema.from_dict(ordered_decide_schema(row)))
-    encoded = common.encoded_evidence(model, row["text"], initial, boundary=False)
+    encoded = encoded_evidence(model, row["text"], initial, boundary=False)
     if encoded["input_ids"] != row["encoded"]["input_ids"]:
         raise BenchmarkError(f"{row['id']}: prepared token IDs differ")
 
@@ -442,13 +804,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     capture_path, capture, rows = load_capture(args.profile, args.task)
     contract = strict_json(args.contract)
 
-    # These helpers perform the same whole-artifact and pinned-source checks as
-    # capture generation. Imports occur only after the runtime search path and
-    # MPS fallback policy have been fixed.
-    import capture_family_references as common
-    import verify_family_contract as family
-
-    source = common.verify_source(args.upstream, contract)
+    source = verify_source(args.upstream, contract)
     model_before = family.verify_model(
         args.profile, args.model_dir, contract_path=args.contract, verify_model_sha256=True
     )
@@ -457,13 +813,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     runtime: dict[str, Any]
     if args.profile == "decide_1b":
-        import capture_decide_1b_references as one_b
-
         runtime_contract = strict_json(args.runtime_contract)
-        runtime = one_b.verify_runtime_dir(args.runtime_dir, runtime_contract)
-        one_b.activate(args.runtime_dir, args.upstream)
+        runtime = verify_runtime_dir(args.runtime_dir, runtime_contract)
+        activate(args.runtime_dir, args.upstream)
     else:
-        runtime = common.runtime_identity(contract)
+        runtime = runtime_identity(contract)
         sys.path.insert(0, str(args.upstream.resolve()))
 
     import torch
@@ -480,7 +834,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     # environment before the serving-only PEFT type shim is installed. Span
     # Decide-1B does not need or install this boundary-training import shim.
     if args.profile != "decide_1b":
-        common.install_inference_peft_shim()
+        install_inference_peft_shim()
     if args.device == "mps" and (
         not torch.backends.mps.is_built() or not torch.backends.mps.is_available()
     ):
@@ -505,14 +859,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise BenchmarkError("loaded model is not in evaluation mode")
     tensor_summary = verify_model_device(model, torch, args.device)
     if args.profile == "decide_1b":
-        rope = one_b.verify_rope(args.model_dir, runtime_contract, model.encoder)
+        rope = verify_rope(args.model_dir, runtime_contract, model.encoder)
     else:
         rope = None
 
     prepare = select_prepare(
         args.task,
-        lambda row: prepare_extract(model, row, common),
-        lambda row: prepare_decide(model, row, common),
+        lambda row: prepare_extract(model, row),
+        lambda row: prepare_decide(model, row),
     )
     cases = [benchmark_case(torch, args.device, row, prepare) for row in rows]
     synchronize(torch, args.device)
@@ -522,7 +876,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     )
     if model_after != model_before:
         raise BenchmarkError("model artifact changed during benchmark")
-    if common.verify_source(args.upstream, contract) != source:
+    if verify_source(args.upstream, contract) != source:
         raise BenchmarkError("pinned source changed during benchmark")
     if sha256(capture_path) != CAPTURES[(args.profile, args.task)][1]:
         raise BenchmarkError("capture changed during benchmark")

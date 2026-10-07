@@ -68,8 +68,6 @@
       "sliding_attention_inv_freq_sha256_f32le": "734f9e6b629f7baccc4de81b7e8d2982035ee1b81f73f158e7d33a4dcf13fa0e",
       "reason": "nested rope_parameters are retained as unknown metadata but ignored by the 4.55 ModernBERT per-layer constructor"
     },
-    "shared_helper_sha256": "4e9fee278e8e4757f1ee03aec87208dfc7cbb58eb7a009b30e8f525c8eb9cde5",
-    "runtime_tree_sha256": "6259dc40ff96d6bb7afaf079345be8e36bc3c3fd77194b9a88a6c635ba0f6969",
-    "public_decide_helper_sha256": "4364c3fc1cfacfca4bad2cd48e19a8600af8041339b817e44c111e252bb1a844"
+    "runtime_tree_sha256": "6259dc40ff96d6bb7afaf079345be8e36bc3c3fd77194b9a88a6c635ba0f6969"
   }
 }

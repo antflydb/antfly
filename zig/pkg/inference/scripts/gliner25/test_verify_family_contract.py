@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import benchmark_family_python as benchmark
 import verify_family_contract as family
 
 
@@ -142,6 +146,133 @@ class FamilyContractTest(unittest.TestCase):
     def test_json_field_comparison_rejects_bool_as_integer(self) -> None:
         with self.assertRaisesRegex(family.ContractError, "encoder.hidden_size"):
             family._require_fields({"hidden_size": True}, {"hidden_size": 1}, "encoder")
+
+
+class FamilyBenchmarkContractTest(unittest.TestCase):
+    def wheel_tree(self, root: Path) -> tuple[Path, Path]:
+        code = root / "package.py"
+        code.write_bytes(b"trusted\n")
+        info = root / "package-1.0.dist-info"
+        info.mkdir()
+        digest = base64.urlsafe_b64encode(hashlib.sha256(code.read_bytes()).digest()).decode().rstrip("=")
+        record = info / "RECORD"
+        record.write_text(
+            f"package.py,sha256={digest},{code.stat().st_size}\n"
+            "package-1.0.dist-info/RECORD,,\n",
+            encoding="utf-8",
+        )
+        return code, record
+
+    def test_runtime_tree_rejects_code_tampering_and_unrecorded_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            code, _ = self.wheel_tree(root)
+            identity = benchmark.verify_record_tree(root, None)
+            self.assertEqual(2, identity["files"])
+            benchmark.verify_record_tree(root, identity["tree_sha256"])
+            extra = root / "unrecorded.py"
+            extra.write_bytes(b"untrusted\n")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "unrecorded"):
+                benchmark.verify_record_tree(root, identity["tree_sha256"])
+            extra.unlink()
+            code.write_bytes(b"changed\n")
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "hash differs"):
+                benchmark.verify_record_tree(root, identity["tree_sha256"])
+
+    def test_runtime_records_reject_path_escape_and_duplicate_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, record = self.wheel_tree(root)
+            original = record.read_text()
+            for extra in (original.splitlines()[0] + "\n", "../escape.py,sha256=invalid,1\n"):
+                record.write_text(original + extra)
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "escapes or is duplicated"):
+                    benchmark.verify_record_tree(root, None)
+
+    def test_isolated_runtime_rejects_wrong_distribution_inventory(self) -> None:
+        contract = benchmark.strict_json(benchmark.RUNTIME_CONTRACT_1B)
+        expected = contract["oracle_runtime_decide_1b"]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(
+            benchmark.platform, "python_version", return_value=expected["python"]
+        ), mock.patch.object(benchmark.unicodedata, "unidata_version", expected["unicode"]), mock.patch.object(
+            benchmark.importlib.metadata, "distributions", return_value=[]
+        ):
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "inventory differs"):
+                benchmark.verify_runtime_dir(Path(tmp), contract)
+
+    def test_peft_shim_only_supplies_inactive_types(self) -> None:
+        names = ("peft", "peft.tuners", "peft.tuners.lora", "peft.tuners.lora.layer")
+        saved = {name: sys.modules.get(name) for name in names}
+        try:
+            for name in names:
+                sys.modules.pop(name, None)
+            with mock.patch.object(benchmark.importlib.util, "find_spec", return_value=None):
+                identity = benchmark.install_inference_peft_shim()
+            self.assertFalse(identity["executed_peft_code"])
+            self.assertFalse(isinstance(object(), sys.modules["peft"].PeftModel))
+            self.assertFalse(isinstance(object(), sys.modules["peft.tuners.lora.layer"].LoraLayer))
+        finally:
+            for name in names:
+                sys.modules.pop(name, None)
+                if saved[name] is not None:
+                    sys.modules[name] = saved[name]
+
+    def test_capture_selection_rejects_unqualified_profile_task(self) -> None:
+        for profile, task in benchmark.CAPTURES:
+            _, capture, rows = benchmark.load_capture(profile, task)
+            self.assertFalse(capture["qualification"])
+            self.assertTrue(rows)
+        with self.assertRaises(benchmark.UnsupportedBenchmark):
+            benchmark.load_capture("multi_v1", "decide")
+
+    def test_decide_schema_restores_label_order_and_rejects_missing_label(self) -> None:
+        _, _, rows = benchmark.load_capture("multi_decide", "decide")
+        row = json.loads(json.dumps(rows[0]))
+        for task in row["schema"]["tasks"].values():
+            task["labels"] = dict(reversed(list(task["labels"].items())))
+        schema = benchmark.ordered_decide_schema(row)
+        evidence = row["native_classification"]["tasks"]
+        self.assertEqual([task["name"] for task in evidence], list(schema["tasks"]))
+        for task in evidence:
+            self.assertEqual(task["labels"], list(schema["tasks"][task["name"]]["labels"]))
+        first = next(iter(row["schema"]["tasks"].values()))
+        first["labels"].pop(next(iter(first["labels"])))
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "inventory differs"):
+            benchmark.ordered_decide_schema(row)
+
+    def test_extraction_schema_restores_entity_order(self) -> None:
+        _, _, rows = benchmark.load_capture("multi_decide", "extract")
+        row = json.loads(json.dumps(rows[0]))
+        row["schema"]["entities"] = dict(reversed(list(row["schema"]["entities"].items())))
+        self.assertEqual(row["native_schema"]["entities"], list(benchmark.ordered_extract_schema(row)["entities"]))
+        row["schema"]["entities"].pop(next(iter(row["schema"]["entities"])))
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "inventory differs"):
+            benchmark.ordered_extract_schema(row)
+
+    def test_preflight_word_limit_is_preserved_before_collation(self) -> None:
+        model = mock.Mock()
+        model.processor.word_splitter.return_value = ["word"] * 129
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "128 words"):
+            benchmark.encoded_evidence(model, "text", {}, boundary=True)
+        model.processor.collate_fn_inference.assert_not_called()
+
+    def test_canonical_output_preserves_selected_labels_and_source_offsets(self) -> None:
+        schema = {"classifications": [{"name": "intent"}], "entities": ["person"]}
+        output = {
+            "intent": {"value": "refund", "probabilities": {"refund": 0.8, "sales": 0.2}},
+            "entities": {"person": [{"text": "María", "confidence": 0.9, "start": 0, "end": 5}]},
+        }
+        expected = benchmark.canonical_expected({}, schema, output)
+        self.assertEqual([{"label": "refund", "confidence": 0.8}], expected["classifications"][0]["labels"])
+        self.assertEqual({"start": 0, "end": 5}, expected["entities"][0]["values"][0]["source"])
+
+    def test_decide_dispatch_uses_decide_preprocessor(self) -> None:
+        extract = mock.Mock()
+        decide = mock.Mock(return_value="decision")
+        prepare = benchmark.select_prepare("decide", extract, decide)
+        self.assertEqual("decision", prepare({"id": "choice"}))
+        extract.assert_not_called()
+        decide.assert_called_once_with({"id": "choice"})
 
 
 if __name__ == "__main__":

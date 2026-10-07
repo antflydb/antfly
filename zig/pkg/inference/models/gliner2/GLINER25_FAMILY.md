@@ -247,22 +247,17 @@ python3 zig/pkg/inference/scripts/gliner25/generate_family_tokenizer_fixtures.py
 zig fmt zig/lib/tokenizer/src/gliner_family_fixtures.zig
 ```
 
-The multilingual Python reference capture uses a clean checkout of
+The immutable multilingual Python references use a clean checkout of
 [`fastino-ai/GLiNER2` at `55656fb`](https://github.com/fastino-ai/GLiNER2/tree/55656fbfa01d3d4a77485e1a1eeeaf682990ccdf)
-and the runtime versions recorded in `family_contract.json`. It verifies the
-full checkpoint before and after inference, records prepared token IDs,
-raw classifier logits, decoded outputs, and separate semantic observations:
-
-```sh
-PYTHONHASHSEED=0 python3 zig/pkg/inference/scripts/gliner25/capture_family_references.py \
-  --profile multi_decide --model-dir /path/to/multilingual/checkpoint \
-  --upstream /path/to/pinned/GLiNER2 --output /path/to/new/reference --threads 2
-```
-
-The capture is reference evidence; its `qualification` field remains false.
-Model-quality observations are separate from implementation parity. A source
-model's missed entity or incorrect intent must not be silently replaced in
-the runtime oracle.
+and the runtime versions recorded in `family_contract.json`. The retained
+goldens include full requests, prepared token IDs, raw logits, decoded outputs,
+source/runtime identity, and original generator/request digests. The one-time
+capture generators and duplicate request manifests are external qualification
+tooling rather than part of this runtime change. The canonical Python benchmark
+replays the measured requests against these goldens without those generators.
+New serving bounds require fresh captured evidence; do not rewrite existing
+goldens to fit results. Their `qualification` fields remain false, and captured
+model-quality misses remain separate from implementation parity.
 
 The 1B oracle requires the separate runtime inventory in
 `decide_1b_oracle_runtime.json`. An installed Transformers 4.55.4 runtime
@@ -274,13 +269,6 @@ alone do not establish that this checkpoint can run under its declared
 dependency range. The isolated 5.17 reference completes the full checkpoint
 load and all ten forward cases; its installed files and RoPE arrays are
 verified before capture.
-
-```sh
-PYTHONHASHSEED=0 python3 zig/pkg/inference/scripts/gliner25/capture_decide_1b_references.py \
-  --model-dir /path/to/1b/checkpoint --upstream /path/to/pinned/GLiNER2 \
-  --runtime-dir /path/to/pinned/transformers-5.17-runtime \
-  --output /path/to/new/1b/reference --threads 2
-```
 
 Use `ANTFLY_GLINER25_MULTI_V1_MODEL_DIR` and
 `ANTFLY_GLINER25_MULTI_DECIDE_MODEL_DIR` with the inference tests to check
@@ -344,6 +332,21 @@ runtime tuning/debug overrides, records configured CPU/vendor thread caps,
 and binds source, binary, model, sidecar, and capture identities. It rejects
 incomplete case/path samples, incorrect geometry, non-conserved ownership,
 and statistics that do not reproduce from the raw nanosecond samples.
+
+The retained upstream Python comparison uses the same captured requests:
+
+```sh
+PYTHONHASHSEED=0 python3.12 zig/pkg/inference/scripts/gliner25/benchmark_family_python.py \
+  --profile multi_decide --task decide --device mps \
+  --model-dir /path/to/family/multi-decide --upstream /path/to/pinned/GLiNER2 \
+  --output /path/to/new/python-report.json --threads 2
+```
+
+Use `--device cpu` for the CPU comparison. For 1B, select `--profile decide_1b`,
+point `--model-dir` at its checkpoint, and pass `--runtime-dir` for the pinned
+Transformers 5.17 target directory. The benchmark verifies the complete model,
+upstream source, installed runtime files, RoPE arrays, token IDs, and outputs;
+it writes run reports outside Git.
 
 To measure the 1B direct pipeline separately, use the explicit diagnostic job:
 
