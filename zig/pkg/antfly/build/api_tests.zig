@@ -66,6 +66,48 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
+    // This contract gate owns only the API execution capsule and inference
+    // control/admission boundary; it needs no resident storage/model archive.
+    const inference_owner_sources = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/src/source_catalog.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_owner_sources.addImport("antfly_local_test_sources", b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_inference_test_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const inference_owner_admission = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/server/runnable_execution.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_owner_admission.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    inference_owner_admission.addImport("inference_linalg", antfly_imports.inference_server.import_table.get("inference_linalg").?);
+    const inference_owner_control = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/execution_control.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    inference_owner_control.addImport("antfly_platform", antfly_imports.platform);
+    const inference_owner_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_inference_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    inference_owner_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    inference_owner_root.addImport("antfly_local_sources", inference_owner_sources);
+    inference_owner_root.addImport("inference_runnable_execution", inference_owner_admission);
+    inference_owner_root.addImport("inference_execution_control", inference_owner_control);
+    const inference_owner_tests = b.addTest(.{
+        .name = "inference-owner-handoff-tests",
+        .root_module = inference_owner_root,
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-inference-owner-handoff-test", "Run real shared-owner inference handoff and model-lock control progress contracts")
+        .dependOn(&b.addRunArtifact(inference_owner_tests).step);
     const inference_phase_filters = [_][]const u8{ "runnable execution local provider", "runnable execution worker budget" };
     const inference_phase_tests = b.addTest(.{
         .name = "inference-parent-phase-tests",
