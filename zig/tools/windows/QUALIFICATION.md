@@ -452,3 +452,59 @@ ancestor directories and deletion remain unqualified. The HTTP reset workload
 uses Lite; it does not establish LSM compaction crash durability. Focused LSM
 writer tests establish bounded memory and publication behavior. These bounded
 workloads do not qualify an endurance run or a supported Windows port.
+
+
+## Main integration and native replacement qualification (2026-10-07)
+
+Merge `c3845962d6` incorporates `origin/main` at `f2e6054632` into the review
+branch. Directory rename detection moved all six new focused test/staging
+files to `pkg/antfly-embedded/src/`; current README commands use these paths.
+A freshly generated Zig overlay matches the previously tested overlay.
+Its safety tests pass 2/2 and CrossOver compatibility tests pass 5/5.
+
+After the merge, macOS passes backup/staging 14/14, object-store filesystem
+10/10 and selected Lite index/vacuum tests 25/25. CrossOver Debug and
+ReleaseFast each pass backup/staging 14/14, filesystem 8/10 and Lite 23/25.
+The four failures remain `AccessDenied` when replacing an open destination.
+
+A new disposable Windows Server 2022 VM (build `10.0.20348.0`, NTFS,
+`e2-standard-4`, 80 GB boot disk) executed all six hashed binaries below.
+Both Debug and ReleaseFast pass backup/staging 14/14, filesystem 10/10 and
+Lite 25/25, with no failures or skips. Backup/staging reports no leaks and
+one expected error log. All six processes exited 0 and matched the manifest.
+This resolves native qualification of the four open-destination replacement
+failures and of the snapshot staging cancellation regressions. No atomic
+replacement workaround or test skip was needed; the failures are specific to
+CrossOver. It does not extend the earlier hard-reset evidence to this build.
+
+| Native executable | SHA-256 |
+| --- | --- |
+| `backup-Debug.exe` | `e232b9ae693a655d251c40fe4ff3919b4ffbcbf40c8cdbd7514f9fe2865f3576` |
+| `backup-ReleaseFast.exe` | `2f76199e539792b56c1bc1cd224896f32e4063f29ea531cc27756edfd88f18b4` |
+| `filesystem-Debug.exe` | `3969cec0c28f56d85b9dd53e57524dd164a46b3314d78e4ea682f1bb19395d39` |
+| `filesystem-ReleaseFast.exe` | `68f5f4ffc00186ab9fcfbf3d07a71e076e3c8328f2ecdf54ba0d9bd2d7f46aeb` |
+| `lite-Debug.exe` | `9628bdefe82d2cbbf2f7abb99fb85547e5c125abb61b3526035eb097f51e99ac` |
+| `lite-ReleaseFast.exe` | `be87bb7bb719c5931c7c6bdc06fe0d04dae79604efa16aee4c8b37714a3d96c2` |
+
+Native evidence and source hashes are retained in
+`/private/tmp/antfly-pr987-merged-native-results/` (`final-results.json`,
+`manifest.json`, `qualified-source.json`, `resources.json`). The VM, boot disk,
+artifact bucket, service account, subnet and network were deleted afterward.
+No ingress firewall rules or tunnels were created.
+
+The merged full Windows Debug application passes all 46 build steps, with
+ONNX disabled and BLAS off. Executable SHA-256:
+`9560875ae71396351c75ccb77b5811d33f1edcf4cddad7a7cfd17272036b3f4e`.
+CrossOver verifies all 32 acknowledged documents and full-text entries after
+forced termination/reopening, passes 64 concurrent queries across both starts,
+and reports `valid=true`, zero tail bytes and no integrity issue. Evidence:
+`/private/tmp/antfly-pr987-merged-app-build.log` and
+`/private/tmp/antfly-pr987-merged-app-smoke/`.
+
+The CI policy test incorrectly rejected main's existing automatic Apache
+license source check. It now explicitly permits that read-only workflow and
+checks its unprivileged PR trigger, permissions and credential handling;
+expensive suites remain gated. All 92 CI script tests pass. Hosted policy CI
+also tests its executing main revision, so the isolated assertion fix must
+land on main before that job can pass. Hosted tests still require a non-draft
+PR and a human `/ci run <full-head-sha>` approval under the repository policy.

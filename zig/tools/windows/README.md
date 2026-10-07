@@ -33,6 +33,26 @@ The generator rejects overlapping input/output paths and stages its patches
 before replacing an existing overlay, so a mismatched Zig release leaves the
 previous overlay intact.
 
+## Maintaining the Zig patch
+
+The build currently requires a standard-library overlay. Start from an
+unmodified Zig 0.17.0 library: the generator copies it, patches `std/c.zig`,
+`std/dynamic_library.zig` and `std/Io/Threaded.zig`, and installs the compatibility
+module under `std/c/`. The hardlink implementation is appended inside
+`Io.Threaded` so it uses that executor's syscall and cancellation state.
+The compiler binary and its installed library are unchanged.
+
+Use `ZIG_LIB_DIR` for every Windows test and build, including all runtime
+archives linked into the executable. Regenerate the overlay whenever its
+source adapters change. When upgrading Zig, update the exact source anchors
+in `make_zig_lib_overlay.py`, then rerun overlay safety tests, compatibility
+and owning-runtime tests, and native Windows qualification before using it.
+The generator refuses a library whose expected anchors do not match.
+
+```sh
+python3 -m unittest discover -s tools/windows -p 'test_*.py'
+```
+
 ## CrossOver smoke testing on macOS
 
 CrossOver's Intel loader requires Rosetta on Apple Silicon. Create a dedicated
@@ -255,7 +275,7 @@ For focused staging tests without the full application:
 
 ```sh
 ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test \
-  pkg/antfly-embedded/src/local/storage/lsm_backend/staged_file.zig \
+  pkg/antfly-embedded/src/storage/lsm_backend/staged_file.zig \
   -target x86_64-windows-gnu -O ReleaseFast -lc --test-no-exec \
   -femit-bin=/path/to/staged-test.exe
 ```
@@ -297,7 +317,7 @@ ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test -lc \
   -target x86_64-windows-gnu -O ReleaseFast --test-no-exec \
   -femit-bin=/path/to/storage-test.exe --test-filter 'storage_io.' \
   --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
-  -Mroot=pkg/antfly-embedded/src/local/windows_storage_test.zig \
+  -Mroot=pkg/antfly-embedded/src/windows_storage_test.zig \
   -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
   --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig
 ```
@@ -332,7 +352,7 @@ zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
 
 Nested listing and prefix download pass after object-key normalization.
 CrossOver still fails the two open-reader replacement tests with `AccessDenied`;
-see the qualification report. They need native Windows execution.
+see the qualification report. Both pass on native NTFS in Debug and ReleaseFast.
 
 Vector-block cleanup and empty/trailing-separator root regressions have a focused root:
 
@@ -343,12 +363,12 @@ zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
   -femit-bin=/path/to/vector-cleanup-test.exe \
   --dep antfly_source_root=root --dep antfly_hash --dep antfly_platform \
   --dep antfly_runtime_fs --dep antfly_vectorindex --dep antfly_test_error_logs \
-  --dep antfly_vector -Mroot=pkg/antfly-embedded/src/local/windows_vector_test.zig \
+  --dep antfly_vector -Mroot=pkg/antfly-embedded/src/windows_vector_test.zig \
   -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
   --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
   --dep antfly_hash --dep antfly_platform --dep antfly_vector \
   -Mantfly_vectorindex=lib/vectorindex/src/mod.zig \
-  -Mantfly_test_error_logs=pkg/antfly-embedded/src/local/test_error_logs.zig \
+  -Mantfly_test_error_logs=pkg/antfly-embedded/src/test_error_logs.zig \
   -Mantfly_vector=lib/vector/src/mod.zig
 ```
 
@@ -361,7 +381,7 @@ zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
   -femit-bin=/path/to/lite-index-test.exe \
   --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
   --dep antfly_cache_budget \
-  -Mroot=pkg/antfly-embedded/src/local/windows_lite_index_test.zig \
+  -Mroot=pkg/antfly-embedded/src/windows_lite_index_test.zig \
   -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
   --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
   --dep antfly_platform -Mantfly_cache_budget=lib/runtime/src/cache_budget.zig
@@ -371,14 +391,14 @@ For macOS execution, omit the Windows target and output/no-exec options and
 add `lib/platform/src/filesystem_capacity.c` before `-Mroot`.
 The suite passes all 24 tests on macOS. CrossOver passes 23 and fails the vacuum
 replacement test with `AccessDenied` in both Debug and ReleaseFast. Native
-Windows vacuum publication still needs verification; see the report.
+NTFS passes all 24 tests in both modes; see the report.
 
 For all three cancellation cleanup regressions, substitute the filter
 `--test-filter 'pending cancellation'`. The root also includes native Lite
 tests, so `--test-filter 'lite native streaming vacuum rejects corrupt values before publication'`
 exercises corrupt-input cleanup and the subsequent successful-vacuum attempt.
-CrossOver fails that final replacement with `AccessDenied`; the macOS test
-passes. The cancellation regressions use a canceled event and re-arm the
+CrossOver fails that final replacement with `AccessDenied`; macOS and native
+NTFS in both Windows build modes pass. The cancellation regressions use a canceled event and re-arm the
 request before cleanup, without a timed release.
 
 Backup seal and generation inventory paths normalize Windows walker output to
@@ -387,19 +407,19 @@ Backup seal and generation inventory paths normalize Windows walker output to
 ```sh
 ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
   zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
-  --test-runner pkg/antfly-embedded/src/local/test_runner.zig \
+  --test-runner pkg/antfly-embedded/src/test_runner.zig \
   --test-filter 'storage.db.native_backup' \
   --test-filter 'storage.db.snapshot_staging' \
   -femit-bin=/path/to/backup-test.exe \
   --dep antfly_source_root=root --dep antfly_test_error_logs \
   --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
   --dep antfly_cancellation --dep antfly_cache_budget \
-  -Mroot=pkg/antfly-embedded/src/local/windows_backup_test.zig \
+  -Mroot=pkg/antfly-embedded/src/windows_backup_test.zig \
   -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
   --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
   --dep antfly_platform -Mantfly_cancellation=lib/runtime/src/cancellation.zig \
   --dep antfly_platform -Mantfly_cache_budget=lib/runtime/src/cache_budget.zig \
-  -Mantfly_test_error_logs=pkg/antfly-embedded/src/local/test_error_logs.zig
+  -Mantfly_test_error_logs=pkg/antfly-embedded/src/test_error_logs.zig
 ```
 
 The repository runner verifies expected error logs. With the current overlay,
