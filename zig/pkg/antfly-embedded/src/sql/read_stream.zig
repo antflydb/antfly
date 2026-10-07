@@ -461,7 +461,7 @@ pub const Stream = struct {
             }
             const owner = try self.budget.allocator().create(Spool);
             errdefer self.budget.allocator().destroy(owner);
-            owner.manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_io orelse backend.spill_manager.?.io, .parallel_work = backend.execution_io != null, .async_writes = backend.execution_io != null, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+            owner.manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_io orelse backend.spill_manager.?.io, .parallel_work = backend.execution_io != null and backend.spill_wait == null, .async_writes = backend.execution_io != null and backend.spill_wait == null, .wait = backend.spill_wait, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
             owner.shared = backend.spill_manager;
             const manager = owner.shared orelse &owner.manager;
             errdefer if (owner.shared == null) owner.manager.deinit();

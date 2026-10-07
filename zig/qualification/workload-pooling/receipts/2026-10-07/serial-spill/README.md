@@ -67,3 +67,18 @@ SQL target; all ten build steps succeed. The plan-cache fixture uses determinist
 allocate/copy growth and retains its original 8,192-byte cache and 4,096-byte
 compile bounds. Production cache limits are unchanged. The API artifact above
 preceded this test-only plan-cache correction; its production code is unchanged.
+
+## GNU Linux protocol result
+
+The isolated snapshot at a19cf06f23 compiles with pinned Nix/glibc Zig and its
+local pooling shard passes all 33 tests. The API artifact passes all 38 tests
+without skips, failures or leaks in a separate two-CPU, 2 GiB runtime container
+with no additional swap. This snapshot precedes the private spill wait hooks.
+
+The initial full build remains failed: its compiler peaked at 24,105,984,000
+bytes, above the former 14 GiB compilation estimate, and its read-only source
+mount prevented std.testing.tmpDir from creating .zig-cache scratch. The direct
+runtime rerun retains the original artifact and suite filters while providing
+a writable scratch mount. The current Linux compiler estimate is 26 GiB based
+on that observation; runtime limits remain 2/4 GiB. Compiler and runtime gates
+are recorded separately rather than treating the initial build as green.

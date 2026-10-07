@@ -31,6 +31,7 @@ test {
     _ = @import("antfly_local_sources").sql_document_row;
     _ = @import("antfly_local_sources").sql_read_stream;
     _ = @import("antfly_local_sources").sql_operators;
+    _ = @import("antfly_local_sources").sql_spill;
     _ = @import("plan_cache.zig");
     _ = @import("antfly_local_sources").sql_session;
     _ = @import("antfly_local_sources").sql_setting_catalog;

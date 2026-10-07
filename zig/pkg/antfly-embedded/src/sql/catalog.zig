@@ -257,6 +257,8 @@ pub const Backend = struct {
     /// scheduled single-worker adapter can retain spilling without launching
     /// children that share its mutable execution capsule.
     spill_io: ?std.Io = null,
+    /// Single-worker execution handoff around private spill file I/O.
+    spill_wait: ?@import("execution_wait.zig").Boundary = null,
     spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,

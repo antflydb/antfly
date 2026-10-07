@@ -97,10 +97,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "default-workload-pooling-tests",
         .root_module = options.api_http_runtime_test_mod,
         .filters = &pooling_filters,
-        // GNU AArch64 Debug compilation measured 13.24 GB; native ReleaseSafe
-        // scheduler integration peaked at 20.18 GB. Keep compilation allowances
-        // separate from the unchanged 2/4 GiB qualification runtime limits.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 22 else 14) * 1024 * 1024 * 1024,
+        // Runnable integration compilation peaked at 20.18 GB on macOS and
+        // 24.11 GB with Nix/glibc Zig on GNU AArch64. These compiler allowances
+        // are separate from the unchanged 2/4 GiB qualification runtime limits.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 22 else 26) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-workload-pooling-test", "Run bounded waiting and shared HTTP/SQL admission contracts")

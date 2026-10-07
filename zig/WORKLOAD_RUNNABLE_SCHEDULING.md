@@ -2,7 +2,8 @@
 
 Status: scheduler core and opt-in HTTP/pgwire SQL read integration pass native
 protocol qualification; full Linux API and runtime metrics endpoint checks remain
-pending. Genuine backend wait suspension, parallel child ownership,
+pending. Private spill read/write suspension is implemented and under API verification;
+other backend waits, parallel child ownership,
 remote-attempt accounting, qualification and default selection remain required.
 The whole delivery goal remains safe sharing across
 many connections by default, with fairness and bounded waiting, while preserving
@@ -91,7 +92,12 @@ only already verified protected controls use reserved runnable capacity.
 No adapter may label a whole backend call resource-blocked just because it may
 perform I/O: it can also execute substantial CPU work. Releasing its runnable
 permit requires a genuine wait boundary and reacquisition before execution
-resumes. That integration remains outstanding.
+resumes. Private spill positional reads and writes now use that boundary, keeping
+stable buffers and their quota owners across the wait. Reacquisition runs on I/O
+failure as well as success; backend checkpoints run before successful data is
+decoded. Ten stalled read/write schedules pass on both platforms, including
+cancellation, expiry, shutdown and I/O errors. Storage/RPC and directory waits
+remain outstanding, as do fresh policy/catalog fences and parallel child owners.
 
 ## Integration order and completion requirements
 

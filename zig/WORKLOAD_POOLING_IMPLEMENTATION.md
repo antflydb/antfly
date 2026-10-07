@@ -795,3 +795,31 @@ fixture keeps its original hard bounds with deterministic allocate/copy growth.
 These checks qualify opt-in native SQL read integration; full Linux API and
 runtime metrics endpoints remain required, alongside genuine backend waits,
 parallel child ownership, wider workload coverage and automatic default sizing.
+
+
+Private spill reads and writes now relinquish runnable ownership around positional
+file I/O and reacquire before decoding or propagating I/O errors. The full SQL
+corpus passes 267 local and 118 server contracts on both macOS and pinned
+Nix/glibc GNU Linux. One fixture runs ten stalled read/write schedules; explicit
+module inclusion and a strict selection check corrected an initially empty
+focused run. The [spill-wait receipt](qualification/workload-pooling/receipts/2026-10-07/spill-waits/README.md)
+preserves both the non-qualifying selection and the complete passing schedules.
+The authored boundary now covers 736 sources. New API hook qualification remains
+pending; storage/RPC and directory waits, fresh policy/catalog fences, independent
+parallel children, broader workload classes and automatic defaults remain required.
+
+
+The isolated a19cf06f23 Linux API artifact passes all 38 protocol contracts in a
+separate 2 GiB runtime container; its local pooling shard passes all 33 tests. The
+initial build failed its obsolete compiler estimate and read-only test scratch
+setup, both preserved in the serial-spill receipt. The measured 24.11 GB compiler
+peak updates the Linux compilation estimate to 26 GiB while runtime qualification
+limits remain unchanged. This snapshot precedes the private spill wait hooks;
+their full native API verification is now running separately.
+
+
+The private spill wait hooks now pass the complete native API pooling target:
+33 local and 38 API contracts without skips, failures or leaks, and all 50 build
+steps succeed. Full Linux API qualification of the new hooks is the next gate.
+The documented hard original cursor snapshot deadline is unchanged; buffered
+rows still need fresh policy/catalog validation after cooperative resumption.
