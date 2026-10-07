@@ -134,6 +134,24 @@ guard already in validation. A permit may not remain borrowed across the wait,
 and a successful wait may not publish an owned result after failed reacquisition.
 General backend calls must retain CPU ownership for their non-waiting work.
 
+## Checked native wait callbacks
+
+`common/execution_wait.zig` supplies borrowed begin/end callbacks through the
+checked native callback ABI. Storage archives can release and reacquire a
+coordinator's execution owner without interpreting compilation-local Zig error
+integers. Scheduling error details are append-only and preserve prior numeric
+IDs and timeout/unavailable/retryable behavior. Owned successful I/O results are
+discarded through the original owner when resumption fails.
+
+The [native wait receipt](qualification/workload-pooling/receipts/2026-10-07/storage-wait-boundary/README.md)
+records three wait fixtures and all 25 error ABI fixtures passing on both
+platforms, including a separately compiled callback owner and explicit rejection
+of incompatible layouts. The qualifier verifies that the foreign dispatcher is
+used, rather than taking the local-call shortcut. This establishes the interface;
+request-local propagation to real storage/read-index/RPC waits is still required.
+Parallel children cannot share this single-worker execution owner. Accepted
+durable completion retains its own owner and cannot depend on a fresh grant.
+
 ## Integration order and completion requirements
 
 1. Own a scheduler on the execution node and validate its opt-in canonical

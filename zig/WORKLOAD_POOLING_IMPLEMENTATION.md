@@ -892,3 +892,16 @@ Whole native API qualification of private spill creation waits now passes all
 50 build steps. The exact-source [creation receipt](qualification/workload-pooling/receipts/2026-10-07/spill-creation-waits/README.md)
 preserves the complete output. Full Linux API verification of creation hooks
 remains a separate gate.
+
+
+The checked native execution-wait interface is now qualified through a separately
+compiled callback owner on macOS and pinned Nix/glibc GNU AArch64. All three wait
+fixtures and 25 error ABI fixtures pass, including foreign dispatcher selection,
+version/layout rejection, exact scheduling/authority error identity and original
+caller heap cleanup after a foreign resume failure. Scheduling details append to
+the existing error ABI without renumbering previous outcomes. The
+[native wait receipt](qualification/workload-pooling/receipts/2026-10-07/storage-wait-boundary/README.md)
+preserves matching post-format source hashes, owner artifact hashes and complete
+commands/logs. The explicit embedded boundary covers 738 sources. Actual storage
+wait propagation, parallel children and wider workload integration remain required;
+this interface does not by itself release capacity in those backends.
