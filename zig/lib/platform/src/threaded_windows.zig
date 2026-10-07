@@ -12512,9 +12512,8 @@ fn netConnectIpWindows(
     const addr_len = addressToPosix(address, &storage.Address);
     const compat = @import("windows_native.zig");
     if (compat.isWine()) {
-        const syscall: Syscall = try .start();
-        compat.connectSocket(socket_handle, @as([]const u8, @ptrCast(&storage.Address))[0..addr_len]) catch |err| return syscall.fail(err);
-        syscall.finish();
+        try Thread.checkCancel();
+        try compat.connectSocket(socket_handle, @as([]const u8, @ptrCast(&storage.Address))[0..addr_len], options.mode, waitSocketEvent);
         return .{ .handle = socket_handle, .address = bound_address };
     }
     switch ((try deviceIoControl(&.{

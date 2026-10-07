@@ -728,3 +728,59 @@ source hashes, native/Wine results and cleanup records),
 `/private/tmp/pr987-ownership-c-file-native.log`,
 `/private/tmp/pr987-ownership-app-build.log`, and
 `/private/tmp/pr987-ownership-app-smoke`.
+
+
+## Main merge, Winsock connections and Linux clocks (2026-10-07)
+
+PR head `3573538aa0` is merged with `origin/main` at
+`cd69bdadfb556f21b8b9c54075b097a20d3449b3` in merge commit `6f0b23614c`.
+The lake-test conflict was formatting only on the PR side; the resolved
+Python AST matches main exactly, preserving its new text/highlight and
+filtered-limit coverage. Locked TypeScript dependencies were installed to
+run the repository's normal commit formatter.
+
+Wine connection-oriented sockets now use a provider-resolved `ConnectEx`
+request on their already-bound socket, an owned event, and the executor's
+cancellation wakeup. Cancellation targets and drains that request before
+releasing storage; success applies `SO_UPDATE_CONNECT_CONTEXT`. Datagram
+peer association retains the local Winsock connect operation. Native
+Windows retains its existing AFD connection path.
+
+Winsock failures use explicit typed mappings for resets, refusal, timeout,
+unreachable networks/hosts and cancellation. Unknown socket errors are
+logged numerically on connect, accept, stream and generic socket paths;
+they are never formatted as unrelated Win32 enum values. Both original
+live probes now pass: a reset returns `ConnectionResetByPeer`, and a stalled
+connection cancels and joins instead of hanging.
+
+POSIX clocks and nanosleep again use `std.posix.system`, preserving Linux
+syscalls when libc is absent. Platform checks now run clock tests and always
+compile their x86_64 Linux variant without libc, including on macOS hosts.
+The two clock tests also pass in a disposable local ARM64 Linux container
+with libc absent, networking disabled and a read-only filesystem; that
+container was removed. macOS platform checks pass **17/17 build steps**,
+including the clock tests and 13 Python process checks.
+
+All six focused Debug/ReleaseFast executables pass on CrossOver and Windows
+Server 2022 build `10.0.20348.0` on NTFS: **28 passed, zero skips, zero
+failures and zero leaks** per environment. The archive now includes dedicated
+Winsock mapping/tracing tests. The compatibility suite covers task-level
+outbound-connect deadlines and repeated cancellation near submission and
+while pending. Environments rejecting the documentation address immediately
+skip that pending-connect case; it ran successfully in both qualification
+environments. All native executable hashes match the manifest.
+
+The merged Windows application and native/browser module boundary audits
+pass **59/59 build steps**. Application SHA-256:
+`d12177d8a6fb68c1e9f592502035be07550e45e4b626a81f6320f9195debe831`.
+Its CrossOver smoke passes 64 queries across forced termination/reopen,
+verifies all 32 acknowledged documents and full-text entries, and reports
+valid storage with zero tail bytes. This does not add native application
+VM-reset durability qualification. The installed Zig library is unchanged.
+
+Evidence is retained in `/private/tmp/pr987-connect-fix-tests` (manifest,
+source hashes, native/Wine results and cleanup records),
+`/private/tmp/pr987-connect-platform-tests.log`,
+`/private/tmp/pr987-connect-linux-clocks.log`,
+`/private/tmp/pr987-connect-fix-app-build.log`, and
+`/private/tmp/pr987-connect-fix-app-smoke`.

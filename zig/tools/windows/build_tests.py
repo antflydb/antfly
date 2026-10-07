@@ -47,6 +47,10 @@ def module(root, dependencies, tail):
 
 
 SUITES = {
+    "socket-errors": (
+        ["Windows socket "],
+        module("tools/windows/socket_error_test.zig", ["antfly_platform"], PLATFORM),
+    ),
     "model-file": (
         ["file readers preserve positional mode"],
         module("pkg/inference/src/util/c_file.zig", ["antfly_platform"], PLATFORM),

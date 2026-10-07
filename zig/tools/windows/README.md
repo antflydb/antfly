@@ -72,7 +72,7 @@ or Windows Server compatibility; those still need a real Windows runner.
 
 ## Focused qualification with stock Zig
 
-From `zig/`, build all eight suites in Debug and ReleaseFast:
+From `zig/`, build all nine suites in Debug and ReleaseFast:
 
 ```sh
 python3 tools/windows/build_tests.py --zig zig --out /private/tmp/antfly-windows-tests
@@ -80,9 +80,11 @@ python3 tools/windows/build_tests.py --zig zig --out /private/tmp/antfly-windows
 
 The builder explicitly selects the installed Zig library, clears `ZIG_LIB_DIR`,
 and creates hashed executables, `manifest.json`, and `tests.zip`. It covers
-compatibility primitives, model-file reads/mapping/parallel prefetch, hardlinks, backup/staging cancellation, object-store
-filesystem publication, Lite index/vacuum, storage I/O, and a separately compiled
-archive borrower that dispatches 64 times after owning workers park. Use
+compatibility primitives and Winsock error translation, model-file
+reads/mapping/parallel prefetch, hardlinks, backup/staging cancellation,
+object-store filesystem publication, Lite index/vacuum, storage I/O, and a
+separately compiled archive borrower that dispatches 64 times after owning
+workers park. Use
 `--suite backup --mode Debug` for a focused loop, or `--target native` for macOS
 comparison. It uses the repository test runner and checks expected error logs.
 

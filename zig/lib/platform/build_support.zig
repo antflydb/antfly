@@ -108,7 +108,24 @@ pub fn addTests(b: *std.Build, options: struct {
         .optimize = optimize,
     }) });
     const run_entropy_tests = b.addRunArtifact(entropy_tests);
+    const clock_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/time.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const run_clocks = b.addRunArtifact(clock_tests);
+    // Always compile the Linux syscall variant, including on macOS hosts.
+    // This catches an accidental libc dependency without a cross-runner.
+    const syscall_clocks = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/time.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu }),
+        .optimize = optimize,
+        .link_libc = false,
+    }) });
     const run_unit = b.addRunArtifact(unit);
+    run_unit.step.dependOn(&run_clocks.step);
+    run_unit.step.dependOn(&syscall_clocks.step);
     run_unit.step.dependOn(&run_atomic_tests.step);
     run_unit.step.dependOn(&run_entropy_tests.step);
     const one_shot = b.createModule(.{

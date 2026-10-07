@@ -24,11 +24,11 @@ pub fn sleepNs(ns: u64) void {
     if (comptime is_hostless) return;
     if (comptime builtin.os.tag == .windows) return windows.sleepNs(ns);
 
-    var req = @import("root.zig").c.timespec{
+    var req = std.posix.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(@import("root.zig").c.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -72,8 +72,8 @@ pub fn monotonicNs() u64 {
     }
     if (comptime builtin.os.tag == .windows) return windows.monotonicNs();
 
-    var ts: @import("root.zig").c.timespec = undefined;
-    switch (std.posix.errno(@import("root.zig").c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -84,8 +84,8 @@ pub fn monotonicNs() u64 {
 /// Other supported platforms fall back to their monotonic clock.
 pub fn authorityNs() u64 {
     if (comptime builtin.os.tag == .linux) {
-        var ts: @import("root.zig").c.timespec = undefined;
-        switch (std.posix.errno(@import("root.zig").c.clock_gettime(.BOOTTIME, &ts))) {
+        var ts: std.posix.timespec = undefined;
+        switch (std.posix.errno(std.posix.system.clock_gettime(.BOOTTIME, &ts))) {
             .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
             // A suspend-blind fallback could reopen a stale writer after node
             // resume. Saturating time expires every outstanding authority.
@@ -102,8 +102,8 @@ pub fn realtimeNs() u64 {
     }
     if (comptime builtin.os.tag == .windows) return windows.realtimeNs();
 
-    var ts: @import("root.zig").c.timespec = undefined;
-    switch (std.posix.errno(@import("root.zig").c.clock_gettime(.REALTIME, &ts))) {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -118,8 +118,8 @@ pub fn nowSeconds() u64 {
 /// targets and clock failures are explicit absence, never a fabricated zero.
 pub fn threadCpuNs() ?u64 {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .macos) return null;
-    var ts: @import("root.zig").c.timespec = undefined;
-    switch (std.posix.errno(@import("root.zig").c.clock_gettime(.THREAD_CPUTIME_ID, &ts))) {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.THREAD_CPUTIME_ID, &ts))) {
         .SUCCESS => return std.math.cast(u64, @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return null,
     }
@@ -142,4 +142,15 @@ pub fn residentBytes() usize {
         .linux => std.math.mul(usize, maxrss, 1024) catch std.math.maxInt(usize),
         else => maxrss,
     };
+}
+
+test "platform clocks and sleep work without requiring libc on Linux" {
+    if (comptime is_hostless) return error.SkipZigTest;
+    const before = monotonicNs();
+    try std.testing.expect(before > 0);
+    sleepNs(std.time.ns_per_ms);
+    try std.testing.expect(monotonicNs() >= before);
+    try std.testing.expect(realtimeNs() > 0);
+    try std.testing.expect(authorityNs() >= before);
+    if (threadCpuNs()) |cpu| try std.testing.expect(cpu > 0);
 }

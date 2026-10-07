@@ -48,7 +48,7 @@ extern "kernel32" fn CancelIoEx(file: windows.HANDLE, overlapped: *Overlapped) c
 extern "ntdll" fn RtlNtStatusToDosError(status: windows.NTSTATUS) callconv(.winapi) u32;
 extern "ws2_32" fn WSAGetOverlappedResult(socket: usize, overlapped: *Overlapped, transferred: *u32, wait: BOOL, flags: *u32) callconv(.winapi) BOOL;
 extern "bcrypt" fn BCryptGenRandom(algorithm: ?*anyopaque, buffer: [*]u8, len: u32, flags: u32) callconv(.winapi) windows.NTSTATUS;
-extern "ws2_32" fn setsockopt(socket: windows.HANDLE, level: i32, option: i32, value: [*]const u8, len: i32) callconv(.winapi) c_int;
+extern "ws2_32" fn setsockopt(socket: windows.HANDLE, level: i32, option: i32, value: ?[*]const u8, len: i32) callconv(.winapi) c_int;
 extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
 extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) c_int;
 extern "ws2_32" fn WSASocketW(family: i32, mode: i32, protocol: i32, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
@@ -124,7 +124,7 @@ var winsock_init_lock: ?*anyopaque = null;
 fn socketError() error{ SystemResources, Unexpected } {
     const code = WSAGetLastError();
     if (code == 10055) return error.SystemResources;
-    return windows.unexpectedError(@fromBackingInt(@intCast(@as(u32, @intCast(code)))));
+    return unexpectedSocketError(code);
 }
 
 pub fn openSocket(family: i32, mode: i32, protocol: i32) !windows.HANDLE {
@@ -150,14 +150,65 @@ pub fn closeSocket(socket: windows.HANDLE) void {
     } else windows.CloseHandle(socket);
 }
 
-pub fn connectSocket(socket: windows.HANDLE, address: []const u8) std.Io.net.IpAddress.ConnectError!void {
-    if (connect(@intFromPtr(socket), address.ptr, @intCast(address.len)) != 0) {
-        return switch (WSAGetLastError()) {
-            10004 => error.Canceled,
-            10061 => error.ConnectionRefused,
-            else => socketError(),
-        };
+/// The caller binds before ConnectEx. Own and drain the request exactly like
+/// stream reads/accepts so a task deadline can join without waiting for TCP's
+/// retransmission timeout. Datagram connect only associates a peer locally.
+pub fn connectSocket(socket: windows.HANDLE, address: []const u8, mode: std.Io.net.Socket.Mode, comptime wait: anytype) std.Io.net.IpAddress.ConnectError!void {
+    if (mode == .dgram or mode == .raw) {
+        if (connect(@intFromPtr(socket), address.ptr, @intCast(address.len)) != 0) return connectSocketError(WSAGetLastError());
+        return;
     }
+    const ConnectEx = *const fn (usize, [*]const u8, i32, ?*const anyopaque, u32, *u32, *Overlapped) callconv(.winapi) BOOL;
+    const Guid = extern struct { a: u32, b: u16, c: u16, d: [8]u8 };
+    const id: Guid = .{ .a = 0x25a207b9, .b = 0xddf3, .c = 0x4660, .d = .{ 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e } };
+    var connect_ex: ConnectEx = undefined;
+    var returned: u32 = 0;
+    if (WSAIoctl(@intFromPtr(socket), 0xc8000006, &id, @sizeOf(Guid), @ptrCast(&connect_ex), @sizeOf(ConnectEx), &returned, null, null) != 0) return connectSocketError(WSAGetLastError());
+    var operation: Overlapped = .{ .event = try createIoEvent() };
+    defer windows.CloseHandle(operation.event.?);
+    var sent: u32 = 0;
+    if (connect_ex(@intFromPtr(socket), address.ptr, @intCast(address.len), null, 0, &sent, &operation) == 0) {
+        const code = WSAGetLastError();
+        if (code != 997) return connectSocketError(code);
+        var flags: u32 = 0;
+        wait(operation.event.?) catch |err| {
+            _ = CancelIoEx(socket, &operation);
+            _ = WSAGetOverlappedResult(@intFromPtr(socket), &operation, &sent, 1, &flags);
+            return err;
+        };
+        if (WSAGetOverlappedResult(@intFromPtr(socket), &operation, &sent, 0, &flags) == 0) return connectSocketError(WSAGetLastError());
+    }
+    // Make ordinary socket options/address queries valid after ConnectEx.
+    if (setsockopt(socket, 0xffff, 0x7010, null, 0) != 0) return connectSocketError(WSAGetLastError());
+}
+
+fn connectSocketError(code: c_int) std.Io.net.IpAddress.ConnectError {
+    return switch (code) {
+        995, 10004 => error.Canceled,
+        10013 => error.AccessDenied,
+        10024 => error.ProcessFdQuotaExceeded,
+        10035 => error.WouldBlock,
+        10036, 10037 => error.ConnectionPending,
+        10043 => error.ProtocolUnsupportedBySystem,
+        10045 => error.OptionUnsupported,
+        10047 => error.AddressFamilyUnsupported,
+        10048, 10049 => error.AddressUnavailable,
+        10050 => error.NetworkDown,
+        10051 => error.NetworkUnreachable,
+        10053, 10054 => error.ConnectionResetByPeer,
+        10055 => error.SystemResources,
+        10060 => error.Timeout,
+        10061 => error.ConnectionRefused,
+        10064, 10065 => error.HostUnreachable,
+        else => unexpectedSocketError(code),
+    };
+}
+
+/// Winsock codes are not Win32Error tags. Formatting them as that enum panics
+/// on unmapped values in Debug. Keep unknown codes numeric on every socket path.
+fn unexpectedSocketError(code: c_int) error{Unexpected} {
+    if (std.options.unexpected_error_tracing) std.debug.print("error.Unexpected: WSAGetLastError({d})\n", .{code});
+    return error.Unexpected;
 }
 
 /// AcceptEx owns an unconnected socket and an overlapped request. Canceling
@@ -221,7 +272,7 @@ fn acceptSocketError(code: c_int) std.Io.net.Server.AcceptError {
         10053, 10054 => error.ConnectionAborted,
         10055 => error.SystemResources,
         10013 => error.BlockedByFirewall,
-        else => windows.unexpectedError(@fromBackingInt(@intCast(@as(u32, @intCast(code))))),
+        else => unexpectedSocketError(code),
     };
 }
 
@@ -295,7 +346,7 @@ fn streamSocketError(code: c_int) error{ Canceled, ConnectionResetByPeer, Connec
         10053, 10054, 10058 => error.ConnectionResetByPeer,
         10060 => error.ConnectionTimedOut,
         10055 => error.SystemResources,
-        else => windows.unexpectedError(@fromBackingInt(@intCast(@as(u32, @intCast(code))))),
+        else => unexpectedSocketError(code),
     };
 }
 
@@ -561,3 +612,10 @@ fn failWindowsError(code: u32) isize {
         else => .IO,
     });
 }
+
+// Error mapping is exposed only to the platform qualification tests.
+pub const SocketTesting = if (@import("builtin").is_test) struct {
+    pub const connectError = connectSocketError;
+    pub const acceptError = acceptSocketError;
+    pub const streamError = streamSocketError;
+} else void;

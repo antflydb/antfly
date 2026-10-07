@@ -326,3 +326,45 @@ fn groupedIdleAccept(io: std.Io, server: *std.Io.net.Server, started: *std.Io.Ev
         else => std.debug.panic("unexpected accept failure: {t}", .{err}),
     };
 }
+
+fn outboundConnect(io: std.Io, address: std.Io.net.IpAddress, started: *std.Io.Event) std.Io.net.IpAddress.ConnectError!void {
+    started.set(io);
+    const peer = try address.connect(io, .{ .mode = .stream });
+    peer.close(io);
+}
+
+test "Windows outbound connect deadlines cancel and join stalled requests" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = native_platform.testing.io;
+    // RFC 5737 documentation address: normally leaves the TCP handshake
+    // pending. Environments rejecting it immediately skip the pending case.
+    const address = try std.Io.net.IpAddress.parse("192.0.2.1", 443);
+    const Result = union(enum) { connect: std.Io.net.IpAddress.ConnectError!void, timeout: std.Io.Cancelable!void };
+    var results: [2]Result = undefined;
+    var selection: std.Io.Select(Result) = .init(io, &results);
+    defer selection.cancelDiscard();
+    var started: std.Io.Event = .unset;
+    try selection.concurrent(.connect, outboundConnect, .{ io, address, &started });
+    try started.wait(io);
+    try selection.concurrent(.timeout, std.Io.sleep, .{ io, .fromMilliseconds(20), .awake });
+    switch (try selection.await()) {
+        .timeout => |result| try result,
+        .connect => |result| {
+            result catch |err| switch (err) {
+                error.NetworkUnreachable, error.HostUnreachable, error.ConnectionRefused, error.Timeout, error.ConnectionResetByPeer, error.AccessDenied => return error.SkipZigTest,
+                else => return err,
+            };
+            return error.SkipZigTest;
+        },
+    }
+    selection.cancelDiscard();
+    // Repeated direct cancellation also exercises cancellation near submission.
+    for (0..8) |iteration| {
+        started = .unset;
+        var future = try io.concurrent(outboundConnect, .{ io, address, &started });
+        defer future.cancel(io) catch {};
+        try started.wait(io);
+        if (iteration % 2 == 0) try io.sleep(.fromMilliseconds(20), .awake);
+        try std.testing.expectError(error.Canceled, future.cancel(io));
+    }
+}
