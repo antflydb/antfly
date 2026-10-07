@@ -150,6 +150,22 @@ const Owner = struct {
             };
             self.offsets = @splat(null);
         }
+        fn rememberPage(self: *@This(), page: u64) void {
+            for (self.recent_pages) |prior| if (prior == page) return;
+            self.recent_pages[self.recent_cursor] = page;
+            self.recent_cursor = (self.recent_cursor + 1) % self.recent_pages.len;
+        }
+        fn reap(self: *@This(), io: std.Io) void {
+            for (&self.pending, &self.offsets) |*slot, *offset| {
+                if (slot.*) |*task| {
+                    if (!task.isComplete()) continue;
+                    const succeeded = if (task.await(io)) |_| true else |_| false;
+                    if (succeeded) self.rememberPage(offset.*.? / block_bytes);
+                    slot.* = null;
+                    offset.* = null;
+                }
+            }
+        }
         fn prefetch(raw: *anyopaque, start: u64, length: u64) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             @import("antfly_platform").sync.lockYielding(&self.mutex);
@@ -159,6 +175,7 @@ const Owner = struct {
             if (self.capability.cache == null) return;
             const io = self.capability.context.io orelse return;
             self.capability.check() catch return;
+            self.reap(io);
             if (start > self.owner.directory.bytes or length > self.owner.directory.bytes - start) return;
             var offset = start;
             var count: usize = 0;
@@ -206,15 +223,7 @@ const Owner = struct {
                     page += 1;
                     count += 1;
                 }) {
-                    var seen = false;
-                    for (self.recent_pages) |prior| if (prior == page) {
-                        seen = true;
-                        break;
-                    };
-                    if (!seen) {
-                        self.recent_pages[self.recent_cursor] = page;
-                        self.recent_cursor = (self.recent_cursor + 1) % self.recent_pages.len;
-                    }
+                    self.rememberPage(page);
                 }
             }
             if (self.capability.context.io) |io| for (&self.pending, &self.offsets) |*slot, *start| {
@@ -465,12 +474,18 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     defer if (open) source.close();
     source.prefetch(0, bytes.len);
     const query: *Owner.Query = @ptrCast(@alignCast(source.ranges.ptr));
+    // WAND can skip every hinted page. Completed tasks must not permanently
+    // occupy the four slots even when no required read overlaps them.
+    for (&query.pending) |*slot| if (slot.*) |*task| {
+        while (!task.isComplete()) std.atomic.spinLoopHint();
+    };
+    source.prefetch(block_bytes * 4, block_bytes);
     query.drain(false);
-    try std.testing.expectEqual(@as(u64, 4), cache.stats.provider_reads);
+    try std.testing.expectEqual(@as(u64, 5), cache.stats.provider_reads);
     var sample: [1]u8 = undefined;
     try source.readInto(block_bytes * 3, &sample);
     try std.testing.expectEqual(@as(u8, 3), sample[0]);
-    try std.testing.expectEqual(@as(u64, 4), cache.stats.provider_reads);
+    try std.testing.expectEqual(@as(u64, 5), cache.stats.provider_reads);
     // Speculative failures remain invisible until that block is required.
     const Denied = struct {
         fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
@@ -481,9 +496,9 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     vtable.stat = Denied.stat;
     vtable.stat_with_cancellation = null;
     capability.store.vtable = &vtable;
-    source.prefetch(block_bytes * 4, block_bytes);
+    source.prefetch(block_bytes * 5, block_bytes);
     query.drain(false);
-    try std.testing.expectError(error.TestRemoteUnavailable, source.readInto(block_bytes * 4, &sample));
+    try std.testing.expectError(error.TestRemoteUnavailable, source.readInto(block_bytes * 5, &sample));
     source.prefetch(block_bytes * 5, block_bytes);
     source.quiesceReadContext();
     try std.testing.expectError(error.Canceled, source.readInto(0, &sample));

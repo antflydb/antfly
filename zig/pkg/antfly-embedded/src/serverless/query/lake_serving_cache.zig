@@ -68,7 +68,9 @@ pub const Cache = struct {
         try policy.validate();
         if (root.len == 0) return error.InvalidPersistentObjectRangeCachePolicy;
         if (self.persistent_attempted) return;
-        self.persistent = parquet.PersistentObjectRangeCache.initWithPolicyAndResources(io, root, policy, resources) catch |err| {
+        var coordinated = resources;
+        coordinated.reclaim_idle = .{ .ptr = self, .reclaim_one = reclaimIdleMapping };
+        self.persistent = parquet.PersistentObjectRangeCache.initWithPolicyAndResources(io, root, policy, coordinated) catch |err| {
             if (err == error.Canceled) return err;
             // Local cache availability is never source/readiness authority.
             // Report the reason once and continue serving through RAM/source.
@@ -155,6 +157,9 @@ pub const Cache = struct {
         return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
+        // Readers are quiescent. Join accepted writes before destroying the
+        // mapping table borrowed by the worker's pressure callback.
+        if (self.persistent) |*disk| disk.flush();
         var mappings = self.mappings.valueIterator();
         while (mappings.next()) |entry| entry.*.destroy();
         self.mappings.deinit(self.alloc);
@@ -279,6 +284,22 @@ pub const Cache = struct {
         mapping.touched = self.tick;
         self.stats.mapping_hits +|= 1;
         return mapping;
+    }
+    fn reclaimIdleMapping(raw: *anyopaque) bool {
+        const self: *Cache = @ptrCast(@alignCast(raw));
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        var victim: ?*Mapping = null;
+        var entries = self.mappings.valueIterator();
+        while (entries.next()) |entry| {
+            if (entry.*.refs != 0) continue;
+            if (victim == null or entry.*.touched < victim.?.touched) victim = entry.*;
+        }
+        const retired = victim orelse return false;
+        _ = self.mappings.remove(retired.key);
+        self.mapped_bytes -= retired.value.mapping.len;
+        retired.destroy();
+        return true;
     }
     // Only verified immutable cache inodes enter this owner. Replacement is
     // atomic; pins keep the original mapping and disk eviction lease alive.
@@ -1096,4 +1117,52 @@ test "external lake bounded verified mappings reuse owners and pin through press
     try std.testing.expect(cache.mapped_bytes <= cache.max_mapped_bytes);
     try std.testing.expectEqual(@as(usize, 1), cache.mappings.count());
     try std.testing.expectEqual(@as(usize, 2), provider.calls);
+}
+
+test "external lake disk pressure reclaims idle mappings while preserving active readers" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/mapping-pressure", .{tmp.sub_path});
+    defer a.free(path);
+    var cache = Cache.initWithMemoryLimit(a, 0);
+    defer cache.deinit();
+    try cache.ensurePersistent(io, path, .{ .max_entries = 2 }, .{});
+    const Provider = struct {
+        fn load(_: *anyopaque, alloc: Allocator) ![]u8 {
+            return alloc.dupe(u8, "verified block");
+        }
+    };
+    var dummy: u8 = 0;
+    const loader: Cache.ImmutableLoader = .{ .ptr = &dummy, .load = Provider.load };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("verified block", &digest, .{});
+    for ([_][]const u8{ "active", "idle" }) |key| {
+        var cold = try cache.readImmutableBlockLease(a, @splat(1), key, 14, digest, .{ .io = io }, loader);
+        cold.deinit();
+    }
+    cache.persistent.?.flush();
+    var active = try cache.readImmutableBlockLease(a, @splat(1), "active", 14, digest, .{ .io = io }, loader);
+    defer active.deinit();
+    {
+        var idle = try cache.readImmutableBlockLease(a, @splat(1), "idle", 14, digest, .{ .io = io }, loader);
+        defer idle.deinit();
+        try std.testing.expect(active == .mapping and idle == .mapping);
+        try std.testing.expect(!Cache.reclaimIdleMapping(&cache));
+    }
+    // Both entries remain disk-pinned, but only one has a live query reader.
+    // Disk capacity is much smaller than the mapping cache's independent limit.
+    var incoming = try cache.readImmutableBlockLease(a, @splat(1), "incoming", 14, digest, .{ .io = io }, loader);
+    incoming.deinit();
+    cache.persistent.?.flush();
+    try std.testing.expectEqual(@as(usize, 1), cache.mappings.count());
+    try std.testing.expectEqual(@as(usize, 1), cache.persistentStats().?.evicted_entries);
+    var admitted = try cache.readImmutableBlockLease(a, @splat(1), "incoming", 14, digest, .{ .io = io }, loader);
+    defer admitted.deinit();
+    try std.testing.expect(admitted == .mapping);
+    try std.testing.expectEqualStrings("verified block", active.bytes());
 }

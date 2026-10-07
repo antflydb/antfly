@@ -1650,6 +1650,7 @@ fn analyzeDefaultEnglish(alloc: Allocator, text: []const u8) ![]Token {
     const stops = stopwords_mod.getStopWords(.english);
     var tokens = std.ArrayListUnmanaged(Token).empty;
     defer tokens.deinit(alloc);
+    errdefer for (tokens.items) |token| alloc.free(token.term);
 
     var pos: u32 = 0;
     var position: u32 = 0;

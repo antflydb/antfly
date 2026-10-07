@@ -1016,6 +1016,20 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         mixed_result = call("POST", "/tables/lake_text/query", mixed_request)
         assert {hit["_source"]["label"] for hit in mixed_result["hits"]["hits"]} >= {"row-17", "row-18", "row-129", "row-2055"}, mixed_result
         assert all(hit["_score"] > 0 for hit in mixed_result["hits"]["hits"]), mixed_result
+        # Final-page typed hydration must preserve exact source values and
+        # keep highlight-only dependencies out of the public projection,
+        # including after text/dense/sparse fusion.
+        typed_request = dict(request, fields=["label", "amount"], highlight={"fields": ["body"]})
+        def assert_typed_page(response):
+            for hit in response["hits"]["hits"]:
+                source = hit["_source"]
+                assert set(source) == {"label", "amount"}, hit
+                assert source["amount"] == base + int(source["label"].removeprefix("row-")), hit
+                if source["label"] in {"row-17", "row-18", "row-129", "row-2055"}:
+                    assert hit["_highlights"]["body"], hit
+        assert_typed_page(call("POST", "/tables/lake_text/query", typed_request))
+        assert_typed_page(call("POST", "/tables/lake_text/query",
+                              dict(mixed_request, fields=["label", "amount"], highlight={"fields": ["body"]})))
         ordered_request = dict(request, order_by=[{"field": "_score", "desc": True}])
         ordered_first = call("POST", "/tables/lake_text/query", dict(ordered_request, limit=1))
         snapshot_token = ordered_first["remote_snapshot"]
@@ -1043,6 +1057,7 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         sparse_reopened = call("POST", "/tables/lake_text/query", sparse_request)
         assert [(hit["_id"], hit["_score"]) for hit in sparse_reopened["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in sparse_result["hits"]["hits"]]
         assert_highlights(call("POST", "/tables/lake_text/query", highlight_request))
+        assert_typed_page(call("POST", "/tables/lake_text/query", typed_request))
         warm = call("POST", "/tables/lake_text/query", request)
         assert [(hit["_id"], hit["_score"]) for hit in warm["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in hits]
         prefix_reopened = call("POST", "/tables/lake_text/query", prefix_request)

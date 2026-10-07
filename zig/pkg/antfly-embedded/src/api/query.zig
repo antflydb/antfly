@@ -1401,6 +1401,7 @@ fn graphHitRetainedBytes(hit: db_mod.types.SearchHit) usize {
     retainedAdd(&total, retainedBytesForSlice(std.json.Value, hit.sort_values.len));
     for (hit.sort_values) |value| retainedAdd(&total, jsonValueRetainedBytes(value));
     if (hit.stored_data) |data| retainedAdd(&total, data.len);
+    if (hit.source_value) |value| retainedAdd(&total, jsonValueRetainedBytes(value));
     if (hit.ancestor_source_data) |data| retainedAdd(&total, data.len);
     if (hit.ancestor_unit_data) |data| retainedAdd(&total, data.len);
     if (hit.artifact_ref) |artifact| retainedAdd(&total, artifactRefRetainedBytes(artifact));

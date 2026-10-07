@@ -18785,15 +18785,15 @@ pub fn attachHighlightsWithIndexQueries(
 
     for (hits, 0..) |*hit, hit_index| {
         if (hit.highlights.len > 0) continue;
-        const stored = blk: {
-            if (sources) |items| {
-                if (items[hit_index]) |source| break :blk source;
-            }
-            break :blk hit.stored_data orelse continue;
-        };
         _ = hit_arena_state.reset(.retain_capacity);
         const hit_arena = hit_arena_state.allocator();
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
+        const parsed = parsed: {
+            if (sources) |items| if (items[hit_index]) |source|
+                break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, source, .{}) catch continue;
+            if (hit.source_value) |value| break :parsed value;
+            const stored = hit.stored_data orelse continue;
+            break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
+        };
 
         const text_fields = try hit_arena.alloc([]const mapper_mod.HighlightTextField, indexed_queries.len);
         var fields = std.ArrayListUnmanaged([]const u8).empty;

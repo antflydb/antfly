@@ -848,3 +848,35 @@ only highlight dependencies. Exclusion-only/full-source requests, schema-less
 or unrestricted dynamic highlighting, and consumers without a finite dependency
 contract (evaluation, reranking, hierarchy and residual filters) retain full
 source. Final public projection still controls the returned document.
+
+
+Native lookahead owns a rolling bounded task set. Shared scheduler completion
+is observable independently of joining or admission release. Each new hint
+reaps completed tasks, including ranges skipped by WAND, and remembers recently
+warmed pages to avoid resubmitting work for every small decoder read. Failures
+remain speculative until a required read, and close still cancels and joins
+all outstanding work before releasing the query capability.
+
+Disk-cache quota pressure can reclaim idle verified mapping owners, even when
+the independent mapping LRU has spare capacity. The disk worker calls this
+consumer hook without holding its inventory mutex. Only mappings with zero
+active leases are retired; active query mappings remain pinned. Cache shutdown
+flushes the worker before destroying the table borrowed by this hook.
+
+Source-independent remote retrieval, including named text/vector fusion, now
+hydrates the final hit page into owned typed source values. Physical hydration
+still batches 256 identities and applies the same snapshot/delete/lease checks;
+key lookup uses a batch map rather than repeatedly scanning all requested keys.
+Shared highlighting borrows the typed source and public field projection
+operates on values directly. The public response is the first JSON encoding of
+the document. Typed sources participate in hit cloning, release, and retained
+memory accounting. Source omitted from the response may still be retained for
+highlighting, without leaking dependency fields into `_source`.
+
+An explicit shared dependency contract keeps encoded hydration for evaluation,
+reranking, hierarchy, document-bound filters, and other source-dependent
+operators. Ordinary native identity/score ordering can use typed delivery;
+field sorting and cursor continuations retain their established execution path.
+This preserves response projection, exact integers, source omission, and
+highlight behavior while removing document encode/parse cycles from the common
+retrieval path.
