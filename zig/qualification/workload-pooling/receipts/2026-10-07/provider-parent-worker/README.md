@@ -17,3 +17,11 @@ access. The initial failure is retained rather than counted as a product pass.
 This qualifies the provider runtime contract on native macOS only. Linux and
 SQL API integration are pending. It does not qualify independent child admission,
 provider wait suspension, model/backend inference scheduling, or automatic defaults.
+
+The strengthened provider fixture returns distinct probabilities for each input
+and verifies their result order and total input-token usage. The same 47-step,
+24-test native gate passes; `native-order.json` pins the new runtime bytes and
+`native-order.log.gz` retains the complete output. Added assertions in the real
+HTTP SQL fixture cover the adapter selection for scheduled reads, serial writes
+and unscheduled callers, but those assertions await the full API gate. They are
+not covered by this provider-only result.

@@ -382,7 +382,7 @@ test "decision functions serial provider batches remain on the admitted parent w
             defer parsed.deinit();
             try std.testing.expectEqualStrings(if (self.calls == 0) "first" else "second", parsed.value.object.get("state").?.string);
             self.calls += 1;
-            return alloc.dupe(u8, "{\"model\":\"serial-model\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}");
+            return std.fmt.allocPrint(alloc, "{{\"model\":\"serial-model\",\"answers\":{{\"answer\":{{\"type\":\"noul\",\"noul\":{d}}}}},\"usage\":{{\"input_tokens\":2,\"output_tokens\":0}}}}", .{@as(f64, if (self.calls == 1) 0.1 else 0.9)});
         }
     };
     var embedded: Provider = .{ .thread = std.Thread.getCurrentId() };
@@ -402,6 +402,10 @@ test "decision functions serial provider batches remain on the admitted parent w
     });
     try std.testing.expectEqual(@as(usize, 2), embedded.calls);
     try std.testing.expectEqual(@as(usize, 2), results.len);
+    for (results, [_]f64{ 0.1, 0.9 }) |result, expected| {
+        try std.testing.expectEqual(expected, result.object.get("answers").?.object.get("answer").?.object.get("noul").?.float);
+    }
     try std.testing.expectEqual(@as(u64, 2), runtime.rows);
     try std.testing.expectEqual(@as(u64, 1), runtime.batches);
+    try std.testing.expectEqual(@as(u64, 4), runtime.input_tokens);
 }
