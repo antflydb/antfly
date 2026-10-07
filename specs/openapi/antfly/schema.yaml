@@ -511,6 +511,11 @@ components:
           type: string
           enum: [read_only]
           default: read_only
+        object_mutability:
+          type: string
+          enum: [mutable, immutable]
+          default: mutable
+          description: Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
         credentials:
           $ref: "#/components/schemas/ExternalLakeCredentialRef"
         snapshot:

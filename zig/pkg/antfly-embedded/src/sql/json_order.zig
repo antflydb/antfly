@@ -249,6 +249,71 @@ fn keyOrder(a: []const u8, b: []const u8) Order {
     return if (lengths == .eq) std.mem.order(u8, a, b) else lengths;
 }
 
+/// Every finite primitive number has one exact dyadic representation. Hash
+/// that representation without formatting decimal text or using big integers.
+/// Decimal JSON tokens enter this domain only after an exact equality check.
+fn primitiveHash(value: Json) !u64 {
+    var negative: bool = false;
+    var mantissa: u64 = 0;
+    var exponent: i32 = 0;
+    switch (value) {
+        .integer => |n| {
+            negative = n < 0;
+            mantissa = @intCast(@abs(n));
+        },
+        .float => |n| {
+            if (!std.math.isFinite(n)) return error.SqlNumericOutOfRange;
+            const bits: u64 = @bitCast(n);
+            negative = bits >> 63 != 0;
+            const raw = (bits >> 52) & 0x7ff;
+            mantissa = bits & 0xfffffffffffff;
+            if (raw != 0) mantissa |= 1 << 52;
+            exponent = if (raw == 0) -1074 else @as(i32, @intCast(raw)) - 1023 - 52;
+        },
+        else => unreachable,
+    }
+    if (mantissa == 0) {
+        negative = false;
+        exponent = 0;
+    } else {
+        const zeros = @ctz(mantissa);
+        mantissa >>= @intCast(zeros);
+        exponent += zeros;
+    }
+    var bytes: [13]u8 = undefined;
+    bytes[0] = @intFromBool(negative);
+    std.mem.writeInt(u64, bytes[1..9], mantissa, .little);
+    std.mem.writeInt(i32, bytes[9..13], exponent, .little);
+    return std.hash.Wyhash.hash(2, &bytes);
+}
+fn tokenHash(text: []const u8, budget: *Budget) !u64 {
+    const normalized = try Decimal.parse(text, budget);
+    if (normalized.digits.len == 0) return primitiveHash(.{ .integer = 0 });
+    // Reconstruct only the bounded integer domain, including spellings such
+    // as 9007199254740993.0 that must not round through an f64.
+    if (normalized.magnitude >= 0 and normalized.magnitude <= 18) integer: {
+        var magnitude: u64 = 0;
+        var digits: usize = 0;
+        for (normalized.digits) |digit| {
+            if (digit == '.') continue;
+            magnitude = std.math.mul(u64, magnitude, 10) catch break :integer;
+            magnitude = std.math.add(u64, magnitude, digit - '0') catch break :integer;
+            digits += 1;
+        }
+        const width: usize = @intCast(normalized.magnitude + 1);
+        if (digits > width) break :integer;
+        for (digits..width) |_| magnitude = std.math.mul(u64, magnitude, 10) catch break :integer;
+        const signed: i128 = if (normalized.negative) -@as(i128, magnitude) else magnitude;
+        if (std.math.cast(i64, signed)) |n| return primitiveHash(.{ .integer = n });
+    }
+    const number = std.fmt.parseFloat(f64, text) catch return normalized.hash();
+    if (std.math.isFinite(number)) {
+        var buffer: [768]u8 = undefined;
+        if (Decimal.compare(normalized, try decimal(.{ .float = number }, &buffer, budget)) == .eq) return primitiveHash(.{ .float = number });
+    }
+    return normalized.hash();
+}
+
 pub fn compare(a: Json, b: Json, budget: *Budget, depth: usize) anyerror!Order {
     if (depth > 64) return error.SqlProgramLimitExceeded;
     try budget.consume(1);
@@ -306,8 +371,11 @@ pub fn hash(value: Json, budget: *Budget, depth: usize) anyerror!u64 {
     if (depth > 64) return error.SqlProgramLimitExceeded;
     try budget.consume(1);
     if (rank(value) == 2) {
-        var buffer: [768]u8 = undefined;
-        return (try decimal(value, &buffer, budget)).hash();
+        return switch (value) {
+            .integer, .float => primitiveHash(value),
+            .number_string => |text| tokenHash(text, budget),
+            else => unreachable,
+        };
     }
     var state = std.hash.Wyhash.init(rank(value));
     switch (value) {
@@ -365,4 +433,57 @@ test "structural JSON ordering and hashes ignore object order and exact numeric 
     try std.testing.expectEqual(try hash(rounded, &budget, 0), try hash(exact, &budget, 0));
     var tiny: Budget = .{ .remaining = 1 };
     try std.testing.expectError(error.SqlProgramLimitExceeded, compare(.{ .string = "abc" }, .{ .string = "abc" }, &tiny, 0));
+}
+
+test "primitive numeric hashes preserve exact mixed integer float and decimal equivalence" {
+    const a = std.testing.allocator;
+    var budget: Budget = .{};
+    for ([_]i64{ 0, 1, -1, 10000, 9007199254740993, std.math.minInt(i64), std.math.maxInt(i64) }) |integer| {
+        const token = try std.fmt.allocPrint(a, "{d}.000", .{integer});
+        defer a.free(token);
+        try std.testing.expectEqual(try hash(.{ .integer = integer }, &budget, 0), try hash(.{ .number_string = token }, &budget, 0));
+    }
+    for ([_]f64{ 0, -0.0, 0.5, -1.25, 0.1, std.math.floatMin(f64), std.math.floatMax(f64), 1000000000000000128.0 }) |number| {
+        var bytes: [768]u8 = undefined;
+        const exact = try decimal(.{ .float = number }, &bytes, &budget);
+        const digits = if (exact.digits.len == 0) "0" else exact.digits;
+        const token = try std.fmt.allocPrint(a, "{s}{s}e{d}", .{ if (exact.negative) "-" else "", digits, exact.magnitude - @as(i64, @intCast(digits.len)) + 1 });
+        defer a.free(token);
+        try std.testing.expectEqual(Order.eq, try compare(.{ .float = number }, .{ .number_string = token }, &budget, 0));
+        try std.testing.expectEqual(try hash(.{ .float = number }, &budget, 0), try hash(.{ .number_string = token }, &budget, 0));
+    }
+    try std.testing.expect((try hash(.{ .float = 0.1 }, &budget, 0)) != (try hash(.{ .number_string = "0.1" }, &budget, 0)));
+    try std.testing.expectEqual(try hash(.{ .integer = 1 }, &budget, 0), try hash(.{ .float = 1 }, &budget, 0));
+}
+
+test "native pipeline refinements benchmark primitive numeric hashing" {
+    if (@import("builtin").mode == .debug) return error.SkipZigTest;
+    const count = 100_000;
+    var values: [1024]Json = undefined;
+    for (&values, 0..) |*value, index| value.* = if (index % 2 == 0) .{ .integer = @intCast(index * 1009) } else .{ .float = @as(f64, @floatFromInt(index)) + 0.1 };
+    var prior_checksums: [2]?u64 = .{ null, null };
+    for (0..3) |sample| {
+        var elapsed: [2]i96 = undefined;
+        for (0..2) |pass| {
+            const fast = (sample + pass) % 2 != 0;
+            const slot = @intFromBool(fast);
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            var checksum: u64 = 0;
+            for (0..count) |index| {
+                var budget: Budget = .{};
+                const value = values[index % values.len];
+                if (fast) {
+                    checksum ^= try hash(value, &budget, 0);
+                } else {
+                    // Frozen prior primitive path, with the same exact decimal
+                    // normalization and semantic hash used before this PR.
+                    var buffer: [768]u8 = undefined;
+                    checksum ^= (try decimal(value, &buffer, &budget)).hash();
+                }
+            }
+            elapsed[slot] = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
+            if (prior_checksums[slot]) |prior| try std.testing.expectEqual(prior, checksum) else prior_checksums[slot] = checksum;
+        }
+        std.debug.print("native_refinement {{\"case\":\"primitive_numeric_hash\",\"rows\":{d},\"sample\":{d},\"decimal_ns\":{d},\"primitive_ns\":{d}}}\n", .{ count, sample, elapsed[0], elapsed[1] });
+    }
 }

@@ -23,6 +23,17 @@ live: usize = 0,
 peak: usize = 0,
 exhausted: bool = false,
 mutex: std.atomic.Mutex = .unlocked,
+/// Optional shared admission for the live allocations of an active operation.
+/// Reservations grow with actual allocator capacity, never a size estimate.
+admission: ?struct { ptr: *anyopaque, reserve: *const fn (*anyopaque, usize) bool, release: *const fn (*anyopaque, usize) void } = null,
+admission_exhausted: bool = false,
+
+pub fn finishAdmission(self: *Budget) void {
+    self.lock();
+    defer self.mutex.unlock();
+    if (self.admission) |owner| owner.release(owner.ptr, self.live);
+    self.admission = null;
+}
 
 fn lock(self: *Budget) void {
     while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
@@ -31,12 +42,30 @@ fn lock(self: *Budget) void {
 pub fn allocator(self: *Budget) std.mem.Allocator {
     return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
 }
+/// Live headroom of this allocator's budget chain, when known. Unknown backing
+/// allocators provide no extra bound; they never imply unlimited admission.
+pub fn headroom(a: std.mem.Allocator) ?usize {
+    if (a.vtable.alloc != alloc) return null;
+    const self: *Budget = @ptrCast(@alignCast(a.ptr));
+    self.lock();
+    const available = self.limit - self.live;
+    const backing = self.backing;
+    self.mutex.unlock();
+    return if (headroom(backing)) |parent| @min(available, parent) else available;
+}
 fn admit(self: *Budget, growth: usize) bool {
     if (growth > self.limit - self.live) {
         self.exhausted = true;
         return false;
     }
+    if (self.admission) |owner| if (!owner.reserve(owner.ptr, growth)) {
+        self.admission_exhausted = true;
+        return false;
+    };
     return true;
+}
+fn releaseAdmission(self: *Budget, bytes: usize) void {
+    if (self.admission) |owner| owner.release(owner.ptr, bytes);
 }
 fn account(self: *Budget, old: usize, new: usize) void {
     self.live = self.live - old + new;
@@ -47,7 +76,10 @@ fn alloc(ptr: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?
     self.lock();
     defer self.mutex.unlock();
     if (!self.admit(len)) return null;
-    const result = self.backing.rawAlloc(len, alignment, ra) orelse return null;
+    const result = self.backing.rawAlloc(len, alignment, ra) orelse {
+        self.releaseAdmission(len);
+        return null;
+    };
     self.account(0, len);
     return result;
 }
@@ -56,7 +88,11 @@ fn resize(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize
     self.lock();
     defer self.mutex.unlock();
     if (!self.admit(len -| bytes.len)) return false;
-    if (!self.backing.rawResize(bytes, alignment, len, ra)) return false;
+    if (!self.backing.rawResize(bytes, alignment, len, ra)) {
+        self.releaseAdmission(len -| bytes.len);
+        return false;
+    }
+    self.releaseAdmission(bytes.len -| len);
     self.account(bytes.len, len);
     return true;
 }
@@ -65,7 +101,11 @@ fn remap(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize,
     self.lock();
     defer self.mutex.unlock();
     if (!self.admit(len -| bytes.len)) return null;
-    const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse return null;
+    const result = self.backing.rawRemap(bytes, alignment, len, ra) orelse {
+        self.releaseAdmission(len -| bytes.len);
+        return null;
+    };
+    self.releaseAdmission(bytes.len -| len);
     self.account(bytes.len, len);
     return result;
 }
@@ -74,7 +114,20 @@ fn free(ptr: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) v
     self.lock();
     defer self.mutex.unlock();
     self.backing.rawFree(bytes, alignment, ra);
+    self.releaseAdmission(bytes.len);
     self.account(bytes.len, 0);
+}
+
+test "SQL nested memory budget headroom respects the live shared parent" {
+    var parent: Budget = .{ .backing = std.testing.allocator, .limit = 4096 };
+    var child: Budget = .{ .backing = parent.allocator(), .limit = 8192 };
+    const a = child.allocator();
+    try std.testing.expectEqual(@as(?usize, 4096), headroom(a));
+    const bytes = try a.alloc(u8, 128);
+    try std.testing.expectEqual(@as(?usize, 3968), headroom(a));
+    a.free(bytes);
+    try std.testing.expectEqual(@as(?usize, 4096), headroom(a));
+    try std.testing.expect(headroom(std.testing.allocator) == null);
 }
 
 test "SQL memory budget rejects before allocation and reclaims page capacity" {

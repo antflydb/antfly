@@ -71,6 +71,28 @@ pub const OrderKey = struct {
     descending: bool,
     nulls_first: ?bool = null,
 };
+/// Direct column ordering can be negotiated with a snapshot-pinned provider.
+/// Expressions keep the ordinary sort path until a typed expression proof exists.
+pub fn scanOrder(a: std.mem.Allocator, binding: BoundStatement, statement: ast.Select) ![]const catalog.Scan.Order {
+    const table = binding.table orelse return &.{};
+    const result = try a.alloc(catalog.Scan.Order, binding.order_keys.len);
+    for (binding.order_keys, result) |key, *out| {
+        const column = switch (key.source) {
+            .column => |column| column,
+            .expression => return &.{},
+            .output => |index| blk: {
+                if (statement.columns.len == 0) {
+                    if (index >= table.columns.len) return &.{};
+                    break :blk table.columns[index];
+                }
+                if (index >= statement.columns.len or statement.columns[index].expression != null) return &.{};
+                break :blk try table.column(statement.columns[index].field);
+            },
+        };
+        out.* = .{ .column = column.path, .descending = key.descending, .nulls_first = key.nulls_first orelse key.descending };
+    }
+    return result;
+}
 pub const BoundStatement = struct {
     parameter_invocation: ?*@import("parameter_binding.zig").Invocation = null,
     parameter_descriptors: []const @import("scalar.zig").Type = &.{},

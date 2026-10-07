@@ -22569,9 +22569,10 @@ fn implementationTests() type {
             try std.testing.expect(backend.runs.count() > 0);
             var read = try Backend.BoundReadTxn.open(&backend, .{});
             defer read.abort();
+            var scope = try read.openReadScope(alloc);
+            defer scope.close();
             for (0..128) |i| {
-                var scope = try read.openReadScope(alloc);
-                defer scope.close();
+                defer scope.reset();
                 var key_buf: [16]u8 = undefined;
                 const key = try std.fmt.bufPrint(&key_buf, "row:{d:0>4}", .{i});
                 try std.testing.expectEqualSlices(u8, &payload, try scope.get(key));
@@ -22579,6 +22580,10 @@ fn implementationTests() type {
                 try std.testing.expectEqual(@as(usize, 0), read.held_blocks.items.len);
                 try std.testing.expectEqual(@as(usize, 0), read.held_values.items.len);
             }
+
+            try std.testing.expectEqual(@as(usize, 0), scope.held_blocks.items.len);
+            try std.testing.expectEqual(@as(usize, 0), scope.held_values.items.len);
+            try std.testing.expect(scope.held_blocks.capacity * @sizeOf(@TypeOf(scope.held_blocks.items[0])) <= 64 * 1024);
 
             var runtime = try backend.runtimeStore(alloc, .{});
             defer runtime.deinit();
@@ -22595,6 +22600,8 @@ fn implementationTests() type {
                 try write.commit();
             }
             try std.testing.expectEqualSlices(u8, &payload, try first.get("row:0000"));
+            try first.reset();
+            try second.reset();
             try std.testing.expectEqualSlices(u8, &payload, try second.get("row:0000"));
         }
 

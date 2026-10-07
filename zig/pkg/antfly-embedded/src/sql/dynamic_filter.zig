@@ -105,11 +105,10 @@ pub const Filter = struct {
             for (selected, values, 0..) |*keep, *value, index| {
                 if (!keep.*) continue;
                 const one: @import("catalog.zig").ColumnPage = .{ .batch = batch, .selection = &.{index} };
-                value.* = if (physical != null and physical.?.values == .dictionary_bytes and !physical.?.nulls.isNull(index)) blk: {
-                    const id = physical.?.values.dictionary_bytes.indices[index];
-                    if (id >= physical.?.values.dictionary_bytes.values.len) return error.InvalidSqlBackendResponse;
+                value.* = if (if (physical) |source| try source.dictionaryId(index) else null) |id| blk: {
                     if (dictionary.get(id)) |cached| break :blk cached;
-                    const cell = Datum.json(try @import("describe.zig").coerceAlloc(scratch.allocator(), .{ .string = physical.?.values.dictionary_bytes.values[id] }, definition.type));
+                    const raw = try one.cell(scratch.allocator(), 0, definition.name);
+                    const cell = Datum.json(try @import("describe.zig").coerceAlloc(scratch.allocator(), raw.value, definition.type));
                     try dictionary.put(a, id, cell);
                     break :blk cell;
                 } else blk: {
@@ -169,7 +168,7 @@ test "SQL batch dynamic masks match scalar membership for dictionaries nulls and
         .row_refs = &.{ .{ .relational_key = "1" }, .{ .relational_key = "2" }, .{ .relational_key = "3" }, .{ .relational_key = "4" } },
         .columns = &.{
             .{ .name = "s", .values = .{ .dictionary_bytes = .{ .values = &.{ "no", "yes" }, .indices = &.{ 1, 0, 99, 1 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
-            .{ .name = "n", .values = .{ .i64 = &.{ 9007199254740993, 9007199254740993, 0, 9007199254740993 } } },
+            .{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{9007199254740993}, .indices = &.{ 0, 0, 99, 0 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
         },
     };
     var selected = [_]bool{ true, true, true, false };

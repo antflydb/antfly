@@ -29,6 +29,7 @@ const Mock = struct {
     array_results: bool = false,
     array_parameters: bool = false,
     result_override: ?backend.Result = null,
+    result_cells: bool = false,
     ddl_pending: bool = false,
     ddl_unknown: bool = false,
     unknown_outcome: bool = false,
@@ -43,6 +44,8 @@ const Mock = struct {
     entered: ?*std.Io.Event = null,
     blocked: bool = false,
     stream_rows: usize = 0,
+    stream_cells: bool = false,
+    stream_page_begin: usize = 0,
     expected_stream_statement: ?[]const u8 = null,
     expected_execute_statement: ?[]const u8 = null,
     expected_result_tag: ?[]const u8 = null,
@@ -133,6 +136,13 @@ const Mock = struct {
         self.stream_pulls += 1;
         if (self.stream_fail_at) |at| if (self.stream_offset >= at) return error.QueryCanceled;
         const count = @min(wanted, self.stream_rows - self.stream_offset);
+        if (self.stream_cells) {
+            std.debug.assert(self.stream_live_pages == 0);
+            self.stream_page_begin = self.stream_offset;
+            self.stream_offset += count;
+            self.stream_live_pages += 1;
+            return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .cells = .{ .context = self, .count = count, .width = 1, .read = streamCell }, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
+        }
         const rows = try alloc.alloc([]const std.json.Value, count);
         for (rows, 0..) |*row, i| row.* = try alloc.dupe(std.json.Value, &.{.{ .integer = @intCast(self.stream_offset + i) }});
         self.stream_offset += count;
@@ -143,6 +153,11 @@ const Mock = struct {
         const self: *Mock = @ptrCast(@alignCast(raw));
         std.debug.assert(self.stream_live_pages > 0);
         self.stream_live_pages -= 1;
+    }
+    fn streamCell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !backend.Cell {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.stream_live_pages == 1 and column == 0);
+        return .{ .value = .{ .integer = @intCast(self.stream_page_begin + row) }, .sql_null = false };
     }
     fn closeStream(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -223,8 +238,9 @@ const Mock = struct {
         }
         if (self.json_null_results) return .{
             .columns = &.{.{ .name = "j", .type = .json }},
-            .rows = &.{ &.{.null}, &.{.null} },
-            .sql_nulls = &.{ &.{false}, &.{true} },
+            .rows = if (self.result_cells) &.{} else &.{ &.{.null}, &.{.null} },
+            .sql_nulls = if (self.result_cells) null else &.{ &.{false}, &.{true} },
+            .cells = if (self.result_cells) .{ .context = self, .count = 2, .width = 1, .read = resultCell } else null,
             .command_tag = "SELECT 2",
         };
         self.saw_statement_unchanged = std.mem.eql(u8, request.statement, "SELECT $1");
@@ -258,7 +274,8 @@ const Mock = struct {
         rows[1] = try alloc.dupe(std.json.Value, &.{.{ .integer = 2 }});
         return .{
             .columns = &.{.{ .name = "n", .type = .integer }},
-            .rows = rows,
+            .rows = if (self.result_cells) &.{} else rows,
+            .cells = if (self.result_cells) .{ .context = self, .count = 2, .width = 1, .read = resultCell } else null,
             .command_tag = "SELECT 2",
             .transaction_status = if (request.session_id != null) .in_transaction else .idle,
             .session_id = request.session_id,
@@ -266,6 +283,12 @@ const Mock = struct {
             .transaction_id = if (self.mutation_outcome != null) "0123456789abcdef0123456789abcdef".* else null,
             .owner = if (self.owned_results) .{ .context = self, .release = releaseResult } else null,
         };
+    }
+    fn resultCell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) !backend.Cell {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        std.debug.assert(row < 2 and column == 0);
+        if (self.json_null_results) return .{ .value = .null, .sql_null = row == 1 };
+        return .{ .value = .{ .integer = if (row == 0) self.seen_parameter orelse 9007199254740993 else 2 }, .sql_null = false };
     }
     fn releaseResult(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
@@ -510,6 +533,73 @@ test "pgwire frame admission reserves later headers and rejects wide rows before
         }
     }
     try std.testing.expect(rejected);
+}
+
+test "pgwire retained materialized views preserve exact binary integers and JSON nulls" {
+    for ([_]bool{ false, true }) |json_null| for ([_]bool{ false, true }) |simple| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        if (simple) {
+            try frame(&input.writer, 'Q', "SELECT n FROM t\x00");
+        } else {
+            try parse(&input.writer, "q", "SELECT n FROM t", false);
+            try bind(&input.writer, "p", "q", null);
+            try execute(&input.writer, "p", 1);
+            try execute(&input.writer, "p", 1);
+            try frame(&input.writer, 'S', "");
+        }
+        try frame(&input.writer, 'X', "");
+        var row_mock: Mock = .{ .json_null_results = json_null };
+        var cell_mock: Mock = .{ .json_null_results = json_null, .result_cells = true };
+        var rows = try run(&row_mock, input.written(), .{});
+        defer rows.deinit();
+        var cells = try run(&cell_mock, input.written(), .{});
+        defer cells.deinit();
+        try std.testing.expectEqualSlices(u8, rows.written(), cells.written());
+        const messages = try tags(std.testing.allocator, cells.written());
+        defer std.testing.allocator.free(messages);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, messages, "D"));
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, messages, "E"));
+    };
+}
+
+test "pgwire retained cells preserve wire bytes through portals and scroll spooling" {
+    for ([_]u8{ 0, 1, 2 }) |mode| {
+        var input = std.Io.Writer.Allocating.init(std.testing.allocator);
+        defer input.deinit();
+        try startup(&input.writer);
+        switch (mode) {
+            0 => try frame(&input.writer, 'Q', "SELECT n FROM t\x00"),
+            1 => {
+                try parse(&input.writer, "q", "SELECT n FROM t", false);
+                try bind(&input.writer, "p", "q", null);
+                try execute(&input.writer, "p", 3);
+                try execute(&input.writer, "p", 0);
+                try frame(&input.writer, 'S', "");
+            },
+            2 => {
+                try frame(&input.writer, 'Q', "BEGIN\x00");
+                try frame(&input.writer, 'Q', "DECLARE rows SCROLL CURSOR FOR SELECT n FROM t\x00");
+                try frame(&input.writer, 'Q', "FETCH FORWARD 3 FROM rows\x00");
+                try frame(&input.writer, 'Q', "FETCH BACKWARD 2 FROM rows\x00");
+                try frame(&input.writer, 'Q', "FETCH ALL FROM rows\x00");
+                try frame(&input.writer, 'Q', "COMMIT\x00");
+            },
+            else => unreachable,
+        }
+        try frame(&input.writer, 'X', "");
+        var row_mock: Mock = .{ .stream_rows = 600 };
+        var cell_mock: Mock = .{ .stream_rows = 600, .stream_cells = true };
+        var rows = try run(&row_mock, input.written(), .{ .result_rows = 7 });
+        defer rows.deinit();
+        var cells = try run(&cell_mock, input.written(), .{ .result_rows = 7 });
+        defer cells.deinit();
+        try std.testing.expectEqualSlices(u8, rows.written(), cells.written());
+        try std.testing.expect(cell_mock.stream_pulls > 1);
+        try std.testing.expectEqual(@as(usize, 0), cell_mock.stream_live_pages);
+        try std.testing.expectEqual(@as(usize, 1), cell_mock.stream_closes);
+    }
 }
 
 test "pgwire pull portals stream beyond result cap without replay and release on exhaustion" {

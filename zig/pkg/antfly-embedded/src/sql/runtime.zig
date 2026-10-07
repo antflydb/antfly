@@ -551,9 +551,18 @@ pub const Context = struct {
                 if (!slot.found_existing) try native_fields.append(self.arena, column.path);
             },
         };
+        var scan_state: ScanState = .{};
+        defer scan_state.deinit();
+        const requested_order = if (!self.binding.primary_order and !statement.count_all) try @import("describe.zig").scanOrder(self.arena, self.binding, statement) else &.{};
+        const scan_request: catalog.Scan = .{ .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = @intCast(self.limits.page_rows) };
+        var ordered_source = false;
+        if (self.backend.vtable.supports_scan_order and requested_order.len != 0 and limit != 0 and !predicates.empty) {
+            try scan_state.open(self, table_def, scan_request);
+            ordered_source = if (scan_state.cursor) |cursor| cursor.order_satisfied else false;
+        }
         var top_k: ?operators.TopK = null;
         defer if (top_k) |*operator| operator.deinit();
-        if (self.binding.order_keys.len != 0 and !self.binding.primary_order and !statement.count_all and limit != 0) {
+        if (self.binding.order_keys.len != 0 and !self.binding.primary_order and !ordered_source and !statement.count_all and limit != 0) {
             const orders = try self.arena.alloc(operators.Order, self.binding.order_keys.len);
             for (self.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
             top_k = try operators.TopK.initWithSpill(self.alloc, offset + limit + @intFromBool(statement.limit == null), orders, self.limits.retained_bytes, self.spill);
@@ -576,12 +585,12 @@ pub const Context = struct {
         var retained: usize = 0;
         var after: ?[]const u8 = null;
         defer if (after) |key| self.alloc.free(key);
-        var scan_state: ScanState = .{};
-        defer scan_state.deinit();
         if (limit == 0) return .{ .columns = columns, .command_tag = "SELECT" };
         var metadata_counted = false;
         if (statement.count_all and statement.predicate == null and !predicates.empty) {
-            if (try scan_state.count(self, table_def, .{ .fields = native_fields.items, .limit = self.limits.page_rows })) |exact_count| {
+            const materialized_count = try @import("aggregate_materialization.zig").countFromProvider(self, table_def);
+            const exact: ?u64 = if (materialized_count != null) materialized_count else try scan_state.count(self, table_def, .{ .fields = native_fields.items, .limit = self.limits.page_rows });
+            if (exact) |exact_count| {
                 _ = std.math.cast(i64, exact_count) orelse return error.SqlNumericOutOfRange;
                 scanned = std.math.cast(usize, exact_count) orelse return error.SqlNumericOutOfRange;
                 metadata_counted = true;
@@ -602,14 +611,10 @@ pub const Context = struct {
                 @min(self.limits.page_rows, (offset -| scanned) +| (limit -| delivered) +| @intFromBool(statement.limit == null))
             else
                 self.limits.page_rows;
-            const page = try scan_state.page(self, page_arena.allocator(), table_def, .{
-                .fields = native_fields.items,
-                .primary_order = self.binding.primary_order,
-                .primary_key = predicates.primary_key,
-                .conditions = predicates.terms.items,
-                .after = after,
-                .limit = @intCast(wanted),
-            });
+            var request = scan_request;
+            request.after = after;
+            request.limit = @intCast(wanted);
+            const page = try scan_state.page(self, page_arena.allocator(), table_def, request);
             defer page.deinit();
             if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
@@ -3773,4 +3778,108 @@ test "SQL review regression nested probe projection preserves satisfied limit" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
     try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+}
+
+test "SQL native aggregate materialization retains projection and fails closed after selection" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var base: TestBackend = .{};
+    const table = try TestBackend.resolve(&base, scratch, .{ .table = "docs" }, .read);
+    var reference = try compiler.compile(a, "SELECT SUM(id), COUNT(*) FROM docs", .{});
+    defer reference.deinit();
+    const bound = try @import("aggregate_binding.zig").bind(scratch, table, reference.statement.select, &.{});
+    const recipe = (try @import("aggregate_materialization.zig").fromBound(scratch, table, bound)).?;
+    const source = try operators.Grouped.create(a, bound.specs, .{});
+    defer source.deinit();
+    for (0..2) |_| try source.add(&.{}, &.{ Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.{ .integer = 1 }) });
+    const partials = try scratch.alloc(operators.GroupResult, 1);
+    partials[0] = (try source.nextPartialResult(scratch)).?;
+    const Driver = struct {
+        const Owner = @This();
+        base: TestBackend = .{},
+        recipe: @import("aggregate_materialization.zig").Recipe,
+        partials: []const operators.GroupResult,
+        opened: usize = 0,
+        closed: usize = 0,
+        fail: bool = false,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
+            return TestBackend.resolve(&from(raw).base, alloc, name, action);
+        }
+        fn scan(raw: *anyopaque, alloc: std.mem.Allocator, definition: catalog.Table, request: catalog.Scan) !catalog.Page {
+            return TestBackend.scan(&from(raw).base, alloc, definition, request);
+        }
+        fn mutate(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.TestUnexpectedResult;
+        }
+        fn checkpoint(raw: *anyopaque) !void {
+            try TestBackend.checkpoint(&from(raw).base);
+        }
+        fn load(raw: *anyopaque, alloc: std.mem.Allocator, _: catalog.Table, requested: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
+            const self = from(raw);
+            if (!self.recipe.eql(requested)) return null;
+            const state = try alloc.create(State);
+            state.* = .{ .owner = self, .a = alloc };
+            self.opened += 1;
+            return .{ .ptr = state, .next = State.next, .close = State.close };
+        }
+        const State = struct {
+            owner: *Owner,
+            a: std.mem.Allocator,
+            done: bool = false,
+            fn next(raw: *anyopaque, _: std.mem.Allocator, _: u32) !?[]const operators.GroupResult {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.owner.fail) return error.ArtifactChecksumMismatch;
+                if (self.done) return null;
+                self.done = true;
+                return self.owner.partials;
+            }
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.owner.closed += 1;
+                self.a.destroy(self);
+            }
+        };
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint, .aggregate_partials = load } };
+        }
+    };
+    var driver: Driver = .{ .recipe = recipe, .partials = partials };
+    for ([_][]const u8{
+        "SELECT SUM(id) AS total, COUNT(*) AS n FROM docs HAVING COUNT(*) > 0 ORDER BY SUM(id) DESC LIMIT 1",
+        "SELECT SUM(id), COUNT(*) FROM docs WHERE id > 0",
+        "SELECT SUM(id + 1), COUNT(*) FROM docs",
+    }, 0..) |sql, index| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var result = try execute(a, driver.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings(if (index == 2) "18014398509481988" else "18014398509481986", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("2", result.output.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 1), driver.opened);
+        try std.testing.expectEqual(driver.opened, driver.closed);
+        try std.testing.expectEqual(index, driver.base.pages);
+    }
+    const count_partials = [_]operators.GroupResult{.{ .keys = &.{}, .aggregates = partials[0].aggregates[1..], .ordinal = 0 }};
+    driver.recipe = .{ .keys = &.{}, .inputs = recipe.inputs[1..] };
+    driver.partials = &count_partials;
+    var count_compiled = try compiler.compile(a, "SELECT COUNT(*) AS total FROM docs", .{});
+    defer count_compiled.deinit();
+    var count_result = try execute(a, driver.backend(), &count_compiled, &.{}, .{});
+    defer count_result.deinit();
+    try std.testing.expectEqualStrings("2", count_result.output.rows[0][0].string);
+    try std.testing.expectEqual(@as(usize, 2), driver.opened);
+    try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
+    driver.recipe = recipe;
+    driver.partials = partials;
+    driver.fail = true;
+    try std.testing.expectError(error.ArtifactChecksumMismatch, execute(a, driver.backend(), &reference, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 3), driver.opened);
+    try std.testing.expectEqual(driver.opened, driver.closed);
+    try std.testing.expectEqual(@as(usize, 2), driver.base.pages);
 }

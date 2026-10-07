@@ -115,6 +115,36 @@ pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: anytyp
     }
     var accepted = page;
     accepted.selection = selection.items;
+    // Unfiltered grouped cohorts preserve physical expression vectors all the
+    // way into typed state. Filtered cohorts below retain lazy evaluation.
+    if (bound.group_count != 0 and for (bound.filters) |filter| {
+        if (filter != null) break false;
+    } else true) {
+        const Batch = @import("execution_batch.zig").Batch;
+        var cohort: std.ArrayList(*const scalar.Program) = .empty;
+        for (bound.input.projections[0..bound.group_count]) |*optional| try cohort.append(a, &optional.*.?);
+        for (bound.inputs) |input| if (input) |slot| {
+            try cohort.append(a, &bound.input.projections[slot].?);
+        };
+        const outputs = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, cohort.items, accepted, bound.input.columns, context.parameters, context.backend.execution_io);
+        const key_batches = try a.alloc(Batch, bound.group_count);
+        const input_batches = try a.alloc(Batch, bound.inputs.len);
+        for (key_batches, cohort.items[0..key_batches.len], outputs[0..key_batches.len]) |*batch, program, output| {
+            batch.* = output orelse .{ .vectors = .{ .values = try a.dupe([]const Datum, &.{try columnValues(context, bound, a, accepted, program)}), .count = accepted.selection.len } };
+        }
+        var position = key_batches.len;
+        for (bound.inputs, input_batches) |input, *batch| {
+            if (input != null) {
+                batch.* = outputs[position] orelse .{ .vectors = .{ .values = try a.dupe([]const Datum, &.{try columnValues(context, bound, a, accepted, cohort.items[position])}), .count = accepted.selection.len } };
+                position += 1;
+            } else {
+                const indices = try a.alloc(u32, accepted.selection.len);
+                @memset(indices, 0);
+                batch.* = .{ .dictionary = .{ .values = &.{Datum.json(.{ .integer = 1 })}, .indices = indices } };
+            }
+        }
+        return grouped.addEncodedColumns(key_batches, input_batches, accepted.selection.len);
+    }
     const keys = try a.alloc([]const Datum, bound.group_count);
     const inputs = try a.alloc([]Datum, bound.inputs.len);
     for (inputs) |*input| {
@@ -229,6 +259,30 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
     }
 }
 
+fn loadMaterialized(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, table: catalog.Table) !bool {
+    const open = context.backend.vtable.aggregate_partials orelse return false;
+    const recipe = (try @import("aggregate_materialization.zig").fromBound(context.arena, table, bound.*)) orelse return false;
+    const cursor = (try open(context.backend.ptr, context.alloc, table, recipe)) orelse return false;
+    defer cursor.close(cursor.ptr);
+    var pages: usize = 0;
+    var groups: usize = 0;
+    while (true) {
+        try context.checkpoint();
+        var arena = std.heap.ArenaAllocator.init(context.alloc);
+        defer arena.deinit();
+        const partials = (try cursor.next(cursor.ptr, arena.allocator(), context.limits.executionRows())) orelse break;
+        if (partials.len == 0 or partials.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
+        pages += 1;
+        if (pages > context.limits.scan_pages or partials.len > context.limits.scan_rows -| groups) return error.SqlProgramLimitExceeded;
+        groups += partials.len;
+        for (partials) |partial| {
+            if (partial.keys.len != recipe.keys.len) return error.InvalidSqlBackendResponse;
+            try grouped.importPartialMapped(partial.keys, partial.aggregates, partial.aggregate_slots, partial.ordinal);
+        }
+    }
+    return true;
+}
+
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
     if (context.invocation_constants.len != bound.constant_count) return error.InvalidSqlBackendResponse;
@@ -266,16 +320,16 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer if (after) |key| context.alloc.free(key);
         var pages: usize = 0;
         var visited: usize = 0;
-        var metadata_counted = false;
+        var aggregate_loaded = try loadMaterialized(context, bound, grouped, table);
         const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
             if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
         } else true;
-        if (count_only and !predicates.empty) if (try scan.count(context, table, .{ .fields = fields[0..field_count], .limit = context.limits.page_rows })) |count| {
+        if (!aggregate_loaded and count_only and !predicates.empty) if (try scan.count(context, table, .{ .fields = fields[0..field_count], .limit = context.limits.page_rows })) |count| {
             try grouped.addGlobalCount(count);
-            metadata_counted = true;
+            aggregate_loaded = true;
         };
-        const parallel = bound.ordered.len == 0 and !external and !predicates.empty and !metadata_counted and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
-        while (!predicates.empty and !metadata_counted and !parallel) {
+        const parallel = bound.ordered.len == 0 and !external and !predicates.empty and !aggregate_loaded and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
+        while (!predicates.empty and !aggregate_loaded and !parallel) {
             try context.checkpoint();
             pages += 1;
             if (pages > context.limits.scan_pages) return error.SqlProgramLimitExceeded;
@@ -348,23 +402,57 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const group = (try collector.nextResult(context, alloc)) orelse break;
-        const grouped_width = group.keys.len + group.aggregates.len;
-        const cells = try alloc.alloc(Datum, grouped_width + bound.constant_count);
-        @memcpy(cells[0..group.keys.len], group.keys);
-        @memcpy(cells[group.keys.len..grouped_width], group.aggregates);
-        @memcpy(cells[grouped_width..], context.invocation_constants);
-        if (bound.having) |program| {
-            const result = try context.evaluate(alloc, program, cells);
-            if (result.sql_null) continue;
-            if (result.value != .bool) return error.SqlTypeMismatch;
-            if (!result.value.bool) continue;
+        const groups: operators.GroupBatch = if (bound.ordered.len == 0)
+            (try grouped.nextResultBatch(alloc, context.limits.executionRows(), false)) orelse break
+        else ordered: {
+            const group = (try collector.nextResult(context, alloc)) orelse break;
+            const keys = try alloc.alloc([]const Datum, 1);
+            keys[0] = group.keys;
+            const aggregates = try alloc.alloc([]const Datum, 1);
+            aggregates[0] = group.aggregates;
+            const ordinals = try alloc.alloc(u64, 1);
+            ordinals[0] = group.ordinal;
+            break :ordered .{ .keys = .{ .rows = keys }, .aggregates = .{ .rows = aggregates }, .ordinals = ordinals };
+        };
+        const Cells = struct {
+            groups: operators.GroupBatch,
+            constants: []const Datum,
+            selection: ?[]const usize = null,
+            fn cell(raw: *anyopaque, a: std.mem.Allocator, row: usize, column: usize) anyerror!Datum {
+                const reader: *@This() = @ptrCast(@alignCast(raw));
+                const index = if (reader.selection) |selected| selected[row] else row;
+                const width = reader.groups.keys.width() + reader.groups.aggregates.width();
+                if (column >= width) return reader.constants[column - width];
+                return if (column < reader.groups.keys.width()) reader.groups.keys.cell(a, index, column) else reader.groups.aggregates.cell(a, index, column - reader.groups.keys.width());
+            }
+        };
+        var reader: Cells = .{ .groups = groups, .constants = context.invocation_constants };
+        var batch: @import("execution_batch.zig").Batch = .{ .reader = .{ .ptr = &reader, .read = Cells.cell, .count = groups.ordinals.len, .width = groups.keys.width() + groups.aggregates.width() + bound.constant_count } };
+        const predicates = if (bound.having) |*program| try resultValues(context, alloc, program, batch) else null;
+        var selected: std.ArrayList(usize) = .empty;
+        for (0..batch.len()) |row| {
+            if (predicates) |values| {
+                if (values[row].sql_null) continue;
+                if (values[row].value != .bool) return error.SqlTypeMismatch;
+                if (!values[row].value.bool) continue;
+            }
+            try selected.append(alloc, row);
         }
+        reader.selection = selected.items;
+        batch.reader.count = selected.items.len;
+        const outputs = try alloc.alloc([]const Datum, bound.outputs.len);
+        const ordering = try alloc.alloc([]const Datum, bound.orders.len);
+        for (bound.outputs, outputs) |*program, *values| values.* = try resultValues(context, alloc, program, batch);
+        for (bound.orders, ordering) |*program, *values| values.* = try resultValues(context, alloc, program, batch);
+        // TopK owns admitted rows; reuse these small boundary slices rather
+        // than allocating each group's input/output/key row matrix.
         const values = try alloc.alloc(Datum, bound.outputs.len);
-        for (bound.outputs, values) |program, *value| value.* = try context.evaluate(alloc, program, cells);
         const keys = try alloc.alloc(Datum, bound.orders.len);
-        for (bound.orders, keys) |program, *value| value.* = try context.evaluate(alloc, program, cells);
-        try top.add(.{ .values = values, .keys = keys, .ordinal = group.ordinal });
+        for (selected.items, 0..) |physical, row| {
+            for (outputs, values) |column, *value| value.* = column[row];
+            for (ordering, keys) |column, *key| key.* = column[row];
+            try top.add(.{ .values = values, .keys = keys, .ordinal = groups.ordinals[physical] });
+        }
     }
     if (context.sink != null) return context.emitTop(&top, offset, limit, statement.limit == null);
     const ordered = try top.finishPage(context.arena, offset, limit + @intFromBool(statement.limit == null));
@@ -388,4 +476,11 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         null_row.* = sql_nulls;
     }
     return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = nulls, .pattern_sources = sources, .command_tag = "SELECT" };
+}
+
+fn resultValues(context: anytype, a: std.mem.Allocator, program: *const scalar.Program, batch: @import("execution_batch.zig").Batch) ![]const Datum {
+    if (try @import("vector_eval.zig").evaluateBatch(a, program, batch, context.parameters)) |values| return values;
+    const values = try a.alloc(Datum, batch.len());
+    for (values, 0..) |*value, row| value.* = try context.evaluate(a, program.*, try batch.row(a, row));
+    return values;
 }

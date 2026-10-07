@@ -476,18 +476,13 @@ const OwnedRead = struct {
         var fresh = try self.authority.credential.identity(alloc);
         defer fresh.deinit(alloc);
         try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
-        var page = try self.stream.next(limit);
+        var page = try self.stream.nextBatch(limit);
         errdefer page.deinit();
-        // Adapt only datetime cells; the page retains exact typed integers.
-        for (self.columns, 0..) |column, index| if (column.type == .datetime) {
-            for (page.output.rows) |row| @constCast(row)[index] = try datetimeResult(page.arena.allocator(), row[index]);
-        };
         const owner = try alloc.create(PageOwner);
         owner.* = .{ .alloc = alloc, .page = page };
         return .{ .exhausted = page.exhausted, .result = .{
             .columns = self.columns,
-            .rows = page.output.rows,
-            .sql_nulls = page.output.sql_nulls,
+            .cells = .{ .context = owner, .count = page.values.len(), .width = self.columns.len, .read = PageOwner.cell },
             .command_tag = "SELECT",
             .owner = .{ .context = owner, .release = releasePage },
         } };
@@ -514,7 +509,15 @@ const OwnedRead = struct {
         owner.alloc.destroy(owner);
     }
 
-    const PageOwner = struct { alloc: std.mem.Allocator, page: Pull.Page };
+    const PageOwner = struct {
+        alloc: std.mem.Allocator,
+        page: Pull.BatchPage,
+        fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const value = try self.page.values.cell(alloc, row, column);
+            return .{ .value = if (!value.sql_null and self.page.columns[column].type == .datetime) try datetimeResult(alloc, value.value) else value.value, .sql_null = value.sql_null };
+        }
+    };
 
     fn detach(raw: *anyopaque) void {
         const self: *OwnedRead = @ptrCast(@alignCast(raw));
@@ -971,7 +974,7 @@ const GuardedCatalog = struct {
     fn backend(self: *GuardedCatalog) catalog.Backend {
         var result = self.native;
         result.ptr = self;
-        result.vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
+        result.vtable = &.{ .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .checkpoint = checkpoint, .ddl = ddl };
         return result;
     }
     fn generateRowId(raw: *anyopaque, alloc: std.mem.Allocator) ![]const u8 {

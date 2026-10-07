@@ -102,6 +102,11 @@ pub const Plan = struct {
             .is_null, .is_not_null => unreachable,
         });
     }
+
+    /// The caller used this plan's tuple encoder over a certified typed batch.
+    pub fn evaluateEncoded(self: *const Plan, bytes: []const u8, is_null: bool) Truth {
+        return self.compare(bytes, is_null);
+    }
 };
 
 pub const Source = struct {

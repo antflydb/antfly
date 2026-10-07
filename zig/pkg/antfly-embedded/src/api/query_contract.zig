@@ -448,6 +448,8 @@ pub const QueryResponseMeta = struct {
 
     evaluation_json: ?[]u8 = null,
     took_ms: i64 = 0,
+    /// Borrowed execution fence; response encoding copies it before return.
+    remote_snapshot: ?[]const u8 = null,
     shard_count: u32 = 1,
     merged: bool = false,
     reranker: ?RerankerProfile = null,
@@ -2224,6 +2226,10 @@ fn applyCommonSearchRequestOptions(
 
     if (request.offset) |offset| req.offset = @intCast(offset);
     if (request.count) |count| req.count_only = count;
+    if (request.remote_snapshot) |snapshot| {
+        if (snapshot.len != 64) return error.InvalidQueryRequest;
+        req.remote_snapshot = try alloc.dupe(u8, snapshot);
+    }
     const has_result_page_options =
         request.order_by != null or
         request.search_after != null or
@@ -3656,6 +3662,7 @@ pub fn encodeQueryResponses(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
+                .remote_snapshot = meta.remote_snapshot,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -3687,6 +3694,7 @@ pub fn encodeQueryResponses(
                 .took = meta.took_ms,
                 .status = 200,
                 .table = req.response_table_name orelse table_name,
+                .remote_snapshot = meta.remote_snapshot,
             };
             break :blk try std.json.Stringify.valueAlloc(
                 alloc,
@@ -10406,6 +10414,7 @@ fn appendUniqueOwnedString(
 fn freeSearchRequest(alloc: std.mem.Allocator, req: *db_mod.types.SearchRequest) void {
     if (req.index_name) |index_name| alloc.free(index_name);
     if (req.primary_text_index_name) |index_name| alloc.free(index_name);
+    if (req.remote_snapshot) |snapshot| alloc.free(snapshot);
     if (req.evaluation_json.len > 0) alloc.free(req.evaluation_json);
     if (req.aggregations_json.len > 0) alloc.free(req.aggregations_json);
     if (req.filter_prefix.len > 0) alloc.free(req.filter_prefix);

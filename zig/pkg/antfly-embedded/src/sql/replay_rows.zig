@@ -102,7 +102,7 @@ pub const Replay = struct {
 
     pub const Reader = struct {
         owner: *Replay,
-        disk: ?spill.Sequential.Reader,
+        disk: ?spill.Sequential.ReplayReader,
         index: usize = 0,
 
         /// A borrowed row survives other readers, but not this reader's next

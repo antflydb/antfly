@@ -113,6 +113,25 @@ pub const Collector = struct {
     pub fn addGlobalColumns(self: *Collector, inputs: []const []const Datum, count: usize) !void {
         try self.addColumns(&.{}, inputs, count);
     }
+    pub fn addEncodedColumns(self: *Collector, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize) !void {
+        try self.grouped.addEncodedColumns(keys, inputs, count);
+        if (self.sorts.len == 0) return;
+        var arena = std.heap.ArenaAllocator.init(self.manager.allocator());
+        defer arena.deinit();
+        for (0..count) |row| {
+            _ = arena.reset(.retain_capacity);
+            const a = arena.allocator();
+            for (keys, self.key_buffer[0..keys.len]) |column_, *key| key.* = try column_.cell(a, row, 0);
+            for (self.sorts, self.representatives) |*sort, index| {
+                const plan = self.bound.ordered[index];
+                const value = try inputs[plan.aggregate_index].cell(a, row, 0);
+                if (!value.sql_null) {
+                    self.key_buffer[keys.len] = value;
+                    try sort.add(.{ .values = &.{}, .keys = self.key_buffer, .ordinal = sort.total });
+                }
+            }
+        }
+    }
     pub fn addColumns(self: *Collector, keys: []const []const Datum, inputs: []const []const Datum, count: usize) !void {
         if (keys.len == 0) try self.grouped.addGlobalColumns(inputs, count) else try self.grouped.addColumns(keys, inputs, count);
         if (self.sorts.len == 0) return;

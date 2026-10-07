@@ -5527,6 +5527,7 @@ pub const AntflyApiHandler = struct {
         cache: *sql_plan_cache.Cache,
         done: std.Io.Event = .unset,
         result: ?sql_runtime.Result = null,
+        encoded_read: ?[]const u8 = null,
         failure: ?anyerror = null,
         diagnostic: sql_compiler.Diagnostic = .{},
         diagnostic_message_buffer: [256]u8 = undefined,
@@ -5540,6 +5541,81 @@ pub const AntflyApiHandler = struct {
         prepared_response_budget: SQLMemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 16 << 20 },
         connection_owned: ?@import("sql_connections.zig").Owned = null,
         connection_session_hex: [32]u8 = undefined,
+
+        fn deliverRead(raw: *anyopaque, alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream) anyerror!sql_runtime.Result {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.encodeRead(alloc, stream) catch |err| return if (self.prepared_response_budget.exhausted) error.SqlProgramLimitExceeded else err;
+        }
+        fn encodeRead(self: *@This(), alloc: std.mem.Allocator, stream: *@import("antfly_local_sources").sql_read_stream.Stream) !sql_runtime.Result {
+            const a = self.prepared_response_budget.allocator();
+            var writer: std.Io.Writer.Allocating = .init(a);
+            defer writer.deinit();
+            // Keep NULL flags in one bit per cell; encode rows directly from
+            // leased columns and release each page before pulling the next.
+            var nulls: std.ArrayList(u8) = .empty;
+            defer nulls.deinit(a);
+            var cells: usize = 0;
+            var rows: usize = 0;
+            const columns = stream.context.binding.columns;
+            try writer.writer.writeAll("{\"columns\":");
+            try std.json.Stringify.value(columns, .{}, &writer.writer);
+            try writer.writer.writeAll(",\"rows\":[");
+            while (true) {
+                var page = try stream.nextBatch(256);
+                defer page.deinit();
+                if (page.values.len() > self.limit -| rows) return error.SqlProgramLimitExceeded;
+                for (0..page.values.len()) |row| {
+                    if (rows != 0) try writer.writer.writeByte(',');
+                    try writer.writer.writeByte('[');
+                    for (columns, 0..) |_, column| {
+                        if (column != 0) try writer.writer.writeByte(',');
+                        const value = try page.values.cell(page.arena.allocator(), row, column);
+                        if (cells % 8 == 0) try nulls.append(a, 0);
+                        if (value.sql_null) nulls.items[cells / 8] |= @as(u8, 1) << @intCast(cells % 8);
+                        cells += 1;
+                        if (value.sql_null) {
+                            try writer.writer.writeAll("null");
+                        } else if (value.patterns) |patterns| {
+                            try writer.writer.writeByte('[');
+                            var offset: u64 = 0;
+                            var first = true;
+                            while (try patterns.next(patterns.ptr, page.arena.allocator(), &offset)) |pattern| {
+                                try self.adapter.context.ensureActive();
+                                if (!first) try writer.writer.writeByte(',');
+                                first = false;
+                                try std.json.Stringify.value(pattern.value, .{}, &writer.writer);
+                            }
+                            try writer.writer.writeByte(']');
+                        } else if (value.value == .integer) {
+                            var buffer: [20]u8 = undefined;
+                            const exact = try std.fmt.bufPrint(&buffer, "{d}", .{value.value.integer});
+                            try std.json.Stringify.value(exact, .{}, &writer.writer);
+                        } else try std.json.Stringify.value(value.value, .{}, &writer.writer);
+                    }
+                    try writer.writer.writeByte(']');
+                    rows += 1;
+                }
+                if (page.exhausted) break;
+            }
+            try writer.writer.writeAll("],\"sql_nulls\":[");
+            for (0..rows) |row| {
+                if (row != 0) try writer.writer.writeByte(',');
+                try writer.writer.writeByte('[');
+                for (0..columns.len) |column| {
+                    if (column != 0) try writer.writer.writeByte(',');
+                    const index = row * columns.len + column;
+                    const flag = nulls.items[index / 8] & (@as(u8, 1) << @intCast(index % 8)) != 0;
+                    try writer.writer.writeAll(if (flag) "true" else "false");
+                }
+                try writer.writer.writeByte(']');
+            }
+            try writer.writer.writeAll("],\"rows_affected\":0,\"command_tag\":\"SELECT\",\"transaction_status\":\"idle\"}");
+            try self.adapter.context.ensureActive();
+            var result = try sql_runtime.Result.empty(alloc, "SELECT");
+            errdefer result.deinit();
+            self.encoded_read = try writer.toOwnedSlice();
+            return result;
+        }
 
         fn run(self: *@This()) void {
             // Wake on the executor that owns the request waiter, not the
@@ -5733,6 +5809,7 @@ pub const AntflyApiHandler = struct {
             defer execution.release();
             self.preparation.release();
             self.execution_entered = true;
+            self.adapter.read_delivery = .{ .ptr = self, .deliver = deliverRead };
             var execution_backend = self.adapter.backend();
             if (resource) |owned| execution_backend.parameter_descriptor_hints = owned.value.parameter_descriptors;
             self.result = self.adapter.execute(std.heap.page_allocator, compiled, self.parameters, .{ .result_rows = self.limit }, if (resource != null) execution_backend else null) catch |err| {
@@ -5951,6 +6028,10 @@ pub const AntflyApiHandler = struct {
         }
         var result = job.result.?;
         defer result.deinit();
+        if (job.encoded_read) |encoded| {
+            defer job.prepared_response_budget.allocator().free(encoded);
+            return jsonResponse(ctx, 200, encoded);
+        }
         const columns = ctx.allocator.alloc(sql_wire.SQLColumn, result.output.columns.len) catch |err| {
             if (job.is_write) return ctx.status(409).json(sql_wire.SQLDiagnostic{ .code = "40003", .message = "mutation completed but its acknowledgement could not be encoded; do not replay the statement", .retryable = false, .transaction_id = if (job.adapter.outcome_transaction_id) |*id| id else null });
             return err;
@@ -7239,6 +7320,10 @@ pub const AntflyApiHandler = struct {
             self.api_server.preparePartialWitnessSchema(alloc, decoded_table_name, fk_schema, "", operationContext(ctx, authenticated_identity)) catch |err| return witnessDDLError(ctx, err);
         if (create_req.schema_json) |old| alloc.free(old);
         create_req.schema_json = supported_schema;
+        const derived_indexes_json = tables_api.expandSchemaDerivedAlgebraicIndexesAlloc(alloc, decoded_table_name, create_req.indexes_json orelse tables_api.default_indexes_json, supported_schema) catch return jsonErrorResponse(ctx, 400, "invalid schema-derived index configuration");
+        if (create_req.indexes_json) |old| alloc.free(old);
+        create_req.indexes_json = derived_indexes_json;
+        @import("antfly_local_sources").api_local_tables.validateLakeIndexCapacity(alloc, supported_schema, derived_indexes_json) catch return jsonErrorResponse(ctx, 400, "lake index declaration limit exceeded");
         if (has_initial_fk) {
             const request_context = operationContext(ctx, authenticated_identity);
             var plan_arena = std.heap.ArenaAllocator.init(alloc);
@@ -8056,14 +8141,20 @@ pub const AntflyApiHandler = struct {
         const request = operationContext(ctx, authenticated_identity);
         if (relational) if (binding.logical) |logical| {
             var lake_adapter: @import("sql_execution.zig").Adapter = .{ .server = self.api_server, .identity = &authenticated_identity, .context = request };
-            const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| return switch (err) {
-                error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
-                error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
-                error.CatalogGenerationChanged, error.ExternalLakeSnapshotMismatch => jsonErrorResponse(ctx, 409, "external table snapshot changed"),
-                error.InvalidQueryRequest, error.InvalidSqlDateTime, error.SqlTypeMismatch, error.UndefinedColumn, error.SqlUnknownColumn, error.RowPolicyUnsupported, error.UnsupportedRowsQuery, error.UnsupportedSqlExecution => jsonErrorResponse(ctx, 400, "external table does not support this read"),
-                error.Canceled, error.Cancelled => error.Canceled,
-                error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
-                else => jsonErrorResponse(ctx, 503, "external table read unavailable"),
+            const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| {
+                std.log.warn("external lake rows read failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                return switch (err) {
+                    error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
+                    error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
+                    error.ExternalLakeRowIndexNotFound => jsonErrorResponse(ctx, 404, "relational index not found"),
+                    error.ExternalLakePartialIndexNotImplied => jsonErrorResponse(ctx, 400, "query conditions must imply the partial index predicate"),
+                    error.ExternalLakeIndexNotPublished, error.ExternalLakeRowIndexNotPublished => jsonErrorResponse(ctx, 503, "relational index publication is not ready"),
+                    error.CatalogGenerationChanged, error.ExternalLakeSnapshotMismatch, error.PreparedGenerationChanged, error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexSourceChanged => jsonErrorResponse(ctx, 409, "external table snapshot or index publication changed"),
+                    error.InvalidRelationalRowsRequest, error.InvalidRelationalIndexBound, error.InvalidQueryRequest, error.InvalidSqlDateTime, error.SqlTypeMismatch, error.UndefinedColumn, error.SqlUnknownColumn, error.RowPolicyUnsupported, error.UnsupportedRowsQuery, error.UnsupportedSqlExecution => jsonErrorResponse(ctx, 400, "external table does not support this read"),
+                    error.Canceled, error.Cancelled => error.Canceled,
+                    error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
+                    else => jsonErrorResponse(ctx, 503, "external table read unavailable"),
+                };
             };
             if (lake_result) |ndjson| {
                 defer alloc.free(ndjson);
@@ -14485,9 +14576,10 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             while (true) {
                 var page = try stream.next(stream.context, alloc, request, 2);
                 defer page.result.deinit();
-                for (page.result.rows) |row| {
+                for (0..page.result.rowCount()) |row_index| {
+                    const cell = try page.result.cell(alloc, row_index, 0);
                     try std.testing.expect(offset < expected.len);
-                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), row[0].integer);
+                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), cell.value.integer);
                     offset += 1;
                 }
                 if (page.exhausted) break;

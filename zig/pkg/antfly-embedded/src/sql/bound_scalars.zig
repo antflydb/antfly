@@ -78,7 +78,7 @@ pub const Bound = struct {
         @memset(out, .{});
         for (self.required) |ordinal| {
             const cell = try page.cell(alloc, index, self.columns[ordinal].name);
-            out[ordinal] = .{ .value = try @import("describe.zig").coerceAlloc(alloc, cell.value, self.columns[ordinal].type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+            out[ordinal] = try @import("describe.zig").coerceDatum(alloc, cell, self.columns[ordinal].type, self.columns[ordinal].element_type);
         }
         return out;
     }

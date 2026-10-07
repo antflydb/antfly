@@ -2611,7 +2611,7 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
         parsed.enforce_types = true;
     }
     if (parsed.external_base_source) |source| {
-        if (source.binding.format == .lance or parsed.ttl_duration_ns != 0 or parsed.relational_indexes != null or parsed.checks != null or parsed.unique_constraints != null or parsed.foreign_keys != null or parsed.column_defaults != null or parsed.generated_columns != null) return error.InvalidSchemaUpdateRequest;
+        if (source.binding.format == .lance or parsed.ttl_duration_ns != 0 or parsed.checks != null or parsed.unique_constraints != null or parsed.foreign_keys != null or parsed.column_defaults != null or parsed.generated_columns != null) return error.InvalidSchemaUpdateRequest;
     }
     return parsed;
 }
