@@ -438,6 +438,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     };
     const relational_returning = returningReads(returning_columns);
     const returning_select: ?ast.Select = if (returning_columns) |projections| selection: {
+        if (joined and !relational_returning) break :selection null;
         if (!relational_returning) break :selection .{ .table = target.name, .columns = try @import("relation_binding.zig").normalizeTargetProjection(allocator, backend, table, projection_name, target_aliased, projections) };
         const source = try allocator.create(ast.Relation);
         source.* = .{ .table = .{ .name = target.name, .alias = if (target_aliased) projection_name.table else null, .prepared_rows = true } };
@@ -479,6 +480,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         bound.* = try @import("joined_mutation.zig").bind(allocator, backend, table, compiled, parameters);
         result.joined_mutation = bound;
         result.parameter_types = bound.input.parameter_types;
+        if (bound.returning_plan) |plan| result.columns = plan.columns;
     }
     if (compiled.statement == .insert) if (compiled.statement.insert.source) |source| {
         const insertion = compiled.statement.insert;
@@ -566,7 +568,7 @@ fn bindImpl(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     return result;
 }
 
-fn returningReads(projections: ?[]const ast.Projection) bool {
+pub fn returningReads(projections: ?[]const ast.Projection) bool {
     for (projections orelse return false) |projection| if (projection.expression) |expression| {
         if (@import("subquery_lowering.zig").has(expression)) return true;
     };

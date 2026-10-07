@@ -86,6 +86,106 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute("SELECT " + case["expression"]).fetchone()[0],
                 )
 
+    def test_joined_returning_preserves_target_postimage_and_source_array_identity(
+        self,
+    ):
+        import json
+        from generate_sql_postgres_reference import execute
+
+        fixture = json.loads(
+            (FIXTURES / "sql_joined_returning_reference.json").read_text()
+        )
+        for entry in fixture["entries"]:
+            with (
+                self.subTest(sql=entry["sql"]),
+                self.db.transaction(force_rollback=True),
+            ):
+                self.db.execute(
+                    "CREATE TABLE target(id text, n bigint, a bigint[], j jsonb[], cold text)"
+                )
+                self.db.execute(
+                    "CREATE TABLE source(id text, delta bigint, a smallint[])"
+                )
+                self.db.execute(
+                    "INSERT INTO target VALUES ('a',1,'[-1:1]={9007199254740993,NULL,2}',ARRAY['null'::jsonb,NULL],'old'),('b',2,'[-1:1]={9007199254740993,NULL,2}',ARRAY['null'::jsonb,NULL],'old')"
+                )
+                self.db.execute(
+                    "INSERT INTO source VALUES ('a',10,'[3:4]={3,NULL}'),(%s,20,'[3:4]={3,NULL}')",
+                    ("a" if entry.get("duplicates") else "b",),
+                )
+                result = execute(
+                    self.db,
+                    {"id": "joined-returning", "sql": entry["sql"], "params": []},
+                )
+                target_values = (
+                    ["3", None]
+                    if entry["target_first"] == "3"
+                    else ["9007199254740993", None, "2"]
+                )
+                expected = [
+                    {
+                        "dimensions": [
+                            {
+                                "length": len(target_values),
+                                "lower_bound": entry["target_lower"],
+                            }
+                        ],
+                        "values": target_values,
+                        "sql_nulls": [False, True]
+                        if len(target_values) == 2
+                        else [False, True, False],
+                    },
+                    {
+                        "dimensions": [{"length": 2, "lower_bound": 1}],
+                        "values": [None, None],
+                        "sql_nulls": [False, True],
+                    },
+                    {
+                        "dimensions": [{"length": 2, "lower_bound": 3}],
+                        "values": ["3", None],
+                        "sql_nulls": [False, True],
+                    },
+                ]
+                affected = 1 if entry.get("duplicates") else 2
+                self.assertEqual(affected, result["affected"])
+                self.assertEqual([1016, 3807, 1005], result["column_oids"])
+                self.assertEqual(["a", "j", "a"], result["columns"])
+                self.assertEqual([expected] * affected, result["rows"])
+                self.assertEqual([[False] * 3] * affected, result["sql_nulls"])
+                self.assertEqual(
+                    0 if entry["sql"].startswith("DELETE") else 2,
+                    self.db.execute("SELECT count(*) FROM target").fetchone()[0],
+                )
+                self.assertEqual(
+                    2, self.db.execute("SELECT count(*) FROM source").fetchone()[0]
+                )
+
+    def test_update_from_fanout_selects_one_coherent_source_match(self):
+        from generate_sql_postgres_reference import execute
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE target(_id text,n bigint,cold text)")
+            self.db.execute("CREATE TABLE source(id text,delta bigint)")
+            self.db.execute("INSERT INTO target VALUES ('a',1,'old'),('b',2,'old')")
+            self.db.execute("INSERT INTO source VALUES ('a',10),('a',20)")
+            result = execute(
+                self.db,
+                {
+                    "id": "joined-fanout",
+                    "sql": "UPDATE target t SET n=s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.n,s.delta,s.delta+1",
+                    "params": [],
+                },
+            )
+            self.assertEqual(1, result["affected"])
+            self.assertEqual([20, 20, 20], result["column_oids"])
+            self.assertEqual([[False] * 3], result["sql_nulls"])
+            row = [int(cell) for cell in result["rows"][0]]
+            self.assertIn(row, [[10, 10, 11], [20, 20, 21]])
+            self.assertEqual(
+                [(row[0], "new"), (2, "old")],
+                self.db.execute("SELECT n,cold FROM target ORDER BY _id").fetchall(),
+            )
+
     def test_declared_array_columns_roundtrip_all_builtin_domains_and_bounds(self):
         examples = {
             "boolean": True,

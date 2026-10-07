@@ -495,10 +495,7 @@ pub const BoundArm = struct {
     predicate: ?scalar.Program,
     action: union(enum) { update: []const BoundAssignment, delete, insert: []const BoundAssignment, nothing },
 };
-pub const Returning = struct {
-    columns: []const describe.Column,
-    programs: []const scalar.Program,
-};
+pub const Returning = @import("mutation_returning.zig").Plan;
 const Expression = struct { column: catalog.Column, value: ?*const ast.Scalar };
 const UnboundArm = struct {
     matched: bool,
@@ -648,34 +645,11 @@ fn bindArms(alloc: Allocator, backend: catalog.Backend, target: catalog.Table, s
 fn bindReturning(alloc: Allocator, backend: catalog.Backend, statement: ast.Merge, input: *const describe.BoundStatement, parameters: []?ast.ColumnType) !Returning {
     const relation = input.relation orelse return error.InvalidSqlBackendResponse;
     const requested = statement.returning orelse return error.InvalidSqlBackendResponse;
-    const projections = try relation_binding.expandWildcards(alloc, relation.root.columns, if (requested.len == 0) &[_]ast.Projection{.{ .wildcard = true }} else requested, statement.alias orelse statement.table.table);
-    const count = projections.len;
-    const expressions = try alloc.alloc(*const ast.Scalar, count);
-    const names = try alloc.alloc([]const u8, count);
-    for (projections, expressions, names) |projection, *expression, *name| {
-        const node = if (projection.expression) |value| value else blk: {
-            const column = try alloc.create(ast.Scalar);
-            column.* = .{ .column = if (projection.bound_column) |ordinal| relation.root.columns[ordinal].internal else projection.field };
-            break :blk column;
-        };
-        expression.* = node;
-        const field_name = if (std.mem.lastIndexOfScalar(u8, projection.field, 0)) |index| projection.field[index + 1 ..] else projection.field;
-        name.* = projection.alias orelse if (projection.expression == null) field_name else "?column?";
-    }
     const scalar_columns = try alloc.alloc(scalar.Column, input.columns.len);
     for (relation.statement.columns, input.columns, scalar_columns, 0..) |projection, column, *out, index| {
         out.* = .{ .name = if (projection.field.len != 0) projection.field else try std.fmt.allocPrint(alloc, "\x00merge_null_{d}", .{index}), .type = column.type, .element_type = column.element_type };
     }
-    const lowered = try alloc.alloc(*const ast.Scalar, count);
-    for (expressions, projections, lowered) |expression, projection, *out| out.* = if (projection.bound_column != null) expression else try relation_binding.lowerBoundExpression(alloc, relation.root.columns, expression);
-    for (lowered) |expression| _ = try scalar.inferParameters(alloc, expression, scalar_columns, parameters, null, .{ .invocation = backend.parameter_invocation });
-    const programs = try alloc.alloc(scalar.Program, count);
-    const columns = try alloc.alloc(describe.Column, count);
-    for (lowered, names, programs, columns) |expression, name, *program, *column| {
-        program.* = try scalar.bindWithSettings(alloc, expression, scalar_columns, parameters, .{ .invocation = backend.parameter_invocation }, backend.settings_view);
-        column.* = .{ .name = name, .type = program.output_type.kind orelse .string, .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
-    }
-    return .{ .columns = columns, .programs = programs };
+    return @import("mutation_returning.zig").bind(alloc, backend, relation.root.columns, scalar_columns, requested, statement.alias orelse statement.table.table, parameters);
 }
 
 fn qualifiedColumn(alloc: Allocator, column: relation_binding.Column) ![]const u8 {

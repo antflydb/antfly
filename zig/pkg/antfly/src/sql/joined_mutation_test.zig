@@ -95,6 +95,7 @@ const Backend = struct {
     returning_mode: bool = false,
     cold_source: bool = false,
     cold_width: usize = 0,
+    source_resolves: usize = 0,
     inserting: bool = false,
     row_count: usize = 2,
     rows_read: usize = 0,
@@ -123,6 +124,7 @@ const Backend = struct {
             return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .json }, .{ .name = "cold", .path = "cold", .type = .string } } };
         }
         try std.testing.expectEqual(catalog.Action.read, action);
+        self.source_resolves += 1;
         if (self.deny_source) return error.Forbidden;
         if (self.arrays) return .{ .id = 2, .physical_name = "source", .schema_version = 1, .columns = &.{
             .{ .name = "id", .path = "id", .type = .string }, .{ .name = "delta", .path = "delta", .type = .integer }, .{ .name = "a", .path = "a", .type = .array, .element_type = .int16 },
@@ -199,8 +201,6 @@ const Backend = struct {
     fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqual(self.captures, self.closes);
-        self.commits += 1;
-        self.writes += mutations.len;
         for (mutations) |mutation| {
             if (self.inserting) {
                 try std.testing.expectEqualStrings("fresh", mutation.key);
@@ -231,6 +231,8 @@ const Backend = struct {
                 if (self.document and !self.inserting) try std.testing.expectEqual(@as(i64, 42), row.object.get("undeclared").?.integer);
             }
         }
+        self.commits += 1;
+        self.writes += mutations.len;
         return .committed;
     }
     fn backend(self: *@This()) catalog.Backend {
@@ -417,6 +419,170 @@ test "SQL joined RETURNING resolves ambiguous names before any source capture or
         try std.testing.expectError(error.AmbiguousSqlColumn, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
         try std.testing.expectEqual(@as(usize, 0), backend.captures);
         try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+}
+
+test "SQL joined source RETURNING preserves PostgreSQL target images and source array domains" {
+    const a = std.testing.allocator;
+    const sources = @import("antfly_local_sources");
+    const fixture = try std.json.parseFromSlice(struct { entries: []const struct { sql: []const u8, target_first: []const u8, target_lower: i32, duplicates: bool = false } }, a, sources.sql_parity_fixtures.joined_returning_reference, .{});
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| for ([_]bool{ false, true }) |document| {
+        var backend: Backend = .{ .arrays = true, .document = document, .duplicates = entry.duplicates, .array_first = try std.fmt.parseInt(i64, entry.target_first, 10), .array_lower = entry.target_lower };
+        var compiled = try compiler.compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, if (entry.duplicates) 1 else 2), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(backend.captures, backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        for (result.output.rows, result.output.sql_nulls.?) |row, flags| {
+            try std.testing.expectEqualSlices(bool, &.{ false, false, false }, flags);
+            var target = try sources.sql_array_wire.decode(a, .int64, row[0], .{});
+            defer target.deinit();
+            try std.testing.expectEqual(entry.target_lower, target.value.dimensions[0].lower);
+            try std.testing.expectEqual(backend.array_first, target.value.elements[0].value.integer);
+            try std.testing.expect(target.value.elements[1].sql_null);
+            var json = try sources.sql_array_wire.decode(a, .jsonb, row[1], .{});
+            defer json.deinit();
+            try std.testing.expect(!json.value.elements[0].sql_null and json.value.elements[0].value == .null and json.value.elements[1].sql_null);
+            var source = try sources.sql_array_wire.decode(a, .int16, row[2], .{});
+            defer source.deinit();
+            try std.testing.expectEqual(@as(i32, 3), source.value.dimensions[0].lower);
+            try std.testing.expectEqual(@as(i64, 3), source.value.elements[0].value.integer);
+            try std.testing.expect(source.value.elements[1].sql_null);
+            try std.testing.expectEqual(.int16, result.output.columns[2].element_type.?);
+        }
+    };
+}
+
+test "SQL joined DELETE source RETURNING deduplicates fanout before mutation admission" {
+    var backend: Backend = .{ .duplicates = true, .row_count = 256 };
+    var compiled = try compiler.compile(std.testing.allocator, "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING t._id,s.delta,s.delta+1", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .mutation_rows = 1, .result_rows = 1, .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.writes);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    const row = result.output.rows[0];
+    try std.testing.expectEqualStrings("a", row[0].string);
+    try std.testing.expectEqual(try std.fmt.parseInt(i64, row[1].string, 10) + 1, try std.fmt.parseInt(i64, row[2].string, 10));
+}
+
+test "SQL joined source RETURNING sees normalized generated values and keeps parameter identity" {
+    var backend: Backend = .{ .default_mode = true, .generated_mode = true };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=s.delta,cold=DEFAULT,g=DEFAULT FROM source s WHERE t._id=s.id RETURNING t.n,t.g,t.cold,s.delta+$1", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .integer = 5 }}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    for (result.output.rows) |row| {
+        const n = try std.fmt.parseInt(i64, row[0].string, 10);
+        try std.testing.expectEqual(n * 2, try std.fmt.parseInt(i64, row[1].string, 10));
+        try std.testing.expectEqualStrings("default", row[2].string);
+        try std.testing.expectEqual(n + 5, try std.fmt.parseInt(i64, row[3].string, 10));
+    }
+}
+
+test "SQL joined source RETURNING expands qualified stars without capturing cold source fields" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING s.*,t.n", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.output.columns.len);
+    try std.testing.expectEqualStrings("id", result.output.columns[0].name);
+    try std.testing.expectEqualStrings("delta", result.output.columns[1].name);
+    for (result.output.rows) |row| try std.testing.expectEqualStrings(row[1].string, row[2].string);
+}
+
+test "SQL joined source RETURNING execution slots scale with dependencies not schema width" {
+    var backend: Backend = .{ .cold_source = true, .cold_width = 128 };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.n,s.delta", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const binding = try describe.bind(arena.allocator(), backend.backend(), &compiled, &.{});
+    const joined = binding.joined_mutation.?;
+    // Type inference and the dependency-pruned rebind share one schema epoch.
+    try std.testing.expectEqual(@as(usize, 1), backend.source_resolves);
+    try std.testing.expectEqual(@as(usize, 2), joined.returning_scope.len);
+    try std.testing.expectEqual(@as(usize, 1), joined.returning_sources.len);
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 2), backend.source_resolves);
+    for (result.output.rows) |row| try std.testing.expectEqualStrings(row[0].string, row[1].string);
+}
+
+test "SQL joined source RETURNING replays the bounded shared disk capture" {
+    var backend: Backend = .{ .arrays = true, .array_first = 3, .array_lower = 3 };
+    var interface = backend.backend();
+    interface.execution_io = std.testing.io;
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t.id=s.id RETURNING t.a,s.a", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, interface, &compiled, &.{}, .{ .page_rows = 1, .spill_bytes = 16 << 20, .retained_bytes = 4 << 20 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    const local = @import("antfly_local_sources");
+    for (result.output.rows) |row| {
+        var source = try local.sql_array_wire.decode(std.testing.allocator, .int16, row[1], .{});
+        defer source.deinit();
+        try std.testing.expectEqual(@as(i32, 3), source.value.dimensions[0].lower);
+        try std.testing.expect(source.value.elements[1].sql_null);
+    }
+}
+
+test "SQL joined source RETURNING rejects normalization guard changes and errors before publication" {
+    for ([_]@FieldType(Backend, "prepare_guard"){ .absence, .conflict }) |guard| {
+        var backend: Backend = .{ .prepare_guard = guard };
+        var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.n,s.delta", .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidSqlBackendResponse, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING t.n,1/(s.delta-10)", .{});
+    defer compiled.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+    try std.testing.expectEqual(@as(usize, 0), backend.commits);
+}
+
+test "SQL joined source RETURNING unwinds allocation faults and cancellation before publication" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            for ([_][]const u8{
+                "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t.id=s.id RETURNING t.a,t.j,s.a",
+                "DELETE FROM target t USING source s WHERE t.id=s.id RETURNING t.a,t.j,s.a",
+            }) |sql| {
+                var backend: Backend = .{ .arrays = true, .array_first = 3, .array_lower = 3 };
+                var compiled = try compiler.compile(a, sql, .{});
+                defer compiled.deinit();
+                var result = runtime.execute(a, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 }) catch |err| {
+                    try std.testing.expectEqual(@as(usize, 0), backend.commits);
+                    try std.testing.expectEqual(backend.captures, backend.closes);
+                    return err;
+                };
+                defer result.deinit();
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var baseline: Backend = .{ .arrays = true, .array_first = 3, .array_lower = 3 };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET a=s.a,cold='new' FROM source s WHERE t.id=s.id RETURNING t.a,t.j,s.a", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, baseline.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    for (1..baseline.checkpoints + 1) |point| {
+        var canceled: Backend = .{ .arrays = true, .cancel_at = point };
+        try std.testing.expectError(error.Canceled, runtime.execute(std.testing.allocator, canceled.backend(), &compiled, &.{}, .{ .page_rows = 1 }));
+        try std.testing.expectEqual(@as(usize, 0), canceled.commits);
+        try std.testing.expectEqual(canceled.captures, canceled.closes);
     }
 }
 
@@ -967,7 +1133,7 @@ test "SQL mutation subquery quota aborts before commit" {
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET cold='new' WHERE _id IN (SELECT id FROM source)", .{});
     defer compiled.deinit();
-    try std.testing.expectError(error.SqlResultTooLarge, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .mutation_rows = 1 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .mutation_rows = 1 }));
     try std.testing.expectEqual(@as(usize, 1), backend.captures);
     try std.testing.expectEqual(@as(usize, 1), backend.closes);
     try std.testing.expectEqual(@as(usize, 0), backend.commits);
@@ -1140,7 +1306,7 @@ test "SQL joined mutations empty matches and limits never partially commit" {
     backend = .{};
     var limited = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=s.delta,cold='new' FROM source s WHERE t._id=s.id", .{});
     defer limited.deinit();
-    try std.testing.expectError(error.SqlResultTooLarge, runtime.execute(std.testing.allocator, backend.backend(), &limited, &.{}, .{ .mutation_rows = 1 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &limited, &.{}, .{ .mutation_rows = 1 }));
     try std.testing.expectEqual(@as(usize, 0), backend.commits);
 }
 
@@ -1172,12 +1338,19 @@ test "SQL DELETE source fanout consumes one target mutation slot" {
     try std.testing.expectEqual(@as(usize, 1), backend.writes);
 }
 
-test "SQL joined UPDATE rejects ambiguous matches atomically and DELETE deduplicates" {
+test "SQL joined UPDATE and DELETE retain one coherent source match per target" {
     var backend: Backend = .{ .duplicates = true };
-    var update = try compiler.compile(std.testing.allocator, "UPDATE target t JOIN source s ON t._id=s.id SET t.n=s.delta, cold='new'", .{});
+    var update = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=s.delta,cold='new' FROM source s WHERE t._id=s.id RETURNING t.n,s.delta,s.delta+1", .{});
     defer update.deinit();
-    try std.testing.expectError(error.SqlMutationCardinalityViolation, runtime.execute(std.testing.allocator, backend.backend(), &update, &.{}, .{}));
-    try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    var updated = try runtime.execute(std.testing.allocator, backend.backend(), &update, &.{}, .{ .mutation_rows = 1, .result_rows = 1 });
+    defer updated.deinit();
+    try std.testing.expectEqual(@as(u64, 1), updated.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    const row = updated.output.rows[0];
+    try std.testing.expectEqualStrings(row[0].string, row[1].string);
+    const chosen = try std.fmt.parseInt(i64, row[1].string, 10);
+    try std.testing.expect(chosen == 10 or chosen == 20);
+    try std.testing.expectEqual(chosen + 1, try std.fmt.parseInt(i64, row[2].string, 10));
     backend = .{ .duplicates = true };
     var deletion = try compiler.compile(std.testing.allocator, "DELETE FROM target t USING source s WHERE t._id=s.id", .{});
     defer deletion.deinit();

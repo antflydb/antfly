@@ -1408,12 +1408,12 @@ pub const Context = struct {
         return output;
     }
 
-    const ReturningImages = struct {
+    pub const ReturningImages = struct {
         table: catalog.Table,
         projection: @import("document_row.zig").Projection,
         layout: ?catalog.Row.TypedLayout,
 
-        fn init(a: std.mem.Allocator, table: catalog.Table, fields: ?[]const []const u8) !ReturningImages {
+        pub fn init(a: std.mem.Allocator, table: catalog.Table, fields: ?[]const []const u8) !ReturningImages {
             const names = fields orelse blk: {
                 const all = try a.alloc([]const u8, table.columns.len);
                 for (table.columns, all) |column, *name| name.* = column.name;
@@ -1423,8 +1423,11 @@ pub const Context = struct {
             return .{ .table = table, .projection = projection, .layout = try projection.pageLayout(a) };
         }
 
-        fn row(self: ReturningImages, a: std.mem.Allocator, mutation: catalog.Mutation, original: catalog.Mutation) !catalog.Row {
-            if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
+        pub fn row(self: ReturningImages, a: std.mem.Allocator, mutation: catalog.Mutation, original: catalog.Mutation) !catalog.Row {
+            if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
+                !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or mutation.unique_absence != original.unique_absence or
+                mutation.conflict_guard != original.conflict_guard or mutation.predicate_only != original.predicate_only or
+                (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
             const datum = mutation.row orelse return (original.previous orelse return error.InvalidSqlBackendResponse).*;
             if (datum != .object) return error.InvalidSqlBackendResponse;
             const nulls = try a.alloc(bool, datum.object.count());

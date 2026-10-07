@@ -13368,6 +13368,96 @@ test "httpx SQL PostgreSQL original stored array reads preserve typed column sem
     try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
 }
 
+test "httpx SQL joined source RETURNING preserves native array storage and PostgreSQL images" {
+    const alloc = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const reference = try std.json.parseFromSlice(struct { entries: []const struct { sql: []const u8, target_first: []const u8, target_lower: i32, duplicates: bool = false } }, alloc, local.sql_parity_fixtures.joined_returning_reference, .{});
+    defer reference.deinit();
+    const schemas = [_][]const u8{
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"n":{"type":"integer"},"cold":{"type":"keyword"},"a":{"type":"sql_array","x-antfly-sql-type":"int64"},"j":{"type":"sql_array","x-antfly-sql-type":"jsonb"}},"additionalProperties":false}}}}
+        ,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"delta":{"type":"integer"},"a":{"type":"sql_array","x-antfly-sql-type":"int16"}},"additionalProperties":false}}}}
+        ,
+    };
+    for (reference.value.entries) |entry| {
+        var directory = try local.common_test_directory.TestDirectory.init("antfly-httpx-joined-source-returning");
+        defer directory.cleanup();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const Source = @import("sql_parity_sources.zig").Tables(2);
+        var source: Source = .{ .records = undefined, .reads = undefined };
+        var databases: [2]db_mod.DB = undefined;
+        var opened: usize = 0;
+        defer for (databases[0..opened]) |*database| database.close();
+        const json_array = (try local.sql_array_text.decodeLeaky(a, .jsonb, "{\"null\",NULL}", .{})).value;
+        const json = try local.sql_array_wire.toJsonLeaky(a, json_array, .{});
+        for (&databases, [_][]const u8{ "target", "source" }, schemas, 0..) |*database, name, schema, index| {
+            database.* = try db_mod.DB.open(alloc, try std.fmt.allocPrint(a, "{s}/{s}", .{ directory.path(), name }), .{ .start_optional_runtimes = false, .start_index_workers = false });
+            opened += 1;
+            try database.setSchemaJson(alloc, schema);
+            source.records[index] = .{ .table_id = 7 + index, .name = name, .schema_json = schema };
+            source.reads[index] = table_reads.BoundTableReadSource.init(name, 7 + index, database, raft_mod.read_gate.alreadyReadSafeBarrier());
+            const array = (try local.sql_array_text.decodeLeaky(a, if (index == 0) .int64 else .int16, if (index == 0) "[-1:1]={9007199254740993,NULL,2}" else "[3:4]={3,NULL}", .{})).value;
+            const wire_array = try local.sql_array_wire.toJsonLeaky(a, array, .{});
+            var writes: [2]db_mod.types.BatchWrite = undefined;
+            for ([_][]const u8{ "a", "b" }, &writes, 0..) |key, *write, row| write.* = .{ .key = key, .value = if (index == 0) try std.json.Stringify.valueAlloc(a, .{ .id = key, .n = row + 1, .cold = "old", .a = wire_array, .j = json }, .{}) else try std.json.Stringify.valueAlloc(a, .{ .id = if (entry.duplicates) "a" else key, .delta = (row + 1) * 10, .a = wire_array }, .{}) };
+            try database.batch(.{ .writes = &writes, .timestamp_ns = 42 });
+        }
+        var writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("target", &databases[0]);
+        var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+        defer backend_runtime.deinit();
+        var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, source.source(), writes.source());
+        defer server.deinit();
+        var handler = AntflyApiHandler{ .api_server = &server };
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = try std.json.Stringify.valueAlloc(a, .{ .statement = entry.sql }, .{});
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        if (response.status.code != 200) std.debug.print("joined source RETURNING rejected: {s}\n", .{response.body orelse ""});
+        try std.testing.expectEqual(@as(u16, 200), response.status.code);
+        const result = try std.json.parseFromSlice(sql_wire.SQLResponse, a, response.body.?, .{});
+        try std.testing.expectEqual(@as(i64, if (entry.duplicates) 1 else 2), result.value.rows_affected);
+        try std.testing.expectEqual(@as(usize, if (entry.duplicates) 1 else 2), result.value.rows.len);
+        try std.testing.expectEqual(@as(usize, 3), result.value.columns.len);
+        for (result.value.columns, [_][]const u8{ "a", "j", "a" }, [_]sql_wire.SQLArrayElementType{ .int64, .jsonb, .int16 }) |column_, name, element| {
+            try std.testing.expectEqualStrings(name, column_.name);
+            try std.testing.expectEqual(.array, column_.type);
+            try std.testing.expectEqual(element, column_.element_type.?);
+        }
+        try std.testing.expectEqual(@as(usize, 1), source.captures);
+        const expected_target = (try local.sql_array_text.decodeLeaky(a, .int64, if (std.mem.eql(u8, entry.target_first, "3")) "[3:4]={3,NULL}" else "[-1:1]={9007199254740993,NULL,2}", .{})).value;
+        const expected_source = (try local.sql_array_text.decodeLeaky(a, .int16, "[3:4]={3,NULL}", .{})).value;
+        for (result.value.rows, result.value.sql_nulls.?) |row, flags| {
+            try std.testing.expectEqualSlices(bool, &.{ false, false, false }, flags);
+            var work: local.sql_array_value.Budget = .{};
+            var target = try local.sql_array_wire.decode(alloc, .int64, row[0], .{});
+            defer target.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, try target.value.compare(expected_target, &work));
+            const returned_json = try local.sql_array_wire.decodeLeaky(a, .jsonb, row[1], .{});
+            try std.testing.expectEqual(std.math.Order.eq, try returned_json.compare(json_array, &work));
+            var source_array = try local.sql_array_wire.decode(alloc, .int16, row[2], .{});
+            defer source_array.deinit();
+            try std.testing.expectEqual(std.math.Order.eq, try source_array.value.compare(expected_source, &work));
+        }
+        var stored = try databases[0].scan(a, "", "", .{ .include_documents = true, .limit = 3 });
+        defer stored.deinit(a);
+        try std.testing.expectEqual(@as(usize, if (std.mem.startsWith(u8, entry.sql, "DELETE")) 0 else 2), stored.documents.len);
+        for (stored.documents) |document| {
+            const value = try std.json.parseFromSliceLeaky(std.json.Value, a, document.json, .{});
+            const unchanged = entry.duplicates and std.mem.eql(u8, document.id, "b");
+            try std.testing.expectEqualStrings(if (unchanged) "old" else "new", value.object.get("cold").?.string);
+            const array = try local.sql_array_wire.decodeLeaky(a, .int64, value.object.get("a").?, .{});
+            var work: local.sql_array_value.Budget = .{};
+            const expected = if (unchanged) (try local.sql_array_text.decodeLeaky(a, .int64, "[-1:1]={9007199254740993,NULL,2}", .{})).value else expected_target;
+            try std.testing.expectEqual(std.math.Order.eq, try array.compare(expected, &work));
+        }
+    }
+}
+
 test "httpx SQL PostgreSQL mutations capture native source relations and complete storage" {
     // Exact-source non-key mutations. Logical PK/index-owner activation is
     // deliberately not claimed by this fixture: sql-0012, sql-0013,

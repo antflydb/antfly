@@ -4318,3 +4318,43 @@ fallback wire cells re-enter typed execution using their declared element type.
 Leased/native and public-page regressions exercise non-default bounds, NULL
 elements, exact bigint values and allocation failures. This does not activate
 array DDL, array index keys, or the unfinished broader SQL architecture.
+
+### Joined mutation source-aware RETURNING
+
+Joined UPDATE/DELETE RETURNING now binds against the complete authorized join
+scope, sharing wildcard, ambiguity and typed-program binding with MERGE. Its
+execution slots are dense: a 128-column unused source tail does not widen a
+two-cell RETURNING frame. Only required source cells enter the shared bounded,
+spill-capable capture. DELETE preimages likewise retain only required target
+fields. Source types remain independent of assignment coercion: copying a
+smallint array into a bigint target does not change the source RETURNING type.
+
+Joined selection streams into a target-keyed mutation collector. Match fanout
+retains one coherent source representative per target before mutation-row
+admission, rather than materializing every joined match or grouping independent
+source columns into incompatible representatives. All target images undergo
+native preparation, then RETURNING evaluates against the normalized/defaulted/
+generated target and captured source. Key, version, digest, absence, conflict and
+predicate guards must survive normalization. Typed readers and physical read
+owners close before writer admission; errors in RETURNING cannot publish writes.
+
+The existing 1,024-target/source debug workload retains one physical capture and
+2,048 native input rows. Its observed peak statement memory decreased from
+4,632,337 to 4,432,621 bytes after streaming collection and reclaimable metadata
+growth; debug latency remained approximately 120 ms. These local samples are
+not a production throughput claim. Component regressions exercise source/target
+array domains and NULL provenance, generated/defaulted images, qualified stars,
+parameters, 256-fold DELETE fanout under a one-row mutation limit, allocation
+faults, cancellation, shared disk capture replay and normalization guard
+tampering. Shared unchanged query fixtures are independently verified against
+PostgreSQL. Type inference and dependency-pruned rebinding reuse each authorized
+source catalog identity, preventing schema-epoch drift within a statement.
+
+UPDATE FROM and DELETE USING select one coherent matched source row per target
+before affected-row admission, rather than rejecting PostgreSQL's legal UPDATE
+fanout or returning columns from different matches. This does not promise which
+matching row is chosen; MERGE retains its independent cardinality contract.
+Target-only relational RETURNING subqueries retain their existing path; broader
+source-aware/correlated RETURNING subqueries still need implementation and
+original-case evidence. No original corpus disposition is credited solely for
+these component fixtures.

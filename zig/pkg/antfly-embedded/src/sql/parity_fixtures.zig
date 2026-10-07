@@ -26,6 +26,7 @@ pub const document_campaign = @embedFile("fixtures/sql_document_campaign.json");
 pub const document_reference = @embedFile("fixtures/sql_document_reference.json");
 pub const read_campaign_reference = @embedFile("fixtures/sql_read_campaign_reference.json");
 pub const typed_array_read_reference = @embedFile("fixtures/sql_typed_array_read_reference.json");
+pub const joined_returning_reference = @embedFile("fixtures/sql_joined_returning_reference.json");
 pub const lateral_campaign_reference = @embedFile("fixtures/sql_lateral_campaign_reference.json");
 pub const array_expression_reference = @embedFile("fixtures/sql_array_expression_reference.json");
 
