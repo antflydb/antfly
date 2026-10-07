@@ -20,9 +20,72 @@ from generate_sql_postgres_reference import execute, FIXTURES, postgres
 
 
 class ArraySearchReferenceTest(unittest.TestCase):
+    def test_native_array_construction_shapes_and_overloads_match_postgres(self):
+        source = (FIXTURES.parent / "scalar.zig").read_text()
+        section = source.split(
+            'test "SQL PostgreSQL array construction preserves ranks bounds NULLs and compatible types" {',
+            1,
+        )[1].split('\ntest "', 1)[0]
+        cases = re.findall(r'\.sql = "([^"]+)"', section)
+        self.assertEqual(19, len(cases))
+        with postgres() as db:
+            for index, expression in enumerate(cases):
+                with self.subTest(expression=expression):
+                    result = execute(
+                        db,
+                        {
+                            "id": f"array-construction-{index}",
+                            "sql": "SELECT " + expression,
+                            "params": [],
+                        },
+                        read=True,
+                    )
+                    self.assertEqual([[True]], result["rows"])
+                    self.assertEqual([[False]], result["sql_nulls"])
+                    self.assertEqual([16], result["column_oids"])
+
+    def test_native_array_construction_errors_match_postgres(self):
+        import psycopg
+
+        source = (FIXTURES.parent / "scalar.zig").read_text()
+        section = source.split(
+            'test "SQL PostgreSQL array construction diagnoses incompatible shapes and overloads" {',
+            1,
+        )[1].split('\ntest "', 1)[0]
+        cases = re.findall(r'\.sql = "([^"]+)", \.err = error\.(\w+)', section)
+        self.assertEqual(8, len(cases))
+        codes = {
+            "SqlArrayAppendDimensions": "22000",
+            "SqlArrayConcatenationDimensions": "2202E",
+            "SqlInvalidTextRepresentation": "22P02",
+            "SqlProgramLimitExceeded": "54000",
+            "SqlUndefinedFunction": "42883",
+        }
+        with postgres() as db:
+            for expression, error in cases:
+                with self.subTest(expression=expression):
+                    with db.transaction(force_rollback=True):
+                        with self.assertRaises(psycopg.Error) as caught:
+                            db.execute("SELECT " + expression)
+                        self.assertEqual(codes[error], caught.exception.sqlstate)
+
     def test_array_search_result_oids_and_complete_physical_shape(self):
         with postgres() as db:
             for sql, oid, dimensions, values, nulls in (
+                (
+                    "SELECT array_cat('[0:0][3:4]={{1,2}}'::int4[],'[9:9][3:4]={{3,4}}'::int4[])",
+                    1007,
+                    [{"length": 2, "lower_bound": 0}, {"length": 2, "lower_bound": 3}],
+                    ["1", "2", "3", "4"],
+                    [False, False, False, False],
+                ),
+                (
+                    "SELECT array_append(NULL::text[],NULL)",
+                    1009,
+                    [{"length": 1, "lower_bound": 1}],
+                    [None],
+                    [True],
+                ),
                 (
                     "SELECT array_positions('[0:3]={1,NULL,1,NULL}'::int4[],NULL)",
                     1007,

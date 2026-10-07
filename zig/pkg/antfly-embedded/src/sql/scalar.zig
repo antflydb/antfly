@@ -76,7 +76,7 @@ pub const EvalLimits = struct {
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat };
 
 pub const Instruction = struct {
     type: Type,
@@ -939,11 +939,126 @@ fn functionId(name: []const u8) !Function {
     if (std.mem.eql(u8, name, "btrim")) return .trim;
     return error.UnsupportedSqlShape;
 }
-fn arraySearchFunction(function: Function) bool {
+fn arrayCompatibleFunction(function: Function) bool {
     return switch (function) {
-        .array_position, .array_positions, .array_remove, .array_replace => true,
+        .array_position, .array_positions, .array_remove, .array_replace, .array_append, .array_prepend, .array_cat => true,
         else => false,
     };
+}
+fn arrayArgument(function: Function, index: usize) bool {
+    return if (function == .array_cat) true else if (function == .array_prepend) index == 1 else index == 0;
+}
+
+test "SQL PostgreSQL array construction preserves ranks bounds NULLs and compatible types" {
+    const Case = struct { sql: []const u8 };
+    for ([_]Case{
+        .{ .sql = "array_append(ARRAY[1,NULL],2) = ARRAY[1,NULL,2]" },
+        .{ .sql = "array_prepend(1,'[0:1]={2,3}'::int4[]) = '[0:2]={1,2,3}'::int4[]" },
+        .{ .sql = "array_append(NULL::int4[],1) = ARRAY[1]" },
+        .{ .sql = "array_prepend(NULL,NULL) = ARRAY[NULL]::text[]" },
+        .{ .sql = "array_cat(NULL::int4[],NULL::int4[]) IS NULL" },
+        .{ .sql = "array_cat(ARRAY[]::int4[],NULL::int4[]) = ARRAY[]::int4[]" },
+        .{ .sql = "array_cat(ARRAY[1],ARRAY[2,3]) = ARRAY[1,2,3]" },
+        .{ .sql = "array_cat('[0:0][3:4]={{1,2}}'::int4[],'[9:9][3:4]={{3,4}}'::int4[]) = '[0:1][3:4]={{1,2},{3,4}}'::int4[]" },
+        .{ .sql = "array_cat(ARRAY[1,2],'[0:0][1:2]={{3,4}}'::int4[]) = '[0:1][1:2]={{1,2},{3,4}}'::int4[]" },
+        .{ .sql = "array_cat('[0:0][1:2]={{1,2}}'::int4[],ARRAY[3,4]) = '[0:1][1:2]={{1,2},{3,4}}'::int4[]" },
+        .{ .sql = "array_append(ARRAY[1]::int2[],9007199254740993::int8) = ARRAY[1,9007199254740993]::int8[]" },
+        .{ .sql = "array_cat(ARRAY[1]::int2[],ARRAY[9007199254740993]::int8[]) = ARRAY[1,9007199254740993]::int8[]" },
+        .{ .sql = "(ARRAY[1] || NULL) = ARRAY[1]" },
+        .{ .sql = "(ARRAY[1] || NULL::int4) = ARRAY[1,NULL]" },
+        .{ .sql = "(ARRAY[1] || '{2,3}') = ARRAY[1,2,3]" },
+        .{ .sql = "(1 || ARRAY[2,3]) = ARRAY[1,2,3]" },
+        .{ .sql = "(ARRAY[1,2] || 3) = ARRAY[1,2,3]" },
+        .{ .sql = "('x'::text || ARRAY['y']) = ARRAY['x','y']" },
+        .{ .sql = "CASE WHEN false THEN cardinality(array_append(ARRAY[[1,2]],3)) = 0 ELSE true END" },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const actual = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expect(!actual.sql_null and actual.value == .bool and actual.value.bool);
+    }
+}
+
+test "SQL PostgreSQL array construction diagnoses incompatible shapes and overloads" {
+    for ([_]struct { sql: []const u8, err: anyerror }{
+        .{ .sql = "array_append(ARRAY[[1,2]],3)", .err = error.SqlArrayAppendDimensions },
+        .{ .sql = "array_cat(ARRAY[[1,2]],ARRAY[[3]])", .err = error.SqlArrayConcatenationDimensions },
+        .{ .sql = "array_cat(ARRAY[1],ARRAY[[[2]]])", .err = error.SqlArrayConcatenationDimensions },
+        .{ .sql = "array_cat('[0:1]={1,2}'::int4[],ARRAY[[3,4]])", .err = error.SqlArrayConcatenationDimensions },
+        .{ .sql = "ARRAY[1,2] || '7'", .err = error.SqlInvalidTextRepresentation },
+        .{ .sql = "array_cat(ARRAY[1],ARRAY[true])", .err = error.SqlUndefinedFunction },
+        .{ .sql = "array_append('[2147483646:2147483646]={1}'::int4[],2)", .err = error.SqlProgramLimitExceeded },
+        .{ .sql = "array_cat('[2147483646:2147483646]={1}'::int4[],ARRAY[2])", .err = error.SqlProgramLimitExceeded },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var program = bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqual(case.err, err);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expectError(case.err, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
+    }
+}
+
+test "SQL PostgreSQL array construction unwinds every allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(a, "array_prepend('a',array_append(ARRAY['b',NULL],'c')) || ARRAY['d']", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+            try std.testing.expectEqual(@as(usize, 5), result.array.?.elements.len);
+            try std.testing.expectEqualStrings("a", result.array.?.elements[0].value.string);
+            try std.testing.expect(result.array.?.elements[2].sql_null);
+            try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, &.{}, .{ .output_bytes = 1 }));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL PostgreSQL array construction preserves prepared widths and borrows identity results" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "array_cat($1,$2)", .{});
+    defer compiled.deinit();
+    const hints: []const Type = &.{ .{ .kind = .array, .element_type = .int16 }, .{ .kind = .array, .element_type = .int64 } };
+    var program = try bindTyped(a, compiled.expression, &.{}, hints, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(arrays.ElementType.int64, program.output_type.element_type.?);
+    for (hints, program.parameter_descriptors) |expected, actual| try std.testing.expectEqual(expected.element_type, actual.element_type);
+    const Frame = @import("parameter_frame.zig").Frame;
+    var frame = try Frame.prepare(a, program.parameter_descriptors, &.{ .{ .text = "[0:1]={1,NULL}" }, .{ .text = "{9007199254740993}" } }, .{});
+    defer frame.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = try (try program.bindParameters(&frame)).evaluate(arena.allocator(), &.{}, .{});
+    try std.testing.expectEqual(@as(i32, 0), result.array.?.dimensions[0].lower);
+    try std.testing.expect(result.array.?.elements[1].sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), result.array.?.elements[2].value.integer);
+
+    var identity_sql = try @import("compiler.zig").compileScalar(a, "$1::int4[] || NULL", .{});
+    defer identity_sql.deinit();
+    var identity = try bindTyped(a, identity_sql.expression, &.{}, &.{}, .{});
+    defer identity.deinit();
+    var identity_frame = try Frame.prepare(a, identity.parameter_descriptors, &.{.{ .text = "[0:2]={1,NULL,2}" }}, .{});
+    defer identity_frame.deinit();
+    const prepared = try identity.bindParameters(&identity_frame);
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const value = try prepared.evaluate(none.allocator(), &.{}, .{});
+        try std.testing.expect(value.array == identity_frame.values[0].array);
+    }
+    std.debug.print("SQL array concatenation identity: rows=10000 evaluation_scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started});
 }
 
 test "SQL PostgreSQL array search and transform preserve typed NULLs bounds and promotion" {
@@ -1070,7 +1185,7 @@ test "SQL PostgreSQL array search prepared frames keep input widths and bounded 
 fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
         .array_position => count == 2 or count == 3,
-        .array_positions, .array_remove => count == 2,
+        .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
         .array_replace => count == 3,
         .@"$like_escape" => count == 4,
         .@"$contains", .jsonb_exists => count == 2,
@@ -1095,7 +1210,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return if (arraySearchFunction(function)) error.SqlUndefinedFunction else error.InvalidSqlParameters;
+    if (!valid) return if (arrayCompatibleFunction(function)) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -1117,7 +1232,7 @@ const Binder = struct {
     /// PostgreSQL anycompatiblearray/anycompatible resolution is distinct
     /// from the exact anyarray identity used by equality operators. Unknown
     /// literal strings adopt the known domain; typed text never does so.
-    fn arraySearchElement(self: *Binder, call: anytype, function: Function, depth: usize) anyerror!arrays.ElementType {
+    fn arrayCompatibleElement(self: *Binder, call: anytype, function: Function, depth: usize) anyerror!arrays.ElementType {
         var chosen: ?arrays.ElementType = null;
         for (call.args, 0..) |arg, i| {
             const actual = try self.infer(arg, depth + 1);
@@ -1127,13 +1242,30 @@ const Binder = struct {
                 continue;
             }
             if (actual.kind == null or (arg.* == .literal and arg.literal == .string)) continue;
-            if ((i == 0) != (actual.kind == .array)) return error.SqlUndefinedFunction;
-            const element = actual.element_type orelse if (i == 0) return error.UnknownSqlArrayType else try arrayElementType(actual.kind.?);
+            if (arrayArgument(function, i) != (actual.kind == .array)) return error.SqlUndefinedFunction;
+            const element = actual.element_type orelse if (arrayArgument(function, i)) return error.UnknownSqlArrayType else try arrayElementType(actual.kind.?);
             if (chosen) |prior| {
                 if (prior != element) chosen = builtin_cast.commonNumeric(prior, element) catch return error.SqlUndefinedFunction;
             } else chosen = element;
         }
         return chosen orelse .text;
+    }
+
+    /// Unknown string/NULL operands choose the array-array overload, as in
+    /// PostgreSQL operator resolution. A typed scalar chooses append/prepend.
+    /// Keep text and JSON concatenation on their existing scalar path.
+    fn arrayConcatenation(self: *Binder, binary: anytype, depth: usize) anyerror!?*const ast.Scalar {
+        if (binary.op != .concat) return null;
+        const left = try self.infer(binary.left, depth + 1);
+        const right = try self.infer(binary.right, depth + 1);
+        if (left.kind != .array and right.kind != .array) return null;
+        const operand = if (left.kind == .array) binary.right else binary.left;
+        const other = if (left.kind == .array) right else left;
+        const unknown = other.kind == null or (operand.* == .literal and operand.literal == .string);
+        const name = if ((left.kind == .array and right.kind == .array) or unknown) "array_cat" else if (left.kind == .array) "array_append" else "array_prepend";
+        const node = try self.alloc.create(ast.Scalar);
+        node.* = .{ .call = .{ .name = name, .args = try self.alloc.dupe(*const ast.Scalar, &.{ binary.left, binary.right }) } };
+        return node;
     }
 
     fn registerColumns(self: *Binder) !void {
@@ -1197,6 +1329,7 @@ const Binder = struct {
                 break :blk .{ .kind = .boolean, .nullable = unary.op == .not and input.nullable };
             },
             .binary => |binary| blk: {
+                if (try self.arrayConcatenation(binary, depth)) |call| break :blk try self.infer(call, depth + 1);
                 const left = try self.infer(binary.left, depth + 1);
                 const right = try self.infer(binary.right, depth + 1);
                 try arrayOperator(left, right);
@@ -1234,8 +1367,8 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
-                if (arraySearchFunction(function)) {
-                    const element = try self.arraySearchElement(call, function, depth);
+                if (arrayCompatibleFunction(function)) {
+                    const element = try self.arrayCompatibleElement(call, function, depth);
                     break :blk .{ .kind = if (function == .array_position) .integer else .array, .element_type = if (function == .array_position or function == .array_positions) .int32 else element, .nullable = true };
                 }
                 if (function == .@"$like_escape") {
@@ -1496,6 +1629,7 @@ const Binder = struct {
                 else => null,
             }, depth + 1) } },
             .binary => |binary| blk: {
+                if (try self.arrayConcatenation(binary, depth)) |call| return self.compileArrayContext(call, expected, array_element, depth + 1);
                 if (binary.op == .json_get or binary.op == .json_text) break :blk .{ .binary = .{ .op = binary.op, .left = try self.compile(binary.left, .json, depth + 1), .right = try self.compile(binary.right, .string, depth + 1) } };
                 const merged = try common(try self.infer(binary.left, depth + 1), try self.infer(binary.right, depth + 1));
                 const operand_kind: ?ast.ColumnType = switch (binary.op) {
@@ -1538,12 +1672,12 @@ const Binder = struct {
                     break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
                 }
                 const args = try self.alloc.alloc(u32, call.args.len);
-                if (arraySearchFunction(function)) {
-                    const element = try self.arraySearchElement(call, function, depth);
+                if (arrayCompatibleFunction(function)) {
+                    const element = try self.arrayCompatibleElement(call, function, depth);
                     for (call.args, args, 0..) |arg, *out, i| {
                         const start = function == .array_position and i == 2;
                         const target: arrays.ElementType = if (start) .int32 else element;
-                        const desired: ast.ColumnType = if (i == 0) .array else arrayScalarType(target);
+                        const desired: ast.ColumnType = if (arrayArgument(function, i)) .array else arrayScalarType(target);
                         const coercion = try self.alloc.create(ast.Scalar);
                         coercion.* = .{ .cast = .{ .operand = arg, .type = desired, .element_type = target } };
                         out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
@@ -1828,6 +1962,28 @@ const Evaluator = struct {
                     } });
                 }
                 switch (call.function) {
+                    .array_append, .array_prepend, .array_cat => {
+                        const left = try self.runDatum(call.args[0], depth + 1);
+                        const right = try self.runDatum(call.args[1], depth + 1);
+                        if (call.function == .array_cat) {
+                            if (left.sql_null) break :blk right;
+                            if (right.sql_null) break :blk left;
+                            if (left.array.?.elements.len == 0) break :blk right;
+                            if (right.array.?.elements.len == 0) break :blk left;
+                        }
+                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
+                        const before = work.remaining;
+                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+                        const prepend = call.function == .array_prepend;
+                        const input = if (prepend) right else left;
+                        const empty: arrays.Value = .{ .element_type = instruction.type.element_type.?, .dimensions = &.{}, .elements = &.{} };
+                        const output = if (call.function == .array_cat) try left.array.?.concatenate(self.alloc, right.array.?.*, limits, &work) else try (input.array orelse &empty).append(self.alloc, if (prepend) left else right, prepend, limits, &work);
+                        self.steps += before - work.remaining;
+                        try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.elements.len * @sizeOf(arrays.Element));
+                        const owned = try self.alloc.create(arrays.Value);
+                        owned.* = output;
+                        break :blk Datum.typedArray(owned);
+                    },
                     .array_position, .array_positions, .array_remove, .array_replace => {
                         // These functions are deliberately non-strict in the
                         // searched value/replacement: NULL is a matchable cell.

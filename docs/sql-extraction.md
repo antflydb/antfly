@@ -3794,6 +3794,37 @@ Independent PostgreSQL contracts check complete Boolean semantics, exact array
 OIDs, dimensions, bigint payloads, SQL NULL flags and diagnostic codes. Mounted
 HTTP checks array envelopes and prepared promotions. These are shared execution
 contracts, not original-corpus disposition credit: stored-array schema/read/
-mutation activation remains unfinished, as do concatenation and the broader
-array-function catalog. The original-case inventory remains 365 implemented,
+mutation activation and the broader array-function catalog remain unfinished.
+The original-case inventory remains 365 implemented,
 136 rejected, 73 superseded and 1,012 unresolved.
+
+### Shape-aware array concatenation
+
+`array_append`, `array_prepend`, `array_cat` and array-valued `||` overloads
+share the compatible-element resolver and explicit typed coercions. Array
+operator resolution distinguishes unknown string/NULL operands (array-array
+concatenation) from typed scalar operands (append/prepend); text/JSON scalar
+concatenation retains its existing path. Prepared-input descriptors retain
+their original widths even when the result promotes to a wider element type.
+
+Append/prepend accept empty or one-dimensional arrays and preserve an existing
+lower bound. Concatenation admits equal or adjacent ranks: equal-rank operands
+must have matching trailing lengths and lower bounds; adjacent-rank operands
+must match the complete lower-rank shape to the higher-rank tail. The result
+retains the appropriate first-axis lower bound rather than normalizing it to
+one. Nonidentity construction allocates one admitted flat element vector and
+dimension vector, borrowing pinned payloads until the usual retention boundary.
+NULL/empty concatenation identities reuse the existing typed operand without
+allocating or copying its vector. Rank/shape errors have PostgreSQL diagnostic
+codes, and dimension-growth overflow fails admission before result allocation.
+
+Native contracts cover array/element NULL distinctions, equal/adjacent ranks,
+non-default bounds, exact bigint promotion, unknown-string overloads and masked
+evaluation. Independent PostgreSQL checks verify these semantics and complete
+typed output shapes. Allocation-failure tests cover nested construction and
+operator lowering. A prepared identity workload asserts zero evaluation scratch
+allocation over 10,000 rows and measured approximately 3.7 ms in a debug build
+(an absolute workload measurement, not a before/after speedup claim).
+Mounted HTTP contracts check exact envelopes and
+cross-width array parameters. This remains shared execution progress, not
+additional original-case credit or stored-array activation.

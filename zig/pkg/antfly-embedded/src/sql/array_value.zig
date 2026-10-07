@@ -252,6 +252,52 @@ pub const Value = struct {
         return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
     }
 
+    /// Append/prepend preserve an existing one-dimensional lower bound.
+    /// Empty arrays acquire the ordinary one-based bound. Payloads borrow the
+    /// pinned operand owners; structural storage belongs to the result arena.
+    pub fn append(self: Value, alloc: Allocator, element: Element, prepend: bool, limits: Limits, work: *Budget) !Value {
+        if (self.dimensions.len > 1) return error.SqlArrayAppendDimensions;
+        try validateElement(self.element_type, element, work);
+        const count = self.elements.len + 1;
+        try resultAdmission(count, 1, limits);
+        const lower_bound: i32 = if (self.dimensions.len == 0) 1 else self.dimensions[0].lower;
+        if (@as(i64, lower_bound) + @as(i64, @intCast(count)) > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+        const dimensions = try alloc.dupe(Dimension, &.{.{ .length = @intCast(count), .lower = lower_bound }});
+        const elements = try alloc.alloc(Element, count);
+        @memcpy(elements[@intFromBool(prepend)..][0..self.elements.len], self.elements);
+        elements[if (prepend) 0 else count - 1] = element;
+        return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
+    }
+
+    /// Concatenate whole first-axis slices. Equal-rank arrays may differ only
+    /// in their first axis; adjacent ranks require the lower-rank shape to
+    /// exactly match the higher-rank tail, including lower bounds. Identity
+    /// results borrow all storage; nonidentity results allocate one flat vector.
+    pub fn concatenate(self: Value, alloc: Allocator, other: Value, limits: Limits, work: *Budget) !Value {
+        if (self.element_type != other.element_type) return error.SqlTypeMismatch;
+        if (self.elements.len == 0) return other;
+        if (other.elements.len == 0) return self;
+        const left_rank = self.dimensions.len;
+        const right_rank = other.dimensions.len;
+        if (@max(left_rank, right_rank) - @min(left_rank, right_rank) > 1) return error.SqlArrayConcatenationDimensions;
+        const higher = if (left_rank >= right_rank) self else other;
+        const lower_rank = if (left_rank >= right_rank) other else self;
+        const tails = if (left_rank == right_rank) lower_rank.dimensions[1..] else lower_rank.dimensions;
+        for (higher.dimensions[1..], tails) |a, b| {
+            if (a.length != b.length or a.lower != b.lower) return error.SqlArrayConcatenationDimensions;
+        }
+        const count = self.elements.len + other.elements.len;
+        try resultAdmission(count, higher.dimensions.len, limits);
+        const first_length = higher.dimensions[0].length + @as(u32, if (left_rank == right_rank) other.dimensions[0].length else 1);
+        if (@as(i64, higher.dimensions[0].lower) + first_length > std.math.maxInt(i32)) return error.SqlProgramLimitExceeded;
+        const dimensions = try alloc.dupe(Dimension, higher.dimensions);
+        dimensions[0].length = first_length;
+        const elements = try alloc.alloc(Element, count);
+        @memcpy(elements[0..self.elements.len], self.elements);
+        @memcpy(elements[self.elements.len..], other.elements);
+        return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
+    }
+
     pub fn compare(self: Value, other: Value, budget: *Budget) !std.math.Order {
         try budget.consume(1);
         if (self.element_type != other.element_type) return error.SqlTypeMismatch;
