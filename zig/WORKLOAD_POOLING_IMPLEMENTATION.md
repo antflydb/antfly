@@ -1180,6 +1180,25 @@ Worker-process transfer, other backend teams, complete memory accounting and
 full production/default qualification are still required. The adapter is not
 installed by production yet.
 
+### Local inference parent phase (2026-10-07, final native API gate passed)
+
+SQL decision calls now propagate a checked borrowed execution descriptor through
+RequestContext and provider bridge ABI v29. The local host transfers the same
+operation to inference, installs its native CPU scope, and restores the parent
+through original deadline and read-fence checks. Failed return discards owned
+JSON/numeric responses. Borrowed invocations use a non-fan-out executor so task
+pipelines cannot migrate CPU work off the admitted worker. Native and Nix/glibc
+Linux focused host tests pass; the earlier full native API gate passed 87 tests
+before the executor addition. The [parent phase receipt](qualification/workload-pooling/receipts/2026-10-07/local-inference-parent-phase/README.md)
+records the evidence. The final combined native API gate also passes all 50
+steps and 87 tests, with no skips/failures/leaks and exit 0, after a verified
+interrupted run and unchanged-source rerun. Source hashes match the completed
+gate. This ABI v29 gate does not qualify the separate worker-protocol candidate. At this historical ABI v29 source, subprocess
+borrowed calls required protocol handoff and failed before transfer; the ABI v30
+worker delivery below provides that handoff.
+Independent broker admission, fused waiting, broader backend teams and full
+production/default qualification remain required; defaults are disabled.
+
 ### Worker CPU budget handoff (2026-10-07, focused gates passed)
 
 Provider ABI v30/private worker protocol v6 now carry CPU demand while the
@@ -1188,13 +1207,33 @@ worker validates demand before payload preparation and installs its own native
 scope and non-fan-out executor. Conflicting/out-of-range demand and worker
 relays fail closed. All seven focused host/wire tests pass on native macOS and
 Nix/glibc Linux; [worker budget receipts](qualification/workload-pooling/receipts/2026-10-07/worker-cpu-budget-handoff/README.md)
-pin source and output. Actual subprocess and production dispatcher/archive
-qualification are still pending, along with whole API/default overload gates.
+pin source and output. Production archive and real subprocess probes now pass
+on both platforms, as recorded below. Whole API/default overload gates remain required.
 The separate local-parent ABI v29 gate does not qualify these worker bytes.
+
+### Production worker handoff (2026-10-07, native and GNU probes passed)
+
+The complete production inference archive and exported C probe pass all 23
+native build steps. The probe covers provider-tail rejection, demand validation,
+delegated scope, borrowed restoration and authority failure. A second 23-step
+gate re-execs an actual private worker through the production process ABI:
+CPU demand travels over real RPC, invalid demand is rejected by the child,
+parent ownership is restored and reaping clears resource-owner references.
+[Native production receipts](qualification/workload-pooling/receipts/2026-10-07/production-worker-native/README.md)
+pin source, commands and logs. These malformed-provider probes verify plumbing,
+not model team peaks or overload fairness. Corresponding Nix/glibc production
+gates also pass all 23 steps; ABI v30 full API and combined startup/default gates
+remain required. Defaults are still disabled.
+
+The ABI30 production archive and subprocess probes now pass on both native macOS and pinned Nix/glibc aarch64-linux-gnu. The GNU run validates all seven recorded source hashes and retains its exit-0 result and full log beside the native production-worker receipts. Numerical model execution and combined overload/default qualification remain pending.
 
 ### Owning-thread inference checkpoints (2026-10-07, focused gates passed)
 
 Borrowed local provider phases now lend their scheduler checkpoint to the owning OS worker through a synchronous TLS scope. Existing inference execution checks can yield/check original parent authority; watchdogs and parallel children do not receive the borrowed callback. Nested scopes restore in stack order, and callbacks are removed before returning the grant. All eight focused host/wire contracts pass on macOS and pinned Nix/glibc Linux; [receipts](qualification/workload-pooling/receipts/2026-10-07/inference-owning-checkpoints/README.md) retain hashes, commands, full logs and the initial mountpoint failure. These focused contracts do not qualify model numerical work, subprocess physical scheduling, other resource waits or automatic defaults. Full API and production qualification must use these newer source bytes.
+
+Inference HTTP response ownership follow-up: the consumer now installs the host response destructor before its post-dispatch original deadline/cancellation check. A rejected publication therefore retires the host-owned response rather than leaking it. Missing-response errors retain the cancellation/deadline precedence. Formatting and diff checks pass; combined integration/production qualification of these newer consumer bytes is pending.
+
+The native `antfly-inference-response-cleanup-test` gate now passes the post-dispatch cancellation regression with exit 0 and no leaks. The real host handler allocates a response and then cancels the original invocation; the production consumer rejects publication and retires that response and its lifetime guard. [Receipts](qualification/workload-pooling/receipts/2026-10-07/inference-http-response-cleanup/README.md) pin five source hashes and complete output. Linux and consolidation with newer inference wait scopes remain pending.
 
 ### Inference model-lock waits (2026-10-07, focused contracts passed)
 
@@ -1211,3 +1250,7 @@ An independently admitted child scope can run checkpoints and resource waits whi
 ### Broker result publication ownership (native focused gate passed)
 
 Owned result slots now dispose allocated values exactly once when final member or admission fences reject publication. Original request cancellation also fences completed physical waves, while late I/O executor cancellation retains joined caller cleanup. All 23 native broker/adapter tests pass; [receipt](qualification/workload-pooling/receipts/2026-10-07/broker-result-ownership/README.md) preserves the initial expectation failure and final passing output. Production owning producers were converted but are not compiled by this focused gate; production/numerical and GNU qualification remain required.
+
+Provider context adapter follow-up (native integration passed): dense text/parts and raster embedding, text/document reranking, and both text and binary chunking now pass the complete RequestContext into the inference ABI. Controls-only public helpers retain their signatures and delegate to shared context implementations. A model-free integration regression covers seven affected calls, requiring a denied parent checkpoint to stop before any transfer or model work and checking that provider lifetime borrowers are released. This does not yet qualify numerical model execution, other provider contexts, or default enablement.
+
+The [provider context receipt](qualification/workload-pooling/receipts/2026-10-07/provider-context-propagation/README.md) records all 69 passing native steps and the seven-adapter regression, with no skips, failures or allocator leaks. Linux and combined-source qualification remain pending.

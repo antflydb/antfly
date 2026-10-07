@@ -3847,6 +3847,48 @@ test "runnable execution local provider checkpoints stay on the owning worker" {
     try inference.execution_control.testSynchronousCheckpoint();
 }
 
+/// Exercise a consumer's post-dispatch cancellation fence with a real host
+/// response allocated by the test allocator. A missed destructor leaks here.
+pub fn testCanceledHttpResponseConsumer(invoke: *const fn (*anyopaque, http_abi.CancellationView) anyerror!void) !void {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Handler = struct {
+        canceled: bool = false,
+        calls: usize = 0,
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(self.canceled);
+        }
+        fn run(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            self.calls += 1;
+            var response = try httpx.Response.fromText(ctx.allocator, 200, "owned response");
+            errdefer response.deinit();
+            self.canceled = true;
+            return response;
+        }
+    };
+    var handler = Handler{};
+    var state = LinkedInferenceState{
+        .alloc = alloc,
+        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&io).receive(),
+        .io = io,
+        .node = undefined, // Manifest and handler are supplied; no model runs.
+        .warm_models = undefined,
+        .content_security = null,
+        .s3_credentials = null,
+        .runtime_config = undefined,
+        .owned_models_dir = null,
+        .owned_ml_dir = null,
+        .route_validator = undefined,
+        .route_manifest_ready = true,
+    };
+    defer state.route_manifest.deinit(alloc);
+    var route = RouteState{ .owner = &state, .handler = httpx.Handler.bind(&handler, Handler.run), .path = "/ai/v1/generate" };
+    try state.route_manifest.append(alloc, .{ .route_handle = &route, .method = .post, .path = .init(route.path), .request_body = .buffered, .streaming_response = 0 });
+    try std.testing.expectError(error.Canceled, invoke(&state, .{ .context = &handler, .is_cancelled = Handler.requested }));
+    try std.testing.expectEqual(@as(usize, 1), handler.calls);
+}
+
 test "runnable execution local provider parks model locks and fails closed on rejected resume" {
     try inference.execution_control.testSynchronousResourceWait();
     const Parent = struct {

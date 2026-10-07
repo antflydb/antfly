@@ -4640,6 +4640,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = &.{
             "standalone runtime module compiles",
+            "standalone inference response cancellation",
+
+            "runnable execution context adapters",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",
@@ -4736,6 +4739,24 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         // Linux retains the measured aggregate default.
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 18 else 7) * 1024 * 1024 * 1024,
     });
+    const inference_response_cleanup_tests = b.addTest(.{
+        .name = "inference-response-cleanup-tests",
+        .root_module = lib_standalone_runtime_test_mod,
+        .filters = &.{"standalone inference response cancellation"},
+        .max_rss = 20 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-inference-response-cleanup-test", "Verify post-dispatch cancellation retires host response ownership")
+        .dependOn(&addFilteredTestRunArtifact(b, inference_response_cleanup_tests).step);
+
+    const provider_context_filters = [_][]const u8{"runnable execution context adapters"};
+    const provider_context_tests = b.addTest(.{
+        .name = "inference-provider-context-tests",
+        .root_module = lib_standalone_runtime_test_mod,
+        .filters = &provider_context_filters,
+        .max_rss = 20 * 1024 * 1024 * 1024,
+    });
+    const provider_context_step = b.step("antfly-inference-provider-context-test", "Run full request context propagation through provider adapters");
+    provider_context_step.dependOn(&addFilteredTestRunArtifact(b, provider_context_tests).step);
     const lib_standalone_runtime_test_step = b.step("antfly-standalone-runtime-test", "Run focused standalone runtime tests");
     const run_lib_standalone_runtime_tests = addFilteredTestRunArtifact(b, lib_standalone_runtime_tests);
     lib_standalone_runtime_test_step.dependOn(&run_lib_standalone_runtime_tests.step);

@@ -14616,3 +14616,80 @@ test "system catalog offline migration publishes rows and fences server startup"
     try std.testing.expectEqual(.vector_store, reopened.findTableByNameLocked("docs").?.storage.dense_embeddings);
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "preserved") != null);
 }
+
+test "standalone inference response cancellation retires host ownership" {
+    const Consumer = struct {
+        fn invoke(handle: *anyopaque, cancellation: runtime_http_abi.CancellationView) !void {
+            var lifetime = EmbeddedInferenceProviderLifetime{ .handle = handle };
+            defer std.debug.assert(lifetime.activeCallCount() == 0);
+            const response = try inference_provider.invokeEmbeddedInferenceRoute(&lifetime, std.testing.allocator, .post, "generate", "{}", 0, cancellation, .{});
+            defer std.testing.allocator.free(response.body);
+        }
+    };
+    try inference_host.testCanceledHttpResponseConsumer(Consumer.invoke);
+}
+
+test "runnable execution context adapters preserve parent authority" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var handle: ?*anyopaque = null;
+    const create = inference_bridge.CreateContext{
+        .abi_version = inference_bridge.abi_version,
+        .data_dir_ptr = ".".ptr,
+        .data_dir_len = 1,
+        .models_dir = .init("."),
+        .ml_dir = .init("."),
+        .host_limit_bytes = 0,
+        .backend_limit_bytes = 0,
+        .combined_limit_bytes = 0,
+        .kv_limit_bytes = 0,
+        .scratch_limit_bytes = 0,
+        .process_memory_limit_bytes = std.math.maxInt(usize),
+        .preload_ptr = null,
+        .preload_len = 0,
+        .keep_alive = .{},
+        .max_loaded_models = 0,
+        .has_max_loaded_models = 0,
+        .content_security_json = .{},
+        .s3_credentials_json = .{},
+        .runtime_config_json = .init("{\"embedded_enabled\":false}"),
+        .executor = .init(&io),
+        .out_handle = &handle,
+    };
+    handle = try inference_host.linkedInferenceCreate(&create);
+    defer inference_host.linkedInferenceDestroy(handle.?);
+    var lifetime = EmbeddedInferenceProviderLifetime{ .handle = handle.? };
+    const Parent = struct {
+        checks: usize = 0,
+        fn check(raw: *anyopaque) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return @import("antfly_runtime_abi").error_abi.statusFromError(error.Forbidden);
+        }
+        fn park(_: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
+            @panic("denied parent must not park");
+        }
+        fn enter(_: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
+            @panic("denied parent must not transfer");
+        }
+    };
+    var parent = Parent{};
+    const context = antfly.inference.RequestContext{
+        .io = io,
+        .deadline_ns = null,
+        .runnable = .{ .context = &parent, .cpu_slots = 1, .parent_class = @backingInt(inference_bridge.runnable_abi.Class.query), .checkpoint = Parent.check, .park = Parent.park, .enter = Parent.enter },
+    };
+    const embedding = antfly.inference.managed_embedder.EmbeddingRequestContext{ .request = context };
+    const parts = [_]antfly.template.ContentPart{.{ .binary = .{ .mime_type = "image/png", .data = &.{1} } }};
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDenseTextsWithContext(&lifetime, alloc, "unused", &.{"text"}, embedding));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDensePartsWithContext(&lifetime, alloc, "unused", &parts, embedding));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderRerankTextsWithContext(&lifetime, alloc, "unused", "query", &.{"text"}, context));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderRerankDocumentsWithContext(&lifetime, alloc, "unused", "query", &.{&parts}, context));
+    const config = chunking_types.Config{ .provider = .antfly };
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderChunkInputWithContext(&lifetime, alloc, "unused", .{ .text = "text" }, config, context));
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderChunkInputWithContext(&lifetime, alloc, "unused", .{ .binary = .{ .mime_type = "audio/wav", .data = &.{1} } }, config, context));
+    const rasters = [_]antfly.readers.RasterImage{.{ .bytes = &.{ 0, 0, 0, 255 }, .width = 1, .height = 1, .stride_bytes = 4 }};
+    try std.testing.expectError(error.Forbidden, inference_provider.inferenceProviderEmbedDenseRasters(&lifetime, alloc, "unused", &rasters, embedding));
+    try std.testing.expectEqual(@as(usize, 7), parent.checks);
+    try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
+}
