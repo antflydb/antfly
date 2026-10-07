@@ -1179,3 +1179,21 @@ current embedded calls retain the SQL grant and nested admission could deadlock.
 Worker-process transfer, other backend teams, complete memory accounting and
 full production/default qualification are still required. The adapter is not
 installed by production yet.
+
+### Local inference parent phase (2026-10-07, final native API gate passed)
+
+SQL decision calls now propagate a checked borrowed execution descriptor through
+RequestContext and provider bridge ABI v29. The local host transfers the same
+operation to inference, installs its native CPU scope, and restores the parent
+through original deadline and read-fence checks. Failed return discards owned
+JSON/numeric responses. Borrowed invocations use a non-fan-out executor so task
+pipelines cannot migrate CPU work off the admitted worker. Native and Nix/glibc
+Linux focused host tests pass; the earlier full native API gate passed 87 tests
+before the executor addition. The [parent phase receipt](qualification/workload-pooling/receipts/2026-10-07/local-inference-parent-phase/README.md)
+records the evidence. The final combined native API gate also passes all 50
+steps and 87 tests, with no skips/failures/leaks and exit 0, after a verified
+interrupted run and unchanged-source rerun. Source hashes match the completed
+gate. This ABI v29 gate does not qualify the separate worker-protocol candidate. Subprocess
+borrowed calls require protocol handoff and currently fail before transfer.
+Independent broker admission, fused waiting, broader backend teams and full
+production/default qualification remain required; defaults are disabled.

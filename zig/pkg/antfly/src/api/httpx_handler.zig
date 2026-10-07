@@ -13570,6 +13570,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             const write_runtime = (try serial_write_adapter.decisionRuntime()).?;
             try std.testing.expect(!write_runtime.parallel_work);
             try std.testing.expect(write_runtime.parent_execution == null);
+            try std.testing.expect(write_runtime.context.?.runnable == null);
             var provider_execution: http_server_mod.RunnableScheduler.Execution = .{};
             defer provider_execution.finish();
             try server.startSqlRunnable(&provider_execution, .{ .io = server.embedding_provider_runtime.io }, .query);
@@ -13579,10 +13580,17 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try std.testing.expect(!read_runtime.parallel_work);
             try std.testing.expect(read_runtime.parent_execution.?.ptr == @as(*anyopaque, @ptrCast(&serial_write_adapter)));
             try read_runtime.provider().checkpoint();
+            const provider_borrow = read_runtime.context.?.runnable.?;
+            try provider_borrow.validate();
+            var provider_transfer = try @import("antfly_runtime_abi").runnable_abi.Transfer.init(provider_borrow, .inference);
+            try std.testing.expectEqual(http_server_mod.RunnableScheduler.Class.inference, provider_execution.entry.?.class);
+            try provider_transfer.returnToParent();
+            try std.testing.expectEqual(http_server_mod.RunnableScheduler.Class.query, provider_execution.entry.?.class);
             serial_write_adapter.runnable = null;
             const unscheduled_runtime = (try serial_write_adapter.decisionRuntime()).?;
             try std.testing.expect(unscheduled_runtime.parallel_work);
             try std.testing.expect(unscheduled_runtime.parent_execution == null);
+            try std.testing.expect(unscheduled_runtime.context.?.runnable == null);
         }
         try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
         try @import("sql_pgwire_socket_test.zig").qualify(&server, &storage_manager);

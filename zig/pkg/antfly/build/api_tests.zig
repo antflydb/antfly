@@ -66,6 +66,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
+    const inference_phase_filters = [_][]const u8{"runnable execution local provider"};
+    const inference_phase_tests = b.addTest(.{
+        .name = "inference-parent-phase-tests",
+        .root_module = antfly_imports.inference_host,
+        .filters = &inference_phase_filters,
+        .max_rss = 4 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-inference-parent-phase-test", "Run local provider grant transfer and owned-result cleanup contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, inference_phase_tests, &inference_phase_filters).step);
     const pooling_filters = [_][]const u8{
         "bounded admission",
         "runnable scheduler",
