@@ -92,6 +92,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "httpx SQL connection routes",
         "httpx SQL durable session settings",
         "SQL pgwire credential snapshot",
+        "SQL read resume fences",
+        "read fence validates each",
+        "read fence owns bounded",
+        "read fence invalidates",
     };
     const pooling_tests = b.addTest(.{
         .name = "default-workload-pooling-tests",
@@ -106,7 +110,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-workload-pooling-test", "Run bounded waiting and shared HTTP/SQL admission contracts")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, pooling_tests, &pooling_filters).step);
 
-    const read_authority_filters = [_][]const u8{"SQL pgwire credential snapshot"};
+    const read_authority_filters = [_][]const u8{ "SQL pgwire credential snapshot", "SQL read resume fences", "read fence validates each", "read fence owns bounded", "read fence invalidates" };
     const read_authority_tests = b.addTest(.{
         .name = "sql-read-authority-tests",
         .root_module = options.api_http_runtime_test_mod,

@@ -279,6 +279,7 @@ pub const ApiKeyRecord = struct {
 };
 
 pub const ValidatedApiKey = struct {
+    user_instance_id: [16]u8,
     username: []u8,
     permissions: []Permission,
     row_filter: []RowFilterEntry,
@@ -1419,6 +1420,7 @@ pub const UserManager = struct {
         }
 
         return .{
+            .user_instance_id = self.user_instances.get(record.key.username) orelse return error.UserNotFound,
             .username = try self.alloc.dupe(u8, record.key.username),
             .permissions = effective_permissions,
             .row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter),
@@ -1487,6 +1489,7 @@ pub const UserManager = struct {
         errdefer self.alloc.free(metadata);
         const owned_username = try self.alloc.dupe(u8, username);
         return .{ .instance_id = instance_id, .policy = .{
+            .user_instance_id = instance_id,
             .username = owned_username,
             .permissions = permissions,
             .row_filter = filters,
@@ -2361,6 +2364,7 @@ test "usermgr api keys validate and persist creator-scoped permissions" {
 
     var validated = try manager.validateApiKey(created.key.key_id, created.key_secret);
     defer validated.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, validated.user_instance_id);
     try std.testing.expectEqualStrings("alice", validated.username);
     try std.testing.expectEqualStrings("{}", validated.metadata_json);
     try std.testing.expectEqual(@as(usize, 1), validated.permissions.len);

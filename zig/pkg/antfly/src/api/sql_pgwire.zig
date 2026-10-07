@@ -410,6 +410,8 @@ const OwnedRead = struct {
         self.authority.request.session_id = self.session_id;
         try server.startSqlRunnable(&self.runnable, admissionOptions(self.authority.request), .query);
         self.native_adapter = .{ .runnable = if (self.runnable.entry != null) &self.runnable else null, .server = server, .identity = &self.identity, .context = try self.authority.context(), .database = self.authority.request.database.?, .namespace = self.authority.request.namespace.?, .session_id = self.session_id, .setting_overlay = self.authority.request.setting_overlay, .setting_overlay_source = .connection, .expected_setting_epoch = self.authority.request.setting_epoch };
+        if (self.native_adapter.runnable != null) try self.native_adapter.beginReadFence();
+        errdefer self.native_adapter.endReadFence();
         var transaction_lease: ?@import("transactions.zig").SessionRegistry.CommitExecution = null;
         defer if (transaction_lease) |lease| lease.release();
         if (self.session_id) |id_hex| {
@@ -435,6 +437,7 @@ const OwnedRead = struct {
         // prepared epoch on that same snapshot before binding or reading rows.
         const opened = try Pull.Stream.open(alloc, stream_backend, plan.compiled(), parameters, .{ .result_rows = request.limit, .page_rows = 256 });
         if (opened == null) {
+            self.native_adapter.endReadFence();
             self.runnable.finish();
             self.identity.?.deinit(server.alloc);
             self.arena.deinit();
@@ -554,6 +557,7 @@ const OwnedRead = struct {
 
     fn validateCurrentPolicies(self: *OwnedRead, alloc: std.mem.Allocator) !void {
         try self.authority.request.check();
+        try self.native_adapter.validateReadFence(true);
         var fresh = try self.authority.credential.identity(alloc);
         defer fresh.deinit(alloc);
         try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
@@ -590,6 +594,7 @@ const OwnedRead = struct {
         if (self.detached) return;
         self.detached = true;
         self.stream.close();
+        self.native_adapter.endReadFence();
         self.plan.release(self.adapter.server.sqlPlanCacheIo());
         self.runnable.finish();
         self.admission.release();
@@ -1397,6 +1402,16 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
         try OwnedRead.validatePolicies(alloc, &restored, projected, &retained_policies);
         restored.user_instance_id = @splat(0);
         try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(alloc, &restored, projected, &retained_policies));
+        try manager.setRowFilter("alice", "*", "{\"term\":{\"tenant\":\"wildcard\"}}");
+        try manager.setRowFilter("alice", "docs", "null");
+        var override = try credential.identity(alloc);
+        defer override.deinit(alloc);
+        try std.testing.expect(http.effectiveRowFilterJson(override, "docs") == null);
+        try http.projectCatalogIdentity(alloc, &override, "docs", "private-table-17");
+        try std.testing.expect(http.effectiveRowFilterJson(override, "private-table-17") == null);
+        try OwnedRead.validatePolicies(alloc, &override, projected, &retained_policies);
+        try manager.removeRowFilter("alice", "*");
+        try manager.removeRowFilter("alice", "docs");
     }
     const NativeCursor = struct {
         pages: usize = 0,

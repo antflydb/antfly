@@ -102,6 +102,36 @@ locks or remote-owner failures. New storage work required during COMMIT can stil
 fail under its own downstream ceiling; do not turn that failure into a claim of
 replay-safe mutation rejection.
 
+## Runnable execution and resumed reads
+
+The opt-in runnable scheduler is separate from coarse operation admission. A
+scheduled SQL read retains its operation, snapshot, output and memory owners
+while it gives up a runnable slot during cooperative yields, private positional
+spill I/O and retained PG output waits. Slot reacquisition preserves the original
+statement deadline. Mutation execution remains outside this integration; accepted
+durable work keeps its existing completion owner.
+
+Scheduled HTTP SELECT/EXPLAIN and retained PG SELECT streams keep at most 64
+owned table authority pins. Before continuing after a new runnable grant, and
+before handing off results, they validate catalog identity/schema/revision,
+native serving policy generation, and current managed user/API-key permission
+and effective row-filter scope. Current authority cannot broaden the admitted
+query. Protected policies also retain the admitted role/metadata interpretation.
+A pending installation can retain the previous serving generation; a serving
+transition or changed generation stops the read. Failed validation releases
+through the original operation owners and never becomes a successful cached
+check. [Qualification evidence](receipts/2026-10-07/read-resume-fences/README.md)
+records the covered schedules and platform results.
+
+Private spill reads/writes currently release runnable capacity. General storage,
+RPC and directory waits still need suspension boundaries. Authority validation
+itself performs catalog I/O: extending these boundaries must avoid recursively
+validating a guard already in validation, and must reacquire execution capacity
+before parsing or consuming returned data. Preparation, serialization, parallel
+CPU children, externally issued credential refresh, non-SQL workloads and remote
+attempt completion still need their own owners and qualification. These read
+fences do not qualify automatic defaults or the full scheduler design.
+
 ## Default release gates
 
 Automatic query waiting/sizing remains unqualified until all of these have

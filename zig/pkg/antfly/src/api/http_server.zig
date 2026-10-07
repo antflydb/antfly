@@ -7846,6 +7846,7 @@ pub const ApiHttpServer = struct {
             defer alloc.free(credential_principal);
             var identity = try cloneAuthenticatedIdentity(alloc, validated.username, credential_principal, validated.permissions, validated.row_filter, validated.metadata_json, validated.roles);
             identity.live_user_manager = manager;
+            identity.user_instance_id = validated.user_instance_id;
             return identity;
         }
 
@@ -56065,7 +56066,14 @@ pub fn projectCatalogIdentity(alloc: std.mem.Allocator, identity: *Authenticated
         identity.permissions = try alloc.realloc(identity.permissions, identity.permissions.len + 1);
         identity.permissions[identity.permissions.len - 1] = permission;
     }
-    if (effectiveRowFilterJson(identity.*, logical)) |raw| {
+    const selected = effectiveRowFilterJson(identity.*, logical);
+    const matches_policy = for (identity.row_filter) |entry| {
+        if (system_catalog.tableResourceMatches(entry.table, logical)) break true;
+    } else false;
+    // An explicit null override must survive projection, otherwise a wildcard
+    // filter starts matching the private name and changes the admitted query.
+    const projected: ?[]const u8 = if (selected) |raw| raw else if (matches_policy) "null" else null;
+    if (projected) |raw| {
         var filter = try usermgr.RowFilterEntry.initOwned(alloc, physical, raw);
         errdefer filter.deinit(alloc);
         identity.row_filter = try alloc.realloc(identity.row_filter, identity.row_filter.len + 1);

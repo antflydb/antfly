@@ -24,6 +24,7 @@ const helpers = @import("http_route_helpers.zig");
 const wire = @import("antfly_metadata_openapi").types;
 const db_types = @import("antfly_local_sources").storage_db_types;
 const setting_catalog = @import("antfly_local_sources").sql_setting_catalog;
+const read_fence = @import("antfly_local_sources").sql_read_fence;
 
 const SettingOverlaySource = enum { durable_session, connection };
 
@@ -113,6 +114,7 @@ pub const Adapter = struct {
     identity: *?http_server.AuthenticatedIdentity,
     context: operation.RequestContext,
     runnable: ?*http_server.RunnableScheduler.Execution = null,
+    read_guard: ?read_fence.Guard = null,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
     decision_provider: ?@import("antfly_local_sources").functions_decisions.DecisionProvider = null,
@@ -169,6 +171,8 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend) !@import("antfly_local_sources").sql_runtime.Result {
+        if (self.runnable != null and (compiled.statement == .select or compiled.statement == .explain)) try self.beginReadFence();
+        defer self.endReadFence();
         const state_alloc = if (@import("sql_control.zig").isControl(compiled.statement)) self.server.controlAllocator() else self.server.alloc;
         var zig017_return_error: ?anyerror = null;
         var decision_runtime: ?@import("antfly_local_sources").functions_runtime.Runtime = null;
@@ -509,15 +513,144 @@ pub const Adapter = struct {
                     },
                 };
             }
+            self.validateReadFence(true) catch |err| {
+                zig017_return_error = err;
+                return err;
+            };
             return result;
         }
         var statement_backend = guarded_backend orelse self.backend();
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
-        return @import("antfly_local_sources").sql_runtime.execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
+        var result = @import("antfly_local_sources").sql_runtime.execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;
         };
+        errdefer result.deinit();
+        self.validateReadFence(true) catch |err| {
+            zig017_return_error = err;
+            return err;
+        };
+        return result;
+    }
+
+    pub fn beginReadFence(self: *Adapter) !void {
+        if (self.read_guard != null) return error.InvalidReadFenceTransition;
+        self.read_guard = read_fence.Guard.init(self.server.alloc);
+    }
+
+    pub fn endReadFence(self: *Adapter) void {
+        if (self.read_guard) |*guard| guard.deinit();
+        self.read_guard = null;
+    }
+
+    pub fn validateReadFence(self: *Adapter, force: bool) !void {
+        const guard = if (self.read_guard) |*value| value else return;
+        const execution = self.runnable orelse return error.InvalidReadFenceTransition;
+        const entry = if (execution.entry) |*value| value else return error.InvalidReadFenceTransition;
+        const scratch = if (entry.class == .control) self.server.controlAllocator() else self.server.alloc;
+        try guard.check(scratch, execution.resume_generation, force, .{ .ptr = self, .check = validateReadPins });
+        try self.context.ensureActive();
+    }
+
+    fn captureReadFence(self: *Adapter, table: catalog.Table) !void {
+        const guard = if (self.read_guard) |*value| value else return;
+        const scope = table.scope orelse return error.InvalidSqlBackendResponse;
+        const filter = try http_server.resolveEffectiveRowFilterJson(guard.alloc, self.identity.*, table.physical_name);
+        defer if (filter) |value| guard.alloc.free(value);
+        const policy = try self.readPolicyGeneration(guard.alloc, table.id, table.schema_version);
+        try guard.capture(.{ .database = scope.database, .namespace = scope.namespace, .name = scope.name, .physical = table.physical_name, .id = table.id, .schema_version = table.schema_version, .catalog_revision = scope.revision, .filter = filter, .row_policy = policy });
+        try self.validateReadFence(false);
+    }
+
+    fn readPolicyGeneration(self: *Adapter, alloc: std.mem.Allocator, table_id: u64, schema_version: u32) !?read_fence.Table.Policy {
+        var context = self.context;
+        context.row_policy_install_authority = true;
+        const bytes = try self.server.source.systemCatalog(alloc, context, .{ .policy_publication_status = table_id });
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(?@import("antfly_local_sources").system_catalog_policies.PublicationStamp, alloc, bytes, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const publication = parsed.value orelse return null;
+        if (publication.table_id != table_id or publication.schema_version != schema_version) return error.RowPolicyCatalogChanged;
+        const serving = (try publication.servingAuthority()) orelse return null;
+        return .{ .generation = serving.generation, .catalog_epoch = serving.catalog_epoch };
+    }
+
+    fn validateReadPins(raw: *anyopaque, alloc: std.mem.Allocator, tables: []const read_fence.Table) !void {
+        const self: *Adapter = @ptrCast(@alignCast(raw));
+        try self.context.ensureActive();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const targets = try scratch.alloc(system_catalog.Target, tables.len);
+        const revision = tables[0].catalog_revision;
+        for (tables, targets) |table, *target| {
+            if (table.catalog_revision != revision) return error.CatalogGenerationChanged;
+            target.* = .{ .database = table.database, .namespace = table.namespace, .table = table.name };
+        }
+        const bytes = try self.server.source.systemCatalog(scratch, self.context, .{ .resolve_many = .{ .targets = targets, .include_query_definitions = true, .expected_revision = revision } });
+        const current = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, scratch, bytes, .{});
+        if (current.revision != revision or current.tables.len != tables.len) return error.CatalogGenerationChanged;
+        for (tables, current.tables) |pinned, resolved| {
+            const table = resolved orelse return error.CatalogGenerationChanged;
+            if (table.table_id != pinned.id or !std.mem.eql(u8, table.name, pinned.physical)) return error.CatalogGenerationChanged;
+            const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
+            if (definition.table_id != pinned.id) return error.CatalogGenerationChanged;
+            const binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), scratch, definition.schema_json, table.table_id, table.name);
+            if (binding.schema_version != pinned.schema_version) return error.CatalogGenerationChanged;
+            const policy = try self.readPolicyGeneration(scratch, pinned.id, pinned.schema_version);
+            if (!std.meta.eql(policy, pinned.row_policy)) return error.RowPolicyCatalogChanged;
+        }
+        // Catalog I/O may itself wait. Capture current user/key policy after
+        // that lookup so the policy preceding the wait cannot authorize it.
+        if (self.identity.*) |admitted| {
+            var fresh: http_server.AuthenticatedIdentity = undefined;
+            if (admitted.live_user_manager) |manager| {
+                if (!admitted.is_internal_service) {
+                    var snapshot = manager.snapshotCredentialPolicies(admitted.credential_principal) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.Forbidden,
+                    };
+                    defer snapshot.deinit(manager.alloc);
+                    if (!std.mem.eql(u8, admitted.username, snapshot.policy.username)) return error.Forbidden;
+                    if (admitted.user_instance_id) |instance| if (!std.mem.eql(u8, &instance, &snapshot.instance_id)) return error.Forbidden;
+                    // Native row-policy proofs can use roles and metadata
+                    // even when no user row filter exists. An already opened
+                    // cursor cannot reinterpret buffered rows with new values.
+                    const protected = for (tables) |table| {
+                        if (table.row_policy != null) break true;
+                    } else false;
+                    if (protected) {
+                        if (!std.mem.eql(u8, admitted.metadata_json, snapshot.policy.metadata_json) or
+                            admitted.roles.len != snapshot.policy.roles.len) return error.Forbidden;
+                        for (admitted.roles, snapshot.policy.roles) |old, current_role| {
+                            if (!std.mem.eql(u8, old, current_role)) return error.Forbidden;
+                        }
+                    }
+                    fresh = (try http_server.cloneCatalogIdentity(scratch, .{
+                        .user_instance_id = snapshot.instance_id,
+                        .username = snapshot.policy.username,
+                        .credential_principal = admitted.credential_principal,
+                        .permissions = snapshot.policy.permissions,
+                        .row_filter = snapshot.policy.row_filter,
+                        .metadata_json = snapshot.policy.metadata_json,
+                        .roles = snapshot.policy.roles,
+                        .live_user_manager = manager,
+                    })).?;
+                } else fresh = (try http_server.cloneCatalogIdentity(scratch, admitted)).?;
+            } else fresh = (try http_server.cloneCatalogIdentity(scratch, admitted)).?;
+            defer fresh.deinit(scratch);
+            for (tables, targets) |pinned, target| {
+                const logical = try target.resourceNameAlloc(scratch);
+                if (!http_server.permissionsAllow(admitted.permissions, .table, logical, .read) or
+                    !http_server.permissionsAllow(fresh.permissions, .table, logical, .read)) return error.Forbidden;
+                try http_server.projectCatalogIdentity(scratch, &fresh, logical, pinned.physical);
+                const filter = try http_server.resolveEffectiveRowFilterJson(scratch, fresh, pinned.physical);
+                if ((filter == null) != (pinned.filter == null) or
+                    (filter != null and !std.mem.eql(u8, filter.?, pinned.filter.?))) return error.Forbidden;
+            }
+        }
+        try self.context.ensureActive();
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
@@ -595,12 +728,14 @@ pub const Adapter = struct {
         const class = if (execution.entry) |*entry| entry.class else return error.InvalidRunnableTransition;
         try execution.enter(class);
         try self.context.ensureActive();
+        try self.validateReadFence(false);
     }
 
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
         try self.context.ensureActive();
         if (self.runnable) |execution| try execution.checkpoint();
+        try self.validateReadFence(false);
     }
 
     fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
@@ -646,6 +781,7 @@ pub const Adapter = struct {
             }
         }
         if (self.identity.*) |*identity| try http_server.projectCatalogIdentity(self.server.alloc, identity, logical, table.name);
+        if (action == .read) try self.captureReadFence(binding);
         return binding;
     }
 
@@ -669,8 +805,9 @@ pub const Adapter = struct {
         if (self.policy_proofs) |*proofs| if (proofs.get(table.id)) |cached| return cached;
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const identity: ?*const http_server.AuthenticatedIdentity = if (self.identity.*) |*value| value else null;
+        const token_alloc = if (self.policy_proofs != null) self.server.alloc else alloc;
         const signed = try self.server.rowPolicyReadProof(
-            if (self.policy_proofs != null) self.server.alloc else alloc,
+            token_alloc,
             identity,
             self.context,
             table.id,
@@ -678,8 +815,11 @@ pub const Adapter = struct {
             scope.database,
             table.schema_version,
         );
+        errdefer if (signed) |token| token_alloc.free(token);
+        // Publication can change while minting the proof. Reject the new
+        // generation before an existing binding opens a source with it.
+        if (self.read_guard != null) try self.validateReadFence(true);
         if (self.policy_proofs) |*proofs| {
-            errdefer if (signed) |token| self.server.alloc.free(token);
             try proofs.put(self.server.alloc, table.id, signed);
             return signed;
         }
@@ -761,6 +901,7 @@ pub const Adapter = struct {
             try checkpoint(self.adapter);
             var page = try self.view.next(alloc, limit);
             errdefer page.deinit();
+            try checkpoint(self.adapter);
             if (page.rows.len > limit) return error.InvalidSqlBackendResponse;
             const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
             for (page.rows, rows) |row, *out| {
@@ -1403,6 +1544,203 @@ pub fn httpStatus(err: anyerror) u16 {
 pub fn characterPosition(statement: []const u8, byte_offset: usize) ?i64 {
     const count = std.unicode.utf8CountCodepoints(statement[0..@min(byte_offset, statement.len)]) catch return null;
     return @intCast(count + 1);
+}
+
+test "SQL read resume fences validate live policy and catalog before continuing" {
+    const a = std.testing.allocator;
+    const users_api = @import("../usermgr/mod.zig");
+    const casbin = @import("antfly_casbin");
+    const metadata = @import("../metadata/api.zig");
+    const Case = enum { success, filter, permission, roles, roles_without_filter, metadata_without_filter, unprotected_roles_change, unprotected_metadata_change, account, replacement, schema, revision, physical, key_expiry, key_deletion, during_catalog, deadline, policy_enable, policy_generation, policy_disable, policy_pending, policy_transition };
+    const Source = struct {
+        const Stamp = @import("antfly_local_sources").system_catalog_policies.PublicationStamp;
+        const schema_one =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        const schema_two =
+            \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"additionalProperties":false}}}}
+        ;
+        manager: *users_api.UserManager,
+        calls: usize = 0,
+        id: u64 = 7,
+        revision: u64 = 19,
+        physical: []const u8 = "private-7",
+        schema: []const u8 = schema_one,
+        mutate: bool = false,
+        policy: ?Stamp = null,
+
+        fn status(_: *anyopaque) !metadata.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn resolve(raw: *anyopaque, alloc: std.mem.Allocator, context: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (call == .policy_publication_status) {
+                try std.testing.expect(context.row_policy_install_authority);
+                return std.json.Stringify.valueAlloc(alloc, self.policy, .{});
+            }
+            if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
+            self.calls += 1;
+            const request = call.resolve_many;
+            try std.testing.expectEqual(@as(usize, 1), request.targets.len);
+            try std.testing.expect(request.include_query_definitions);
+            if (self.mutate) {
+                self.mutate = false;
+                try self.manager.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"changed-during-catalog\"}}");
+            }
+            const tables = [_]?system_catalog.ResolvedTable{.{ .table_id = self.id, .name = self.physical, .query_definition = .{ .table_id = self.id, .schema_json = self.schema, .read_schema_json = "", .indexes_json = "{}" } }};
+            return std.json.Stringify.valueAlloc(alloc, system_catalog.ResolvedMany{ .revision = self.revision, .tables = &tables }, .{});
+        }
+    };
+    const Clock = struct {
+        fn now() u64 {
+            return value;
+        }
+        var value: u64 = 0;
+    };
+    for (std.enums.values(Case)) |case| {
+        var store = users_api.MemoryStore.init(a);
+        defer store.deinit();
+        var policies = casbin.MemoryAdapter.init(a);
+        defer policies.deinit();
+        var users = try users_api.UserManager.init(a, store.iface(), try users_api.initDefaultEnforcer(a, policies.iface()));
+        defer users.deinit();
+        var read = try users_api.Permission.initOwned(a, .table, "*", .read);
+        defer read.deinit(a);
+        var user = try users.createUserWithMetadata("alice", "secret", &.{read}, "{\"tenant\":\"initial\"}");
+        defer user.deinit(a);
+        try users.addRoleToUser("alice", "role:reader");
+        try users.setRowFilter("alice", "docs", "{\"conjuncts\":[{\"term\":{\"tenant\":{\"$auth\":\"metadata.tenant\"}}},{\"terms\":{\"roles\":{\"$auth\":\"roles\"}}}]}");
+        if (case == .roles_without_filter or case == .metadata_without_filter or case == .unprotected_roles_change or case == .unprotected_metadata_change) try users.setRowFilter("alice", "docs", "null");
+        var key: ?users_api.CreatedApiKey = null;
+        defer if (key) |*value| value.deinit(a);
+        const principal = if (case == .key_expiry or case == .key_deletion) blk: {
+            key = try users.createApiKey("alice", "read", &.{read}, &.{}, null);
+            break :blk try std.fmt.allocPrint(a, "api-key:{s}", .{key.?.key.key_id});
+        } else try a.dupe(u8, "basic:alice");
+        defer a.free(principal);
+        var snapshot = try users.snapshotCredentialPolicies(principal);
+        defer snapshot.deinit(a);
+        var identity = try http_server.cloneCatalogIdentity(a, .{
+            .user_instance_id = snapshot.instance_id,
+            .username = snapshot.policy.username,
+            .credential_principal = principal,
+            .permissions = snapshot.policy.permissions,
+            .row_filter = snapshot.policy.row_filter,
+            .metadata_json = snapshot.policy.metadata_json,
+            .roles = snapshot.policy.roles,
+            .live_user_manager = &users,
+        });
+        defer identity.?.deinit(a);
+        var source: Source = .{ .manager = &users };
+        switch (case) {
+            .policy_generation, .policy_disable, .policy_pending, .policy_transition, .roles_without_filter, .metadata_without_filter => source.policy = .{ .table_id = 7, .schema_version = 1, .generation = 2, .catalog_epoch = 3, .phase = .active },
+            else => {},
+        }
+        var server = http_server.ApiHttpServer.init(a, .{ .auth_enabled = true, .user_manager = &users }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.resolve, .supports_query_definitions = true } }, null, null);
+        defer server.deinit();
+        if (key) |created| {
+            const raw = try std.fmt.allocPrint(a, "{s}:{s}", .{ created.key.key_id, created.key_secret });
+            defer a.free(raw);
+            const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(raw.len));
+            defer a.free(encoded);
+            _ = std.base64.standard.Encoder.encode(encoded, raw);
+            const header = try std.fmt.allocPrint(a, "ApiKey {s}", .{encoded});
+            defer a.free(header);
+            const authenticated = try server.authenticateRequest(.{ .authorization = header });
+            identity.?.deinit(a);
+            identity = authenticated;
+            try std.testing.expectEqual(user.instance_id, identity.?.user_instance_id.?);
+        }
+        var scheduler = try http_server.RunnableScheduler.Scheduler.init(.{ .slots = 2, .max_operations = 3, .max_bytes = 128, .control_bytes = 32, .checkpoint_budget = 1 });
+        defer scheduler.close();
+        var execution: http_server.RunnableScheduler.Execution = .{};
+        defer execution.finish();
+        Clock.value = 0;
+        try execution.start(&scheduler, .{ .io = std.testing.io, .native_now_ns = Clock.now, .deadline_ns = std.time.ns_per_s, .retained_bytes = 17 }, .query);
+        var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{}, .runnable = &execution };
+        try adapter.beginReadFence();
+        defer adapter.endReadFence();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        _ = try Adapter.resolve(&adapter, arena.allocator(), .{ .table = "docs" }, .read);
+        const captured_calls = source.calls;
+        try adapter.validateReadFence(false);
+        try std.testing.expectEqual(captured_calls, source.calls);
+        try Adapter.spillWaitBegin(&adapter);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+        var other: http_server.RunnableScheduler.Execution = .{};
+        defer other.finish();
+        try other.start(&scheduler, .{ .io = std.testing.io }, .query);
+        var control: http_server.RunnableScheduler.Execution = .{};
+        defer control.finish();
+        try control.start(&scheduler, .{ .io = std.testing.io }, .control);
+        try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+        switch (case) {
+            .success => {},
+            .filter => try users.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"changed\"}}"),
+            .permission => try users.removePermissionFromUser("alice", "*", .table),
+            .roles, .roles_without_filter, .unprotected_roles_change => try users.addRoleToUser("alice", "role:added"),
+            .metadata_without_filter, .unprotected_metadata_change => {
+                // Represent a replicated metadata update; this fixture owns
+                // the manager exclusively and retains the old admitted copy.
+                const updated = try a.dupe(u8, "{\"tenant\":\"replicated-update\"}");
+                const metadata_slot = users.user_metadata.getPtr("alice").?;
+                a.free(metadata_slot.*);
+                metadata_slot.* = updated;
+            },
+            .account => {
+                try users.deleteUser("alice");
+                var replacement = try users.createUserWithMetadata("alice", "secret", &.{read}, "{\"tenant\":\"replacement\"}");
+                defer replacement.deinit(a);
+            },
+            .replacement => source.id = 8,
+            .schema => source.schema = Source.schema_two,
+            .revision => source.revision += 1,
+            .physical => source.physical = "renamed-7",
+            .key_expiry => users.api_keys.getPtr(key.?.key.key_id).?.key.expires_at_ns = 0,
+            .key_deletion => try users.deleteApiKey("alice", key.?.key.key_id),
+            .during_catalog => source.mutate = true,
+            .deadline => Clock.value = 2 * std.time.ns_per_s,
+            .policy_enable => source.policy = .{ .table_id = 7, .schema_version = 1, .generation = 2, .catalog_epoch = 3, .phase = .active },
+            .policy_generation => {
+                source.policy.?.generation = 3;
+                source.policy.?.catalog_epoch = 4;
+            },
+            .policy_disable => source.policy.?.phase = .disabled,
+            .policy_pending, .policy_transition => {
+                source.policy.?.generation = 3;
+                source.policy.?.catalog_epoch = 4;
+                source.policy.?.serving_generation = 2;
+                source.policy.?.serving_catalog_epoch = 3;
+                source.policy.?.phase = if (case == .policy_pending) .pending_install else .serving_install;
+            },
+        }
+        other.finish();
+        control.finish();
+        switch (case) {
+            .success, .policy_pending, .unprotected_roles_change, .unprotected_metadata_change => {
+                try Adapter.spillWaitEnd(&adapter);
+                try std.testing.expectEqual(captured_calls + 1, source.calls);
+                try Adapter.checkpoint(&adapter);
+                try std.testing.expectEqual(captured_calls + 2, source.calls);
+                // Output is fenced even when there was no new runnable grant.
+                try users.removePermissionFromUser("alice", "*", .table);
+                try std.testing.expectError(error.Forbidden, adapter.validateReadFence(true));
+            },
+            .replacement, .schema, .revision, .physical => try std.testing.expectError(error.CatalogGenerationChanged, Adapter.spillWaitEnd(&adapter)),
+            .deadline => try std.testing.expectError(error.DeadlineExceeded, Adapter.spillWaitEnd(&adapter)),
+            .policy_enable, .policy_generation, .policy_disable, .policy_transition => try std.testing.expectError(error.RowPolicyCatalogChanged, Adapter.spillWaitEnd(&adapter)),
+            else => try std.testing.expectError(error.Forbidden, Adapter.spillWaitEnd(&adapter)),
+        }
+        try std.testing.expectEqual(@as(?u64, std.time.ns_per_s), execution.entry.?.options.deadline_ns);
+        execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        std.debug.print("read fence case {s}: no runnable or metadata charges\n", .{@tagName(case)});
+    }
 }
 
 test "SQL diagnostics preserve SQLSTATE and Unicode character positions" {

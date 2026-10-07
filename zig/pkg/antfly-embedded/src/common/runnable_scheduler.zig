@@ -429,6 +429,9 @@ pub const Execution = struct {
     entry: ?Entry = null,
     quantum_start_ns: u64 = 0,
     checkpoints: u32 = 0,
+    /// Changes only after a successful grant. Readers use it to invalidate
+    /// authority checks across cooperative yields and resource/output waits.
+    resume_generation: u64 = 0,
 
     pub fn start(self: *Execution, scheduler: ?*Scheduler, options: admission.Options, class: Class) !void {
         std.debug.assert(self.entry == null);
@@ -437,6 +440,7 @@ pub const Execution = struct {
         errdefer self.finish();
         try owner.submit(&self.entry.?);
         try owner.wait(&self.entry.?);
+        self.resume_generation +%= 1;
         self.quantum_start_ns = options.now();
     }
     pub fn checkpoint(self: *Execution) !void {
@@ -449,6 +453,7 @@ pub const Execution = struct {
             e.options.now() -| self.quantum_start_ns < @as(u64, owner.config.quantum_ms) * std.time.ns_per_ms) return;
         try owner.yield(e);
         try owner.wait(e);
+        self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
         self.checkpoints = 0;
     }
@@ -463,6 +468,7 @@ pub const Execution = struct {
         try owner.reclassifyBlocked(e, class);
         try owner.unblock(e);
         try owner.wait(e);
+        self.resume_generation +%= 1;
         self.quantum_start_ns = e.options.now();
         self.checkpoints = 0;
     }
@@ -698,12 +704,16 @@ test "runnable scheduler execution quanta preserve deadline and parked ownership
     var exec: Execution = .{};
     try exec.start(&s, .{ .io = std.testing.io, .native_now_ns = VirtualClock.now, .deadline_ns = 10 * std.time.ns_per_ms, .retained_bytes = 17 }, .query);
     defer exec.finish();
+    try std.testing.expectEqual(@as(u64, 1), exec.resume_generation);
     try exec.checkpoint();
+    try std.testing.expectEqual(@as(u64, 1), exec.resume_generation);
     try std.testing.expectEqual(@as(u64, 0), s.stats().yields);
     VirtualClock.value = 3 * std.time.ns_per_ms;
     try exec.checkpoint();
     try std.testing.expectEqual(@as(u64, 1), s.stats().yields);
+    try std.testing.expectEqual(@as(u64, 2), exec.resume_generation);
     try exec.park(.output_blocked);
+    try std.testing.expectEqual(@as(u64, 2), exec.resume_generation);
     try std.testing.expectEqual(@as(usize, 0), s.stats().runnable_slots);
     try std.testing.expectEqual(@as(u64, 17), s.stats().retained_bytes);
     var other: Execution = .{};
@@ -711,10 +721,12 @@ test "runnable scheduler execution quanta preserve deadline and parked ownership
     defer other.finish();
     // Verified completion drain uses reserved control slots at full foreground.
     try exec.enter(.control);
+    try std.testing.expectEqual(@as(u64, 3), exec.resume_generation);
     try std.testing.expectEqual(@as(usize, 2), s.stats().runnable_slots);
     try std.testing.expectEqual(@as(usize, 1), s.stats().control_slots);
     VirtualClock.value = 11 * std.time.ns_per_ms;
     try std.testing.expectError(error.DeadlineExceeded, exec.checkpoint());
+    try std.testing.expectEqual(@as(u64, 3), exec.resume_generation);
     try std.testing.expectEqual(@as(?u64, 10 * std.time.ns_per_ms), exec.entry.?.options.deadline_ns);
 }
 
@@ -725,6 +737,7 @@ test "runnable scheduler checkpoint work budget and disabled execution" {
     try disabled.park(.resource_blocked);
     try disabled.enter(.query);
     disabled.finish();
+    try std.testing.expectEqual(@as(u64, 0), disabled.resume_generation);
     var s = try Scheduler.init(.{ .slots = 2, .checkpoint_budget = 2, .quantum_ms = 100 });
     var exec: Execution = .{};
     try exec.start(&s, .{ .io = std.testing.io }, .query);
