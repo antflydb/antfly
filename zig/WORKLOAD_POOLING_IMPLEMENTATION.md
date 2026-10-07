@@ -1002,3 +1002,17 @@ records the initial fixture error and corrected source-pinned run. Linux
 API/runtime, production qualification of this write snapshot, and stalled
 accepted mutation schedules remain pending. Broader execution classes and
 automatic defaults remain required for the overall design.
+
+
+The combined preparation/read-index/write API snapshot also passes pinned
+Nix/glibc GNU AArch64 qualification: all 47 build steps and all 75 selected
+contracts, without skips/leaks or a compile memory overrun. This whole API
+harness does not link the production storage archive, so its unchanged 23 GiB
+compiler allowance fits the VM's default budget. Separate storage-linked graphs
+retain the 26 GiB admission constraint. Both exact API artifacts pass again under
+two CPUs and 2 GiB without extra swap or a compiler, with matching ELF/SHA-256,
+required fixture names/counts, zero exits and no skips/leaks. The
+[write receipt](qualification/workload-pooling/receipts/2026-10-07/write-runnable/README.md)
+preserves commands, compiler/image hashes and complete build/runtime logs.
+Complete production qualification of the write snapshot and broader scheduler
+ownership/default rollout remain pending.

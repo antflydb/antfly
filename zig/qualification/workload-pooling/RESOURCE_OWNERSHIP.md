@@ -164,6 +164,7 @@ ordinary writes; their native SQL backend runs serial CPU work and retains
 spill I/O. Write waits currently continue holding runnable capacity. Releasing
 that capacity requires a verified durable completion owner that can finish
 without request cancellation or a new foreground grant. Qualification of this
-write integration passes all 75 selected native API contracts with zero skips
-or leaks. Linux API/runtime, complete production qualification and stalled
-accepted mutation schedules remain pending.
+write integration passes all 75 selected API contracts on native macOS and
+pinned Nix/glibc GNU AArch64 with zero skips or leaks. Both exact Linux artifacts
+also pass under two CPUs and 2 GiB without extra swap. Complete production
+qualification and stalled accepted mutation schedules remain pending.

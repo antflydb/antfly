@@ -32,8 +32,8 @@ and `initial-source-hashes.json` preserve the failed evidence. `source-hashes.js
 pins the corrected implementation. The corrected native API run exits zero:
 all 50 build steps, 36 embedded tests and 39 coordinator tests pass with no skips
 or leaks. `native-api.log.gz` and `native-api.json` preserve complete output,
-command, source hashes and terminal result. Linux API/runtime and complete
-production qualification of this write snapshot remain pending.
+command, source hashes and terminal result. Complete production qualification
+of this write snapshot remains pending.
 
 Linux API qualification is prepared with the existing, SHA-256-verified pinned
 Nix/glibc Zig image. The whole pooling API target does not link the storage
@@ -42,3 +42,20 @@ budget, with no `--maxrss` override. The Docker VM reports 25,159,036,928 bytes
 (23.43 GiB). Storage-linked integration/production graphs retain their distinct
 26 GiB admission constraint. The runtime gate remains a separate two-CPU, 2 GiB
 run without extra swap or a compiler.
+
+Pinned Nix/glibc GNU AArch64 API qualification now passes all 47 build steps
+and the same 36 embedded plus 39 coordinator tests, without skips or leaks,
+against commit `bbbe67c0b0`. It uses the default Zig build memory budget and the
+unchanged 23 GiB API compiler allowance; no compile memory overrun is reported.
+`linux-api.log.gz`, `linux-build.json` and `linux-compiler.json` preserve full
+output, command, zero exit, actual VM capacity and exact compiler/image hashes.
+
+Both exact ELF AArch64 artifacts also pass under two CPUs and 2 GiB without extra
+swap or a compiler. The verifier checks ELF machine 183, matching SHA-256 hashes,
+exact test counts, required mixed-protocol/control/weighted-class fixture names,
+zero artifact exits and no skips/leaks. `linux-artifacts.json`,
+`linux-runtime.json`, `linux-runtime.log.gz` and `linux-runtime-verifier.py`
+preserve that proof. This qualifies the preparation, read-index and ordinary
+write API snapshot together. It does not prove serverless scheduling, production
+CLI compilation of the write changes, stalled accepted mutation handoff,
+inference/background execution owners or automatic defaults.

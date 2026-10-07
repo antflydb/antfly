@@ -202,7 +202,7 @@ serialization ownership and broader execution classes remain separate work;
 this phase does not enable scheduler defaults.
 
 
-## Ordinary SQL write ownership (native API qualified)
+## Ordinary SQL write ownership (native and Linux API qualified)
 
 HTTP and pgwire ordinary SQL execution now acquire the write class after
 preparation and coarse operation admission, before execution setup. HTTP
@@ -235,6 +235,9 @@ grant and zero remaining charges, and remove their probe row before later cases.
 These fixtures do not prove a stalled accepted row-mutation schedule. All 75
 selected native API contracts and 50 build steps pass with no skips or leaks.
 The [write receipt](qualification/workload-pooling/receipts/2026-10-07/write-runnable/README.md)
-preserves the initial fixture failure and corrected complete run. Linux API/runtime
-and complete production qualification of this write slice remain pending;
-automatic defaults remain disabled.
+preserves the initial fixture failure and corrected complete run. GNU AArch64
+also passes all 75 API contracts and 47 build steps with the pinned Nix/glibc
+compiler and default build budget. Both exact artifacts pass again under two
+CPUs and 2 GiB without extra swap, with required counts/names, matching hashes,
+zero exits and no skips/leaks. Complete production qualification of this write
+slice remains pending; automatic defaults remain disabled.
