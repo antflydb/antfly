@@ -31,6 +31,7 @@ const boundary_executor = @import("gliner_boundary_executor.zig");
 const compute = @import("../ops/ops.zig");
 const deberta_mod = @import("../models/deberta.zig");
 const deberta_arch = @import("../architectures/deberta.zig");
+const modern_bert_arch = @import("../architectures/modern_bert.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
@@ -87,6 +88,37 @@ pub const Profile = struct {
     readback_ns: u64 = 0,
 };
 
+/// The span wrapper's classifier head is encoder-independent. The nested
+/// encoder config selects the actual backbone at load time.
+pub const EncoderConfig = union(enum) {
+    deberta: deberta_mod.Config,
+    modern_bert: modern_bert_arch.Config,
+
+    pub fn hiddenSize(self: EncoderConfig) u32 {
+        return switch (self) {
+            inline else => |config| config.hidden_size,
+        };
+    }
+
+    pub fn intermediateSize(self: EncoderConfig) u32 {
+        return switch (self) {
+            inline else => |config| config.intermediate_size,
+        };
+    }
+
+    pub fn attentionHeads(self: EncoderConfig) u32 {
+        return switch (self) {
+            inline else => |config| config.num_attention_heads,
+        };
+    }
+
+    pub fn maxPositionEmbeddings(self: EncoderConfig) u32 {
+        return switch (self) {
+            inline else => |config| config.max_position_embeddings,
+        };
+    }
+};
+
 fn nowNs() u64 {
     return @import("antfly_platform").time.monotonicNs();
 }
@@ -96,7 +128,7 @@ fn nowNs() u64 {
 pub fn classificationLogits(
     cb: *const compute.ComputeBackend,
     allocator: Allocator,
-    config: deberta_mod.Config,
+    config: EncoderConfig,
     sample: processor.Sample,
     task_label_counts: []const usize,
 ) ![][]f64 {
@@ -106,23 +138,34 @@ pub fn classificationLogits(
 pub fn classificationLogitsProfiled(
     cb: *const compute.ComputeBackend,
     allocator: Allocator,
-    config: deberta_mod.Config,
+    config: EncoderConfig,
     sample: processor.Sample,
     task_label_counts: []const usize,
     profile: ?*Profile,
 ) ![][]f64 {
     var stage_start = if (profile != null) nowNs() else 0;
     const seq_len = sample.input_ids.len;
-    const H: usize = config.hidden_size;
+    const H: usize = config.hiddenSize();
     const labels = sample.classification_labels;
     if (seq_len == 0 or labels.len == 0) return error.InvalidExtractionInput;
+    // The embedded CUDA local-attention artifact has a fixed 512-score
+    // threadgroup buffer. Keep longer declared contexts on the bounded native
+    // and Metal segment-attention implementations until a regenerated CUDA
+    // kernel removes that physical limit.
+    if (config == .modern_bert and cb.kind() == .cuda and seq_len > 512)
+        return error.UnsupportedModernBertCudaSequenceLength;
 
     const attention_mask = try allocator.alloc(i64, seq_len);
     defer allocator.free(attention_mask);
     @memset(attention_mask, 1);
-    // Same encoder and head mirror policy as the session's legacy span route.
-    cb.preferEagerQuantMirrors(true);
-    const hidden = try deberta_arch.forwardCtProfiled(cb, allocator, config, sample.input_ids, attention_mask, 1, seq_len, deberta_mod.glinerPrefersWeightMirrors(config), if (profile) |p| &p.encoder else null);
+    const hidden = switch (config) {
+        .deberta => |deberta| blk: {
+            // Same encoder and head mirror policy as the legacy span route.
+            cb.preferEagerQuantMirrors(true);
+            break :blk try deberta_arch.forwardCtProfiled(cb, allocator, deberta, sample.input_ids, attention_mask, 1, seq_len, deberta_mod.glinerPrefersWeightMirrors(deberta), if (profile) |p| &p.encoder else null);
+        },
+        .modern_bert => |modern| try modern_bert_arch.forwardCT(cb, allocator, modern, sample.input_ids, attention_mask, 1, seq_len),
+    };
     defer cb.free(hidden);
     if (profile) |p| {
         try cb.evalTensor(hidden);
@@ -357,7 +400,7 @@ pub const ItemLogits = struct {
 pub fn preparedItemLogits(
     cb: *const compute.ComputeBackend,
     allocator: Allocator,
-    config: deberta_mod.Config,
+    config: EncoderConfig,
     item: *const wire.Item,
     prepared_item: *const PreparedItem,
     profile: ?*Profile,
@@ -389,7 +432,7 @@ pub fn preparedItemLogits(
 pub fn itemClassificationLogits(
     cb: *const compute.ComputeBackend,
     allocator: Allocator,
-    config: deberta_mod.Config,
+    config: EncoderConfig,
     tokenizer: Tokenizer,
     item: *const wire.Item,
     options: Options,
@@ -404,20 +447,38 @@ pub fn itemClassificationLogits(
 /// hidden-sized activations, the FFN intermediate, disentangled-attention
 /// score/c2p/p2c matrices (as if materialized), relative-position tables and
 /// the classifier head. Sequences run serially, so this bounds a request.
-pub fn deviceScratchUpperBound(config: deberta_mod.Config, tokens: usize) !usize {
-    const h: usize = config.hidden_size;
-    const i: usize = config.intermediate_size;
-    const heads: usize = config.num_attention_heads;
-    const buckets: usize = config.position_buckets;
+pub fn deviceScratchUpperBound(config: EncoderConfig, tokens: usize) !usize {
+    const h: usize = config.hiddenSize();
+    const i: usize = config.intermediateSize();
+    const heads: usize = config.attentionHeads();
+    const buckets: usize = switch (config) {
+        .deberta => |deberta| deberta.position_buckets,
+        .modern_bert => 0,
+    };
     const f = @sizeOf(f32);
     var total: usize = 0;
     total = try std.math.add(usize, total, try std.math.mul(usize, 8 * f, try std.math.mul(usize, tokens, h)));
     total = try std.math.add(usize, total, try std.math.mul(usize, 2 * f, try std.math.mul(usize, tokens, i)));
-    total = try std.math.add(usize, total, try std.math.mul(usize, 3 * f * heads, try std.math.mul(usize, tokens, tokens)));
+    // DeBERTa retains a correctness fallback that materializes C2C/C2P/P2C.
+    // ModernBERT's supported routes are bounded: native and Metal use segment
+    // attention, CUDA launches attention directly without a score allocation.
+    if (config == .deberta)
+        total = try std.math.add(usize, total, try std.math.mul(usize, 3 * f * heads, try std.math.mul(usize, tokens, tokens)));
     total = try std.math.add(usize, total, try std.math.mul(usize, 4 * f, try std.math.mul(usize, buckets, h)));
     total = try std.math.add(usize, total, try std.math.mul(usize, 2 * f, try std.math.mul(usize, tokens, h)));
     // Allocator rounding and transient copies.
     return std.math.mul(usize, total, 2);
+}
+
+/// DeBERTa span checkpoints retain their established request ceiling. A
+/// ModernBERT span checkpoint may use its declared context because all three
+/// supported backends use bounded-memory attention; runtime admission still
+/// accounts for its linear activations and FFN workspace.
+pub fn sequenceTokenCeiling(config: EncoderConfig, deberta_limit: usize, cuda_backend: bool) usize {
+    return switch (config) {
+        .deberta => |deberta| @min(@as(usize, deberta.max_position_embeddings), deberta_limit),
+        .modern_bert => |modern| @min(@as(usize, modern.max_position_embeddings), if (cuda_backend) @as(usize, 512) else std.math.maxInt(usize)),
+    };
 }
 
 /// Longest planned sequence, for executor-contract token validation and
@@ -432,10 +493,30 @@ pub fn maxPlannedSequenceTokens(request_plan: *const Plan) usize {
 
 test "gliner span v2 device scratch bound covers a large 512-token sequence" {
     const large = deberta_mod.Config{ .hidden_size = 1024, .num_hidden_layers = 24, .num_attention_heads = 16, .intermediate_size = 4096 };
-    const bytes = try deviceScratchUpperBound(large, 512);
+    const bytes = try deviceScratchUpperBound(.{ .deberta = large }, 512);
     // Materialized 16-head 512x512 scores alone are 16 MiB per matrix.
     try std.testing.expect(bytes >= 3 * 16 * 512 * 512 * 4);
     try std.testing.expect(bytes < 512 * 1024 * 1024);
+}
+
+test "gliner span v2 preserves DeBERTa 512 ceiling and admits Decide 1B context with bounded scratch" {
+    const deberta = EncoderConfig{ .deberta = .{ .max_position_embeddings = 512 } };
+    const modern = EncoderConfig{ .modern_bert = .{
+        .vocab_size = 50378,
+        .hidden_size = 1792,
+        .num_hidden_layers = 28,
+        .num_attention_heads = 28,
+        .intermediate_size = 3840,
+        .max_position_embeddings = 7999,
+        .local_attention_window = 128,
+        .global_attn_every_n_layers = 3,
+    } };
+    try std.testing.expectEqual(@as(usize, 512), sequenceTokenCeiling(deberta, 512, false));
+    try std.testing.expectEqual(@as(usize, 7999), sequenceTokenCeiling(modern, 512, false));
+    try std.testing.expectEqual(@as(usize, 512), sequenceTokenCeiling(modern, 512, true));
+    const bytes = try deviceScratchUpperBound(modern, 7999);
+    try std.testing.expect(bytes > 1024 * 1024 * 1024);
+    try std.testing.expect(bytes < 2 * 1024 * 1024 * 1024);
 }
 
 /// Tokenized, split request. Built before the model lock is taken.
@@ -475,8 +556,8 @@ pub fn plan(allocator: Allocator, tokenizer: Tokenizer, request: *const wire.Req
 
 /// Runs a plan built by `plan` for the same request. The caller owns the
 /// managed backend, model lock and admission for the complete execution.
-pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, config: deberta_mod.Config, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
-    if (cb.kind() != .native and cb.kind() != .metal) return error.UnsupportedExtractionBackend;
+pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
+    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .cuda) return error.UnsupportedExtractionBackend;
     if (request_plan.items.len != request.items.len) return error.InvalidExtractionInput;
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
@@ -507,7 +588,7 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
     return writer.finish(request_plan.prompt_tokens);
 }
 
-pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: deberta_mod.Config, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
+pub fn execute(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, tokenizer: Tokenizer, request: *const wire.Request, options: Options) ![]u8 {
     var request_plan = try plan(allocator, tokenizer, request, options);
     defer request_plan.deinit(allocator);
     return executePlanned(cb, allocator, config, request, &request_plan, options);
@@ -603,9 +684,17 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
     const factory = @import("../architectures/session_factory.zig");
     const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
     defer session.close();
-    const config = try factory.getGlinerSpanConfig(session);
-    try std.testing.expectEqual(@as(u32, 1024), config.hidden_size);
-    try std.testing.expectEqual(deberta_mod.GlinerCountLayer.count_lstm, config.gliner_count_layer);
+    const session_config = try factory.getGlinerSpanConfig(session);
+    const config: EncoderConfig = switch (session_config) {
+        .deberta => |value| .{ .deberta = value },
+        .modern_bert => |value| .{ .modern_bert = value },
+    };
+    const deberta = switch (session_config) {
+        .deberta => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(@as(u32, 1024), deberta.hidden_size);
+    try std.testing.expectEqual(deberta_mod.GlinerCountLayer.count_lstm, deberta.gliner_count_layer);
     const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
     defer a.free(tokenizer_path);
     const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
@@ -723,7 +812,11 @@ test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
     const gliner_head = @import("../architectures/gliner_head.zig");
     const session = try factory.createNativeSession(a, directory);
     defer session.close();
-    const config = try factory.getGlinerSpanConfig(session);
+    const span_config = try factory.getGlinerSpanConfig(session);
+    const config = switch (span_config) {
+        .deberta => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
     var managed = try factory.getManagedComputeBackend(session, a, null, null);
     defer managed.deinit();
     const cb = &managed.backend;
@@ -784,7 +877,11 @@ test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
     const metal = std.mem.eql(u8, backend_name, "metal");
     const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
     defer session.close();
-    const config = try factory.getGlinerSpanConfig(session);
+    const session_config = try factory.getGlinerSpanConfig(session);
+    const config: EncoderConfig = switch (session_config) {
+        .deberta => |value| .{ .deberta = value },
+        .modern_bert => |value| .{ .modern_bert = value },
+    };
     const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
     defer a.free(tokenizer_path);
     const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
@@ -877,7 +974,11 @@ test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequen
     const factory = @import("../architectures/session_factory.zig");
     const session = try factory.createNativeSession(a, directory);
     defer session.close();
-    const config = try factory.getGlinerSpanConfig(session);
+    const session_config = try factory.getGlinerSpanConfig(session);
+    const config: EncoderConfig = switch (session_config) {
+        .deberta => |value| .{ .deberta = value },
+        .modern_bert => |value| .{ .modern_bert = value },
+    };
     const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
     defer a.free(tokenizer_path);
     const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
@@ -945,7 +1046,11 @@ test "gliner span v2 GLiNER2.5-Decide execute serves the wire response and enfor
     const factory = @import("../architectures/session_factory.zig");
     const session = try factory.createNativeSession(a, directory);
     defer session.close();
-    const config = try factory.getGlinerSpanConfig(session);
+    const session_config = try factory.getGlinerSpanConfig(session);
+    const config: EncoderConfig = switch (session_config) {
+        .deberta => |value| .{ .deberta = value },
+        .modern_bert => |value| .{ .modern_bert = value },
+    };
     const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
     defer a.free(tokenizer_path);
     const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);

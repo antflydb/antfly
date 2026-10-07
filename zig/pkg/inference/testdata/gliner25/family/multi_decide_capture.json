@@ -1,0 +1,3812 @@
+{
+  "artifacts": {
+    "contract_sha256": "0beb19e072fd46f0318bd7a1e2c0ac3b8ad1deaf47bdc0cf1ce7ca1e9c6364c5",
+    "generator_sha256": "4e9fee278e8e4757f1ee03aec87208dfc7cbb58eb7a009b30e8f525c8eb9cde5",
+    "requests_sha256": "f5a609866d7077c63956cde11bdbd8164c1d8072073d6634ac4da3ed816526b5"
+  },
+  "format_version": 1,
+  "model": {
+    "architecture": "boundary",
+    "compatibility": {
+      "gliner25_boundary_converter": true,
+      "reason": "The checkpoint has the released multilingual boundary tensor schema; runtime quality and backend qualification remain separate gates."
+    },
+    "encoder_family": "deberta-v2",
+    "model_sha256": "9efe0f88c99f2aa794452e9559dc60e98d60d9fa2bf1b60cf2710411b6da5b4e",
+    "model_size_bytes": 1149461028,
+    "parameter_count": 287355159,
+    "profile": "multi_decide",
+    "qualification": false,
+    "repo": "fastino/GLiNER2.5-multi-Decide",
+    "revision": "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
+    "sidecars": {
+      "config.json": {
+        "sha256": "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf",
+        "size_bytes": 3152
+      },
+      "encoder_config/config.json": {
+        "sha256": "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83",
+        "size_bytes": 858
+      },
+      "tokenizer.json": {
+        "sha256": "c62446df87ae18ec98b133f8f84fc449a07cc89bbf8ef192a4cb5f9c53777a7a",
+        "size_bytes": 16035853
+      },
+      "tokenizer_config.json": {
+        "sha256": "fd4a31dc2f1f17e31638c5f0e783b81cdb2fbe6bddd116a8d9e5d50d78148cf1",
+        "size_bytes": 646
+      }
+    },
+    "status": "verified",
+    "tensor_count": 334,
+    "tensor_header_sha256": "013eacdfc5811df532e5afc637b013307dd93787b7dfdc95e5c404a9d6ca4e6c"
+  },
+  "native_runtime_qualified": false,
+  "production_qualified": false,
+  "qualification": false,
+  "requests": [
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          4,
+          9,
+          16,
+          21,
+          30,
+          33,
+          41,
+          44,
+          53,
+          62,
+          63
+        ],
+        "input_ids": [
+          275,
+          250104,
+          260,
+          59129,
+          275,
+          250105,
+          2986,
+          250105,
+          29661,
+          250105,
+          10332,
+          260,
+          272,
+          260,
+          272,
+          250102,
+          275,
+          250104,
+          260,
+          266,
+          188457,
+          250111,
+          2986,
+          268,
+          299,
+          260,
+          55979,
+          6921,
+          250111,
+          29661,
+          268,
+          299,
+          5836,
+          632,
+          73569,
+          250111,
+          8939,
+          268,
+          299,
+          9417,
+          632,
+          2555,
+          275,
+          250106,
+          2986,
+          250106,
+          29661,
+          250106,
+          8939,
+          260,
+          272,
+          260,
+          272,
+          250102,
+          275,
+          250104,
+          19515,
+          291,
+          1566,
+          275,
+          250107,
+          8278,
+          250107,
+          149517,
+          260,
+          272,
+          260,
+          272,
+          250102,
+          275,
+          250104,
+          260,
+          59129,
+          291,
+          9657,
+          275,
+          250108,
+          16854,
+          346,
+          250108,
+          12256,
+          250108,
+          336,
+          36486,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          260,
+          11558,
+          260,
+          4574,
+          16854,
+          346,
+          2778,
+          646,
+          15333,
+          44608,
+          282,
+          304,
+          132329,
+          528,
+          8349,
+          10754,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "employment",
+            "(",
+            "[C]",
+            "person",
+            "[C]",
+            "organization",
+            "[C]",
+            "title",
+            ")",
+            ")"
+          ],
+          [
+            "(",
+            "[P]",
+            "entities [DESCRIPTION] person: A named individual [DESCRIPTION] organization: A company or institution [DESCRIPTION] location: A city or place",
+            "(",
+            "[E]",
+            "person",
+            "[E]",
+            "organization",
+            "[E]",
+            "location",
+            ")",
+            ")"
+          ],
+          [
+            "(",
+            "[P]",
+            "works_for",
+            "(",
+            "[R]",
+            "head",
+            "[R]",
+            "tail",
+            ")",
+            ")"
+          ],
+          [
+            "(",
+            "[P]",
+            "employment_status",
+            "(",
+            "[L]",
+            "joined",
+            "[L]",
+            "left",
+            "[L]",
+            "unchanged",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          5,
+          10,
+          17,
+          22,
+          31,
+          34,
+          42,
+          45,
+          54,
+          62
+        ],
+        "text_tokens": [
+          "maya",
+          "chen",
+          "joined",
+          "acme",
+          "robotics",
+          "in",
+          "seattle",
+          "as",
+          "research",
+          "director",
+          "."
+        ]
+      },
+      "id": "english_full_task",
+      "kind": "extract",
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9944276809692383,
+                "label": "joined"
+              }
+            ],
+            "name": "employment_status"
+          }
+        ],
+        "entities": [
+          {
+            "name": "person",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.5163359642028809,
+                "source": {
+                  "end": 9,
+                  "start": 0
+                },
+                "text": "Maya Chen"
+              }
+            ]
+          },
+          {
+            "name": "organization",
+            "values": []
+          },
+          {
+            "name": "location",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.5803945660591125,
+                "source": {
+                  "end": 41,
+                  "start": 34
+                },
+                "text": "Seattle"
+              }
+            ]
+          }
+        ],
+        "relations": [
+          {
+            "confidence": 0.5435332655906677,
+            "head": {
+              "attributes": [],
+              "confidence": 0.5435332655906677,
+              "source": {
+                "end": 9,
+                "start": 0
+              },
+              "text": "Maya Chen"
+            },
+            "name": "works_for",
+            "tail": {
+              "attributes": [],
+              "confidence": 0.5435332655906677,
+              "source": {
+                "end": 30,
+                "start": 17
+              },
+              "text": "Acme Robotics"
+            }
+          }
+        ],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classifications": [
+          {
+            "labels": [
+              "joined",
+              "left",
+              "unchanged"
+            ],
+            "name": "employment_status"
+          }
+        ],
+        "entities": [
+          "person",
+          "organization",
+          "location"
+        ],
+        "entity_definitions": {
+          "location": {
+            "description": "A city or place"
+          },
+          "organization": {
+            "description": "A company or institution"
+          },
+          "person": {
+            "description": "A named individual"
+          }
+        },
+        "relations": [
+          {
+            "type": "works_for"
+          }
+        ],
+        "structures": {
+          "employment": {
+            "fields": {
+              "organization": {
+                "type": "str"
+              },
+              "person": {
+                "type": "str"
+              },
+              "title": {
+                "type": "str"
+              }
+            }
+          }
+        }
+      },
+      "native_schema_json": "{\"entities\":[\"person\",\"organization\",\"location\"],\"classifications\":[{\"name\":\"employment_status\",\"labels\":[\"joined\",\"left\",\"unchanged\"]}],\"relations\":[{\"type\":\"works_for\"}],\"structures\":{\"employment\":{\"fields\":{\"person\":{\"type\":\"str\"},\"organization\":{\"type\":\"str\"},\"title\":{\"type\":\"str\"}}}},\"entity_definitions\":{\"person\":{\"description\":\"A named individual\"},\"organization\":{\"description\":\"A company or institution\"},\"location\":{\"description\":\"A city or place\"}}}",
+      "output": {
+        "employment_status": {
+          "confidence": 0.9944276809692383,
+          "label": "joined"
+        },
+        "entities": {
+          "location": [
+            {
+              "confidence": 0.5803945660591125,
+              "end": 41,
+              "start": 34,
+              "text": "Seattle"
+            }
+          ],
+          "organization": [],
+          "person": [
+            {
+              "confidence": 0.5163359642028809,
+              "end": 9,
+              "start": 0,
+              "text": "Maya Chen"
+            }
+          ]
+        },
+        "relation_extraction": {
+          "works_for": [
+            {
+              "head": {
+                "confidence": 0.5435332655906677,
+                "end": 9,
+                "start": 0,
+                "text": "Maya Chen"
+              },
+              "tail": {
+                "confidence": 0.5435332655906677,
+                "end": 30,
+                "start": 17,
+                "text": "Acme Robotics"
+              }
+            }
+          ]
+        }
+      },
+      "schema": {
+        "classifications": [
+          {
+            "labels": [
+              "joined",
+              "left",
+              "unchanged"
+            ],
+            "task": "employment_status"
+          }
+        ],
+        "entities": {
+          "location": "A city or place",
+          "organization": "A company or institution",
+          "person": "A named individual"
+        },
+        "relations": [
+          "works_for"
+        ],
+        "structures": {
+          "employment": {
+            "fields": [
+              {
+                "dtype": "str",
+                "name": "person"
+              },
+              {
+                "dtype": "str",
+                "name": "organization"
+              },
+              {
+                "dtype": "str",
+                "name": "title"
+              }
+            ]
+          }
+        }
+      },
+      "semantic": {
+        "checks": [
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "Maya Chen"
+          },
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "Acme Robotics"
+          },
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "Seattle"
+          }
+        ],
+        "pass": true
+      },
+      "text": "Maya Chen joined Acme Robotics in Seattle as research director."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          5,
+          14,
+          22,
+          27,
+          33,
+          39,
+          42,
+          49,
+          50
+        ],
+        "input_ids": [
+          275,
+          250104,
+          260,
+          266,
+          188457,
+          250111,
+          6813,
+          268,
+          260,
+          52943,
+          270,
+          574,
+          6813,
+          250111,
+          4827,
+          1435,
+          268,
+          63757,
+          260,
+          269,
+          282,
+          73351,
+          250111,
+          5968,
+          268,
+          260,
+          33625,
+          260,
+          269,
+          260,
+          274,
+          127306,
+          275,
+          250106,
+          6813,
+          250106,
+          4827,
+          1435,
+          250106,
+          5968,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          497,
+          4359,
+          260,
+          3850,
+          152817,
+          361,
+          16182,
+          436,
+          260,
+          42077,
+          260,
+          40553,
+          290,
+          35498,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "entities [DESCRIPTION] persona: Nombre de una persona [DESCRIPTION] organización: Empresa o institución [DESCRIPTION] lugar: Ciudad o ubicación",
+            "(",
+            "[E]",
+            "persona",
+            "[E]",
+            "organización",
+            "[E]",
+            "lugar",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          6,
+          15,
+          23,
+          28,
+          34,
+          40,
+          43,
+          49
+        ],
+        "text_tokens": [
+          "maría",
+          "gonzález",
+          "trabaja",
+          "para",
+          "banco",
+          "norte",
+          "en",
+          "madrid",
+          "."
+        ]
+      },
+      "id": "spanish_entities",
+      "kind": "extract",
+      "native_expected": {
+        "classifications": [],
+        "entities": [
+          {
+            "name": "persona",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.6975468397140503,
+                "source": {
+                  "end": 14,
+                  "start": 0
+                },
+                "text": "María González"
+              }
+            ]
+          },
+          {
+            "name": "organización",
+            "values": []
+          },
+          {
+            "name": "lugar",
+            "values": [
+              {
+                "attributes": [],
+                "confidence": 0.520136296749115,
+                "source": {
+                  "end": 49,
+                  "start": 43
+                },
+                "text": "Madrid"
+              }
+            ]
+          }
+        ],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "entities": [
+          "persona",
+          "organización",
+          "lugar"
+        ],
+        "entity_definitions": {
+          "lugar": {
+            "description": "Ciudad o ubicación"
+          },
+          "organización": {
+            "description": "Empresa o institución"
+          },
+          "persona": {
+            "description": "Nombre de una persona"
+          }
+        }
+      },
+      "native_schema_json": "{\"entities\":[\"persona\",\"organización\",\"lugar\"],\"entity_definitions\":{\"persona\":{\"description\":\"Nombre de una persona\"},\"organización\":{\"description\":\"Empresa o institución\"},\"lugar\":{\"description\":\"Ciudad o ubicación\"}}}",
+      "output": {
+        "entities": {
+          "lugar": [
+            {
+              "confidence": 0.520136296749115,
+              "end": 49,
+              "start": 43,
+              "text": "Madrid"
+            }
+          ],
+          "organización": [],
+          "persona": [
+            {
+              "confidence": 0.6975468397140503,
+              "end": 14,
+              "start": 0,
+              "text": "María González"
+            }
+          ]
+        }
+      },
+      "schema": {
+        "entities": {
+          "lugar": "Ciudad o ubicación",
+          "organización": "Empresa o institución",
+          "persona": "Nombre de una persona"
+        }
+      },
+      "semantic": {
+        "checks": [
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "María González"
+          },
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "Banco Norte"
+          },
+          {
+            "kind": "contains_text",
+            "pass": true,
+            "value": "Madrid"
+          }
+        ],
+        "pass": false
+      },
+      "text": "María González trabaja para Banco Norte en Madrid."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          2,
+          4,
+          7,
+          9,
+          13,
+          15,
+          22,
+          23,
+          24
+        ],
+        "input_ids": [
+          275,
+          250104,
+          260,
+          266,
+          188457,
+          250111,
+          260,
+          58840,
+          268,
+          260,
+          1194,
+          136790,
+          250111,
+          260,
+          63980,
+          268,
+          260,
+          21329,
+          30374,
+          63980,
+          250111,
+          260,
+          30874,
+          268,
+          260,
+          36039,
+          30374,
+          30874,
+          275,
+          250106,
+          260,
+          58840,
+          250106,
+          260,
+          63980,
+          250106,
+          260,
+          30874,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          260,
+          124650,
+          260,
+          536,
+          93286,
+          260,
+          424,
+          260,
+          166089,
+          260,
+          628,
+          260,
+          172932,
+          17629,
+          260,
+          307,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "entities [DESCRIPTION] 人物: 人の名前 [DESCRIPTION] 組織: 会社または組織 [DESCRIPTION] 場所: 都市または場所",
+            "(",
+            "[E]",
+            "人物",
+            "[E]",
+            "組織",
+            "[E]",
+            "場所",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          3,
+          5,
+          8,
+          10,
+          14,
+          16,
+          22,
+          23
+        ],
+        "text_tokens": [
+          "田中",
+          "は",
+          "東京",
+          "の",
+          "ソニー",
+          "で",
+          "働いています",
+          "。",
+          "."
+        ]
+      },
+      "id": "japanese_entities",
+      "kind": "extract",
+      "native_expected": {
+        "classifications": [],
+        "entities": [
+          {
+            "name": "人物",
+            "values": []
+          },
+          {
+            "name": "組織",
+            "values": []
+          },
+          {
+            "name": "場所",
+            "values": []
+          }
+        ],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "entities": [
+          "人物",
+          "組織",
+          "場所"
+        ],
+        "entity_definitions": {
+          "人物": {
+            "description": "人の名前"
+          },
+          "場所": {
+            "description": "都市または場所"
+          },
+          "組織": {
+            "description": "会社または組織"
+          }
+        }
+      },
+      "native_schema_json": "{\"entities\":[\"人物\",\"組織\",\"場所\"],\"entity_definitions\":{\"人物\":{\"description\":\"人の名前\"},\"組織\":{\"description\":\"会社または組織\"},\"場所\":{\"description\":\"都市または場所\"}}}",
+      "output": {
+        "entities": {
+          "人物": [],
+          "場所": [],
+          "組織": []
+        }
+      },
+      "schema": {
+        "entities": {
+          "人物": "人の名前",
+          "場所": "都市または場所",
+          "組織": "会社または組織"
+        }
+      },
+      "semantic": {
+        "checks": [
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "田中"
+          },
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "東京"
+          },
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "ソニー"
+          }
+        ],
+        "pass": false
+      },
+      "text": "田中 は 東京 の ソニー で 働いています。"
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          4,
+          9,
+          15,
+          18,
+          23,
+          29,
+          36,
+          40,
+          41
+        ],
+        "input_ids": [
+          275,
+          250104,
+          260,
+          266,
+          188457,
+          250111,
+          11071,
+          268,
+          21377,
+          11071,
+          250111,
+          20868,
+          4606,
+          268,
+          260,
+          11320,
+          2877,
+          260,
+          24304,
+          446,
+          250111,
+          260,
+          19393,
+          268,
+          260,
+          26637,
+          2877,
+          260,
+          9564,
+          275,
+          250106,
+          11071,
+          250106,
+          20868,
+          4606,
+          250106,
+          260,
+          19393,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          260,
+          59667,
+          260,
+          14896,
+          843,
+          557,
+          24734,
+          576,
+          260,
+          11320,
+          7283,
+          2738,
+          615,
+          26637,
+          260,
+          51337,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "entities [DESCRIPTION] شخص: اسم شخص [DESCRIPTION] منظمة: شركة أو مؤسسة [DESCRIPTION] مكان: مدينة أو موقع",
+            "(",
+            "[E]",
+            "شخص",
+            "[E]",
+            "منظمة",
+            "[E]",
+            "مكان",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          5,
+          10,
+          16,
+          19,
+          24,
+          30,
+          37,
+          40
+        ],
+        "text_tokens": [
+          "تعمل",
+          "ليلى",
+          "منصور",
+          "في",
+          "شركة",
+          "النور",
+          "بمدينة",
+          "دبي",
+          "."
+        ]
+      },
+      "id": "arabic_entities",
+      "kind": "extract",
+      "native_expected": {
+        "classifications": [],
+        "entities": [
+          {
+            "name": "شخص",
+            "values": []
+          },
+          {
+            "name": "منظمة",
+            "values": []
+          },
+          {
+            "name": "مكان",
+            "values": []
+          }
+        ],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "entities": [
+          "شخص",
+          "منظمة",
+          "مكان"
+        ],
+        "entity_definitions": {
+          "شخص": {
+            "description": "اسم شخص"
+          },
+          "مكان": {
+            "description": "مدينة أو موقع"
+          },
+          "منظمة": {
+            "description": "شركة أو مؤسسة"
+          }
+        }
+      },
+      "native_schema_json": "{\"entities\":[\"شخص\",\"منظمة\",\"مكان\"],\"entity_definitions\":{\"شخص\":{\"description\":\"اسم شخص\"},\"منظمة\":{\"description\":\"شركة أو مؤسسة\"},\"مكان\":{\"description\":\"مدينة أو موقع\"}}}",
+      "output": {
+        "entities": {
+          "شخص": [],
+          "مكان": [],
+          "منظمة": []
+        }
+      },
+      "schema": {
+        "entities": {
+          "شخص": "اسم شخص",
+          "مكان": "مدينة أو موقع",
+          "منظمة": "شركة أو مؤسسة"
+        }
+      },
+      "semantic": {
+        "checks": [
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "ليلى منصور"
+          },
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "شركة النور"
+          },
+          {
+            "kind": "contains_text",
+            "pass": false,
+            "value": "دبي"
+          }
+        ],
+        "pass": false
+      },
+      "text": "تعمل ليلى منصور في شركة النور بمدينة دبي."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          6,
+          13,
+          17,
+          27,
+          32,
+          39,
+          40
+        ],
+        "input_ids": [
+          275,
+          250104,
+          24381,
+          275,
+          250108,
+          95857,
+          250108,
+          260,
+          32946,
+          291,
+          36510,
+          250108,
+          17690,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          10152,
+          95857,
+          288,
+          173407,
+          347,
+          10169,
+          11752,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "intent",
+            "(",
+            "[L]",
+            "refund",
+            "[L]",
+            "technical_support",
+            "[L]",
+            "sales",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          7,
+          14,
+          18,
+          28,
+          33,
+          39
+        ],
+        "text_tokens": [
+          "please",
+          "refund",
+          "the",
+          "duplicate",
+          "card",
+          "charge",
+          "."
+        ]
+      },
+      "id": "english_intent",
+      "kind": "classification",
+      "logits": {
+        "intent": {
+          "refund": 5.362913608551025,
+          "sales": -3.849560022354126,
+          "technical_support": -4.529926300048828
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          275,
+          250104,
+          24381,
+          275,
+          250108,
+          95857,
+          250108,
+          260,
+          32946,
+          291,
+          36510,
+          250108,
+          17690,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          10152,
+          95857,
+          288,
+          173407,
+          347,
+          10169,
+          11752,
+          260,
+          261
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "refund",
+              "technical_support",
+              "sales"
+            ],
+            "name": "intent",
+            "raw_logits": [
+              5.362913608551025,
+              -4.529926300048828,
+              -3.849560022354126
+            ]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9998497004652696,
+                "label": "refund"
+              }
+            ],
+            "name": "intent"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "refund",
+              "technical_support",
+              "sales"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "intent"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"intent\",\"labels\":[\"refund\",\"technical_support\",\"sales\"],\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 5.362913608551025,
+          "violations": []
+        },
+        "intent": {
+          "confidence": 0.9998497004652696,
+          "probabilities": {
+            "refund": 0.9998497004652696,
+            "sales": 9.977190356020655e-05,
+            "technical_support": 5.052763117020679e-05
+          },
+          "value": "refund"
+        }
+      },
+      "probabilities": {
+        "intent": {
+          "refund": 0.9998497004652696,
+          "sales": 9.977190356020655e-05,
+          "technical_support": 5.052763117020679e-05
+        }
+      },
+      "schema": {
+        "tasks": {
+          "intent": {
+            "labels": [
+              "refund",
+              "technical_support",
+              "sales"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "654d8f24c8a8abf1feb6208002362ad4ef8c2562efd776ba07010315d16fe5cc",
+      "selected": {
+        "intent": [
+          "refund"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "refund"
+            ],
+            "expected": [
+              "refund"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "intent"
+          }
+        ],
+        "pass": true
+      },
+      "text": "Please refund the duplicate card charge."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          6,
+          15,
+          18,
+          26,
+          31,
+          38,
+          39
+        ],
+        "input_ids": [
+          275,
+          250104,
+          282,
+          20231,
+          275,
+          250108,
+          22029,
+          287,
+          250108,
+          260,
+          47101,
+          250108,
+          47737,
+          373,
+          250108,
+          22446,
+          287,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          32004,
+          269,
+          47737,
+          373,
+          659,
+          22029,
+          436,
+          260,
+          71864,
+          1239,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "intención",
+            "(",
+            "[L]",
+            "reservar",
+            "[L]",
+            "cambiar",
+            "[L]",
+            "cancelar",
+            "[L]",
+            "consultar",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          7,
+          16,
+          19,
+          27,
+          32,
+          38
+        ],
+        "text_tokens": [
+          "quiero",
+          "cancelar",
+          "mi",
+          "reserva",
+          "para",
+          "mañana",
+          "."
+        ]
+      },
+      "id": "spanish_intent",
+      "kind": "classification",
+      "logits": {
+        "intención": {
+          "cambiar": -3.7100961208343506,
+          "cancelar": 3.4344286918640137,
+          "consultar": -4.361438751220703,
+          "reservar": -1.988293170928955
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          275,
+          250104,
+          282,
+          20231,
+          275,
+          250108,
+          22029,
+          287,
+          250108,
+          260,
+          47101,
+          250108,
+          47737,
+          373,
+          250108,
+          22446,
+          287,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          32004,
+          269,
+          47737,
+          373,
+          659,
+          22029,
+          436,
+          260,
+          71864,
+          1239,
+          260,
+          261
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "reservar",
+              "cambiar",
+              "cancelar",
+              "consultar"
+            ],
+            "name": "intención",
+            "raw_logits": [
+              -1.988293170928955,
+              -3.7100961208343506,
+              3.4344286918640137,
+              -4.361438751220703
+            ]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.994415642349726,
+                "label": "cancelar"
+              }
+            ],
+            "name": "intención"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "reservar",
+              "cambiar",
+              "cancelar",
+              "consultar"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "intención"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"intención\",\"labels\":[\"reservar\",\"cambiar\",\"cancelar\",\"consultar\"],\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 3.4344286918640137,
+          "violations": []
+        },
+        "intención": {
+          "confidence": 0.994415642349726,
+          "probabilities": {
+            "cambiar": 0.0007847661197739134,
+            "cancelar": 0.994415642349726,
+            "consultar": 0.0004091341536970186,
+            "reservar": 0.0043904573768030145
+          },
+          "value": "cancelar"
+        }
+      },
+      "probabilities": {
+        "intención": {
+          "cambiar": 0.0007847661197739134,
+          "cancelar": 0.994415642349726,
+          "consultar": 0.0004091341536970186,
+          "reservar": 0.0043904573768030145
+        }
+      },
+      "schema": {
+        "tasks": {
+          "intención": {
+            "labels": [
+              "reservar",
+              "cambiar",
+              "cancelar",
+              "consultar"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "cea3301803c5310208084fc122935ab1259572b9d728d84dfc307b5e59fb0467",
+      "selected": {
+        "intención": [
+          "cancelar"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "cancelar"
+            ],
+            "expected": [
+              "cancelar"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "intención"
+          }
+        ],
+        "pass": true
+      },
+      "text": "Quiero cancelar mi reserva para mañana."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          14,
+          15,
+          16
+        ],
+        "input_ids": [
+          275,
+          250104,
+          260,
+          51370,
+          275,
+          250108,
+          260,
+          66334,
+          250108,
+          260,
+          44745,
+          250108,
+          260,
+          87405,
+          250108,
+          260,
+          32213,
+          25282,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          260,
+          66334,
+          575,
+          87405,
+          42481,
+          260,
+          307,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "依頼",
+            "(",
+            "[L]",
+            "注文",
+            "[L]",
+            "変更",
+            "[L]",
+            "キャンセル",
+            "[L]",
+            "状況確認",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          14,
+          15
+        ],
+        "text_tokens": [
+          "注文をキャンセルしてください",
+          "。",
+          "."
+        ]
+      },
+      "id": "japanese_intent",
+      "kind": "classification",
+      "logits": {
+        "依頼": {
+          "キャンセル": 4.2598114013671875,
+          "変更": -4.611667156219482,
+          "注文": -2.66780948638916,
+          "状況確認": -4.630751609802246
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          275,
+          250104,
+          260,
+          51370,
+          275,
+          250108,
+          260,
+          66334,
+          250108,
+          260,
+          44745,
+          250108,
+          260,
+          87405,
+          250108,
+          260,
+          32213,
+          25282,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          260,
+          66334,
+          575,
+          87405,
+          42481,
+          260,
+          307,
+          260,
+          261
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "注文",
+              "変更",
+              "キャンセル",
+              "状況確認"
+            ],
+            "name": "依頼",
+            "raw_logits": [
+              -2.66780948638916,
+              -4.611667156219482,
+              4.2598114013671875,
+              -4.630751609802246
+            ]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9987432339755936,
+                "label": "キャンセル"
+              }
+            ],
+            "name": "依頼"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "注文",
+              "変更",
+              "キャンセル",
+              "状況確認"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "依頼"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"依頼\",\"labels\":[\"注文\",\"変更\",\"キャンセル\",\"状況確認\"],\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 4.2598114013671875,
+          "violations": []
+        },
+        "依頼": {
+          "confidence": 0.9987432339755936,
+          "probabilities": {
+            "キャンセル": 0.9987432339755936,
+            "変更": 0.00014015857272608692,
+            "注文": 0.0009790983663052388,
+            "状況確認": 0.00013750908537492218
+          },
+          "value": "キャンセル"
+        }
+      },
+      "probabilities": {
+        "依頼": {
+          "キャンセル": 0.9987432339755936,
+          "変更": 0.00014015857272608692,
+          "注文": 0.0009790983663052388,
+          "状況確認": 0.00013750908537492218
+        }
+      },
+      "schema": {
+        "tasks": {
+          "依頼": {
+            "labels": [
+              "注文",
+              "変更",
+              "キャンセル",
+              "状況確認"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "a9780e16ec4463145b48ad138d466274697520ed7c257810d9169bc351fbc676",
+      "selected": {
+        "依頼": [
+          "キャンセル"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "キャンセル"
+            ],
+            "expected": [
+              "キャンセル"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "依頼"
+          }
+        ],
+        "pass": true
+      },
+      "text": "注文をキャンセルしてください。"
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          4,
+          10,
+          15,
+          21,
+          25,
+          29,
+          36,
+          37
+        ],
+        "input_ids": [
+          275,
+          250104,
+          403,
+          9235,
+          275,
+          250108,
+          1241,
+          17831,
+          250108,
+          15723,
+          61038,
+          250108,
+          1737,
+          7033,
+          2217,
+          250108,
+          951,
+          51612,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          1022,
+          32759,
+          15723,
+          61038,
+          549,
+          55507,
+          260,
+          45557,
+          7670,
+          1737,
+          843,
+          6091,
+          260,
+          47596,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "الطلب",
+            "(",
+            "[L]",
+            "حجز",
+            "[L]",
+            "تغيير",
+            "[L]",
+            "إلغاء",
+            "[L]",
+            "استعلام",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          5,
+          11,
+          16,
+          22,
+          26,
+          30,
+          36
+        ],
+        "text_tokens": [
+          "أريد",
+          "تغيير",
+          "موعد",
+          "رحلتي",
+          "إلى",
+          "يوم",
+          "الجمعة",
+          "."
+        ]
+      },
+      "id": "arabic_intent",
+      "kind": "classification",
+      "logits": {
+        "الطلب": {
+          "إلغاء": -4.214288711547852,
+          "استعلام": -4.188018798828125,
+          "تغيير": 4.990183353424072,
+          "حجز": -3.849271535873413
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          275,
+          250104,
+          403,
+          9235,
+          275,
+          250108,
+          1241,
+          17831,
+          250108,
+          15723,
+          61038,
+          250108,
+          1737,
+          7033,
+          2217,
+          250108,
+          951,
+          51612,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          1022,
+          32759,
+          15723,
+          61038,
+          549,
+          55507,
+          260,
+          45557,
+          7670,
+          1737,
+          843,
+          6091,
+          260,
+          47596,
+          260,
+          261
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "حجز",
+              "تغيير",
+              "إلغاء",
+              "استعلام"
+            ],
+            "name": "الطلب",
+            "raw_logits": [
+              -3.849271535873413,
+              4.990183353424072,
+              -4.214288711547852,
+              -4.188018798828125
+            ]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9996513652970433,
+                "label": "تغيير"
+              }
+            ],
+            "name": "الطلب"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "حجز",
+              "تغيير",
+              "إلغاء",
+              "استعلام"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "الطلب"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"الطلب\",\"labels\":[\"حجز\",\"تغيير\",\"إلغاء\",\"استعلام\"],\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 4.990183353424072,
+          "violations": []
+        },
+        "الطلب": {
+          "confidence": 0.9996513652970433,
+          "probabilities": {
+            "إلغاء": 0.00010055348726352956,
+            "استعلام": 0.00010323002082607803,
+            "تغيير": 0.9996513652970433,
+            "حجز": 0.00014485119486696757
+          },
+          "value": "تغيير"
+        }
+      },
+      "probabilities": {
+        "الطلب": {
+          "إلغاء": 0.00010055348726352956,
+          "استعلام": 0.00010323002082607803,
+          "تغيير": 0.9996513652970433,
+          "حجز": 0.00014485119486696757
+        }
+      },
+      "schema": {
+        "tasks": {
+          "الطلب": {
+            "labels": [
+              "حجز",
+              "تغيير",
+              "إلغاء",
+              "استعلام"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "5497a351e3e32995578cdd209aea7aed4d477529acb46193aa08d60520a2c88b",
+      "selected": {
+        "الطلب": [
+          "تغيير"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "تغيير"
+            ],
+            "expected": [
+              "تغيير"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "الطلب"
+          }
+        ],
+        "pass": true
+      },
+      "text": "أريد تغيير موعد رحلتي إلى يوم الجمعة."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          3,
+          7,
+          12,
+          20,
+          21,
+          25,
+          27,
+          33,
+          42,
+          46,
+          50,
+          54,
+          61,
+          65,
+          68,
+          69
+        ],
+        "input_ids": [
+          275,
+          250104,
+          24381,
+          250111,
+          10169,
+          291,
+          7497,
+          291,
+          22389,
+          268,
+          487,
+          17231,
+          260,
+          19239,
+          260,
+          263,
+          1547,
+          62856,
+          632,
+          3032,
+          777,
+          11244,
+          610,
+          250111,
+          10169,
+          291,
+          45023,
+          268,
+          487,
+          260,
+          28224,
+          10169,
+          340,
+          260,
+          53830,
+          250111,
+          23318,
+          291,
+          267,
+          68840,
+          268,
+          487,
+          17231,
+          17025,
+          264,
+          333,
+          462,
+          9495,
+          23318,
+          275,
+          250108,
+          10169,
+          291,
+          7497,
+          291,
+          22389,
+          250108,
+          10169,
+          291,
+          45023,
+          250108,
+          23318,
+          291,
+          267,
+          68840,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          288,
+          1547,
+          10169,
+          24939,
+          286,
+          260,
+          262,
+          1157,
+          260,
+          267,
+          8104,
+          11244,
+          286,
+          2477,
+          8653,
+          306,
+          739,
+          3358,
+          2226,
+          610,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "intent [DESCRIPTION] card_pin_change: The customer needs a new PIN or did not receive it [DESCRIPTION] card_lost: The physical card is missing [DESCRIPTION] balance_inquiry: The customer asks for an account balance",
+            "(",
+            "[L]",
+            "card_pin_change",
+            "[L]",
+            "card_lost",
+            "[L]",
+            "balance_inquiry",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          4,
+          8,
+          13,
+          20,
+          22,
+          26,
+          28,
+          34,
+          43,
+          47,
+          51,
+          55,
+          62,
+          66,
+          68
+        ],
+        "text_tokens": [
+          "the",
+          "new",
+          "card",
+          "arrived",
+          ",",
+          "but",
+          "i",
+          "never",
+          "received",
+          "its",
+          "pin",
+          "and",
+          "cannot",
+          "use",
+          "it",
+          "."
+        ]
+      },
+      "id": "described_labels",
+      "kind": "classification",
+      "logits": {
+        "intent": {
+          "balance_inquiry": -2.8617725372314453,
+          "card_lost": -1.2571947574615479,
+          "card_pin_change": 0.9114483594894409
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          275,
+          250104,
+          24381,
+          250111,
+          10169,
+          291,
+          7497,
+          291,
+          22389,
+          268,
+          487,
+          17231,
+          260,
+          19239,
+          260,
+          263,
+          1547,
+          62856,
+          632,
+          3032,
+          777,
+          11244,
+          610,
+          250111,
+          10169,
+          291,
+          45023,
+          268,
+          487,
+          260,
+          28224,
+          10169,
+          340,
+          260,
+          53830,
+          250111,
+          23318,
+          291,
+          267,
+          68840,
+          268,
+          487,
+          17231,
+          17025,
+          264,
+          333,
+          462,
+          9495,
+          23318,
+          275,
+          250108,
+          10169,
+          291,
+          7497,
+          291,
+          22389,
+          250108,
+          10169,
+          291,
+          45023,
+          250108,
+          23318,
+          291,
+          267,
+          68840,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          288,
+          1547,
+          10169,
+          24939,
+          286,
+          260,
+          262,
+          1157,
+          260,
+          267,
+          8104,
+          11244,
+          286,
+          2477,
+          8653,
+          306,
+          739,
+          3358,
+          2226,
+          610,
+          260,
+          261
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "card_pin_change",
+              "card_lost",
+              "balance_inquiry"
+            ],
+            "name": "intent",
+            "raw_logits": [
+              0.9114483594894409,
+              -1.2571947574615479,
+              -2.8617725372314453
+            ]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.8792672957495911,
+                "label": "card_pin_change"
+              }
+            ],
+            "name": "intent"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "label_definitions": {
+              "balance_inquiry": {
+                "description": "The customer asks for an account balance"
+              },
+              "card_lost": {
+                "description": "The physical card is missing"
+              },
+              "card_pin_change": {
+                "description": "The customer needs a new PIN or did not receive it"
+              }
+            },
+            "labels": [
+              "card_pin_change",
+              "card_lost",
+              "balance_inquiry"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "intent"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"intent\",\"labels\":[\"card_pin_change\",\"card_lost\",\"balance_inquiry\"],\"label_definitions\":{\"card_pin_change\":{\"description\":\"The customer needs a new PIN or did not receive it\"},\"card_lost\":{\"description\":\"The physical card is missing\"},\"balance_inquiry\":{\"description\":\"The customer asks for an account balance\"}},\"min_labels\":1,\"max_labels\":1}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 0.9114483594894409,
+          "violations": []
+        },
+        "intent": {
+          "confidence": 0.8792672957495911,
+          "probabilities": {
+            "balance_inquiry": 0.020203746256726926,
+            "card_lost": 0.100528957993682,
+            "card_pin_change": 0.8792672957495911
+          },
+          "value": "card_pin_change"
+        }
+      },
+      "probabilities": {
+        "intent": {
+          "balance_inquiry": 0.020203746256726926,
+          "card_lost": 0.100528957993682,
+          "card_pin_change": 0.8792672957495911
+        }
+      },
+      "schema": {
+        "tasks": {
+          "intent": {
+            "labels": {
+              "balance_inquiry": "The customer asks for an account balance",
+              "card_lost": "The physical card is missing",
+              "card_pin_change": "The customer needs a new PIN or did not receive it"
+            },
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "1a00f6c491919cf8b37e52d6a8a693ed02b23ce7c88fa06266872d875a0e0475",
+      "selected": {
+        "intent": [
+          "card_pin_change"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "card_pin_change"
+            ],
+            "expected": [
+              "card_pin_change"
+            ],
+            "kind": "selected",
+            "pass": true,
+            "task": "intent"
+          }
+        ],
+        "pass": true
+      },
+      "text": "The new card arrived, but I never received its PIN and cannot use it."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          3,
+          10,
+          14,
+          21,
+          24,
+          29,
+          33,
+          41,
+          46,
+          52,
+          55,
+          60,
+          61
+        ],
+        "input_ids": [
+          275,
+          250104,
+          20955,
+          268,
+          33834,
+          288,
+          44712,
+          277,
+          21549,
+          2388,
+          12078,
+          282,
+          12124,
+          292,
+          275,
+          250108,
+          36340,
+          250108,
+          376,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          288,
+          44712,
+          277,
+          640,
+          260,
+          38995,
+          282,
+          12124,
+          306,
+          260,
+          106033,
+          2388,
+          12078,
+          282,
+          12892,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "answer: Did the treaty enter into force in 1992?",
+            "(",
+            "[L]",
+            "yes",
+            "[L]",
+            "no",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          4,
+          11,
+          15,
+          22,
+          25,
+          30,
+          34,
+          42,
+          47,
+          53,
+          56,
+          60
+        ],
+        "text_tokens": [
+          "the",
+          "treaty",
+          "was",
+          "signed",
+          "in",
+          "1992",
+          "and",
+          "entered",
+          "into",
+          "force",
+          "in",
+          "1993",
+          "."
+        ]
+      },
+      "id": "instruction_prompt",
+      "kind": "classification",
+      "logits": {
+        "answer": {
+          "no": -1.1394634246826172,
+          "yes": 1.4346452951431274
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          275,
+          250104,
+          20955,
+          268,
+          33834,
+          288,
+          44712,
+          277,
+          21549,
+          2388,
+          12078,
+          282,
+          12124,
+          292,
+          275,
+          250108,
+          36340,
+          250108,
+          376,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          288,
+          44712,
+          277,
+          640,
+          260,
+          38995,
+          282,
+          12124,
+          306,
+          260,
+          106033,
+          2388,
+          12078,
+          282,
+          12892,
+          260,
+          261
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "yes",
+              "no"
+            ],
+            "name": "answer",
+            "raw_logits": [
+              1.4346452951431274,
+              -1.1394634246826172
+            ]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.9291765576705346,
+                "label": "yes"
+              }
+            ],
+            "name": "answer"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "instruction": "Did the treaty enter into force in 1992?",
+            "labels": [
+              "yes",
+              "no"
+            ],
+            "max_labels": 1,
+            "min_labels": 1,
+            "name": "answer"
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"answer\",\"labels\":[\"yes\",\"no\"],\"min_labels\":1,\"max_labels\":1,\"instruction\":\"Did the treaty enter into force in 1992?\"}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 1.4346452951431274,
+          "violations": []
+        },
+        "answer": {
+          "confidence": 0.9291765576705346,
+          "probabilities": {
+            "no": 0.07082344232946547,
+            "yes": 0.9291765576705346
+          },
+          "value": "yes"
+        }
+      },
+      "probabilities": {
+        "answer": {
+          "no": 0.07082344232946547,
+          "yes": 0.9291765576705346
+        }
+      },
+      "schema": {
+        "tasks": {
+          "answer": {
+            "instruction": "Did the treaty enter into force in 1992?",
+            "labels": [
+              "yes",
+              "no"
+            ],
+            "max_labels": 1,
+            "min_labels": 1
+          }
+        }
+      },
+      "schema_fingerprint": "9c516cd2f349cedaa3efe040f9a219a846d2b0aee23755e7fcabf4268f9007c4",
+      "selected": {
+        "answer": [
+          "yes"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "yes"
+            ],
+            "expected": [
+              "no"
+            ],
+            "kind": "selected",
+            "pass": false,
+            "task": "answer"
+          }
+        ],
+        "pass": false
+      },
+      "text": "The treaty was signed in 1992 and entered into force in 1993."
+    },
+    {
+      "encoded": {
+        "attention_mask": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "end_mappings": [
+          3,
+          11,
+          16,
+          23,
+          29,
+          30,
+          34,
+          38,
+          47,
+          51,
+          58,
+          62,
+          72,
+          73
+        ],
+        "input_ids": [
+          275,
+          250104,
+          10619,
+          264,
+          275,
+          250108,
+          43376,
+          250108,
+          65344,
+          250108,
+          10989,
+          250108,
+          10512,
+          250108,
+          6397,
+          250108,
+          2479,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          288,
+          43376,
+          22220,
+          5039,
+          40817,
+          260,
+          262,
+          1157,
+          288,
+          65344,
+          306,
+          10989,
+          419,
+          16387,
+          260,
+          261
+        ],
+        "schema_tokens": [
+          [
+            "(",
+            "[P]",
+            "aspects",
+            "(",
+            "[L]",
+            "battery",
+            "[L]",
+            "keyboard",
+            "[L]",
+            "screen",
+            "[L]",
+            "camera",
+            "[L]",
+            "price",
+            "[L]",
+            "support",
+            ")",
+            ")"
+          ]
+        ],
+        "start_mappings": [
+          0,
+          4,
+          12,
+          17,
+          24,
+          29,
+          31,
+          35,
+          39,
+          48,
+          52,
+          59,
+          63,
+          72
+        ],
+        "text_tokens": [
+          "the",
+          "battery",
+          "dies",
+          "before",
+          "lunch",
+          ",",
+          "but",
+          "the",
+          "keyboard",
+          "and",
+          "screen",
+          "are",
+          "excellent",
+          "."
+        ]
+      },
+      "id": "multi_label_aspects",
+      "kind": "classification",
+      "logits": {
+        "aspects": {
+          "battery": 0.60466468334198,
+          "camera": -5.1873321533203125,
+          "keyboard": 4.058218002319336,
+          "price": -5.228296279907227,
+          "screen": 4.361360549926758,
+          "support": -4.059736251831055
+        }
+      },
+      "native_classification": {
+        "input_ids": [
+          275,
+          250104,
+          10619,
+          264,
+          275,
+          250108,
+          43376,
+          250108,
+          65344,
+          250108,
+          10989,
+          250108,
+          10512,
+          250108,
+          6397,
+          250108,
+          2479,
+          260,
+          272,
+          260,
+          272,
+          250103,
+          288,
+          43376,
+          22220,
+          5039,
+          40817,
+          260,
+          262,
+          1157,
+          288,
+          65344,
+          306,
+          10989,
+          419,
+          16387,
+          260,
+          261
+        ],
+        "tasks": [
+          {
+            "labels": [
+              "battery",
+              "keyboard",
+              "screen",
+              "camera",
+              "price",
+              "support"
+            ],
+            "name": "aspects",
+            "raw_logits": [
+              0.60466468334198,
+              4.058218002319336,
+              4.361360549926758,
+              -5.1873321533203125,
+              -5.228296279907227,
+              -4.059736251831055
+            ]
+          }
+        ]
+      },
+      "native_expected": {
+        "classifications": [
+          {
+            "labels": [
+              {
+                "confidence": 0.6467227857179362,
+                "label": "battery"
+              },
+              {
+                "confidence": 0.9830137347671682,
+                "label": "keyboard"
+              },
+              {
+                "confidence": 0.9873997777733757,
+                "label": "screen"
+              }
+            ],
+            "name": "aspects"
+          }
+        ],
+        "entities": [],
+        "relations": [],
+        "structures": []
+      },
+      "native_options": {
+        "include_confidence": true,
+        "include_spans": true,
+        "offset_unit": "unicode_codepoints"
+      },
+      "native_schema": {
+        "classification_constraints": [],
+        "classifications": [
+          {
+            "labels": [
+              "battery",
+              "keyboard",
+              "screen",
+              "camera",
+              "price",
+              "support"
+            ],
+            "max_labels": 6,
+            "min_labels": 0,
+            "name": "aspects",
+            "threshold": 0.4
+          }
+        ]
+      },
+      "native_schema_json": "{\"classifications\":[{\"name\":\"aspects\",\"labels\":[\"battery\",\"keyboard\",\"screen\",\"camera\",\"price\",\"support\"],\"min_labels\":0,\"max_labels\":6,\"threshold\":0.4}],\"classification_constraints\":[]}",
+      "output": {
+        "_meta": {
+          "decoder": "independent",
+          "exact": true,
+          "feasible": true,
+          "objective": 10.240638559912567,
+          "violations": []
+        },
+        "aspects": {
+          "confidence": 0.9210146391684407,
+          "probabilities": {
+            "battery": 0.6467227857179362,
+            "camera": 0.005555851977035035,
+            "keyboard": 0.9830137347671682,
+            "price": 0.005334049324568314,
+            "screen": 0.9873997777733757,
+            "support": 0.016960932491597247
+          },
+          "value": [
+            "battery",
+            "keyboard",
+            "screen"
+          ]
+        }
+      },
+      "probabilities": {
+        "aspects": {
+          "battery": 0.6467227857179362,
+          "camera": 0.005555851977035035,
+          "keyboard": 0.9830137347671682,
+          "price": 0.005334049324568314,
+          "screen": 0.9873997777733757,
+          "support": 0.016960932491597247
+        }
+      },
+      "schema": {
+        "tasks": {
+          "aspects": {
+            "labels": [
+              "battery",
+              "keyboard",
+              "screen",
+              "camera",
+              "price",
+              "support"
+            ],
+            "max_labels": 6,
+            "min_labels": 0,
+            "threshold": 0.4
+          }
+        }
+      },
+      "schema_fingerprint": "8fdbb34253884ca5f6825f324f9fe0bf876afb022000a8e33dca37e3e37a582d",
+      "selected": {
+        "aspects": [
+          "battery",
+          "keyboard",
+          "screen"
+        ]
+      },
+      "semantic": {
+        "checks": [
+          {
+            "actual": [
+              "battery",
+              "keyboard",
+              "screen"
+            ],
+            "expected": [
+              "battery",
+              "keyboard",
+              "screen"
+            ],
+            "kind": "selected_contains",
+            "pass": true,
+            "task": "aspects"
+          }
+        ],
+        "pass": true
+      },
+      "text": "The battery dies before lunch, but the keyboard and screen are excellent."
+    }
+  ],
+  "runtime": {
+    "absent_packages": [
+      "peft"
+    ],
+    "compatibility": [
+      {
+        "classes": [
+          "PeftModel",
+          "LoraLayer"
+        ],
+        "executed_peft_code": false,
+        "name": "inference_only_peft_type_import_shim",
+        "reason": "pinned GLiNER2 ExtractorCollator eagerly imports trainer-only PEFT types"
+      }
+    ],
+    "device": "cpu",
+    "dtype": "float32",
+    "packages": {
+      "huggingface-hub": "0.36.0",
+      "numpy": "2.3.5",
+      "pydantic": "2.12.3",
+      "safetensors": "0.7.0",
+      "tokenizers": "0.21.4",
+      "torch": "2.9.1",
+      "transformers": "4.55.4"
+    },
+    "platform": {
+      "machine": "arm64",
+      "system": "Darwin"
+    },
+    "python": "3.12.3",
+    "pythonhashseed": 0,
+    "threads": 2,
+    "unicode": "15.0.0"
+  },
+  "scope": "upstream_multilingual_family_reference",
+  "semantic_pass": false,
+  "source": {
+    "checkout": "/private/tmp/antfly-gliner-family-upstream",
+    "imports": {
+      "gliner2": "/private/tmp/antfly-gliner-family-upstream/gliner2/__init__.py",
+      "gliner2.api_client": "/private/tmp/antfly-gliner-family-upstream/gliner2/api_client.py",
+      "gliner2.auto": "/private/tmp/antfly-gliner-family-upstream/gliner2/auto.py",
+      "gliner2.classification": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/__init__.py",
+      "gliner2.classification.candidates": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/candidates.py",
+      "gliner2.classification.compiler": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/compiler.py",
+      "gliner2.classification.constraints": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/constraints.py",
+      "gliner2.classification.decoding": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/__init__.py",
+      "gliner2.classification.decoding.base": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/base.py",
+      "gliner2.classification.decoding.beam": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/beam.py",
+      "gliner2.classification.decoding.exact": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/exact.py",
+      "gliner2.classification.decoding.independent": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/decoding/independent.py",
+      "gliner2.classification.engine": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/engine.py",
+      "gliner2.classification.errors": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/errors.py",
+      "gliner2.classification.result": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/result.py",
+      "gliner2.classification.schema": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/schema.py",
+      "gliner2.classification.scoring": "/private/tmp/antfly-gliner-family-upstream/gliner2/classification/scoring.py",
+      "gliner2.configuration": "/private/tmp/antfly-gliner-family-upstream/gliner2/configuration.py",
+      "gliner2.inference": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/__init__.py",
+      "gliner2.inference.candidate_decoder": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/candidate_decoder.py",
+      "gliner2.inference.chunking": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/chunking.py",
+      "gliner2.inference.engine": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/engine.py",
+      "gliner2.inference.overlap": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/overlap.py",
+      "gliner2.inference.runtime": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/runtime.py",
+      "gliner2.inference.schema": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/schema.py",
+      "gliner2.inference.schema_model": "/private/tmp/antfly-gliner-family-upstream/gliner2/inference/schema_model.py",
+      "gliner2.joint_ie": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/__init__.py",
+      "gliner2.joint_ie.calibration": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/calibration.py",
+      "gliner2.joint_ie.candidate_scores": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/candidate_scores.py",
+      "gliner2.joint_ie.candidates": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/candidates.py",
+      "gliner2.joint_ie.compiler": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/compiler.py",
+      "gliner2.joint_ie.constraints": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/constraints.py",
+      "gliner2.joint_ie.engine": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/engine.py",
+      "gliner2.joint_ie.lattice": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/lattice.py",
+      "gliner2.joint_ie.result": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/result.py",
+      "gliner2.joint_ie.schema": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/schema.py",
+      "gliner2.joint_ie.scoring": "/private/tmp/antfly-gliner-family-upstream/gliner2/joint_ie/scoring.py",
+      "gliner2.layers": "/private/tmp/antfly-gliner-family-upstream/gliner2/layers.py",
+      "gliner2.models": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/__init__.py",
+      "gliner2.models.base": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/base.py",
+      "gliner2.models.boundary": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/__init__.py",
+      "gliner2.models.boundary.constants": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/constants.py",
+      "gliner2.models.boundary.content": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/content.py",
+      "gliner2.models.boundary.encoding": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/encoding.py",
+      "gliner2.models.boundary.engine": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/engine.py",
+      "gliner2.models.boundary.heads": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/heads.py",
+      "gliner2.models.boundary.indexing": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/indexing.py",
+      "gliner2.models.boundary.losses": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/losses.py",
+      "gliner2.models.boundary.model": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/model.py",
+      "gliner2.models.boundary.pool": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/pool.py",
+      "gliner2.models.boundary.proposal": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/proposal.py",
+      "gliner2.models.boundary.records": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/records.py",
+      "gliner2.models.boundary.relations": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/relations.py",
+      "gliner2.models.boundary.rotary": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/rotary.py",
+      "gliner2.models.boundary.scoring": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/scoring.py",
+      "gliner2.models.boundary.targets_device": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/targets_device.py",
+      "gliner2.models.boundary.validation": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/boundary/validation.py",
+      "gliner2.models.candidates": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/candidates.py",
+      "gliner2.models.loading": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/loading.py",
+      "gliner2.models.outputs": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/outputs.py",
+      "gliner2.models.span": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/span/__init__.py",
+      "gliner2.models.span.model": "/private/tmp/antfly-gliner-family-upstream/gliner2/models/span/model.py",
+      "gliner2.processing": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/__init__.py",
+      "gliner2.processing.boundary_preprocessing": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/boundary_preprocessing.py",
+      "gliner2.processing.layouts": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/layouts.py",
+      "gliner2.processing.records": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/records.py",
+      "gliner2.processing.targets": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/targets.py",
+      "gliner2.processing.word_splitter": "/private/tmp/antfly-gliner-family-upstream/gliner2/processing/word_splitter.py",
+      "gliner2.processor": "/private/tmp/antfly-gliner-family-upstream/gliner2/processor.py",
+      "gliner2.training": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/__init__.py",
+      "gliner2.training.data": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/data.py",
+      "gliner2.training.matching": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/matching.py",
+      "gliner2.training.sampler": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/sampler.py",
+      "gliner2.training.trainer": "/private/tmp/antfly-gliner-family-upstream/gliner2/training/trainer.py",
+      "gliner2.utils.device_errors": "/private/tmp/antfly-gliner-family-upstream/gliner2/utils/device_errors.py",
+      "gliner2.utils.sync_probe": "/private/tmp/antfly-gliner-family-upstream/gliner2/utils/sync_probe.py"
+    },
+    "package_version": "2.0.0",
+    "repo": "https://github.com/fastino-ai/GLiNER2",
+    "revision": "55656fbfa01d3d4a77485e1a1eeeaf682990ccdf"
+  },
+  "status": "captured"
+}

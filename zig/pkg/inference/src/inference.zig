@@ -177,6 +177,8 @@ test {
     _ = @import("architectures/gliner/boundary_engine_device_test.zig");
     _ = @import("architectures/gliner/boundary_reduced_device_test.zig");
     _ = @import("architectures/gliner/boundary_scorer_device_test.zig");
+    _ = @import("architectures/gliner/boundary_family_device_test.zig");
+    _ = @import("extractors/gliner_decide_1b_parity_test.zig");
     _ = @import("architectures/gliner/boundary_request_device_test.zig");
     _ = @import("extractors/gliner_boundary_long_tasks_test.zig");
     _ = @import("ops/native_activation_policy_test.zig");

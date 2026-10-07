@@ -1,0 +1,130 @@
+{
+  "format_version": 1,
+  "requests": [
+    {
+      "id": "bare_long",
+      "kind": "classification",
+      "text": "Jordan Lee joined Acme Labs in Seattle as research director on Monday. The team builds reliable search systems for hospitals, schools, and public agencies. During the first meeting, Jordan reviewed the launch plan with Priya Shah and confirmed that Acme Labs would open a new office in Portland. Engineers discussed model quality, response speed, privacy controls, and multilingual support. The company expects the project to help nurses find patient records faster while keeping sensitive data protected. Jordan will lead hiring, Priya will manage operations, and the research group will publish a progress report after the first customer trial next spring.",
+      "schema": {
+        "tasks": {
+          "topic": {
+            "labels": ["employment", "product", "other"],
+            "min_labels": 1,
+            "max_labels": 1
+          }
+        }
+      },
+      "expect": {"selected": {"topic": ["employment"]}}
+    },
+    {
+      "id": "described_short",
+      "kind": "classification",
+      "text": "a",
+      "schema": {
+        "tasks": {
+          "topic": {
+            "labels": {
+              "employment": "A person joins or works for an organization",
+              "product": "A product or technical system is discussed",
+              "other": "The text is about another subject"
+            },
+            "min_labels": 1,
+            "max_labels": 1
+          }
+        }
+      },
+      "expect": {"selected": {"topic": ["employment"]}}
+    },
+    {
+      "id": "described_long",
+      "kind": "classification",
+      "text": "Jordan Lee joined Acme Labs in Seattle as research director on Monday. The team builds reliable search systems for hospitals, schools, and public agencies. During the first meeting, Jordan reviewed the launch plan with Priya Shah and confirmed that Acme Labs would open a new office in Portland. Engineers discussed model quality, response speed, privacy controls, and multilingual support. The company expects the project to help nurses find patient records faster while keeping sensitive data protected. Jordan will lead hiring, Priya will manage operations, and the research group will publish a progress report after the first customer trial next spring.",
+      "schema": {
+        "tasks": {
+          "topic": {
+            "labels": {
+              "employment": "A person joins or works for an organization",
+              "product": "A product or technical system is discussed",
+              "other": "The text is about another subject"
+            },
+            "min_labels": 1,
+            "max_labels": 1
+          }
+        }
+      },
+      "expect": {"selected": {"topic": ["employment"]}}
+    },
+    {
+      "id": "prompt_described_short",
+      "kind": "classification",
+      "text": "a",
+      "schema": {
+        "tasks": {
+          "topic": {
+            "labels": {
+              "employment": "A person joins or works for an organization",
+              "product": "A product or technical system is discussed",
+              "other": "The text is about another subject"
+            },
+            "min_labels": 1,
+            "max_labels": 1,
+            "instruction": "Choose the single main topic of this document."
+          }
+        }
+      },
+      "expect": {"selected": {"topic": ["employment"]}}
+    },
+    {
+      "id": "prompt_described_long",
+      "kind": "classification",
+      "text": "Jordan Lee joined Acme Labs in Seattle as research director on Monday. The team builds reliable search systems for hospitals, schools, and public agencies. During the first meeting, Jordan reviewed the launch plan with Priya Shah and confirmed that Acme Labs would open a new office in Portland. Engineers discussed model quality, response speed, privacy controls, and multilingual support. The company expects the project to help nurses find patient records faster while keeping sensitive data protected. Jordan will lead hiring, Priya will manage operations, and the research group will publish a progress report after the first customer trial next spring.",
+      "schema": {
+        "tasks": {
+          "topic": {
+            "labels": {
+              "employment": "A person joins or works for an organization",
+              "product": "A product or technical system is discussed",
+              "other": "The text is about another subject"
+            },
+            "min_labels": 1,
+            "max_labels": 1,
+            "instruction": "Choose the single main topic of this document."
+          }
+        }
+      },
+      "expect": {"selected": {"topic": ["employment"]}}
+    },
+    {
+      "id": "prompt_short",
+      "kind": "classification",
+      "text": "a",
+      "schema": {
+        "tasks": {
+          "topic": {
+            "labels": ["employment", "product", "other"],
+            "min_labels": 1,
+            "max_labels": 1,
+            "instruction": "Choose the single main topic of this document."
+          }
+        }
+      },
+      "expect": {"selected": {"topic": ["employment"]}}
+    },
+    {
+      "id": "prompt_long",
+      "kind": "classification",
+      "text": "Jordan Lee joined Acme Labs in Seattle as research director on Monday. The team builds reliable search systems for hospitals, schools, and public agencies. During the first meeting, Jordan reviewed the launch plan with Priya Shah and confirmed that Acme Labs would open a new office in Portland. Engineers discussed model quality, response speed, privacy controls, and multilingual support. The company expects the project to help nurses find patient records faster while keeping sensitive data protected. Jordan will lead hiring, Priya will manage operations, and the research group will publish a progress report after the first customer trial next spring.",
+      "schema": {
+        "tasks": {
+          "topic": {
+            "labels": ["employment", "product", "other"],
+            "min_labels": 1,
+            "max_labels": 1,
+            "instruction": "Choose the single main topic of this document."
+          }
+        }
+      },
+      "expect": {"selected": {"topic": ["employment"]}}
+    }
+  ]
+}

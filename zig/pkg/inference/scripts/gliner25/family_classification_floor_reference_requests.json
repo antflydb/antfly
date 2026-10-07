@@ -1,0 +1,24 @@
+{
+  "format_version": 1,
+  "requests": [
+    {
+      "id": "one_character_two_label",
+      "kind": "classification",
+      "text": "a",
+      "schema": {
+        "tasks": {
+          "answer": {
+            "labels": ["a", "other"],
+            "min_labels": 1,
+            "max_labels": 1
+          }
+        }
+      },
+      "expect": {
+        "selected": {
+          "answer": ["a"]
+        }
+      }
+    }
+  ]
+}

@@ -166,6 +166,10 @@ pub const Limits = struct {
 };
 pub const Options = struct {
     schema_version: u32 = 2,
+    /// Compatibility for requests upgraded from the legacy classification
+    /// contract, whose inclusive threshold domain was [0, 1]. Public
+    /// schema-v2 compilation keeps the constraint calibration domain (0, 1).
+    allow_legacy_classification_threshold_endpoints: bool = false,
     limits: Limits = .{},
     regex_context: ?*anyopaque = null,
     /// Must compile syntax/flags using the same bounded engine used at execution.
@@ -269,7 +273,22 @@ const Parser = struct {
         }
         if (self.has_explicit_classification_top_k and usesStructuredClassification(cls, raw_constraints.array.items.len > 0))
             return error.ConstrainedClassificationTopKUnsupported;
-        const program = try constraints.compileValue(self.allocator, tasks, raw_constraints, .{ .max_nodes = self.options.limits.max_constraint_nodes, .max_depth = self.options.limits.max_json_depth });
+        const structured_route = usesStructuredClassification(cls, raw_constraints.array.items.len > 0);
+        const program_tasks = if (self.options.allow_legacy_classification_threshold_endpoints and !structured_route) blk: {
+            const ordinary = try self.allocator.dupe(constraints.Task, tasks);
+            // The ordinary presenter accepts inclusive cutoffs: zero selects
+            // every sigmoid label and one selects only an exact-one score (with
+            // its existing best-label fallback). The constraint solver keeps
+            // its strict open interval because its centered-logit objective
+            // cannot represent either endpoint. Give only its rootless,
+            // non-structured metadata copy a neutral finite cutoff; the
+            // classification IR above retains the caller's actual threshold.
+            for (ordinary) |*task| {
+                if (task.threshold == 0 or task.threshold == 1) task.threshold = 0.5;
+            }
+            break :blk ordinary;
+        } else tasks;
+        const program = try constraints.compileValue(self.allocator, program_tasks, raw_constraints, .{ .max_nodes = self.options.limits.max_constraint_nodes, .max_depth = self.options.limits.max_json_depth });
         return .{ .source_version = self.options.schema_version, .entities = entities, .entity_attributes = attrs, .classifications = cls, .structures = structures, .relations = relations, .classification_constraints = program, .joint_ie = joint };
     }
 
@@ -400,6 +419,7 @@ const Parser = struct {
             const top_k = (try optionalNumber(obj, "top_k")) orelse 1;
             if (top_k == 0) return error.InvalidClassificationTopK;
             self.has_explicit_classification_top_k = self.has_explicit_classification_top_k or obj.contains("top_k");
+            const structured_selection = mode == .ordinal or obj.contains("min_labels") or obj.contains("max_labels") or obj.contains("default") or obj.contains("candidate_threshold") or obj.contains("ordered");
             const task = constraints.Task{
                 .name = name,
                 .labels = names,
@@ -412,11 +432,14 @@ const Parser = struct {
                 .default_label = default_label,
             };
             if (mode == .ordinal and present(obj, "ordered") != null and !try boolean(obj, "ordered", true)) return error.ConflictingClassificationMode;
-            try constraints.validateTask(task);
+            var validation_task = task;
+            if (self.options.allow_legacy_classification_threshold_endpoints and !structured_selection and (validation_task.threshold == 0 or validation_task.threshold == 1))
+                validation_task.threshold = 0.5;
+            try constraints.validateTask(validation_task);
             classification.* = .{
                 .task = task,
                 .mode = mode,
-                .structured_selection = mode == .ordinal or obj.contains("min_labels") or obj.contains("max_labels") or obj.contains("default") or obj.contains("candidate_threshold") or obj.contains("ordered"),
+                .structured_selection = structured_selection,
                 .activation = try enumeration(Activation, obj, "activation", .auto),
                 .label_definitions = defs,
                 .prompt = prompt,
@@ -791,6 +814,47 @@ test "extraction classification preserves explicit structured selection intent" 
         defer compiled.deinit();
         try std.testing.expect(compiled.schema.classifications[0].structured_selection);
     }
+}
+
+test "ordinary classification accepts endpoint thresholds without weakening constraints" {
+    const a = std.testing.allocator;
+    const interior_json = "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"multi_label\":true,\"threshold\":0.5}]}";
+    var standard = try compile(a, interior_json, .{});
+    defer standard.deinit();
+    var compatible = try compile(a, interior_json, .{ .allow_legacy_classification_threshold_endpoints = true });
+    defer compatible.deinit();
+    try std.testing.expectEqualSlices(u8, &standard.fingerprint, &compatible.fingerprint);
+
+    inline for (.{ 0, 1 }) |endpoint| {
+        const json = std.fmt.comptimePrint(
+            "{{\"classifications\":[{{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"multi_label\":true,\"threshold\":{d}}}]}}",
+            .{endpoint},
+        );
+        try std.testing.expectError(error.InvalidClassificationCalibration, compile(a, json, .{}));
+        var compiled = try compile(a, json, .{ .allow_legacy_classification_threshold_endpoints = true });
+        defer compiled.deinit();
+        try std.testing.expect(!usesStructuredClassification(compiled.schema.classifications, false));
+        try std.testing.expectEqual(@as(f64, endpoint), compiled.schema.classifications[0].task.threshold);
+        try std.testing.expectEqual(@as(f64, 0.5), compiled.schema.classification_constraints.tasks[0].threshold);
+    }
+
+    const structured = [_][]const u8{
+        // A task-local cardinality field selects the constraint solver.
+        "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"multi_label\":true,\"min_labels\":0,\"threshold\":0}]}",
+        // A structured sibling moves the complete collection onto that route.
+        "{\"classifications\":[{\"name\":\"ordinary\",\"labels\":[\"a\",\"b\"],\"multi_label\":true,\"threshold\":1},{\"name\":\"structured\",\"labels\":[\"x\",\"y\"],\"min_labels\":1,\"max_labels\":1}]}",
+        // Cross-task roots also require the strict solver calibration domain.
+        "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"multi_label\":true,\"threshold\":0}],\"classification_constraints\":[{\"type\":\"LabelRef\",\"task\":\"t\",\"label\":\"a\"}]}",
+    };
+    for (structured) |json|
+        try std.testing.expectError(error.InvalidClassificationCalibration, compile(a, json, .{ .allow_legacy_classification_threshold_endpoints = true }));
+
+    // Keep the established explicit-top-k diagnostic ahead of solver
+    // calibration when both parts of a request are invalid.
+    try std.testing.expectError(
+        error.ConstrainedClassificationTopKUnsupported,
+        compile(a, "{\"classifications\":[{\"name\":\"t\",\"labels\":[\"a\",\"b\"],\"multi_label\":true,\"threshold\":0,\"top_k\":1}],\"classification_constraints\":[{\"type\":\"LabelRef\",\"task\":\"t\",\"label\":\"a\"}]}", .{ .allow_legacy_classification_threshold_endpoints = true }),
+    );
 }
 
 test "extraction classification top_k rejects every structured route including explicit one" {

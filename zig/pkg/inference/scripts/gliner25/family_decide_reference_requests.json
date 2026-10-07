@@ -1,0 +1,158 @@
+{
+  "format_version": 1,
+  "scope": "public_decide_classification_reference",
+  "requests": [
+    {
+      "id": "described_prompt_choice",
+      "kind": "classification",
+      "text": "The replacement card arrived, but the PIN never came and the card cannot be used.",
+      "schema": {
+        "tasks": {
+          "action": {
+            "labels": {
+              "send_pin": "Send or reset the card PIN",
+              "replace_card": "Replace a lost or damaged physical card",
+              "balance_help": "Answer a balance question"
+            },
+            "min_labels": 1,
+            "max_labels": 1,
+            "instruction": "Choose the one action that best resolves the customer's issue."
+          }
+        }
+      },
+      "native_schema": {
+        "classifications": [
+          {
+            "name": "action",
+            "prompt": "Choose the one action that best resolves the customer's issue.",
+            "top_k": 3,
+            "labels": ["send_pin", "replace_card", "balance_help"],
+            "label_definitions": {
+              "send_pin": {"description": "Send or reset the card PIN"},
+              "replace_card": {"description": "Replace a lost or damaged physical card"},
+              "balance_help": {"description": "Answer a balance question"}
+            }
+          }
+        ]
+      },
+      "decide_request": {
+        "model": "fastino/GLiNER2.5-multi-Decide",
+        "state": "The replacement card arrived, but the PIN never came and the card cannot be used.",
+        "questions": {
+          "action": {
+            "type": "choice",
+            "instructions": "Choose the one action that best resolves the customer's issue.",
+            "criteria": {
+              "send_pin": "Send or reset the card PIN",
+              "replace_card": "Replace a lost or damaged physical card",
+              "balance_help": "Answer a balance question"
+            }
+          }
+        }
+      },
+      "expect": {"tasks": ["action"]}
+    },
+    {
+      "id": "choice_score_noul",
+      "kind": "classification",
+      "text": "The deployment failed twice, affects all customers, and rollback is ready.",
+      "schema": {
+        "tasks": {
+          "response": {
+            "labels": {
+              "rollback": "Roll back to the last healthy release",
+              "retry": "Retry the current deployment",
+              "observe": "Wait and collect more evidence"
+            },
+            "min_labels": 1,
+            "max_labels": 1,
+            "instruction": "Choose the safest immediate response."
+          },
+          "severity": {
+            "labels": {
+              "0": "Low impact",
+              "1": "Moderate impact",
+              "2": "High impact",
+              "3": "Critical impact"
+            },
+            "min_labels": 1,
+            "max_labels": 1,
+            "ordered": true,
+            "instruction": "Score the incident severity."
+          },
+          "page_on_call": {
+            "labels": {
+              "false": "False",
+              "true": "True"
+            },
+            "min_labels": 1,
+            "max_labels": 1,
+            "instruction": "Should the on-call engineer be paged now?"
+          }
+        }
+      },
+      "native_schema": {
+        "classifications": [
+          {
+            "name": "response",
+            "prompt": "Choose the safest immediate response.",
+            "top_k": 3,
+            "labels": ["rollback", "retry", "observe"],
+            "label_definitions": {
+              "rollback": {"description": "Roll back to the last healthy release"},
+              "retry": {"description": "Retry the current deployment"},
+              "observe": {"description": "Wait and collect more evidence"}
+            }
+          },
+          {
+            "name": "severity",
+            "prompt": "Score the incident severity.",
+            "top_k": 4,
+            "labels": ["0", "1", "2", "3"],
+            "label_definitions": {
+              "0": {"description": "Low impact"},
+              "1": {"description": "Moderate impact"},
+              "2": {"description": "High impact"},
+              "3": {"description": "Critical impact"}
+            }
+          },
+          {
+            "name": "page_on_call",
+            "prompt": "Should the on-call engineer be paged now?",
+            "top_k": 2,
+            "labels": ["false", "true"],
+            "label_definitions": {
+              "false": {"description": "False"},
+              "true": {"description": "True"}
+            }
+          }
+        ]
+      },
+      "decide_request": {
+        "model": "fastino/GLiNER2.5-multi-Decide",
+        "state": "The deployment failed twice, affects all customers, and rollback is ready.",
+        "questions": {
+          "response": {
+            "type": "choice",
+            "instructions": "Choose the safest immediate response.",
+            "criteria": {
+              "rollback": "Roll back to the last healthy release",
+              "retry": "Retry the current deployment",
+              "observe": "Wait and collect more evidence"
+            }
+          },
+          "severity": {
+            "type": "score",
+            "instructions": "Score the incident severity.",
+            "criteria": ["Low impact", "Moderate impact", "High impact", "Critical impact"]
+          },
+          "page_on_call": {
+            "type": "noul",
+            "instructions": "Should the on-call engineer be paged now?"
+          }
+        }
+      },
+      "expect": {"tasks": ["response", "severity", "page_on_call"]}
+    }
+  ]
+}

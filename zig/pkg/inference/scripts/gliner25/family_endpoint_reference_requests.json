@@ -1,0 +1,74 @@
+{
+  "format_version": 1,
+  "scope": "mixed_feature_endpoint_bounds_reference",
+  "extract_schema": {
+    "entities": {
+      "person": "A named individual",
+      "organization": "A company or institution",
+      "location": "A city or place"
+    },
+    "relations": ["works_for"],
+    "structures": {
+      "employment": {
+        "fields": [
+          {"name": "person", "dtype": "str"},
+          {"name": "organization", "dtype": "str"},
+          {"name": "role", "dtype": "str"}
+        ]
+      }
+    }
+  },
+  "classification_schema": {
+    "tasks": {
+      "topic": {
+        "labels": {
+          "employment": "A person joins or works for an organization",
+          "product": "A product or technical system is discussed",
+          "other": "The text is about another subject"
+        },
+        "min_labels": 1,
+        "max_labels": 1,
+        "instruction": "Choose the single main topic of this document."
+      }
+    }
+  },
+  "native_schema": {
+    "entities": ["person", "organization", "location"],
+    "entity_definitions": {
+      "person": {"description": "A named individual"},
+      "organization": {"description": "A company or institution"},
+      "location": {"description": "A city or place"}
+    },
+    "relations": [{"type": "works_for"}],
+    "structures": {
+      "employment": {
+        "fields": {
+          "person": {"type": "str"},
+          "organization": {"type": "str"},
+          "role": {"type": "str"}
+        }
+      }
+    },
+    "classifications": [
+      {
+        "name": "topic",
+        "labels": ["employment", "product", "other"],
+        "label_definitions": {
+          "employment": {"description": "A person joins or works for an organization"},
+          "product": {"description": "A product or technical system is discussed"},
+          "other": {"description": "The text is about another subject"}
+        },
+        "prompt": "Choose the single main topic of this document.",
+        "min_labels": 1,
+        "max_labels": 1
+      }
+    ]
+  },
+  "requests": [
+    {"id": "one_character", "text": "A"},
+    {
+      "id": "realistic_long",
+      "text": "Jordan Lee joined Acme Labs in Seattle as research director on Monday. The team builds reliable search systems for hospitals, schools, and public agencies. During the first meeting, Jordan reviewed the launch plan with Priya Shah and confirmed that Acme Labs would open a new office in Portland. Engineers discussed model quality, response speed, privacy controls, and multilingual support. The company expects the project to help nurses find patient records faster while keeping sensitive data protected. Jordan will lead hiring, Priya will manage operations, and the research group will publish a progress report after the first customer trial next spring."
+    }
+  ]
+}

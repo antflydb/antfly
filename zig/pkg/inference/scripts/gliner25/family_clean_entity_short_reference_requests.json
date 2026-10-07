@@ -1,0 +1,42 @@
+{
+  "format_version": 1,
+  "scope": "clean_entity_short_reference",
+  "prepared_geometry": {
+    "bare_clean_short": {
+      "input_tokens": 18,
+      "processor_text_tokens": 2,
+      "schema_token_lengths": [8]
+    },
+    "described_clean_short": {
+      "input_tokens": 24,
+      "processor_text_tokens": 2,
+      "schema_token_lengths": [8]
+    }
+  },
+  "requests": [
+    {
+      "id": "bare_clean_short",
+      "kind": "extract",
+      "text": "a.",
+      "schema": {
+        "entities": ["x"]
+      },
+      "expect": {
+        "contains_text": ["a."]
+      }
+    },
+    {
+      "id": "described_clean_short",
+      "kind": "extract",
+      "text": "a.",
+      "schema": {
+        "entities": {
+          "x": "x"
+        }
+      },
+      "expect": {
+        "contains_text": ["a."]
+      }
+    }
+  ]
+}

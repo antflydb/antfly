@@ -172,9 +172,12 @@ fn encoderLayer(math: *math_mod.Context, hidden: CT, relative: CT, relative_ids:
     const h = e.hidden_size;
     const rows = batch * sequence;
     var name: [192]u8 = undefined;
-    const q = try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.query_proj", .{layer}));
-    const k = try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.key_proj", .{layer}));
-    const v = try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.value_proj", .{layer}));
+    var stage_started_ns = math.traceNow();
+    var stage_started_dispatches = math.stats.device_dispatches;
+    const packed_qkv = try math.linearQkv(hidden, rows, h, layer);
+    const q = if (packed_qkv) |result| result.query else try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.query_proj", .{layer}));
+    const k = if (packed_qkv) |result| result.key else try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.key_proj", .{layer}));
+    const v = if (packed_qkv) |result| result.value else try math.linear(hidden, rows, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.value_proj", .{layer}));
     const qr = if (math.resident_weights)
         try math.derived(.{ .relative_query = @intCast(layer) }, &.{ e.max_position_embeddings, h })
     else
@@ -183,7 +186,13 @@ fn encoderLayer(math: *math_mod.Context, hidden: CT, relative: CT, relative_ids:
         try math.derived(.{ .relative_key = @intCast(layer) }, &.{ e.max_position_embeddings, h })
     else
         try math.linear(relative, e.max_position_embeddings, h, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.self.key_proj", .{layer}));
+    try math.traceLayerStage(layer, .qkv, stage_started_ns, stage_started_dispatches);
+    stage_started_ns = math.traceNow();
+    stage_started_dispatches = math.stats.device_dispatches;
     const attended = try math.kernel(.deberta_attention, &.{ batch, sequence, e.num_attention_heads, h / e.num_attention_heads, e.max_position_embeddings }, &.{ q, k, v, qr, kr, relative_ids, mask }, 0);
+    try math.traceLayerStage(layer, .attention, stage_started_ns, stage_started_dispatches);
+    stage_started_ns = math.traceNow();
+    stage_started_dispatches = math.stats.device_dispatches;
     math.drop(q);
     math.drop(k);
     math.drop(v);
@@ -195,6 +204,14 @@ fn encoderLayer(math: *math_mod.Context, hidden: CT, relative: CT, relative_ids:
     math.drop(projected);
     const attention_norm = try math.normEps(residual, rows, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.attention.output.LayerNorm", .{layer}), e.layer_norm_eps);
     math.drop(residual);
+    try math.traceLayerStage(layer, .output, stage_started_ns, stage_started_dispatches);
+    stage_started_ns = math.traceNow();
+    stage_started_dispatches = math.stats.device_dispatches;
+    if (try math.fusedFfn(attention_norm, attention_norm, rows, h, e.intermediate_size, layer, e.layer_norm_eps)) |normalized| {
+        math.drop(attention_norm);
+        try math.traceLayerStage(layer, .ffn, stage_started_ns, stage_started_dispatches);
+        return normalized;
+    }
     const intermediate = try math.linear(attention_norm, rows, h, e.intermediate_size, try std.fmt.bufPrint(&name, "encoder.layer.{d}.intermediate.dense", .{layer}));
     const activated = try math.kernel(.gelu, &.{rows * e.intermediate_size}, &.{intermediate}, 0);
     math.drop(intermediate);
@@ -205,6 +222,7 @@ fn encoderLayer(math: *math_mod.Context, hidden: CT, relative: CT, relative_ids:
     math.drop(output);
     const normalized = try math.normEps(ffn_residual, rows, h, try std.fmt.bufPrint(&name, "encoder.layer.{d}.output.LayerNorm", .{layer}), e.layer_norm_eps);
     math.drop(ffn_residual);
+    try math.traceLayerStage(layer, .ffn, stage_started_ns, stage_started_dispatches);
     return normalized;
 }
 
@@ -244,11 +262,13 @@ pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator,
     errdefer math.destroy();
     math.encoder_precision = physicalPrecision(options.precision);
     math.configure(options.execution_policy);
+    math.setTraceRole(.encoder);
     const e = config.encoder;
     const h = e.hidden_size;
     const batch = prepared.samples.len;
     const sequence = prepared.sequence_length;
     const rows = prepared.input_ids.len;
+    const embedding_started_ns = math.traceNow();
     const mask = try uploadIds(math, prepared.attention_mask);
     defer math.drop(mask);
     const words = if (options.precision == .fp32) blk: {
@@ -261,6 +281,7 @@ pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator,
     math.drop(words);
     var hidden = try math.kernel(.mask_rows, &.{ rows, h }, &.{ normed, mask }, 0);
     math.drop(normed);
+    math.traceStage(.embedding, embedding_started_ns);
     const relative = if (math.resident_weights)
         try math.derived(.relative_normalized, &.{ e.max_position_embeddings, h })
     else blk: {
@@ -273,6 +294,7 @@ pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator,
     for (relative_values, 0..) |*value, i| value.* = @intCast(@import("../../models/deberta.zig").relativePositionBucket(@as(i64, @intCast(i)) - @as(i64, @intCast(sequence - 1)), e.position_buckets, e.max_position_embeddings));
     const relative_ids = try math.uploadIntegers(relative_values);
     defer math.drop(relative_ids);
+    const encoder_started_ns = math.traceNow();
     for (0..e.num_hidden_layers) |layer| {
         try math.check();
         const output = try encoderLayer(math, hidden, relative, relative_ids, mask, config, batch, sequence, layer);
@@ -280,6 +302,8 @@ pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator,
         hidden = output;
         if ((layer + 1) % 2 == 0) try math.finishSegment();
     }
+    math.traceStage(.encoder_layers, encoder_started_ns);
+    const routing_started_ns = math.traceNow();
     const text = (try route(math, hidden, prepared, prepared.text_word_indices, prepared.text_word_mask, prepared.word_width, h)).?;
     const queries = try route(math, hidden, prepared, prepared.query_marker_indices, prepared.query_marker_mask, prepared.query_width, h);
     const classification = try route(math, hidden, prepared, prepared.cls_marker_indices, prepared.cls_marker_mask, prepared.classification_width, h);
@@ -330,5 +354,6 @@ pub fn encodeDevice(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator,
         break :blk try math.kernel(.concat, &.{ batch * relation_width, h, h }, &.{ heads, tails }, 0);
     } else null;
     try math.finishSegment();
+    math.traceStage(.routing, routing_started_ns);
     return .{ .math = math, .prepared = prepared, .hidden_states = hidden, .text_states = text, .query_states = queries, .classification_states = classification, .parent_states = parents, .relation_query_states = relation_states, .text_lengths = lengths, .relation_routes = relation_routes, .relation_width = relation_width, .relation_query_dim = resource_plan.native.relation_query_dim };
 }

@@ -1119,6 +1119,8 @@ fn exportGlinerBundleToGguf(
 fn requireLegacyGlinerExportProfile(manifest: manifest_mod.ModelManifest) !void {
     if (manifest.gliner_architecture == .boundary or std.mem.eql(u8, manifest.gliner_model_type, "gliner2.5"))
         return error.UnsupportedGlinerBoundaryExport;
+    if (manifest.gliner_architecture == .span and manifest.gliner_span_encoder_family == .modern_bert)
+        return error.UnsupportedGlinerModernBertExport;
 }
 
 fn requireGlinerClassificationHeadArtifacts(
@@ -1160,6 +1162,11 @@ test "gliner boundary export cannot write a legacy span bundle" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.UnsupportedGlinerBoundaryExport, requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_architecture = .boundary }));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryExport, requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_model_type = "gliner2.5" }));
+    try std.testing.expectError(error.UnsupportedGlinerModernBertExport, requireLegacyGlinerExportProfile(.{
+        .allocator = a,
+        .gliner_architecture = .span,
+        .gliner_span_encoder_family = .modern_bert,
+    }));
     try requireLegacyGlinerExportProfile(.{ .allocator = a, .gliner_model_type = "gliner2" });
 }
 
@@ -1595,12 +1602,72 @@ fn copyGlinerBundleAssets(
     for (asset_names) |asset_name| {
         const bytes = c_file.readFileFromDir(allocator, model_dir, asset_name) catch continue;
         defer allocator.free(bytes);
+        const exported_bytes = if (std.mem.eql(u8, asset_name, "model_manifest.json"))
+            try glinerExportManifestWithoutReservedDecision(allocator, bytes)
+        else
+            null;
+        defer if (exported_bytes) |owned| allocator.free(owned);
         const target = try std.fs.path.join(allocator, &.{ out_dir, asset_name });
         defer allocator.free(target);
         if (std.fs.path.dirname(target)) |parent| try compat.cwd().createDirPath(io, parent);
-        try compat.cwd().writeFile(io, .{ .sub_path = target, .data = bytes });
+        try compat.cwd().writeFile(io, .{ .sub_path = target, .data = exported_bytes orelse bytes });
     }
     try writeGlinerBundleMarker(allocator, out_dir, output_path);
+}
+
+/// Quantized legacy span exports retain ordinary extraction/classification,
+/// but do not inherit the source F32 artifact's exact-byte Decide grant.
+fn glinerExportManifestWithoutReservedDecision(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{ .duplicate_field_behavior = .@"error" }) catch
+        return error.InvalidModelManifest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidModelManifest;
+
+    var changed = false;
+    const fields = [_]struct { name: []const u8, reserved: []const u8 }{
+        .{ .name = "tasks", .reserved = "decide" },
+        .{ .name = "capabilities", .reserved = "typed_decisions" },
+    };
+    for (fields) |field| {
+        const value = parsed.value.object.getPtr(field.name) orelse continue;
+        if (value.* != .array) return error.InvalidModelManifest;
+        var write: usize = 0;
+        for (value.array.items) |item| {
+            if (item != .string) return error.InvalidModelManifest;
+            if (std.mem.eql(u8, item.string, field.reserved)) {
+                changed = true;
+                continue;
+            }
+            value.array.items[write] = item;
+            write += 1;
+        }
+        value.array.items.len = write;
+    }
+    if (!changed) return allocator.dupe(u8, bytes);
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
+}
+
+test "GLiNER quantized export strips only the unqualified decision grant" {
+    const a = std.testing.allocator;
+    const source =
+        \\{"type":"extractor","tasks":["extract","decide"],"capabilities":["classification","typed_decisions"],"inputs":["text"],"source":{"revision":"pinned"}}
+    ;
+    const transformed = try glinerExportManifestWithoutReservedDecision(a, source);
+    defer a.free(transformed);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, transformed, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("tasks").?.array.items.len);
+    try std.testing.expectEqualStrings("extract", parsed.value.object.get("tasks").?.array.items[0].string);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("capabilities").?.array.items.len);
+    try std.testing.expectEqualStrings("classification", parsed.value.object.get("capabilities").?.array.items[0].string);
+    try std.testing.expectEqualStrings("pinned", parsed.value.object.get("source").?.object.get("revision").?.string);
+
+    const ordinary = "{\"tasks\":[\"extract\"],\"capabilities\":[\"classification\"]}";
+    const unchanged = try glinerExportManifestWithoutReservedDecision(a, ordinary);
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings(ordinary, unchanged);
+    try std.testing.expectError(error.InvalidModelManifest, glinerExportManifestWithoutReservedDecision(a, "{"));
+    try std.testing.expectError(error.InvalidModelManifest, glinerExportManifestWithoutReservedDecision(a, "{\"tasks\":false}"));
 }
 
 fn writeGlinerBundleMarker(allocator: std.mem.Allocator, out_dir: []const u8, output_path: []const u8) !void {

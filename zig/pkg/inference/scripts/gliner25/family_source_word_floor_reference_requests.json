@@ -1,0 +1,30 @@
+{
+  "format_version": 1,
+  "scope": "source_word_entity_floor_reference",
+  "requests": [
+    {
+      "id": "bare_source_word_floor",
+      "kind": "extract",
+      "text": "Alice",
+      "schema": {
+        "entities": ["person"]
+      },
+      "expect": {
+        "contains_text": ["Alice"]
+      }
+    },
+    {
+      "id": "described_source_word_floor",
+      "kind": "extract",
+      "text": "Alice",
+      "schema": {
+        "entities": {
+          "person": "x"
+        }
+      },
+      "expect": {
+        "contains_text": ["Alice"]
+      }
+    }
+  ]
+}
