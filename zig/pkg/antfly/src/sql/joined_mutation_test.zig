@@ -1143,13 +1143,47 @@ test "SQL row subquery count star has one output rather than zero projections" {
     try std.testing.expectEqual(@as(usize, 1), backend.commits);
 }
 
-test "SQL row subquery cannot escape its independent derived source" {
-    var backend: Backend = .{};
-    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source WHERE source.id=target._id)", .{});
-    defer compiled.deinit();
-    try std.testing.expectError(error.UndefinedColumn, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
-    try std.testing.expectEqual(@as(usize, 0), backend.captures);
-    try std.testing.expectEqual(@as(usize, 0), backend.commits);
+test "SQL row subquery shares one correlated producer across typed assignments" {
+    for ([_]struct { sql: []const u8, first: []const u8 = "10", last: []const u8 = "20" }{
+        .{ .sql = "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source WHERE source.id=target._id) RETURNING n,cold" },
+        .{ .sql = "UPDATE target t SET (n,cold)=(SELECT s.delta,'new' FROM source s WHERE s.id=t._id ORDER BY s.delta DESC LIMIT 1) RETURNING n,cold" },
+        .{ .sql = "UPDATE target t SET (n,cold)=(SELECT q.* FROM (SELECT s.delta,'new' AS label FROM source s WHERE s.id=t._id) q) RETURNING n,cold" },
+        .{ .sql = "UPDATE target t SET (n,cold)=(SELECT s.delta+t.n,'new' FROM source s WHERE s.id=t._id) RETURNING n,cold", .first = "11", .last = "22" },
+        .{ .sql = "UPDATE target t SET (n,cold)=(SELECT COUNT(*),'new' FROM source s WHERE s.id=t._id) RETURNING n,cold", .first = "1", .last = "1" },
+    }) |case| {
+        var backend: Backend = .{};
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+        try std.testing.expectEqualStrings(case.first, result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings(case.last, result.output.rows[1][0].string);
+        for (result.output.rows) |row| try std.testing.expectEqualStrings("new", row[1].string);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 2), backend.last_scan_count);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    }
+}
+
+test "SQL row subquery keyed correlation scales without source rescans or duplicate producers" {
+    for ([_]usize{ 128, 1024 }) |count| {
+        var backend: Backend = .{ .row_count = count };
+        var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET (n,cold)=(SELECT s.delta,'new' FROM source s WHERE s.id=t._id) RETURNING n,cold", .{});
+        defer compiled.deinit();
+        const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 17, .result_rows = count });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, @intCast(count)), result.output.rows_affected);
+        for (result.output.rows, 1..) |row, n| try std.testing.expectEqual(n * 10, try std.fmt.parseInt(usize, row[0].string, 10));
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 2), backend.last_scan_count);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        try std.testing.expect(backend.rows_read <= count * 2);
+        try std.testing.expect(backend.checkpoints <= count * 32);
+        std.debug.print("SQL row producer: rows={} native_rows={} checkpoints={} peak_bytes={} elapsed_ns={}\n", .{ count, backend.rows_read, backend.checkpoints, result.peakMemoryBytes(), std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+    }
 }
 
 test "SQL row subquery expanded width releases every allocation on failure" {
@@ -1157,7 +1191,7 @@ test "SQL row subquery expanded width releases every allocation on failure" {
         fn run(a: std.mem.Allocator) !void {
             var backend: Backend = .{};
             defer std.debug.assert(backend.captures == backend.closes);
-            var compiled = try compiler.compile(a, "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source ORDER BY delta DESC LIMIT 1) s) RETURNING n,cold", .{});
+            var compiled = try compiler.compile(a, "UPDATE target t SET (n,cold)=(SELECT s.delta,'new' FROM source s WHERE s.id=t._id) RETURNING n,cold", .{});
             defer compiled.deinit();
             var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
             defer result.deinit();
@@ -1190,7 +1224,7 @@ test "SQL row subquery empty expanded source assigns SQL NULL to every target" {
     vtable.mutate = Empty.mutate;
     vtable.mutate_prepared = Empty.mutate;
     iface.vtable = &vtable;
-    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source WHERE false) s) RETURNING n,cold", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET (n,cold)=(SELECT s.delta,'new' FROM source s WHERE s.id=t._id AND false) RETURNING n,cold", .{});
     defer compiled.deinit();
     var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{}, .{});
     defer result.deinit();
@@ -1240,6 +1274,7 @@ test "SQL mutation scalar subquery rejects multiple rows before commit" {
         "UPDATE target SET (n,cold)=ROW((SELECT delta FROM source WHERE source.id=target._id),'new')",
         "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source)",
         "UPDATE target SET (n,cold)=(SELECT * FROM (SELECT delta,'new' AS label FROM source) s)",
+        "UPDATE target t SET (n,cold)=(SELECT s.delta,'new' FROM source s WHERE s.id=t._id)",
     }) |sql| {
         var backend: Backend = .{ .duplicates = true };
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});

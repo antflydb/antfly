@@ -1790,6 +1790,56 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute("SELECT n,cold FROM target ORDER BY n").fetchall(),
                 )
 
+    def test_correlated_row_assignment_uses_one_cardinality_checked_tuple(self):
+        import psycopg
+
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE target(_id text,n bigint,cold text)")
+            self.db.execute("CREATE TABLE source(id text,delta bigint)")
+            self.db.execute("INSERT INTO target VALUES('a',1,'old'),('b',2,'old')")
+            self.db.execute("INSERT INTO source VALUES('a',10),('b',20)")
+            for sql, expected in (
+                (
+                    "UPDATE target SET (n,cold)=(SELECT delta,'new' FROM source WHERE source.id=target._id) RETURNING n,cold",
+                    [(10, "new"), (20, "new")],
+                ),
+                (
+                    "UPDATE target t SET (n,cold)=(SELECT s.delta,'new' FROM source s WHERE s.id=t._id ORDER BY s.delta DESC LIMIT 1) RETURNING n,cold",
+                    [(10, "new"), (20, "new")],
+                ),
+                (
+                    "UPDATE target t SET (n,cold)=(SELECT q.* FROM (SELECT s.delta,'new' AS label FROM source s WHERE s.id=t._id) q) RETURNING n,cold",
+                    [(10, "new"), (20, "new")],
+                ),
+                (
+                    "UPDATE target t SET (n,cold)=(SELECT s.delta+t.n,'new' FROM source s WHERE s.id=t._id) RETURNING n,cold",
+                    [(11, "new"), (22, "new")],
+                ),
+                (
+                    "UPDATE target t SET (n,cold)=(SELECT COUNT(*),'new' FROM source s WHERE s.id=t._id) RETURNING n,cold",
+                    [(1, "new"), (1, "new")],
+                ),
+                (
+                    "UPDATE target t SET (n,cold)=(SELECT s.delta,'new' FROM source s WHERE s.id=t._id AND false) RETURNING n,cold",
+                    [(None, None), (None, None)],
+                ),
+            ):
+                with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                    self.assertEqual(expected, self.db.execute(sql).fetchall())
+            self.db.execute("INSERT INTO source VALUES('a',30)")
+            with (
+                self.assertRaises(psycopg.Error) as error,
+                self.db.transaction(force_rollback=True),
+            ):
+                self.db.execute(
+                    "UPDATE target t SET (n,cold)=(SELECT s.delta,'new' FROM source s WHERE s.id=t._id)"
+                )
+            self.assertEqual("21000", error.exception.sqlstate)
+            self.assertEqual(
+                [(1, "old"), (2, "old")],
+                self.db.execute("SELECT n,cold FROM target ORDER BY _id").fetchall(),
+            )
+
     def test_original_set_campaign_preserves_duplicate_and_null_witnesses(self):
         import json
         from collections import Counter

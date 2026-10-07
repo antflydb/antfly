@@ -1206,9 +1206,19 @@ fn Engine(comptime Context: type) type {
                     }
                     _ = self.scratch.reset(.free_all);
                     if (try self.right.?.next(self.scratch.allocator())) |right| {
+                        // A second pull may retire borrowed cursor/cache pages.
+                        // Own the first row before checking the cardinality
+                        // witness, and never expose a prefix of an invalid row.
+                        const row = if (apply.single_row) blk: {
+                            const owned = try self.scratch.allocator().alloc(Datum, right.len);
+                            for (right, owned) |value, *out| out.* = try operators.cloneDatum(self.scratch.allocator(), value);
+                            _ = self.probe_arena.reset(.{ .retain_with_limit = 16 * 1024 });
+                            if (try self.right.?.next(self.probe_arena.allocator()) != null) return error.SqlCardinalityViolation;
+                            break :blk owned;
+                        } else right;
                         const values = try self.scratch.allocator().alloc(Datum, self.node.columns.len);
                         @memcpy(values[0..self.left_values.?.len], self.left_values.?);
-                        @memcpy(values[self.left_values.?.len..], right);
+                        @memcpy(values[self.left_values.?.len..], row);
                         if (apply.condition) |program| {
                             const accepted = try self.engine.context.evaluate(self.scratch.allocator(), program, values);
                             if (accepted.sql_null) continue;
@@ -1218,6 +1228,12 @@ fn Engine(comptime Context: type) type {
                         self.left_matched = true;
                         const output = try alloc.alloc(Datum, values.len);
                         for (values, output) |value, *out| out.* = try operators.cloneDatum(alloc, value);
+                        if (apply.single_row) {
+                            self.right.?.deinit();
+                            self.right = null;
+                            self.engine.clearOuter(apply.id);
+                            self.left_values = null;
+                        }
                         return output;
                     }
                     self.right.?.deinit();

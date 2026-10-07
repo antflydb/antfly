@@ -1222,10 +1222,14 @@ SQL NULL assignment on an empty source, allocation-fault cleanup, and exact
 typed-array lower bounds/NULL elements/64-bit payloads. A mounted HTTP
 regression verifies a committed wildcard row update, both error SQLSTATEs,
 direct native postimages after each error, and sparse nullable-field retention.
-This closes the
-schema-bound width gap, not correlated row-source execution: the existing
-independent materialized-source guard remains until a shared multi-output
-Apply producer can retain per-target demand and cardinality safely. No original
+Correlated row assignments share one typed multi-output Apply producer rather
+than independent scalar readers. The producer owns the first tuple before
+checking a second-row witness; zero rows assign SQL NULL to every column and
+multiple rows abort before commit. Ordering, paging, nested derived sources,
+outer arithmetic and correlated COUNT(*) retain their per-target semantics.
+The keyed-correlation scaling regression checks bounded native reads and linear
+execution checkpoints at 128 and 1,024 target rows. Allocation-fault tests cover
+correlated producer cleanup. No original
 inventory case receives completion credit from these component regressions.
 
 - TRUNCATE: `sql-0160` through `sql-0165` and `sql-1101` are mapped to

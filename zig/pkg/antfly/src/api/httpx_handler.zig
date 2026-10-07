@@ -14702,6 +14702,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             // leave that image untouched, including sparse nullable fields.
             for ([_]struct { sql: []const u8, code: ?[]const u8 = null }{
                 .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT s.* FROM (SELECT quantity+1 AS q,'reviewed' AS s FROM usage_records WHERE id='u2') s) WHERE id='u2' RETURNING status,quantity" },
+                .{ .sql = "UPDATE usage_records t SET (quantity,status)=(SELECT u.quantity,'reviewed' FROM usage_records u WHERE u.id=t.id) WHERE t.id='u2' RETURNING status,quantity" },
                 .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT * FROM (SELECT quantity FROM usage_records WHERE false) s) WHERE id='u2'", .code = "42601" },
                 .{ .sql = "UPDATE usage_records SET (quantity,status)=(SELECT * FROM (SELECT quantity,status FROM usage_records) s) WHERE id='u2'", .code = "21000" },
             }) |case| {

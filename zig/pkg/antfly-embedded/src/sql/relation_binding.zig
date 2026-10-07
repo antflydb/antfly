@@ -111,7 +111,7 @@ pub const Node = struct {
         materialized_ref: *const Node,
         scan: struct { index: usize, source_columns: []const []const u8 },
         join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false, membership: ?struct { correlations: usize } = null },
-        apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null },
+        apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null, single_row: bool = false },
         query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement, preserve_scope: bool = false, constant_refs: []const ConstantRef = &.{} },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
         /// Compiler-generated INSERT VALUES arms in input order. Each arm
@@ -1289,6 +1289,10 @@ const Builder = struct {
                     }
                 }
                 const result = try self.joinNode(left, right, join.kind, expression_, apply_id);
+                if (join.single_row) {
+                    if (!lateral or join.kind != .left or apply_id == null or join.condition != null or join.membership != null) return error.InvalidSqlBackendResponse;
+                    if (!self.shape_only) @constCast(result).operation.apply.single_row = true;
+                }
                 if (!self.shape_only and demand != null) @constCast(result).operation.apply.demand = demand;
                 break :blk result;
             },

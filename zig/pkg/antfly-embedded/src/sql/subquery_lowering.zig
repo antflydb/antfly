@@ -109,6 +109,7 @@ const Builder = struct {
     source: *const ast.Relation,
     outer: Names = .empty,
     serial: usize = 0,
+    row_producers: std.ArrayList(struct { query: *const ast.Select, demand: ?*const ast.Scalar, alias: []const u8 }) = .empty,
     fn scalar(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
         const out = try self.alloc.create(ast.Scalar);
         out.* = value;
@@ -878,6 +879,39 @@ const Builder = struct {
         return self.call("$single", &.{ try self.field(alias, "$value"), try self.field(alias, "$count") });
     }
 
+    fn rowProducer(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) !*const ast.Scalar {
+        const original = input.call.subquery.?;
+        const width = original.required_output_columns orelse return error.InvalidSqlBackendResponse;
+        if (width == 0 or width > 1024 or input.call.args.len != 1) return error.InvalidSqlBackendResponse;
+        const argument = input.call.args[0];
+        if (argument.* != .literal or argument.literal != .integer) return error.InvalidSqlBackendResponse;
+        const slot = std.math.cast(usize, argument.literal.integer) orelse return error.InvalidSqlBackendResponse;
+        if (slot >= width) return error.InvalidSqlBackendResponse;
+        const output_name = try std.fmt.allocPrint(self.alloc, "$row_{d}", .{slot});
+        for (self.row_producers.items) |producer| {
+            if (producer.query == original and producer.demand == demand) return self.field(producer.alias, output_name);
+        }
+        const alias = try std.fmt.allocPrint(self.alloc, "$row_demand_{d}", .{self.serial});
+        self.serial += 1;
+        if (self.serial > 64 or self.outer.contains(alias)) return error.SqlProgramLimitExceeded;
+        try self.outer.put(self.alloc, alias, {});
+        const names = try self.alloc.alloc([]const u8, width);
+        for (names, 0..) |*name, index| name.* = try std.fmt.allocPrint(self.alloc, "$row_{d}", .{index});
+        const bounded = try self.alloc.create(ast.Select);
+        bounded.* = original.*;
+        bounded.scalar_cardinality_limit = true;
+        if (bounded.limit == null) bounded.limit = .{ .integer = 2 };
+        self.source = try self.relation(.{ .join = .{
+            .kind = .left,
+            .left = self.source,
+            .right = try self.relation(.{ .derived = .{ .query = bounded, .alias = alias, .columns = names, .hidden = true, .lateral = true } }),
+            .demand = demand,
+            .single_row = true,
+        } });
+        try self.row_producers.append(self.alloc, .{ .query = original, .demand = demand, .alias = alias });
+        return self.field(alias, output_name);
+    }
+
     fn scalarBoundary(query: ast.Select) bool {
         return query.set_operation != null or query.ctes.len != 0 or query.order_by.len != 0 or query.limit != null or query.offset != null or query.group_by.len != 0 or query.having != null or @import("window_binding.zig").accepts(query);
     }
@@ -915,6 +949,7 @@ const Builder = struct {
     fn rewriteDemand(self: *Builder, input: *const ast.Scalar, demand: ?*const ast.Scalar) anyerror!*const ast.Scalar {
         if (!has(input)) return input;
         if (input.* == .call and input.call.subquery != null) {
+            if (std.mem.eql(u8, input.call.name, "$row_scalar")) return self.rowProducer(input, demand);
             if (std.mem.eql(u8, input.call.name, "$scalar") and (demand != null or try self.scalarNeedsApply(input.call.subquery.?.*)))
                 return self.scalarProducer(input.call.subquery.?, demand);
             return if (demand != null) self.produce(input, demand) else self.subquery(input);

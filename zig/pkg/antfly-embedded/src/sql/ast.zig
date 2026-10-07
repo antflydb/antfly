@@ -181,6 +181,9 @@ pub const Relation = union(enum) {
         /// Compiler-only left-domain demand. A masked LEFT LATERAL producer
         /// is not opened or evaluated for an undemanded row.
         demand: ?*const Scalar = null,
+        /// Compiler-owned row assignment: zero rows produce SQL NULL cells;
+        /// a second row is an error before any output from this producer.
+        single_row: bool = false,
         /// Compiler-owned NULL-aware membership, not a SQL join condition.
         membership: ?struct { probes: []const *const Scalar, correlations: usize, alias: []const u8 } = null,
     },
