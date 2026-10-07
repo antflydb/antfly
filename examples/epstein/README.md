@@ -640,3 +640,5 @@ server/data directory to attribute it to this table. Source bytes count whole ch
 files, even when a pilot selects only some PDF pages. Raw source storage remains
 additional to Antfly storage. Compare representative text, scanned PDF and audio
 pilots, with and without semantic/graph indexes, before extrapolating to the corpus.
+
+Graph searches show only edges connected to the matching rows. A search with no edges stays empty. Citation labels and PDF page/audio time links come from the seed documents returned in the same query; graph rendering makes no additional document requests.

@@ -2098,11 +2098,6 @@ func (s *SearchServer) handleAPIGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	viz := buildGraphVisualization(query, resp)
-	if len(viz.Edges) == 0 {
-		if fallback, err := s.queryGraphVisualization(r.Context(), graphVisualizationSampleQuery()); err == nil {
-			viz = buildGraphVisualization(query, fallback)
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(viz)
 }
@@ -2135,6 +2130,16 @@ func (s *SearchServer) queryGraphVisualization(ctx context.Context, payload map[
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
 		return nil, fmt.Errorf("decode graph query: %w", err)
 	}
+	for _, result := range decoded.Responses {
+		if result.Error != "" || result.Status >= 400 {
+			return nil, fmt.Errorf("query graph: status %d: %s", result.Status, result.Error)
+		}
+		for name, graph := range result.GraphResults {
+			if _, err := antfly.DecodeCanonicalGraphResult(graph); err != nil {
+				return nil, fmt.Errorf("decode graph result %s: %w", name, err)
+			}
+		}
+	}
 	return &decoded, nil
 }
 
@@ -2146,31 +2151,8 @@ func graphVisualizationQuery(searchText string) map[string]any {
 		"full_text_search": map[string]any{
 			"match": map[string]any{"content": searchText},
 		},
-		"limit": 8,
-		"graph_queries": map[string]any{
-			"relations": map[string]any{
-				"index": DefaultAutographIndex,
-				"traverse": map[string]any{
-					"start":             map[string]any{"result_ref": "$query_results", "limit": 8},
-					"direction":         "both",
-					"max_depth":         1,
-					"limit":             80,
-					"include_paths":     true,
-					"include_documents": true,
-					"fields":            []string{"title", "url", "original_url", "metadata"},
-				},
-			},
-		},
-	}
-}
-
-func graphVisualizationSampleQuery() map[string]any {
-	return map[string]any{
-		"full_text_index": DefaultFullTextIndex,
-		"query": map[string]any{
-			"match_all": map[string]any{},
-		},
-		"limit": 8,
+		"limit":  8,
+		"fields": []string{"title", "url", "original_url", "metadata"},
 		"graph_queries": map[string]any{
 			"relations": map[string]any{
 				"index": DefaultAutographIndex,
@@ -2201,6 +2183,16 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 	if err != nil {
 		return viz
 	}
+	// Search seeds can appear only as path endpoints. Reuse their projected
+	// documents; entity neighbors need no separate document requests.
+	response := resp.Responses[0]
+	documents := make(map[string]map[string]any, len(response.Hits.Hits))
+	for _, hit := range response.Hits.Hits {
+		documents[hit.ID] = hit.Source
+		if response.Table != "" {
+			documents[response.Table+"/"+hit.ID] = hit.Source
+		}
+	}
 	nodeByID := map[string]int{}
 	addNode := func(node GraphNode) {
 		if node.ID == "" {
@@ -2230,8 +2222,8 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 		if edge.Source == "" || edge.Target == "" {
 			return
 		}
-		addNode(GraphNode{ID: edge.Source, Label: edge.Source})
-		addNode(GraphNode{ID: edge.Target, Label: edge.Target})
+		addNode(graphNodeFromDocument(edge.Source, documents[edge.Source], 0))
+		addNode(graphNodeFromDocument(edge.Target, documents[edge.Target], 0))
 		key := edge.Source + "\x00" + edge.Target + "\x00" + edge.Type
 		if _, ok := edgeSeen[key]; ok {
 			return
@@ -2243,7 +2235,9 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 	switch result := graphValue.(type) {
 	case antfly.GraphNodesResult:
 		for _, resultNode := range result.Nodes {
-			addNode(graphNodeFromResult(resultNode))
+			node := graphNodeFromResult(resultNode)
+			addNode(node)
+			addNode(graphNodeFromDocument(node.ID, documents[node.ID], resultNode.Depth))
 			for _, edge := range resultNode.PathEdges {
 				addEdge(GraphEdge{
 					Source: graphEndpointID(edge.From),

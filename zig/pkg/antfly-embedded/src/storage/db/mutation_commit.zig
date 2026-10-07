@@ -2654,6 +2654,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 self.core.store,
                 self.core.index_manager,
                 precomputed_generated.coverage_outcomes,
+                sequence,
                 &store_writes,
                 &owned_store_keys,
                 &owned_store_values,

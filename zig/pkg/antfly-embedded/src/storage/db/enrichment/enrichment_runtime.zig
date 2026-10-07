@@ -458,6 +458,8 @@ const CoverageOutcomeTransition = struct {
     marker_key: []u8,
     counter_keys: [coverage_outcome_count][]u8,
     failure_guards: std.ArrayListUnmanaged(FailureIdentity) = .empty,
+    source_specific: bool = false,
+    source_document: ?[]u8 = null,
 };
 
 const graph_stage_prefix = "\x00\x00__graph_stage__:v1:";
@@ -12231,6 +12233,15 @@ fn processAsset(
 
     if (producer_cfg.type == .document_extraction) {
         try processDocumentExtractionAsset(runtime, request, raw, source_text, producer_cfg.config_json, key, prepared_sources, window);
+        // Failed/empty extraction owns its explicit outcome below. A converged
+        // manifest is the final receipt after all unit/chunk publication.
+        const manifest = try storeGetOptionalAllocWithRetry(runtime, key);
+        defer if (manifest) |value| runtime.alloc.free(value);
+        if (manifest) |value| {
+            if (!try documentExtractionManifestHasLastError(runtime.alloc, value) and
+                !try documentExtractionEmptyCoverageIsTerminalFailure(runtime.alloc, value))
+                try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
+        }
         return;
     }
 
@@ -28411,6 +28422,23 @@ fn queueArtifactCoverageOutcomeForRequest(
         };
         if (!is_graph and !is_full_text) continue;
         try queueDerivedCoverageOutcomeForIndex(runtime, window, index_name, request, outcome);
+        const readiness = @import("../artifact_producer_readiness.zig");
+        var pinned = try runtime.index_manager.acquireWritePlanSnapshot();
+        defer pinned.release();
+        const requirements = if (pinned.plan().completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+        _ = requirements.providerFor(request) catch return error.EnrichmentSourceChanged;
+        const sources = blk: {
+            runtime.index_manager.catalog_mutex.lockShared();
+            defer runtime.index_manager.catalog_mutex.unlockShared();
+            break :blk try runtime.index_manager.artifactSourceNamesForIndexAlloc(runtime.alloc, index_name);
+        };
+        defer freeAffectedIndexes(runtime, sources);
+        for (sources) |source| {
+            if (!readiness.localSourceProduced(pinned.plan(), requestArtifactName(request), source)) continue;
+            const scope = try readiness.localScopeAlloc(runtime.alloc, index_name, source, pinned.plan());
+            defer runtime.alloc.free(scope);
+            try queueDerivedCoverageOutcomeForScope(runtime, window, index_name, scope, request, outcome);
+        }
     }
 }
 
@@ -29875,7 +29903,7 @@ fn storePutBatchWithRetry(runtime: anytype, writes: []const KVPair, deletes: []c
     }
 }
 
-fn storeCoverageBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8) !void {
+fn storeCoverageBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPair, deletes: []const []const u8, transitions: []const CoverageOutcomeTransition) !void {
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         try heartbeatEnrichmentLease(runtime);
@@ -29891,6 +29919,15 @@ fn storeCoverageBatchWithRetry(runtime: *EnrichmentRuntime, writes: []const KVPa
         var committed = false;
         defer if (!committed) batch.abort();
         try validateRuntimeStoreWriteFenceTxn(runtime, &batch, fence);
+        // A late receipt cannot restore completion after a newer primary
+        // version reopened debt, even in the window after replay append.
+        for (transitions) |transition| if (transition.source_document) |document| {
+            const identity = @import("../doc_identity.zig");
+            const ordinal = (try identity.lookupOrdinalTxn(runtime.alloc, &batch, document)) orelse return error.EnrichmentSourceChanged;
+            const state = (try identity.lookupStateTxn(&batch, ordinal)) orelse return error.InvalidDocIdentity;
+            if (!state.isLive() or transition.source_sequence == 0 or state.created_generation > transition.source_sequence)
+                return error.EnrichmentSourceChanged;
+        };
         for (writes) |write| try batch.put(write.key, write.value);
         for (deletes) |key| batch.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -30189,6 +30226,7 @@ fn appendCoverageFailureGuard(
 
 fn deinitCoverageOutcomeTransition(alloc: Allocator, transition: CoverageOutcomeTransition) void {
     alloc.free(transition.index_name);
+    if (transition.source_document) |document| alloc.free(document);
     alloc.free(transition.marker_key);
     for (transition.counter_keys) |key| alloc.free(key);
     var failure_guards = transition.failure_guards;
@@ -30280,9 +30318,32 @@ fn queueDerivedCoverageOutcomeForIndex(
     request: enrichment_types.GeneratedEnrichmentRequest,
     outcome: CoverageOutcome,
 ) !void {
+    return queueDerivedCoverageOutcomeForScope(runtime, window, index_name, null, request, outcome);
+}
+
+fn queueDerivedCoverageOutcomeForScope(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    index_name: []const u8,
+    scope: ?[]const u8,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    outcome: CoverageOutcome,
+) !void {
     const generation = runtime.index_manager.coverageGenerationForIndex(index_name) orelse return;
     var transition = try initCoverageOutcomeTransition(runtime, index_name, generation, request.doc_key, request.sequence, outcome);
     errdefer deinitCoverageOutcomeTransition(runtime.alloc, transition);
+    if (scope) |name| {
+        const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(runtime.alloc, name, generation, request.doc_key);
+        runtime.alloc.free(transition.marker_key);
+        transition.marker_key = marker;
+        inline for (std.meta.tags(CoverageOutcome), 0..) |candidate, i| {
+            const selected = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(runtime.alloc, name, generation, @tagName(candidate));
+            runtime.alloc.free(transition.counter_keys[i]);
+            transition.counter_keys[i] = selected;
+        }
+        transition.source_specific = true;
+        transition.source_document = try runtime.alloc.dupe(u8, request.doc_key);
+    }
     const identity_key = transition.marker_key;
     if (window.coverage_transition_keys.getKey(identity_key)) |existing_key| {
         for (window.coverage_transitions.items) |*queued| {
@@ -30380,7 +30441,17 @@ fn applyCoverageOutcomeTransitions(runtime: *EnrichmentRuntime, transitions: []c
         var group_end = group_start + 1;
         while (group_end < ordered.len and std.mem.eql(u8, ordered[group_start].index_name, ordered[group_end].index_name)) : (group_end += 1) {}
 
-        var apply_guard = runtime.index_manager.lockVectorIndexApply(ordered[group_start].index_name) catch |err| switch (err) {
+        const index_kind = blk: {
+            runtime.index_manager.catalog_mutex.lockShared();
+            defer runtime.index_manager.catalog_mutex.unlockShared();
+            const config = runtime.index_manager.get(ordered[group_start].index_name) orelse break :blk null;
+            break :blk @as(?types.IndexKind, config.kind);
+        };
+        if (index_kind == null) {
+            group_start = group_end;
+            continue;
+        }
+        var apply_guard = runtime.index_manager.lockManagedIndexApply(.{ .name = ordered[group_start].index_name, .kind = index_kind.? }) catch |err| switch (err) {
             error.IndexNotFound => {
                 group_start = group_end;
                 continue;
@@ -30450,7 +30521,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             const counter_key = transition.counter_keys[outcome_index];
             if (indexes.get(counter_key)) |index| return index;
             const current_count = (try loadDerivedCoverageOutcomeCounter(runtime_value, counter_key)) orelse
-                try scanDerivedCoverageOutcome(runtime_value, transition.index_name, transition.generation, outcome);
+                (if (transition.source_specific) 0 else try scanDerivedCoverageOutcome(runtime_value, transition.index_name, transition.generation, outcome));
             const index = states.items.len;
             try states.append(runtime_value.alloc, .{ .key = counter_key, .outcome = outcome, .count = current_count });
             try indexes.put(runtime_value.alloc, counter_key, index);
@@ -30459,6 +30530,8 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
     }.get;
 
     var skipped_delta: i64 = 0;
+    var receipt_arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer receipt_arena.deinit();
     for (transitions) |transition| {
         const target_outcome = transition.outcome;
         if (seen_transitions.contains(transition.marker_key)) continue;
@@ -30479,6 +30552,13 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
         // A later successful replay may replace one, but an empty downstream
         // consumer must not relabel the same failure as an intentional skip.
         const weaker_than_existing_failure = existing_outcome == .terminal_failed and target_outcome == .skipped;
+        if (transition.source_specific and !weaker_than_existing_failure) {
+            const receipt_alloc = receipt_arena.allocator();
+            const key = try @import("../artifact_producer_readiness.zig").localReceiptRevisionKeyAlloc(receipt_alloc, transition.marker_key);
+            const value = try receipt_alloc.alloc(u8, 8);
+            std.mem.writeInt(u64, value[0..8], transition.source_sequence, .little);
+            try writes.append(runtime.alloc, .{ .key = key, .value = value });
+        }
         if (!weaker_than_existing_failure and (existing_outcome == null or existing_outcome.? != target_outcome)) {
             if (existing_outcome) |previous_outcome| {
                 const previous_state_index = try counterState(runtime, &counter_states, &counter_indexes, transition, previous_outcome);
@@ -30503,7 +30583,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             .value = internal_keys.encodeDerivedCoverageOutcomeCount(&state.value, state.count),
         });
     }
-    try storeCoverageBatchWithRetry(runtime, writes.items, &.{});
+    try storeCoverageBatchWithRetry(runtime, writes.items, &.{}, transitions);
     if (skipped_delta > 0) {
         runtime.skipped_source_count +|= @intCast(skipped_delta);
     } else if (skipped_delta < 0) {

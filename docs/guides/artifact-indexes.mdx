@@ -252,6 +252,10 @@ Every index kind also reports a catalog-assigned `incarnation`, at the status ro
 
 The document-level `coverage` object belongs to embedding indexes. Full-text and graph indexes report completion through `readiness`, including `readiness.sources` for artifact-backed projections, and replay status. They do not publish embedding producer counters: an absent counter cannot distinguish unfinished extraction from an intentional empty output. Source extraction failures remain visible in source readiness and repair status, including after restart.
 
+Artifact source readiness also waits for verified completion of that source's producer dependencies. A caught-up replay cursor cannot mark unfinished OCR, transcription, chunking, or relation extraction complete before its output is published. Producer work uses durable, revision-fenced summaries; status polling does not scan documents. Each source is checked independently, so relation extraction debt does not block a text stream that has finished. Intentional empty outputs can complete; extraction failures remain unhealthy.
+
+Existing stores establish these summaries through bounded background discovery and verification of retained artifacts. Local producers use the durable paged source-recovery owner and retain the published generation once its receipts and native checkpoint agree. Until discovery finishes, producer-backed sources remain pending. Restart, source edits, and catalog changes retain or reopen the appropriate completion fences. Known terminal failures remain with their repair/retry owner rather than being regenerated on every open.
+
 Internal replay watermarks are diagnostics only.
 
 Changing source membership, projection fields, analyzer semantics, embedding space, or graph mapping changes what the index means and requires a new materialized generation. Execution batching fields tune work without changing artifact identity.

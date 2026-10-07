@@ -3052,6 +3052,7 @@ pub const DB = struct {
     artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
+    local_source_completion_audit_pending: bool = true,
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
     /// no_progress_timeout_ns`); 0 disables it. Copied into `ReplayDrainOptions`
@@ -11570,6 +11571,7 @@ pub const DB = struct {
         alloc: Allocator,
         intent: index_repair_state.IndexRepairIntent,
     ) !bool {
+        if (try self.localArtifactSourceRecoveryIsServiceable(alloc, intent)) return true;
         const minimum_replay = (try self.managedInitialBuildMinimumReplay(alloc, intent)) orelse return false;
         if (!initialBuildCanRetireBeforeActivation(intent) or intent.source_replay_state == .pending) return false;
         if (intent.candidate_relative_path) |candidate| {
@@ -11581,6 +11583,59 @@ pub const DB = struct {
             intent.config_hash,
             minimum_replay,
         );
+    }
+
+    /// Receipt migration reuses the published text/graph generation. Once its
+    /// bounded source pass, producer receipts and native checkpoint agree, a
+    /// shadow rebuild would only duplicate already published artifacts.
+    fn localArtifactSourceRecoveryIsServiceable(self: *DB, alloc: Allocator, intent: index_repair_state.IndexRepairIntent) !bool {
+        if ((intent.kind != .full_text and intent.kind != .graph) or
+            intent.work_class != .initial_build or
+            (intent.trigger != .replay_artifact_unavailable and intent.trigger != .catalog_admission) or
+            intent.source_replay_state == .pending or !initialBuildCanRetireBeforeActivation(intent) or
+            intent.root_generation != self.core.root_generation or intent.group_id != self.localRepairGroupId()) return false;
+        var minimum_replay = intent.target_sequence;
+        if (intent.trigger == .replay_artifact_unavailable and intent.source_replay_state != .complete) return false;
+        if (intent.trigger == .catalog_admission) {
+            const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, intent.index_name);
+            defer alloc.free(key);
+            const raw = self.core.store.get(alloc, key) catch |err| if (err == error.NotFound) return false else return err;
+            defer alloc.free(raw);
+            const marker = try decodeManagedIndexAdmissionMarker(raw);
+            if (marker.disposition != .managed_rebuild or marker.config_hash != intent.config_hash) return false;
+            minimum_replay = @max(minimum_replay, marker.replay_target_sequence);
+        }
+        if (intent.candidate_relative_path) |candidate| {
+            if (try self.core.index_manager.isRepairCandidateActive(intent.index_name, candidate)) return false;
+        }
+        const cfg = self.core.index_manager.get(intent.index_name) orelse return false;
+        if (types.indexConfigHash(cfg.*) != intent.config_hash or self.core.index_manager.loadFailure(intent.index_name) != null) return false;
+        const checkpoint = try self.core.loadProjectionCheckpoint(alloc, intent.index_name);
+        const applied = try self.managedIndexAppliedSequence(alloc, intent.index_name);
+        const target = @max(minimum_replay, try self.projectionStatsTargetSequence(alloc, cfg.*, applied));
+        if (checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash or
+            applied < target or checkpoint.applied_sequence < target) return false;
+        const generation = self.core.index_manager.coverageGenerationForIndex(intent.index_name) orelse return false;
+        var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        const sources = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, intent.index_name);
+        defer {
+            for (sources) |source| alloc.free(source);
+            alloc.free(sources);
+        }
+        if (sources.len == 0) return false;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        if (try @import("artifact_publication.zig").authority(&read) != null) return false;
+        for (sources) |source| {
+            const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, intent.index_name, source, plan.plan());
+            defer alloc.free(scope);
+            const counts = try DerivedCoverageCounters.load(alloc, &read, scope, generation);
+            const total = counts.source_total orelse return false;
+            if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or
+                counts.produced.? +| counts.skipped.? != total) return false;
+        }
+        return true;
     }
 
     /// Atomic managed admission normally defers the canonical derived worker
@@ -14950,6 +15005,10 @@ pub const DB = struct {
         // the head of a one-slot repair queue forever.
         if (try self.managedAdmissionGenerationIsServiceable(alloc, entry.intent)) {
             try self.ensureManagedAdmissionCanonicalWorker(alloc, entry.intent);
+            if (entry.intent.kind == .full_text) {
+                const text = self.core.textIndexEntry(entry.intent.index_name) orelse return error.IndexNotFound;
+                try self.core.index_manager.rebuildState(.full_text, text.rebuild_root_path, text.config).clearWithIo(self.core.index_manager.checkpointIo());
+            }
             if (entry.intent.candidate_relative_path != null) {
                 try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
             }
@@ -29741,8 +29800,21 @@ pub const DB = struct {
     }
 
     fn advanceArtifactProducerWorkPageWithAllocator(self: *DB, scratch: Allocator) !bool {
+        const has_ordered_authority = blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk try @import("artifact_publication.zig").authority(&read) != null;
+        };
+        if (!has_ordered_authority) {
+            if (self.local_source_completion_audit_pending) {
+                _ = try self.ensureGeneratedCoverageRecoveryIntents(scratch);
+                self.local_source_completion_audit_pending = false;
+            }
+            return false;
+        }
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
+        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan.plan());
         const obligations = @import("artifact_producer_obligations.zig");
         var page = blk: {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
@@ -29840,7 +29912,12 @@ pub const DB = struct {
             self.artifact_producer_scheduler.commitCursor(self.alloc, page.authority, next);
             processed += 1;
         }
+        const readiness_pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
+        more_dispatch = more_dispatch or readiness_pending;
         self.artifact_producer_scheduler.completePage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, self.independentMaintenanceNowNs());
+        if (readiness_pending and !readiness_progress and processed == page.items.len and page.at_end) {
+            self.artifact_producer_scheduler.retry_after_ns.store(self.independentMaintenanceNowNs() +| @import("artifact_producer_scheduler.zig").Scheduler.poll_interval_ns, .release);
+        }
         return processed != 0;
     }
 
@@ -32973,6 +33050,11 @@ pub const DB = struct {
             for (names[initialized..]) |name| alloc.free(name);
             alloc.free(statuses);
         }
+        var producer_plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer producer_plan.release();
+        var producer_read = try self.core.store.beginReadTxn();
+        defer producer_read.abort();
+        const legacy = try @import("artifact_publication.zig").authority(&producer_read) == null;
         const repair_summary_ready = try self.artifactRepairSummaryReady(alloc);
         for (names) |name| {
             const source_repair = try self.artifactRepairSummarySourceSnapshot(
@@ -32981,6 +33063,15 @@ pub const DB = struct {
                 name,
                 repair_summary_ready,
             );
+            const local_scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_name, name, producer_plan.plan());
+            defer alloc.free(local_scope);
+            const legacy_complete = if (legacy) blk: {
+                const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse break :blk false;
+                const counts = try DerivedCoverageCounters.load(alloc, &producer_read, if (item.kind == .dense_vector or item.kind == .sparse_vector) index_name else local_scope, generation);
+                const total = counts.source_total orelse break :blk false;
+                break :blk if (total == 0) true else counts.produced != null and counts.skipped != null and counts.terminal_failed == 0 and
+                    counts.produced.? +| counts.skipped.? == total;
+            } else false;
             statuses[initialized] = .{
                 .artifact_name = name,
                 .published_sequence = published_sequence,
@@ -32988,6 +33079,7 @@ pub const DB = struct {
                 .failed = source_repair.ready and source_repair.count != 0,
                 .repair_issue_count = source_repair.count,
                 .repair_summary_ready = source_repair.ready,
+                .producer_complete = legacy_complete or try @import("artifact_producer_readiness.zig").sourceComplete(alloc, &producer_read, producer_plan.plan(), self.root_incarnation, name),
             };
             initialized += 1;
         }
@@ -36827,13 +36919,41 @@ pub const DB = struct {
             for (configs.items) |*cfg| cfg.deinit(alloc);
             configs.deinit(alloc);
         }
+        var recovery_plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer recovery_plan.release();
         for (managed_indexes) |index_ref| {
-            // Only vector replay maintains this per-index source-outcome
-            // tuple. Artifact-backed text/graph projections can require the
-            // same producers without emitting vector coverage counters. Their
-            // absence is not unfinished materialization: treating it as debt
-            // reprocesses healthy sibling artifacts and gates their queries.
-            if (index_ref.kind != .dense_vector and index_ref.kind != .sparse_vector) continue;
+            if (!try self.core.indexRequiresEnrichmentReplay(index_ref.name)) continue;
+            // Local text/graph producers maintain direct-source completion
+            // separately from vector outcomes. Missing historical receipts
+            // belong to the existing durable paged recovery owner.
+            if (index_ref.kind != .dense_vector and index_ref.kind != .sparse_vector) {
+                if (index_ref.kind != .full_text and index_ref.kind != .graph) continue;
+                const source_names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_ref.name);
+                defer {
+                    for (source_names) |source_name| alloc.free(source_name);
+                    alloc.free(source_names);
+                }
+                if (source_names.len == 0) continue;
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                if (try @import("artifact_publication.zig").authority(&read) != null) continue;
+                const generation = self.core.index_manager.coverageGenerationForIndex(index_ref.name) orelse continue;
+                var complete = primary_doc_count != null;
+                for (source_names) |source_name| {
+                    const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_ref.name, source_name, recovery_plan.plan());
+                    defer alloc.free(scope);
+                    const counts = try DerivedCoverageCounters.load(alloc, &read, scope, generation);
+                    // A retained terminal failure is known producer debt, not
+                    // missing migration evidence. Its repair/retry owner keeps
+                    // readiness unhealthy without reinvoking it on every open.
+                    complete = complete and counts.produced != null and counts.skipped != null and
+                        counts.produced.? +| counts.skipped.? +| (counts.terminal_failed orelse 0) == primary_doc_count.?;
+                }
+                if (complete) continue;
+                const cfg = self.core.index_manager.get(index_ref.name) orelse continue;
+                try configs.append(alloc, try types.IndexConfig.clone(alloc, cfg.*));
+                continue;
+            }
             if (!try self.core.indexRequiresEnrichmentReplay(index_ref.name)) continue;
             const cfg = self.core.index_manager.get(index_ref.name) orelse continue;
             var item = types.DBIndexStats{ .name = index_ref.name, .kind = index_ref.kind };
@@ -102178,6 +102298,55 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 } },
         .limit = 1,
     }));
+}
+
+test "producer readiness local receipt migration retires only after source and checkpoint proof" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    const cfg = types.IndexConfig{
+        .name = "text",
+        .kind = .full_text,
+        .config_json =
+        \\{"sources":[{"artifact":"copied"}]}
+        ,
+    };
+    try db.addIndex(cfg);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"silver submarine\"}" }}, .sync_level = .full_index });
+    const id = try db.createGenerationRepairIntentAtTarget(alloc, cfg, .replay_artifact_unavailable, 0, 0, null, null, .complete, .initial_build);
+    var entry = try db.loadIndexRepairEntryById(alloc, id);
+    defer entry.deinit(alloc);
+    try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    // Synchronous publication precedes its replay invalidation turn. The
+    // current revision's receipt must survive that turn after an overwrite.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .full_index });
+    try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try db.core.saveProjectionCheckpoint(cfg.name, .{
+        .applied_sequence = checkpoint.applied_sequence,
+        .generation = checkpoint.generation,
+        .config_hash = checkpoint.config_hash,
+        .status = .rebuilding,
+    });
+    try std.testing.expect(!try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    try db.core.saveProjectionCheckpoint(cfg.name, checkpoint);
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, cfg.name, "copied", plan.plan());
+    defer alloc.free(scope);
+    const generation = db.core.index_manager.coverageGenerationForIndex(cfg.name).?;
+    const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, scope, generation, "produced");
+    defer alloc.free(key);
+    try db.core.store.delete(key);
+    try std.testing.expect(!try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
 }
 
 test "db empty managed index does not invent generated coverage recovery debt" {
