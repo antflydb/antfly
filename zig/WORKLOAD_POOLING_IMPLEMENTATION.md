@@ -1191,3 +1191,7 @@ Nix/glibc Linux; [worker budget receipts](qualification/workload-pooling/receipt
 pin source and output. Actual subprocess and production dispatcher/archive
 qualification are still pending, along with whole API/default overload gates.
 The separate local-parent ABI v29 gate does not qualify these worker bytes.
+
+Provider context adapter follow-up (native integration passed): dense text/parts and raster embedding, text/document reranking, and both text and binary chunking now pass the complete RequestContext into the inference ABI. Controls-only public helpers retain their signatures and delegate to shared context implementations. A model-free integration regression covers seven affected calls, requiring a denied parent checkpoint to stop before any transfer or model work and checking that provider lifetime borrowers are released. This does not yet qualify numerical model execution, other provider contexts, or default enablement.
+
+The [provider context receipt](qualification/workload-pooling/receipts/2026-10-07/provider-context-propagation/README.md) records all 69 passing native steps and the seven-adapter regression, with no skips, failures or allocator leaks. Linux and combined-source qualification remain pending.
