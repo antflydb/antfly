@@ -287,12 +287,15 @@ pub fn execute(context: anytype, bound: Bound) !runtime.Output {
         const selected = try read.typedQuery(bound.query);
         defer selected.close();
         if (selected.count() > context.limits.mutation_rows) return error.SqlProgramLimitExceeded;
+        // One borrowed forward pass releases finished resident sort rows and
+        // never writes a replay run for an external sort. Only retained image
+        // fields cross the owned storage/preimage boundary below.
         var scratch = std.heap.ArenaAllocator.init(context.alloc);
         defer scratch.deinit();
         const temporary = scratch.allocator();
         while (true) {
             _ = scratch.reset(.retain_capacity);
-            const values = (try selected.next(temporary)) orelse break;
+            const values = (try selected.nextBorrowed(temporary)) orelse break;
             try context.checkpoint();
             if (values.len != bound.fields.len + 5) return error.InvalidSqlBackendResponse;
             if (values[0].sql_null) continue; // An outer join may have no target row.

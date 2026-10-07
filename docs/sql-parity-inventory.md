@@ -244,6 +244,20 @@ uses the common owned storage encoder, and DELETE RETURNING retains complete
 typed preimages with shared name metadata. Per-row scratch can retire without
 invalidating mutation keys, nested document members, bounds or JSONB null flags.
 Presence metadata is indexed once per row instead of rescanned per output cell.
+Typed captures now expose sealed, independent borrowed replay readers over
+their existing bounded resident rows or spill blocks. Resident sorted rows
+are retained directly without a second spool or row payload clone. External
+sorts seal their selected offset/limit window once into bounded final blocks;
+partially consumed sorts reject replay rather than accessing retired rows.
+Joined mutations use a borrowed forward pass: finished resident sort rows retire
+on advancement, and external sorts never write an unnecessary replay run.
+They only own values at storage/preimage preparation. A fail-on-allocation
+regression verifies zero per-row allocation for resident borrowed sorts and
+checks their exact retirement boundary. Replay reader positions and decoded
+blocks are independent; closing the
+capture requires readers to have retired first. Rewind, array/null ownership,
+sort windows, cancellation, spill cleanup and allocation-failure tests cover
+the shared reader; MERGE integration remains unfinished.
 RETURNING ambiguity is checked against the already-authorized join scope; this
 does not activate FROM/USING source-value RETURNING, which still needs captured
 source-image execution. MERGE arm binding now preserves source, target and

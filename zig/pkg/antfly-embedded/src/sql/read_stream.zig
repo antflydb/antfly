@@ -551,21 +551,20 @@ pub const Stream = struct {
             }
             const owner = try self.budget.allocator().create(Spool);
             errdefer self.budget.allocator().destroy(owner);
-            owner.manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
-            owner.shared = backend.spill_manager;
+            // Initialize the complete cursor, including its reader/lifetime
+            // defaults. Its owned manager needs this stable heap address before
+            // the run can borrow it; rows become valid only after init succeeds.
+            owner.* = .{
+                .manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) },
+                .shared = backend.spill_manager,
+                .a = self.budget.allocator(),
+                .width = binding.columns.len,
+                .rows = undefined,
+            };
             const manager = owner.shared orelse &owner.manager;
             errdefer if (owner.shared == null) owner.manager.deinit();
-            owner.a = self.budget.allocator();
-            owner.width = binding.columns.len;
             owner.rows = try @import("spill.zig").Sequential.init(manager, @max(128, @min(32 * 1024, limits.retained_bytes / 64)));
             errdefer owner.rows.close();
-            owner.index = 0;
-            owner.memory = null;
-            owner.memory_reader = null;
-            owner.sorted = null;
-            owner.sorted_rows = &.{};
-            owner.sorted_offset = 0;
-            owner.sorted_count = 0;
             self.context.spill = manager;
             self.context.sink = .{ .ptr = owner, .append = Spool.append, .take_sorted = Spool.takeSorted };
             self.context.limits.result_rows = limits.scan_rows;
