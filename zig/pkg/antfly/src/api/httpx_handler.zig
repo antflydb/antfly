@@ -13527,6 +13527,39 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         try std.testing.expect(serial_write_backend.spill_io != null);
         try std.testing.expect(serial_write_backend.spill_wait == null);
         {
+            var node_owner = try http_server_mod.RunnableScheduler.NodeOwner.init(.{ .slots = 2, .checkpoint_budget = 1 });
+            defer node_owner.deinit();
+            var first = ApiHttpServer.init(alloc, .{ .runnable_owner_handle = &node_owner }, server.source, null, null);
+            var first_live = true;
+            defer if (first_live) first.deinit();
+            var second = ApiHttpServer.init(alloc, .{ .runnable_owner_handle = &node_owner }, server.source, null, null);
+            var second_live = true;
+            defer if (second_live) second.deinit();
+            try std.testing.expectEqual(@as(usize, 2), node_owner.borrowers);
+            try std.testing.expect(first.runnable_scheduler == null and second.runnable_scheduler == null);
+            var shared_query: http_server_mod.RunnableScheduler.Execution = .{};
+            defer shared_query.finish();
+            try first.startSqlRunnable(&shared_query, .{ .io = server.embedding_provider_runtime.io, .retained_bytes = 17 }, .query);
+            first.deinit();
+            first_live = false;
+            try shared_query.checkpoint();
+            try std.testing.expectEqual(@as(usize, 1), node_owner.borrowers);
+            try std.testing.expectEqual(@as(u64, 17), node_owner.scheduler.stats().retained_bytes);
+            var shared_control: http_server_mod.RunnableScheduler.Execution = .{};
+            defer shared_control.finish();
+            try second.startSqlRunnable(&shared_control, .{ .io = server.embedding_provider_runtime.io }, .control);
+            try std.testing.expectEqual(@as(usize, 1), node_owner.scheduler.stats().control_slots);
+            shared_control.finish();
+            shared_query.finish();
+            node_owner.close();
+            try std.testing.expectError(error.SchedulerClosed, ApiHttpServer.initWithConfig(alloc, .{ .runnable_owner_handle = &node_owner }, server.source, null, null));
+            try std.testing.expectError(error.InvalidApiServerConfig, ApiHttpServer.initWithConfig(alloc, .{ .runnable_owner_handle = &node_owner, .runnable_policy = .{} }, server.source, null, null));
+            second.deinit();
+            second_live = false;
+            try std.testing.expectEqual(@as(usize, 0), node_owner.borrowers);
+            try std.testing.expectEqual(@as(usize, 0), node_owner.scheduler.stats().operations);
+        }
+        {
             // Provider CPU must obey the same parent ownership as SQL operators.
             var decision_config = try common_config.Config.parseFromSlice(alloc, "{}");
             defer decision_config.deinit();
@@ -13544,7 +13577,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             serial_write_adapter.runnable = &provider_execution;
             var read_runtime = (try serial_write_adapter.decisionRuntime()).?;
             try std.testing.expect(!read_runtime.parallel_work);
-            try std.testing.expect(read_runtime.parent_execution.?.ptr == &serial_write_adapter);
+            try std.testing.expect(read_runtime.parent_execution.?.ptr == @as(*anyopaque, @ptrCast(&serial_write_adapter)));
             try read_runtime.provider().checkpoint();
             serial_write_adapter.runnable = null;
             const unscheduled_runtime = (try serial_write_adapter.decisionRuntime()).?;

@@ -71,6 +71,15 @@ pub const CallContext = extern struct {
     output_contract: native_abi.TypeContract = .of(void),
 };
 
+pub const RunnableOwnerCreateContext = extern struct {
+    abi_version: u32,
+    struct_size: u32 = @sizeOf(@This()),
+    owner_alloc: *const memory_abi.Allocator,
+    policy: *const anyopaque,
+    policy_contract: native_abi.TypeContract,
+    out_handle: *?*anyopaque,
+};
+
 pub const HandlerCreateContext = extern struct {
     abi_version: u32,
     struct_size: u32 = @sizeOf(@This()),
@@ -217,6 +226,7 @@ pub const Capability = struct {
     pub const route_manifest: u64 = 1 << 3;
     pub const inference_admission_stats: u64 = 1 << 4;
     pub const internal_service_ingress: u64 = 1 << 5;
+    pub const node_runnable_owner: u64 = 1 << 6;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -254,6 +264,9 @@ pub const FunctionTable = extern struct {
     inference_admission_stats: *const fn (*const CallContext) callconv(.c) Status,
     handler_authorize_internal_service: *const fn (*const InternalServiceAuthContext) callconv(.c) Status,
     configure_http_transport: *const fn (*const CallContext) callconv(.c) Status,
+    runnable_owner_create: *const fn (*const RunnableOwnerCreateContext) callconv(.c) Status,
+    runnable_owner_close: *const fn (*const CallContext) callconv(.c) Status,
+    runnable_owner_destroy: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -275,7 +288,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
     const known = Capability.core |
         Capability.route_manifest |
         Capability.inference_admission_stats |
-        Capability.internal_service_ingress;
+        Capability.internal_service_ingress |
+        Capability.node_runnable_owner;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -286,6 +300,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("inference_admission_stats"));
     if (required_capabilities & Capability.internal_service_ingress != 0)
         required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
+    if (required_capabilities & Capability.node_runnable_owner != 0)
+        required = @max(required, functionTableFieldEnd("runnable_owner_destroy"));
     return required;
 }
 
@@ -293,6 +309,7 @@ test "API kernel control contexts retain C layout" {
     const std = @import("std");
     try std.testing.expectEqual(.@"extern", @typeInfo(CreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(CallContext).@"struct".layout);
+    try std.testing.expectEqual(.@"extern", @typeInfo(RunnableOwnerCreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(HandlerCreateContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(RouteManifestContext).@"struct".layout);
     try std.testing.expectEqual(.@"extern", @typeInfo(AuthorizeInferenceContext).@"struct".layout);
@@ -318,11 +335,17 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expect(!validFunctionTable(&table, Capability.route_manifest));
     try std.testing.expect(!validFunctionTable(&table, Capability.inference_admission_stats));
     try std.testing.expect(!validFunctionTable(&table, Capability.internal_service_ingress));
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_owner));
     table.struct_size = requiredFunctionTableSize(Capability.core).? - 1;
     try std.testing.expect(!validFunctionTable(&table, Capability.core));
     table.struct_size = requiredFunctionTableSize(Capability.core).?;
     try std.testing.expect(validFunctionTable(&table, Capability.core));
     try std.testing.expect(!validFunctionTable(&table, 1 << 63));
+    table.capabilities |= Capability.node_runnable_owner;
+    table.struct_size = requiredFunctionTableSize(Capability.node_runnable_owner).? - 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_owner));
+    table.struct_size += 1;
+    try std.testing.expect(validFunctionTable(&table, Capability.node_runnable_owner));
 }
 
 test "API imported runtime capability struct retains versioned C layout" {

@@ -1646,6 +1646,9 @@ pub const ApiHttpServerConfig = struct {
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
     query_waiting: @import("antfly_local_sources").common_bounded_admission.Waiting = .{},
     runnable_policy: ?RunnableScheduler.Config = null,
+    /// Trusted API-kernel-owned node handle. Its owner closes it before joining
+    /// node consumers and destroys it after every borrower has retired.
+    runnable_owner_handle: ?*anyopaque = null,
     /// Aggregate API request/backend-response/transaction-state allocation cap.
     /// Control work receives a separate partition within this envelope.
     request_memory_bytes: usize = 256 << 20,
@@ -3876,6 +3879,7 @@ pub const ApiHttpServer = struct {
     cfg: ApiHttpServerConfig,
     query_admission: RequestAdmission,
     runnable_scheduler: ?RunnableScheduler.Scheduler = null,
+    runnable_owner: ?*RunnableScheduler.NodeOwner = null,
     sql_preparation_admission: RequestAdmission,
     sql_control_preparation: RequestAdmission = RequestAdmission.init(4),
     sql_control_admission: RequestAdmission = RequestAdmission.init(4),
@@ -4094,7 +4098,7 @@ pub const ApiHttpServer = struct {
             table_read_source,
             table_write_source,
             owner_ids,
-        );
+        ) catch @panic("API runnable owner acquisition failed");
     }
 
     fn initWithRequestAllocatorAndOwners(
@@ -4106,7 +4110,10 @@ pub const ApiHttpServer = struct {
         table_read_source: ?table_reads.TableReadSource,
         table_write_source: ?table_writes.TableWriteSource,
         owner_ids: RuntimeOwnerIds,
-    ) ApiHttpServer {
+    ) !ApiHttpServer {
+        if (cfg.runnable_owner_handle != null and cfg.runnable_policy != null) return error.InvalidApiServerConfig;
+        const runnable_owner: ?*RunnableScheduler.NodeOwner = if (cfg.runnable_owner_handle) |handle| @ptrCast(@alignCast(handle)) else null;
+        if (runnable_owner) |owner| try owner.retain();
         const effective_query_embedding_cache = effectiveQueryEmbeddingCacheConfig(cfg);
         const api_io = queryEmbeddingCacheIo(cfg);
         var incoming_graph_routes = distributed_graph.IncomingSourceGroupCache.initWithDurableStore(
@@ -4126,6 +4133,7 @@ pub const ApiHttpServer = struct {
             .cfg = cfg,
             .query_admission = RequestAdmission.initConfigured(cfg.query_max_concurrent_requests, cfg.query_waiting) catch @panic("invalid query waiting policy"),
             .runnable_scheduler = if (cfg.runnable_policy) |policy| RunnableScheduler.Scheduler.init(policy) catch @panic("invalid runnable scheduling policy") else null,
+            .runnable_owner = runnable_owner,
             .sql_preparation_admission = RequestAdmission.init(@max(1, cfg.sql_max_concurrent_preparations)),
             .write_admission = RequestAdmission.init(cfg.write_max_concurrent_requests),
             .inference_admission = RequestAdmission.init(cfg.inference_max_concurrent_requests),
@@ -4361,12 +4369,17 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn startSqlRunnable(self: *ApiHttpServer, execution: *RunnableScheduler.Execution, options: @import("antfly_local_sources").common_bounded_admission.Options, class: RunnableScheduler.Class) !void {
-        try execution.start(if (self.runnable_scheduler) |*scheduler| scheduler else null, options, class);
+        try execution.start(self.runnableScheduler(), options, class);
+    }
+
+    fn runnableScheduler(self: *ApiHttpServer) ?*RunnableScheduler.Scheduler {
+        if (self.runnable_owner) |owner| return &owner.scheduler;
+        return if (self.runnable_scheduler) |*scheduler| scheduler else null;
     }
 
     pub fn runnableSchedulingStats(self: *const ApiHttpServer) @import("antfly_runtime_abi").RunnableStats {
         const mutable = @constCast(self);
-        return @import("antfly_local_sources").common_request_admission.runnable_metrics.snapshot(if (mutable.runnable_scheduler) |*scheduler| scheduler else null);
+        return @import("antfly_local_sources").common_request_admission.runnable_metrics.snapshot(mutable.runnableScheduler());
     }
 
     pub fn sqlControlIo(self: *ApiHttpServer) !std.Io {
@@ -4392,7 +4405,7 @@ pub const ApiHttpServer = struct {
     /// completion and control lanes. Reserve it before publishing SQL work.
     pub fn sqlExecutionIo(self: *ApiHttpServer) !std.Io {
         const runtime = self.cfg.backend_runtime orelse return error.SqlWriteCapacityUnavailable;
-        if ((self.cfg.query_waiting.max_wait_ms == 0 and self.cfg.runnable_policy == null) or runtime.borrowed_io != null or
+        if ((self.cfg.query_waiting.max_wait_ms == 0 and self.runnableScheduler() == null) or runtime.borrowed_io != null or
             self.cfg.query_max_concurrent_requests == 0 or self.cfg.write_max_concurrent_requests == 0)
             return runtime.io() orelse error.SqlWriteCapacityUnavailable;
         _ = try self.sqlControlIo();
@@ -4643,6 +4656,7 @@ pub const ApiHttpServer = struct {
         table_write_source: ?table_writes.TableWriteSource,
     ) !ApiHttpServer {
         var effective_cfg = cfg;
+        if (cfg.runnable_owner_handle != null and cfg.runnable_policy != null) return error.InvalidApiServerConfig;
         if (cfg.runnable_policy) |policy| try policy.validate();
         if (cfg.request_memory_bytes < 1 << 20 or cfg.retained_memory_bytes < 1 << 20) return error.InvalidApiServerConfig;
         const backing = if (builtin.is_test)
@@ -4689,7 +4703,7 @@ pub const ApiHttpServer = struct {
                 if (owner_ids.index_installation != 0) runtime.durable_jobs.closeOwner(owner_ids.index_installation);
             }
         };
-        var server = initWithRequestAllocatorAndOwners(
+        var server = try initWithRequestAllocatorAndOwners(
             alloc,
             request_alloc,
             state_memory.allocator(),
@@ -4825,6 +4839,8 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
+        const runnable_owner = self.runnable_owner;
+        defer if (runnable_owner) |owner| owner.release();
         if (self.runnable_scheduler) |*scheduler| scheduler.close();
         self.query_admission.close();
         self.write_admission.close();

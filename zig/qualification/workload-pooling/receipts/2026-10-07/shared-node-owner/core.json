@@ -1,0 +1,28 @@
+{
+  "source_sha256": {
+    "zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig": "66fc7a13b355b3d518003f888f821685b87bda7476dbac91f0cc33b81b4001e8",
+    "zig/pkg/antfly-embedded/src/common/bounded_admission.zig": "de3752df68796efa72f122cc02ca56b030b367bacfc21fa314b853c21bbaa732"
+  },
+  "native": {
+    "command": "/Users/ajroetker/bin/zig-0.17.0/zig test zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig -Osafe --test-filter 'runnable scheduler' --cache-dir /private/tmp/antfly-node-runnable-owner-native-cache",
+    "exit_code": 0,
+    "tests": 14
+  },
+  "linux": {
+    "image": "sha256:fb3236b6cc7411028d62f76eb418110a6c34e246b9437a9d093d58a53a3e2954",
+    "compiler_sha256": "4818e9e28e752456421034db9229035c165c0e3392bf534421016e79de33d022",
+    "command": "zig test /work/zig/pkg/antfly-embedded/src/common/runnable_scheduler.zig -target aarch64-linux-gnu -Osafe --test-filter 'runnable scheduler' --cache-dir /cache",
+    "cpus": 2,
+    "container_memory_bytes": 1073741824,
+    "container_memory_swap_bytes": 1073741824,
+    "exit_code": 0,
+    "tests": 14
+  },
+  "pending": [
+    "full API borrower fixture qualification",
+    "checked API-kernel owner creation/destruction callbacks",
+    "standalone node owner wiring",
+    "inference/backend and background class integration",
+    "default sizing and rollout"
+  ]
+}

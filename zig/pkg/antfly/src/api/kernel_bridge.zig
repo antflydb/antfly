@@ -62,6 +62,53 @@ fn validateFunctionTable() !*const abi.FunctionTable {
 pub const ApiHttpServer = if (direct_codegen) server_mod.ApiHttpServer else OpaqueApiHttpServer;
 pub const HttpxHandler = if (direct_codegen) handler_mod.AntflyApiHandler else OpaqueHttpxHandler;
 
+/// Node lifetime owns this handle independently of each borrowing API. Closing
+/// precedes consumer joins; destruction follows all API/inference/background joins.
+pub const NodeRunnableOwner = struct {
+    handle: *anyopaque,
+    functions: *const abi.FunctionTable,
+    boundary_allocator: *BoundaryAllocator,
+
+    pub fn init(alloc: std.mem.Allocator, policy: server_mod.RunnableScheduler.Config) !NodeRunnableOwner {
+        const functions = if (direct_codegen) @import("kernel_exports.zig").getFunctionTable() else try validateFunctionTable();
+        if (!abi.validFunctionTable(functions, abi.Capability.node_runnable_owner)) return error.UnsupportedVersion;
+        const boundary_allocator = try alloc.create(BoundaryAllocator);
+        errdefer alloc.destroy(boundary_allocator);
+        boundary_allocator.allocator = alloc;
+        boundary_allocator.abi_allocator = .fromStd(&boundary_allocator.allocator);
+        var handle: ?*anyopaque = null;
+        try callError(functions.runnable_owner_create(&.{
+            .abi_version = abi.abi_version,
+            .owner_alloc = &boundary_allocator.abi_allocator,
+            .policy = &policy,
+            .policy_contract = .of(server_mod.RunnableScheduler.Config),
+            .out_handle = &handle,
+        }));
+        return .{ .handle = handle orelse return error.ApiKernelOperationFailed, .functions = functions, .boundary_allocator = boundary_allocator };
+    }
+
+    pub fn close(self: *const NodeRunnableOwner) !void {
+        try callError(self.functions.runnable_owner_close(&.{ .abi_version = abi.abi_version, .handle = self.handle }));
+    }
+
+    pub fn deinit(self: *NodeRunnableOwner) !void {
+        try callError(self.functions.runnable_owner_destroy(&.{ .abi_version = abi.abi_version, .handle = self.handle }));
+        const alloc = self.boundary_allocator.allocator;
+        alloc.destroy(self.boundary_allocator);
+        self.* = undefined;
+    }
+};
+
+test "runnable scheduler opaque node owner retains its allocator after refused destruction" {
+    var owner = try NodeRunnableOwner.init(std.testing.allocator, .{ .slots = 2 });
+    const implementation: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(owner.handle));
+    try implementation.retain();
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.deinit());
+    implementation.release();
+    try owner.close();
+    try owner.deinit();
+}
+
 const OpaqueApiHttpServer = struct {
     opaque_handle: *anyopaque,
     functions: *const abi.FunctionTable,

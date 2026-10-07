@@ -423,6 +423,51 @@ pub const Scheduler = struct {
     }
 };
 
+/// Stable node lifetime, distinct from the API instances borrowing it. Native
+/// archive consumers must use owner callbacks rather than dereference this type.
+pub const NodeOwner = struct {
+    scheduler: Scheduler,
+    mutex: std.atomic.Mutex = .unlocked,
+    borrowers: usize = 0,
+    closed: bool = false,
+
+    pub fn init(config: Config) !NodeOwner {
+        return .{ .scheduler = try Scheduler.init(config) };
+    }
+    pub fn retain(self: *NodeOwner) !void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.closed) return error.SchedulerClosed;
+        self.borrowers += 1;
+    }
+    pub fn release(self: *NodeOwner) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        std.debug.assert(self.borrowers != 0);
+        self.borrowers -= 1;
+    }
+    pub fn close(self: *NodeOwner) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        self.closed = true;
+        self.mutex.unlock();
+        self.scheduler.close();
+    }
+    pub fn deinit(self: *NodeOwner) void {
+        self.tryDeinit() catch @panic("runnable node owner still in use");
+    }
+    pub fn tryDeinit(self: *NodeOwner) !void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        if (self.borrowers != 0 or self.scheduler.stats().operations != 0) {
+            self.mutex.unlock();
+            return error.InvalidRunnableTransition;
+        }
+        self.closed = true;
+        self.mutex.unlock();
+        self.scheduler.close();
+        self.* = undefined;
+    }
+};
+
 /// Stable, single-worker execution capsule. Parallel children must get their
 /// own ownership before sharing this capsule's adapter; it is not a gang lease.
 pub const Execution = struct {
@@ -480,6 +525,30 @@ pub const Execution = struct {
 
 fn testEntry(class: Class, slots: usize, bytes: u64) Entry {
     return .{ .options = .{ .io = std.testing.io }, .class = class, .slots = slots, .bytes = bytes };
+}
+
+test "runnable scheduler node owner outlives independent borrowers and executions" {
+    var owner = try NodeOwner.init(.{ .slots = 2, .checkpoint_budget = 1 });
+    defer owner.deinit();
+    try owner.retain();
+    try owner.retain();
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.tryDeinit());
+    var execution: Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner.scheduler, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+    owner.release();
+    try execution.checkpoint();
+    try std.testing.expectEqual(@as(usize, 1), owner.borrowers);
+    try std.testing.expectEqual(@as(u64, 17), owner.scheduler.stats().retained_bytes);
+    owner.close();
+    try std.testing.expectError(error.SchedulerClosed, owner.retain());
+    try std.testing.expectEqual(@as(usize, 1), owner.scheduler.stats().operations);
+    owner.release();
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.tryDeinit());
+    execution.finish();
+    try std.testing.expectEqual(@as(usize, 0), owner.scheduler.stats().operations);
+    try std.testing.expectEqual(@as(usize, 0), owner.scheduler.stats().runnable_slots);
+    try std.testing.expectEqual(@as(u64, 0), owner.scheduler.stats().retained_bytes);
 }
 
 test "runnable scheduler preserves blocked ownership and protected capacity" {

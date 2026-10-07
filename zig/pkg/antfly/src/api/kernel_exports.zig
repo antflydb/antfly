@@ -46,6 +46,11 @@ const ServerState = struct {
     runtime_io: RuntimeIoReceivers = .{},
 };
 
+const RunnableOwnerState = struct {
+    owner_alloc: std.mem.Allocator,
+    owner: server_mod.RunnableScheduler.NodeOwner,
+};
+
 const RuntimeIoReceivers = struct {
     api: ?runtime_io_abi.Receiver = null,
     api_network: ?runtime_io_abi.Receiver = null,
@@ -144,6 +149,78 @@ fn input(comptime T: type, context: *const CallContext) *const T {
 
 fn output(comptime T: type, context: *const CallContext) *T {
     return @ptrCast(@alignCast(context.output orelse @panic("missing API kernel output")));
+}
+
+pub fn runnableOwnerCreate(context: *const abi.RunnableOwnerCreateContext) callconv(.c) abi.Status {
+    if (validateContext(abi.RunnableOwnerCreateContext, context.abi_version, context.struct_size)) |failure| return failure;
+    if (!context.owner_alloc.valid()) return fail(error.UnsupportedVersion);
+    if (!context.policy_contract.matches(.of(server_mod.RunnableScheduler.Config))) return fail(error.InvalidArgument);
+    const policy: *const server_mod.RunnableScheduler.Config = @ptrCast(@alignCast(context.policy));
+    const owner = server_mod.RunnableScheduler.NodeOwner.init(policy.*) catch return fail(error.InvalidArgument);
+    const alloc = context.owner_alloc.asStd();
+    const state = alloc.create(RunnableOwnerState) catch |err| return fail(err);
+    state.* = .{ .owner_alloc = alloc, .owner = owner };
+    context.out_handle.* = &state.owner;
+    return .ok;
+}
+
+pub fn runnableOwnerClose(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(context.handle));
+    owner.close();
+    return .ok;
+}
+
+pub fn runnableOwnerDestroy(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, void, context)) |failure| return failure;
+    const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(context.handle));
+    const state: *RunnableOwnerState = @fieldParentPtr("owner", owner);
+    const alloc = state.owner_alloc;
+    owner.tryDeinit() catch |err| return fail(err);
+    alloc.destroy(state);
+    return .ok;
+}
+
+test "runnable scheduler API kernel node owner rejects unsafe creation and destruction" {
+    const allocator = std.testing.allocator;
+    const allocator_abi = abi.memory_abi.Allocator.fromStd(&allocator);
+    const policy: server_mod.RunnableScheduler.Config = .{ .slots = 2 };
+    var handle: ?*anyopaque = null;
+    var context: abi.RunnableOwnerCreateContext = .{
+        .abi_version = abi.abi_version - 1,
+        .owner_alloc = &allocator_abi,
+        .policy = @ptrFromInt(8),
+        .policy_contract = .of(void),
+        .out_handle = &handle,
+    };
+    try std.testing.expectEqual(error.UnsupportedVersion, abi.errorFromStatus(runnableOwnerCreate(&context)));
+    try std.testing.expect(handle == null);
+    context.abi_version = abi.abi_version;
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(runnableOwnerCreate(&context)));
+    try std.testing.expect(handle == null);
+    context.policy = &policy;
+    context.policy_contract = .of(server_mod.RunnableScheduler.Config);
+    const invalid_policy: server_mod.RunnableScheduler.Config = .{ .slots = 1 };
+    context.policy = &invalid_policy;
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(runnableOwnerCreate(&context)));
+    try std.testing.expect(handle == null);
+    context.policy = &policy;
+    try std.testing.expect(runnableOwnerCreate(&context).isOk());
+    const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(handle.?));
+    const call: CallContext = .{ .abi_version = abi.abi_version, .handle = handle.? };
+    try owner.retain();
+    try std.testing.expectEqual(error.InvalidRunnableTransition, abi.errorFromStatus(runnableOwnerDestroy(&call)));
+    try std.testing.expect(!owner.closed);
+    owner.release();
+    var execution: server_mod.RunnableScheduler.Execution = .{};
+    defer execution.finish();
+    try execution.start(&owner.scheduler, .{ .io = std.testing.io, .retained_bytes = 17 }, .query);
+    try std.testing.expectEqual(error.InvalidRunnableTransition, abi.errorFromStatus(runnableOwnerDestroy(&call)));
+    try std.testing.expect(runnableOwnerClose(&call).isOk());
+    try std.testing.expect(runnableOwnerClose(&call).isOk());
+    try std.testing.expectError(error.SchedulerClosed, owner.retain());
+    execution.finish();
+    try std.testing.expect(runnableOwnerDestroy(&call).isOk());
 }
 
 pub fn create(context: *const CreateContext) callconv(.c) abi.Status {
@@ -582,7 +659,8 @@ const function_table: abi.FunctionTable = .{
     .capabilities = abi.Capability.core |
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
-        abi.Capability.internal_service_ingress,
+        abi.Capability.internal_service_ingress |
+        abi.Capability.node_runnable_owner,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -610,6 +688,9 @@ const function_table: abi.FunctionTable = .{
     .handler_destroy = &handlerDestroy,
     .inference_admission_stats = &inferenceAdmissionStats,
     .handler_authorize_internal_service = &handlerAuthorizeInternalService,
+    .runnable_owner_create = &runnableOwnerCreate,
+    .runnable_owner_close = &runnableOwnerClose,
+    .runnable_owner_destroy = &runnableOwnerDestroy,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {

@@ -185,8 +185,14 @@ checkpoint; their accepted completion obligations remain unchanged.
 
 ## Shared execution owner still required
 
-The current runnable scheduler is stored in `ApiHttpServer`; it is not yet a
-node-wide owner shared with inference or storage maintenance. Standalone already
+Opt-in standalone now creates an opaque API-kernel-owned `NodeOwner` whose
+lifetime outlives individual API borrowers. Checked create/close/destroy exports
+keep its scheduler and native errors inside the API archive. API destruction
+releases its borrow after worker joins; standalone closes the node owner before
+transport/provider joins and destroys it after consumers retire. The native API
+gate qualifies the borrower and factory contracts; complete production startup
+and shutdown of this new wiring remain pending. Inference and maintenance do
+not yet acquire this shared owner. Standalone already
 shares managed memory with inference through `inference_bridge.ResourceBudget`,
 but that ABI carries no execution grant. Inference HTTP dispatch and embedded
 provider invocation live in the separate inference archive
@@ -194,9 +200,9 @@ provider invocation live in the separate inference archive
 runnable capacity. DataServer's work-cost port is a pacing/accounting hook, not
 an execution owner.
 
-The next integration needs a node-owned scheduler that outlives API, inference,
-and background consumers, with checked archive callbacks for stable request-owned
-execution capsules. Independently admitted inference requests use the inference
+The next integration needs checked archive callbacks for stable request-owned
+execution capsules, borrowing the new node owner across inference and background
+consumer lifetimes. Independently admitted inference requests use the inference
 class. An embedded provider invoked synchronously by an already scheduled SQL
 worker must inherit that worker's grant rather than acquire a second ordinary
 slot: with one ordinary slot, nested acquisition would wait on its own parent.

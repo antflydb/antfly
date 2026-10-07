@@ -5171,6 +5171,14 @@ pub fn runFromIterator(
 
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
+    var runnable_node_owner: ?antfly.public_api.kernel_bridge.NodeRunnableOwner = if (loaded_config) |*cfg|
+        if (cfg.admission.runnable) |policy| try antfly.public_api.kernel_bridge.NodeRunnableOwner.init(alloc, policy) else null
+    else
+        null;
+    defer if (runnable_node_owner) |*owner| {
+        owner.close() catch @panic("runnable node owner close failed");
+        owner.deinit() catch @panic("runnable node owner still in use after consumer joins");
+    };
     var data_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
         .bind_host = public_listener.bind_host,
         .bind_port = public_listener.bind_port,
@@ -5198,7 +5206,7 @@ pub fn runFromIterator(
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,
             .query_max_concurrent_requests = if (loaded_config) |*cfg| cfg.admission.query.max_concurrent_requests else antfly.common.config.default_query_max_concurrent_requests,
             .query_waiting = if (loaded_config) |*cfg| cfg.admission.query.waiting else .{},
-            .runnable_policy = if (loaded_config) |*cfg| cfg.admission.runnable else null,
+            .runnable_owner_handle = if (runnable_node_owner) |owner| owner.handle else null,
             .request_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_request_memory_bytes) else 256 << 20,
             .retained_memory_bytes = if (loaded_config) |*cfg| @intCast(cfg.admission.max_retained_memory_bytes) else 256 << 20,
             .graph_execution_limits = if (loaded_config) |*cfg| cfg.graph_execution else .{},
@@ -5302,6 +5310,7 @@ pub fn runFromIterator(
         // embedded provider. Drain them while the node is valid, then release
         // tokenizer reservations while DataServer's ResourceManager is valid.
         // The earlier data_server.deinit defer performs final storage teardown.
+        if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
         data_server.quiesceExternalProviderUsersWithDeadline(supervisor.deadline()) catch |err| {
             std.log.err("standalone provider shutdown barrier failed err={s}", .{@errorName(err)});
             @panic("standalone provider shutdown barrier failed");
@@ -5515,6 +5524,7 @@ pub fn runFromIterator(
     };
     var future_awaited = false;
     defer if (!future_awaited) {
+        if (runnable_node_owner) |*owner| owner.close() catch @panic("runnable node owner close failed");
         unified_lifecycle.stop();
         _ = unified_future.await(control_io);
     };
@@ -5562,6 +5572,7 @@ pub fn runFromIterator(
     }
 
     const process_shutdown_deadline = supervisor.deadline();
+    if (runnable_node_owner) |*owner| try owner.close();
     unified_lifecycle.shutdown(process_shutdown_deadline);
     _ = unified_future.await(control_io);
     future_awaited = true;

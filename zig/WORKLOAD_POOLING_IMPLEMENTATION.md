@@ -1028,3 +1028,24 @@ also passes `--help` under two CPUs and 2 GiB with no extra swap. The
 records complete output and source/compiler/artifact hashes. Full service
 pressure, the newer isolated provider/shared-owner candidate, and native
 post-write whole production qualification remain pending.
+
+### Shared node runnable owner and provider checkpoints (2026-10-07)
+
+Standalone opt-in scheduling now creates an opaque API-kernel-owned scheduler
+at node lifetime and passes a borrow to its API. Checked factory/lifecycle
+exports preserve allocator ownership, refuse destruction with live borrowers
+or executions, and close before node consumer joins. API teardown captures its
+owner pointer before poisoning the server and releases the borrow after joins.
+Scheduled SQL provider frontend work remains on its parent worker and reaches
+read execution checkpoints before/after invocation and before normalization.
+
+All 50 native pooling API build steps and 78 tests pass (37 embedded, 41
+coordinator), with no skips or leaks. The core scheduler also passes all 14
+contracts on native macOS and pinned Nix/glibc GNU AArch64; two layout/prefix
+checks pass on both platforms. The
+[owner receipt](qualification/workload-pooling/receipts/2026-10-07/shared-node-owner-abi/README.md)
+retains passing evidence and the initial assertion/teardown failures. GNU API,
+separate archive execution and whole-production startup/shutdown of the new
+wiring remain pending. Inference/background execution admission, inherited
+provider grants across the inference boundary, completion ownership, pressure
+qualification and automatic defaults remain required.
