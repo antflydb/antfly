@@ -205,6 +205,9 @@ pub const Context = struct {
     typed_output: bool = false,
     statement_capture: ?*@import("mutation_capture.zig") = null,
     returning_rows: []const catalog.Row = &.{},
+    /// Typed values borrowed from the active Apply frame, not from input rows.
+    /// Their lifetime covers this invocation, including empty global grouping.
+    invocation_constants: []const Datum = &.{},
 
     pub fn emitTop(self: Context, top: *@import("operators.zig").TopK, offset: usize, limit: usize, implicit: bool) !Output {
         if (self.sink.?.take_sorted) |take| try take(self.sink.?.ptr, top, offset, limit, implicit) else try top.drain(self.alloc, offset, limit, implicit, self.sink.?);

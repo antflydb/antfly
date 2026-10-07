@@ -682,6 +682,13 @@ fn Engine(comptime Context: type) type {
                             context.binding = query.binding;
                             context.binding.relation = null;
                             context.arena = self.arena.allocator();
+                            const constants = try context.arena.alloc(Datum, query.constant_refs.len);
+                            for (query.constant_refs, constants) |reference, *constant| {
+                                const values = self.engine.outer_values[reference.frame] orelse return error.InvalidSqlBackendResponse;
+                                if (reference.ordinal >= values.len) return error.InvalidSqlBackendResponse;
+                                constant.* = values[reference.ordinal];
+                            }
+                            context.invocation_constants = constants;
                             context.limits.result_rows = context.limits.scan_rows;
                             if (context.spill) |manager| {
                                 const Cursor = @import("result_cursor.zig").Cursor;

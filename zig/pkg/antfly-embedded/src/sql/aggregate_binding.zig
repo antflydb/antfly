@@ -35,6 +35,7 @@ pub const Bound = struct {
     having: ?scalar.Program,
     orders: []const scalar.Program,
     order_outputs: []const ?usize = &.{},
+    constant_count: usize = 0,
 };
 
 pub fn aggregateKind(name: []const u8) ?operators.Aggregate.Kind {
@@ -117,6 +118,7 @@ const Builder = struct {
     inputs: std.ArrayList(?usize) = .empty,
     filters: std.ArrayList(?usize) = .empty,
     inference: bool = false,
+    constants: []const []const u8 = &.{},
 
     fn node(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
         const result = try self.alloc.create(ast.Scalar);
@@ -128,6 +130,10 @@ const Builder = struct {
     }
     fn rewrite(self: *Builder, input: *const ast.Scalar) anyerror!*const ast.Scalar {
         if (!self.inference) for (self.groups, 0..) |group, index| if (same(input, group)) return self.slot(index);
+        if (!self.inference and input.* == .column) for (self.constants, 0..) |name, index| {
+            if (std.mem.eql(u8, input.column, name))
+                return self.node(.{ .column = try std.fmt.allocPrint(self.alloc, "$constant_{d}", .{index}) });
+        };
         if (self.aliases_enabled and input.* == .column) {
             const source_exists = if (self.table) |definition| blk: {
                 _ = definition.column(input.column) catch break :blk false;
@@ -203,7 +209,7 @@ pub fn bind(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, para
 
 pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.Select, parameters: []?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View) !Bound {
     if (statement.columns.len == 0) return error.SqlGroupingError;
-    var builder: Builder = .{ .alloc = alloc, .groups = statement.group_by, .table = table, .output_columns = statement.columns };
+    var builder: Builder = .{ .alloc = alloc, .groups = statement.group_by, .table = table, .output_columns = statement.columns, .constants = statement.invocation_constants };
     const projection_nodes = try alloc.alloc(*const ast.Scalar, statement.columns.len);
     for (statement.columns, projection_nodes) |projection, *node| node.* = projection.expression orelse try builder.node(.{ .column = projection.field });
     builder.output_nodes = projection_nodes;
@@ -277,11 +283,16 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
     }
     var predicate: ast.Predicate = if (statement.predicate) |node| .{ .scalar = try bound_scalars.predicateScalar(alloc, table, node) } else undefined;
     const input = try bound_scalars.bindWithSettings(alloc, table, .{ .select = .{ .table = statement.table, .columns = builder.arguments.items, .predicate = if (statement.predicate != null) &predicate else null, .limit = statement.limit, .offset = statement.offset } }, parameters, settings);
-    const columns = try alloc.alloc(scalar.Column, groups.len + builder.aggregates.items.len);
-    for (columns, 0..) |*column, index| column.* = .{ .name = try std.fmt.allocPrint(alloc, "$grouped_{d}", .{index}), .type = .string };
+    const grouped_width = groups.len + builder.aggregates.items.len;
+    const columns = try alloc.alloc(scalar.Column, grouped_width + builder.constants.len);
+    for (columns[0..grouped_width], 0..) |*column, index| column.* = .{ .name = try std.fmt.allocPrint(alloc, "$grouped_{d}", .{index}), .type = .string };
+    for (builder.constants, columns[grouped_width..], 0..) |name, *column, index| {
+        const definition = try (table orelse return error.InvalidSqlBackendResponse).column(name);
+        column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .nullable = definition.nullable };
+    }
     for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| column.type = program.?.output_type.kind orelse .string;
     const specs = try alloc.alloc(operators.AggregateSpec, builder.aggregates.items.len);
-    for (builder.aggregates.items, builder.inputs.items, specs, columns[groups.len..]) |node, index, *spec, *column| {
+    for (builder.aggregates.items, builder.inputs.items, specs, columns[groups.len..grouped_width]) |node, index, *spec, *column| {
         const kind = aggregateKind(node.call.name).?;
         const input_type = if (index) |slot| input.projections[slot].?.output_type.kind else null;
         try operators.Aggregate.validate(kind, input_type);
@@ -325,7 +336,7 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         const kind = input.projections[index].?.output_type.kind;
         if (kind != null and kind != .boolean) return error.SqlTypeMismatch;
     };
-    return .{ .input = input, .group_count = groups.len, .specs = specs, .inputs = try builder.inputs.toOwnedSlice(alloc), .filters = try builder.filters.toOwnedSlice(alloc), .outputs = programs, .names = names, .having = having_program, .orders = orders, .order_outputs = order_outputs };
+    return .{ .input = input, .group_count = groups.len, .specs = specs, .inputs = try builder.inputs.toOwnedSlice(alloc), .filters = try builder.filters.toOwnedSlice(alloc), .outputs = programs, .names = names, .having = having_program, .orders = orders, .order_outputs = order_outputs, .constant_count = builder.constants.len };
 }
 
 test "aggregate binding separates row input from grouped expressions and deduplicates aggregates" {

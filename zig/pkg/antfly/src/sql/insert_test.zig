@@ -90,7 +90,7 @@ fn expressionAllocationCase(alloc: std.mem.Allocator) !void {
 }
 
 test "SQL INSERT expression ownership and JSON null survive allocation failures" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, expressionAllocationCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, expressionAllocationCase, .{});
 }
 
 test "SQL INSERT SELECT retains typed exact integers and JSON null across set sources" {
@@ -222,7 +222,7 @@ fn sourceAllocationCase(alloc: std.mem.Allocator) !void {
 }
 
 test "SQL INSERT SELECT pages preserve null flags widen numeric types and close before commit" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, sourceAllocationCase, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, sourceAllocationCase, .{});
 }
 
 test "SQL INSERT SELECT source failures and row quotas occur before mutation" {

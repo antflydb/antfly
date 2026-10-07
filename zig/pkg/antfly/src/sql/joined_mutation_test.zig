@@ -478,6 +478,30 @@ test "SQL scalar cardinality reads two rows from an unestimated million-row sour
     try std.testing.expectEqual(@as(usize, 0), backend.commits);
 }
 
+test "SQL global aggregate invocation constants reuse a captured empty or nonempty source" {
+    for ([_]usize{ 0, 512 }) |count| {
+        var backend: Backend = .{ .returning_mode = true, .cold_source = true, .row_count = count };
+        var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
+        var iface = backend.backend();
+        iface.decision_provider = provider.provider();
+        var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT o.x+COUNT(*) FROM source i) AS n,(SELECT ai_probability(CAST(o.x AS TEXT),'Refund?','local')+COUNT(*) FROM source i) AS p FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{}, .{ .page_rows = 4 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        for (result.output.rows, 1..) |row, index| {
+            try std.testing.expectEqual(count + index, try std.fmt.parseInt(usize, row[0].string, 10));
+            try std.testing.expectApproxEqAbs(@as(f64, @floatFromInt(count)) + 0.9, row[1].float, 0.00001);
+        }
+        try std.testing.expectEqual(@as(usize, 2), provider.calls);
+        // Two physical source occurrences, each read once, not once per parent.
+        try std.testing.expectEqual(count * 2, backend.rows_read);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+}
+
 test "SQL sorted scalar producers execute only selected parents and retain cold scan pruning" {
     const cases = [_]struct { sql: []const u8, calls: usize, rows: usize, scans: usize = 512 }{
         .{ .sql = "SELECT (SELECT ai_probability(o.id,'Refund?','local')) FROM source o ORDER BY o.delta DESC LIMIT $1 OFFSET $2", .calls = 2, .rows = 2 },

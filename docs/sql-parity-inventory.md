@@ -420,7 +420,7 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 62 result contracts and 25 error
+The shared PostgreSQL/native fixture checks 75 result contracts and 26 error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused
@@ -452,9 +452,20 @@ non-equality predicates. Catalog-bound aggregate-level admission rejects
 outer-owned aggregates until their enclosing-query lifting is implemented;
 PostgreSQL reference tests record the required single outer result, and native
 tests reject incorrect per-parent execution before capture. Global aggregates
-that project outer constants,
-post-group output demand, top-level LIMIT demand and distributed concurrent
-snapshot correctness still need separate work. No original inventory
+now retain referenced outer values as typed invocation constants, separate from
+grouping keys and aggregate state. Compiler-bound frame/ordinal references carry
+the active Apply values into the grouped output domain even when no inner row
+exists. HAVING, sorting and external decision outputs use that same domain;
+SQL NULL and JSON null retain distinct provenance. No synthetic grouping key,
+first-input-row dependency or public parameter slot is introduced. A captured
+empty/nonempty-source regression checks two outer parents and two physical
+source occurrences: one capture, exactly twice the source row count, and two
+output-provider calls. Reused compiled statements and allocation-fault tests
+cover parameter inference, nested frames, lexical name shadowing and cleanup.
+A spill-backed nested-result-cursor regression verifies the invocation values
+outlive buffered input and retain the same empty-input results. Post-group scalar-output
+demand and distributed concurrent snapshot correctness still need separate work.
+No original inventory
 disposition is changed by these shared-operator fixtures.
 
 Scalar producers now apply a compiler-owned two-row result bound after validating

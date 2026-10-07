@@ -116,6 +116,9 @@ pub const Select = struct {
     /// Compiler-only ordinal forwarding; its width is not a user projection
     /// or a physical storage-field request. Retained-memory limits still apply.
     internal_projection: bool = false,
+    /// Bound outer-frame columns are invocation constants, not grouping keys.
+    /// In particular they survive a global aggregate's empty input.
+    invocation_constants: []const []const u8 = &.{},
 
     pub fn capRows(self: Select, requested: usize) usize {
         return if (self.scalar_cardinality_limit) @min(requested, 2) else requested;

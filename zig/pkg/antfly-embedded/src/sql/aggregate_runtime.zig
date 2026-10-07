@@ -201,9 +201,11 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
                 exhausted = true;
                 break;
             };
-            const row = try a.alloc(Datum, group.keys.len + group.aggregates.len);
+            const grouped_width = group.keys.len + group.aggregates.len;
+            const row = try a.alloc(Datum, grouped_width + bound.constant_count);
             @memcpy(row[0..group.keys.len], group.keys);
-            @memcpy(row[group.keys.len..], group.aggregates);
+            @memcpy(row[group.keys.len..grouped_width], group.aggregates);
+            @memcpy(row[grouped_width..], context.invocation_constants);
             try cells.append(a, row);
             try ordinals.append(a, group.ordinal);
             for (row) |cell| bytes +|= try operators.datumBytes(cell);
@@ -229,6 +231,7 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
 
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
+    if (context.invocation_constants.len != bound.constant_count) return error.InvalidSqlBackendResponse;
     try bound.input.validateDecisions(context.arena, context.parameters, context.backend.decision_provider);
     var external = if (bound.input.predicate) |*program| @import("decision_eval.zig").hasExternal(program) else false;
     for (bound.input.projections) |optional| if (optional) |*program| {
@@ -340,9 +343,11 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer arena.deinit();
         const alloc = arena.allocator();
         const group = (try grouped.nextResult(alloc)) orelse break;
-        const cells = try alloc.alloc(Datum, group.keys.len + group.aggregates.len);
+        const grouped_width = group.keys.len + group.aggregates.len;
+        const cells = try alloc.alloc(Datum, grouped_width + bound.constant_count);
         @memcpy(cells[0..group.keys.len], group.keys);
-        @memcpy(cells[group.keys.len..], group.aggregates);
+        @memcpy(cells[group.keys.len..grouped_width], group.aggregates);
+        @memcpy(cells[grouped_width..], context.invocation_constants);
         if (bound.having) |program| {
             const result = try context.evaluate(alloc, program, cells);
             if (result.sql_null) continue;

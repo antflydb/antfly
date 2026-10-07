@@ -38,6 +38,7 @@ pub const Column = struct {
     origin: ?*const ast.Scalar = null,
     outer_level: u8 = 0,
     outer_frame: ?usize = null,
+    outer_ordinal: ?usize = null,
 };
 
 /// Expand only authorized visible columns, before allocating expression
@@ -99,6 +100,7 @@ fn physicalScope(table: catalog.Table, name: ast.Name, aliased: bool) ?catalog.T
 }
 
 pub const Node = struct {
+    pub const ConstantRef = struct { frame: usize, ordinal: usize };
     columns: []const Column,
     operation: union(enum) {
         singleton,
@@ -109,7 +111,7 @@ pub const Node = struct {
         scan: struct { index: usize, source_columns: []const []const u8 },
         join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false },
         apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, demand: ?scalar.Program = null },
-        query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement, preserve_scope: bool = false },
+        query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement, preserve_scope: bool = false, constant_refs: []const ConstantRef = &.{} },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
         /// Compiler-generated INSERT VALUES arms in input order. Each arm
         /// retains its own captured source dependencies, but execution opens
@@ -731,6 +733,18 @@ const Builder = struct {
                 if (!present) try grouped.append(self.alloc, try self.scalarNode(.{ .column = column.internal }));
             }
             result.group_by = grouped.items;
+        } else if (@import("aggregate_binding.zig").accepts(result)) {
+            // A lateral frame exists even when the inner input is empty.
+            // These values belong to the invocation, never to a synthetic
+            // grouping key or an arbitrary first/last input row.
+            var needed: std.StringHashMapUnmanaged(void) = .empty;
+            try markSelect(self.alloc, &needed, result);
+            var constants: std.ArrayList([]const u8) = .empty;
+            for (source.columns) |column| {
+                if (column.outer_frame != null and needed.contains(column.internal))
+                    try constants.append(self.alloc, column.internal);
+            }
+            result.invocation_constants = constants.items;
         }
         return result;
     }
@@ -776,9 +790,10 @@ const Builder = struct {
             level += 1;
         }) {
             const columns = try self.alloc.dupe(Column, current.columns);
-            for (columns) |*column| {
+            for (columns, 0..) |*column, ordinal| {
                 column.outer_level = level;
                 column.outer_frame = current.id;
+                column.outer_ordinal = ordinal;
             }
             const reference = try self.node(columns, .{ .outer_ref = current.id });
             outer = if (outer) |left| try self.joinNode(left, reference, .cross, null, null) else reference;
@@ -993,7 +1008,14 @@ const Builder = struct {
             }
             out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .nullable = true, .untyped_null = untyped };
         }
-        return self.node(columns, .{ .query = .{ .source = child, .statement = lowered, .binding = bound } });
+        const constants = try self.alloc.alloc(Node.ConstantRef, lowered.invocation_constants.len);
+        for (lowered.invocation_constants, constants) |name, *reference| {
+            reference.* = for (child.columns) |column| {
+                if (!std.mem.eql(u8, column.internal, name)) continue;
+                break .{ .frame = column.outer_frame orelse return error.InvalidSqlBackendResponse, .ordinal = column.outer_ordinal orelse return error.InvalidSqlBackendResponse };
+            } else return error.InvalidSqlBackendResponse;
+        }
+        return self.node(columns, .{ .query = .{ .source = child, .statement = lowered, .binding = bound, .constant_refs = constants } });
     }
     fn recursiveAlias(self: *Builder, source: *const Node, alias: []const u8) !*const Node {
         const columns = try self.alloc.dupe(Column, source.columns);

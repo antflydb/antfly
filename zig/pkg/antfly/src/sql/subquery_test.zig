@@ -76,6 +76,51 @@ test "SQL masked Apply preserves PostgreSQL conditional subquery demand and NULL
     }
 }
 
+test "SQL global aggregate invocation constants preserve parameter types and empty rows" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT COALESCE(o.x,7)+COUNT(*) FROM (SELECT 1 AS y WHERE FALSE) i) FROM (SELECT $1::bigint AS x) o", .{});
+    defer compiled.deinit();
+    var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{});
+    defer description.deinit();
+    try std.testing.expectEqual(ast.ColumnType.integer, description.binding.parameter_types[0].?);
+    for ([_]std.json.Value{ .null, .{ .integer = 9 }, .{ .integer = -3 } }, [_][]const u8{ "7", "9", "-3" }) |value, expected| {
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{value}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqualStrings(expected, result.output.rows[0][0].string);
+        try std.testing.expect(!result.output.sql_nulls.?[0][0]);
+    }
+}
+
+test "SQL global aggregate invocation constants unwind every allocation failure" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(a, "SELECT (SELECT (SELECT o.x+q.z+COUNT(*) FROM (SELECT 1 AS y WHERE FALSE) i) FROM (SELECT 3 AS z) q) FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+            try std.testing.expectEqualStrings("5", result.output.rows[1][0].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
+test "SQL global aggregate invocation constants survive spill-backed nested result cursors" {
+    var backend: Backend = .{};
+    var iface = backend.backend();
+    iface.execution_io = std.testing.io;
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT (SELECT o.x+q.z+COUNT(*) FROM (SELECT 1 AS y WHERE FALSE) i) FROM (SELECT 3 AS z) q) FROM (SELECT 1 AS x UNION ALL SELECT 2) o ORDER BY o.x", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, iface, &compiled, &.{}, .{ .spill_bytes = 1024 * 1024 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+    try std.testing.expectEqualStrings("4", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("5", result.output.rows[1][0].string);
+}
+
 test "SQL sorted scalar outputs retain computed aliases and NULL provenance" {
     var backend: Backend = .{};
     for ([_][]const u8{
