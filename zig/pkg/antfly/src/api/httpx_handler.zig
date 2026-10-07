@@ -13331,6 +13331,65 @@ test "httpx SQL LATERAL original campaign executes captured native table relatio
     try std.testing.expectEqual(ids.len, source.captures);
 }
 
+test "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls" {
+    // Original SQL and parameters are loaded by ID, never rewritten for this
+    // test. Logical IDs repeat across distinct physical row keys deliberately.
+    const alloc = std.testing.allocator;
+    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.set_read_reference;
+    const Row = struct { key: []const u8, value: std.json.Value };
+    const Table = struct { name: []const u8, schema: std.json.Value, rows: []const Row };
+    const parsed = try std.json.parseFromSlice(struct {
+        profile: struct { schema: std.json.Value, rows: []const Row, additional_tables: []const Table },
+        entries: []const struct { id: []const u8 },
+    }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 18), parsed.value.entries.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.profile.additional_tables.len);
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("sql-set-originals");
+    defer directory.cleanup();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tables = [_]Table{
+        .{ .name = "usage_records", .schema = parsed.value.profile.schema, .rows = parsed.value.profile.rows },
+        parsed.value.profile.additional_tables[0],
+        parsed.value.profile.additional_tables[1],
+    };
+    const Source = @import("sql_parity_sources.zig").Tables(3);
+    var source: Source = undefined;
+    source.captures = 0;
+    var databases: [3]db_mod.DB = undefined;
+    var opened: usize = 0;
+    defer for (databases[0..opened]) |*database| database.close();
+    for (tables, &databases, &source.records, &source.reads, 0..) |table, *database, *record, *read, i| {
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ directory.path(), table.name });
+        database.* = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
+        opened += 1;
+        const schema = try std.json.Stringify.valueAlloc(a, table.schema, .{});
+        try database.setSchemaJson(alloc, schema);
+        const writes = try a.alloc(db_mod.types.BatchWrite, table.rows.len);
+        for (table.rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(a, row.value, .{}) };
+        try database.batch(.{ .writes = writes, .timestamp_ns = 42 });
+        const id: u64 = @intCast(7 + i);
+        record.* = .{ .table_id = id, .name = table.name, .schema_json = schema };
+        read.* = table_reads.BoundTableReadSource.init(table.name, id, database, raft_mod.read_gate.alreadyReadSafeBarrier());
+    }
+    // Fixture tables are immutable throughout capture: this proves native
+    // multi-table execution, not distributed snapshot publication semantics.
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.systemCatalog, .supports_query_definitions = true } }, source.source(), null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const ids = [_][]const u8{
+        "sql-0468", "sql-0471", "sql-0473", "sql-0475", "sql-0476", "sql-0477",
+        "sql-0492", "sql-0493", "sql-0494", "sql-0495", "sql-0537", "sql-0540",
+        "sql-0542", "sql-0543", "sql-0544", "sql-0547", "sql-0548", "sql-0553",
+    };
+    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, &ids, reference_bytes);
+    try std.testing.expectEqual(ids.len, source.captures);
+}
+
 test "httpx SQL PostgreSQL original stored array reads preserve typed column semantics" {
     const alloc = std.testing.allocator;
     const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.typed_array_read_reference;

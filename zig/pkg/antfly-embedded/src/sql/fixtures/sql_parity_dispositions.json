@@ -2,6 +2,16 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-set-reads": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL original set reads preserve cross table bags and nulls"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-postgres-set-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "set_read", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_set_read_campaign_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
     "sql-native-catalog-campaign": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL catalog"],
       "cwd": "zig",
@@ -4453,8 +4463,20 @@
     },
     {
       "id": "sql-0468",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0469",
@@ -4492,8 +4514,20 @@
     },
     {
       "id": "sql-0471",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0472",
@@ -4514,8 +4548,20 @@
     },
     {
       "id": "sql-0473",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0474",
@@ -4536,18 +4582,54 @@
     },
     {
       "id": "sql-0475",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0476",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0477",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0478",
@@ -4799,23 +4881,71 @@
     },
     {
       "id": "sql-0492",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0493",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0494",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0495",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0496",
@@ -5544,8 +5674,20 @@
     },
     {
       "id": "sql-0537",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0538",
@@ -5583,8 +5725,20 @@
     },
     {
       "id": "sql-0540",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0541",
@@ -5593,18 +5747,54 @@
     },
     {
       "id": "sql-0542",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0543",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0544",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0545",
@@ -5642,13 +5832,37 @@
     },
     {
       "id": "sql-0547",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0548",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0549",
@@ -5718,8 +5932,20 @@
     },
     {
       "id": "sql-0553",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Unchanged original SQL executes through mounted public HTTP over captured native relational inputs. PostgreSQL independently verifies complete bags, ordering, labels, type OIDs and SQL NULL provenance using duplicate logical IDs and archived/tenant tables. Physical row keys remain distinct. Fixture tables are immutable; distributed snapshot publication is not certified.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-original-set-reads"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL PostgreSQL original set reads preserve cross table bags and nulls",
+          "gate": "sql-postgres-set-reference"
+        }
+      ]
     },
     {
       "id": "sql-0554",

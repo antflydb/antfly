@@ -42,6 +42,7 @@ then verify selected PostgreSQL goldens with:
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_read_campaign_reference.json
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py document --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_reference.json
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py typed_array_read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_typed_array_read_reference.json
+uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py set_read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_set_read_campaign_reference.json
 uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_generate_sql_postgres_reference.py
 ```
 
@@ -98,9 +99,15 @@ The no-spill comparison exceeds that quota; spilled execution completes under
 it. Tests separately cover zero-file small sets, typed-array lower bounds and
 NULL elements across disk blocks, allocation faults, cancellation, disk quota
 and group caps. Debug timings are diagnostic measurements, not production
-throughput claims. This is shared executor evidence, not completion credit for
-the unresolved original set cohort: those unchanged queries still require a
-dedicated multi-table/duplicate-ID profile and mounted endpoint validation.
+throughput claims. This shared executor evidence is separate from original
+case completion. The eighteen-case `set_read` campaign supplies distinct
+physical rows with repeated logical IDs, SQL NULLs, and archived/tenant tables
+without modifying the baseline read fixture. Its PostgreSQL golden and strict
+mounted native HTTP gate compare unchanged original queries, complete bags,
+ordering, labels, type OIDs and NULL provenance. The native fixture captures
+immutable local inputs; it does not certify distributed snapshot publication.
+Contradictory source predicates (sql-0459, sql-0516 and sql-0541) remain
+unresolved: the oracle's nonempty-witness admission is not relaxed for them.
 
 The catalog boundary now tests 6,585 original-source request truncations, with
 bounded diagnostic positions and no missing-token dereferences. Targeted

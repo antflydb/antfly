@@ -1,0 +1,1267 @@
+{
+  "format": 2,
+  "reference": "PostgreSQL exact SQL",
+  "profile": {
+    "format": 1,
+    "schema": {
+      "version": 1,
+      "storage_mode": "relational",
+      "default_type": "row",
+      "document_schemas": {
+        "row": {
+          "schema": {
+            "type": "object",
+          "properties": {
+            "id": {
+              "type": "keyword",
+              "nullable": true
+            },
+            "name": {
+              "type": "keyword"
+            },
+            "status": {
+              "type": "keyword",
+              "nullable": true
+            },
+              "organization_id": {
+                "type": "keyword"
+              },
+              "email": {
+                "type": "keyword"
+              },
+              "amount": {
+                "type": "integer"
+              },
+              "quantity": {
+                "type": "integer"
+              },
+              "tenant_id": {
+                "type": "keyword"
+              },
+              "customer_id": {
+                "type": "keyword"
+              },
+              "created_at": {
+                "type": "keyword"
+              },
+              "enabled": {
+                "type": "boolean"
+              },
+              "kind": {
+                "type": "keyword"
+              },
+              "tags": {
+                "type": "json"
+              },
+              "metadata": {
+                "type": "json"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    "rows": [
+      {
+        "key": "open-a",
+        "value": {
+          "id": "a",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "open-a-copy",
+        "value": {
+          "id": "a",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "closed-a",
+        "value": {
+          "id": "a",
+          "name": "Ada",
+          "status": "closed",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "open-b",
+        "value": {
+          "id": "b",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "open-c",
+        "value": {
+          "id": "c",
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": false,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "closed-d",
+        "value": {
+          "id": "d",
+          "name": "Ada",
+          "status": "closed",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "null-id",
+        "value": {
+          "id": null,
+          "name": "Ada",
+          "status": "open",
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      },
+      {
+        "key": "null-status",
+        "value": {
+          "id": "e",
+          "name": "Ada",
+          "status": null,
+          "organization_id": "org_1",
+          "email": "ADA@EXAMPLE.TEST",
+          "amount": 12,
+          "quantity": 2,
+          "tenant_id": "t1",
+          "customer_id": "c1",
+          "created_at": "2025-01-01T00:00:00Z",
+          "enabled": true,
+          "kind": "order",
+          "tags": [
+            "hot",
+            "new"
+          ],
+          "metadata": {
+            "source": "api",
+            "kind": "external",
+            "flags": [
+              "rated"
+            ],
+            "billing": {
+              "plan": "pro"
+            }
+          }
+        }
+      }
+    ],
+    "additional_tables": [
+      {
+        "name": "archived_records",
+        "schema": {
+          "version": 1,
+          "storage_mode": "relational",
+          "default_type": "row",
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "keyword",
+                    "nullable": true
+                  },
+                  "name": {
+                    "type": "keyword"
+                  },
+                  "status": {
+                    "type": "keyword",
+                    "nullable": true
+                  },
+                  "organization_id": {
+                    "type": "keyword"
+                  },
+                  "email": {
+                    "type": "keyword"
+                  },
+                  "amount": {
+                    "type": "integer"
+                  },
+                  "quantity": {
+                    "type": "integer"
+                  },
+                  "tenant_id": {
+                    "type": "keyword"
+                  },
+                  "customer_id": {
+                    "type": "keyword"
+                  },
+                  "created_at": {
+                    "type": "keyword"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "kind": {
+                    "type": "keyword"
+                  },
+                  "tags": {
+                    "type": "json"
+                  },
+                  "metadata": {
+                    "type": "json"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "rows": [
+          {
+            "key": "deleted-a",
+            "value": {
+              "id": "a",
+              "name": "Ada",
+              "status": "deleted",
+              "organization_id": "org_1",
+              "email": "ADA@EXAMPLE.TEST",
+              "amount": 12,
+              "quantity": 2,
+              "tenant_id": "t1",
+              "customer_id": "c1",
+              "created_at": "2025-01-01T00:00:00Z",
+              "enabled": true,
+              "kind": "order",
+              "tags": [
+                "hot",
+                "new"
+              ],
+              "metadata": {
+                "source": "api",
+                "kind": "external",
+                "flags": [
+                  "rated"
+                ],
+                "billing": {
+                  "plan": "pro"
+                }
+              }
+            }
+          },
+          {
+            "key": "deleted-a-copy",
+            "value": {
+              "id": "a",
+              "name": "Ada",
+              "status": "deleted",
+              "organization_id": "org_1",
+              "email": "ADA@EXAMPLE.TEST",
+              "amount": 12,
+              "quantity": 2,
+              "tenant_id": "t1",
+              "customer_id": "c1",
+              "created_at": "2025-01-01T00:00:00Z",
+              "enabled": true,
+              "kind": "order",
+              "tags": [
+                "hot",
+                "new"
+              ],
+              "metadata": {
+                "source": "api",
+                "kind": "external",
+                "flags": [
+                  "rated"
+                ],
+                "billing": {
+                  "plan": "pro"
+                }
+              }
+            }
+          },
+          {
+            "key": "deleted-d",
+            "value": {
+              "id": "d",
+              "name": "Ada",
+              "status": "deleted",
+              "organization_id": "org_1",
+              "email": "ADA@EXAMPLE.TEST",
+              "amount": 12,
+              "quantity": 2,
+              "tenant_id": "t2",
+              "customer_id": "c1",
+              "created_at": "2025-01-01T00:00:00Z",
+              "enabled": false,
+              "kind": "order",
+              "tags": [
+                "hot",
+                "new"
+              ],
+              "metadata": {
+                "source": "api",
+                "kind": "external",
+                "flags": [
+                  "rated"
+                ],
+                "billing": {
+                  "plan": "pro"
+                }
+              }
+            }
+          },
+          {
+            "key": "archived-z",
+            "value": {
+              "id": "z",
+              "name": "Ada",
+              "status": "archived",
+              "organization_id": "org_1",
+              "email": "ADA@EXAMPLE.TEST",
+              "amount": 12,
+              "quantity": 2,
+              "tenant_id": "t1",
+              "customer_id": "c1",
+              "created_at": "2025-01-01T00:00:00Z",
+              "enabled": true,
+              "kind": "order",
+              "tags": [
+                "hot",
+                "new"
+              ],
+              "metadata": {
+                "source": "api",
+                "kind": "external",
+                "flags": [
+                  "rated"
+                ],
+                "billing": {
+                  "plan": "pro"
+                }
+              }
+            }
+          },
+          {
+            "key": "deleted-null",
+            "value": {
+              "id": null,
+              "name": "Ada",
+              "status": "deleted",
+              "organization_id": "org_1",
+              "email": "ADA@EXAMPLE.TEST",
+              "amount": 12,
+              "quantity": 2,
+              "tenant_id": "t1",
+              "customer_id": "c1",
+              "created_at": "2025-01-01T00:00:00Z",
+              "enabled": true,
+              "kind": "order",
+              "tags": [
+                "hot",
+                "new"
+              ],
+              "metadata": {
+                "source": "api",
+                "kind": "external",
+                "flags": [
+                  "rated"
+                ],
+                "billing": {
+                  "plan": "pro"
+                }
+              }
+            }
+          }
+        ]
+      },
+      {
+        "name": "tenant_records",
+        "schema": {
+          "version": 1,
+          "storage_mode": "relational",
+          "default_type": "row",
+          "document_schemas": {
+            "row": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "keyword",
+                    "nullable": true
+                  },
+                  "name": {
+                    "type": "keyword"
+                  },
+                  "status": {
+                    "type": "keyword",
+                    "nullable": true
+                  },
+                  "organization_id": {
+                    "type": "keyword"
+                  },
+                  "email": {
+                    "type": "keyword"
+                  },
+                  "amount": {
+                    "type": "integer"
+                  },
+                  "quantity": {
+                    "type": "integer"
+                  },
+                  "tenant_id": {
+                    "type": "keyword"
+                  },
+                  "customer_id": {
+                    "type": "keyword"
+                  },
+                  "created_at": {
+                    "type": "keyword"
+                  },
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "kind": {
+                    "type": "keyword"
+                  },
+                  "tags": {
+                    "type": "json"
+                  },
+                  "metadata": {
+                    "type": "json"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "rows": [
+          {
+            "key": "tenant-t1",
+            "value": {
+              "id": "t1",
+              "name": "Ada",
+              "status": "active",
+              "organization_id": "org_1",
+              "email": "ADA@EXAMPLE.TEST",
+              "amount": 12,
+              "quantity": 2,
+              "tenant_id": "t1",
+              "customer_id": "c1",
+              "created_at": "2025-01-01T00:00:00Z",
+              "enabled": true,
+              "kind": "order",
+              "tags": [
+                "hot",
+                "new"
+              ],
+              "metadata": {
+                "source": "api",
+                "kind": "external",
+                "flags": [
+                  "rated"
+                ],
+                "billing": {
+                  "plan": "pro"
+                }
+              }
+            }
+          },
+          {
+            "key": "tenant-t2",
+            "value": {
+              "id": "t2",
+              "name": "Ada",
+              "status": "inactive",
+              "organization_id": "org_1",
+              "email": "ADA@EXAMPLE.TEST",
+              "amount": 12,
+              "quantity": 2,
+              "tenant_id": "t2",
+              "customer_id": "c1",
+              "created_at": "2025-01-01T00:00:00Z",
+              "enabled": true,
+              "kind": "order",
+              "tags": [
+                "hot",
+                "new"
+              ],
+              "metadata": {
+                "source": "api",
+                "kind": "external",
+                "flags": [
+                  "rated"
+                ],
+                "billing": {
+                  "plan": "pro"
+                }
+              }
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "entries": [
+    {
+      "id": "sql-0468",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0471",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0473",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ],
+        [
+          "b"
+        ],
+        [
+          "c"
+        ],
+        [
+          "d"
+        ],
+        [
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          true
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0475",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0476",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          null
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "b"
+        ],
+        [
+          "c"
+        ],
+        [
+          "a"
+        ],
+        [
+          "d"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          true
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0477",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ],
+        [
+          "b"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0492",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ],
+        [
+          "b"
+        ],
+        [
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          true
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0493",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0494",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          null
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "b"
+        ],
+        [
+          "c"
+        ],
+        [
+          "a"
+        ],
+        [
+          "d"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          true
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0495",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ],
+        [
+          "b"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0537",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0540",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0542",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          null
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "b"
+        ],
+        [
+          "c"
+        ],
+        [
+          "z"
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          true
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          true
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0543",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "b"
+        ],
+        [
+          "c"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0544",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ],
+        [
+          null
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          true
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0547",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0548",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ],
+        [
+          "a"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0553",
+      "columns": [
+        "id"
+      ],
+      "rows": [
+        [
+          "b"
+        ],
+        [
+          "c"
+        ],
+        [
+          "e"
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false
+        ],
+        [
+          false
+        ],
+        [
+          false
+        ]
+      ],
+      "column_oids": [
+        25
+      ],
+      "affected": 0
+    }
+  ],
+  "excluded": [],
+  "server_version": 180006
+}

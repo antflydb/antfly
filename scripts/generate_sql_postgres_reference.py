@@ -811,6 +811,57 @@ def read_reference(db, cases, profile):
     }
 
 
+def set_read_profile():
+    """Independent physical rows with duplicate logical values and three tables.
+
+    Logical id is deliberately not a primary key: SQL set multiplicities are
+    distinct from physical document identity. Keep the baseline read fixture
+    unchanged; this campaign supplies nonempty intersection and OFFSET witnesses.
+    """
+    profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
+    for column in ("id", "status"):
+        properties(profile["schema"])[column]["nullable"] = True
+    seed = profile["rows"][0]["value"]
+
+    def row(key, identity, status, enabled=True, tenant="t1"):
+        value = deepcopy(seed)
+        value.update(id=identity, status=status, enabled=enabled, tenant_id=tenant)
+        return {"key": key, "value": value}
+
+    profile["rows"] = [
+        row("open-a", "a", "open"),
+        row("open-a-copy", "a", "open"),
+        row("closed-a", "a", "closed"),
+        row("open-b", "b", "open"),
+        row("open-c", "c", "open", False),
+        row("closed-d", "d", "closed"),
+        row("null-id", None, "open"),
+        row("null-status", "e", None),
+    ]
+    profile["additional_tables"] = [
+        {
+            "name": "archived_records",
+            "schema": deepcopy(profile["schema"]),
+            "rows": [
+                row("deleted-a", "a", "deleted"),
+                row("deleted-a-copy", "a", "deleted"),
+                row("deleted-d", "d", "deleted", False, "t2"),
+                row("archived-z", "z", "archived"),
+                row("deleted-null", None, "deleted"),
+            ],
+        },
+        {
+            "name": "tenant_records",
+            "schema": deepcopy(profile["schema"]),
+            "rows": [
+                row("tenant-t1", "t1", "active"),
+                row("tenant-t2", "t2", "inactive", tenant="t2"),
+            ],
+        },
+    ]
+    return profile
+
+
 def typed_array_read_profile():
     """Keep the scalar campaign stable; declare a separate stored-array domain."""
     profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
@@ -975,6 +1026,7 @@ def main():
         choices=[
             "read",
             "typed_array_read",
+            "set_read",
             "document",
             "lateral",
             "mutation",
@@ -1018,12 +1070,15 @@ def main():
         if args.campaign in {
             "read",
             "typed_array_read",
+            "set_read",
             "lateral",
             "mutation",
             "correlated_mutation",
         }:
             profile = (
-                typed_array_read_profile()
+                set_read_profile()
+                if args.campaign == "set_read"
+                else typed_array_read_profile()
                 if args.campaign == "typed_array_read"
                 else json.loads(
                     (

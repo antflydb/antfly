@@ -35,6 +35,7 @@ from generate_sql_postgres_reference import (
     execute,
     postgres,
     read_reference,
+    set_read_profile,
     mutation_reference,
     SEEDS,
     validate_ordered_groups,
@@ -1718,6 +1719,38 @@ class PostgresReferenceTest(unittest.TestCase):
                 "ORDER BY e.dst DESC LIMIT 1 OFFSET 1) l ON true ORDER BY p.n"
             ).fetchall()
             self.assertEqual([(n, n * 10) for n in range(1, 129)], rows)
+
+    def test_original_set_campaign_preserves_duplicate_and_null_witnesses(self):
+        import json
+        from collections import Counter
+
+        manifest = json.loads((FIXTURES / "sql_set_read_campaign.json").read_text())
+        ids = {entry["id"] for entry in manifest["entries"]}
+        self.assertEqual(18, len(ids))
+        inventory = json.loads((FIXTURES / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+        cases = [case for case in inventory if case["id"] in ids]
+        profile = set_read_profile()
+        self.assertEqual(2, len(profile["additional_tables"]))
+        result = read_reference(self.db, cases, profile)
+        self.assertEqual([], result["excluded"])
+        self.assertEqual(ids, {entry["id"] for entry in result["entries"]})
+        self.assertTrue(all(entry["rows"] for entry in result["entries"]))
+        golden = json.loads(
+            (FIXTURES / "sql_set_read_campaign_reference.json").read_text()
+        )
+        self.assertEqual(profile, golden["profile"])
+        expected = {entry["id"]: entry for entry in golden["entries"]}
+        for entry in result["entries"]:
+            self.assertEqual(expected[entry["id"]], entry)
+        by_id = {entry["id"]: entry for entry in result["entries"]}
+        self.assertEqual(
+            Counter({"a": 3, "b": 1, "c": 1, "d": 1, None: 1}),
+            Counter(row[0] for row in by_id["sql-0476"]["rows"]),
+        )
+        self.assertEqual({"a", None}, {row[0] for row in by_id["sql-0544"]["rows"]})
+        self.assertEqual({"b", "c"}, {row[0] for row in by_id["sql-0543"]["rows"]})
 
     def test_original_lateral_campaign_and_postgres_alias_scope(self):
         import json
