@@ -1576,12 +1576,10 @@ pub const AntflyApiHandler = struct {
         body_data: []const u8,
         api: public_table_http.TableApi,
         handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
-        done: std.atomic.Value(bool) = .init(false),
         result: ?public_table_http.OwnedResponse = null,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            defer self.done.store(true, .release);
             self.result = self.handler(
                 self.alloc,
                 self.table_name,
@@ -1641,16 +1639,10 @@ pub const AntflyApiHandler = struct {
             std.log.warn("batch offload scheduling failed; executing inline err={s}", .{@errorName(err)});
             return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         };
-        while (!job.done.load(.acquire)) {
-            // The borrowed request token is consumed only by post-commit
-            // visibility waits. Never cancel the whole future here: that
-            // could interrupt proposal before its durability is known.
-            if (ctx.isCancellationRequested()) {
-                break;
-            }
-            ctx.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
-        }
-        _ = future.await(runtime_io);
+        // Future.await can forward caller cancellation to its child. Protect
+        // this wait so proposal cannot be interrupted before durability is
+        // known. The batch's request token still controls visibility waits.
+        @import("protected_future.zig").wait(runtime_io, &future);
         if (job.err) |err| return err;
         var resp = job.result.?;
         return respondOwnedApiResponseWithAllocator(ctx, &resp, job_alloc);
