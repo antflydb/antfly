@@ -134,11 +134,20 @@ like `lib/generating` cannot import it today, or upstream them to Zig.
   `CommandLineToArgvW` quoting. The `argsIterator` buffers are process-lifetime.
 - Durability (`lib/runtime/src/fs_paths.zig`, `lib/objectstore`): file sync uses
   `std.Io.File.sync` (`NtFlushBuffersFile`, so handles are opened read-write).
-  Directory sync is a no-op. NTFS journaling is not a proof that an acknowledged
-  rename survives power loss; crash safety of namespace publication is unverified.
-- LSM atomic writes on Windows use `BufferedAtomicWriteSink` (in-memory, then
-  write, sync and rename) instead of the POSIX fd sink. Large compactions hold
-  the whole output in memory.
+  LSM and immutable object publication flush file contents before rename and
+  reopen/flush the published file afterward. Flush failures propagate to the
+  caller, including failures after publication. Microsoft's
+  [file caching documentation](https://learn.microsoft.com/en-us/windows/win32/fileio/file-caching)
+  describes flushing file metadata this way. Directory sync remains a no-op;
+  this does not prove durability of new ancestor directories or deletion, nor
+  qualify the storage device's power-loss behavior.
+- LSM atomic writes on Windows use `NativeStreamingAtomicWriteSink`: a sibling
+  staging file, a fixed 64 KiB write buffer, and a 64 KiB checksum scratch buffer.
+  Header patches and CRC ranges work across buffered and persisted bytes. The
+  sink retains the I/O runtime through finish/abort, closes the staging handle
+  before rename, and removes staging on abort or pre-publication failure. Memory
+  used by this writer no longer scales with compaction output size. Windows
+  still lacks the POSIX cold-cache eviction hints and descriptor cache.
 - `storage_io.zig` fd cache, `vector_block_store` mmap, and `peer_disconnect_observer`
   stay disabled on Windows (pre-existing gates).
 - Inference `c_file.zig`: open, size, pread and read-only mmap use Win32 handles.
@@ -184,6 +193,97 @@ were added. The final adapters were exercised in ReleaseFast by the focused
 compatibility tests; the final full HTTP/recovery workload ran in Debug.
 This does not qualify native NTFS power-loss behavior or a supported Windows
 release.
+
+See [the follow-up qualification report](QUALIFICATION.md) for bounded-writer
+tests, native Windows Server/NTFS reset evidence, and sustained-write limits.
+
+## Native Windows reset qualification
+
+Use a disposable Windows machine and an NTFS data directory. Do not reset a
+shared machine. An abrupt hypervisor reset tests loss of the guest's buffered
+state; it does not simulate loss of power to the storage controller or prove
+physical-device durability. A process kill alone leaves the OS cache intact.
+
+On Windows, check the filesystem and run the server with explicit fsync:
+
+```powershell
+New-Item -ItemType Directory -Path C:\antfly-test -ErrorAction Stop
+Get-Volume -FilePath C:\antfly-test | Select-Object FileSystem, HealthStatus
+C:\antfly-test\antfly.exe standalone --host 127.0.0.1 --port 8080 --health false `
+  --storage-engine lite --storage-path C:\antfly-test\data.aflite `
+  --data-dir C:\antfly-test\runtime --fsync true
+```
+
+Keep the acknowledgment ledger on a separate controller machine. Reach the
+server over a private connection or tunnel; do not expose the test HTTP API
+publicly. Start an ongoing write stream from that controller:
+
+```sh
+python3 tools/windows/durability_probe.py write --url http://127.0.0.1:8080 \
+  --ledger /path/on/controller/acknowledged.jsonl --count 0
+```
+
+After some acknowledgments, abruptly reset **only the disposable test VM**
+while the write stream is active. The controller will exit on a lost request;
+its ledger includes only successful `full_index` responses. Restart the same
+server/database, restore the tunnel, then run:
+
+```sh
+python3 tools/windows/durability_probe.py verify --url http://127.0.0.1:8080 \
+  --ledger /path/on/controller/acknowledged.jsonl
+```
+
+The verifier requires every acknowledged document's body hash and full-text
+entry to survive. A last interrupted request may survive without acknowledgment
+and is permitted. Stop the server and run `antfly lite check` afterward. Record
+the binary hash, Windows build, volume type, reset mechanism, ledger, server
+logs, and check result. Repeat with fresh ledgers/databases around table creation
+and compaction. Lite qualification does not qualify the separate LSM engine.
+
+For focused staging tests without the full application:
+
+```sh
+ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test \
+  pkg/antfly-embedded/src/local/storage/lsm_backend/staged_file.zig \
+  -target x86_64-windows-gnu -O ReleaseFast -lc --test-no-exec \
+  -femit-bin=/path/to/staged-test.exe
+```
+
+Run `staged-test.exe` directly on Windows or through the isolated CrossOver
+bottle. It exercises an 8 MiB output, boundary-crossing patches, checksums,
+range validation, and a read failure that must prevent later publication.
+
+The integrated writer tests also exercise finish, replacement, abort cleanup,
+and runtime ownership after storage shutdown. From `zig/`:
+
+```sh
+ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test -lc \
+  -target x86_64-windows-gnu -O ReleaseFast --test-no-exec \
+  -femit-bin=/path/to/storage-test.exe --test-filter 'native streaming' \
+  --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
+  -Mroot=pkg/antfly-embedded/src/local/windows_storage_test.zig \
+  -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
+  --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig
+```
+
+An 80 KiB fixed allocator must accommodate an 8 MiB atomic output. Use
+`gce_qualify.ps1` as a disposable VM startup script for the native qualification.
+It downloads `tests.zip` from the private bucket named in instance metadata
+`antfly-artifact-bucket`; set `antfly-artifact-sha256` to the application's SHA-256.
+Set `antfly-mode=serve` to start the HTTP runner, or `antfly-mode=check`
+to publish an offline integrity result in the `antfly/check` guest attribute.
+The archive contains `antfly.exe`, `compat-test.exe`, `staged-test.exe`,
+`storage-test.exe`, and `object-durability-test.exe`. Give the VM identity object-viewer
+access only to that bucket. Enable guest attributes and allow ports 8080/9090
+only through authenticated IAP forwarding. The script records the NTFS volume,
+Windows version, binary hash, and unit-test results in `antfly/status` guest
+attributes and `/status` on port 9090. `POST /check` on that port stops only the
+test Antfly server and returns the offline Lite integrity result. The endpoint
+is intended only for the isolated test VM. Fixed diagnostic endpoints expose
+the test process's minidump (`POST /dump`), CPU/memory use and database size
+(`GET /diagnostics`), and the OS's ntdll binary for stack unwinding
+(`GET /ntdll`). These endpoints must remain private; dumps and logs can contain
+test data.
 
 ## Prior native Windows qualification
 

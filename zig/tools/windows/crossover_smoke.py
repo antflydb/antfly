@@ -18,6 +18,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from durability_probe import verify, write
+
 
 def windows_path(path: Path) -> str:
     return "Z:" + str(path.resolve()).replace("/", "\\")
@@ -29,11 +31,14 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--bottle", required=True)
     parser.add_argument("--bottle-path", required=True, type=Path)
+    parser.add_argument("--durability-count", type=int, default=0)
     parser.add_argument(
         "--wine",
         default="/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine",
     )
     args = parser.parse_args()
+    if args.durability_count < 0:
+        parser.error("durability-count must be nonnegative")
     if not args.binary.is_file():
         parser.error(f"Windows executable does not exist: {args.binary}")
     args.out.mkdir(parents=True, exist_ok=False)
@@ -120,6 +125,12 @@ def main() -> None:
                         },
                     )
                 search()
+                if args.durability_count:
+                    ledger = args.out / "acknowledged.jsonl"
+                    if run == 0:
+                        write(base, ledger, args.durability_count, 4096)
+                    else:
+                        verify(base, ledger)
                 with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
                     list(pool.map(lambda _: search(), range(32)))
                 print(
