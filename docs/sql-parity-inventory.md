@@ -420,7 +420,7 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 75 result contracts and 26 error
+The shared PostgreSQL/native fixture checks 79 result contracts and 34 error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused
@@ -510,7 +510,26 @@ LIMIT 2 OFFSET 1 demands exactly three scalar outputs and source rows, and a
 cardinality failure on a skipped row remains observable. These are tested plan
 contracts, not a promise of identical error precedence across PostgreSQL optimizer
 rewrites or constant folding. Allocation-fault tests cover selection-stage cleanup.
-Grouped/window scalar-output staging, cross-level aggregate lifting and wildcard
+Ordered window output now reuses a compatible window permutation in memory as
+well as on disk. It moves only row references, after all window/navigation
+specifications finish in the original identity domain. The output frontier
+evaluates OFFSET-skipped rows but stops at the explicit LIMIT instead of reading
+and evaluating the unused ordered tail. A 512-row native regression checks
+exactly one/three projection checkpoints for LIMIT 1 with OFFSET 0/2 and bounded
+spill reads; an unbounded query still enforces the response quota. PostgreSQL
+contracts retain skipped-row and sort-required arithmetic errors. This is a
+final-projection work bound, not a claim that window input or frame computation
+can skip rows needed by their semantics. Rewritten ORDER BY expressions also
+discard stale qualified field spellings so canonical binding cannot recurse.
+Scalar children normalize their compiler-owned two-row bound separately from
+the implicit response quota, so ordered window projection reports cardinality
+(`21000`) before an unused third projection rather than a result-size (`54000`)
+error. Sort-required value failures remain observable. Allocation-fault
+enumeration covers the final permutation's ownership across multiple window
+specifications. Window input explicitly clears that scalar-result bound: COUNT,
+SUM, frame calculations and sort keys must still see all required input rows.
+
+General grouped/window scalar-subquery output staging, cross-level aggregate lifting and wildcard
 ORDER BY ordinal mapping remain unfinished. These shared execution regressions
 do not change the original-case dispositions or the 1,025 unresolved total.
 

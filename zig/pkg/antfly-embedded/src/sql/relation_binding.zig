@@ -625,7 +625,10 @@ const Builder = struct {
                     spec.partition = partitions;
                     const order = try self.alloc.dupe(ast.Order, spec.order);
                     for (order) |*item| {
-                        if (item.expression) |expression_| item.expression = try self.expression(columns, expression_, &.{}) else item.field = (try self.resolveField(columns, item.field)).internal;
+                        if (item.expression) |expression_| {
+                            item.expression = try self.expression(columns, expression_, &.{});
+                            item.field = "";
+                        } else item.field = (try self.resolveField(columns, item.field)).internal;
                     }
                     spec.order = order;
                 }
@@ -687,6 +690,10 @@ const Builder = struct {
             out.* = order;
             if (order.expression) |input| {
                 out.expression = try self.expression(source.columns, input, &.{});
+                // The expression is authoritative. Retaining its original
+                // qualified spelling makes semantic binding enter relation
+                // lowering again even though all names are already internal.
+                out.field = "";
             } else if (order.position == null) {
                 var alias = false;
                 for (result.columns) |projection| if (projection.alias) |name| if (std.mem.eql(u8, name, order.field)) {

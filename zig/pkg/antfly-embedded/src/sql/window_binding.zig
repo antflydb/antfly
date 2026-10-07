@@ -233,6 +233,10 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     input_statement.order_by = &.{};
     input_statement.limit = null;
     input_statement.offset = null;
+    // The scalar cardinality bound belongs to the completed window query,
+    // never to its input. Window counts, frames and final sort keys may need
+    // rows beyond the two scalar-result witnesses.
+    input_statement.scalar_cardinality_limit = false;
     var input_compiled = compiled.*;
     input_compiled.statement = .{ .select = input_statement };
     const input = try alloc.create(describe.BoundStatement);

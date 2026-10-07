@@ -462,6 +462,26 @@ test "SQL window input preparation releases every allocation failure" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
+test "SQL window final permutation owns references through every allocation failure" {
+    const Case = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var backend: Backend = .{};
+            var compiled = try compiler.compile(alloc, "SELECT x,lag(x) OVER (ORDER BY x),sum(x) OVER (ORDER BY x DESC) FROM (SELECT 3 AS x UNION ALL SELECT 1 UNION ALL SELECT 2) t ORDER BY x LIMIT 2", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(alloc, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
+            try std.testing.expect(result.output.sql_nulls.?[0][1]);
+            try std.testing.expectEqualStrings("6", result.output.rows[0][2].string);
+            try std.testing.expectEqualStrings("2", result.output.rows[1][0].string);
+            try std.testing.expectEqualStrings("1", result.output.rows[1][1].string);
+            try std.testing.expectEqualStrings("5", result.output.rows[1][2].string);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
 test "SQL window shape infers frame value and offset parameters before execution" {
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT sum($1) OVER (ORDER BY 0 ROWS BETWEEN $2 PRECEDING AND CURRENT ROW)+1, lag(4,$3,$4) OVER (), ntile($5) OVER ()", .{});

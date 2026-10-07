@@ -427,6 +427,12 @@ pub const Context = struct {
         var statement = requested;
         if (statement.limit != null and !try self.hasRowLimit(statement.limit))
             statement.limit = if (statement.scalar_cardinality_limit) .{ .integer = 2 } else null;
+        // A scalar child's internal two-row bound is physical demand, not an
+        // implicit public response quota. Sort/group/window finishers must
+        // deliver those two rows to the cardinality check instead of reporting
+        // a result-size error for the unused third row.
+        if (statement.scalar_cardinality_limit and statement.limit == null)
+            statement.limit = .{ .integer = 2 };
         if (self.binding.relation != null) return @import("relation_runtime.zig").execute(self);
         if (self.binding.window != null) return @import("window_runtime.zig").execute(self, statement);
         if (self.binding.aggregate != null) return @import("aggregate_runtime.zig").execute(self, statement);

@@ -663,6 +663,9 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
 pub fn evaluateCells(context: anytype, statement: ast.Select, cells: [][]Datum) !@import("runtime.zig").Output {
     const bound = context.binding.window.?;
     const roots = try @import("ordering_reuse.zig").plan(context.arena, bound);
+    var final_indices: ?[]usize = null;
+    defer if (final_indices) |indices| context.alloc.free(indices);
+    var final_order: ?binding.Sort = null;
     for (bound.sorts, 0..) |strong, root| {
         if (roots[root] != root) continue;
         try context.checkpoint();
@@ -677,6 +680,15 @@ pub fn evaluateCells(context: anytype, statement: ast.Select, cells: [][]Datum) 
         const peer_ends = try sorted.allocator().alloc(usize, cells.len);
         for (bound.sorts, 0..) |sort, sort_index| {
             if (roots[sort_index] != root) continue;
+            if (final_indices == null and !@import("decision_eval.zig").hasExternalPrograms(bound.outputs) and
+                @import("ordering_reuse.zig").finalOrder(sort, bound.orders, statement.order_by))
+            {
+                // Retain one permutation, not another copy of every payload.
+                // Delay applying it until all window/navigation specifications
+                // have finished in the original row-identity domain.
+                final_indices = try context.alloc.dupe(usize, indices);
+                final_order = sort;
+            }
             const needs_groups = for (bound.specs) |spec| {
                 if (spec.sort == sort_index and spec.frame != null and spec.frame.?.mode == .groups) break true;
             } else false;
@@ -707,6 +719,23 @@ pub fn evaluateCells(context: anytype, statement: ast.Select, cells: [][]Datum) 
             }
         }
     }
+    if (final_indices) |indices| {
+        for (0..indices.len) |start| {
+            if (indices[start] == start) continue;
+            const saved = cells[start];
+            var current = start;
+            while (indices[current] != start) {
+                try context.checkpoint();
+                const next = indices[current];
+                cells[current] = cells[next];
+                indices[current] = current;
+                current = next;
+            }
+            cells[current] = saved;
+            indices[current] = current;
+        }
+        return finishOrderedCells(context, statement, cells, final_order);
+    }
     return finishCells(context, statement, cells);
 }
 fn rowCells(cells: anytype, alloc: Allocator, index: usize) ![]const Datum {
@@ -736,13 +765,18 @@ pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytyp
         const flags = try context.arena.alloc([]const bool, rows.len);
         var scratch = std.heap.ArenaAllocator.init(context.alloc);
         defer scratch.deinit();
-        for (0..cells.len) |index| {
+        // Window inputs/results have already been evaluated in their own
+        // domain. This projection sits below OFFSET, but an explicit LIMIT
+        // need not demand the unused ordered tail. Do not silently apply the
+        // response quota as a SQL limit to an unbounded query.
+        const prefix = if (statement.limit != null or statement.scalar_cardinality_limit) @min(cells.len, offset +| limit) else cells.len;
+        for (0..prefix) |index| {
             try context.checkpoint();
             _ = scratch.reset(.retain_capacity);
             const a = scratch.allocator();
             const input = try rowCells(cells, a, index);
             const values = try a.alloc(Datum, bound.outputs.len);
-            // Keep expression error/evaluation order even outside LIMIT.
+            // Keep expression errors on OFFSET-skipped rows observable.
             for (bound.outputs, values) |program, *out| out.* = try context.evaluate(a, program, input);
             if (index < offset or index - offset >= count) continue;
             if (context.sink) |sink| {
@@ -823,6 +857,68 @@ pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytyp
         nulls.* = bits;
     }
     return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = flags, .command_tag = "SELECT" };
+}
+
+test "SQL ordered window projection demands the prefix not the unused memory or disk tail" {
+    const Fixture = struct {
+        checkpoints: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checkpoints += 1;
+        }
+        fn resolve(_: *anyopaque, _: Allocator, _: ast.Name, _: @import("catalog.zig").Action) !@import("catalog.zig").Table {
+            return .{ .id = 1, .physical_name = "things", .schema_version = 1, .columns = &.{.{ .name = "x", .path = "x", .type = .integer }} };
+        }
+        fn verify(context: @import("runtime.zig").Context, statement: ast.Select, cells: anytype, want: ?[]const u8, expected_error: ?anyerror) !void {
+            const order = context.binding.window.?.sorts[0];
+            if (expected_error) |err| {
+                try std.testing.expectError(err, finishOrderedCells(context, statement, cells, order));
+            } else {
+                const output = try finishOrderedCells(context, statement, cells, order);
+                try std.testing.expectEqual(@as(usize, 1), output.rows.len);
+                try std.testing.expectEqualStrings(want.?, output.rows[0][0].string);
+            }
+        }
+    };
+    const cases = [_]struct { sql: []const u8, want: ?[]const u8 = null, err: ?anyerror = null, prefix: usize }{
+        .{ .sql = "SELECT 1/(2-ROW_NUMBER() OVER (ORDER BY x)) FROM things ORDER BY x LIMIT 1", .want = "1", .prefix = 1 },
+        .{ .sql = "SELECT 1/(2-ROW_NUMBER() OVER (ORDER BY x)) FROM things ORDER BY x LIMIT 1 OFFSET 1", .err = error.SqlDivisionByZero, .prefix = 2 },
+        .{ .sql = "SELECT ROW_NUMBER() OVER (ORDER BY x) FROM things ORDER BY x LIMIT 1 OFFSET 2", .want = "3", .prefix = 3 },
+        .{ .sql = "SELECT ROW_NUMBER() OVER (ORDER BY x) FROM things ORDER BY x", .err = error.SqlResultTooLarge, .prefix = 512 },
+    };
+    for (cases) |case| {
+        var fixture: Fixture = .{};
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const backend: @import("catalog.zig").Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .scan = undefined, .mutate = undefined, .checkpoint = Fixture.checkpoint } };
+        const bound = try describe.bind(a, backend, &compiled, &.{});
+        const context: @import("runtime.zig").Context = .{ .alloc = std.testing.allocator, .arena = a, .backend = backend, .binding = bound, .parameters = &.{}, .limits = .{ .result_rows = 1 } };
+        var data: [512][2]Datum = undefined;
+        var cells: [512][]Datum = undefined;
+        for (&data, &cells, 0..) |*row, *cell, index| {
+            row.* = @splat(Datum.json(.{ .integer = @intCast(index + 1) }));
+            cell.* = row;
+        }
+        fixture.checkpoints = 0;
+        try Fixture.verify(context, compiled.statement.select, &cells, case.want, case.err);
+        try std.testing.expectEqual(case.prefix, fixture.checkpoints);
+
+        var manager: @import("spill.zig").Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.checkpoint, .max_bytes = 1024 * 1024, .max_record_bytes = 4096, .async_writes = false };
+        defer manager.deinit();
+        var rows = try disk.Rows.init(std.testing.allocator, &manager, 2);
+        defer rows.deinit();
+        for (cells, 0..) |row, index| try rows.append(.{ .values = row, .keys = &.{}, .ordinal = index });
+        fixture.checkpoints = 0;
+        manager.read_calls = 0;
+        try Fixture.verify(context, compiled.statement.select, &rows, case.want, case.err);
+        if (case.prefix < cells.len) {
+            try std.testing.expect(manager.read_calls < 64);
+            try std.testing.expect(fixture.checkpoints < 64);
+        }
+    }
 }
 
 test "SQL sliding kernels match independent tree across nullable filtered reversing frames" {

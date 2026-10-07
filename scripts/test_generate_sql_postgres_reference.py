@@ -516,8 +516,8 @@ class PostgresReferenceTest(unittest.TestCase):
                 / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_conditional_subquery_reference.json"
             ).read_text()
         )
-        self.assertEqual(75, len(fixture["entries"]))
-        self.assertEqual(26, len(fixture["errors"]))
+        self.assertEqual(79, len(fixture["entries"]))
+        self.assertEqual(34, len(fixture["errors"]))
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 self.assertEqual(
