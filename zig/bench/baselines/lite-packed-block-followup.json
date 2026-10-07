@@ -1,0 +1,220 @@
+{
+  "baseline_commit": "23f5bf1110851e963a1e780ce395eefe5058362d",
+  "candidate_commit": "e9174305836529f0f69b81ae956b5a26a6ecedbb",
+  "method": {
+    "optimize": "ReleaseSafe",
+    "runs_per_build": 8,
+    "warmup_runs_discarded": 1,
+    "retained_samples": 7,
+    "ordering": "alternating baseline/candidate order",
+    "timings": "Local microfixtures measured inside merge/spill preparation; concurrent compatibility compilations were running. Not production RSS or throughput qualification.",
+    "legacy_baseline_fixture": "Append candidate test v23 positional merges and historical spills consume immutable packed records to baseline inverted.zig; relax max_position_record_bytes from 128 to 128 KiB and omit linear read-byte bound for replay baseline. No production baseline code changed."
+  },
+  "fixtures": {
+    "v23 positional merges and historical spills": {
+      "baseline": {
+        "LITE_LEGACY_PACKED_false": {
+          "median_ns": 10617000,
+          "samples_ns": [
+            12012000,
+            11282000,
+            10617000,
+            11934000,
+            8892000,
+            8783000,
+            8988000
+          ]
+        },
+        "LITE_LEGACY_SPILL_false": {
+          "median_ns": 9970000,
+          "samples_ns": [
+            8288000,
+            12978000,
+            9970000,
+            9241000,
+            10065000,
+            7967000,
+            14638000
+          ]
+        },
+        "LITE_LEGACY_PACKED_true": {
+          "median_ns": 11598000,
+          "samples_ns": [
+            11598000,
+            13082000,
+            9439000,
+            11465000,
+            14082000,
+            8710000,
+            18099000
+          ]
+        },
+        "LITE_LEGACY_SPILL_true": {
+          "median_ns": 8690000,
+          "samples_ns": [
+            8395000,
+            13681000,
+            8354000,
+            10037000,
+            8690000,
+            8624000,
+            9535000
+          ]
+        }
+      },
+      "followup": {
+        "LITE_LEGACY_PACKED_false": {
+          "median_ns": 401000,
+          "samples_ns": [
+            525000,
+            368000,
+            401000,
+            735000,
+            367000,
+            356000,
+            443000
+          ]
+        },
+        "LITE_LEGACY_SPILL_false": {
+          "median_ns": 886000,
+          "samples_ns": [
+            923000,
+            861000,
+            876000,
+            886000,
+            3787000,
+            858000,
+            893000
+          ]
+        },
+        "LITE_LEGACY_PACKED_true": {
+          "median_ns": 1286000,
+          "samples_ns": [
+            1483000,
+            1286000,
+            1275000,
+            1307000,
+            3079000,
+            1284000,
+            1270000
+          ]
+        },
+        "LITE_LEGACY_SPILL_true": {
+          "median_ns": 1943000,
+          "samples_ns": [
+            2261000,
+            1817000,
+            2093000,
+            1857000,
+            6713000,
+            1943000,
+            1749000
+          ]
+        }
+      }
+    },
+    "streamed common postings merge matches": {
+      "baseline": {
+        "streamed_ns": {
+          "median_ns": 4516000,
+          "samples_ns": [
+            4981000,
+            4710000,
+            4611000,
+            4478000,
+            4310000,
+            4064000,
+            4516000
+          ]
+        }
+      },
+      "followup": {
+        "streamed_ns": {
+          "median_ns": 4144000,
+          "samples_ns": [
+            4072000,
+            4386000,
+            4282000,
+            4144000,
+            4445000,
+            4133000,
+            4137000
+          ]
+        }
+      }
+    },
+    "large positional output chunks": {
+      "baseline": {
+        "scratch_samples": [
+          "1/1 segment.test.large positional output chunks remain bounded and preserve fixed chunk framing...LITE_LARGE_POSITION_CHUNK documents=512 positions_per_doc=16384 result=success budget=10485760 sorted=false peak=208723",
+          "LITE_LARGE_POSITION_CHUNK documents=256 positions_per_doc=16384 result=success budget=10485760 sorted=true peak=667513"
+        ]
+      },
+      "followup": {
+        "scratch_samples": [
+          "1/1 segment.test.large positional output chunks remain bounded and preserve fixed chunk framing...LITE_LARGE_POSITION_CHUNK documents=512 positions_per_doc=16384 result=success budget=10485760 sorted=false peak=208723",
+          "LITE_LARGE_POSITION_CHUNK documents=256 positions_per_doc=16384 result=success budget=10485760 sorted=true peak=667912"
+        ]
+      }
+    },
+    "medium frequency position heavy": {
+      "baseline": {
+        "scratch_samples": [
+          "1/1 segment.test.medium frequency position heavy term spills within native budget...LITE_MEDIUM_TERM documents=2000 positions_per_doc=2048 result=success budget=10485760 sorted=false peak=245976",
+          "LITE_MEDIUM_TERM documents=1000 positions_per_doc=2048 result=success budget=10485760 sorted=true peak=766882"
+        ]
+      },
+      "followup": {
+        "scratch_samples": [
+          "1/1 segment.test.medium frequency position heavy term spills within native budget...LITE_MEDIUM_TERM documents=2000 positions_per_doc=2048 result=success budget=10485760 sorted=false peak=245976",
+          "LITE_MEDIUM_TERM documents=1000 positions_per_doc=2048 result=success budget=10485760 sorted=true peak=767063"
+        ]
+      }
+    }
+  },
+  "partial_prefix": {
+    "documents": 2049,
+    "body_bytes": 4092,
+    "baseline_recompression_peak_bytes": 2531870,
+    "candidate_peak_bytes": 562,
+    "paths": [
+      "append",
+      "sorted"
+    ],
+    "checks": [
+      "all live IDs and bodies",
+      "copied compressed payload bytes",
+      "block counts",
+      "zero live scratch after writer returns"
+    ]
+  },
+  "legacy_positions": {
+    "documents": 256,
+    "positions_per_document": 4096,
+    "baseline_contiguous_peak_bytes": 317688,
+    "baseline_range_peak_bytes": 309880,
+    "candidate_peak_bytes": 79896,
+    "baseline_range_read_calls": 192304,
+    "candidate_range_read_calls": 1280,
+    "baseline_range_read_bytes": 568400,
+    "candidate_range_read_bytes": 262912,
+    "private_spill_input_bytes": 138496
+  },
+  "marker_race": {
+    "before": {
+      "runs": 160,
+      "workers": 8,
+      "marker_wouldblock_failures": 6,
+      "temporary_path_failures": 2
+    },
+    "after": {
+      "runs": 160,
+      "workers": 8,
+      "return_codes": {
+        "0": 160
+      },
+      "failures": []
+    },
+    "regression": "lite persistent mapped lease publication excludes cross-root marker sweeping"
+  }
+}
