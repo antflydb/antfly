@@ -539,6 +539,22 @@ const Parser = struct {
                 }
                 try self.expect(.rparen);
             }
+            var within_group: ?*const ast.Scalar.WithinGroup = null;
+            if (self.ddlWord("within")) {
+                try self.expectKeyword(.group);
+                try self.expect(.lparen);
+                const orders = try self.orderExpressionsDepth(false, depth + 1);
+                if (orders.len == 0) return self.fail(error.InvalidSqlSyntax, "WITHIN GROUP requires ORDER BY");
+                try self.expect(.rparen);
+                const ordering = try self.alloc.alloc(ast.Scalar.Ordering, orders.len);
+                for (orders, ordering) |order, *out| {
+                    out.* = .{ .descending = order.descending, .nulls_first = order.nulls_first };
+                    try args.append(self.alloc, order.expression orelse try self.scalarNode(.{ .column = order.field }));
+                }
+                const descriptor = try self.alloc.create(ast.Scalar.WithinGroup);
+                descriptor.* = .{ .orders = ordering };
+                within_group = descriptor;
+            }
             var filter: ?*const ast.Scalar = null;
             if (self.keyword(.filter)) {
                 try self.expect(.lparen);
@@ -547,7 +563,7 @@ const Parser = struct {
                 try self.expect(.rparen);
             }
             const window_spec = if (self.keyword(.over)) try self.window(depth + 1) else null;
-            left = try self.scalarNode(.{ .call = .{ .name = name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec } });
+            left = try self.scalarNode(.{ .call = .{ .name = name_value, .args = try args.toOwnedSlice(self.alloc), .star = star, .distinct = distinct, .filter = filter, .window = window_spec, .within_group = within_group } });
         } else if (self.peek(.identifier) and !self.tokens[self.pos].isKeyword(.null) and !self.tokens[self.pos].isKeyword(.true) and !self.tokens[self.pos].isKeyword(.false)) {
             left = try self.scalarNode(.{ .column = try self.field() });
         } else left = try self.scalarNode(.{ .literal = try self.value() });
@@ -923,7 +939,7 @@ const Parser = struct {
             } else break;
         }
         if (result.columns.len == 1 and result.group_by.len == 0 and result.having == null and result.order_by.len == 0) {
-            if (result.columns[0].expression) |expression| if (expression.* == .call and expression.call.window == null and expression.call.star and !expression.call.distinct and expression.call.filter == null and std.mem.eql(u8, expression.call.name, "count")) {
+            if (result.columns[0].expression) |expression| if (expression.* == .call and expression.call.window == null and expression.call.within_group == null and expression.call.star and !expression.call.distinct and expression.call.filter == null and std.mem.eql(u8, expression.call.name, "count")) {
                 result.count_all = true;
                 result.count_alias = result.columns[0].alias;
                 result.columns = &.{};
@@ -1065,12 +1081,15 @@ const Parser = struct {
     }
 
     fn orderExpressions(self: *Parser, positions: bool) Error![]const ast.Order {
+        return self.orderExpressionsDepth(positions, 0);
+    }
+    fn orderExpressionsDepth(self: *Parser, positions: bool, depth: usize) Error![]const ast.Order {
         var order_by = std.ArrayList(ast.Order).empty;
         if (self.keyword(.order)) {
             try self.expectKeyword(.by);
             while (true) {
                 try self.node();
-                const expression = try self.scalar(0, 0);
+                const expression = try self.scalar(depth, 0);
                 try self.checkScalarDepth(expression, 0);
                 var descending = self.keyword(.desc);
                 const explicit_direction = descending or self.keyword(.asc);
@@ -2669,6 +2688,34 @@ test "compiler preserves PostgreSQL expression labels before relational lowering
     defer quoted.deinit();
     try std.testing.expectEqualStrings("isnull", quoted.statement.select.columns[0].alias.?);
     try std.testing.expectError(error.UnsupportedSqlShape, compile(std.testing.allocator, "SELECT id FROM usage_records WHERE status \"isnull\"", .{}));
+}
+
+test "compiler ordered-set inputs remain visible to ordinary scalar visitors" {
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    for (560..567) |ordinal| {
+        var id_buffer: [8]u8 = undefined;
+        const case = try corpus.get(try std.fmt.bufPrint(&id_buffer, "sql-{d:0>4}", .{ordinal}));
+        var compiled = try compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        const call = compiled.statement.select.columns[1].expression.?.call;
+        try std.testing.expectEqual(@as(usize, 1), call.within_group.?.orders.len);
+        try std.testing.expectEqual(@as(usize, if (ordinal == 560) 1 else 2), call.args.len);
+        try std.testing.expectEqualStrings(if (ordinal == 560) "status" else "amount", call.args[call.args.len - 1].column);
+        try std.testing.expectEqual(ordinal == 563 or ordinal == 564, call.within_group.?.orders[0].descending);
+        if (ordinal == 562) try std.testing.expectEqual(false, call.within_group.?.orders[0].nulls_first.?);
+        try std.testing.expectEqual(ordinal == 564, call.filter != null);
+    }
+    const Fixture = struct {
+        fn run(alloc: std.mem.Allocator) !void {
+            var compiled = try compile(alloc, "SELECT percentile_cont($1) WITHIN GROUP (ORDER BY x DESC NULLS FIRST) FILTER (WHERE flag) FROM t", .{});
+            defer compiled.deinit();
+            try std.testing.expectEqual(@as(u32, 1), compiled.parameter_count);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    const nested = "SELECT mode() WITHIN GROUP (ORDER BY mode() WITHIN GROUP (ORDER BY mode() WITHIN GROUP (ORDER BY mode() WITHIN GROUP (ORDER BY 1))))";
+    try std.testing.expectError(error.SqlLimitExceeded, compile(std.testing.allocator, nested, .{ .max_depth = 3 }));
 }
 
 test "compiler preserves keyword-named columns and quoted SQL-looking values" {

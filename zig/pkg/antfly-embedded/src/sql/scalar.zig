@@ -1025,7 +1025,7 @@ const Binder = struct {
                 break :blk .{ .kind = if (binary.op == .concat) .string else .boolean, .nullable = if (binary.op == .is_distinct or binary.op == .is_not_distinct) false else merged.nullable };
             },
             .call => |call| blk: {
-                if (call.subquery != null or call.window != null or call.star or call.distinct or call.filter != null) return error.UnsupportedSqlShape;
+                if (call.subquery != null or call.window != null or call.star or call.distinct or call.filter != null or call.within_group != null) return error.UnsupportedSqlShape;
                 if (std.mem.eql(u8, call.name, "$validate")) {
                     if (call.args.len == 0) return error.InvalidSqlParameters;
                     for (call.args) |arg| _ = try self.infer(arg, depth + 1);

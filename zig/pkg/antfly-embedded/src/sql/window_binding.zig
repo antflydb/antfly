@@ -135,6 +135,7 @@ const Builder = struct {
             // Alias reuse must not allocate/evaluate another identical window.
             for (self.specs.items, 0..) |pending, index| if (@import("aggregate_binding.zig").same(pending.node, node_)) return self.slot("window", index);
             const call = node_.call;
+            if (call.within_group != null) return error.UnsupportedSqlShape;
             if (call.distinct) return error.UnsupportedSqlShape;
             _ = std.meta.stringToEnum(Kind, call.name) orelse return error.UndefinedSqlFunction;
             const args = try self.alloc.alloc(usize, call.args.len);

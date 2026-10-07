@@ -231,6 +231,10 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
 
 pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").Output {
     const bound = context.binding.aggregate orelse return error.InvalidSqlBackendResponse;
+    // Ordered plans retain input counts separately from their final values.
+    // Do not expose those counts as SQL results until the grouped sorted-run
+    // delivery path is connected. Planning alone is not activation.
+    if (bound.ordered.len != 0) return error.UnsupportedSqlExecution;
     if (context.invocation_constants.len != bound.constant_count) return error.InvalidSqlBackendResponse;
     try bound.input.validateDecisions(context.arena, context.parameters, context.backend.decision_provider);
     var external = if (bound.input.predicate) |*program| @import("decision_eval.zig").hasExternal(program) else false;

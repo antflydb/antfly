@@ -294,6 +294,25 @@ const Builder = struct {
                 break :blk expression_.*;
             },
             .call => |call| blk: {
+                if (call.within_group) |within| {
+                    const aggregate_binding = @import("aggregate_binding.zig");
+                    const kind = aggregate_binding.orderedKind(call.name) orelse return if (aggregate_binding.aggregateKind(call.name) != null) error.SqlWrongAggregateKind else error.UndefinedSqlFunction;
+                    if (call.window != null) return error.UnsupportedSqlShape;
+                    if (within.orders.len != 1 or call.args.len != (if (kind == .mode) @as(usize, 1) else 2)) return error.UndefinedSqlFunction;
+                    if (call.distinct or call.star) return error.InvalidSqlSyntax;
+                    const argument = try self.inferenceExpression(call.args[call.args.len - 1], columns);
+                    var result = if (kind == .continuous) try self.scalarNode(.{ .cast = .{ .operand = argument, .type = .number } }) else argument;
+                    if (kind != .mode) {
+                        const direct = try self.inferenceExpression(call.args[0], columns);
+                        const array = try @import("aggregate_binding.zig").arrayExpression(self.alloc, direct, self.shape_columns.items, self.parameters);
+                        const coerced = try self.scalarNode(.{ .cast = .{ .operand = direct, .type = if (array) .array else .number, .element_type = if (array) .float64 else null } });
+                        if (self.shape_only) try self.constraints.append(self.alloc, .{ .expression = coerced });
+                        if (array) result = try self.scalarNode(.{ .call = .{ .name = "$array", .args = try self.alloc.dupe(*const ast.Scalar, &.{result}) } });
+                    }
+                    if (self.shape_only) if (call.filter) |filter| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(filter, columns), .expected = .boolean });
+                    break :blk result.*;
+                }
+                if (@import("aggregate_binding.zig").orderedKind(call.name)) |kind| return @import("aggregate_binding.zig").orderedWithoutClauseError(kind, call.args.len);
                 if (call.window) |spec| {
                     if (self.shape_only) {
                         for (spec.partition) |item| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(item, columns) });
@@ -632,7 +651,7 @@ const Builder = struct {
                     }
                     spec.order = order;
                 }
-                break :blk .{ .call = .{ .name = part.name, .args = args, .star = part.star, .distinct = part.distinct, .filter = if (part.filter) |filter| try self.expression(columns, filter, aliases) else null, .window = window } };
+                break :blk .{ .call = .{ .name = part.name, .args = args, .star = part.star, .distinct = part.distinct, .filter = if (part.filter) |filter| try self.expression(columns, filter, aliases) else null, .window = window, .within_group = part.within_group } };
             },
             .case_when => |part| blk: {
                 const branches = try self.alloc.alloc(ast.Scalar.Branch, part.branches.len);
@@ -1451,7 +1470,7 @@ fn validateAggregateLevel(alloc: Allocator, columns: []const Column, input: *con
         },
         .call => |part| {
             const aggregates = @import("aggregate_binding.zig");
-            if (part.window == null and aggregates.aggregateKind(part.name) != null) {
+            if (part.window == null and (part.within_group != null or aggregates.aggregateKind(part.name) != null)) {
                 // Preserve the ordinary grouping diagnostic for illegal
                 // aggregate nesting; do not replace it with admission failure.
                 for (part.args) |arg| if (aggregates.contains(arg)) return;

@@ -19,7 +19,20 @@ pub const Scalar = union(enum) {
     column: []const u8,
     unary: struct { op: Unary, operand: *const Scalar },
     binary: struct { op: Binary, left: *const Scalar, right: *const Scalar },
-    call: struct { name: []const u8, args: []const *const Scalar, star: bool = false, distinct: bool = false, filter: ?*const Scalar = null, window: ?Window = null, subquery: ?*const Select = null },
+    call: struct {
+        name: []const u8,
+        args: []const *const Scalar,
+        star: bool = false,
+        distinct: bool = false,
+        filter: ?*const Scalar = null,
+        window: ?Window = null,
+        subquery: ?*const Select = null,
+        /// Ordered inputs are the last within_group.orders.len arguments. Keeping
+        /// expressions in args makes ordinary dependency, authorization and
+        /// parameter visitors see every input without a second hidden tree.
+        /// Earlier arguments belong to the grouped direct-argument domain.
+        within_group: ?*const WithinGroup = null,
+    },
     cast: struct { operand: *const Scalar, type: ColumnType, element_type: ?@import("array_value.zig").ElementType = null },
     case_when: struct { branches: []const Branch, otherwise: ?*const Scalar = null },
     in_list: struct { operand: *const Scalar, values: []const *const Scalar, negated: bool = false },
@@ -27,6 +40,10 @@ pub const Scalar = union(enum) {
     pub const Unary = enum { positive, negative, not, is_null, is_not_null, is_true, is_not_true, is_false, is_not_false };
     pub const Binary = enum { add, subtract, multiply, divide, modulo, concat, eq, neq, lt, lte, gt, gte, @"and", @"or", is_distinct, is_not_distinct, like, ilike, json_get, json_text };
     pub const Branch = struct { condition: *const Scalar, value: *const Scalar };
+    pub const Ordering = struct { descending: bool = false, nulls_first: ?bool = null };
+    /// Cold metadata is indirect: ordinary scalar nodes must not retain a
+    /// slice/optional discriminator for a rarely used aggregate clause.
+    pub const WithinGroup = struct { orders: []const Ordering };
 };
 
 pub const Name = struct {

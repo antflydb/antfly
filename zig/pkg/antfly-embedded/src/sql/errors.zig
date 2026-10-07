@@ -76,6 +76,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.InvalidSqlCharacterCode => .{ .code = "54000", .message = "The character code is not a nonzero Unicode scalar value.", .retryable = false },
         error.InvalidSqlDateTime => .{ .code = "22007", .message = "The datetime is invalid or outside the supported UTC nanosecond range.", .hint = "Use a valid ISO date or RFC3339 timestamp representable as unsigned epoch nanoseconds.", .retryable = false },
         error.SqlGroupingError => .{ .code = "42803", .message = "A grouped expression references an ungrouped column or invalid aggregate.", .hint = "Group every non-aggregate column and avoid nested aggregate functions.", .retryable = false },
+        error.SqlWrongAggregateKind => .{ .code = "42809", .message = "The aggregate requires a different WITHIN GROUP form.", .hint = "Use WITHIN GROUP for ordered-set aggregates, not ordinary aggregates.", .retryable = false },
+        error.UndefinedSqlFunction => .{ .code = "42883", .message = "No function matches the supplied name and argument types.", .hint = "Check the function signature and use explicit casts for compatible argument types.", .retryable = false },
         error.SqlDivisionByZero => .{ .code = "22012", .message = "A numeric expression divides by zero.", .retryable = false },
         error.UnknownSqlParameterType => .{ .code = "42P18", .message = "A parameter type cannot be inferred.", .hint = "Add an explicit cast or provide a parameter type." },
         error.UnknownSqlArrayType => .{ .code = "42P18", .message = "The array element type cannot be inferred.", .hint = "Provide an explicit array element type." },
@@ -179,6 +181,8 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003", .retryable = false },
         .{ .err = error.QueryCanceled, .code = "57014", .retryable = null },
         .{ .err = error.RowPolicyUnsupported, .code = "0A000", .retryable = false },
+        .{ .err = error.SqlWrongAggregateKind, .code = "42809", .retryable = false },
+        .{ .err = error.UndefinedSqlFunction, .code = "42883", .retryable = false },
     }) |case| {
         const value = describe(case.err);
         try std.testing.expectEqualStrings(case.code, value.code);

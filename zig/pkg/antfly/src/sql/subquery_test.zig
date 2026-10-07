@@ -34,6 +34,42 @@ const Backend = struct {
     }
 };
 
+test "SQL ordered-set planning preserves derived namespaces and rejects incomplete execution" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, err: anyerror = error.UnsupportedSqlExecution }{
+        .{ .sql = "SELECT g,percentile_cont(g/10.0) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS g,2 AS x UNION ALL SELECT 1,4) t GROUP BY g" },
+        // The public result-type contract independently rejects SQL arrays.
+        // Preserve that boundary; never expose a JSON-array approximation.
+        .{ .sql = "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .err = error.UnsupportedSqlShape },
+        .{ .sql = "SELECT mode() WITHIN GROUP (ORDER BY t.x DESC) FILTER (WHERE t.x>0) FROM (SELECT 1 AS x UNION ALL SELECT 3) t" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        // Parser/typed-planning support must not accidentally expose the
+        // internal COUNT state as a completed ordered-set SQL result.
+        try std.testing.expectError(case.err, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+    }
+    const invalid = [_]struct { sql: []const u8, code: []const u8 }{
+        .{ .sql = "SELECT COUNT(*) WITHIN GROUP (ORDER BY 1)", .code = "42809" },
+        .{ .sql = "SELECT percentile_cont(0.5)", .code = "42883" },
+        .{ .sql = "SELECT percentile_cont(0.5,1.0)", .code = "42809" },
+        .{ .sql = "SELECT mode()", .code = "42883" },
+        .{ .sql = "SELECT mode(1)", .code = "42809" },
+        .{ .sql = "SELECT percentile_cont(x) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x,2 AS g) t GROUP BY g", .code = "42803" },
+        .{ .sql = "SELECT percentile_cont(SUM(x)) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x) t", .code = "42803" },
+        .{ .sql = "SELECT mode() WITHIN GROUP (ORDER BY 1) OVER ()", .code = "0A000" },
+    };
+    for (invalid) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            return error.ExpectedOrderedSetBindingFailure;
+        } else |err| try std.testing.expectEqualStrings(case.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+}
+
 test "SQL masked Apply preserves PostgreSQL conditional subquery demand and NULL truth" {
     const fixture = try std.json.parseFromSlice(struct {
         reference: []const u8,

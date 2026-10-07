@@ -97,6 +97,49 @@ class PostgresReferenceTest(unittest.TestCase):
             ).fetchone(),
         )
 
+    def test_ordered_set_binding_domains_and_clause_kind(self):
+        import psycopg
+
+        cases = (
+            ("SELECT COUNT(*) WITHIN GROUP (ORDER BY 1)", "42809"),
+            ("SELECT percentile_cont(0.5)", "42883"),
+            ("SELECT percentile_cont(0.5,1.0)", "42809"),
+            ("SELECT mode()", "42883"),
+            ("SELECT mode(1)", "42809"),
+            (
+                "SELECT percentile_cont(x) WITHIN GROUP (ORDER BY x) "
+                "FROM (SELECT 1 AS x,2 AS g) t GROUP BY g",
+                "42803",
+            ),
+            (
+                "SELECT percentile_cont(SUM(x)) WITHIN GROUP (ORDER BY x) "
+                "FROM (SELECT 1 AS x) t",
+                "42803",
+            ),
+            ("SELECT mode() WITHIN GROUP (ORDER BY 1) OVER ()", "0A000"),
+        )
+        for sql, code in cases:
+            with self.subTest(sql=sql):
+                with self.assertRaises(psycopg.Error) as error:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(sql)
+                self.assertEqual(code, error.exception.sqlstate)
+        self.assertEqual(
+            [(1, 2.2)],
+            self.db.execute(
+                "SELECT g,percentile_cont(g/10.0) WITHIN GROUP (ORDER BY x) "
+                "FROM (SELECT 1 AS g,2 AS x UNION ALL SELECT 1,4) t GROUP BY g"
+            ).fetchall(),
+        )
+        self.assertEqual(
+            [([1.5, None, 2.5],)],
+            self.db.execute(
+                "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) "
+                "WITHIN GROUP (ORDER BY x) "
+                "FROM (SELECT 1 AS x UNION ALL SELECT 3) t"
+            ).fetchall(),
+        )
+
     def test_original_grouped_output_labels_are_not_visible_to_having(self):
         import json
         from pathlib import Path

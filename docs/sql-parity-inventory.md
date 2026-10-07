@@ -551,10 +551,22 @@ disk quotas and allocation faults. Independent PostgreSQL tests check the same
 rank/tie/direct-argument contracts. A 512-row forced-spill comparison writes
 207,562 bytes for four compatible requests together versus 830,248 bytes for
 four independent sorts (4× less I/O in this operator fixture, not an endpoint
-latency claim). This is **not** completed SQL support:
-ordered-set AST/binding, grouped invocation ownership, FILTER integration,
-array-fraction shape reconstruction, compatible-sort sharing across bound
-aggregate slots and mounted exact-source execution still need integration.
+latency claim). The immutable AST now parses the seven original WITHIN GROUP
+forms, retaining ordered inputs in the ordinary argument dependency tree and
+only cold direction/null-order metadata behind a pointer. Typed binding gives
+direct percentile arguments their grouped key/constant domain, preserves array
+fraction result element types, and assigns compatible input/filter/order slots
+to shared-sort classes. It rejects ungrouped direct arguments and aggregate
+nesting with 42803 and wrong aggregate clause kinds with 42809. Parser-owned
+nesting and allocation limits still cover the ordered expressions.
+
+This is **not** completed SQL support: grouped invocation ownership and sorted
+run delivery, execution-side FILTER integration, array-fraction dimension and
+NULL reconstruction, compatible-sort reuse across executed aggregate slots,
+and mounted exact-source execution still need integration. Execution rejects
+the staged ordered plans with 0A000 rather than returning internal COUNT states
+as percentile/mode values. Derived-name and array planning tests explicitly
+verify that boundary, alongside independent PostgreSQL namespace diagnostics.
 The seven original ordered-set cases `sql-0560`–`sql-0566` remain unresolved;
 no corpus disposition or coverage count changes from this core alone.
 

@@ -503,7 +503,7 @@ const Builder = struct {
     /// NULL; evaluating the original scalar expression here preserves that
     /// empty-input contract even for CASE, arithmetic and COALESCE.
     fn aggregateResult(self: *Builder, input: *const ast.Scalar, alias: []const u8, columns: *std.ArrayList(ast.Projection)) anyerror!*const ast.Scalar {
-        if (input.* == .call and @import("aggregate_binding.zig").aggregateKind(input.call.name) != null) {
+        if (input.* == .call and (input.call.within_group != null or @import("aggregate_binding.zig").aggregateKind(input.call.name) != null)) {
             if (columns.items.len >= 256) return error.SqlProgramLimitExceeded;
             const name = try std.fmt.allocPrint(self.alloc, "$aggregate_{d}", .{columns.items.len});
             try columns.append(self.alloc, .{ .alias = name, .expression = input });
