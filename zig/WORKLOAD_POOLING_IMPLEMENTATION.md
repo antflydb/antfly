@@ -1119,3 +1119,21 @@ pins source and output. Production SQL/inference propagation and backend CPU
 team enforcement are still pending; this primitive alone does not claim
 inference execution is bounded. Full API/production gates and defaults remain
 required. Parallel children must own independently admitted capsules.
+
+### Scoped native CPU teams (2026-10-07)
+
+Native linalg dispatch now supports an admitted per-worker CPU scope. Explicit
+Io jobs run in bounded waves; children get one worker and cannot expand nested
+kernels. Sync dispatch follows the same cap, while process capacity and BLAS
+initialization remain independent of scoped requests. System BLAS is bypassed
+under a scope; OpenBLAS is used only when its measured team fits. Scopes are
+synchronous and stay on one OS thread.
+
+Native/GNU scope, matrix-reference, real native backend and existing matrix
+regressions pass, including the macOS system-BLAS configuration. All nine GNU
+pool/CPU-budget tests also pass after moving temporary fixtures to writable
+cache storage. The [CPU worker receipt](qualification/workload-pooling/receipts/2026-10-07/admitted-cpu-workers/README.md)
+records sources, flags, full logs, limits and the initial read-only fixture
+failure. Production invocations do not yet install scopes. Parent propagation,
+actual broker/worker grants, other backend teams, whole-production integration
+and automatic default qualification remain pending.
