@@ -182,3 +182,27 @@ authority after a cooperative yield. A borrowed parent always prevents task
 fan-out, including when a caller leaves the parallel default enabled. The parent
 and its adapter outlive evaluation. Ordinary writes do not borrow this read
 checkpoint; their accepted completion obligations remain unchanged.
+
+## Shared execution owner still required
+
+The current runnable scheduler is stored in `ApiHttpServer`; it is not yet a
+node-wide owner shared with inference or storage maintenance. Standalone already
+shares managed memory with inference through `inference_bridge.ResourceBudget`,
+but that ABI carries no execution grant. Inference HTTP dispatch and embedded
+provider invocation live in the separate inference archive
+(`pkg/inference/src/host/host.zig`). Its request-count gate is independent of
+runnable capacity. DataServer's work-cost port is a pacing/accounting hook, not
+an execution owner.
+
+The next integration needs a node-owned scheduler that outlives API, inference,
+and background consumers, with checked archive callbacks for stable request-owned
+execution capsules. Independently admitted inference requests use the inference
+class. An embedded provider invoked synchronously by an already scheduled SQL
+worker must inherit that worker's grant rather than acquire a second ordinary
+slot: with one ordinary slot, nested acquisition would wait on its own parent.
+Inherited grants remain confined to that worker; concurrent children need their
+own entries and the parent must release execution capacity before joining them.
+Shutdown closes the node owner before joining its consumers, while accepted
+durable completion retains an independently valid completion contract. API
+destruction alone must not invalidate a borrowed node owner. These lifetimes and
+the mixed-class schedules need qualification before default enablement.
