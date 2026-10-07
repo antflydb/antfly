@@ -942,6 +942,7 @@ pub const IoStorage = struct {
         .file_size = fileSize,
         .read_file_trailer_alloc = readFileTrailerAlloc,
         .write_file_absolute = writeFileAbsolute,
+        .begin_atomic_write = if (builtin.os.tag == .windows) beginAtomicWrite else null,
         .append_file_absolute = appendFileAbsolute,
         .sync_contents_absolute = syncContentsAbsolute,
         .sync_parent_absolute = syncParentAbsolute,
@@ -990,6 +991,10 @@ pub const IoStorage = struct {
         try std.Io.Dir.cwd().writeFile(context(ptr).io, .{ .sub_path = path, .data = contents });
     }
 
+    fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
+        return try NativeStreamingAtomicWriteSink.createBorrowed(allocator, path, context(ptr).io);
+    }
+
     fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, sync: bool) !void {
         const io = context(ptr).io;
         var file = try fs_paths.createFilePortable(io, path, .{ .read = true, .truncate = false });
@@ -1009,6 +1014,7 @@ pub const IoStorage = struct {
 
     fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !void {
         try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, context(ptr).io);
+        if (comptime builtin.os.tag == .windows) try syncFileContentsPathWithIo(context(ptr).io, new_path);
     }
 
     fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -3264,7 +3270,7 @@ fn posixStatError(err: std.posix.E) anyerror {
 
 const NativeStreamingAtomicWriteSink = struct {
     allocator: Allocator,
-    state: *NativeStorageState,
+    state: ?*NativeStorageState,
     final_path: []u8,
     tmp_path: []u8,
     staged: @import("staged_file.zig").StagedFile(Crc32),
@@ -3274,13 +3280,21 @@ const NativeStreamingAtomicWriteSink = struct {
         const retained_state = try state.retain();
         errdefer retained_state.release();
 
+        return try createWithIo(allocator, path, retained_state.threaded.io(), retained_state);
+    }
+
+    /// The executor and its userdata remain caller-owned through finish/abort.
+    fn createBorrowed(allocator: Allocator, path: []const u8, io: std.Io) !AtomicWriteSink {
+        return try createWithIo(allocator, path, io, null);
+    }
+
+    fn createWithIo(allocator: Allocator, path: []const u8, io: std.Io, state: ?*NativeStorageState) !AtomicWriteSink {
         const self = try allocator.create(NativeStreamingAtomicWriteSink);
         errdefer allocator.destroy(self);
 
         const final_path = try allocator.dupe(u8, path);
         errdefer allocator.free(final_path);
 
-        const io = retained_state.threaded.io();
         var random: [16]u8 = undefined;
         try io.randomSecure(&random);
         const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{x}", .{ path, random });
@@ -3291,7 +3305,7 @@ const NativeStreamingAtomicWriteSink = struct {
 
         self.* = .{
             .allocator = allocator,
-            .state = retained_state,
+            .state = state,
             .final_path = final_path,
             .tmp_path = tmp_path,
             .staged = .{ .io = io, .file = file },
@@ -3304,7 +3318,7 @@ const NativeStreamingAtomicWriteSink = struct {
 
     fn deinit(self: *NativeStreamingAtomicWriteSink) void {
         if (self.file_open) self.staged.file.close(self.staged.io);
-        self.state.release();
+        if (self.state) |state| state.release();
         self.allocator.free(self.final_path);
         self.allocator.free(self.tmp_path);
         self.allocator.destroy(self);
@@ -3339,19 +3353,19 @@ const NativeStreamingAtomicWriteSink = struct {
         const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
 
-        const io = self.state.threaded.io();
-        self.state.invalidatePath(self.tmp_path);
+        const io = self.staged.io;
+        if (self.state) |state| state.invalidatePath(self.tmp_path);
         self.staged.sync() catch |err| {
             self.staged.file.close(io);
             self.file_open = false;
             deleteFilePathWithIo(io, self.tmp_path) catch {};
-            self.state.invalidatePath(self.tmp_path);
+            if (self.state) |state| state.invalidatePath(self.tmp_path);
             return err;
         };
         self.staged.file.close(io);
         self.file_open = false;
-        self.state.invalidateRename(self.tmp_path, self.final_path);
-        defer self.state.invalidateRename(self.tmp_path, self.final_path);
+        if (self.state) |state| state.invalidateRename(self.tmp_path, self.final_path);
+        defer if (self.state) |state| state.invalidateRename(self.tmp_path, self.final_path);
         renamePathWithIo(io, self.tmp_path, self.final_path) catch |err| {
             deleteFilePathWithIo(io, self.tmp_path) catch {};
             return err;
@@ -3363,9 +3377,9 @@ const NativeStreamingAtomicWriteSink = struct {
         const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
         self.staged.file.close(self.staged.io);
         self.file_open = false;
-        self.state.invalidatePath(self.tmp_path);
-        deleteFilePathWithIo(self.state.threaded.io(), self.tmp_path) catch {};
-        self.state.invalidatePath(self.tmp_path);
+        if (self.state) |state| state.invalidatePath(self.tmp_path);
+        deleteFilePathWithIo(self.staged.io, self.tmp_path) catch {};
+        if (self.state) |state| state.invalidatePath(self.tmp_path);
         self.deinit();
     }
 };
@@ -5508,4 +5522,44 @@ test "native streaming atomic write sink bounds memory and abort preserves publi
     }
     try std.testing.expectEqual(@as(usize, 1), names.len);
     try std.testing.expectEqualStrings(std.fs.path.basename(path), names[0]);
+}
+
+test "Windows borrowed executor atomic writes bound memory and preserve I/O authority" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    var test_tmp = try TestDirectory.init("borrowed_storage");
+    defer test_tmp.cleanup();
+    var borrowed = IoStorage.init(std.testing.io);
+    const storage = borrowed.storage();
+    const path = test_tmp.path();
+    try storage.writeFileAbsolute(path, "old");
+    var memory: [80 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&memory);
+    var sink = try storage.beginAtomicWrite(bounded.allocator(), path);
+    var active = true;
+    defer if (active) sink.abort();
+    const chunk: [64 * 1024]u8 = @splat('b');
+    var crc = Crc32.init();
+    for (0..128) |_| {
+        try sink.appendSlice(&chunk);
+        crc.update(&chunk);
+    }
+    try std.testing.expectEqual(crc.final(), try sink.crc32Prefix(sink.len()));
+    const before = try storage.readFileAlloc(std.testing.allocator, path, 16);
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqualStrings("old", before);
+    active = false;
+    try sink.finish();
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), try storage.fileSize(path));
+    bounded.reset();
+    sink = try storage.beginAtomicWrite(bounded.allocator(), path);
+    active = true;
+    try sink.appendSlice("discarded");
+    active = false;
+    sink.abort();
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), try storage.fileSize(path));
+
+    // A hidden native executor would incorrectly succeed instead of using
+    // the caller's failing authority.
+    var failing = IoStorage.init(std.Io.failing);
+    try std.testing.expectError(error.EntropyUnavailable, failing.storage().beginAtomicWrite(std.testing.allocator, path));
 }
