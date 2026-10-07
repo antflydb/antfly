@@ -1275,7 +1275,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
 
-    return .{
+    const shared: Shared = .{
         .api_bench_standalone = api_bench_standalone,
         .conformance_fetch = conformance_fetch,
         .conformance_fixtures = conformance_fixtures,
@@ -1351,6 +1351,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .antfly_imports = antfly_imports,
         .production_antfly_imports = production_antfly_imports,
     };
+    platform_build.bindPlatform(shared, platform_mod);
+    return shared;
 }
 
 fn buildArguments(b: *std.Build) ?[]const []const u8 {

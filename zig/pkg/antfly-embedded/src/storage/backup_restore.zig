@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const system_catalog = @import("../system_catalog/domain.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
@@ -53,7 +55,7 @@ pub const RestoreSource = struct {
 const RestoreIoScope = struct {
     alloc: std.mem.Allocator,
     io_value: std.Io,
-    owned: ?*std.Io.Threaded = null,
+    owned: ?*native_platform.Threaded = null,
 
     fn init(alloc: std.mem.Allocator, restore: RestoreSource) !RestoreIoScope {
         if (restore.backend_runtime) |runtime| {
@@ -64,7 +66,7 @@ const RestoreIoScope = struct {
             return .{ .alloc = alloc, .io_value = shared_io };
         }
         if (restore.backend_runtime != null) return error.BackendRuntimeIoUnavailable;
-        const owned = try alloc.create(std.Io.Threaded);
+        const owned = try alloc.create(native_platform.Threaded);
         errdefer alloc.destroy(owned);
         owned.* = threaded_io_limits.initService(alloc);
         return .{ .alloc = alloc, .io_value = owned.io(), .owned = owned };
@@ -381,7 +383,7 @@ pub fn publishPreparedRestore(
 ) !db_mod.generation_lifecycle.PublicationOutcome {
     try prepared._generation.validateLivePath(path);
     const outcome = try prepared._generation.publish();
-    cleanupSnapshotsForPublishedRestore(alloc, prepared._generation.io orelse std.Options.debug_io, path);
+    cleanupSnapshotsForPublishedRestore(alloc, prepared._generation.io orelse native_platform.debug_io, path);
     return outcome;
 }
 
@@ -1060,13 +1062,13 @@ pub fn cleanupSnapshotsForPublishedRestore(alloc: std.mem.Allocator, io: std.Io,
 }
 
 fn ensureDirPath(path: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), path);
 }
 
 fn destroyPathIfExists(path: []const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
@@ -1077,7 +1079,7 @@ fn destroyPathIfExistsWithIo(io: std.Io, path: []const u8) void {
 
 fn writeFile(path: []const u8, data: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir| try ensureDirPath(dir);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{
         .sub_path = path,
@@ -1086,7 +1088,7 @@ fn writeFile(path: []const u8, data: []const u8) !void {
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
 }
@@ -1126,7 +1128,7 @@ test "restore binding pins the authenticated native generation manifest" {
 
 test "prepared native restore repair reuses target backend admission" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-native-restore-plan", .{tmp.sub_path});
     defer alloc.free(path);

@@ -21,11 +21,13 @@
 // per-connection failures degrade to status "error" without failing the
 // response.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const objectstore = @import("objectstore");
-const platform_time = @import("antfly_platform").time;
-const platform_sync = @import("antfly_platform").sync;
+const platform_time = native_platform.time;
+const platform_sync = native_platform.sync;
 const common_config = @import("antfly_local_sources").common_config;
 const common_secrets = @import("antfly_local_sources").common_secrets;
 const metadata_api = @import("../metadata/api.zig");
@@ -605,7 +607,7 @@ const ModelsJob = struct {
                 }
             }
         }
-        var fallback_io_impl: ?std.Io.Threaded = if (job.io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+        var fallback_io_impl: ?native_platform.Threaded = if (job.io == null) native_platform.Threaded.init(std.heap.page_allocator, .{}) else null;
         defer if (fallback_io_impl) |*io_impl| io_impl.deinit();
         const io = job.io orelse fallback_io_impl.?.io();
         var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
@@ -1475,7 +1477,7 @@ fn probeS3Buckets(
     defer if (dynamic_credentials) |*credentials| credentials.deinit(arena);
 
     if (cfg.credentials.source != .static) {
-        var io_impl: ?std.Io.Threaded = if (network_io == null) std.Io.Threaded.init(arena, .{}) else null;
+        var io_impl: ?native_platform.Threaded = if (network_io == null) native_platform.Threaded.init(arena, .{}) else null;
         defer if (io_impl) |*owned| owned.deinit();
         var http = httpx.Client.initWithConfig(arena, network_io orelse io_impl.?.io(), .{ .timeouts = .{
             .connect_ms = timeout_ms,
@@ -1592,7 +1594,7 @@ fn probeGcsBuckets(
 
 fn probeFilesystemRoot(root: []const u8, shared_io: ?std.Io) !void {
     if (!std.fs.path.isAbsolute(root)) return error.InvalidFilesystemRoot;
-    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+    var io_impl: ?native_platform.Threaded = if (shared_io == null) native_platform.Threaded.init(std.heap.page_allocator, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = shared_io orelse io_impl.?.io();
     var dir = try std.Io.Dir.openDirAbsolute(io, root, .{});
@@ -1624,7 +1626,7 @@ test "object probe cache identity covers every bucket and credential source" {
 
 test "connection filesystem probes use the explicit filesystem authority" {
     const alloc = std.testing.allocator;
-    var network_impl = std.Io.Threaded.init(alloc, .{});
+    var network_impl = native_platform.Threaded.init(alloc, .{});
     defer network_impl.deinit();
     const NetworkOnly = struct {
         fn rejectDirectory(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, _: std.Io.Dir.OpenOptions) std.Io.Dir.OpenError!std.Io.Dir {
@@ -1634,10 +1636,10 @@ test "connection filesystem probes use the explicit filesystem authority" {
     var network_vtable = network_impl.io().vtable.*;
     network_vtable.dirOpenDir = NetworkOnly.rejectDirectory;
     const network_io: std.Io = .{ .userdata = network_impl.io().userdata, .vtable = &network_vtable };
-    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    var filesystem_impl = native_platform.Threaded.init(alloc, .{});
     defer filesystem_impl.deinit();
     const filesystem_io = filesystem_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(filesystem_io, ".", alloc);
     defer alloc.free(root);
@@ -1734,7 +1736,7 @@ test "inference connection operations are allowlisted" {
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-connection-secrets-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
 

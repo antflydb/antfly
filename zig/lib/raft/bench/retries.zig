@@ -14,7 +14,9 @@
 // limitations under the License.
 
 // Node reconnect: drain the production bounded retry queue after an outage.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const raft = @import("raft");
 const Driver = struct {
     fail: bool = true,
@@ -30,7 +32,7 @@ const Driver = struct {
 };
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
-    var io_runtime = std.Io.Threaded.init(alloc, .{});
+    var io_runtime = native_platform.Threaded.init(alloc, .{});
     defer io_runtime.deinit();
     for ([_]usize{ 100, 1000, 4096 }) |count| {
         const groups = try alloc.alloc(raft.runtime.transport_iface.GroupMessageBatch, count);

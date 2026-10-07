@@ -1,6 +1,19 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 /// Bounded staging for platforms without the POSIX atomic writer. The caller
@@ -90,8 +103,8 @@ pub fn StagedFile(comptime Crc32: type) type {
 }
 
 test "staged output is bounded and patches and checksums cross the disk buffer boundary" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "staging", .{ .read = true, .exclusive = true });
     defer file.close(io);
@@ -120,8 +133,8 @@ test "staged output is bounded and patches and checksums cross the disk buffer b
 }
 
 test "a failed staging read prevents later publication" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "staging", .{ .read = true });
     defer file.close(io);

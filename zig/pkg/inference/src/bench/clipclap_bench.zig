@@ -20,7 +20,9 @@
 // audio decode/mel features, encoder, pooling/projection/normalize, and response
 // serialization.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const build_options = @import("build_options");
 
 const inference = @import("inference_internal");
@@ -1048,8 +1050,8 @@ fn jsonEncodeString(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocat
 }
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+    var ts: native_platform.c.timespec = undefined;
+    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }

@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const in_progress_filename = ".antfly-download-in-progress";
@@ -398,8 +399,8 @@ pub fn loadValidatedPlan(
 
 test "validated artifact checksum rehashes the opened file" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(io, .{ .sub_path = "payload.bin", .data = "payload" });
@@ -437,8 +438,8 @@ test "artifact receipt paths reject ambiguous and platform-specific forms" {
 
 test "validated managed receipt rejects artifacts escaping through symlinks" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model");
@@ -456,8 +457,8 @@ test "validated managed receipt rejects artifacts escaping through symlinks" {
 
 test "validated managed receipt accepts contained symlink artifacts" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model/artifacts");
@@ -478,8 +479,8 @@ test "validated managed receipt accepts contained symlink artifacts" {
 
 test "validated staging plan is private from published receipt loading" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model");
@@ -503,8 +504,8 @@ test "validated staging plan is private from published receipt loading" {
 
 test "validated receipts reject duplicate artifact paths" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model");
@@ -521,8 +522,8 @@ test "validated receipts reject duplicate artifact paths" {
 
 test "validated managed receipt cleans up every allocation failure" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model/nested");
@@ -537,10 +538,10 @@ test "validated managed receipt cleans up every allocation failure" {
 
     const Runner = struct {
         fn run(alloc: std.mem.Allocator, path: []const u8) !void {
-            var receipt = (try loadValidated(alloc, std.testing.io, path)) orelse
+            var receipt = (try loadValidated(alloc, native_platform.testing.io, path)) orelse
                 return error.TestExpectedManagedReceipt;
             defer receipt.deinit();
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_dir});
+    try native_platform.allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_dir});
 }

@@ -20432,11 +20432,11 @@ test "CUDA runtime JIT cache misses then reuses exact keyed PTX and qualificatio
         &bundled_image_sha256,
         "test-device/driver-12000",
     );
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = platform.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var cache = try kernel_jit.ArtifactCache.initDir(
         std.testing.allocator,
-        std.testing.io,
+        platform.testing.io,
         tmp.dir,
         1024 * 1024,
     );

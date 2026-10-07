@@ -13,9 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const metadata_mod = @import("domain.zig");
@@ -1671,7 +1673,7 @@ test "metadata server can expose admin listener endpoints" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.heap.page_allocator, ".zig-cache/tmp/{s}/metadata-server-root", .{tmp.sub_path});
@@ -1752,7 +1754,7 @@ test "metadata server can expose admin listener endpoints" {
     const setting_call = @import("../system_catalog/server_call.zig").Call{ .setting_snapshot = .{ .principal = "alice", .database = "main" } };
     const setting_body = try std.json.Stringify.valueAlloc(std.heap.page_allocator, setting_call, .{});
     defer std.heap.page_allocator.free(setting_body);
-    const now_seconds: i64 = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
+    const now_seconds: i64 = @intCast(@divFloor(native_platform.time.realtimeNs(), std.time.ns_per_s));
     const grant = try @import("../system_catalog/setting_authority.zig").sign(std.heap.page_allocator, "metadata-setting-secret-0123456789abcdef", "metadata-gateway", .read, setting_body, now_seconds);
     defer std.heap.page_allocator.free(grant);
     const wrong_service_token = try @import("../api/internal_service_auth.zig").tokenAlloc(std.heap.page_allocator, .{ .secret = "different-service-secret-0123456789abcdef", .issuer = "metadata-node" }, now_seconds);
@@ -1912,7 +1914,7 @@ test "metadata admin maps retryable authority loss to service unavailable" {
 
     var source = FakeSource{};
     var admin = metadata_http_server.MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
-    var server_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    var server_io = native_platform.Threaded.init(std.testing.allocator, .{});
     defer server_io.deinit();
     var http_server = httpx.Server.initWithConfig(std.testing.allocator, server_io.io(), .{
         .host = "127.0.0.1",
@@ -1988,7 +1990,7 @@ test "metadata public api server carries auth and restore configuration" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-mux-root", .{tmp.sub_path});

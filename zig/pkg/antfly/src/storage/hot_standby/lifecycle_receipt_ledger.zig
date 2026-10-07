@@ -20,10 +20,12 @@
 //! truncation, while the WAL's compact idempotency index retains identity and
 //! digest bindings so a retry can never duplicate or mutate an old event.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const wal_mod = @import("../wal_runtime.zig");
 const validation = @import("validation.zig");
 
@@ -516,7 +518,7 @@ fn authoritativeState(alloc: Allocator, root: []const u8, event: StoredEvent) !A
         .activation => try std.fs.path.join(alloc, &.{ root, "ACTIVE.json" }),
     };
     defer alloc.free(path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_receipt_bytes)) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => return .missing,
@@ -597,5 +599,5 @@ fn freeWalEntries(alloc: Allocator, entries: []wal_mod.WalEntry) void {
 }
 
 fn lock(mutex: *std.atomic.Mutex) void {
-    @import("antfly_platform").sync.lockYielding(mutex);
+    native_platform.sync.lockYielding(mutex);
 }

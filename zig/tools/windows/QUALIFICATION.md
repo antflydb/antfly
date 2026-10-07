@@ -508,3 +508,71 @@ expensive suites remain gated. All 92 CI script tests pass. Hosted policy CI
 also tests its executing main revision, so the isolated assertion fix must
 land on main before that job can pass. Hosted tests still require a non-draft
 PR and a human `/ci run <full-head-sha>` approval under the repository policy.
+
+## Repository-owned Windows backend with stock Zig (2026-10-07)
+
+The platform executor, C compatibility APIs, dynamic loading, test I/O and
+callers now live in the repository. The Zig-library overlay and generator
+have been removed. Windows process entry points explicitly select the platform
+executor instead of accepting Zig's default `std.process.Init.io`. Diagnostic
+fallbacks use `platform.debug_io`; borrowed runtime I/O keeps its caller's
+vtable and executor authority.
+
+All qualification builds use the installed, unmodified Zig 0.17.0 library.
+Stock `std/Io/Threaded.zig` SHA-256:
+`1a770001e309f24c8c58a9fdb3c095994c454cbfa9dba9d4f1dede2f134eeac7`.
+Repository-owned Windows executor SHA-256:
+`2c063f1b3d3d4796aece947002fdc10193617d9faec4890fa7008aa44f5f9b67`.
+The checked-in adaptation retains Zig's MIT notice and upstream provenance;
+it must be maintained alongside future Zig API updates.
+
+Windows Server 2022 (10.0.20348.0), NTFS, passed all 14 qualification
+executables in Debug and ReleaseFast: 152 passed, 42 POSIX-only skips,
+zero failures and zero leaks. Every downloaded executable hash matched the
+local build manifest. These focused executables qualify the Windows backend;
+the subsequent process-startup integration fix is covered by the application
+smoke below. CrossOver reproduced four destination-replacement failures per
+mode (72 passed, 21 skipped, four failed, no leaks); all four passed on native
+Windows. Tests retain these failures and do not skip them under Wine.
+
+| Executable | SHA-256 |
+| --- | --- |
+| `compat-Debug.exe` | `c7d5f14bb0beb1d257471cf7a1abfeb633df64ef58f5ac710d5ed4f645dbd271` |
+| `hardlink-Debug.exe` | `b7c792022464c0fc516bb1a9405c31b0642e5f5ee54288d4973bdaa52022e4bc` |
+| `backup-Debug.exe` | `2710e6307910310879a4e404a6cbf904581b5aae6bcdc0fa368d90382add50d6` |
+| `filesystem-Debug.exe` | `758b0d8f973ad31265bafe839231994c2ba9280df3d4bd632540cd3f052a8b46` |
+| `lite-Debug.exe` | `a4bd940a67376fd862b61c49453617588ba5d17207c0c8797e8bde3ff35f48bb` |
+| `storage-Debug.exe` | `8e8e4dfdcf3b9ab496c37cd23fc1e0d86ca389f4ec9bf50c53e023244b9cd579` |
+| `bridge-Debug.exe` | `4f44f74ffd724ac8e8f4ff47c0fe7674ac13e91676aaf9639b2adace33f1f4b9` |
+| `compat-ReleaseFast.exe` | `52314f75a3b0e3d0415cc8da59384f7323fa2c0c3e538506d0b04a90dca2e2ba` |
+| `hardlink-ReleaseFast.exe` | `a47c9fb1d012c050412e9db2495029f9648bc1530c7285a0f08eb523b97ce2b6` |
+| `backup-ReleaseFast.exe` | `d291c608f46e74c8076e06fbfe4a48ed175d9d90b1a80c00ab9973d6345101fa` |
+| `filesystem-ReleaseFast.exe` | `4dc84bc0fa0a63e6719ed01b3e7767290e314f293305dfea21fa86e30a7eaf23` |
+| `lite-ReleaseFast.exe` | `147eb1f2560d0f180897489c4c390500daff20bd1a72eb59cb97e3eb9615c0e9` |
+| `storage-ReleaseFast.exe` | `d85e3a3e4361452c76ed0e408f2d22e15dfe4fa377c4515f8c64073feb4a3bcc` |
+| `bridge-ReleaseFast.exe` | `b1b4917db1299976e61c978e0fd34e56aa1698c61a74c7b8579133448c827081` |
+
+Native results, manifest, CrossOver output and verified resource cleanup are
+retained in `/private/tmp/antfly-pr987-stock-windows-tests/`. The VM, boot disk,
+private artifact bucket, service account, subnet and network were deleted and
+absence verified. No inbound firewall rules or tunnels were created.
+
+The final full Windows Debug application passes 46/46 build steps with ONNX
+disabled and BLAS off. Its SHA-256 is `c8de500b4ae9f48347646a3caabaf624daf86ee22b0c3530ac43815f999e67bc`.
+CrossOver confirms 32 acknowledged documents and full-text entries survive
+forced process termination, passes 64 concurrent queries across both starts,
+and reports `valid=true`, zero tail bytes and no integrity issue. Evidence:
+`/private/tmp/antfly-pr987-stock-app-final-startup-build.log` and
+`/private/tmp/antfly-pr987-stock-app-smoke-final/`.
+
+Native macOS focused qualification passes 87 tests with two platform-specific
+skips. Standalone Raft passes 427 tests, VOPR passes 167, structlog passes nine,
+and platform passes all 14 build steps (13 Zig tests and 13 Python process
+checks). Both native and browser module-boundary audits pass. Apache source
+boundary checks verify 1,896 files, license-header checks pass, and CI policy
+scripts pass 92 tests. The existing human CI approval gate still applies;
+the main-branch policy assertion fix is isolated in PR #996.
+
+These results do not extend the earlier native abrupt-reset/physical-durability
+qualification to this new application binary. Windows remains experimental;
+CrossOver cannot establish loss of the Windows OS cache.

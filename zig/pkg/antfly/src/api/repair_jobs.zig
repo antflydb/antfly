@@ -13,12 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
-const platform_time = @import("antfly_platform").time;
-const platform_sync = @import("antfly_platform").sync;
+const platform_time = native_platform.time;
+const platform_sync = native_platform.sync;
 
 fn testProcessId() u64 {
     std.debug.assert(builtin.is_test);
@@ -1603,7 +1605,7 @@ test "named index repair cancellation remains nonterminal until durable controls
 
 test "named index repair cancellation restarts its durable traversal after job store recovery" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-cancel-recovery-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
@@ -1685,7 +1687,7 @@ test "named index repair cancellation restarts its durable traversal after job s
 
 test "table repair job recovery quarantines corrupt primary without blocking service" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-corrupt-primary-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
@@ -1720,7 +1722,7 @@ test "active repair job recovery quarantines malformed secondary entries" {
     try std.testing.expectError(error.InvalidRepairJobState, activeJobIdFromKey(active_job_key_prefix));
     try std.testing.expectError(error.InvalidRepairJobState, activeJobIdFromKey(active_job_key_prefix ++ "short"));
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-job-corrupt-marker-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
@@ -1742,7 +1744,7 @@ test "active repair job recovery quarantines malformed secondary entries" {
 
 test "table repair job store persists monotonic next id across stale durable writes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-jobs-monotonic-next-id-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
@@ -1816,7 +1818,7 @@ test "table repair job store persists monotonic next id across stale durable wri
 
 test "table repair job cleanup pages durable expired jobs" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-jobs-cleanup-page-{d}-{x}", .{ tmp.sub_path, testProcessId(), std.testing.random_seed });
     defer alloc.free(path);
@@ -1863,7 +1865,7 @@ test "table repair job cleanup pages durable expired jobs" {
 
 test "durable index controls preserve cursor fence and intent across interrupted recovery" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_]db_mod.types.IndexRepairControl{ .pause_automatic, .resume_automatic, .cancel_current_attempt }) |control| {
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, @tagName(control) });

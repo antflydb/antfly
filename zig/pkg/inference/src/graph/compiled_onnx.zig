@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const build_options = @import("build_options");
 const ml = @import("ml");
 const compiled_artifact = @import("../compiled_artifact.zig");
@@ -342,7 +344,7 @@ fn executeModelForwardViaDefinition(
         );
         defer allocator.free(package_path);
 
-        var io_impl = std.Io.Threaded.init(allocator, .{});
+        var io_impl = native_platform.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const executor_ctx = onnx_artifact_executor_mod.createModelExecutorFromPackageManifestPath(
             allocator,
@@ -465,7 +467,7 @@ fn findMatchingOnnxWholeModelArtifact(
         shape,
     )) |found| return found;
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -522,7 +524,7 @@ fn findMatchingOnnxWholeModelDecodeArtifact(
         model_dir,
     )) |found| return found;
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -585,7 +587,7 @@ fn findMatchingOnnxArtifactFromPackage(
     artifact_role: []const u8,
     shape: ArtifactShape,
 ) !?OnnxArtifactMatch {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -628,7 +630,7 @@ fn findMatchingOnnxDecodeArtifactFromPackage(
     artifact_dir: []const u8,
     model_dir: []const u8,
 ) !?OnnxArtifactMatch {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -667,8 +669,8 @@ fn findMatchingOnnxDecodeArtifactFromPackage(
 
 test "ONNX whole-model decode artifact lookup rejects ambiguous candidates" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -700,8 +702,8 @@ test "ONNX whole-model decode artifact lookup rejects ambiguous candidates" {
 
 test "ONNX whole-model artifact lookup resolves package manifest entries" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });

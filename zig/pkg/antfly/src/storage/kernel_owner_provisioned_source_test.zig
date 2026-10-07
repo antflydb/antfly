@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const abi = @import("kernel_owner_abi");
 const kernel_owner_source = @import("../api/kernel_owner_source.zig");
 const backup_contract = @import("antfly_local_sources").api_backup_contract;
@@ -33,9 +35,9 @@ const shard_state_store = @import("../data/storage/shard_state_store.zig");
 
 test "cold warmup reopens transient owners without disturbing resident siblings" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const Catalog = struct {
         fn snapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
@@ -105,9 +107,9 @@ test "bulk callback ABI retains exact consumer error identity" {
 
 test "replica retirement cold readers configure a lazy compiled context" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
     defer alloc.free(root);
@@ -129,11 +131,11 @@ test "replica retirement cold readers configure a lazy compiled context" {
 
 test "replica retirement drains active compiled owners before deleting physical roots" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     inline for (.{ @as(?[]const u8, "retired"), @as(?[]const u8, null) }) |retirement_name| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
         defer alloc.free(root);
@@ -221,9 +223,9 @@ test "replica retirement drains active compiled owners before deleting physical 
 
 test "empty hidden bootstrap read retries when the root generation advances" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const Generation = struct {
         reads: usize = 0,
@@ -255,9 +257,9 @@ test "empty hidden bootstrap read retries when the root generation advances" {
 
 test "concurrent cold hidden bootstrap reads share one configured context" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     var owners = kernel_owner_source.ProvisionedKernelOwnerSource.init(
         alloc,
@@ -336,9 +338,9 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
     defer alloc.free(bootstrap_json);
     const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = "{}", .restore_bootstrap_json = bootstrap_json };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const Authority = struct {
         descriptor: @import("kernel_owner_descriptor.zig").Descriptor,
@@ -502,9 +504,9 @@ test "restore publication recovers a cold compiled owner between preparation and
     const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
     defer alloc.free(bootstrap_json);
     const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = "{}", .restore_bootstrap_json = bootstrap_json };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const Authority = struct {
         descriptor: @import("kernel_owner_descriptor.zig").Descriptor,
@@ -574,9 +576,9 @@ test "restore publication recovers a cold compiled owner between preparation and
 
 test "transition lease reads unpublished owner metadata without admitting document reads" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     // This fixture deliberately has no public routing entry for the owner.
     // Only the admitted transition descriptor is allowed to open it.
@@ -616,7 +618,7 @@ test "transition lease reads unpublished owner metadata without admitting docume
 
 test "restore owner admission cannot pin an unimported replica generation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicas", .{tmp.sub_path});
     defer alloc.free(root);
@@ -677,13 +679,13 @@ test "restore owner admission cannot pin an unimported replica generation" {
 
 test "provisioned batch lookup scan and query share one opaque live storage owner" {
     const alloc = std.testing.allocator;
-    var replica_tmp = std.testing.tmpDir(.{});
+    var replica_tmp = native_platform.testing.tmpDir(.{});
     defer replica_tmp.cleanup();
-    var backup_tmp = std.testing.tmpDir(.{});
+    var backup_tmp = native_platform.testing.tmpDir(.{});
     defer backup_tmp.cleanup();
-    const replica_root = try replica_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const replica_root = try replica_tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(replica_root);
-    const backup_root = try backup_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const backup_root = try backup_tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(backup_root);
 
     const Catalog = struct {
@@ -886,7 +888,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     // A storage transition can outlive a request. Admission must stop waiting
     // on the request's controls, without altering the transition's ownership.
     {
-        const time = @import("antfly_platform").time;
+        const time = native_platform.time;
         const entry = owner_source.entries.items[0];
         entry.exclusive_active = true;
         defer entry.exclusive_active = false;
@@ -904,7 +906,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             at: u64,
             fn requested(ptr: *const anyopaque) bool {
                 const self: *const @This() = @ptrCast(@alignCast(ptr));
-                return @import("antfly_platform").time.monotonicNs() >= self.at;
+                return native_platform.time.monotonicNs() >= self.at;
             }
         };
         const cancel = CancelAfter{ .at = time.monotonicNs() + 20 * std.time.ns_per_ms };
@@ -919,7 +921,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         try std.testing.expect(owner_source.mutex.tryLock());
         defer owner_source.mutex.unlock();
         try std.testing.expectError(error.Timeout, owner_source.readSource().queryGroupLocal(alloc, 7001, "articles", .{
-            .execution_deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms,
+            .execution_deadline_ns = native_platform.time.monotonicNs() + 20 * std.time.ns_per_ms,
         }, .stale));
     }
 
@@ -950,9 +952,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         // Adding the sibling to the original fixture would also change its
         // resident range from ["", infinity) to ["", "m") without a topology
         // transition. Status correctly refuses that stale descriptor.
-        var status_tmp = std.testing.tmpDir(.{});
+        var status_tmp = native_platform.testing.tmpDir(.{});
         defer status_tmp.cleanup();
-        const status_root = try status_tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+        const status_root = try status_tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
         defer alloc.free(status_root);
         var status_catalog = Catalog{ .include_cold_group = true };
         var status_source = kernel_owner_source.ProvisionedKernelOwnerSource.init(alloc, status_root, status_catalog.iface(), read_gate.alreadyReadSafeBarrier());
@@ -979,9 +981,9 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     } else return error.ExpectedDenseIndex;
     _ = try write_source.source().createIndex(alloc, "articles", "dense_idx", "{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}");
     {
-        const time = @import("antfly_platform").time;
+        const time = native_platform.time;
         const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = native_platform.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         while (write_source.structural_reconcile_scheduled.load(.acquire) and time.monotonicNs() < deadline)
             try io_impl.io().sleep(.fromMilliseconds(5), .awake);
@@ -1099,7 +1101,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         try std.testing.expectEqual(@as(usize, 64), shards[0].artifact_sha256.len);
         const artifact_path = try std.fs.path.join(alloc, &.{ backup_root, shards[0].snapshot_path });
         defer alloc.free(artifact_path);
-        var backup_io_impl = std.Io.Threaded.init(alloc, .{});
+        var backup_io_impl = native_platform.Threaded.init(alloc, .{});
         defer backup_io_impl.deinit();
         _ = try std.Io.Dir.cwd().statFile(backup_io_impl.io(), artifact_path, .{});
     }
@@ -1662,7 +1664,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
                     return;
                 };
                 _ = self.rounds.fetchAdd(1, .release);
-                std.testing.io.sleep(.fromMilliseconds(1), .awake) catch return;
+                native_platform.testing.io.sleep(.fromMilliseconds(1), .awake) catch return;
             }
         }
 
@@ -1680,10 +1682,10 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         concurrent_maintenance.stop.store(true, .release);
         maintenance_thread.join();
     };
-    const maintenance_deadline = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 5 * std.time.ns_per_s;
+    const maintenance_deadline = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds + 5 * std.time.ns_per_s;
     while (concurrent_maintenance.rounds.load(.acquire) == 0) {
-        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= maintenance_deadline) return error.TestMaintenanceNotStarted;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        if (std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds >= maintenance_deadline) return error.TestMaintenanceNotStarted;
+        try native_platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     const rounds_before = concurrent_maintenance.rounds.load(.acquire);
     for (backup_formats, 0..) |backup, backup_index| {
@@ -1898,7 +1900,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     catalog.accept_publication = true;
     try std.testing.expect((try write_source.source().dropTable(alloc, "articles", cleanup_contract)) != null);
     try std.testing.expectEqual(@as(usize, 0), owner_source.ownerCountForTest());
-    var path_io_impl = std.Io.Threaded.init(alloc, .{});
+    var path_io_impl = native_platform.Threaded.init(alloc, .{});
     defer path_io_impl.deinit();
     try std.testing.expectError(
         error.FileNotFound,

@@ -66,3 +66,21 @@ test "filesystem capacity reports the test volume" {
     try std.testing.expect(observation.total_bytes > 0);
     try std.testing.expect(observation.available_bytes <= observation.total_bytes);
 }
+
+/// Mapping hints remain optional on Windows; callers retain ownership of the
+/// mapping and should use their owning Io for actual reads and publication.
+pub fn adviseMemory(ptr: [*]align(std.heap.page_size_min) u8, length: usize, advice: u32) std.posix.MadviseError!void {
+    if (builtin.os.tag == .windows) {
+        if (@import("windows_native.zig").madvise(ptr, length, advice) != 0) return error.Unexpected;
+        return;
+    }
+    return std.posix.madvise(ptr, length, advice);
+}
+
+pub fn unmapMemory(memory: []align(std.heap.page_size_min) const u8) void {
+    if (builtin.os.tag == .windows) {
+        if (@import("windows_native.zig").munmap(memory.ptr, memory.len) != 0) @panic("cannot unmap Windows file view");
+        return;
+    }
+    std.posix.munmap(memory);
+}

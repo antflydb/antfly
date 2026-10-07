@@ -14,7 +14,9 @@
 // limitations under the License.
 
 //! Node-local personal OAuth registrations, intentionally outside database metadata.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const paths = @import("antfly_runtime_fs").fs_paths;
 const protocol = @import("protocol.zig");
@@ -691,8 +693,8 @@ test "chatgpt generation bounds refresh and credential queueing by deadline and 
         }
     };
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
@@ -722,16 +724,16 @@ test "chatgpt generation bounds refresh and credential queueing by deadline and 
     defer http.deinit();
     var provider: @import("responses.zig").Provider = .{ .http = &http, .registrations = &instance, .owner = "alice", .connection_id = "one", .timeout_ms = 50 };
     // A short provider timeout includes refresh, not only the Responses POST.
-    var started = @import("antfly_platform").time.monotonicNs();
+    var started = native_platform.time.monotonicNs();
     try std.testing.expectError(error.Timeout, provider.generate(a, "model", &.{}));
-    try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 750 * std.time.ns_per_ms);
+    try std.testing.expect(native_platform.time.monotonicNs() - started < 750 * std.time.ns_per_ms);
     // Cancellation arriving during refresh interrupts it and preserves the grant.
     mock.cancel = &cancelled;
     provider.timeout_ms = 5_000;
     provider.request_context = .{ .io = io, .deadline_ns = null, .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled) };
-    started = @import("antfly_platform").time.monotonicNs();
+    started = native_platform.time.monotonicNs();
     try std.testing.expectError(error.Cancelled, provider.generate(a, "model", &.{}));
-    try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 750 * std.time.ns_per_ms);
+    try std.testing.expect(native_platform.time.monotonicNs() - started < 750 * std.time.ns_per_ms);
     try std.testing.expectEqual(@as(u32, 2), mock.requests.load(.acquire));
     var retained = try instance.load(a);
     defer {
@@ -747,7 +749,7 @@ test "chatgpt generation bounds refresh and credential queueing by deadline and 
     const cancel_context = provider.request_context.?;
     try std.testing.expectError(error.Cancelled, instance.pinWithContext("alice", "one", cancel_context));
     try std.testing.expectError(error.Cancelled, instance.leaseBoundWithContext(a, "alice", "one", null, cancel_context));
-    const deadline_context: RequestContext = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_ms };
+    const deadline_context: RequestContext = .{ .io = io, .deadline_ns = native_platform.time.monotonicNs() + 10 * std.time.ns_per_ms };
     try std.testing.expectError(error.Timeout, instance.pinWithContext("alice", "one", deadline_context));
     try std.testing.expectError(error.Timeout, instance.leaseBoundWithContext(a, "alice", "one", null, deadline_context));
     try std.testing.expectEqual(@as(u32, 2), mock.requests.load(.acquire));
@@ -755,8 +757,8 @@ test "chatgpt generation bounds refresh and credential queueing by deadline and 
 
 test "chatgpt authorization return allocation failure leaves no running attempt" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
@@ -804,8 +806,8 @@ test "chatgpt mock OAuth rotates refresh and rejects changed subject" {
         }
     };
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
@@ -907,8 +909,8 @@ test "chatgpt mock OAuth rotates refresh and rejects changed subject" {
 
 test "chatgpt manager persists host identity and partitions personal registrations" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
@@ -962,8 +964,8 @@ test "chatgpt manager persists host identity and partitions personal registratio
 
 test "chatgpt manager callback is one time owner bound and state checked" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
@@ -996,8 +998,8 @@ test "chatgpt manager callback is one time owner bound and state checked" {
 
 test "chatgpt manager rejects oversized updates without replacing durable credentials" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
@@ -1064,7 +1066,7 @@ test "chatgpt user deletion cancels grants and signins before username recreatio
     const usermgr = @import("../usermgr/user_manager.zig");
     const casbin = @import("antfly_casbin");
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     var store = usermgr.MemoryStore.init(a);
     defer store.deinit();
     var policies = casbin.MemoryAdapter.init(a);
@@ -1073,7 +1075,7 @@ test "chatgpt user deletion cancels grants and signins before username recreatio
     defer users.deinit();
     var first = try users.createUser("alice", "first-password", &.{});
     defer first.deinit(a);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
@@ -1148,8 +1150,8 @@ test "chatgpt user deletion cancels grants and signins before username recreatio
 
 test "chatgpt legacy username grants require consent after ownership migration" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);

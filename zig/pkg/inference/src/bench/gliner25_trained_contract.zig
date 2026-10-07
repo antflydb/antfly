@@ -15,7 +15,9 @@
 
 //! Additive, input-only execution contract for a materialized trained model.
 //! This deliberately does not reinterpret any frozen bundle/evaluation fixture.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const inference = @import("inference_internal");
 const bundle = inference.models.gliner_boundary_bundle;
 const files = inference.file_snapshot;
@@ -438,7 +440,7 @@ pub fn canonicalRequestDigest(a: Allocator, case: Case) !bundle.Digest {
 
 fn testInputs(a: Allocator) ![]u8 {
     // The dedicated test target runs from the inference package directory.
-    return files.read(a, std.testing.io, .cwd(), "testdata/gliner25/trained_execution_inputs_v1.json", @intCast(input_pin.size_bytes), null);
+    return files.read(a, native_platform.testing.io, .cwd(), "testdata/gliner25/trained_execution_inputs_v1.json", @intCast(input_pin.size_bytes), null);
 }
 fn testReceipt(weight: bundle.Digest, sidecars: [4]bundle.Digest) Receipt {
     return .{ .family = "gliner_boundary_merge/v1", .version = 1, .architecture_version = 1, .config_version = 3, .tensor_policy_version = 1, .math_policy = "f32_lora_delta_f64_dora_row_norm_v1", .source = .{ .backbone = .small, .precision = .fp32, .weight = bundle.Digest.of("source weights"), .sidecars = sidecars }, .provenance = .{ .configuration = bundle.Digest.of("job bytes"), .schema_sha256 = @as([32]u8, @splat(5)), .adapter_files = .{ .config = bundle.Digest.of("adapter config"), .weights = bundle.Digest.of("adapter weights"), .receipt = bundle.Digest.of("adapter receipt") } }, .target_sha256 = @as([32]u8, @splat(6)), .parameter_sha256 = @as([32]u8, @splat(7)), .merged = .{ .backbone = .small, .precision = .fp32, .weight = weight, .sidecars = sidecars }, .tensor_count = 334, .merged_tensor_count = 131 };
@@ -559,7 +561,7 @@ test "trained execution parser reclaims every allocation failure and admits a re
             try std.testing.expectEqual(@as(usize, 10), verified.inputs.value.cases.len);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Test.run, .{ fixture, inputs, raw });
+    try native_platform.allocator.checkAllAllocationFailures(a, Test.run, .{ fixture, inputs, raw });
     const owner = try Owner.create(a, 4096);
     defer owner.destroy();
     const owned = owner.allocator();
@@ -582,8 +584,8 @@ fn writeTestFile(io: std.Io, directory: std.Io.Dir, name: []const u8, bytes: []c
 }
 test "trained execution preloader and final verification reject same size substitutions and cancellation" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var temporary = native_platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     try temporary.dir.createDir(io, "encoder_config", .default_dir);
     const directory = try temporary.dir.realPathFileAlloc(io, ".", a);
@@ -642,5 +644,5 @@ test "trained execution preloader and final verification reject same size substi
             try verifyArtifacts(allocator, test_io, path, expected, null);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Test.run, .{ io, directory, envelope });
+    try native_platform.allocator.checkAllAllocationFailures(a, Test.run, .{ io, directory, envelope });
 }

@@ -13,9 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const httpx = @import("httpx");
 const lib = @import("antfly_reranking");
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
@@ -245,7 +247,7 @@ test "reranking runtime failures use stable query dependency classes" {
 
 test "reranking runtime rejects saturation and expired work before provider dispatch" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var runtime = Runtime.init(alloc, io_impl.io());
     defer runtime.deinit();
@@ -691,7 +693,7 @@ test "reranking runtime validates policies and rejects oversized text before dis
     const alloc = std.testing.allocator;
     var registry = provider_limits.Registry.init(alloc);
     defer registry.deinit();
-    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(alloc, native_platform.testing.io, .{});
     defer client.deinit();
     var cfg = Config{ .provider = .cohere, .model = "rerank-v4.0-pro", .url = "http://127.0.0.1:1", .api_key = "test", .field = "body", .rate_limit = .{ .requests_per_minute = 0 } };
     const options = Options{ .limits = &registry };
@@ -702,7 +704,7 @@ test "reranking runtime validates policies and rejects oversized text before dis
 
 test "reranking runtime maps Cohere scores back to input order" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var server = try httpx.TestServer.start(alloc, io, &.{.{
@@ -741,7 +743,7 @@ test "reranking runtime maps Cohere scores back to input order" {
 
 test "reranking runtime delegates to antfly provider" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -803,7 +805,7 @@ test "reranking runtime delegates to antfly provider" {
 
 test "reranking runtime preserves antfly HTTP failure classes" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const Case = struct { status: u16, body: []const u8 = "{}", expected: anyerror };
@@ -870,14 +872,14 @@ test "reranking runtime cancels active antfly HTTP work and releases admission" 
     State.canceled.store(false, .release);
     State.release.store(false, .release);
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var server = httpx.Server.initWithConfig(alloc, io, .{ .host = "127.0.0.1", .port = 0 });
     defer server.deinit();
     try server.post("/rerank", State.handler);
     try server.bind();
-    var listener = try std.testing.io.concurrent(struct {
+    var listener = try native_platform.testing.io.concurrent(struct {
         fn run(s: *httpx.Server) void {
             s.listen() catch {};
         }
@@ -885,7 +887,7 @@ test "reranking runtime cancels active antfly HTTP work and releases admission" 
     defer {
         State.release.store(true, .release);
         server.stop();
-        listener.await(std.testing.io);
+        listener.await(native_platform.testing.io);
     }
     while (!server.listen_started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
     const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}", .{server.boundAddress().?.getPort()});
@@ -926,7 +928,7 @@ test "reranking runtime cancels active antfly HTTP work and releases admission" 
 
 test "reranking runtime routes antfly provider to local antfly" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -1061,8 +1063,8 @@ test "reranking runtime authentication owns wire credentials and stable quota so
 
 test "reranking runtime remote Antfly secret rotation changes headers without resetting quota" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "secrets.json", .data = "{\"secrets\":[]}" });
     const path = try tmp.dir.realPathFileAlloc(io, "secrets.json", alloc);
@@ -1150,7 +1152,7 @@ test "reranking runtime remote Antfly secret rotation changes headers without re
 
 test "reranking runtime remote Antfly defaults match anonymous or environment authentication" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const Check = struct {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             const a = std.testing.allocator;
@@ -1214,7 +1216,7 @@ fn runRemoteContentRerank(
     expect_rerank_request: bool,
 ) !?[]f32 {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var ts = try httpx.TestServer.start(alloc, io, &.{
@@ -1292,7 +1294,7 @@ test "reranking runtime keeps prompts for servers without rerank documents" {
 }
 
 test "reranking runtime rejects image documents for text-only providers before dispatch" {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(std.testing.allocator, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -1313,7 +1315,7 @@ test "reranking runtime rejects image documents for text-only providers before d
 
 test "reranking runtime sends image documents to linked rerankers that accept images" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();

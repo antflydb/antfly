@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const jpeg = @import("jpeg.zig");
 
 const Allocator = std.mem.Allocator;
@@ -226,7 +228,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn runSeedCorporaSweep(alloc: Allocator, config: Config) !Summary {
     var summary = Summary{};
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io_impl.io(), config.root_dir, .{ .iterate = true });
@@ -258,7 +260,7 @@ fn collectStatusSummary(alloc: Allocator, root_dir: []const u8) !StatusSummary {
         .corpus_present = false,
     };
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var dir = std.Io.Dir.cwd().openDir(io_impl.io(), root_dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -283,7 +285,7 @@ fn collectStatusSummary(alloc: Allocator, root_dir: []const u8) !StatusSummary {
 
 fn triageDecodeFailuresWithDjpeg(alloc: Allocator, config: Config) !DjpegTriageSummary {
     var summary = DjpegTriageSummary{};
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io_impl.io(), config.root_dir, .{ .iterate = true });
@@ -317,7 +319,7 @@ fn triageDecodeFailuresWithDjpeg(alloc: Allocator, config: Config) !DjpegTriageS
 
 fn triageSuccessfulDecodesWithDjpegParity(alloc: Allocator, config: Config) !DjpegParitySummary {
     var summary = DjpegParitySummary{};
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io_impl.io(), config.root_dir, .{ .iterate = true });
@@ -543,7 +545,7 @@ const ImageMetadata = struct {
 };
 
 fn loadImageMetadataAlloc(alloc: Allocator, root_dir: []const u8, relative_path: []const u8) !ImageMetadata {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io_impl.io(), root_dir, .{});
@@ -617,7 +619,7 @@ fn probeOneFile(
     print_success: bool,
     quiet_failure: bool,
 ) !Outcome {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io_impl.io(), root_dir, .{});
@@ -685,7 +687,7 @@ fn runProbeOneChild(alloc: Allocator, config: Config, relative_path: []const u8)
         try argv.append("--quiet-failure");
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var child = try std.process.spawn(io_impl.io(), .{
@@ -734,7 +736,7 @@ fn runDjpegChild(alloc: Allocator, root_dir: []const u8, relative_path: []const 
     try argv.append("int");
     try argv.append(full_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var child = std.process.spawn(io_impl.io(), .{
@@ -756,7 +758,7 @@ fn runDjpegChild(alloc: Allocator, root_dir: []const u8, relative_path: []const 
 }
 
 fn decodeOneFileRgbaAlloc(alloc: Allocator, root_dir: []const u8, relative_path: []const u8) ![]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io_impl.io(), root_dir, .{});
@@ -798,7 +800,7 @@ fn readDjpegRgbaAlloc(alloc: Allocator, root_dir: []const u8, relative_path: []c
     try argv.append("-rgb");
     try argv.append(full_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var child = std.process.spawn(io_impl.io(), .{
@@ -922,7 +924,7 @@ fn readGitHeadAlloc(alloc: Allocator, io: std.Io, root_dir: []const u8) !?[]u8 {
 }
 
 fn resolveDjpegPath(alloc: Allocator) !?[]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const candidates = [_][]const u8{
         "/opt/homebrew/bin/djpeg",
@@ -937,7 +939,7 @@ fn resolveDjpegPath(alloc: Allocator) !?[]u8 {
 }
 
 fn ensureSeedCorporaAvailable(alloc: Allocator, io: std.Io, root_dir: []const u8, refresh: bool, allow_fetch: bool) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const dir_exists = blk: {

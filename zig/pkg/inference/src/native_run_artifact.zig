@@ -3005,8 +3005,8 @@ test "validateArtifact keeps XLA metadata inspection outside execution policy" {
     if (!build_options.enable_pjrt) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -3044,8 +3044,8 @@ test "validateArtifact keeps XLA metadata inspection outside execution policy" {
 
 test "validateArtifact summarizes package manifests" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -3151,8 +3151,8 @@ test "validateArtifact summarizes package manifests" {
 
 test "validateArtifact summarizes backend-owned PJRT package manifests" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -3244,8 +3244,8 @@ test "validateArtifact summarizes backend-owned PJRT package manifests" {
 
 test "findMatchingFullModelPackageManifest resolves matching PJRT package" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -3293,8 +3293,8 @@ test "findMatchingFullModelPackageManifest resolves matching PJRT package" {
 
 test "findMatchingFullModelPackageManifest prefers embedded PJRT package" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -3367,8 +3367,8 @@ test "findMatchingFullModelPackageManifest prefers embedded PJRT package" {
 
 test "findMatchingFullModelPackageManifest resolves matching ONNX package" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });

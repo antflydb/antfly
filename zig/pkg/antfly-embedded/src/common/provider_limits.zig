@@ -15,10 +15,12 @@
 
 //! Process-local outbound provider quotas. Identity is independent of policy;
 //! named consumers cannot multiply capacity by choosing different limits.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const credentials = @import("credential_source_identity.zig");
-const sync = @import("antfly_platform").sync;
+const sync = native_platform.sync;
 
 pub const Operation = enum { embedding, generation, reranking, decision };
 pub const Provider = enum { openai, openrouter, ollama, antfly, gemini, vertex, cohere, bedrock, jev };
@@ -105,8 +107,8 @@ pub const Policy = struct {
 };
 
 pub fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    var ts: native_platform.c.timespec = undefined;
+    if (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return 0;
     return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
 }
 
@@ -285,8 +287,8 @@ pub const Handle = struct {
 pub var process_registry = Registry.init(std.heap.page_allocator);
 
 fn wallSeconds() u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
+    var ts: native_platform.c.timespec = undefined;
+    if (std.posix.errno(native_platform.c.clock_gettime(.REALTIME, &ts)) != .SUCCESS) return 0;
     return @intCast(@max(0, ts.sec));
 }
 
@@ -328,7 +330,7 @@ pub fn testCancellationAndDeadline() !void {
         }
     };
     var context: httpx.AttemptObserver.Context = .{
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .deadline_ms = null,
         .cancellation_ptr = &cancelled,
         .is_cancelled = Probe.isCancelled,
@@ -493,8 +495,8 @@ test "provider quotas completion wait honors deadlines and cancellation without 
     const hook = limiter.observer(0);
     var probe = Probe{};
     var context = httpx.AttemptObserver.Context{
-        .io = std.testing.io,
-        .deadline_ms = std.Io.Clock.awake.now(std.testing.io).toMilliseconds() + 5,
+        .io = native_platform.testing.io,
+        .deadline_ms = std.Io.Clock.awake.now(native_platform.testing.io).toMilliseconds() + 5,
         .cancellation_ptr = &probe,
         .is_cancelled = Probe.cancelled,
         .body_bytes = 0,
@@ -512,7 +514,7 @@ test "provider quotas completion wait honors deadlines and cancellation without 
 
 test "provider quotas observe every retry and retain the permit through streamed writes" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const State = struct {
         starts: usize = 0,
         finishes: usize = 0,

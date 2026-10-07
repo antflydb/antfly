@@ -16,10 +16,12 @@
 //! HTTP request execution over a caller-owned `std.Io`.
 //!
 //! Unlike `StdHttpExecutor`, this owner does not create or depend on
-//! `std.Io.Threaded`. Production, integration, and VOPR callers can therefore
+//! `native_platform.Threaded`. Production, integration, and VOPR callers can therefore
 //! put clients and listeners under the same scheduler and clock.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const common = @import("antfly_local_sources").common_http_http_common;
 
@@ -262,7 +264,7 @@ test "I/O HTTP executor rejects an already-cancelled request without transport w
     var cancelled = std.atomic.Value(bool).init(true);
     const cancellation = common.RequestCancellation{ .borrowed = &cancelled };
     var tracker: common.RequestDeliveryTracker = .{};
-    var executor = IoHttpExecutor.init(std.testing.allocator, std.testing.io, .{});
+    var executor = IoHttpExecutor.init(std.testing.allocator, native_platform.testing.io, .{});
     defer executor.deinit();
 
     try std.testing.expectError(error.Cancelled, executor.executor().execute(std.testing.allocator, .{
@@ -277,7 +279,7 @@ test "I/O HTTP executor rejects an already-cancelled request without transport w
 test "I/O HTTP executor preserves not-sent proof when concurrency admission fails" {
     // One task permits the watchdog but rejects the network task. Neither
     // partial task admission nor its cancellation may lose not-sent proof.
-    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    var runtime = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
     defer runtime.deinit();
     var executor = IoHttpExecutor.init(std.testing.allocator, runtime.io(), .{});
     defer executor.deinit();
@@ -357,7 +359,7 @@ test "I/O HTTP executor streams routed response headers and bounded chunks beyon
     try listener.start();
     const uri = try listener.baseUri(std.testing.allocator);
     defer std.testing.allocator.free(uri);
-    var executor = IoHttpExecutor.init(std.testing.allocator, std.testing.io, .{ .max_response_bytes = 16, .keep_alive = true });
+    var executor = IoHttpExecutor.init(std.testing.allocator, native_platform.testing.io, .{ .max_response_bytes = 16, .keep_alive = true });
     defer executor.deinit();
     const request: common.HttpRequest = .{ .method = .POST, .uri = uri, .body = "{\"scan\":true}", .authorization = "Bearer stream-test", .content_type = "application/json", .timeout_ms = 5000 };
 
@@ -381,7 +383,7 @@ test "I/O HTTP executor streams routed response headers and bounded chunks beyon
     // bounded stream. Null above preserves the existing sink-owned budget.
     try std.testing.expectError(error.ResponseTooLarge, executor.executor().executeStream(std.testing.allocator, capped, cap_sink.writer()));
     try std.testing.expectEqual(@as(usize, 0), cap_sink.bytes);
-    var larger = IoHttpExecutor.init(std.testing.allocator, std.testing.io, .{ .max_response_bytes = 256 * 1024 });
+    var larger = IoHttpExecutor.init(std.testing.allocator, native_platform.testing.io, .{ .max_response_bytes = 256 * 1024 });
     defer larger.deinit();
     capped.max_response_bytes = 64;
     try std.testing.expectError(error.ResponseTooLarge, larger.executor().execute(std.testing.allocator, capped));
@@ -392,7 +394,7 @@ test "I/O HTTP executor streams routed response headers and bounded chunks beyon
 }
 
 test "I/O HTTP executor streaming cancellation and zero deadline retain not-sent proof" {
-    var executor = IoHttpExecutor.init(std.testing.allocator, std.testing.io, .{});
+    var executor = IoHttpExecutor.init(std.testing.allocator, native_platform.testing.io, .{});
     defer executor.deinit();
     var cancellation: common.RequestCancellation = .{};
     cancellation.cancel();

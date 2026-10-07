@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const objectstore = @import("objectstore");
 
@@ -325,7 +327,7 @@ fn downloadContentOutcomeAllocImpl(
     if (std.ascii.eqlIgnoreCase(parsed.scheme, "http") or std.ascii.eqlIgnoreCase(parsed.scheme, "https")) {
         try validateUrlSecurity(parsed, security);
         if (maybe_context) |context| return downloadHttpOutcomeAlloc(alloc, context, uri, security, http_headers);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = native_platform.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         return downloadHttpOutcomeAlloc(alloc, .{ .io = io_impl.io() }, uri, security, http_headers);
     }
@@ -685,7 +687,7 @@ fn downloadFileAlloc(
     path: []const u8,
     security: ?*const ContentSecurityConfig,
 ) !DownloadedContent {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     return downloadFileAllocWithIo(alloc, io_impl.io(), path, security);
 }
@@ -761,8 +763,8 @@ fn downloadS3Alloc(
     security: ?*const ContentSecurityConfig,
     s3_credentials: ?*const S3CredentialsConfig,
 ) !DownloadedContent {
-    var local_io_impl: ?std.Io.Threaded = if (maybe_context == null)
-        std.Io.Threaded.init(alloc, .{})
+    var local_io_impl: ?native_platform.Threaded = if (maybe_context == null)
+        native_platform.Threaded.init(alloc, .{})
     else
         null;
     defer if (local_io_impl) |*io_impl| io_impl.deinit();
@@ -1306,28 +1308,28 @@ test "download context timeout cannot lengthen configured deadline" {
     const security = ContentSecurityConfig{ .download_timeout_seconds = 7 };
     try std.testing.expectEqual(
         @as(u64, 1234),
-        effectiveDownloadTimeoutMs(.{ .io = std.testing.io, .timeout_ms = 1234 }, &security),
+        effectiveDownloadTimeoutMs(.{ .io = native_platform.testing.io, .timeout_ms = 1234 }, &security),
     );
     try std.testing.expectEqual(
         @as(u64, 7000),
-        effectiveDownloadTimeoutMs(.{ .io = std.testing.io, .timeout_ms = 30_000 }, &security),
+        effectiveDownloadTimeoutMs(.{ .io = native_platform.testing.io, .timeout_ms = 30_000 }, &security),
     );
     try std.testing.expectEqual(
         @as(u64, 7000),
-        effectiveDownloadTimeoutMs(.{ .io = std.testing.io, .timeout_ms = 0 }, &security),
+        effectiveDownloadTimeoutMs(.{ .io = native_platform.testing.io, .timeout_ms = 0 }, &security),
     );
     try std.testing.expectEqual(
         @as(u64, 7000),
-        effectiveDownloadTimeoutMs(.{ .io = std.testing.io }, &security),
+        effectiveDownloadTimeoutMs(.{ .io = native_platform.testing.io }, &security),
     );
     try std.testing.expectEqual(
         default_download_timeout_ms,
-        effectiveDownloadTimeoutMs(.{ .io = std.testing.io }, null),
+        effectiveDownloadTimeoutMs(.{ .io = native_platform.testing.io }, null),
     );
     try std.testing.expectEqual(
         @as(u64, 1234),
         effectiveDownloadTimeoutMs(
-            .{ .io = std.testing.io, .timeout_ms = 1234 },
+            .{ .io = native_platform.testing.io, .timeout_ms = 1234 },
             &.{ .download_timeout_seconds = 0 },
         ),
     );
@@ -1351,7 +1353,7 @@ test "contextual data URI and URI scheme dispatch are case insensitive" {
     const alloc = std.testing.allocator;
     var downloaded = try downloadContentAllocWithContext(
         alloc,
-        .{ .io = std.testing.io, .timeout_ms = 1000 },
+        .{ .io = native_platform.testing.io, .timeout_ms = 1000 },
         "DATA:text/plain;base64,aGVsbG8=",
         null,
         null,
@@ -1395,17 +1397,17 @@ test "download size defaults apply when content security omits the field" {
 
 test "download content reads percent encoded file uri" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(native_platform.testing.io, .{
         .sub_path = "image file.png",
         .data = "png-bytes",
     });
 
     const rel_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "image file.png" });
     defer alloc.free(rel_path);
-    const abs_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, rel_path, alloc);
+    const abs_path = try std.Io.Dir.cwd().realPathFileAlloc(native_platform.testing.io, rel_path, alloc);
     defer alloc.free(abs_path);
 
     const raw_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{abs_path});
@@ -1429,15 +1431,15 @@ test "file downloads require explicit paths before opening a target" {
     try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, uri, null, null));
     try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, uri, &omitted, null));
     try std.testing.expectError(error.PathNotAllowed, downloadContentAlloc(alloc, uri, &empty, null));
-    try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, .{ .io = std.testing.io }, uri, &omitted, null));
-    const deadline_context = DownloadContext{ .io = std.testing.io, .timeout_ms = 1 };
+    try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, .{ .io = native_platform.testing.io }, uri, &omitted, null));
+    const deadline_context = DownloadContext{ .io = native_platform.testing.io, .timeout_ms = 1 };
     try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, deadline_context, uri, null, null));
     try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, deadline_context, uri, &omitted, null));
     try std.testing.expectError(error.PathNotAllowed, downloadContentOutcomeAllocWithContext(alloc, deadline_context, uri, &empty, null));
 }
 
 test "deadline-bound file downloads fail closed when file IO cannot enforce timeouts" {
-    const context = DownloadContext{ .io = std.testing.io, .timeout_ms = 1 };
+    const context = DownloadContext{ .io = native_platform.testing.io, .timeout_ms = 1 };
     const paths = [_][]u8{@constCast("/not-opened-because-timeout-is-unsupported.txt")};
     const security = ContentSecurityConfig{ .allowed_paths = &paths };
     try std.testing.expectError(
@@ -1454,17 +1456,17 @@ test "deadline-bound file downloads fail closed when file IO cannot enforce time
 
 test "caller-owned IO preserves file downloads without a request deadline" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "context.txt", .data = "bounded by size" });
-    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "context.txt", alloc);
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "context.txt", .data = "bounded by size" });
+    const path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "context.txt", alloc);
     defer alloc.free(path);
 
     const paths = [_][]u8{path};
     const security = ContentSecurityConfig{ .allowed_paths = &paths };
     var downloaded = try downloadFileAllocWithContext(
         alloc,
-        .{ .io = std.testing.io },
+        .{ .io = native_platform.testing.io },
         path,
         &security,
     );
@@ -1474,16 +1476,16 @@ test "caller-owned IO preserves file downloads without a request deadline" {
 
 test "file download accepts an exact cap and rejects cap plus one" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "exact.txt", .data = "abcd" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "over.txt", .data = "abcde" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "exact.txt", .data = "abcd" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "over.txt", .data = "abcde" });
 
-    const exact = try tmp.dir.realPathFileAlloc(std.testing.io, "exact.txt", alloc);
+    const exact = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "exact.txt", alloc);
     defer alloc.free(exact);
-    const over = try tmp.dir.realPathFileAlloc(std.testing.io, "over.txt", alloc);
+    const over = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "over.txt", alloc);
     defer alloc.free(over);
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const paths = [_][]u8{root};
     const security = ContentSecurityConfig{ .max_download_size_bytes = 4, .allowed_paths = &paths };
@@ -1496,19 +1498,19 @@ test "file download accepts an exact cap and rejects cap plus one" {
 
 test "file path security requires canonical component containment" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io, "allowed");
-    try tmp.dir.createDirPath(std.testing.io, "allowed-sibling");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "allowed/child.txt", .data = "allowed" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "allowed-sibling/child.txt", .data = "blocked" });
+    try tmp.dir.createDirPath(native_platform.testing.io, "allowed");
+    try tmp.dir.createDirPath(native_platform.testing.io, "allowed-sibling");
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "allowed/child.txt", .data = "allowed" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "allowed-sibling/child.txt", .data = "blocked" });
 
-    const allowed_root = try tmp.dir.realPathFileAlloc(std.testing.io, "allowed", alloc);
+    const allowed_root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "allowed", alloc);
     defer alloc.free(allowed_root);
-    const allowed_child = try tmp.dir.realPathFileAlloc(std.testing.io, "allowed/child.txt", alloc);
+    const allowed_child = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "allowed/child.txt", alloc);
     defer alloc.free(allowed_child);
-    const sibling_child = try tmp.dir.realPathFileAlloc(std.testing.io, "allowed-sibling/child.txt", alloc);
+    const sibling_child = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "allowed-sibling/child.txt", alloc);
     defer alloc.free(sibling_child);
     const allowed_paths = [_][]u8{allowed_root};
     const security = ContentSecurityConfig{ .allowed_paths = &allowed_paths };
@@ -1521,14 +1523,14 @@ test "file path security requires canonical component containment" {
 
 test "file path security accepts relative roots and rejects outside paths before lookup" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "allowed");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "allowed/child.txt", .data = "allowed" });
+    try tmp.dir.createDirPath(native_platform.testing.io, "allowed");
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "allowed/child.txt", .data = "allowed" });
 
     const relative_root = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "allowed" });
     defer alloc.free(relative_root);
-    const absolute_child = try tmp.dir.realPathFileAlloc(std.testing.io, "allowed/child.txt", alloc);
+    const absolute_child = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "allowed/child.txt", alloc);
     defer alloc.free(absolute_child);
     const allowed_paths = [_][]u8{relative_root};
     const security = ContentSecurityConfig{ .allowed_paths = &allowed_paths };
@@ -1540,7 +1542,7 @@ test "file path security accepts relative roots and rejects outside paths before
     const nonexistent_allowed = [_][]u8{@constCast("/definitely/not/an/antfly/allowed/root")};
     try std.testing.expectError(error.PathNotAllowed, validateFilePathSecurityBeforeOpen(
         alloc,
-        std.testing.io,
+        native_platform.testing.io,
         "/definitely/not/an/antfly/outside/file",
         &.{ .allowed_paths = &nonexistent_allowed },
     ));
@@ -1551,15 +1553,15 @@ test "file path security rejects symlink escape" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io, "allowed");
-    try tmp.dir.createDirPath(std.testing.io, "outside");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside/secret.txt", .data = "secret" });
-    try tmp.dir.symLink(std.testing.io, "../outside/secret.txt", "allowed/link.txt", .{});
+    try tmp.dir.createDirPath(native_platform.testing.io, "allowed");
+    try tmp.dir.createDirPath(native_platform.testing.io, "outside");
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "outside/secret.txt", .data = "secret" });
+    try tmp.dir.symLink(native_platform.testing.io, "../outside/secret.txt", "allowed/link.txt", .{});
 
-    const allowed_root = try tmp.dir.realPathFileAlloc(std.testing.io, "allowed", alloc);
+    const allowed_root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "allowed", alloc);
     defer alloc.free(allowed_root);
     const link_path = try std.fs.path.join(alloc, &.{ allowed_root, "link.txt" });
     defer alloc.free(link_path);
@@ -1688,7 +1690,7 @@ test "safe HTTP policy rejects private DNS at the connection boundary" {
         error.PrivateIpBlocked,
         downloadContentAllocWithContext(
             std.testing.allocator,
-            .{ .io = std.testing.io, .timeout_ms = 1000 },
+            .{ .io = native_platform.testing.io, .timeout_ms = 1000 },
             "http://localhost/image.png",
             &.{ .allowed_hosts = &allowed_hosts, .block_private_ips = true },
             null,
@@ -1915,7 +1917,7 @@ fn downloadTestHttpResponseAlloc(
     content_encoding: ?[]const u8,
     max_download_size_bytes: u64,
 ) !DownloadedContent {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1932,7 +1934,7 @@ fn downloadTestHttpResponseAlloc(
     };
     const uri = try std.fmt.allocPrint(alloc, "http://{f}/blob", .{server.socket.address});
     defer alloc.free(uri);
-    var thread = try std.testing.io.concurrent(TestHttpResponseServer.serve, .{&fixture});
+    var thread = try native_platform.testing.io.concurrent(TestHttpResponseServer.serve, .{&fixture});
     var security = ContentSecurityConfig{
         .block_private_ips = false,
         .max_download_size_bytes = max_download_size_bytes,
@@ -1940,10 +1942,10 @@ fn downloadTestHttpResponseAlloc(
     var downloaded = downloadContentAlloc(alloc, uri, &security, null) catch |err| {
         server.deinit(io);
         server_open = false;
-        thread.await(std.testing.io);
+        thread.await(native_platform.testing.io);
         return err;
     };
-    thread.await(std.testing.io);
+    thread.await(native_platform.testing.io);
     if (fixture.failure) |server_err| {
         downloaded.deinit(alloc);
         return server_err;

@@ -13,11 +13,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const join_planning = @import("join_planning.zig");
 const RouteBudget = @import("table_router.zig").RouteBudget;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 const table_reads = @import("antfly_local_sources").api_table_read_source;
 const query_api = @import("antfly_local_sources").api_query;
 const query_contract = @import("antfly_local_sources").api_query_contract;
@@ -31,9 +33,9 @@ const metadata_server_openapi = @import("antfly_metadata_server_openapi");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const tables_api = @import("tables.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const table_catalog = @import("table_catalog.zig");
-const platform_clock = @import("antfly_platform").clock;
+const platform_clock = native_platform.clock;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const raft_mod = @import("../raft/mod.zig");
 const public_table_http = @import("public_table_http.zig");
@@ -8435,7 +8437,7 @@ test "distributed join lifecycle prepare returns fresh and records start when no
 }
 
 test "distributed join lifecycle prepare reuses persisted resume state" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lifecycle-resume-state.txt", .{tmp.sub_path});
@@ -8492,7 +8494,7 @@ test "distributed join lifecycle prepare reuses persisted resume state" {
 }
 
 test "distributed join lifecycle prepare reuses persisted cached result" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lifecycle-cached-result.txt", .{tmp.sub_path});
@@ -8884,7 +8886,7 @@ test "distributed join durable finalizer state init reuses prior owner lease" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/durable-join-store.txt", .{tmp.sub_path});
@@ -8963,7 +8965,7 @@ test "distributed join durable threshold checks require shuffle shared leases an
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/durable-threshold-store.txt", .{tmp.sub_path});
@@ -9074,7 +9076,7 @@ test "distributed join finalizer start index falls back without usable shared le
 }
 
 test "distributed join persisted cached result reloads after restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/persisted-cached-result.txt", .{tmp.sub_path});
@@ -9124,7 +9126,7 @@ test "distributed join persisted cached result reloads after restart" {
 }
 
 test "distributed join persisted resume state reloads after restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/persisted-resume-state.txt", .{tmp.sub_path});
@@ -9232,7 +9234,7 @@ test "distributed join imports remote job state snapshot into local store" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const remote_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/remote-join-store.txt", .{tmp.sub_path});
@@ -9328,7 +9330,7 @@ test "distributed join finalizer imports cached result from prior owner" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const remote_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/remote-finalizer-store.txt", .{tmp.sub_path});
@@ -9524,13 +9526,13 @@ test "distributed join fanout bounds concurrency drains errors and preserves gro
             _ = self.peak.fetchMax(active, .acq_rel);
             _ = self.calls.fetchAdd(1, .acq_rel);
             // Complete out of order to test deterministic publication.
-            try std.Io.sleep(std.Options.debug_io, .fromMilliseconds(@intCast(10 - group % 8)), .awake);
+            try std.Io.sleep(native_platform.debug_io, .fromMilliseconds(@intCast(10 - group % 8)), .awake);
             if (self.fail and group == 2) return error.TopologyChanged;
             return .{ .json = try std.fmt.allocPrint(alloc, "{{\"responses\":[{{\"hits\":{{\"total\":{{\"value\":1,\"relation\":\"exact\"}},\"hits\":[{{\"_id\":\"{d}\",\"_source\":{{}}}}]}}}}]}}", .{group}) };
         }
     };
     var fixture: Fixture = .{};
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(8) });
+    var threaded = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .limited(8) });
     defer threaded.deinit();
     const io = threaded.io();
     var ctx = JoinContext{ .ptr = &fixture, .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io), .vtable = undefined };

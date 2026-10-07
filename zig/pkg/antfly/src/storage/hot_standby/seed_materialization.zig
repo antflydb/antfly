@@ -17,7 +17,9 @@
 //! directory. Raw transport bytes remain immutable; the returned live tree is
 //! a separate generation that the runtime may mutate after ACTIVE publication.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const data_format = @import("../../common/data_format.zig");
@@ -52,7 +54,7 @@ pub const AuthArtifact = seed_topology.AuthArtifact;
 pub const Topology = seed_topology.Topology;
 
 pub const MaterializeRequest = struct {
-    io: std.Io = std.Options.debug_io,
+    io: std.Io = native_platform.debug_io,
     raw_generation_root: []const u8,
     live_installing_root: []const u8,
     generation: []const u8,
@@ -345,7 +347,7 @@ pub fn validatePublishedBeforeRuntime(
     expected_generation: []const u8,
     expected_receipt_sha256: []const u8,
 ) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const receipt_path = try std.fs.path.join(alloc, &.{ live_root, materialized_receipt_name });
     defer alloc.free(receipt_path);
@@ -363,7 +365,7 @@ pub fn validatePublishedBeforeRuntime(
 }
 
 pub fn loadPublishedEvidence(alloc: Allocator, live_root: []const u8, expected_generation: []const u8) !PublishedEvidence {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const receipt_path = try std.fs.path.join(alloc, &.{ live_root, materialized_receipt_name });
     defer alloc.free(receipt_path);
@@ -397,7 +399,7 @@ pub fn validateRuntimeIdentity(
     expected_generation: []const u8,
     expected_receipt_sha256: []const u8,
 ) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const receipt_path = try std.fs.path.join(alloc, &.{ live_root, materialized_receipt_name });
     defer alloc.free(receipt_path);
@@ -858,9 +860,9 @@ test "storage.ha physical owner policy snapshot must equal metadata seed program
 
 test "storage.ha staged owner rejects metadata policy missing from its physical catalog" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
     defer alloc.free(root);
@@ -890,9 +892,9 @@ test "storage.ha protected owner seed accepts serving program and rejects stale 
     const alloc = std.testing.allocator;
     const policies = @import("antfly_local_sources").system_catalog_policies;
     const schema_mod = @import("antfly_local_sources").storage_schema;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
     defer alloc.free(root);

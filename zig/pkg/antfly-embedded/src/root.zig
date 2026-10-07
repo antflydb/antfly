@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const embedded = @import("embedded_surface");
 pub const db = embedded.db;
 pub const api = embedded.api;
@@ -49,16 +51,16 @@ test "pkg antfly embedded root compiles" {
 test "pkg antfly embedded exposes Lite path-level check helpers" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pkg-lite-malformed.aflite", .{tmp.sub_path});
     defer allocator.free(path);
 
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "short embedded package header", 0);
+        var file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, path, .{});
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "short embedded package header", 0);
     }
 
     const report: db.LiteCheckReport = try db.checkLiteFile(allocator, path);
@@ -74,7 +76,7 @@ test "pkg antfly embedded exposes Lite path-level check helpers" {
 test "pkg antfly embedded exposes Lite path-level snapshot helpers" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pkg-lite-snapshot-src.aflite", .{tmp.sub_path});
@@ -116,7 +118,7 @@ test "pkg antfly embedded exposes Lite path-level snapshot helpers" {
 test "pkg antfly embedded exposes Lite handle-level snapshot helper" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/pkg-lite-handle-snapshot-src.aflite", .{tmp.sub_path});

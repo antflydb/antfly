@@ -20,7 +20,9 @@
 //   - BPE (GPT-2, CLIP, RoBERTa, Gemma, etc.)
 //   - Unigram (SentencePiece-based: DeBERTa v3, T5, ALBERT, XLNet, etc.)
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const SpecialTokens = @import("tokenizer.zig").SpecialTokens;
@@ -425,7 +427,7 @@ pub const HfTokenizer = struct {
         // Two independent bits materially reduce false second-hit admission.
         // Two rotating generations keep a one-shot scan from saturating the
         // filter forever.
-        generations: [2][bpe_doorkeeper_words]@import("antfly_platform").atomic.Value(u64) =
+        generations: [2][bpe_doorkeeper_words]native_platform.atomic.Value(u64) =
             @splat(@splat(.{ .raw = 0 })),
         active_generation: std.atomic.Value(u8) = .init(0),
         observations: std.atomic.Value(usize) = .init(0),
@@ -440,9 +442,9 @@ pub const HfTokenizer = struct {
         bulk_slots: ?[]std.atomic.Value(usize) = null,
         bulk_slots_per_shard: usize = 0,
         used_bytes: std.atomic.Value(usize) = .init(0),
-        rejected_reservations: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        rejected_admissions: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        evictions: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        rejected_reservations: native_platform.atomic.Value(u64) = .init(0),
+        rejected_admissions: native_platform.atomic.Value(u64) = .init(0),
+        evictions: native_platform.atomic.Value(u64) = .init(0),
         resource_budget: ?BpeCacheResourceBudget = null,
         doorkeeper: BpeDoorkeeper = .{},
         reader_gate: std.atomic.Value(bool) = .init(false),
@@ -561,18 +563,18 @@ pub const HfTokenizer = struct {
     };
 
     const BpeProfileCounters = struct {
-        pretokens: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        direct_hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        misses: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        probes: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        key_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        token_ids: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        key_len_histogram: [33]@import("antfly_platform").atomic.Value(u64) =
+        pretokens: native_platform.atomic.Value(u64) = .init(0),
+        direct_hits: native_platform.atomic.Value(u64) = .init(0),
+        hits: native_platform.atomic.Value(u64) = .init(0),
+        misses: native_platform.atomic.Value(u64) = .init(0),
+        probes: native_platform.atomic.Value(u64) = .init(0),
+        key_bytes: native_platform.atomic.Value(u64) = .init(0),
+        token_ids: native_platform.atomic.Value(u64) = .init(0),
+        key_len_histogram: [33]native_platform.atomic.Value(u64) =
             @splat(.{ .raw = 0 }),
-        id_count_histogram: [9]@import("antfly_platform").atomic.Value(u64) =
+        id_count_histogram: [9]native_platform.atomic.Value(u64) =
             @splat(.{ .raw = 0 }),
-        probe_histogram: [17]@import("antfly_platform").atomic.Value(u64) =
+        probe_histogram: [17]native_platform.atomic.Value(u64) =
             @splat(.{ .raw = 0 }),
     };
 
@@ -2352,7 +2354,7 @@ pub const HfTokenizer = struct {
         published_stable_boundary_words: std.atomic.Value(usize) = .init(0),
         published_stable_boundary_bytes: std.atomic.Value(usize) = .init(0),
         published_text_bytes: std.atomic.Value(usize) = .init(0),
-        published_elapsed_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        published_elapsed_ns: native_platform.atomic.Value(u64) = .init(0),
         published_cache_owner: std.atomic.Value(usize) =
             .init(invalid_worker_cache_owner),
 
@@ -2975,9 +2977,9 @@ pub const HfTokenizer = struct {
     ) void {
         if (comptime builtin.os.tag != .macos) return;
         const advice: u32 = if (reusable)
-            std.posix.MADV.FREE_REUSABLE
+            native_platform.c.MADV.FREE_REUSABLE
         else
-            std.posix.MADV.FREE_REUSE;
+            native_platform.c.MADV.FREE_REUSE;
         const page_size = std.heap.page_size_min;
         for (&workspace.workers) |*worker| {
             const capacity_bytes = if (worker.packed_output)
@@ -3004,7 +3006,7 @@ pub const HfTokenizer = struct {
             if (end <= start) continue;
             const aligned_ptr: [*]align(std.heap.page_size_min) u8 =
                 @ptrFromInt(start);
-            std.posix.madvise(
+            native_platform.filesystem.adviseMemory(
                 aligned_ptr,
                 end - start,
                 advice,
@@ -3027,10 +3029,10 @@ pub const HfTokenizer = struct {
             if (end <= start) return;
             const aligned_ptr: [*]align(std.heap.page_size_min) u8 =
                 @ptrFromInt(start);
-            std.posix.madvise(
+            native_platform.filesystem.adviseMemory(
                 aligned_ptr,
                 end - start,
-                std.posix.MADV.HUGEPAGE,
+                native_platform.c.MADV.HUGEPAGE,
             ) catch {};
         }
     }
@@ -9286,7 +9288,7 @@ test "encode for model handles splade wordpiece tokenizer fixture" {
     defer if (std.c.getenv("ANTFLY_INFERENCE_MODELS_DIR") == null) allocator.free(models_dir);
     const path = try std.fs.path.join(allocator, &.{ models_dir, "sparse-encoder-testing", "splade-bert-tiny-nq-onnx", "tokenizer.json" });
     defer allocator.free(path);
-    const bytes = std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, path, allocator, .limited(16 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
@@ -9687,13 +9689,13 @@ test "real tokenizer.json golden values" {
     var tok = HfTokenizer.loadFromDir(
         allocator,
         std.Io.Dir.cwd(),
-        std.testing.io,
+        native_platform.testing.io,
         "lib/tokenizer/testdata/embedder/tokenizer.json",
     ) catch |err| switch (err) {
         error.FileNotFound => try HfTokenizer.loadFromDir(
             allocator,
             std.Io.Dir.cwd(),
-            std.testing.io,
+            native_platform.testing.io,
             "testdata/embedder/tokenizer.json",
         ),
         else => return err,
@@ -9861,16 +9863,16 @@ test "byte-level BPE parallel encoding preserves serial token order" {
 
     var parallel = std.ArrayListUnmanaged(i32).empty;
     defer parallel.deinit(allocator);
-    try tok.tokenizer().encodeIntoParallel(std.testing.io, allocator, text.items, &parallel, 4);
+    try tok.tokenizer().encodeIntoParallel(native_platform.testing.io, allocator, text.items, &parallel, 4);
 
     try std.testing.expectEqualSlices(i32, serial.items, parallel.items);
     parallel.clearRetainingCapacity();
-    try tok.tokenizer().encodeIntoParallel(std.testing.io, allocator, text.items, &parallel, 4);
+    try tok.tokenizer().encodeIntoParallel(native_platform.testing.io, allocator, text.items, &parallel, 4);
     try std.testing.expectEqualSlices(i32, serial.items, parallel.items);
 
     parallel.clearRetainingCapacity();
     try parallel.append(allocator, -123);
-    try tok.tokenizer().encodeIntoParallel(std.testing.io, allocator, text.items, &parallel, 4);
+    try tok.tokenizer().encodeIntoParallel(native_platform.testing.io, allocator, text.items, &parallel, 4);
     try std.testing.expectEqual(@as(i32, -123), parallel.items[0]);
     try std.testing.expectEqualSlices(i32, serial.items, parallel.items[1..]);
     try std.testing.expect(parallel.capacity < text.items.len);
@@ -10113,7 +10115,7 @@ test "worker BPE caches honor external resource-budget denial" {
     var parallel = std.ArrayListUnmanaged(i32).empty;
     defer parallel.deinit(allocator);
     try tok.tokenizer().encodeIntoParallel(
-        std.testing.io,
+        native_platform.testing.io,
         allocator,
         text.items,
         &parallel,
@@ -10124,7 +10126,7 @@ test "worker BPE caches honor external resource-budget denial" {
     try std.testing.expectEqual(base_bytes, budget.used.load(.acquire));
 
     var packed_segments = try tok.encodeParallelSegmentsU16Stable(
-        std.testing.io,
+        native_platform.testing.io,
         text.items,
         4,
         9,
@@ -10302,7 +10304,7 @@ test "stable boundary index yields resource priority to worker caches" {
     var ids = std.ArrayListUnmanaged(i32).empty;
     defer ids.deinit(allocator);
     try tok.tokenizer().encodeIntoParallelStable(
-        std.testing.io,
+        native_platform.testing.io,
         allocator,
         text.items,
         &ids,
@@ -10428,7 +10430,7 @@ test "worker BPE cache retains spilled token sequences" {
     for (0..2) |_| {
         parallel.clearRetainingCapacity();
         try tok.tokenizer().encodeIntoParallel(
-            std.testing.io,
+            native_platform.testing.io,
             allocator,
             text.items,
             &parallel,
@@ -10460,7 +10462,7 @@ test "packed parallel BPE rejects token IDs outside u16" {
     try std.testing.expectError(
         error.TokenIdTooLargeForU16,
         tok.encodeParallelSegmentsU16Stable(
-            std.testing.io,
+            native_platform.testing.io,
             "a",
             2,
             1,
@@ -10537,7 +10539,7 @@ test "worker BPE spill arena falls back when resource budget denies growth" {
     for (0..2) |_| {
         parallel.clearRetainingCapacity();
         try tok.tokenizer().encodeIntoParallel(
-            std.testing.io,
+            native_platform.testing.io,
             allocator,
             text.items,
             &parallel,
@@ -10602,7 +10604,7 @@ test "byte-level BPE parallel encoding preserves document delimiters" {
     for (0..2) |_| {
         parallel.clearRetainingCapacity();
         try tok.tokenizer().encodeIntoParallelStable(
-            std.testing.io,
+            native_platform.testing.io,
             allocator,
             text.items,
             &parallel,
@@ -10612,7 +10614,7 @@ test "byte-level BPE parallel encoding preserves document delimiters" {
         try std.testing.expectEqualSlices(i32, serial.items, parallel.items);
     }
     var segments = try tok.encodeParallelSegmentsStable(
-        std.testing.io,
+        native_platform.testing.io,
         text.items,
         4,
         7,
@@ -10634,7 +10636,7 @@ test "byte-level BPE parallel encoding preserves document delimiters" {
     try std.testing.expectEqual(@as(usize, 1), tok.parallel_workspace_free_count);
 
     var packed_segments = try tok.encodeParallelSegmentsU16Stable(
-        std.testing.io,
+        native_platform.testing.io,
         text.items,
         4,
         7,

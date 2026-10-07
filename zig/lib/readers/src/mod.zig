@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const google_auth = @import("antfly_google").auth;
 const inference_api = @import("inference_api");
@@ -1207,7 +1209,7 @@ test "reader registry duplicate provider error does not double free config" {
 
 test "antfly reader sends configured bearer auth" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1258,7 +1260,7 @@ test "antfly reader sends configured bearer auth" {
 
 test "antfly reader sends batched images and request max tokens" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1313,7 +1315,7 @@ test "antfly reader sends batched images and request max tokens" {
 
 test "antfly reader rejects mismatched batch result count" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1366,7 +1368,7 @@ test "antfly reader rejects mismatched batch result count" {
 
 test "vertex reader exchanges service account credentials and sends bearer auth" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1385,9 +1387,9 @@ test "vertex reader exchanges service account credentials and sends bearer auth"
     const credentials_json = try fakeVertexCredentialsJsonAlloc(alloc, token_uri);
     defer alloc.free(credentials_json);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
     const credentials_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "credentials.json" });
     defer alloc.free(credentials_path);
 
@@ -1432,7 +1434,7 @@ test "vertex reader exchanges service account credentials and sends bearer auth"
 
 test "vertex reader explicit bearer still defaults project id from credentials" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1446,9 +1448,9 @@ test "vertex reader explicit bearer still defaults project id from credentials" 
     const credentials_json = try fakeVertexCredentialsJsonAlloc(alloc, "http://127.0.0.1/token-not-used");
     defer alloc.free(credentials_json);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
     const credentials_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "credentials.json" });
     defer alloc.free(credentials_path);
 

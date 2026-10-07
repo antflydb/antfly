@@ -21,7 +21,9 @@
 //! timeline can rewind if required WAL is retained; otherwise the node must be
 //! reseeded.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const fencing = @import("fencing.zig");
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("antfly_local_sources").storage_db_replication_record;
@@ -305,7 +307,7 @@ fn testPath(alloc: std.mem.Allocator, comptime name: []const u8) ![:0]u8 {
         .{ std.testing.random_seed, nonce },
     );
     defer alloc.free(raw);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
     return try alloc.dupeSentinel(u8, raw, 0);

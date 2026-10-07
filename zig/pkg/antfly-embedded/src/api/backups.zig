@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 pub const std = @import("std");
+
 pub const fs_paths = @import("antfly_runtime_fs").fs_paths;
 pub const group_ids = @import("../common/group_ids.zig");
 pub const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
@@ -101,8 +103,8 @@ pub const OpenOptions = struct {
     filesystem_io: ?std.Io = null,
 };
 
-pub fn createOwnedThreadedIo(alloc: std.mem.Allocator) !*std.Io.Threaded {
-    const owned = try alloc.create(std.Io.Threaded);
+pub fn createOwnedThreadedIo(alloc: std.mem.Allocator) !*native_platform.Threaded {
+    const owned = try alloc.create(native_platform.Threaded);
     // CLI and embedded backup stores can live for the whole operation and
     // issue concurrent HTTP work. Keep the fallback finite when a server
     // runtime was not supplied.
@@ -112,7 +114,7 @@ pub fn createOwnedThreadedIo(alloc: std.mem.Allocator) !*std.Io.Threaded {
 
 pub const AwsCredentialContext = struct {
     alloc: std.mem.Allocator,
-    io_impl: ?*std.Io.Threaded,
+    io_impl: ?*native_platform.Threaded,
     http: httpx.Client,
     cache: aws.CredentialCache = .{},
     region: []u8,
@@ -128,7 +130,7 @@ pub const AwsCredentialContext = struct {
     ) !AwsCredentialContext {
         const owned_region = try alloc.dupe(u8, region);
         errdefer alloc.free(owned_region);
-        const io_impl: ?*std.Io.Threaded = if (network_io == null) blk: {
+        const io_impl: ?*native_platform.Threaded = if (network_io == null) blk: {
             break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
@@ -300,7 +302,7 @@ pub const RemoteBackupStore = struct {
     };
 
     alloc: std.mem.Allocator,
-    io_impl: ?*std.Io.Threaded = null,
+    io_impl: ?*native_platform.Threaded = null,
     io: std.Io,
     client: object_storage.ObjectStorage,
     gcs_client: ?*object_storage.Gcs.JsonApiClient = null,
@@ -332,7 +334,7 @@ pub const RemoteBackupStore = struct {
     }
 
     pub fn initGcsUri(alloc: std.mem.Allocator, bucket: []const u8, prefix: []const u8, options: OpenOptions) !RemoteBackupStore {
-        const io_impl: ?*std.Io.Threaded = if (options.network_io == null) blk: {
+        const io_impl: ?*native_platform.Threaded = if (options.network_io == null) blk: {
             break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
@@ -396,7 +398,7 @@ pub const RemoteBackupStore = struct {
         prefix: []const u8,
         options: OpenOptions,
     ) !RemoteBackupStore {
-        const io_impl: ?*std.Io.Threaded = if (options.network_io == null) blk: {
+        const io_impl: ?*native_platform.Threaded = if (options.network_io == null) blk: {
             break :blk try createOwnedThreadedIo(alloc);
         } else null;
         errdefer if (io_impl) |owned| {
@@ -1480,7 +1482,7 @@ pub const RemoteBackupStore = struct {
     }
 
     pub fn downloadDirectoryRecursive(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8) !void {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = native_platform.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, io_impl.io(), src_suffix, dest_path, 1000, .none);
     }
@@ -1504,7 +1506,7 @@ pub const RemoteBackupStore = struct {
     }
 
     pub fn downloadDirectoryRecursiveWithPageSize(self: *RemoteBackupStore, alloc: std.mem.Allocator, src_suffix: []const u8, dest_path: []const u8, page_size: u32) !void {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = native_platform.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         return try self.downloadDirectoryRecursiveWithPageSizeAndCancellation(alloc, io_impl.io(), src_suffix, dest_path, page_size, .none);
     }
@@ -1798,7 +1800,7 @@ pub fn resolveFilesystemLocationAlloc(alloc: std.mem.Allocator, configured_root:
     const relative = std.mem.trimStart(u8, uri_path, "/");
     if (relative.len > 0) try validateArtifactRelativePath(relative);
 
-    var io_impl: ?std.Io.Threaded = if (shared_io == null)
+    var io_impl: ?native_platform.Threaded = if (shared_io == null)
         threaded_io_limits.initService(alloc)
     else
         null;
@@ -1987,7 +1989,7 @@ pub fn writeManifestToLocation(
     location: *BackupLocation,
     manifest: *const TableBackupManifest,
 ) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return writeManifestToLocationWithIo(alloc, io_impl.io(), location, manifest);
 }
@@ -2737,7 +2739,7 @@ pub fn copyDirectoryToLocationUsingIoWithCancellation(
     // `filesystem_io` owns only the local source tree. Remote object clients
     // retain their configured transport I/O for repository requests.
     try cancellation.check();
-    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    var io_impl: ?native_platform.Threaded = if (filesystem_io == null) native_platform.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const source_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
@@ -2773,7 +2775,7 @@ pub fn copyDirectoryFromLocationUsingIoWithCancellation(
     // clients retain their configured transport I/O for repository requests.
     try cancellation.check();
     try validateArtifactRelativePath(snapshot_path);
-    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    var io_impl: ?native_platform.Threaded = if (filesystem_io == null) native_platform.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const destination_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
@@ -2901,7 +2903,7 @@ pub fn nativeGenerationManifestIntegrityAllocWithCancellation(
     try cancellation.check();
     if (shared_io) |io|
         return try fileArtifactIntegrityAllocCancellable(alloc, io, manifest_path, cancellation);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try fileArtifactIntegrityAllocCancellable(alloc, io_impl.io(), manifest_path, cancellation);
 }
@@ -2913,7 +2915,7 @@ pub fn artifactIntegrityAlloc(
     artifact_path: []const u8,
 ) !ArtifactIntegrity {
     if (shared_io) |io| return try artifactIntegrityAllocWithIo(alloc, io, format, artifact_path);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try artifactIntegrityAllocWithIo(alloc, io_impl.io(), format, artifact_path);
 }
@@ -2928,7 +2930,7 @@ pub fn artifactIntegrityAllocWithCancellation(
     try cancellation.check();
     if (shared_io) |io|
         return try artifactIntegrityAllocCancellableWithIo(alloc, io, format, artifact_path, cancellation);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try artifactIntegrityAllocCancellableWithIo(alloc, io_impl.io(), format, artifact_path, cancellation);
 }
@@ -3388,7 +3390,7 @@ pub fn copyDirectoryRecursiveUsingIoWithCancellation(
 ) !void {
     try cancellation.check();
     if (shared_io) |io| return try copyDirectoryRecursiveWithIo(alloc, io, src_path, dest_path, .durable, cancellation);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     return copyDirectoryRecursiveWithIo(alloc, io_impl.io(), src_path, dest_path, .durable, cancellation);
 }
@@ -3599,7 +3601,7 @@ pub fn copyDirectoryRecursiveWithIo(
 
 pub fn writeFileAbsolute(path: []const u8, data: []const u8) !void {
     if (std.fs.path.dirname(path)) |dir_name| try ensureDirPath(dir_name);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -3615,7 +3617,7 @@ pub fn writeFileAbsolute(path: []const u8, data: []const u8) !void {
 }
 
 pub fn writeFileAbsoluteIfAbsent(alloc: std.mem.Allocator, path: []const u8, data: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return writeFileAbsoluteIfAbsentWithIo(alloc, io_impl.io(), path, data);
 }
@@ -3700,7 +3702,7 @@ pub fn writeFileAbsoluteIfAbsentWithIoAndCancellation(
 }
 
 pub fn readFileAbsoluteAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return readFileAbsoluteAllocWithIo(alloc, io_impl.io(), path, max_bytes);
 }
@@ -3791,7 +3793,7 @@ pub fn copyFileAbsoluteWithIoOptionsCancellable(
 }
 
 pub fn ensureDirPath(path: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return ensureDirPathWithIo(io_impl.io(), path);
 }
@@ -3910,7 +3912,7 @@ pub fn copyFileFromLocationUsingIo(
 ) !void {
     // The explicit I/O authority is for the local destination, not transport.
     try validateArtifactRelativePath(snapshot_path);
-    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    var io_impl: ?native_platform.Threaded = if (filesystem_io == null) native_platform.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const destination_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {

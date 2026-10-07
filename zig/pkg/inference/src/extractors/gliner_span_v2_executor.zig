@@ -23,7 +23,9 @@
 //! model temperature 1. Activation, thresholds, top_k and constraints are the
 //! shared boundary presentation.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const wire = @import("extraction_v2.zig");
 const processor = @import("../pipelines/gliner_boundary_processor.zig");
 const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
@@ -89,7 +91,7 @@ pub const Profile = struct {
 };
 
 fn nowNs() u64 {
-    return @import("antfly_platform").time.monotonicNs();
+    return native_platform.time.monotonicNs();
 }
 
 /// Classifier logits for every `[L]` marker of one prepared sample, grouped by
@@ -617,8 +619,8 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
     // Accelerator sessions require process isolation for uninterruptible work.
     const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
-    if (watchdog) |owner| try owner.start(std.testing.io);
-    const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 600 * std.time.ns_per_s };
+    if (watchdog) |owner| try owner.start(native_platform.testing.io);
+    const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = native_platform.time.monotonicNs() + 600 * std.time.ns_per_s };
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     const cb = &managed.backend;
@@ -705,20 +707,20 @@ fn testDecideParity(directory: []const u8, metal: bool, logit_tolerance: f64) !v
 }
 
 test "gliner span v2 GLiNER2.5-Decide native parity" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
     try testDecideParity(directory, false, 2e-3);
 }
 
 test "gliner span v2 GLiNER2.5-Decide Metal parity" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
     try testDecideParity(directory, true, 5e-3);
 }
 
 // Span head + CountLSTM v1 parity on upstream's exact entity inputs, which
 // isolates the head from the legacy entity pipeline's prompt construction.
 test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
     const gliner_head = @import("../architectures/gliner_head.zig");
@@ -767,7 +769,7 @@ test "gliner span v2 GLiNER2.5-Decide CountLSTM v1 entity head parity" {
 
 test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle Metal parity" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
     // Q8_0 encoder weights: decisions must match exactly; probabilities and
     // logits carry quantization error.
     try testDecideParity(directory, true, 5e-2);
@@ -776,7 +778,7 @@ test "gliner span v2 GLiNER2.5-Decide Q8_0 bundle Metal parity" {
 // Warm Metal latency breakdown: ANTFLY_GLINER25_DECIDE_BENCH=1 plus the model dir.
 test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    const env = @import("antfly_platform").env;
+    const env = native_platform.env;
     const directory = env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
     if (!env.getenvBool("ANTFLY_GLINER25_DECIDE_BENCH")) return error.SkipZigTest;
     const a = std.testing.allocator;
@@ -794,7 +796,7 @@ test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
     defer tokenizer.tokenizer().deinitTokenizer();
     const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
-    if (watchdog) |owner| try owner.start(std.testing.io);
+    if (watchdog) |owner| try owner.start(native_platform.testing.io);
     const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = nowNs() + 900 * std.time.ns_per_s };
 
     const raw =
@@ -873,7 +875,7 @@ test "gliner span v2 GLiNER2.5-Decide Metal latency profile" {
 }
 
 test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequences" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
     const session = try factory.createNativeSession(a, directory);
@@ -941,7 +943,7 @@ test "gliner span v2 GLiNER2.5-Decide splits an over-budget prompt across sequen
 }
 
 test "gliner span v2 GLiNER2.5-Decide execute serves the wire response and enforces limits" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_DECIDE_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
     const session = try factory.createNativeSession(a, directory);

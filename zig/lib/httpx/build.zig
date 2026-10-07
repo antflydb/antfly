@@ -17,6 +17,7 @@ fn linkPlatformLibs(compile: *std.Build.Step.Compile, target: std.Build.Resolved
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    defer @import("antfly_platform").bindBuild(b);
 
     const httpx_module = b.createModule(.{
         .root_source_file = b.path("src/httpx.zig"),

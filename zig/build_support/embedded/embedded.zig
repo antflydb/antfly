@@ -194,6 +194,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     antfly_client_pkg_mod.addImport("antfly_client_openapi", client_openapi_mod);
     antfly_client_pkg_mod.addImport("httpx", httpx_mod);
 
+    const platform_build = @import("antfly_platform");
+    platform_build.bindPlatform(.{ antfly_embedded_pkg_mod, antfly_embedded_db_pkg_mod, antfly_embedded_api_pkg_mod, antfly_client_pkg_mod }, platform_mod);
+
     // Static library
     const lib = b.addLibrary(.{
         .linkage = .static,

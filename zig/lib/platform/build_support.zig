@@ -62,6 +62,12 @@ fn filesystemCapacitySupported(target: std.Build.ResolvedTarget) bool {
 }
 
 fn configureModule(module: *std.Build.Module, options: ModuleOptions) *std.Build.Module {
+    if (options.target.result.os.tag == .windows) {
+        // Independent runtime archives cannot propagate inferred extern-library
+        // dependencies to their final executable. Bind platform imports here.
+        module.linkSystemLibrary("bcrypt", .{});
+        module.linkSystemLibrary("ws2_32", .{});
+    }
     if (options.link_libc) {
         addFilesystemCapacitySource(module, options.filesystem_capacity_source_file, options.target);
     }
@@ -263,4 +269,53 @@ fn visitSdkModule(b: *std.Build, module: *std.Build.Module, steps: *std.AutoHash
         else => {},
     };
     for (module.import_table.values()) |dependency| visitSdkModule(b, dependency, steps, modules);
+}
+
+/// Bind native platform APIs throughout a composed product graph. Borrowed Io
+/// types remain std.Io; only executor construction and native primitives use
+/// this dependency. Host-tool graphs keep their own target and platform.
+pub fn bindPlatform(value: anytype, platform: *std.Build.Module) void {
+    const T = @TypeOf(value);
+    if (T == *std.Build.Module) {
+        bindPlatformModule(value, platform);
+    } else switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.field_names) |name| {
+            bindPlatform(@field(value, name), platform);
+        },
+        .optional => if (value) |present| bindPlatform(present, platform),
+        else => {},
+    }
+}
+
+fn bindPlatformModule(root: *std.Build.Module, platform: *std.Build.Module) void {
+    if (root == platform) return;
+    if (root.resolved_target) |target| {
+        const expected = platform.resolved_target.?.result;
+        if (target.result.os.tag != expected.os.tag or
+            target.result.cpu.arch != expected.cpu.arch or target.result.abi != expected.abi) return;
+    }
+    const arena = root.owner.graph.arena;
+    var seen: std.AutoHashMap(*std.Build.Module, void) = .init(arena);
+    var pending: std.ArrayList(*std.Build.Module) = .empty;
+    pending.append(arena, root) catch @panic("OOM");
+    var index: usize = 0;
+    while (index < pending.items.len) : (index += 1) {
+        const module = pending.items[index];
+        if (module == platform) continue;
+        if (module.resolved_target) |target| {
+            const expected = platform.resolved_target.?.result;
+            if (target.result.os.tag != expected.os.tag or
+                target.result.cpu.arch != expected.cpu.arch or target.result.abi != expected.abi) continue;
+        }
+        const entry = seen.getOrPut(module) catch @panic("OOM");
+        if (entry.found_existing) continue;
+        // Do not override an explicitly configured dependency.
+        if (!module.import_table.contains("antfly_platform")) {
+            module.addImport("antfly_platform", platform);
+        }
+        module.cached_graph = .{ .modules = &.{}, .names = &.{} };
+        for (module.import_table.values()) |dependency| {
+            if (dependency != platform) pending.append(arena, dependency) catch @panic("OOM");
+        }
+    }
 }

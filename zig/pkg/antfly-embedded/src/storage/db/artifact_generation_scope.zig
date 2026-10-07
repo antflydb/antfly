@@ -15,7 +15,9 @@
 
 //! Physical generation namespaces. The shared append/publish/retire machinery
 //! does not grant semantic producer authority or interpret output payloads.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const keys = @import("../internal_keys.zig");
 const chunks = @import("artifact_chunk_manifest.zig");
 
@@ -102,7 +104,7 @@ test "ordered artifact inventory extraction generations share resumable lifecycl
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/extraction-generation", .{tmp.sub_path});
     defer alloc.free(path);

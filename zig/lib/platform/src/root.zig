@@ -32,3 +32,14 @@ pub const Evented = if (@import("std").Io.fiber.supported) switch (@import("buil
     .macos => @import("dispatch_compat.zig"),
     else => @import("std").Io.Evented,
 } else void;
+
+/// Native owning executor; Windows retains repository-owned cancellation/TLS.
+pub const Threaded = if (@import("builtin").os.tag == .windows) @import("threaded_windows.zig") else @import("std").Io.Threaded;
+pub const c = @import("native_c.zig");
+pub const DynLib = if (@import("builtin").os.tag == .windows) @import("windows_native.zig").WindowsDynLib else @import("std").DynLib;
+pub const testing = @import("testing.zig");
+
+/// Process-lifetime fallback for diagnostics and legacy optional I/O.
+/// Runtime APIs should continue to use their caller-supplied executor.
+var debug_threaded: Threaded = .init_single_threaded;
+pub const debug_io: @import("std").Io = if (@import("builtin").os.tag == .windows) debug_threaded.io() else @import("std").Options.debug_io;

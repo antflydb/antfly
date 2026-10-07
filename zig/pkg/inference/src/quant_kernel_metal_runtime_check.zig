@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const quant_kernel_compiler = @import("graph/quant_kernel_compiler.zig");
 const quant_kernel_metal_renderer = @import("graph/quant_kernel_metal_renderer.zig");
@@ -7688,7 +7690,7 @@ test "quant kernel metal attestation rejects dirty source status" {
 }
 
 test "quant kernel metal runtime evidence records dev-only benchmark results" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "evidence.json" });
@@ -7713,7 +7715,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     }
 
     try writeEvidence(std.testing.allocator, path, &metal_runtime_checks, &results, 1, null, null, false, false, false, null);
-    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(128 * 1024));
+    const actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(actual);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, actual, .{});
     defer parsed.deinit();
@@ -7873,7 +7875,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const route_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "q8-route-evidence.json" });
     defer std.testing.allocator.free(route_path);
     try writeEvidence(std.testing.allocator, route_path, route_checks[0..route_count], route_results[0..route_count], 1, null, route_kernel, false, false, false, null);
-    const route_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, route_path, std.testing.allocator, .limited(128 * 1024));
+    const route_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, route_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(route_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, route_actual, 1, "\"runtime_route_kernel\":\"" ++ route_kernel ++ "\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, route_actual, 1, "--runtime-route-kernel " ++ route_kernel));
@@ -7903,7 +7905,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const route_all_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "all-route-evidence.json" });
     defer std.testing.allocator.free(route_all_path);
     try writeEvidence(std.testing.allocator, route_all_path, route_all_checks[0..route_all_count], route_all_results[0..route_all_count], 1, null, null, true, false, false, null);
-    const route_all_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, route_all_path, std.testing.allocator, .limited(128 * 1024));
+    const route_all_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, route_all_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(route_all_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, route_all_actual, 1, "\"runtime_route_kernel\":null"));
     try std.testing.expect(std.mem.containsAtLeast(u8, route_all_actual, 1, "\"runtime_route_all\":true"));
@@ -7985,11 +7987,11 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
 
     const copied_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "copied-evidence.json" });
     defer std.testing.allocator.free(copied_path);
-    try writeFileCreatingParent(std.testing.io, copied_path, actual);
+    try writeFileCreatingParent(native_platform.testing.io, copied_path, actual);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFile(std.testing.allocator, copied_path, false, false, null));
     try std.testing.expect(try commandEvidenceOutMatches(std.testing.allocator, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/a --repeat-runs 3", "/tmp/a"));
     try std.testing.expect(!try commandEvidenceOutMatches(std.testing.allocator, "zig build quant-kernel-metal-runtime-check -Dmetal=true -Dcuda=false -- --evidence-out /tmp/abc --repeat-runs 3", "/tmp/a"));
-    const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, path, std.testing.allocator);
+    const absolute_path = try std.Io.Dir.cwd().realPathFileAlloc(native_platform.testing.io, path, std.testing.allocator);
     defer std.testing.allocator.free(absolute_path);
     try checkEvidenceJsonCommandPath(std.testing.allocator, actual, absolute_path);
 
@@ -8165,7 +8167,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         try std.testing.expectError(error.InvalidArgument, writeEvidence(std.testing.allocator, production_regression_path, short_production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false, null));
     }
     try writeEvidence(std.testing.allocator, production_regression_path, production_checks[0..production_count], production_results[0..production_count], promotion_repeat_runs, null, null, false, true, false, null);
-    const production_regression_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, production_regression_path, std.testing.allocator, .limited(128 * 1024));
+    const production_regression_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, production_regression_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(production_regression_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, production_regression_actual, 1, "\"production_regression_check\":true"));
     const expected_compiler_manifest_schema = try std.fmt.allocPrint(std.testing.allocator, "\"compiler_benchmark_manifest_schema\":\"{s}\"", .{quant_kernel_compiler.first_benchmark_manifest_schema});
@@ -8236,7 +8238,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const repeat_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "evidence-repeat.json" });
     defer std.testing.allocator.free(repeat_path);
     try writeEvidence(std.testing.allocator, repeat_path, &metal_runtime_checks, &repeat_results, promotion_repeat_runs, null, null, false, false, false, null);
-    const repeat_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, repeat_path, std.testing.allocator, .limited(128 * 1024));
+    const repeat_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, repeat_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(repeat_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"repeat_runs\":5"));
     try std.testing.expect(std.mem.containsAtLeast(u8, repeat_actual, 1, "\"warmup_repeat_runs\":2"));
@@ -8256,7 +8258,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     const longer_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "metal", "evidence-repeat-longer.json" });
     defer std.testing.allocator.free(longer_path);
     try writeEvidence(std.testing.allocator, longer_path, &longer_checks, &longer_results, promotion_repeat_runs, null, null, false, false, false, null);
-    const longer_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, longer_path, std.testing.allocator, .limited(128 * 1024));
+    const longer_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, longer_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(longer_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, longer_actual, 1, " --measure-iters 100"));
     try std.testing.expect(std.mem.containsAtLeast(u8, longer_actual, 1, "\"measure_iters\":100"));
@@ -8289,7 +8291,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     }
     try std.testing.expectEqual(@as(usize, 2), q6_promotion_count);
     try writeEvidence(std.testing.allocator, promoted_path, q6_promotion_checks[0..q6_promotion_count], q6_promotion_results_scoped[0..q6_promotion_count], promotion_repeat_runs, quant_kernel_compiler.first_general_metal_q6_kernel_id, null, false, false, false, null);
-    const promoted_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, promoted_path, std.testing.allocator, .limited(128 * 1024));
+    const promoted_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, promoted_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(promoted_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"production_enabled\":true"));
     try std.testing.expect(std.mem.containsAtLeast(u8, promoted_actual, 1, "\"promotion_case_count\":2"));
@@ -8330,7 +8332,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
         false,
         test_attested_provenance,
     );
-    const attested_promoted_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, attested_promoted_path, std.testing.allocator, .limited(128 * 1024));
+    const attested_promoted_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, attested_promoted_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(attested_promoted_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, attested_promoted_actual, 1, "\"provenance_status\":\"attested_v1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, attested_promoted_actual, 1, " --attest-provenance"));
@@ -8353,7 +8355,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     );
     defer std.testing.allocator.free(missing_attested_field);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, missing_attested_field, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id));
-    try writeFileCreatingParent(std.testing.io, attested_promoted_path, missing_attested_field);
+    try writeFileCreatingParent(native_platform.testing.io, attested_promoted_path, missing_attested_field);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFileWithSummaryExpected(std.testing.allocator, attested_promoted_path, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id, test_attested_provenance));
 
     const bad_clean_status_digest = try replaceOnce(
@@ -8364,7 +8366,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     );
     defer std.testing.allocator.free(bad_clean_status_digest);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceJson(std.testing.allocator, bad_clean_status_digest, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id));
-    try writeFileCreatingParent(std.testing.io, attested_promoted_path, bad_clean_status_digest);
+    try writeFileCreatingParent(native_platform.testing.io, attested_promoted_path, bad_clean_status_digest);
     try std.testing.expectError(error.InvalidMetalEvidence, checkEvidenceFileWithSummaryExpected(std.testing.allocator, attested_promoted_path, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id, test_attested_provenance));
 
     const forged_attested_device = try replaceOnce(
@@ -8376,9 +8378,9 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     defer std.testing.allocator.free(forged_attested_device);
     try checkEvidenceJson(std.testing.allocator, forged_attested_device, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id);
     try std.testing.expectError(error.MetalEvidenceProvenanceMismatch, checkEvidenceProvenanceMatches(std.testing.allocator, forged_attested_device, test_attested_provenance));
-    try writeFileCreatingParent(std.testing.io, attested_promoted_path, forged_attested_device);
+    try writeFileCreatingParent(native_platform.testing.io, attested_promoted_path, forged_attested_device);
     try std.testing.expectError(error.MetalEvidenceProvenanceMismatch, checkEvidenceFileWithSummaryExpected(std.testing.allocator, attested_promoted_path, true, false, quant_kernel_compiler.first_general_metal_q6_kernel_id, test_attested_provenance));
-    try writeFileCreatingParent(std.testing.io, attested_promoted_path, attested_promoted_actual);
+    try writeFileCreatingParent(native_platform.testing.io, attested_promoted_path, attested_promoted_actual);
 
     const stale_promoted_ready_count = try replaceOnce(std.testing.allocator, promoted_actual, "\"promotion_ready_count\":2", "\"promotion_ready_count\":1");
     defer std.testing.allocator.free(stale_promoted_ready_count);
@@ -8424,7 +8426,7 @@ test "quant kernel metal runtime evidence records dev-only benchmark results" {
     }
     try std.testing.expectEqual(@as(usize, 2), q5_promotion_count);
     try writeEvidence(std.testing.allocator, slow_promoted_path, q5_promotion_checks[0..q5_promotion_count], q5_promotion_results_scoped[0..q5_promotion_count], promotion_repeat_runs, quant_kernel_compiler.first_general_metal_q5_kernel_id, null, false, false, false, null);
-    const slow_promoted_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, slow_promoted_path, std.testing.allocator, .limited(128 * 1024));
+    const slow_promoted_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, slow_promoted_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(slow_promoted_actual);
     try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"promotion_case_count\":2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, slow_promoted_actual, 1, "\"promotion_ready_count\":0"));
@@ -8722,8 +8724,8 @@ fn replaceAll(allocator: std.mem.Allocator, input: []const u8, needle: []const u
 }
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+    var ts: native_platform.c.timespec = undefined;
+    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }

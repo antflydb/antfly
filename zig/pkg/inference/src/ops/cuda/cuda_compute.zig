@@ -167,7 +167,7 @@ const CudaA4bLoadSlot = struct {
 };
 
 const CudaA4bLoadPipelineState = struct {
-    io: std.Io = std.Io.Threaded.global_single_threaded.io(),
+    io: std.Io = platform.Threaded.global_single_threaded.io(),
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     plan: *const CudaA4bSourceLoadPlan,
@@ -3094,7 +3094,7 @@ pub const CudaCompute = struct {
 
         // Staging producers depend on the upload consumer. Reserve their
         // capacity independently of request work and retain it through drain.
-        var worker_io = std.Io.Threaded.init(self.allocator, .{
+        var worker_io = platform.Threaded.init(self.allocator, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(worker_count),
         });
@@ -9112,7 +9112,7 @@ fn testAcquiredWeightHandle(allocator: std.mem.Allocator) !void {
 
 test "CUDA acquired weight handles have independent metadata and borrowed storage" {
     try testAcquiredWeightHandle(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testAcquiredWeightHandle, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, testAcquiredWeightHandle, .{});
 }
 
 fn prefetchWeightHint(ctx: *anyopaque, name: []const u8, hint: u32) void {
@@ -12866,8 +12866,8 @@ fn cudaTensorTypeDebugEnabled() bool {
 }
 
 fn monotonicNowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -23718,9 +23718,9 @@ test "cuda dense host prefetch queue removal clears pending item" {
 test "CUDA A4B pipeline notification observes ready slots and stop" {
     const Waiter = struct {
         fn run(state: *CudaA4bLoadPipelineState, entered: *std.Io.Event, done: *std.Io.Event) void {
-            entered.set(std.testing.io);
+            entered.set(platform.testing.io);
             state.waitForProgress(1);
-            done.set(std.testing.io);
+            done.set(platform.testing.io);
         }
     };
     for ([_]bool{ false, true }) |stop| {
@@ -23728,27 +23728,27 @@ test "CUDA A4B pipeline notification observes ready slots and stop" {
         var state = CudaA4bLoadPipelineState{ .plan = undefined, .tasks = &.{}, .slots = &slots };
         var entered: std.Io.Event = .unset;
         var done: std.Io.Event = .unset;
-        var future = try std.testing.io.concurrent(Waiter.run, .{ &state, &entered, &done });
+        var future = try platform.testing.io.concurrent(Waiter.run, .{ &state, &entered, &done });
         defer {
             state.lock();
             state.stop = true;
             state.changed.broadcast(state.io);
             state.mutex.unlock(state.io);
-            future.await(std.testing.io);
+            future.await(platform.testing.io);
         }
-        entered.waitUncancelable(std.testing.io);
+        entered.waitUncancelable(platform.testing.io);
         state.lock();
         if (stop) state.stop = true else slots[0].state = .ready;
         state.changed.broadcast(state.io);
         state.mutex.unlock(state.io);
-        try done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
-        future.await(std.testing.io);
+        try done.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        future.await(platform.testing.io);
     }
 }
 
 test "CUDA A4B pipeline rolls back partial worker startup and drains blocked producers" {
     for (0..3) |capacity| {
-        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        var io_impl = platform.Threaded.init(std.testing.allocator, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(capacity),
         });

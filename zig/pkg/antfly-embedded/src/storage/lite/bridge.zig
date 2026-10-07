@@ -20,13 +20,15 @@
 //! in-memory name index. Public Lite files should use `native.zig`; this bridge
 //! remains for storage-engine development and conformance tests.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 const storage_io = @import("../lsm_backend/storage_io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -73,7 +75,7 @@ pub const ContainerStorage = struct {
     };
 
     allocator: Allocator,
-    io_impl: if (builtin.os.tag == .freestanding) void else std.Io.Threaded,
+    io_impl: if (builtin.os.tag == .freestanding) void else native_platform.Threaded,
     path: []u8,
     lock_file: ?std.Io.File = null,
     read_only: bool = false,
@@ -157,7 +159,7 @@ pub const ContainerStorage = struct {
     }
 
     pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
-        var io_impl = std.Io.Threaded.init(allocator, .{});
+        var io_impl = native_platform.Threaded.init(allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
 
@@ -934,13 +936,13 @@ fn appendFile(io: std.Io, path: []const u8, contents: []const u8, sync: bool) !v
     if (sync) try file.sync(io);
 }
 
-fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+fn testPath(allocator: Allocator, tmp: native_platform.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
 test "aflite container storage persists logical files across reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "app.aflite");
     defer alloc.free(path);
@@ -974,7 +976,7 @@ test "aflite container storage persists logical files across reopen" {
 
 test "aflite container storage supports rename delete tree and atomic writer" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "ops.aflite");
     defer alloc.free(path);
@@ -1006,7 +1008,7 @@ test "aflite container storage supports rename delete tree and atomic writer" {
 
 test "aflite container storage ignores truncated tail record on reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "truncated.aflite");
     defer alloc.free(path);
@@ -1017,7 +1019,7 @@ test "aflite container storage ignores truncated tail record on reopen" {
         try container.storage().writeFileAbsolute("/good", "value");
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try appendFile(io_impl.io(), path, "partial-record", true);
 
@@ -1037,7 +1039,7 @@ test "aflite container storage ignores truncated tail record on reopen" {
 
 test "aflite container read-only open requires existing file and rejects writes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "readonly.aflite");
     defer alloc.free(path);
@@ -1067,7 +1069,7 @@ test "aflite container read-only open requires existing file and rejects writes"
 
 test "aflite container vacuum compacts overwritten records" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "vacuum.aflite");
     defer alloc.free(path);

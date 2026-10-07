@@ -15,7 +15,9 @@
 
 //! Indexed statement-local rows and integer arrays. Window partitions use
 //! bounded row caches; payloads and offset/state directories live on disk.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const spill = @import("spill.zig");
 const operators = @import("operators.zig");
 const Datum = @import("scalar.zig").Datum;
@@ -318,7 +320,7 @@ test "SQL window cell updates preserve wide rows without rewriting input payload
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    var manager: spill.Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
     defer manager.deinit();
     var rows = try Rows.init(a, &manager, 3);
     defer rows.deinit();
@@ -347,7 +349,7 @@ test "SQL window permutations share wide payloads and original-row sidecars" {
     };
     const a = std.testing.allocator;
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    var manager: spill.Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
     defer manager.deinit();
     const text = try a.alloc(u8, 64 * 1024);
     defer a.free(text);
@@ -379,7 +381,7 @@ test "SQL window column blocks skip wide payloads and preserve shared updates" {
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var rows = try Rows.init(std.testing.allocator, &manager, 3);
     defer rows.deinit();
@@ -401,7 +403,7 @@ fn columnAllocationScenario(a: A) !void {
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var rows = try Rows.init(a, &manager, 2);
     defer rows.deinit();

@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const core = @import("../core/mod.zig");
 const clock = @import("clock.zig");
 const group_mod = @import("group.zig");
@@ -344,7 +346,7 @@ const SnapshotBuildResult = union(enum) {
 };
 
 const SnapshotBuildWorker = struct {
-    io_impl: std.Io.Threaded,
+    io_impl: native_platform.Threaded,
     mutex: std.Io.Mutex = .init,
     ready: std.Io.Condition = .init,
     future: ?std.Io.Future(void) = null,
@@ -2409,7 +2411,7 @@ pub const MultiRaft = struct {
         if (self.snapshot_worker) |worker| return worker;
         const worker = try self.alloc.create(SnapshotBuildWorker);
         errdefer self.alloc.destroy(worker);
-        worker.* = .{ .io_impl = std.Io.Threaded.init(self.alloc, .{
+        worker.* = .{ .io_impl = native_platform.Threaded.init(self.alloc, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(1),
         }) };
@@ -3907,7 +3909,7 @@ test "multi raft progress round drains ready work without advancing raft time" {
 
 test "snapshot worker startup failure leaves no task and can be drained" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var worker: SnapshotBuildWorker = .{ .io_impl = std.Io.Threaded.init(std.testing.failing_allocator, .{
+    var worker: SnapshotBuildWorker = .{ .io_impl = native_platform.Threaded.init(std.testing.failing_allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .limited(1),
     }) };

@@ -382,7 +382,7 @@ fn allocationCheck(a: Allocator) !void {
 }
 
 test "resident program compilation plans liveness captures and cleans every allocation failure" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationCheck, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, allocationCheck, .{});
 }
 
 test "resident program compilation rejects unsupported integer conversions instructions and resource limits" {
@@ -487,7 +487,7 @@ test "resident program preserves backend and request controls without GPU dispat
     var request = Probe{};
     const future = std.math.maxInt(u64);
     var base = Control{
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .deadline_ns = future - 2,
         .ptr = &original,
         .check_fn = Probe.checkControl,
@@ -501,7 +501,7 @@ test "resident program preserves backend and request controls without GPU dispat
         .check_fn = Probe.checkControl,
         .cancellation = .{ .ptr = &request, .is_cancelled_fn = Probe.isCancelled },
     };
-    var fake = Fake{ .original = &original, .request = &request, .carrier = &original, .expected_io = std.testing.io, .expected_deadline = future - 2 };
+    var fake = Fake{ .original = &original, .request = &request, .carrier = &original, .expected_io = platform.testing.io, .expected_deadline = future - 2 };
     var vtable: ops.ComputeBackend.VTable = undefined;
     vtable.backendKind = Fake.kind;
     vtable.residentTrainingInstruction = Fake.instruction;
@@ -527,7 +527,7 @@ test "resident program preserves backend and request controls without GPU dispat
 
     // A later invocation supplies a different worker carrier and an earlier
     // deadline. The compiled plan must not retain the previous stack adapter.
-    requested.io = .{ .userdata = &request, .vtable = std.testing.io.vtable };
+    requested.io = .{ .userdata = &request, .vtable = platform.testing.io.vtable };
     requested.hard_cancellation = .{ .ptr = &request, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm };
     requested.deadline_ns = future - 3;
     fake.carrier = &request;

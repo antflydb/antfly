@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const antfly = @import("../lite_cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("cli/io.zig");
@@ -1426,7 +1428,7 @@ test "lite promote parser requires values and derives default backup id" {
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--location", "file:///tmp/backups" };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
         try std.testing.expectEqualStrings("http://localhost:8080", opts.target);
@@ -1438,7 +1440,7 @@ test "lite promote parser requires values and derives default backup id" {
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader", "--backup-id", "explicit-id", "--location", "s3://promotions/app", "--idempotency-key", "promote-app", "--no-wait" };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         var opts = try parsePromoteOptions(allocator, "app.aflite", &args);
         defer opts.deinit(allocator);
         try std.testing.expectEqualStrings("explicit-id", opts.backup_id);
@@ -1449,36 +1451,36 @@ test "lite promote parser requires values and derives default backup id" {
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--connection", "local-reader" };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try std.testing.expectError(error.MissingArgument, parsePromoteOptions(allocator, "app.aflite", &args));
     }
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--location" };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try std.testing.expectError(error.MissingArgument, parsePromoteOptions(allocator, "app.aflite", &args));
     }
 
     {
         const argv = [_][*:0]const u8{ "--target", "http://localhost:8080", "--table", "docs", "--bogus" };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try std.testing.expectError(error.UnknownArgument, parsePromoteOptions(allocator, "app.aflite", &args));
     }
 }
 
 test "lite read file parser accepts explicit readonly flag" {
     const argv = [_][*:0]const u8{ "--readonly", "--file", "query.json" };
-    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var args = native_platform.process.argsIterator(argv[0..]);
     try std.testing.expectEqualStrings("query.json", parseReadFileFlag(&args));
 }
 
 test "lite schema index and enrichment commands round trip catalogs" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1502,7 +1504,7 @@ test "lite schema index and enrichment commands round trip catalogs" {
 
     {
         const argv = [_][*:0]const u8{path_z.ptr};
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try initLite(allocator, io, &args);
     }
 
@@ -1512,12 +1514,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
     try writeFileAtomically(allocator, io, schema_path, schema_json);
     {
         const argv = [_][*:0]const u8{ "set", path_z.ptr, "--file", schema_path_z.ptr };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try schemaCommand(allocator, io, &args);
     }
     {
         const argv = [_][*:0]const u8{ "get", path_z.ptr };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try schemaCommand(allocator, io, &args);
     }
 
@@ -1526,12 +1528,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
     );
     {
         const argv = [_][*:0]const u8{ "create", path_z.ptr, "--file", index_path_z.ptr };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try indexCommand(allocator, io, &args);
     }
     {
         const argv = [_][*:0]const u8{ "list", path_z.ptr };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try indexCommand(allocator, io, &args);
     }
 
@@ -1540,12 +1542,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
     );
     {
         const argv = [_][*:0]const u8{ "create", path_z.ptr, "--file", enrichment_path_z.ptr };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try enrichmentCommand(allocator, io, &args);
     }
     {
         const argv = [_][*:0]const u8{ "list", path_z.ptr };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try enrichmentCommand(allocator, io, &args);
     }
 
@@ -1574,12 +1576,12 @@ test "lite schema index and enrichment commands round trip catalogs" {
 
     {
         const argv = [_][*:0]const u8{ "drop", path_z.ptr, "--index", "cmd_ft_body" };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try indexCommand(allocator, io, &args);
     }
     {
         const argv = [_][*:0]const u8{ "drop", path_z.ptr, "--kind", "chunk", "--name", "cmd_body_chunks" };
-        var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var args = native_platform.process.argsIterator(argv[0..]);
         try enrichmentCommand(allocator, io, &args);
     }
 
@@ -1603,10 +1605,10 @@ test "lite schema index and enrichment commands round trip catalogs" {
 test "lite query readonly runs while writer handle is open" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1639,17 +1641,17 @@ test "lite query readonly runs while writer handle is open" {
     );
 
     const argv = [_][*:0]const u8{ path_z.ptr, "--readonly", "--file", query_path_z.ptr };
-    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var args = native_platform.process.argsIterator(argv[0..]);
     try query(allocator, io, &args);
 }
 
 test "lite init target check treats existing aflite as occupied" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1667,10 +1669,10 @@ test "lite init target check treats existing aflite as occupied" {
 test "lite backup writer handles absolute output paths" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1689,10 +1691,10 @@ test "lite backup writer handles absolute output paths" {
 test "lite backup command exports stable data while writer has open transaction" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1723,7 +1725,7 @@ test "lite backup command exports stable data while writer has open transaction"
     });
 
     const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
-    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var args = native_platform.process.argsIterator(argv[0..]);
     try backup(allocator, io, &args);
 
     try writer.db.abortTransaction(txn_id, 0);
@@ -1749,10 +1751,10 @@ test "lite backup command exports stable data while writer has open transaction"
 test "lite export subcommand dispatches portable backup alias" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1779,7 +1781,7 @@ test "lite export subcommand dispatches portable backup alias" {
     }
 
     const argv = [_][*:0]const u8{ path_z.ptr, "--out", backup_path_z.ptr };
-    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var args = native_platform.process.argsIterator(argv[0..]);
     var init: std.process.Init = undefined;
     init.gpa = allocator;
     init.io = io;
@@ -1802,10 +1804,10 @@ test "lite export subcommand dispatches portable backup alias" {
 test "lite restore source can be an aflite database" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1836,10 +1838,10 @@ test "lite restore source can be an aflite database" {
 test "lite restore target writer lock is held before staging" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1888,10 +1890,10 @@ test "lite restore result json distinguishes portable restore and snapshot copy"
 test "lite check returns an error for invalid aflite files after writing report" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1906,17 +1908,17 @@ test "lite check returns an error for invalid aflite files after writing report"
     const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const argv = [_][*:0]const u8{path_z.ptr};
-    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var args = native_platform.process.argsIterator(argv[0..]);
     try std.testing.expectError(error.LiteCheckFailed, check(allocator, io, &args));
 }
 
 test "lite restore publishes staged aflite from aflite source" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1951,10 +1953,10 @@ test "lite restore publishes staged aflite from aflite source" {
 test "lite backup output restores schema indexes enrichments and documents" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2031,7 +2033,7 @@ test "lite backup output restores schema indexes enrichments and documents" {
     const backup_path_z = try allocator.dupeSentinel(u8, backup_path, 0);
     defer allocator.free(backup_path_z);
     const backup_argv = [_][*:0]const u8{ src_path_z.ptr, "--out", backup_path_z.ptr };
-    var backup_args = @import("antfly_platform").process.argsIterator(backup_argv[0..]);
+    var backup_args = native_platform.process.argsIterator(backup_argv[0..]);
     try backup(allocator, io, &backup_args);
     try std.testing.expect(pathExists(io, backup_path));
 
@@ -2194,10 +2196,10 @@ test "lite backup output restores schema indexes enrichments and documents" {
 test "lite restore replace fails before truncating active writer target" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2237,10 +2239,10 @@ test "lite restore replace fails before truncating active writer target" {
 test "lite import from aflite requires replace for existing target" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2291,10 +2293,10 @@ test "lite import from aflite requires replace for existing target" {
 test "lite restore rejects same existing aflite through different path spelling" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2325,10 +2327,10 @@ test "lite restore rejects same existing aflite through different path spelling"
 test "lite snapshot rejects same existing aflite through different path spelling" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2358,7 +2360,7 @@ test "lite snapshot rejects same existing aflite through different path spelling
 
 test "lite offline portable backup rejects standalone-adopted artifacts" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/adopted-backup.aflite", .{tmp.sub_path});
     defer allocator.free(path);
@@ -2375,7 +2377,7 @@ test "lite offline portable backup rejects standalone-adopted artifacts" {
 
     // Fresh standalone artifacts without an adopted embedded root must also
     // reject the root-only offline archive path.
-    var fresh_tmp = std.testing.tmpDir(.{});
+    var fresh_tmp = native_platform.testing.tmpDir(.{});
     defer fresh_tmp.cleanup();
     const fresh_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/standalone-backup.aflite", .{fresh_tmp.sub_path});
     defer allocator.free(fresh_path);
@@ -2395,10 +2397,10 @@ test "lite offline portable backup rejects standalone-adopted artifacts" {
 test "lite restore malformed backup leaves target untouched" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2471,7 +2473,7 @@ test "lite restore malformed backup leaves target untouched" {
 test "lite status json includes pending work" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/status-pending.aflite", .{tmp.sub_path});
@@ -2541,7 +2543,7 @@ test "lite status json includes pending work" {
 test "lite status rejects internal bridge aflite files" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/status-internal-bridge.aflite", .{tmp.sub_path});
@@ -2555,14 +2557,14 @@ test "lite status rejects internal bridge aflite files" {
     }
 
     var argv = [_][*:0]const u8{path_z.ptr};
-    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
-    try std.testing.expectError(error.TruncatedNativeHeader, status(allocator, std.testing.io, &args));
+    var args = native_platform.process.argsIterator(argv[0..]);
+    try std.testing.expectError(error.TruncatedNativeHeader, status(allocator, native_platform.testing.io, &args));
 }
 
 test "lite writer close syncs unsynced batch before readonly reopen" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/writer-close-sync.aflite", .{tmp.sub_path});
@@ -2592,7 +2594,7 @@ test "lite writer close syncs unsynced batch before readonly reopen" {
 test "lite full text query survives writer close and readonly reopen" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/query-reopen.aflite", .{tmp.sub_path});
@@ -2630,7 +2632,7 @@ test "lite full text query survives writer close and readonly reopen" {
 test "lite compact drains text merges before vacuuming aflite file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/compact-text.aflite", .{tmp.sub_path});
@@ -2672,10 +2674,10 @@ test "lite compact drains text merges before vacuuming aflite file" {
 test "lite snapshot copies stable aflite prefix without source tail" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2729,10 +2731,10 @@ test "lite snapshot copies stable aflite prefix without source tail" {
 test "lite promote stages portable afb and table manifest" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2809,10 +2811,10 @@ test "lite promote stages portable afb and table manifest" {
 test "lite promote helper stages backup then submits normal restore request" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -2837,7 +2839,7 @@ test "lite promote helper stages backup then submits normal restore request" {
     const location_z = try allocator.dupeSentinel(u8, location, 0);
     defer allocator.free(location_z);
     const argv = [_][*:0]const u8{ "--target", "http://restore.test", "--table", "docs", "--connection", "local-reader", "--backup-id", "lite-promote-command", "--location", location_z.ptr };
-    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var args = native_platform.process.argsIterator(argv[0..]);
     var opts = try parsePromoteOptions(allocator, src_path, &args);
     defer opts.deinit(allocator);
 
@@ -2906,7 +2908,7 @@ const TestSecretKeyProvider = struct {
         errdefer alloc.free(id);
         const bytes = try alloc.alloc(u8, 24 + 32 + 16);
         errdefer alloc.free(bytes);
-        try std.Options.debug_io.randomSecure(bytes[0..24]);
+        try native_platform.debug_io.randomSecure(bytes[0..24]);
         var tag: [16]u8 = undefined;
         Aead.encrypt(bytes[24..56], &tag, key, identity.scope, bytes[0..24].*, self.key);
         @memcpy(bytes[56..72], &tag);
@@ -2923,10 +2925,10 @@ const TestSecretKeyProvider = struct {
 
 test "lite import without replace preserves live secrets and deleted scope revisions" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secret-source.aflite", .{tmp.sub_path});
     defer alloc.free(source_path);

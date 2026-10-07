@@ -17,7 +17,9 @@
 //! share one transaction; neither operation grants accepted-result evidence.
 //! Callers must include the worker wakeup in that same transaction. Per-scope
 //! headroom bounds outstanding jobs across generations, not merely one page.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const publication = @import("artifact_publication.zig");
 const dispatch = @import("artifact_unit_dispatch.zig");
 const Digest = publication.Digest;
@@ -770,7 +772,7 @@ test "ordered artifact inventory worker continuation is canonical and scope boun
 
 test "ordered artifact inventory document worker fairly resumes nonempty children and wraps behind inserts" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unit-worker-directory", .{tmp.sub_path});
     defer alloc.free(path);

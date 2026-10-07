@@ -16,7 +16,9 @@
 //! Opt-in end-to-end publication qualification. Artifact counters count calls
 //! at the store boundary, not provider-internal requests. Filesystem manifest,
 //! WAL, lease renewal and fenced HEAD latency are included in wall time.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const a = std.heap.page_allocator;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const store_mod = @import("../artifacts/store.zig");
@@ -41,7 +43,7 @@ test "serverless external metadata retention qualification benchmark" {
     const pinned_schema =
         \\{"base_source":{"kind":"external","table_id":"docs","format":"parquet","uri":"s3://warehouse/docs","snapshot":{"mode":"object_version_digest","digest":"parquet-31"},"schema_fingerprint":"schema-v3","write_policy":"read_only"}}
     ;
-    var runtime = std.Io.Threaded.init(a, .{});
+    var runtime = native_platform.Threaded.init(a, .{});
     defer runtime.deinit();
     for ([_]u64{ 1024, 16384 }) |count| for ([_]bool{ false, true }) |rejected| for (std.enums.values(SelectorCase)) |selector| {
         var source = try metadata.testing.fixtureAlloc(a, count);
@@ -142,14 +144,14 @@ test "serverless external metadata retention qualification benchmark" {
 
 test "serverless pending work index qualification benchmark" {
     if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
-    var runtime = std.Io.Threaded.init(a, .{});
+    var runtime = native_platform.Threaded.init(a, .{});
     defer runtime.deinit();
     for ([_]usize{ 1024, 16384 }) |count| try pendingWorkBenchmark(runtime.io(), count);
 }
 
 test "serverless pending cycle boundary qualification benchmark" {
     if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
-    var runtime = std.Io.Threaded.init(a, .{});
+    var runtime = native_platform.Threaded.init(a, .{});
     defer runtime.deinit();
     for ([_]usize{ 1024, 16384 }) |count| {
         try pendingCycleBoundaryBenchmark(runtime.io(), count, 4);
@@ -391,7 +393,7 @@ const CountingStore = struct {
 
 test "serverless publication qualification benchmark" {
     if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH") == null) return error.SkipZigTest;
-    var runtime = std.Io.Threaded.init(a, .{});
+    var runtime = native_platform.Threaded.init(a, .{});
     defer runtime.deinit();
     const io = runtime.io();
     const selected_count = if (std.c.getenv("ANTFLY_DOCUMENT_FACTS_BENCH_DOCS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 0;
@@ -406,13 +408,13 @@ test "serverless publication qualification benchmark" {
 }
 
 pub fn metadataRepublishRegression() !void {
-    var runtime = std.Io.Threaded.init(a, .{});
+    var runtime = native_platform.Threaded.init(a, .{});
     defer runtime.deinit();
     try run(runtime.io(), 16, 1, true);
 }
 
 fn run(io: std.Io, count: usize, degree: usize, metadata_only: bool) !void {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/publication", .{tmp.sub_path});
     defer a.free(root);

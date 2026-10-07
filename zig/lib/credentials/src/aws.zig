@@ -14,7 +14,9 @@
 // limitations under the License.
 
 //! Native AWS credential discovery and ref-counted cache, independent of model providers.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const cloud_credentials = @import("cloud.zig");
 const httpx = @import("httpx");
@@ -538,7 +540,7 @@ fn credentialsFromSharedFiles(alloc: std.mem.Allocator, filesystem_io: ?std.Io, 
         break :blk try std.fmt.allocPrint(alloc, "{s}/.aws/credentials", .{home});
     };
     defer alloc.free(path);
-    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    var io_impl: ?native_platform.Threaded = if (filesystem_io == null) native_platform.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = filesystem_io orelse io_impl.?.io();
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch return error.MissingAwsCredentials;
@@ -640,7 +642,7 @@ fn webIdentityTokenFileAlloc(
     filesystem_io: ?std.Io,
     path: []const u8,
 ) ![]u8 {
-    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    var io_impl: ?native_platform.Threaded = if (filesystem_io == null) native_platform.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = filesystem_io orelse io_impl.?.io();
     return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(1 << 20)) catch
@@ -734,7 +736,7 @@ fn containerAuthorizationToken(alloc: std.mem.Allocator, filesystem_io: ?std.Io)
 }
 
 fn containerAuthorizationTokenFileAlloc(alloc: std.mem.Allocator, filesystem_io: ?std.Io, token_file: []const u8) ![]u8 {
-    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    var io_impl: ?native_platform.Threaded = if (filesystem_io == null) native_platform.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = filesystem_io orelse io_impl.?.io();
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, token_file, alloc, .limited(1 << 20));
@@ -853,7 +855,7 @@ fn daysFromCivil(year_in: i64, month_in: u8, day_in: u8) i64 {
 }
 
 pub fn currentUnixSeconds() !u64 {
-    return unixSecondsFromTimestamp(std.Io.Timestamp.now(std.Io.Threaded.global_single_threaded.io(), .real));
+    return unixSecondsFromTimestamp(std.Io.Timestamp.now(native_platform.Threaded.global_single_threaded.io(), .real));
 }
 
 pub fn unixSecondsFromTimestamp(timestamp: std.Io.Timestamp) !u64 {
@@ -935,10 +937,10 @@ pub fn testCredentialUrlEncoding() !void {
 
 pub fn testCredentialFilesUseSuppliedFilesystemAuthority() !void {
     const alloc = std.testing.allocator;
-    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    var filesystem_impl = native_platform.Threaded.init(alloc, .{});
     defer filesystem_impl.deinit();
     const filesystem_io = filesystem_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const credentials_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/credentials", .{tmp.sub_path});
@@ -1046,7 +1048,7 @@ test "credential source keys are structured" {
 }
 
 test "credential cache shutdown waits for an in-flight refresh" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var cache = CredentialCache{};
@@ -1062,14 +1064,14 @@ test "credential cache shutdown waits for an in-flight refresh" {
                 const closing = target.closing;
                 target.mutex.unlock(worker_io);
                 if (closing) break;
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             target.finishFailedRefresh(worker_io);
         }
     };
-    var thread = try std.testing.io.concurrent(Worker.run, .{ &cache, io });
+    var thread = try native_platform.testing.io.concurrent(Worker.run, .{ &cache, io });
     cache.deinit(std.testing.allocator);
-    thread.await(std.testing.io);
+    thread.await(native_platform.testing.io);
     try std.testing.expect(cache.closing);
     try std.testing.expect(!cache.refreshing);
     try std.testing.expect(cache.cached == null);
@@ -1082,10 +1084,10 @@ test "AWS credential files use supplied filesystem authority" {
 
 test "AWS credential leases survive source replacement and cache shutdown" {
     const alloc = std.testing.allocator;
-    var threaded = std.Io.Threaded.init(alloc, .{});
+    var threaded = native_platform.Threaded.init(alloc, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/profiles", .{tmp.sub_path});
     defer alloc.free(path);

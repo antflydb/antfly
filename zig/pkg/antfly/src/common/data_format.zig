@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 
 pub const marker_file_name = "ANTFLY_FORMAT";
@@ -181,14 +183,14 @@ fn printLegacyGoDataDirError(data_dir: []const u8) void {
 }
 
 test "ensureCompatible writes marker for new data dir" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
     const data_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
     defer alloc.free(data_dir);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try ensureCompatible(alloc, io_impl.io(), data_dir);
 
@@ -198,7 +200,7 @@ test "ensureCompatible writes marker for new data dir" {
 }
 
 test "ensureCompatible rejects legacy Go store dir" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
@@ -207,7 +209,7 @@ test "ensureCompatible rejects legacy Go store dir" {
     const store_dir = try std.fs.path.join(alloc, &.{ data_dir, "store", "1", "2", "storage" });
     defer alloc.free(store_dir);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), store_dir);
 
@@ -215,21 +217,21 @@ test "ensureCompatible rejects legacy Go store dir" {
 }
 
 test "ensureCompatible accepts existing marker" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
     const data_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
     defer alloc.free(data_dir);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try ensureCompatible(alloc, io_impl.io(), data_dir);
     try ensureCompatible(alloc, io_impl.io(), data_dir);
 }
 
 test "ensureCompatible tolerates concurrent marker creation" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
@@ -248,20 +250,20 @@ test "ensureCompatible tolerates concurrent marker creation" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var workers: [8]Worker = undefined;
     var threads: [8]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
     defer {
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (threads[0..started_tasks]) |*task| task.await(native_platform.testing.io);
     }
     for (&workers, &threads) |*worker, *thread| {
         worker.* = .{ .data_dir = data_dir, .io = io_impl.io() };
-        thread.* = try std.testing.io.concurrent(Worker.run, .{worker});
+        thread.* = try native_platform.testing.io.concurrent(Worker.run, .{worker});
         started_tasks += 1;
     }
-    for (&threads) |*thread| thread.await(std.testing.io);
+    for (&threads) |*thread| thread.await(native_platform.testing.io);
     for (&workers) |worker| {
         if (worker.result) |err| return err;
     }
@@ -272,7 +274,7 @@ test "ensureCompatible tolerates concurrent marker creation" {
 }
 
 test "ensureCompatible rejects newer storage format" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const alloc = std.testing.allocator;
@@ -281,7 +283,7 @@ test "ensureCompatible rejects newer storage format" {
     const marker_path = try std.fs.path.join(alloc, &.{ data_dir, marker_file_name });
     defer alloc.free(marker_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), data_dir);
     {

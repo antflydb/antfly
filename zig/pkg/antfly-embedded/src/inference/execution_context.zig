@@ -20,7 +20,9 @@
 //! concerns separate prevents document producers, embedders, rerankers, and
 //! future task families from independently inventing localhost fallbacks.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
@@ -185,7 +187,7 @@ test "execution context preserves control and resource bounds" {
 test "request context preserves absolute deadlines and cancellation" {
     var cancelled = std.atomic.Value(bool).init(false);
     const context = RequestContext{
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .deadline_ns = null,
         .cancellation = CancellationToken.fromAtomic(&cancelled),
     };

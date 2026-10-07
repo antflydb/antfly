@@ -13,8 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+
+const platform_sync = native_platform.sync;
 const object_storage = @import("antfly_local_sources").storage_object_storage;
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
@@ -784,8 +786,8 @@ test "objectstore-backed catalog store persists table bindings over file uri" {
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() native_platform.Threaded {
+    return native_platform.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

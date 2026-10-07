@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const c_file = @import("../util/c_file.zig");
 const gguf_format = @import("../gguf/format.zig");
@@ -1555,10 +1556,10 @@ fn findPrimaryGgufPath(allocator: std.mem.Allocator, model_dir: []const u8) ![]u
     }
 
     if (!c_file.link_libc) {
-        var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, model_dir, .{ .iterate = true }) catch return error.MissingFunctionGemmaTokens;
-        defer dir.close(std.Options.debug_io);
+        var dir = std.Io.Dir.cwd().openDir(native_platform.debug_io, model_dir, .{ .iterate = true }) catch return error.MissingFunctionGemmaTokens;
+        defer dir.close(native_platform.debug_io);
         var iter = dir.iterate();
-        while (iter.next(std.Options.debug_io) catch null) |entry| {
+        while (iter.next(native_platform.debug_io) catch null) |entry| {
             const name = entry.name;
             if (name.len == 0 or name[0] == '.') continue;
             if (!std.mem.endsWith(u8, name, ".gguf")) continue;

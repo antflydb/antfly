@@ -85,9 +85,9 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     const internal_secret = "hosted-fk-internal-service-secret-v1";
     const trusted_secret = "hosted-fk-trusted-principal-secret-v1";
     const issuer = "hosted-fk-test";
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const meta_root = try std.fmt.allocPrint(alloc, "{s}/metadata", .{root});
     defer alloc.free(meta_root);
@@ -99,7 +99,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     defer alloc.free(data_catalog);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

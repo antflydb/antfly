@@ -18,7 +18,9 @@
 // Wraps the generated OpenAPI client with convenience methods, including the
 // negotiated numeric response that keeps embedding floats out of JSON text.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const api = @import("inference_api");
 const httpx = @import("httpx");
 const numeric = httpx.numeric_response;
@@ -230,7 +232,7 @@ test "decoding a json body keeps no vector when an allocation fails" {
 
 test "embedDense decodes the numeric frame a negotiating server returns" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -263,7 +265,7 @@ test "embedDense decodes the numeric frame a negotiating server returns" {
 
 test "embedDense falls back to the JSON body when the server sends no frame" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -317,7 +319,7 @@ fn runEmbedDense(allocator: std.mem.Allocator, io: std.Io, server: *httpx.TestSe
 
 test "transcribe returns the transcript and owns it after the response is freed" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

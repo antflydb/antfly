@@ -37,7 +37,9 @@
 //! and `tls_key_path` fields in `ServerConfig` are reserved for future
 //! direct TLS support.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const array_list_writer_mod = @import("../util/array_list_writer.zig");
 const arrayListWriter = array_list_writer_mod.arrayListWriter;
@@ -3682,7 +3684,7 @@ fn trailerHeaderNames(allocator: Allocator, headers: *const Headers) ![]u8 {
 
 test "Server initialization" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
 
     try std.testing.expectEqual(@as(u16, 8080), server.config.port);
@@ -3712,7 +3714,7 @@ test "bound handlers keep independent instance context" {
 
     var request = try Request.init(allocator, .GET, "/state");
     defer request.deinit();
-    var ctx = Context.init(allocator, std.testing.io, &request);
+    var ctx = Context.init(allocator, native_platform.testing.io, &request);
     defer ctx.deinit();
     var params: [16]RouteParam = undefined;
 
@@ -3752,7 +3754,7 @@ test "wrapped handlers preserve the supplied handler target" {
 
     var request = try Request.init(allocator, .GET, "/wrapped");
     defer request.deinit();
-    var ctx = Context.init(allocator, std.testing.io, &request);
+    var ctx = Context.init(allocator, native_platform.testing.io, &request);
     defer ctx.deinit();
     var response = try handler.invoke(&ctx);
     defer response.deinit();
@@ -3767,7 +3769,7 @@ test "Context response helpers" {
     var req = try Request.init(allocator, .GET, "/test");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     _ = ctx.status(201);
@@ -3776,7 +3778,7 @@ test "Context response helpers" {
 
 test "Server with config" {
     const allocator = std.testing.allocator;
-    var server = Server.initWithConfig(allocator, std.testing.io, .{
+    var server = Server.initWithConfig(allocator, native_platform.testing.io, .{
         .host = "0.0.0.0",
         .port = 3000,
     });
@@ -3791,7 +3793,7 @@ test "Context query parsing" {
     var req = try Request.init(allocator, .GET, "/search?q=zig&lang=en");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     try std.testing.expectEqualStrings("zig", ctx.query("q").?);
@@ -3805,7 +3807,7 @@ test "Context cookie helpers" {
     defer req.deinit();
     try req.headers.set(HeaderName.COOKIE, "session=abc123; theme=dark");
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     try std.testing.expectEqualStrings("abc123", ctx.cookie("session").?);
@@ -3824,7 +3826,7 @@ test "Context cookie helpers" {
 
 test "Router allowed methods for path" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
 
     const handler = struct {
@@ -3858,7 +3860,7 @@ test "Router allowed methods for path" {
 
 test "Server any() registers all methods" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
 
     const handler = struct {
@@ -3901,7 +3903,7 @@ test "ServerConfig defaults" {
     try std.testing.expectEqual(@as(u32, 1), normalized.accept_error_backoff_initial_ms);
     try std.testing.expectEqual(@as(u32, 1), normalized.accept_error_backoff_max_ms);
 
-    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+    var server = Server.initWithConfig(std.testing.allocator, native_platform.testing.io, .{
         .header_read_timeout_ms = 0,
         .body_read_timeout_ms = 0,
         .response_write_timeout_ms = 0,
@@ -3913,7 +3915,7 @@ test "ServerConfig defaults" {
     try std.testing.expectEqual(@as(u64, 0), server.config.response_write_timeout_ms);
     try std.testing.expectEqual(@as(u64, 0), server.config.keep_alive_timeout_ms);
 
-    var bounded_h2 = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+    var bounded_h2 = Server.initWithConfig(std.testing.allocator, native_platform.testing.io, .{
         .max_connections = 64,
         .max_request_tasks = 8,
         .h2_max_concurrent_streams = 100,
@@ -3971,9 +3973,9 @@ test "HTTP/2 pre-dispatch body admission errors retain client-visible status" {
 
 test "HTTP/2 oversized body before handler claim writes 413" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
-    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    var h2 = H2Connection.initServer(allocator, native_platform.testing.io);
     defer h2.deinit();
     const stream = try h2.stream_manager.getOrCreateStream(1);
     try stream.open();
@@ -3998,7 +4000,7 @@ test "HTTP/2 oversized body before handler claim writes 413" {
     try std.testing.expect(wire.items.len >= 18);
     const headers_len: usize = std.mem.readInt(u24, wire.items[0..3], .big);
     try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire.items[3]);
-    var client = H2Connection.initClient(allocator, std.testing.io);
+    var client = H2Connection.initClient(allocator, native_platform.testing.io);
     defer client.deinit();
     const decoded = try client.decodeFrameHeaders(wire.items[9..][0..headers_len], wire.items[4]);
     defer stream_mod.freeDecodedHeaders(allocator, decoded.headers);
@@ -4024,7 +4026,7 @@ test "HTTP/2 oversized body before handler claim writes 413" {
 }
 
 test "route body limits resolve before transport body admission" {
-    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{ .max_body_size = 1024 });
+    var server = Server.initWithConfig(std.testing.allocator, native_platform.testing.io, .{ .max_body_size = 1024 });
     defer server.deinit();
     const handler = struct {
         fn h(ctx: *Context) !Response {
@@ -4039,7 +4041,7 @@ test "route body limits resolve before transport body admission" {
 }
 
 test "attachment body streaming requires route opt-in and framed content type" {
-    var server = Server.init(std.testing.allocator, std.testing.io);
+    var server = Server.init(std.testing.allocator, native_platform.testing.io);
     defer server.deinit();
     const handler = struct {
         fn h(ctx: *Context) !Response {
@@ -4078,7 +4080,7 @@ test "Context queryDecoded decodes percent escapes exactly once" {
     );
     defer req.deinit();
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const location = (try ctx.queryDecoded("location")).?;
@@ -4095,7 +4097,7 @@ test "Context max_file_size default and override" {
     var req = try Request.init(allocator, .GET, "/");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     // Default should match ServerConfig default.
@@ -4111,7 +4113,7 @@ test "Context file rejects path traversal" {
     var req = try Request.init(allocator, .GET, "/");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     var response = try ctx.file("../etc/passwd");
@@ -4147,7 +4149,7 @@ test "Context.streamH2 returns NotH2 for HTTP/1.1 context" {
     var req = try Request.init(allocator, .GET, "/");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     // h2 fields are null by default (HTTP/1.1 context).
@@ -4157,7 +4159,7 @@ test "Context.streamH2 returns NotH2 for HTTP/1.1 context" {
 test "H2StreamWriter write and close" {
     const allocator = std.testing.allocator;
 
-    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    var h2 = H2Connection.initServer(allocator, native_platform.testing.io);
     defer h2.deinit();
 
     // Create a stream so writeData can find it.
@@ -4210,7 +4212,7 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
     var event = Io.Event.unset;
     var reader = Context.H2StreamReader{
         .h2_stream = &s,
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .data_event = &event,
     };
 
@@ -4237,7 +4239,7 @@ test "H2StreamReader.readAll buffers entire body" {
     var event = Io.Event.unset;
     var reader = Context.H2StreamReader{
         .h2_stream = &s,
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .data_event = &event,
     };
 
@@ -4255,9 +4257,9 @@ test "H2StreamReader body deadline cannot be renewed by trickle data" {
     var event = Io.Event.unset;
     var reader = Context.H2StreamReader{
         .h2_stream = &stream,
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .data_event = &event,
-        .deadline_ms = milliTimestamp(std.testing.io) - 1,
+        .deadline_ms = milliTimestamp(native_platform.testing.io) - 1,
     };
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try reader.read(&byte));
@@ -4277,7 +4279,7 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     State.handled.store(false, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -4291,18 +4293,18 @@ test "H1 body deadline starts after headers and rejects a stalled upload" {
     try server.post("/upload", State.handler);
     try server.bind();
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("deadline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.await(std.testing.io);
+        listener_thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -4341,7 +4343,7 @@ test "H1 opted-in framed route dispatches before the full body arrives" {
     State.started.store(false, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -4364,7 +4366,7 @@ test "H1 opted-in framed route dispatches before the full body arrives" {
     }
     while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -4390,7 +4392,7 @@ test "H1 opted-in framed route dispatches before the full body arrives" {
 }
 
 test "raw streaming routes stream every content type" {
-    var server = Server.init(std.testing.allocator, std.testing.io);
+    var server = Server.init(std.testing.allocator, native_platform.testing.io);
     defer server.deinit();
     const handler = struct {
         fn h(ctx: *Context) !Response {
@@ -4432,7 +4434,7 @@ test "H1 raw streaming route reads a chunked upload while streaming its response
     State.started.store(false, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -4455,7 +4457,7 @@ test "H1 raw streaming route reads a chunked upload while streaming its response
     }
     while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -4518,7 +4520,7 @@ test "H1 raw streaming route delivers large chunked pieces before the terminator
     };
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     // Default disconnect cancellation, as production listeners run it.
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
@@ -4541,7 +4543,7 @@ test "H1 raw streaming route delivers large chunked pieces before the terminator
     }
     while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -4594,7 +4596,7 @@ test "H1 oversized content length returns 413 before handler admission" {
     State.handled.store(0, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -4607,18 +4609,18 @@ test "H1 oversized content length returns 413 before handler admission" {
     try server.post("/upload", State.handler);
     try server.bind();
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("oversized-body listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.await(std.testing.io);
+        listener_thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
 
     // Exercise the first-request parser path. The declared size is rejected
     // from the headers alone, before allocating or invoking the handler.
@@ -4671,7 +4673,7 @@ test "H1 oversized content length returns 413 before handler admission" {
 
 test "HTTP/2 prior-knowledge preface can arrive in separate TCP reads" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -4681,19 +4683,19 @@ test "HTTP/2 prior-knowledge preface can arrive in separate TCP reads" {
     defer server.deinit();
     try server.bind();
 
-    var listener = try std.testing.io.concurrent(struct {
+    var listener = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch {};
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener.await(std.testing.io);
+        listener.await(native_platform.testing.io);
     }
     while (!server.listen_started.load(.acquire))
         try io_impl.io().sleep(.fromMilliseconds(1), .awake);
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -4783,7 +4785,7 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
         }
     };
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(alloc, io_impl.io(), .{ .host = "127.0.0.1", .port = 0, .h1_disconnect_cancellation = .disabled });
     defer server.deinit();
@@ -4791,16 +4793,16 @@ test "HTTP streaming headers and automatic preflight preserve middleware policy"
     try server.get("/stream", State.handler);
     try server.get("/rows", State.handler);
     try server.bind();
-    var thread = try std.testing.io.concurrent(struct {
+    var thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("header test listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        thread.await(std.testing.io);
+        thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     for ([_]bool{ false, true }) |http2| {
         var stream = try State.request(alloc, io_impl.io(), server.boundAddress().?, http2, .GET, "https://allowed.example", "/stream");
         defer stream.deinit();
@@ -4848,7 +4850,7 @@ test "H1 streaming advertises and honors connection retirement" {
         }
     };
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const Case = struct { keep_alive: bool = true, limit: u32 = 0, request_close: bool = false, handler_close: bool = false };
     for ([_]Case{
@@ -4878,7 +4880,7 @@ test "H1 streaming advertises and honors connection retirement" {
             thread.join();
         }
         while (!server.listen_started.load(.acquire)) std.Thread.yield() catch {};
-        var client = try Socket.connect(server.boundAddress().?, std.Io.Threaded.global_single_threaded.io());
+        var client = try Socket.connect(server.boundAddress().?, native_platform.Threaded.global_single_threaded.io());
         defer client.close();
         try client.setRecvTimeout(5_000);
         const count: u32 = if (case.limit > 0) case.limit else 1;
@@ -4916,7 +4918,7 @@ test "H1 handler failure after stream commit closes without a second response" {
     };
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -4927,18 +4929,18 @@ test "H1 handler failure after stream commit closes without a second response" {
     try server.get("/stream", State.handler);
     try server.bind();
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("stream failure listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.await(std.testing.io);
+        listener_thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -4968,7 +4970,7 @@ test "H2StreamReader reports terminal stream errors instead of truncated EOF" {
     var event = Io.Event.unset;
     var reader = Context.H2StreamReader{
         .h2_stream = &s,
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .data_event = &event,
     };
     var buf: [1]u8 = undefined;
@@ -4977,9 +4979,9 @@ test "H2StreamReader reports terminal stream errors instead of truncated EOF" {
 
 test "H2 body admission exhaustion writes retryable 429 before stream reset" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
-    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    var h2 = H2Connection.initServer(allocator, native_platform.testing.io);
     defer h2.deinit();
     const stream = try h2.stream_manager.getOrCreateStream(1);
     try stream.open();
@@ -5003,7 +5005,7 @@ test "H2 body admission exhaustion writes retryable 429 before stream reset" {
     try std.testing.expectEqual(@backingInt(http.Http2FrameType.headers), wire.items[3]);
     try std.testing.expect(wire.items[4] & H2Connection.FLAG_END_HEADERS != 0);
 
-    var client = H2Connection.initClient(allocator, std.testing.io);
+    var client = H2Connection.initClient(allocator, native_platform.testing.io);
     defer client.deinit();
     const decoded = try client.decodeFrameHeaders(wire.items[9..][0..headers_len], wire.items[4]);
     defer stream_mod.freeDecodedHeaders(allocator, decoded.headers);
@@ -5032,7 +5034,7 @@ test "Context.body() returns request.body for HTTP/1.1" {
     const body_content = "request body";
     req.body = body_content;
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const result = try ctx.body();
@@ -5052,11 +5054,11 @@ test "Context.body() buffers from H2StreamReader" {
     var event = Io.Event.unset;
     var body_reader = Context.H2StreamReader{
         .h2_stream = &s,
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .data_event = &event,
     };
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
     ctx.h2_body_reader = &body_reader;
 
@@ -5083,11 +5085,11 @@ test "Context.body() treats unframed H2 EndOfStream as absent body" {
     var event = Io.Event.unset;
     var body_reader = Context.H2StreamReader{
         .h2_stream = &s,
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .data_event = &event,
     };
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
     ctx.h2_body_reader = &body_reader;
 
@@ -5109,11 +5111,11 @@ test "Context.body() preserves H2 EndOfStream when content length promised bytes
     var event = Io.Event.unset;
     var body_reader = Context.H2StreamReader{
         .h2_stream = &s,
-        .io = std.testing.io,
+        .io = native_platform.testing.io,
         .data_event = &event,
     };
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
     ctx.h2_body_reader = &body_reader;
 
@@ -5125,7 +5127,7 @@ test "Context.parseBody() returns null without a body" {
     var req = try Request.init(allocator, .POST, "/");
     defer req.deinit();
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const BodyParser = struct {
@@ -5144,7 +5146,7 @@ test "Context.parseBody() delegates raw bytes to a custom parser" {
     defer req.deinit();
     req.body = "custom payload";
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const Parsed = struct {
@@ -5171,7 +5173,7 @@ test "Context.parseJson() parses through the shared body parser path" {
     defer req.deinit();
     req.body = "{\"name\":\"termite\"}";
 
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const Payload = struct {
@@ -5185,9 +5187,9 @@ test "Context.parseJson() parses through the shared body parser path" {
 
 test "H2 request rejection resets an unprocessed stream and unwinds ownership" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
-    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    var h2 = H2Connection.initServer(allocator, native_platform.testing.io);
     defer h2.deinit();
 
     const stream = try h2.stream_manager.getOrCreateStream(1);
@@ -5244,7 +5246,7 @@ test "h2c applyPeerSettings propagates INITIAL_WINDOW_SIZE and HPACK table size"
     const decoded = try http.decodeH2cSettings(encoded, allocator);
     defer allocator.free(decoded);
 
-    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    var h2 = H2Connection.initServer(allocator, native_platform.testing.io);
     defer h2.deinit();
 
     // applyPeerSettings (not raw applySettingsPayload) applies side effects.
@@ -5265,7 +5267,7 @@ test "handleH2Stream cleanup skips RST_STREAM on already-closed stream" {
     // back (RFC 7540 §5.4.2 violation).
     const allocator = std.testing.allocator;
 
-    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    var h2 = H2Connection.initServer(allocator, native_platform.testing.io);
     defer h2.deinit();
 
     // Create stream 1 and put it in closed state (as if peer sent RST_STREAM).
@@ -5289,23 +5291,23 @@ test "handleH2Stream cleanup skips RST_STREAM on already-closed stream" {
 
 test "H2 handler stream lookups share the receive mutex" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
-    var h2 = H2Connection.initServer(allocator, std.testing.io);
+    var h2 = H2Connection.initServer(allocator, native_platform.testing.io);
     defer h2.deinit();
 
-    h2.write_mutex.lockUncancelable(std.testing.io);
+    h2.write_mutex.lockUncancelable(native_platform.testing.io);
     const stream = try h2.stream_manager.getOrCreateStream(1);
-    h2.write_mutex.unlock(std.testing.io);
+    h2.write_mutex.unlock(native_platform.testing.io);
 
     // The handler snapshot shares the receive loop's map mutex and retains
     // the stable Stream allocation rather than any map storage.
     const handler_stream = Server.getH2Stream(&h2, 1) orelse return error.TestUnexpectedResult;
     try std.testing.expect(handler_stream == stream);
 
-    h2.write_mutex.lockUncancelable(std.testing.io);
+    h2.write_mutex.lockUncancelable(native_platform.testing.io);
     h2.stream_manager.removeStream(1);
-    h2.write_mutex.unlock(std.testing.io);
+    h2.write_mutex.unlock(native_platform.testing.io);
     try std.testing.expect(Server.getH2Stream(&h2, 1) == null);
 }
 
@@ -5354,7 +5356,7 @@ test "H2 response serialization strips connection-specific headers" {
 
 test "shutdown publishes graceful listener-thread work" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
 
     server.running = true;
@@ -5367,7 +5369,7 @@ test "shutdown publishes graceful listener-thread work" {
 
 test "stop publishes synchronized listener-thread shutdown" {
     const allocator = std.testing.allocator;
-    var server = Server.init(allocator, std.testing.io);
+    var server = Server.init(allocator, native_platform.testing.io);
     defer server.deinit();
 
     server.running = true;
@@ -5379,7 +5381,7 @@ test "stop publishes synchronized listener-thread shutdown" {
     // The running flag belongs to an already-started listener and is cleared
     // when that listener observes the stop. Exercise the distinct
     // stop-before-listen race with a server that has not started yet.
-    var not_started = Server.init(allocator, std.testing.io);
+    var not_started = Server.init(allocator, native_platform.testing.io);
     defer not_started.deinit();
     not_started.stop();
 
@@ -5392,7 +5394,7 @@ test "stop publishes synchronized listener-thread shutdown" {
 
 test "requestStop only publishes synchronized listener-thread work" {
     const allocator = std.testing.allocator;
-    var server = Server.initWithConfig(allocator, std.testing.io, .{ .host = "127.0.0.1", .port = 1 });
+    var server = Server.initWithConfig(allocator, native_platform.testing.io, .{ .host = "127.0.0.1", .port = 1 });
     defer server.deinit();
 
     server.running = true;
@@ -5403,7 +5405,7 @@ test "requestStop only publishes synchronized listener-thread work" {
 }
 
 test "listener wake does not dereference a concurrently released lease" {
-    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+    var server = Server.initWithConfig(std.testing.allocator, native_platform.testing.io, .{
         .host = "127.0.0.1",
         .port = 0,
         .max_connections = 1,
@@ -5413,7 +5415,7 @@ test "listener wake does not dereference a concurrently released lease" {
     // Model a stopper that observed listen_started before the listener's
     // deferred lease release. The immutable wake lane remains usable after the
     // lease itself has been cleared.
-    server.listener_wake_io = std.testing.io;
+    server.listener_wake_io = native_platform.testing.io;
     server.listen_started.store(true, .release);
     server.waiting_for_connection_permit.store(true, .release);
     server.http_runtime_lease.release();
@@ -5424,9 +5426,9 @@ test "listener wake does not dereference a concurrently released lease" {
 test "listener bind and wake share the borrowed connection lane" {
     if (builtin.os.tag == .freestanding) return;
 
-    var listener_io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    var listener_io_impl = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
     defer listener_io_impl.deinit();
-    var connection_io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    var connection_io_impl = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
     defer connection_io_impl.deinit();
     var runtime = HttpRuntime.init(std.testing.allocator, .{
         .max_active_h1_requests = 0,
@@ -5452,7 +5454,7 @@ test "listener bind and wake share the borrowed connection lane" {
 }
 
 test "repeated stop requests do not inflate connection admission permits" {
-    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+    var server = Server.initWithConfig(std.testing.allocator, native_platform.testing.io, .{
         .host = "127.0.0.1",
         .port = 1,
         .max_connections = 3,
@@ -5477,9 +5479,9 @@ test "listener cancellation exits without accept error or retry" {
         }
     };
     Fake.calls = 0;
-    var vtable = std.testing.io.vtable.*;
+    var vtable = native_platform.testing.io.vtable.*;
     vtable.netAccept = Fake.accept;
-    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const io: Io = .{ .userdata = native_platform.testing.io.userdata, .vtable = &vtable };
     var server = Server.initWithConfig(std.testing.allocator, io, .{
         .host = "127.0.0.1",
         .port = 0,
@@ -5496,7 +5498,7 @@ test "listener cancellation exits without accept error or retry" {
 }
 
 test "accept backoff is normalized and bounded" {
-    var server = Server.initWithConfig(std.testing.allocator, std.testing.io, .{
+    var server = Server.initWithConfig(std.testing.allocator, native_platform.testing.io, .{
         .accept_error_backoff_initial_ms = 0,
         .accept_error_backoff_max_ms = 0,
     });
@@ -5534,21 +5536,21 @@ test "accept backoff is normalized and bounded" {
 
 test "cross-thread stop wakes an ephemeral listener" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
     defer server.deinit();
     try server.bind();
     try std.testing.expect(server.wake_port.load(.acquire) != 0);
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("ephemeral listener failed: {}", .{err});
         }
     }.run, .{&server});
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     server.stop();
-    listener_thread.await(std.testing.io);
+    listener_thread.await(native_platform.testing.io);
     try std.testing.expect(!server.running);
 }
 
@@ -5556,7 +5558,7 @@ test "multiple listeners share one HTTP runtime lifecycle" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var http_runtime = HttpRuntime.init(allocator, .{ .max_active_h1_requests = 8 });
     defer http_runtime.deinit();
@@ -5576,32 +5578,32 @@ test "multiple listeners share one HTTP runtime lifecycle" {
     });
     defer second.deinit();
 
-    var first_thread = try std.testing.io.concurrent(struct {
+    var first_thread = try native_platform.testing.io.concurrent(struct {
         fn run(server: *Server) void {
             server.listen() catch |err| std.debug.panic("first shared-runtime listener failed: {}", .{err});
         }
     }.run, .{&first});
     defer {
         first.stop();
-        first_thread.await(std.testing.io);
+        first_thread.await(native_platform.testing.io);
     }
-    var second_thread = try std.testing.io.concurrent(struct {
+    var second_thread = try native_platform.testing.io.concurrent(struct {
         fn run(server: *Server) void {
             server.listen() catch |err| std.debug.panic("second shared-runtime listener failed: {}", .{err});
         }
     }.run, .{&second});
     defer {
         second.stop();
-        second_thread.await(std.testing.io);
+        second_thread.await(native_platform.testing.io);
     }
     while (!first.listen_started.load(.acquire) or !second.listen_started.load(.acquire))
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     try std.testing.expectEqual(@as(usize, 2), http_runtime.stats().active_listener_leases);
     first.stop();
     second.stop();
-    first_thread.await(std.testing.io);
-    second_thread.await(std.testing.io);
+    first_thread.await(native_platform.testing.io);
+    second_thread.await(native_platform.testing.io);
     try std.testing.expectEqual(@as(usize, 0), http_runtime.stats().active_listener_leases);
 }
 
@@ -5609,7 +5611,7 @@ test "shared HTTP runtime preserves each listener request reservation" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var http_runtime = HttpRuntime.init(allocator, .{
         .max_active_h1_requests = 0,
@@ -5656,7 +5658,7 @@ test "bind establishes HTTP runtime ownership before publishing an address" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var http_runtime = HttpRuntime.init(allocator, .{ .max_active_h1_requests = 1 });
     defer http_runtime.deinit();
@@ -5680,7 +5682,7 @@ test "bind establishes HTTP runtime ownership before publishing an address" {
 
 test "bind rejects a connection limit larger than shared HTTP runtime capacity" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var http_runtime = HttpRuntime.init(allocator, .{
         .max_active_h1_requests = 2,
@@ -5703,7 +5705,7 @@ test "bounded control listener serves without H1 observer capacity" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var http_runtime = HttpRuntime.init(allocator, .{ .max_active_h1_requests = 0 });
     defer http_runtime.deinit();
@@ -5723,18 +5725,18 @@ test "bounded control listener serves without H1 observer capacity" {
     }.handle);
     try server.bind();
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("control listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.await(std.testing.io);
+        listener_thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -5747,7 +5749,7 @@ test "bounded control listener serves without H1 observer capacity" {
 
 test "listener task binds synchronously and joins before executor teardown" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
     defer server.deinit();
@@ -5770,21 +5772,21 @@ test "HTTP runtime tasks do not consume the nested-operation executor" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(1) });
+    var io_impl = native_platform.Threaded.init(allocator, .{ .concurrent_limit = .limited(1) });
     defer io_impl.deinit();
     var application_task_started = std.atomic.Value(bool).init(false);
     var release_application_task = std.atomic.Value(bool).init(false);
     var application_task = try io_impl.io().concurrent(struct {
         fn run(started: *std.atomic.Value(bool), release: *const std.atomic.Value(bool)) void {
             started.store(true, .release);
-            while (!release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!release.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }.run, .{ &application_task_started, &release_application_task });
     defer {
         release_application_task.store(true, .release);
         application_task.await(io_impl.io());
     }
-    while (!application_task_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!application_task_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -5805,9 +5807,9 @@ test "HTTP runtime tasks do not consume the nested-operation executor" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -5829,7 +5831,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
         fn handler(ctx: *Context) anyerror!Response {
             _ = handler_calls.fetchAdd(1, .acq_rel);
             first_started.store(true, .release);
-            while (!release_first.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!release_first.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             return ctx.text("complete");
         }
     };
@@ -5838,7 +5840,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
     State.release_first.store(false, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -5864,7 +5866,7 @@ test "HTTP/1 and h2c request saturation reject before application work" {
     // implementation races reads against a deadline, so the process-global
     // single-threaded backend is deliberately the wrong fixture here and can
     // turn a valid rejection response into a timeout EOF after other tests.
-    var client_io_impl = std.Io.Threaded.init(allocator, .{});
+    var client_io_impl = native_platform.Threaded.init(allocator, .{});
     defer client_io_impl.deinit();
     const client_io = client_io_impl.io();
     var first_client = try Socket.connect(server.boundAddress().?, client_io);
@@ -5917,7 +5919,7 @@ test "canceled route is a response-free terminal transport outcome" {
     if (builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -5938,9 +5940,9 @@ test "canceled route is a response-free terminal transport outcome" {
         task.requestStop();
         task.join() catch {};
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -5952,7 +5954,7 @@ test "canceled route is a response-free terminal transport outcome" {
 
 test "listener task remains valid after its owning handle moves" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
     defer server.deinit();
@@ -5973,7 +5975,7 @@ test "listener task remains valid after its owning handle moves" {
 
 test "reuse address preserves exclusive live listener ownership" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -5997,7 +5999,7 @@ test "reuse address preserves exclusive live listener ownership" {
 
 test "reuse address permits an immediate listener restart" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6027,7 +6029,7 @@ test "reuse address permits an immediate listener restart" {
 
 test "ephemeral listeners remain independently bindable" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6045,7 +6047,7 @@ test "reuse port is an explicit live listener opt in" {
         builtin.os.tag == .freestanding or !@hasDecl(posix.SO, "REUSEPORT")) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6070,28 +6072,28 @@ test "reuse port is an explicit live listener opt in" {
 
 test "cross-thread graceful shutdown is listener-owned" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
     defer server.deinit();
     try server.bind();
     const address = server.boundAddress().?;
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("graceful listener failed: {}", .{err});
         }
     }.run, .{&server});
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     // An idle keep-alive connection is not an active request and must not
     // consume the graceful request deadline.
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
     defer client.close();
-    while (server.active_connections.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (server.active_connections.load(.acquire) == 0) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const started = Io.Clock.awake.now(client_io).nanoseconds;
     server.shutdown(5000);
-    listener_thread.await(std.testing.io);
+    listener_thread.await(native_platform.testing.io);
     const elapsed = Io.Clock.awake.now(client_io).nanoseconds - started;
     try std.testing.expect(!server.running);
     try std.testing.expectEqual(@as(usize, 0), server.active_connections.load(.acquire));
@@ -6118,7 +6120,7 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     State.second_handled.store(false, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -6130,18 +6132,18 @@ test "H1 context preserves buffered pipeline input across client SHUT_WR" {
     try server.bind();
     const address = server.boundAddress().?;
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("pipeline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.await(std.testing.io);
+        listener_thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -6198,14 +6200,14 @@ fn testH1ClientCancellation(cancel_parent_task: bool) !void {
     State.canceled.store(false, .release);
     State.release.store(false, .release);
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var server = Server.initWithConfig(alloc, io, .{ .host = "127.0.0.1", .port = 0 });
     defer server.deinit();
     try server.post("/rerank", State.handler);
     try server.bind();
-    var listener = try std.testing.io.concurrent(struct {
+    var listener = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch {};
         }
@@ -6213,7 +6215,7 @@ fn testH1ClientCancellation(cancel_parent_task: bool) !void {
     defer {
         State.release.store(true, .release);
         server.stop();
-        listener.await(std.testing.io);
+        listener.await(native_platform.testing.io);
     }
     while (!server.listen_started.load(.acquire)) try io.sleep(.fromMilliseconds(1), .awake);
     const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}/rerank", .{server.boundAddress().?.getPort()});
@@ -6261,7 +6263,7 @@ test "H1 orderly half close does not cancel an active response" {
     State.canceled.store(true, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -6271,18 +6273,18 @@ test "H1 orderly half close does not cancel an active response" {
     try server.get("/slow", State.handler);
     try server.bind();
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("half-close listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.await(std.testing.io);
+        listener_thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -6320,7 +6322,7 @@ test "H1 hard disconnect remains observable behind pipelined input" {
     State.canceled.store(false, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -6330,31 +6332,31 @@ test "H1 hard disconnect remains observable behind pipelined input" {
     try server.get("/slow", State.handler);
     try server.bind();
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("hard-disconnect listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.await(std.testing.io);
+        listener_thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(server.boundAddress().?, client_io);
     var client_open = true;
     defer if (client_open) client.close();
     try client.sendAll("GET /slow HTTP/1.1\r\nHost: test\r\n\r\n");
-    while (!State.started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-    while (server.httpRuntimeStats().active_h1_cancellation_observers != 1) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!State.started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (server.httpRuntimeStats().active_h1_cancellation_observers != 1) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     // Leave a partial next request unread while the active handler owns the
     // connection, then abort. Readability must be suppressed without dropping
     // the descriptor's hard-error observation.
     try client.sendAll("G");
-    var observation_delay = std.posix.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
-    _ = std.posix.system.nanosleep(&observation_delay, &observation_delay);
+    var observation_delay = native_platform.c.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
+    _ = native_platform.c.nanosleep(&observation_delay, &observation_delay);
     var linger = std.posix.linger{ .onoff = 1, .linger = 0 };
     try std.posix.setsockopt(
         client.handle,
@@ -6367,8 +6369,8 @@ test "H1 hard disconnect remains observable behind pipelined input" {
 
     for (0..10_000) |_| {
         if (State.canceled.load(.acquire) and server.httpRuntimeStats().active_h1_cancellation_observers == 0) break;
-        var delay = std.posix.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = std.posix.system.nanosleep(&delay, &delay);
+        var delay = native_platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = native_platform.c.nanosleep(&delay, &delay);
     }
     try std.testing.expect(State.canceled.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), server.httpRuntimeStats().active_h1_cancellation_observers);
@@ -6389,7 +6391,7 @@ test "H1 context does not treat a partial pipeline suffix as buffered input" {
     State.first_saw_buffered_input.store(true, .release);
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{
         .host = "127.0.0.1",
@@ -6400,18 +6402,18 @@ test "H1 context does not treat a partial pipeline suffix as buffered input" {
     try server.bind();
     const address = server.boundAddress().?;
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("partial-pipeline listener failed: {}", .{err});
         }
     }.run, .{&server});
     defer {
         server.stop();
-        listener_thread.await(std.testing.io);
+        listener_thread.await(native_platform.testing.io);
     }
-    while (!server.listen_started.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!server.listen_started.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
-    const client_io = std.Io.Threaded.global_single_threaded.io();
+    const client_io = native_platform.Threaded.global_single_threaded.io();
     var client = try Socket.connect(address, client_io);
     defer client.close();
     try client.setRecvTimeout(5_000);
@@ -6430,7 +6432,7 @@ test "H1 context does not treat a partial pipeline suffix as buffered input" {
 test "connection interruption preserves the fiber-owned descriptor" {
     if (builtin.os.tag == .windows) return;
 
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try TcpListener.init(listen_addr, io);
     defer listener.deinit();
@@ -6453,7 +6455,7 @@ test "connection interruption preserves the fiber-owned descriptor" {
 
 test "immediate stop preempts graceful request drain" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var server = Server.initWithConfig(allocator, io_impl.io(), .{ .host = "127.0.0.1", .port = 0 });
     defer server.deinit();
@@ -6461,16 +6463,16 @@ test "immediate stop preempts graceful request drain" {
     server.active_requests.store(1, .release);
     server.shutdown(10_000);
 
-    var listener_thread = try std.testing.io.concurrent(struct {
+    var listener_thread = try native_platform.testing.io.concurrent(struct {
         fn run(s: *Server) void {
             s.listen() catch |err| std.debug.panic("draining listener failed: {}", .{err});
         }
     }.run, .{&server});
-    const caller_io = std.Io.Threaded.global_single_threaded.io();
+    const caller_io = native_platform.Threaded.global_single_threaded.io();
     caller_io.sleep(Io.Duration.fromMilliseconds(20), .awake) catch {};
     const started = Io.Clock.awake.now(caller_io).nanoseconds;
     server.stop();
-    listener_thread.await(std.testing.io);
+    listener_thread.await(native_platform.testing.io);
     const elapsed = Io.Clock.awake.now(caller_io).nanoseconds - started;
     server.active_requests.store(0, .release);
     try std.testing.expect(elapsed < std.time.ns_per_s);
@@ -6568,7 +6570,7 @@ test "SSE rejects CR in id field" {
     const allocator = std.testing.allocator;
     var req = try Request.init(allocator, .GET, "/sse");
     defer req.deinit();
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const events = [_]SseEvent{.{ .data = "data", .id = "bad\rid", .event = null, .retry_ms = null }};
@@ -6580,7 +6582,7 @@ test "SSE rejects LF in event field" {
     const allocator = std.testing.allocator;
     var req = try Request.init(allocator, .GET, "/sse");
     defer req.deinit();
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const events = [_]SseEvent{.{ .data = "data", .id = null, .event = "bad\nevent", .retry_ms = null }};
@@ -6592,7 +6594,7 @@ test "setCookie rejects CR/LF in name" {
     const allocator = std.testing.allocator;
     var req = try Request.init(allocator, .GET, "/");
     defer req.deinit();
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const result = ctx.setCookie("bad\rname", "value", .{});
@@ -6603,7 +6605,7 @@ test "setCookie rejects CR/LF in value" {
     const allocator = std.testing.allocator;
     var req = try Request.init(allocator, .GET, "/");
     defer req.deinit();
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const result = ctx.setCookie("name", "bad\nvalue", .{});
@@ -6614,7 +6616,7 @@ test "removeCookie rejects CR/LF in name" {
     const allocator = std.testing.allocator;
     var req = try Request.init(allocator, .GET, "/");
     defer req.deinit();
-    var ctx = Context.init(allocator, std.testing.io, &req);
+    var ctx = Context.init(allocator, native_platform.testing.io, &req);
     defer ctx.deinit();
 
     const result = ctx.removeCookie("bad\nname", .{});

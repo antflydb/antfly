@@ -30,7 +30,9 @@
 // We report wall-clock ns/call for both, the speedup ratio, and a checksum
 // so the optimizer can't notice the result is unused and elide the call.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const activations = @import("../backends/activations.zig");
 const native_backend = @import("../backends/native.zig");
 const native_compute = @import("../ops/native_compute.zig");
@@ -596,8 +598,8 @@ fn printQuantLinearPhaseRow(label: []const u8, stats: native_compute.NativeQuant
 }
 
 fn nowNs() u64 {
-    var timespec: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec))) {
+    var timespec: native_platform.c.timespec = undefined;
+    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &timespec))) {
         .SUCCESS => return @intCast(@as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec),
         else => return 0,
     }

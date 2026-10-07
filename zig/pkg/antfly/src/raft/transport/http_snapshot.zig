@@ -13,10 +13,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const raft_engine = @import("raft_engine");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 const common_http = @import("../../common/http/mod.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
@@ -100,7 +102,7 @@ const MappedFetchOwner = struct {
 
     fn release(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        std.posix.munmap(self.mapped);
+        native_platform.filesystem.unmapMemory(self.mapped);
         self.staging_budget.release(self.reserved_bytes);
         self.staging_budget.releaseRef();
         const alloc = self.alloc;
@@ -350,10 +352,10 @@ pub const HttpSnapshotTransport = struct {
     executor: common.RequestExecutor,
     resolver: ?SnapshotTargetResolver = null,
     artifact_io: std.Io,
-    owned_artifact_io: ?*std.Io.Threaded = null,
+    owned_artifact_io: ?*native_platform.Threaded = null,
     staging_budget: *SnapshotStagingBudget,
     // Dedicated capacity keeps Raft senders independent of request/artifact fan-out.
-    sender_io: ?std.Io.Threaded = null,
+    sender_io: ?native_platform.Threaded = null,
     send_workers: []std.Io.Future(void) = &.{},
     send_mutex: std.Io.Mutex = .init,
     send_ready: std.Io.Condition = .init,
@@ -377,7 +379,7 @@ pub const HttpSnapshotTransport = struct {
         resolver: ?SnapshotTargetResolver,
     ) !HttpSnapshotTransport {
         try validateConfig(cfg);
-        const io_impl = try alloc.create(std.Io.Threaded);
+        const io_impl = try alloc.create(native_platform.Threaded);
         errdefer alloc.destroy(io_impl);
         io_impl.* = threaded_io_limits.initService(alloc);
         errdefer io_impl.deinit();
@@ -539,7 +541,7 @@ pub const HttpSnapshotTransport = struct {
         }
         @memset(self.send_active_jobs, null);
         self.send_workers = try self.alloc.alloc(std.Io.Future(void), worker_count);
-        if (self.cfg.sender_io == null) self.sender_io = std.Io.Threaded.init(self.alloc, .{
+        if (self.cfg.sender_io == null) self.sender_io = native_platform.Threaded.init(self.alloc, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(worker_count),
         });
@@ -1832,8 +1834,8 @@ pub const HttpSnapshotTransport = struct {
                 staging.handle,
                 0,
             );
-            errdefer std.posix.munmap(mapped);
-            std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
+            errdefer native_platform.filesystem.unmapMemory(mapped);
+            native_platform.filesystem.adviseMemory(mapped.ptr, mapped.len, native_platform.c.MADV.SEQUENTIAL) catch {};
             staging.close(file_io);
             staging_open = false;
             // POSIX keeps the verified inode alive through the mapping. Finish
@@ -2493,11 +2495,11 @@ test "async snapshot sender shutdown waits for admission reservations" {
         }
     };
     var stop_context = StopContext{ .transport = &transport };
-    var stop_future = try std.testing.io.concurrent(StopContext.run, .{&stop_context});
+    var stop_future = try native_platform.testing.io.concurrent(StopContext.run, .{&stop_context});
     var reservation_released = false;
     defer {
         if (!reservation_released) transport.releaseSubmissionReservation(2, 1, false);
-        stop_future.await(std.testing.io);
+        stop_future.await(native_platform.testing.io);
     }
 
     transport.send_mutex.lockUncancelable(transport.artifact_io);
@@ -2507,7 +2509,7 @@ test "async snapshot sender shutdown waits for admission reservations" {
     try std.testing.expect(!stop_context.returned.load(.acquire));
     transport.releaseSubmissionReservation(2, 1, false);
     reservation_released = true;
-    stop_future.await(std.testing.io);
+    stop_future.await(native_platform.testing.io);
     try std.testing.expect(stop_context.returned.load(.acquire));
     try std.testing.expectEqual(HttpSnapshotTransport.SenderState.stopped, transport.send_state);
 }
@@ -2549,11 +2551,11 @@ test "transient capability failure does not silently downgrade snapshot publicat
 
 test "snapshot transport scavenges only private crash artifacts" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/snapshot-scavenge", .{tmp.sub_path});
     defer alloc.free(root_dir);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, root_dir);
@@ -2997,8 +2999,8 @@ test "v2 fetch uses bounded parallel artifact-backed transfer" {
                 self.observePeak(active);
                 // Hold the first requests briefly so the test proves actual
                 // overlap instead of merely observing multiple worker threads.
-                if (active >= 4) self.first_wave_ready.set(std.testing.io);
-                try self.first_wave_ready.waitTimeout(std.testing.io, .{
+                if (active >= 4) self.first_wave_ready.set(native_platform.testing.io);
+                try self.first_wave_ready.waitTimeout(native_platform.testing.io, .{
                     .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
                 });
                 const offset = try std.fmt.parseUnsigned(usize, req.header("x-antfly-raft-snapshot-offset") orelse return error.MissingOffset, 10);
@@ -3036,7 +3038,7 @@ test "v2 fetch uses bounded parallel artifact-backed transfer" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-fetch", .{tmp.sub_path});
     defer std.testing.allocator.free(root_dir);
@@ -3492,7 +3494,7 @@ test "async snapshot sender rolls back partial startup and can restart without s
             .supports_concurrent_requests = UnusedExecutor.supportsConcurrent,
         },
     };
-    var shared = std.Io.Threaded.init(std.testing.allocator, .{
+    var shared = native_platform.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
@@ -3557,7 +3559,7 @@ test "http snapshot sender borrows capacity and restarts after refused partial s
                 .root_dir = "/tmp",
                 .sender_io = io,
                 .async_send_worker_count = 4,
-            }, .{ .ptr = undefined, .vtable = &.{ .execute = Unused.execute, .supports_concurrent_requests = Unused.supportsConcurrent } }, null, std.testing.io);
+            }, .{ .ptr = undefined, .vtable = &.{ .execute = Unused.execute, .supports_concurrent_requests = Unused.supportsConcurrent } }, null, native_platform.testing.io);
             defer transport.deinit();
             try std.testing.expectError(error.ConcurrencyUnavailable, transport.startAsyncSender());
             try std.testing.expectEqual(refuse_after, lane.admitted);

@@ -18,7 +18,9 @@
 //! This module owns revision-3 compatibility and the revision-4 indexed `.aflite`
 //! format, checkpoint publication, ownership retirement, and physical page reuse.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
 const antfly_platform = @import("antfly_platform");
@@ -33,11 +35,11 @@ const Allocator = std.mem.Allocator;
 
 test "lite allocator v4 small checkpoints bound counter and queue boundary growth" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "small-checkpoint-boundaries.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     file.reserve_retirement_capacity = true;
     var pages = try file.pageAllocatorFromFreeMap(file.activeCheckpoint());
@@ -70,18 +72,18 @@ test "lite allocator v4 owner checkpoints bound metadata work across reopen and 
     const CancelWrite = struct {
         var token: ?*maintenance.CancelToken = null;
         fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
-            const written = try std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            const written = try native_platform.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
             if (token) |cancel| cancel.request();
             return written;
         }
     };
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "incremental-owner-checkpoint.aflite");
     defer a.free(path);
     {
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
         defer file.close();
         file.reserve_retirement_capacity = true;
         var pages = try file.pageAllocatorFromFreeMap(file.activeCheckpoint());
@@ -102,19 +104,19 @@ test "lite allocator v4 owner checkpoints bound metadata work across reopen and 
         // of the twenty-page counter table that remains to be snapshotted.
         try std.testing.expect(file.test_page_writes.load(.monotonic) - writes < 16);
     }
-    var vtable = std.testing.io.vtable.*;
+    var vtable = native_platform.testing.io.vtable.*;
     vtable.fileWritePositional = CancelWrite.write;
-    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const io = std.Io{ .userdata = native_platform.testing.io.userdata, .vtable = &vtable };
     var file = try NativeFile.openWithIo(a, io, path, .{ .no_sync = true });
     defer file.close();
     file.reserve_retirement_capacity = true;
     const before = file.activeCheckpoint();
-    const bytes = (try file.file.stat(std.testing.io)).size;
+    const bytes = (try file.file.stat(native_platform.testing.io)).size;
     var cancel = maintenance.CancelToken{};
     cancel.request();
     try std.testing.expectError(error.MaintenanceCanceled, file.reclaimPagesWithCancel(1, &cancel));
     try std.testing.expectEqualDeep(before, file.activeCheckpoint());
-    try std.testing.expectEqual(bytes, (try file.file.stat(std.testing.io)).size);
+    try std.testing.expectEqual(bytes, (try file.file.stat(native_platform.testing.io)).size);
     cancel.requested.store(false, .release);
     CancelWrite.token = &cancel;
     defer CancelWrite.token = null;
@@ -172,11 +174,11 @@ pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reclamation-catalog-scan.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     for (0..512) |revision| {
         var value: [32]u8 = undefined;
@@ -199,11 +201,11 @@ test "lite reclamation catalog snapshots visit live indexes rather than history"
 }
 test "lite allocator v4 overwrite reuses pages across reopen" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "allocator-v4.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true });
     defer file.close();
     const value = try a.alloc(u8, 16384);
     defer a.free(value);
@@ -222,7 +224,7 @@ test "lite allocator v4 overwrite reuses pages across reopen" {
     defer a.free(got);
     try std.testing.expectEqualSlices(u8, value, got);
     file.close();
-    file = try NativeFile.openWithIo(a, std.testing.io, path, .{});
+    file = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{});
     for (0..20) |_| try file.putDocument("doc", value);
     const reopened = (try file.getDocumentAlloc(a, "doc")).?;
     defer a.free(reopened);
@@ -230,11 +232,11 @@ test "lite allocator v4 overwrite reuses pages across reopen" {
 }
 test "lite allocator v4 long keys shared values incremental deletion and vacuum" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reuse-shared.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     var key: [1024]u8 = @splat('k');
     const value: [32768]u8 = @splat('v');
@@ -272,14 +274,14 @@ test "lite allocator v4 long keys shared values incremental deletion and vacuum"
 
 test "lite allocator v4 external readers and deferred durability fence reuse" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reuse-fences.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true });
     defer file.close();
     try file.putDocument("doc", "durable");
-    var external = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    var external = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .read_only = true });
     var external_open = true;
     defer if (external_open) external.close();
     for (0..40) |_| try file.putDocument("doc", "new");
@@ -297,7 +299,7 @@ test "lite allocator v4 external readers and deferred durability fence reuse" {
         try file.commitTransactionWithDurability(false);
     }
     try std.testing.expect(file.durable_header != null);
-    var pinned: NativeFile = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    var pinned: NativeFile = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .read_only = true });
     defer pinned.close();
     try std.testing.expectEqual(durable.checkpoints[durable.active_checkpoint].commit_sequence, pinned.activeCheckpoint().commit_sequence);
     const persisted = (try pinned.getDocumentAlloc(a, "doc")).?;
@@ -309,11 +311,11 @@ test "lite allocator v4 external readers and deferred durability fence reuse" {
 
 test "lite allocator v4 rollback and recovery retain the fallback root" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reuse-recovery.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     for (0..100) |_| try file.putDocument("doc", "stable");
     const checkpoint = file.activeCheckpoint();
@@ -328,7 +330,7 @@ test "lite allocator v4 rollback and recovery retain the fallback root" {
     var bad: [4]u8 = @splat(0);
     try file.file.writePositionalAll(file.runtimeIo(), &bad, damaged);
     file.close();
-    file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    file = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     const recovered = (try file.getDocumentAlloc(a, "doc")).?;
     defer a.free(recovered);
     try std.testing.expectEqualStrings("stable", recovered);
@@ -338,11 +340,11 @@ test "lite allocator v4 rollback and recovery retain the fallback root" {
 
 test "lite allocator v4 rejects a durable free bit for a live page" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reuse-corruption.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     try file.putDocument("doc", "safe");
     var checkpoint = file.activeCheckpoint();
@@ -365,11 +367,11 @@ test "lite allocator v4 allocation failures release every private owner" {
     const Runner = struct {
         fn run(a: Allocator) !void {
             const backing = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = native_platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try testPath(backing, tmp, "reuse-allocation-failures.aflite");
             defer backing.free(path);
-            var file = try NativeFile.createWithIo(backing, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+            var file = try NativeFile.createWithIo(backing, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
             file.invalidateLedger();
             file.page_cache.clear(backing);
             file.page_cache_enabled.store(false, .monotonic);
@@ -394,11 +396,11 @@ test "lite allocator v4 allocation failures release every private owner" {
 
 test "lite allocator v4 large deletes enqueue bounded foreground work" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reuse-large-delete.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     const value = try a.alloc(u8, 4 * 1024 * 1024);
     defer a.free(value);
@@ -1828,7 +1830,7 @@ pub const OpenOptions = struct {
 };
 
 pub const PathWriterLock = struct {
-    io_impl: std.Io.Threaded,
+    io_impl: native_platform.Threaded,
     borrowed_io: ?std.Io = null,
     file: std.Io.File,
 
@@ -2477,7 +2479,7 @@ pub const NativeFile = struct {
     /// constructors leave it undefined and retain `borrowed_io` instead. This
     /// keeps the production convenience API while making the complete Lite
     /// file lifecycle executable by deterministic std.Io implementations.
-    io_impl: std.Io.Threaded,
+    io_impl: native_platform.Threaded,
     borrowed_io: ?std.Io = null,
     path: []u8,
     file: std.Io.File,
@@ -2538,15 +2540,15 @@ pub const NativeFile = struct {
     free_pages_verified: bool = false,
     // Structural scaling assertions count page operations, independent of
     // filesystem speed and cache warmth. No counters exist in production.
-    test_value_read_bytes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_value_read_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_value_read_bytes: if (builtin.is_test) native_platform.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_value_read_calls: if (builtin.is_test) native_platform.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_cancel_on_read: if (builtin.is_test) ?*maintenance.CancelToken else void = if (builtin.is_test) null else {},
-    test_page_reads: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_index_view_hits: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_index_comparisons: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
-    test_page_writes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_page_reads: if (builtin.is_test) native_platform.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_index_view_hits: if (builtin.is_test) native_platform.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_index_comparisons: if (builtin.is_test) native_platform.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_page_writes: if (builtin.is_test) native_platform.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
 
-    test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_page_write_calls: if (builtin.is_test) native_platform.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
 
     pub fn open(allocator: Allocator, path: []const u8, read_only: bool) !NativeFile {
@@ -2570,7 +2572,7 @@ pub const NativeFile = struct {
         allocator: Allocator,
         path: []const u8,
         opts: OpenOptions,
-        io_impl: std.Io.Threaded,
+        io_impl: native_platform.Threaded,
         borrowed_io: ?std.Io,
     ) !NativeFile {
         var owned_io_impl = io_impl;
@@ -2651,7 +2653,7 @@ pub const NativeFile = struct {
         no_sync: bool,
         resource_manager: ?*resource_manager_mod.ResourceManager,
         writer_lock_marker: []const u8,
-        io_impl: std.Io.Threaded,
+        io_impl: native_platform.Threaded,
         borrowed_io: ?std.Io,
         indexed: bool,
     ) !NativeFile {
@@ -8098,7 +8100,7 @@ pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
 }
 
 pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -8890,15 +8892,15 @@ fn invalidCheck(report: CheckReport, issue: []const u8) CheckReport {
     return invalid;
 }
 
-fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+fn testPath(allocator: Allocator, tmp: native_platform.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
 fn readHeaderForTest(path: []const u8) ![header_size]u8 {
     var header_bytes: [header_size]u8 = undefined;
-    var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_only });
-    defer file.close(std.testing.io);
-    try readExactAt(file, std.testing.io, &header_bytes, 0);
+    var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_only });
+    defer file.close(native_platform.testing.io);
+    try readExactAt(file, native_platform.testing.io, &header_bytes, 0);
     return header_bytes;
 }
 
@@ -8994,14 +8996,14 @@ test "lite native header recovers previous checkpoint from a checksum-bad slot" 
 test "lite native create writes inspectable aflite file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native.aflite");
     defer allocator.free(path);
 
-    try create(std.testing.io, path);
-    const report = try inspect(allocator, std.testing.io, path);
+    try create(native_platform.testing.io, path);
+    const report = try inspect(allocator, native_platform.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(format_version, report.format_version);
     try std.testing.expectEqual(default_page_size, report.page_size);
@@ -9013,7 +9015,7 @@ test "lite native create writes inspectable aflite file" {
 test "lite native open options propagate no_sync to file writes" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-no-sync.aflite");
@@ -9043,7 +9045,7 @@ test "lite native open options propagate no_sync to file writes" {
 test "lite native createNew rejects existing aflite without truncating" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-create-new-existing.aflite");
@@ -9067,7 +9069,7 @@ test "lite native createNew rejects existing aflite without truncating" {
 test "lite native recreate atomically replaces the generation pinned by readers" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-recreate-pinned-reader.aflite");
@@ -9101,7 +9103,7 @@ test "lite native recreate through symlink preserves canonical lock identity" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const target_path = try testPath(allocator, tmp, "native-recreate-symlink-target.aflite");
@@ -9114,9 +9116,9 @@ test "lite native recreate through symlink preserves canonical lock identity" {
         defer original.close();
         try original.putDocument("doc:old", "replaced");
     }
-    const canonical_target = try realPathAlloc(allocator, std.testing.io, target_path);
+    const canonical_target = try realPathAlloc(allocator, native_platform.testing.io, target_path);
     defer allocator.free(canonical_target);
-    try std.Io.Dir.cwd().symLink(std.testing.io, canonical_target, alias_path, .{});
+    try std.Io.Dir.cwd().symLink(native_platform.testing.io, canonical_target, alias_path, .{});
 
     {
         var replacement = try NativeFile.create(allocator, alias_path);
@@ -9124,7 +9126,7 @@ test "lite native recreate through symlink preserves canonical lock identity" {
         try std.testing.expectEqual(@as(u64, 0), replacement.activeCheckpoint().commit_sequence);
     }
 
-    const canonical_alias = try realPathAlloc(allocator, std.testing.io, alias_path);
+    const canonical_alias = try realPathAlloc(allocator, native_platform.testing.io, alias_path);
     defer allocator.free(canonical_alias);
     try std.testing.expectEqualStrings(canonical_target, canonical_alias);
 
@@ -9136,19 +9138,19 @@ test "lite native recreate through symlink preserves canonical lock identity" {
 test "lite native open rejects unsupported format version" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-unsupported-version.aflite");
     defer allocator.free(path);
 
-    try create(std.testing.io, path);
+    try create(native_platform.testing.io, path);
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
         var raw_version: [4]u8 = undefined;
         std.mem.writeInt(u32, &raw_version, format_version + 1, .little);
-        try file.writePositionalAll(std.testing.io, &raw_version, version_offset);
+        try file.writePositionalAll(native_platform.testing.io, &raw_version, version_offset);
     }
 
     try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(allocator, path, true));
@@ -9157,43 +9159,43 @@ test "lite native open rejects unsupported format version" {
 test "lite native open rejects short files as truncated native headers" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-short-header.aflite");
     defer allocator.free(path);
 
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "not enough header bytes", 0);
+        var file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, path, .{});
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "not enough header bytes", 0);
     }
 
     try std.testing.expectError(error.TruncatedNativeHeader, NativeFile.open(allocator, path, true));
-    try std.testing.expectError(error.TruncatedNativeHeader, inspect(allocator, std.testing.io, path));
+    try std.testing.expectError(error.TruncatedNativeHeader, inspect(allocator, native_platform.testing.io, path));
 }
 
 test "lite native inspect reads only the header page" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-with-pages.aflite");
     defer allocator.free(path);
 
-    try create(std.testing.io, path);
+    try create(native_platform.testing.io, path);
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = false });
-        defer file.close(std.testing.io);
-        const size = (try file.stat(std.testing.io)).size;
-        var writer = file.writer(std.testing.io, &.{});
+        var file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, path, .{ .truncate = false });
+        defer file.close(native_platform.testing.io);
+        const size = (try file.stat(native_platform.testing.io)).size;
+        var writer = file.writer(native_platform.testing.io, &.{});
         try writer.seekTo(size);
         try writer.interface.writeAll("future-page-data");
         try writer.end();
     }
 
-    const report = try inspect(allocator, std.testing.io, path);
+    const report = try inspect(allocator, native_platform.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(format_version, report.format_version);
 }
@@ -9201,7 +9203,7 @@ test "lite native inspect reads only the header page" {
 test "lite native file appends page and publishes checkpoint" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-pages.aflite");
@@ -9222,7 +9224,7 @@ test "lite native file appends page and publishes checkpoint" {
         try std.testing.expectEqualStrings("hello native page", page);
     }
 
-    const report = try inspect(allocator, std.testing.io, path);
+    const report = try inspect(allocator, native_platform.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
     try std.testing.expectEqual(@as(u64, 3), report.page_count);
@@ -9231,7 +9233,7 @@ test "lite native file appends page and publishes checkpoint" {
 test "lite native file reopens allocated pages" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-reopen.aflite");
@@ -9256,7 +9258,7 @@ test "lite native file reopens allocated pages" {
 test "lite native file publishes checkpoint without rewriting static header" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-slot-publish.aflite");
@@ -9289,7 +9291,7 @@ test "lite native file publishes checkpoint without rewriting static header" {
 test "lite native file recovers older complete checkpoint when newest prefix is truncated" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-truncated-newest-checkpoint.aflite");
@@ -9310,10 +9312,10 @@ test "lite native file recovers older complete checkpoint when newest prefix is 
     };
 
     {
-        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer raw.close(std.testing.io);
-        try raw.setLength(std.testing.io, stable_size);
-        try raw.sync(std.testing.io);
+        var raw = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(native_platform.testing.io);
+        try raw.setLength(native_platform.testing.io, stable_size);
+        try raw.sync(native_platform.testing.io);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -9332,7 +9334,7 @@ test "lite native file recovers older complete checkpoint when newest prefix is 
 test "lite native file permits concurrent readers" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-reader-locks.aflite");
@@ -9357,7 +9359,7 @@ test "lite native file permits concurrent readers" {
 test "lite native file active writer permits readers but blocks second writer" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-writer-lock.aflite");
@@ -9373,7 +9375,7 @@ test "lite native file active writer permits readers but blocks second writer" {
     defer reader.close();
     try std.testing.expectEqual(@as(u64, 3), reader.activeCheckpoint().page_count);
 
-    const report = try inspect(allocator, std.testing.io, path);
+    const report = try inspect(allocator, native_platform.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
 
@@ -9383,7 +9385,7 @@ test "lite native file active writer permits readers but blocks second writer" {
 test "lite native file canonicalizes writer lock path spellings" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-writer-lock-canonical.aflite");
@@ -9400,7 +9402,7 @@ test "lite native file canonicalizes writer lock path spellings" {
 test "lite native file detects corrupted page payload" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-corrupt-page.aflite");
@@ -9413,9 +9415,9 @@ test "lite native file detects corrupted page payload" {
     }
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -9426,7 +9428,7 @@ test "lite native file detects corrupted page payload" {
 test "lite native catalog stores and reopens records" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-catalog.aflite");
@@ -9459,7 +9461,7 @@ test "lite native catalog stores and reopens records" {
 test "lite native catalog supports tombstones and spilled values" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-catalog-large.aflite");
@@ -9498,7 +9500,7 @@ test "lite native catalog supports tombstones and spilled values" {
 test "lite native index catalog snapshots live keys without values" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-index-catalog-keys.aflite");
@@ -9531,7 +9533,7 @@ test "lite native index catalog snapshots live keys without values" {
 test "lite native catalog detects corrupted root page" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-catalog-corrupt.aflite");
@@ -9544,9 +9546,9 @@ test "lite native catalog detects corrupted root page" {
     }
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -9557,7 +9559,7 @@ test "lite native catalog detects corrupted root page" {
 test "lite native document store persists records" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-documents.aflite");
@@ -9589,7 +9591,7 @@ test "lite native document store persists records" {
 test "lite native document store returns newest overwrite" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-document-overwrite.aflite");
@@ -9609,7 +9611,7 @@ test "lite native document store returns newest overwrite" {
 test "lite native hot commits remain append only until explicit vacuum" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-free-map-reuse.aflite");
@@ -9645,7 +9647,7 @@ test "lite native hot commits remain append only until explicit vacuum" {
 test "lite native free map does not reuse pages while reader pins older checkpoint" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-free-map-reader-protected.aflite");
@@ -9688,7 +9690,7 @@ test "lite native free map does not reuse pages while reader pins older checkpoi
 test "lite native stable snapshot preserves pinned reader checkpoint while writer advances" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-pinned-reader-snapshot.aflite");
@@ -9735,7 +9737,7 @@ test "lite native stable snapshot preserves pinned reader checkpoint while write
 test "lite native document store spills large values into value pages" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-document-large.aflite");
@@ -9776,7 +9778,7 @@ test "lite native document store spills large values into value pages" {
 test "lite native document tombstone hides older value after reopen" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-document-delete.aflite");
@@ -9797,7 +9799,7 @@ test "lite native document tombstone hides older value after reopen" {
 test "lite native document store detects corrupted root page" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-document-corrupt.aflite");
@@ -9810,9 +9812,9 @@ test "lite native document store detects corrupted root page" {
     }
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -9823,7 +9825,7 @@ test "lite native document store detects corrupted root page" {
 test "lite native document store detects corrupted external value page" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-document-large-corrupt.aflite");
@@ -9840,9 +9842,9 @@ test "lite native document store detects corrupted external value page" {
     }
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -9857,7 +9859,7 @@ test "lite native document store detects corrupted external value page" {
 test "lite native document batch publishes one checkpoint" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-document-batch.aflite");
@@ -9894,7 +9896,7 @@ test "lite native document batch publishes one checkpoint" {
 test "lite native document snapshot returns sorted live records" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-document-snapshot.aflite");
@@ -9923,7 +9925,7 @@ test "lite native document snapshot returns sorted live records" {
 
 test "lite native namespace snapshot does not read unrelated document chains" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-namespace-index.aflite");
     defer allocator.free(path);
@@ -9946,9 +9948,9 @@ test "lite native namespace snapshot does not read unrelated document chains" {
         try std.testing.expectEqual(@as(usize, 0), user_catalog.len);
     }
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", a_head * default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", a_head * default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -9962,7 +9964,7 @@ test "lite native namespace snapshot does not read unrelated document chains" {
 
 test "lite native small namespace directory stays inline and survives cold reopen" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-namespace-deltas.aflite");
     defer allocator.free(path);
@@ -10008,7 +10010,7 @@ test "lite native small namespace directory stays inline and survives cold reope
 
 test "lite native check rejects incomplete namespace links with valid page checksums" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-namespace-link-check.aflite");
     defer allocator.free(path);
@@ -10045,7 +10047,7 @@ test "lite native check rejects incomplete namespace links with valid page check
 test "lite native check validates committed root chains" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check.aflite");
@@ -10072,7 +10074,7 @@ test "lite native check validates committed root chains" {
 test "lite native check validates committed index catalog root chain" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-index-catalog.aflite");
@@ -10108,7 +10110,7 @@ test "lite native check validates committed index catalog root chain" {
 test "lite native check reports overlapping committed root pages" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-overlap.aflite");
@@ -10134,10 +10136,10 @@ test "lite native check reports overlapping committed root pages" {
     encodeHeader(&header_bytes, header);
 
     {
-        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer raw.close(std.testing.io);
-        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
-        try raw.sync(std.testing.io);
+        var raw = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(native_platform.testing.io);
+        try raw.writePositionalAll(native_platform.testing.io, &header_bytes, 0);
+        try raw.sync(native_platform.testing.io);
     }
 
     const report = try checkFile(allocator, path);
@@ -10148,7 +10150,7 @@ test "lite native check reports overlapping committed root pages" {
 test "lite native stable snapshot copies committed prefix without tail bytes" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const source_path = try testPath(allocator, tmp, "native-snapshot-source.aflite");
@@ -10168,9 +10170,9 @@ test "lite native stable snapshot copies committed prefix without tail bytes" {
     };
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, source_path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "uncommitted tail", snapshot_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, source_path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "uncommitted tail", snapshot_size);
     }
 
     const source_report = try checkFile(allocator, source_path);
@@ -10208,10 +10210,10 @@ test "lite native stable snapshot copies committed prefix without tail bytes" {
 test "lite native stable snapshot rejects same target by canonical path" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -10240,7 +10242,7 @@ test "lite native stable snapshot rejects same target by canonical path" {
 test "lite native stable snapshot holds output writer lock before staging" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const source_path = try testPath(allocator, tmp, "native-snapshot-lock-source.aflite");
@@ -10260,17 +10262,17 @@ test "lite native stable snapshot holds output writer lock before staging" {
     defer dest_lock.close();
 
     try std.testing.expectError(error.WouldBlock, copyStableSnapshot(allocator, source_path, snapshot_path, false));
-    try std.testing.expect(!pathExists(std.testing.io, snapshot_path));
-    try std.testing.expect(!pathExists(std.testing.io, tmp_path));
+    try std.testing.expect(!pathExists(native_platform.testing.io, snapshot_path));
+    try std.testing.expect(!pathExists(native_platform.testing.io, tmp_path));
 }
 
 test "lite vacuum image cleanup removes prepared file despite pending cancellation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vacuum-cleanup.aflite", .{tmp.sub_path});
     defer alloc.free(path);
-    var pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
+    var pool = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
     defer pool.deinit();
     const io = pool.io();
     var file = try NativeFile.createWithIo(alloc, io, path, .{ .no_sync = true });
@@ -10305,7 +10307,7 @@ test "lite vacuum image cleanup removes prepared file despite pending cancellati
 test "lite native vacuum rewrites live catalog and document records" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-vacuum.aflite");
@@ -10375,7 +10377,7 @@ test "lite native vacuum rewrites live catalog and document records" {
 test "lite native vacuum atomically replaces file and keeps writer handle usable" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-vacuum-replace.aflite");
@@ -10416,7 +10418,7 @@ test "lite native vacuum atomically replaces file and keeps writer handle usable
 
 test "lite native vacuum keeps adopted replacement usable after post rename failure" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-vacuum-post-rename-failure.aflite");
     defer allocator.free(path);
@@ -10447,7 +10449,7 @@ test "lite native vacuum keeps adopted replacement usable after post rename fail
 test "lite native check validates committed free map root" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-free-map-corrupt.aflite");
@@ -10477,7 +10479,7 @@ test "lite native check validates committed free map root" {
 test "lite native free map reads are bounded by supplied checkpoint" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-free-map-checkpoint-bound.aflite");
@@ -10501,7 +10503,7 @@ test "lite native free map reads are bounded by supplied checkpoint" {
 
 test "lite native unchanged small index records do not publish checkpoints" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "catalog-noop.aflite");
     defer allocator.free(path);
@@ -10542,7 +10544,7 @@ test "lite native unchanged small index records do not publish checkpoints" {
 
 test "lite native warm catalog point lookups skip history without allocating" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "catalog-probes.aflite");
     defer allocator.free(path);
@@ -10587,7 +10589,7 @@ test "lite native warm catalog point lookups skip history without allocating" {
 
 test "lite native empty free map validation does not allocate or walk checkpoints" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-empty-free-map.aflite");
     defer allocator.free(path);
@@ -10608,7 +10610,7 @@ test "lite native empty free map validation does not allocate or walk checkpoint
 test "lite native free map cannot reclaim previous checkpoint pages" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-free-map-previous-protected.aflite");
@@ -10654,7 +10656,7 @@ test "lite native free map cannot reclaim previous checkpoint pages" {
 test "lite native check reports corrupted committed document page" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-corrupt.aflite");
@@ -10667,9 +10669,9 @@ test "lite native check reports corrupted committed document page" {
     }
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -10682,7 +10684,7 @@ test "lite native check reports corrupted committed document page" {
 test "lite native check reports corrupted committed document index page" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-document-index-corrupt.aflite");
@@ -10696,9 +10698,9 @@ test "lite native check reports corrupted committed document index page" {
     };
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", root_page * default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", root_page * default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -10711,7 +10713,7 @@ test "lite native check reports corrupted committed document index page" {
 test "lite native check rejects a structurally valid stale document index pointer" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-document-index-stale.aflite");
@@ -10748,7 +10750,7 @@ test "lite native check rejects a structurally valid stale document index pointe
 test "lite native check reports corrupted committed index catalog page" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-index-corrupt.aflite");
@@ -10762,9 +10764,9 @@ test "lite native check reports corrupted committed index catalog page" {
     };
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", root_page * default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", root_page * default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -10777,7 +10779,7 @@ test "lite native check reports corrupted committed index catalog page" {
 test "lite native check reports corrupted index catalog external value page" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-index-value-corrupt.aflite");
@@ -10794,9 +10796,9 @@ test "lite native check reports corrupted index catalog external value page" {
     }
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", default_page_size + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -10809,7 +10811,7 @@ test "lite native check reports corrupted index catalog external value page" {
 test "lite native check reports truncated committed file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-truncated.aflite");
@@ -10822,9 +10824,9 @@ test "lite native check reports truncated committed file" {
     }
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.setLength(std.testing.io, default_page_size + 16);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.setLength(native_platform.testing.io, default_page_size + 16);
     }
 
     {
@@ -10842,7 +10844,7 @@ test "lite native check reports truncated committed file" {
 test "lite native checkFile reports corrupted header" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-header-corrupt.aflite");
@@ -10855,9 +10857,9 @@ test "lite native checkFile reports corrupted header" {
     }
 
     {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", page_size_offset);
+        var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, "X", page_size_offset);
     }
 
     const report = try checkFile(allocator, path);
@@ -10868,7 +10870,7 @@ test "lite native checkFile reports corrupted header" {
 test "lite native checkFile reports invalid checkpoint metadata separately from truncation" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-invalid-checkpoint.aflite");
@@ -10891,10 +10893,10 @@ test "lite native checkFile reports invalid checkpoint metadata separately from 
     encodeHeader(&header_bytes, header);
 
     {
-        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer raw.close(std.testing.io);
-        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
-        try raw.sync(std.testing.io);
+        var raw = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(native_platform.testing.io);
+        try raw.writePositionalAll(native_platform.testing.io, &header_bytes, 0);
+        try raw.sync(native_platform.testing.io);
     }
 
     const report = try checkFile(allocator, path);
@@ -10905,7 +10907,7 @@ test "lite native checkFile reports invalid checkpoint metadata separately from 
 test "lite native checkFile reports checkpoint prefix overflow as invalid metadata" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-check-checkpoint-overflow.aflite");
@@ -10932,10 +10934,10 @@ test "lite native checkFile reports checkpoint prefix overflow as invalid metada
     encodeHeader(&header_bytes, header);
 
     {
-        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer raw.close(std.testing.io);
-        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
-        try raw.sync(std.testing.io);
+        var raw = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
+        defer raw.close(native_platform.testing.io);
+        try raw.writePositionalAll(native_platform.testing.io, &header_bytes, 0);
+        try raw.sync(native_platform.testing.io);
     }
 
     const report = try checkFile(allocator, path);
@@ -11042,7 +11044,7 @@ test "lite native page and link caches shrink under hard resource pressure" {
 test "lite native page cache serves updated documents after page reuse and vacuum" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-page-cache-reuse.aflite");
@@ -11084,7 +11086,7 @@ test "lite native page cache serves updated documents after page reuse and vacuu
 
 test "lite native catalog index bounds cold hits and misses across checkpoints" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-index-scaling.aflite");
     defer alloc.free(path);
@@ -11122,7 +11124,7 @@ test "lite native catalog index bounds cold hits and misses across checkpoints" 
 
 test "lite native extent appends and tail reads are bounded and preserve snapshots" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "extent-scaling.aflite");
     defer alloc.free(path);
@@ -11191,7 +11193,7 @@ test "lite native extent appends and tail reads are bounded and preserve snapsho
 
 test "lite native revision 3 rejects revision 2 without modifying the file" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "rejected-v2.aflite");
     defer alloc.free(path);
@@ -11200,22 +11202,22 @@ test "lite native revision 3 rejects revision 2 without modifying the file" {
     std.mem.writeInt(u32, encoded[version_offset..][0..4], 2, .little);
     std.mem.writeInt(u32, encoded[header_checksum_offset..][0..4], headerChecksum(&encoded), .little);
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{});
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, &encoded, 0);
+        var file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, path, .{});
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, &encoded, 0);
     }
     try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(alloc, path, true));
     try std.testing.expectError(error.UnsupportedNativeFormatVersion, NativeFile.open(alloc, path, false));
-    var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
+    var file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{});
+    defer file.close(native_platform.testing.io);
     var actual: [header_size]u8 = undefined;
-    try readHeaderExactAt(file, std.testing.io, &actual);
+    try readHeaderExactAt(file, native_platform.testing.io, &actual);
     try std.testing.expectEqualSlices(u8, &encoded, &actual);
 }
 
 test "lite native extent checks reject corrupted child lengths" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "extent-corrupt.aflite");
     defer alloc.free(path);
@@ -11239,7 +11241,7 @@ test "lite native extent checks reject corrupted child lengths" {
 
 test "lite native catalog index check rejects stale or cross key pointers" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-index-corrupt.aflite");
     defer alloc.free(path);
@@ -11259,7 +11261,7 @@ test "lite native catalog index check rejects stale or cross key pointers" {
 
 test "lite native incomplete extent commit falls back to prior indexed checkpoint" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "extent-fallback.aflite");
     defer alloc.free(path);
@@ -11301,15 +11303,15 @@ test "lite native commits extend positional writes without stat or resize calls"
         }
     };
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "positional-growth.aflite");
     defer alloc.free(path);
-    Counter.base = std.testing.io;
-    var vtable = std.testing.io.vtable.*;
+    Counter.base = native_platform.testing.io;
+    var vtable = native_platform.testing.io.vtable.*;
     vtable.fileStat = Counter.stat;
     vtable.fileSetLength = Counter.resize;
-    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const io = std.Io{ .userdata = native_platform.testing.io.userdata, .vtable = &vtable };
     var file = try NativeFile.createWithIo(alloc, io, path, .{ .no_sync = true });
     defer file.close();
     Counter.stats = 0;
@@ -11322,13 +11324,13 @@ test "lite native commits extend positional writes without stat or resize calls"
     try file.putDocument("doc", value);
     try std.testing.expectEqual(@as(usize, 0), Counter.stats);
     try std.testing.expectEqual(@as(usize, 0), Counter.resizes);
-    try std.testing.expectEqual(file.activeCheckpoint().page_count * file.header.page_size, (try file.file.stat(std.testing.io)).size);
+    try std.testing.expectEqual(file.activeCheckpoint().page_count * file.header.page_size, (try file.file.stat(native_platform.testing.io)).size);
     try std.testing.expect((try file.check()).valid);
 }
 
 test "lite native catalog preserves maximum length keys through vacuum" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-max-key.aflite");
     defer alloc.free(path);
@@ -11350,7 +11352,7 @@ test "lite native catalog preserves maximum length keys through vacuum" {
 
 test "lite native catalog indexes mixed large empty and maximum keys across splits and vacuum" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-overflow-keys.aflite");
     defer alloc.free(path);
@@ -11413,7 +11415,7 @@ test "lite native catalog indexes mixed large empty and maximum keys across spli
 
 test "lite native overflow key references reject non-record pages and out of checkpoint references" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "corrupt-key-reference.aflite");
     defer alloc.free(path);
@@ -11455,7 +11457,7 @@ test "lite native overflow key references reject non-record pages and out of che
 
 test "lite native large appends seal each suffix subtree once" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "bulk-extent-append.aflite");
     defer alloc.free(path);
@@ -11497,7 +11499,7 @@ test "lite native large appends seal each suffix subtree once" {
 
 test "lite native batched extent append handles all small tree boundary shapes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "extent-frontier-boundaries.aflite");
     defer alloc.free(path);
@@ -11521,7 +11523,7 @@ test "lite native batched extent append handles all small tree boundary shapes" 
 
 test "lite native document overflow keys survive bulk build overwrite and vacuum" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "document-overflow-keys.aflite");
     defer alloc.free(path);
@@ -11555,7 +11557,7 @@ test "lite native document overflow keys survive bulk build overwrite and vacuum
 
 test "lite native catalog deletion keeps directory scans independent of retired generations" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "live-catalog-deletion.aflite");
     defer alloc.free(path);
@@ -11597,7 +11599,7 @@ test "lite native catalog deletion keeps directory scans independent of retired 
 
 test "lite native catalog batches write only final reachable index nodes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-batch-editor.aflite");
     defer alloc.free(path);
@@ -11648,7 +11650,7 @@ test "lite native catalog batches write only final reachable index nodes" {
 
 test "lite native long key updates resolve only comparison keys" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "lazy-key-editor.aflite");
     defer alloc.free(path);
@@ -11672,7 +11674,7 @@ test "lite native long key updates resolve only comparison keys" {
 
 test "lite native catalog editor rebalances mixed key widths across deletion and reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "mixed-key-editor.aflite");
     defer alloc.free(path);
@@ -11738,7 +11740,7 @@ test "lite native catalog editor rebalances mixed key widths across deletion and
 
 test "lite native existing document batches write each changed tree node once" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "document-batch-editor.aflite");
     defer alloc.free(path);
@@ -11771,7 +11773,7 @@ test "lite native existing document batches write each changed tree node once" {
 
 test "lite native catalog editor mixed batches match a reference map" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "model-catalog-editor.aflite");
     defer alloc.free(path);
@@ -11822,7 +11824,7 @@ const MaintenanceTestAllocator = @import("test_allocator.zig").BudgetAllocator;
 
 test "lite native maintenance streams large values under a bounded heap budget" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "bounded-maintenance.aflite");
     defer alloc.free(path);
@@ -11831,7 +11833,7 @@ test "lite native maintenance streams large values under a bounded heap budget" 
     for (value, 0..) |*byte, i| byte.* = @intCast(i % 251);
     var budget = MaintenanceTestAllocator{ .backing = alloc };
     {
-        var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         try file.putCatalogRecord("schema", value);
@@ -11863,7 +11865,7 @@ test "lite native maintenance streams large values under a bounded heap budget" 
         try std.testing.expect(std.meta.eql(checkpoint, file.activeCheckpoint()));
         const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-aflite-vacuum", .{path});
         defer alloc.free(temp_path);
-        try std.testing.expect(!pathExists(std.testing.io, temp_path));
+        try std.testing.expect(!pathExists(native_platform.testing.io, temp_path));
 
         const vacuumed = try file.vacuum();
         try std.testing.expectEqual(stats.compact_size, vacuumed.after_size);
@@ -11887,11 +11889,11 @@ test "lite native maintenance streams large values under a bounded heap budget" 
 
 test "lite native vacuum reads live indexes instead of superseded history" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "indexed-vacuum.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     for (0..1000) |i| {
@@ -11915,11 +11917,11 @@ test "lite native vacuum reads live indexes instead of superseded history" {
 
 test "lite native compact statistics match packed live document and namespace indexes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "packed-stats.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     for (0..512) |i| {
         var key: [32]u8 = undefined;
@@ -11941,11 +11943,11 @@ test "lite native compact statistics match packed live document and namespace in
 
 test "lite native streaming vacuum rejects corrupt values before publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "stream-corruption.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     const value = try alloc.alloc(u8, default_page_size * 3);
@@ -11967,7 +11969,7 @@ test "lite native streaming vacuum rejects corrupt values before publication" {
     try file.writePage(catalog.external_value_root_page, .value_extent, extent);
     try std.testing.expectError(error.InvalidNativeValueChain, file.vacuum());
     try std.testing.expect(std.meta.eql(checkpoint, file.activeCheckpoint()));
-    try std.testing.expect(!pathExists(std.testing.io, temp_path));
+    try std.testing.expect(!pathExists(native_platform.testing.io, temp_path));
     try std.testing.expect(!(try file.check()).valid);
     extent[NativeFile.extent_header_size + 8] ^= 1;
     try file.writePage(catalog.external_value_root_page, .value_extent, extent);
@@ -11983,7 +11985,7 @@ test "lite native streaming vacuum rejects corrupt values before publication" {
         try file.writePage(document.external_value_root_page, .value, first);
         try std.testing.expectError(error.InvalidNativeValueChain, file.vacuum());
         try std.testing.expect(std.meta.eql(checkpoint, file.activeCheckpoint()));
-        try std.testing.expect(!pathExists(std.testing.io, temp_path));
+        try std.testing.expect(!pathExists(native_platform.testing.io, temp_path));
     }
     std.mem.writeInt(u64, first[0..8], next, .little);
     try file.writePage(document.external_value_root_page, .value, first);
@@ -11994,7 +11996,7 @@ test "lite native streaming vacuum rejects corrupt values before publication" {
     try file.file.writePositionalAll(file.runtimeIo(), raw, next * default_page_size);
     try std.testing.expectError(error.NativePageChecksumMismatch, file.vacuum());
     try std.testing.expect(std.meta.eql(checkpoint, file.activeCheckpoint()));
-    try std.testing.expect(!pathExists(std.testing.io, temp_path));
+    try std.testing.expect(!pathExists(native_platform.testing.io, temp_path));
     raw[page_header_size + value_page_header_size] ^= 1;
     try file.file.writePositionalAll(file.runtimeIo(), raw, next * default_page_size);
     _ = try file.vacuum();
@@ -12004,7 +12006,7 @@ test "lite native streaming vacuum rejects corrupt values before publication" {
 test "lite native bulk index frontier counts a million long keys with bounded heap" {
     var budget = MaintenanceTestAllocator{ .backing = std.testing.allocator, .limit = 256 * 1024 };
     {
-        var file = NativeFile{ .allocator = budget.allocator(), .io_impl = undefined, .borrowed_io = std.testing.io, .path = @constCast(""), .file = undefined, .header = .{} };
+        var file = NativeFile{ .allocator = budget.allocator(), .io_impl = undefined, .borrowed_io = native_platform.testing.io, .path = @constCast(""), .file = undefined, .header = .{} };
         var pages: u64 = 1;
         var builder = DocumentIndexBulkBuilder{ .owner = &file, .file = undefined, .next_page_id = &pages, .count_only = true };
         defer builder.deinit();
@@ -12023,13 +12025,13 @@ test "lite native bulk index frontier counts a million long keys with bounded he
 
 test "lite native bulk index frontier preserves mixed keys and exact page counts" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "bulk-frontier.aflite");
     defer alloc.free(path);
     var budget = MaintenanceTestAllocator{ .backing = alloc, .limit = 256 * 1024 };
     {
-        var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         const count = 16384;
@@ -12048,7 +12050,7 @@ test "lite native bulk index frontier preserves mixed keys and exact page counts
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(budget.allocator());
             try encodeCatalogEntry(budget.allocator(), &payload, .{ .previous_page = history, .key = bytes, .value = "v" });
-            history = try appendPageToFile(budget.allocator(), file.file, std.testing.io, default_page_size, &next, .catalog, payload.items);
+            history = try appendPageToFile(budget.allocator(), file.file, native_platform.testing.io, default_page_size, &next, .catalog, payload.items);
             try builder.add(bytes, history);
             try counter.add(bytes, history);
         }
@@ -12081,7 +12083,7 @@ test "lite native bulk index frontier preserves mixed keys and exact page counts
 test "lite native bulk index frontier releases ownership on allocation failures" {
     const Runner = struct {
         fn run(alloc: Allocator) !void {
-            var file = NativeFile{ .allocator = alloc, .io_impl = undefined, .borrowed_io = std.testing.io, .path = @constCast(""), .file = undefined, .header = .{} };
+            var file = NativeFile{ .allocator = alloc, .io_impl = undefined, .borrowed_io = native_platform.testing.io, .path = @constCast(""), .file = undefined, .header = .{} };
             var pages: u64 = 1;
             var builder = DocumentIndexBulkBuilder{ .owner = &file, .file = undefined, .next_page_id = &pages, .count_only = true };
             defer builder.deinit();
@@ -12098,7 +12100,7 @@ test "lite native bulk index frontier releases ownership on allocation failures"
 
 test "lite native cold payload writes invalidate reused page bytes and links" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "cold-reuse.aflite");
     defer alloc.free(path);
@@ -12125,12 +12127,12 @@ test "lite native cold payload writes invalidate reused page bytes and links" {
 
 test "lite native page batches coalesce runs without heap allocation and preserve gaps" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "page-batch.aflite");
     defer alloc.free(path);
     var budget = MaintenanceTestAllocator{ .backing = alloc };
-    var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     budget.limit = budget.live; // Neither encoding nor batching may allocate.
@@ -12148,28 +12150,28 @@ test "lite native page batches coalesce runs without heap allocation and preserv
         try batch.flush();
         try std.testing.expectEqual(@as(u64, if (size == 4096) 4 else 5), file.test_page_write_calls.load(.monotonic) - before);
         var raw: [65536]u8 = undefined;
-        try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * 100);
+        try readExactAt(file.file, native_platform.testing.io, raw[0..size], @as(u64, size) * 100);
         try std.testing.expectEqualStrings("untouched gap", try decodePagePayload(raw[0..size], .data));
         for (1..@intCast(run + 2)) |id| {
-            try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * id);
+            try readExactAt(file.file, native_platform.testing.io, raw[0..size], @as(u64, size) * id);
             const value = try decodeValuePage(try decodePagePayload(raw[0..size], .value));
             try std.testing.expectEqualStrings("batched value", value.chunk);
             try std.testing.expectEqual(@as(u64, 0), value.next_page);
         }
-        try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * 101);
+        try readExactAt(file.file, native_platform.testing.io, raw[0..size], @as(u64, size) * 101);
         try std.testing.expectEqualStrings("low page", try decodePagePayload(raw[0..size], .data));
-        try readExactAt(file.file, std.testing.io, raw[0..size], @as(u64, size) * 102);
+        try readExactAt(file.file, native_platform.testing.io, raw[0..size], @as(u64, size) * 102);
         try std.testing.expectEqualStrings("high page", try decodePagePayload(raw[0..size], .data));
     }
 }
 
 test "lite native failed page batches do not admit cache entries or retry" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "failed-page-batch.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     const first = file.activeCheckpoint().page_count;
     var batch = PageWriteBatch{ .file = &file };
@@ -12209,12 +12211,12 @@ test "lite native CLOCK retains hot pages across cold scans and skips oversized 
 
 test "lite native transaction publishes catalog and document roots atomically" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "native-root-transaction.aflite");
     defer alloc.free(path);
     {
-        var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{});
+        var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{});
         defer file.close();
         const before = file.activeCheckpoint().commit_sequence;
         try file.beginTransaction();
@@ -12223,7 +12225,7 @@ test "lite native transaction publishes catalog and document roots atomically" {
         try file.putCatalogRecord("metadata", "settings");
         // Independent opens observe only the last durable checkpoint.
         {
-            var old = try NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true });
+            var old = try NativeFile.openWithIo(alloc, native_platform.testing.io, path, .{ .read_only = true });
             defer old.close();
             try std.testing.expect((try old.getDocumentAlloc(alloc, "document")) == null);
         }
@@ -12241,7 +12243,7 @@ test "lite native transaction publishes catalog and document roots atomically" {
         try std.testing.expectEqualStrings("segment", index);
         try std.testing.expect((try file.check()).valid);
     }
-    var reopened = try NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true });
+    var reopened = try NativeFile.openWithIo(alloc, native_platform.testing.io, path, .{ .read_only = true });
     defer reopened.close();
     const metadata = (try reopened.getCatalogRecordAlloc(alloc, "metadata")).?;
     defer alloc.free(metadata);
@@ -12251,11 +12253,11 @@ test "lite native transaction publishes catalog and document roots atomically" {
 
 test "lite native small document batches coalesce record and index writes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "small-record-batch.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     var keys: [1024][16]u8 = undefined;
     var mutations: [1024]DocumentMutation = undefined;
@@ -12276,11 +12278,11 @@ test "lite native small document batches coalesce record and index writes" {
 
 test "lite deferred durability preserves the durable roots until a shared barrier" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "deferred-durability.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{});
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{});
     defer file.close();
     try file.putIndexCatalogRecord("wal", "first");
     for (0..4) |_| {
@@ -12292,14 +12294,14 @@ test "lite deferred durability preserves the durable roots until a shared barrie
     defer alloc.free(live);
     try std.testing.expectEqualStrings("first++++", live);
     {
-        var disk = try NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true });
+        var disk = try NativeFile.openWithIo(alloc, native_platform.testing.io, path, .{ .read_only = true });
         defer disk.close();
         const value = (try disk.getIndexCatalogRecordAlloc(alloc, "wal")).?;
         defer alloc.free(value);
         try std.testing.expectEqualStrings("first", value);
     }
     try file.sync();
-    var reopened = try NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true });
+    var reopened = try NativeFile.openWithIo(alloc, native_platform.testing.io, path, .{ .read_only = true });
     defer reopened.close();
     const durable = (try reopened.getIndexCatalogRecordAlloc(alloc, "wal")).?;
     defer alloc.free(durable);
@@ -12309,15 +12311,15 @@ test "lite deferred durability preserves the durable roots until a shared barrie
 
 test "lite compaction catches final mutations across all roots and streams large values" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "compaction-catch-up.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try file.putDocument("deleted", "old");
     try file.putIndexCatalogRecord("old-name", "index");
-    var source = try NativeFile.openWithIo(alloc, std.testing.io, path, .{ .read_only = true, .no_sync = true });
+    var source = try NativeFile.openWithIo(alloc, native_platform.testing.io, path, .{ .read_only = true, .no_sync = true });
     defer source.close();
     var capture = ChangeCapture{};
     defer capture.deinit(alloc);
@@ -12355,27 +12357,27 @@ test "lite compaction catches final mutations across all roots and streams large
 
 test "lite unpacked v3 remains readable and vacuum explicitly adopts packed signature" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "unpacked-v3.aflite");
     defer alloc.free(path);
     {
-        var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.header.packed_records = false;
         var header: [header_size]u8 = undefined;
         encodeHeader(&header, file.header);
-        try file.file.writePositionalAll(std.testing.io, &header, 0);
+        try file.file.writePositionalAll(native_platform.testing.io, &header, 0);
         try file.putDocumentBatch(&.{ .{ .key = "a", .value = "one" }, .{ .key = "b", .value = "two" } });
         try std.testing.expect(file.activeCheckpoint().document_root_page & packed_record_flag == 0);
     }
-    var file = try NativeFile.openWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.openWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try std.testing.expect(!file.header.packed_records);
     _ = try file.vacuum();
     try std.testing.expect(file.header.packed_records);
     var header: [header_size]u8 = undefined;
-    try readHeaderExactAt(file.file, std.testing.io, &header);
+    try readHeaderExactAt(file.file, native_platform.testing.io, &header);
     try std.testing.expect(!std.mem.eql(u8, header[0..magic.len], unpacked_v3_magic));
     try std.testing.expect((try decodeHeader(&header)).packed_records);
     const value = (try file.getDocumentAlloc(alloc, "b")).?;
@@ -12386,11 +12388,11 @@ test "lite unpacked v3 remains readable and vacuum explicitly adopts packed sign
 
 test "lite packed record references validate boundaries and physical checksums" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "packed-record-validation.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try file.putDocumentBatch(&.{ .{ .key = "a", .value = "one" }, .{ .key = "b", .value = "two" } });
     const checkpoint = file.activeCheckpoint();
@@ -12398,7 +12400,7 @@ test "lite packed record references validate boundaries and physical checksums" 
     try std.testing.expect(reference & packed_record_flag != 0);
     try std.testing.expectError(error.InvalidPageId, file.readPageAlloc(alloc, reference + (@as(u64, 1) << 47)));
     file.page_cache_enabled.store(false, .monotonic);
-    try file.file.writePositionalAll(std.testing.io, "X", physicalPage(reference) * file.header.page_size + page_header_size);
+    try file.file.writePositionalAll(native_platform.testing.io, "X", physicalPage(reference) * file.header.page_size + page_header_size);
     try std.testing.expectError(error.NativePageChecksumMismatch, file.getDocumentAlloc(alloc, "a"));
     try std.testing.expect(!(try file.check()).valid);
 }
@@ -12424,7 +12426,7 @@ test "lite page replacement invalidates old bytes even when shared pressure bypa
 
 test "lite vacuum catchup batches every root and accounts private caches through failure and publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "bounded-catchup.aflite");
     defer alloc.free(path);
@@ -12432,7 +12434,7 @@ test "lite vacuum catchup batches every root and accounts private caches through
     budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     {
-        var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
+        var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
         defer file.close();
         var image = try file.prepareVacuum(null);
         defer image.deinit();
@@ -12462,7 +12464,7 @@ test "lite vacuum catchup batches every root and accounts private caches through
         image.prepared.test_page_write_fail_after = null;
         try std.testing.expectEqualDeep(before, image.prepared.activeCheckpoint());
         try std.testing.expectEqualDeep(report_before, image.report);
-        try std.testing.expectEqual(before.page_count * file.header.page_size, (try image.prepared.file.stat(std.testing.io)).size);
+        try std.testing.expectEqual(before.page_count * file.header.page_size, (try image.prepared.file.stat(native_platform.testing.io)).size);
         try std.testing.expect((try image.prepared.check()).valid);
         var cancel = maintenance.CancelToken{};
         cancel.request();
@@ -12499,11 +12501,11 @@ test "lite vacuum catchup batches every root and accounts private caches through
 
 test "lite packed record reader reuses validated pages in both directions and rejects invalid views" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "record-page-reader.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try file.putDocumentBatch(&.{ .{ .key = "a", .value = "one" }, .{ .key = "b", .value = "two" }, .{ .key = "c", .value = "three" } });
     const checkpoint = file.activeCheckpoint();
@@ -12524,10 +12526,10 @@ test "lite packed record reader reuses validated pages in both directions and re
     file.page_cache_enabled.store(false, .monotonic);
     const raw = try file.readPhysicalPageAlloc(alloc, physicalPage(a), checkpoint);
     defer alloc.free(raw);
-    try file.file.writePositionalAll(std.testing.io, "X", physicalPage(a) * file.header.page_size + page_header_size);
+    try file.file.writePositionalAll(native_platform.testing.io, "X", physicalPage(a) * file.header.page_size + page_header_size);
     try std.testing.expectError(error.NativePageChecksumMismatch, reader.read(&file, alloc, checkpoint, a, .document));
     // An unsuccessful load must not cache a validated view; retry disk truth.
-    try file.file.writePositionalAll(std.testing.io, raw, physicalPage(a) * file.header.page_size);
+    try file.file.writePositionalAll(native_platform.testing.io, raw, physicalPage(a) * file.header.page_size);
     try std.testing.expectEqualStrings("two", (try decodeDocumentEntry(try reader.read(&file, alloc, checkpoint, b, .document))).value);
 }
 
@@ -12535,12 +12537,12 @@ test "lite vacuum catchup bounds retained inline bytes and rolls back mid-copy c
     const alloc = std.testing.allocator;
     const BudgetAllocator = @import("test_allocator.zig").BudgetAllocator;
     var budget = BudgetAllocator{ .backing = alloc };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catchup-inline-budget.aflite");
     defer alloc.free(path);
     {
-        var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var image = try file.prepareVacuum(null);
@@ -12601,11 +12603,11 @@ test "lite rollback drops only tail cache pages and independently cached links" 
 
 test "lite grouped callbacks share bounded metadata finalization across roots" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "grouped-metadata.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     const before = file.activeCheckpoint();
     const writes = file.test_page_writes.load(.monotonic);
@@ -12639,11 +12641,11 @@ test "lite grouped callbacks share bounded metadata finalization across roots" {
 
 test "lite grouped operations preserve append rename range scan and streamed import ordering" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "grouped-operations.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try file.beginTransaction();
     errdefer file.abortTransaction();
@@ -12659,9 +12661,9 @@ test "lite grouped operations preserve append rename range scan and streamed imp
     const big = try alloc.alloc(u8, 128 * 1024);
     defer alloc.free(big);
     @memset(big, 'x');
-    var source = try tmp.dir.createFile(std.testing.io, "source", .{ .read = true });
-    defer source.close(std.testing.io);
-    try source.writePositionalAll(std.testing.io, big, 0);
+    var source = try tmp.dir.createFile(native_platform.testing.io, "source", .{ .read = true });
+    defer source.close(native_platform.testing.io);
+    try source.writePositionalAll(native_platform.testing.io, big, 0);
     try file.putIndexCatalogRecordFromFile("imported", source, big.len, .{});
     try file.appendIndexCatalogRecord("imported", big);
     try file.renameIndexCatalogRecord("imported", "renamed");
@@ -12688,11 +12690,11 @@ test "lite grouped operations preserve append rename range scan and streamed imp
 
 test "lite grouped spills bound retained memory and abort every private root" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "grouped-spills.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try file.putDocument("survivor", "original");
     const checkpoint = file.activeCheckpoint();
@@ -12713,7 +12715,7 @@ test "lite grouped spills bound retained memory and abort every private root" {
     try std.testing.expectEqualStrings("original", old);
     try std.testing.expect((try file.getDocumentAlloc(alloc, "survivor")) == null);
     file.abortTransaction();
-    try std.testing.expectEqual(checkpoint.page_count * file.header.page_size, (try file.file.stat(std.testing.io)).size);
+    try std.testing.expectEqual(checkpoint.page_count * file.header.page_size, (try file.file.stat(native_platform.testing.io)).size);
     try std.testing.expect((try file.getDocumentAlloc(alloc, "key-00000000")) == null);
     // Reuse the truncated frontier with entirely different pages.
     try file.beginTransaction();
@@ -12724,11 +12726,11 @@ test "lite grouped spills bound retained memory and abort every private root" {
 
 test "lite adoption existence skips system ranges and never reads value pages" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "adoption-metadata.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try std.testing.expect(!try file.hasLiveDocumentOutsidePrefix(file.activeCheckpoint(), "\x02db/"));
     var keys: [1024][32]u8 = undefined;
@@ -12761,7 +12763,7 @@ test "lite adoption existence skips system ranges and never reads value pages" {
 
 test "lite grouped allocation failures roll back staging and partial finalization" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "grouped-oom.aflite");
     defer alloc.free(path);
@@ -12782,7 +12784,7 @@ test "lite grouped allocation failures roll back staging and partial finalizatio
     };
     var fail_index: usize = 0;
     while (fail_index < 512) : (fail_index += 1) {
-        var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
@@ -12808,11 +12810,11 @@ test "lite grouped allocation failures roll back staging and partial finalizatio
 
 test "lite grouped pinned readers never inspect private staging during mutation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "grouped-pinned-readers.aflite");
     defer alloc.free(path);
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try file.putIndexCatalogRecord("key", "original");
     try file.putDocument("key", "original");
@@ -12858,7 +12860,7 @@ test "lite grouped pinned readers never inspect private staging during mutation"
         reader.done.store(true, .release);
         thread.join();
     };
-    while (!reader.ready.load(.acquire)) @import("antfly_platform").time.yieldNow();
+    while (!reader.ready.load(.acquire)) native_platform.time.yieldNow();
     for (0..8) |group| {
         try file.beginTransaction();
         errdefer file.abortTransaction();
@@ -12880,7 +12882,7 @@ test "lite grouped pinned readers never inspect private staging during mutation"
 
 test "lite grouped large borrowed batches retain one index edit per supplied batch" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var keys: [4096][24]u8 = undefined;
     var docs: [4096]DocumentMutation = undefined;
@@ -12894,7 +12896,7 @@ test "lite grouped large borrowed batches retain one index edit per supplied bat
     for ([_]bool{ false, true }) |grouped| {
         const path = try testPath(alloc, tmp, if (grouped) "borrowed-group.aflite" else "borrowed-baseline.aflite");
         defer alloc.free(path);
-        var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         if (grouped) try file.beginTransaction();
         errdefer if (grouped) file.abortTransaction();
@@ -12919,12 +12921,12 @@ test "lite grouped large borrowed batches retain one index edit per supplied bat
 
 test "lite document deletes prune the active index and preserve pinned roots" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "pruned-documents.aflite");
     defer a.free(path);
     {
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -12979,11 +12981,11 @@ test "lite document deletes prune the active index and preserve pinned roots" {
 
 test "lite document bulk and edited indexes retain only latest live mutations" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "delete-duplicates.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     const mutations = [_]DocumentMutation{
         .{ .key = "gone", .value = "old" },
@@ -13019,12 +13021,12 @@ test "lite document bulk and edited indexes retain only latest live mutations" {
 
 test "lite document index coverage accepts legacy tombstones and rejects missing live keys" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "legacy-tombstone-index.aflite");
     defer a.free(path);
     {
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         try file.putDocument("doc", "old");
         const live = file.activeCheckpoint();
@@ -13046,7 +13048,7 @@ test "lite document index coverage accepts legacy tombstones and rejects missing
         defer a.free(encoded);
         var page: [default_page_size]u8 = undefined;
         encodePage(&page, .document_index, encoded);
-        try file.file.writePositionalAll(std.testing.io, &page, live.document_index_root_page * default_page_size);
+        try file.file.writePositionalAll(native_platform.testing.io, &page, live.document_index_root_page * default_page_size);
         file.page_cache.clear(a);
         deleted.commit_sequence += 1;
         try file.publishCheckpoint(deleted);
@@ -13075,11 +13077,11 @@ test "lite document index coverage accepts legacy tombstones and rejects missing
 test "lite lazy overflow cursor bounds seeks scans and allocation failures" {
     const a = std.testing.allocator;
     var budget = MaintenanceTestAllocator{ .backing = a };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "lazy-overflow.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -13149,7 +13151,7 @@ test "lite lazy overflow cursor bounds seeks scans and allocation failures" {
 
 test "lite append frontiers write the same pages as one combined append" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "append-frontier.aflite");
     defer a.free(path);
@@ -13159,7 +13161,7 @@ test "lite append frontiers write the same pages as one combined append" {
     const suffix = @as([(1024 * 64)]u8, @splat('s'));
     var combined_pages: u64 = 0;
     for ([_]bool{ true, false }) |combined| {
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         try file.putIndexCatalogRecord("/wal", initial);
@@ -13187,11 +13189,11 @@ test "lite append frontiers write the same pages as one combined append" {
 
 test "lite append frontiers preserve barriers replacements and bounded spills" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "append-barriers.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     const base = @as([8192]u8, @splat('b'));
     const keys = [_][]const u8{ "/a", "/b", "/c", "/d", "/e", "/f" };
@@ -13235,7 +13237,7 @@ test "lite append frontiers preserve barriers replacements and bounded spills" {
 
 test "lite append frontier allocation and streaming failures roll back and retry" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "append-failures.aflite");
     defer a.free(path);
@@ -13258,7 +13260,7 @@ test "lite append frontier allocation and streaming failures roll back and retry
     };
     var exhausted = false;
     for (0..512) |fail_index| {
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         const base = @as([8192]u8, @splat('v'));
@@ -13284,7 +13286,7 @@ test "lite append frontier allocation and streaming failures roll back and retry
         if (exhausted) break;
     }
     try std.testing.expect(exhausted);
-    var file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     const before = file.activeCheckpoint();
     try file.beginTransaction();
@@ -13302,13 +13304,13 @@ test "lite append frontier allocation and streaming failures roll back and retry
 
 test "lite append frontiers span inline leaf and full subtree boundaries" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "append-boundaries.aflite");
     defer a.free(path);
     const leaf_size = default_page_size - page_header_size - value_page_header_size;
     for ([_]usize{ 0, 1, leaf_size, leaf_size * 64 - 1, leaf_size * 64, leaf_size * 65 }) |initial_len| {
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         const initial = try a.alloc(u8, initial_len);
         defer a.free(initial);
@@ -13332,12 +13334,12 @@ test "lite append frontiers span inline leaf and full subtree boundaries" {
 
 test "lite value reads bound allocations and coalesce physical IO across pinned roots" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "value-read-window.aflite");
     defer a.free(path);
     var counter = std.testing.FailingAllocator.init(a, .{});
-    var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(counter.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     const value = try a.alloc(u8, 8 * 1024 * 1024);
@@ -13382,12 +13384,12 @@ test "lite value reads bound allocations and coalesce physical IO across pinned 
 
 test "lite namespace index bounds hot and cold single namespace mutations" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-index-bounds.aflite");
     defer a.free(path);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-    var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -13402,7 +13404,7 @@ test "lite namespace index bounds hot and cold single namespace mutations" {
     for (0..2) |phase| {
         if (phase != 0) {
             file.close();
-            file = try NativeFile.openWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+            file = try NativeFile.openWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
             file.page_cache_enabled.store(false, .monotonic);
         }
         const baseline = budget.live;
@@ -13423,13 +13425,13 @@ test "lite namespace index bounds hot and cold single namespace mutations" {
     try std.testing.expectEqualStrings("value", old);
     try std.testing.expect((try file.check()).valid);
     const before = file.activeCheckpoint();
-    const size = (try file.file.stat(std.testing.io)).size;
+    const size = (try file.file.stat(native_platform.testing.io)).size;
     try file.beginTransaction();
     try file.putDocument(batch[0].key, "aborted");
     _ = try file.materializeTransactionCheckpoint();
     file.abortTransaction();
     try std.testing.expectEqualDeep(before, file.activeCheckpoint());
-    try std.testing.expectEqual(size, (try file.file.stat(std.testing.io)).size);
+    try std.testing.expectEqual(size, (try file.file.stat(native_platform.testing.io)).size);
     _ = try file.vacuum();
     try std.testing.expect((try file.readCatalogRoots(file.activeCheckpoint().namespace_directory_root_page, file.activeCheckpoint())).indexed);
     try std.testing.expect((try file.check()).valid);
@@ -13468,16 +13470,16 @@ fn legacyNamespaceDirectoryForTest(file: *NativeFile) !CheckpointSlot {
 test "lite namespace index migrates legacy v3 directories atomically and preserves old checkpoints" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |use_packing| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "namespace-migration.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.header.packed_records = use_packing;
         var header: [header_size]u8 = undefined;
         encodeHeader(&header, file.header);
-        try file.file.writePositionalAll(std.testing.io, &header, 0);
+        try file.file.writePositionalAll(native_platform.testing.io, &header, 0);
         file.page_cache_enabled.store(false, .monotonic);
         var long_key: [2048]u8 = @splat('n');
         long_key[1800] = 0;
@@ -13493,14 +13495,14 @@ test "lite namespace index migrates legacy v3 directories atomically and preserv
         const legacy = try legacyNamespaceDirectoryForTest(&file);
         try std.testing.expect(!(try file.readCatalogRoots(legacy.namespace_directory_root_page, legacy)).indexed);
         try std.testing.expect((try file.check()).valid);
-        const length = (try file.file.stat(std.testing.io)).size;
+        const length = (try file.file.stat(native_platform.testing.io)).size;
         // A failed migration must restore the legacy root and every tail page.
         try file.beginTransaction();
         try file.putDocument("ns\x00key", "aborted");
         _ = try file.materializeTransactionCheckpoint();
         file.abortTransaction();
         try std.testing.expectEqualDeep(legacy, file.activeCheckpoint());
-        try std.testing.expectEqual(length, (try file.file.stat(std.testing.io)).size);
+        try std.testing.expectEqual(length, (try file.file.stat(native_platform.testing.io)).size);
         try std.testing.expect((try file.check()).valid);
         var exhausted = false;
         for (0..2048) |fail_index| {
@@ -13522,7 +13524,7 @@ test "lite namespace index migrates legacy v3 directories atomically and preserv
             } else |err| {
                 try std.testing.expectEqual(error.OutOfMemory, err);
                 try std.testing.expectEqualDeep(legacy, file.activeCheckpoint());
-                try std.testing.expectEqual(length, (try file.file.stat(std.testing.io)).size);
+                try std.testing.expectEqual(length, (try file.file.stat(native_platform.testing.io)).size);
             }
             try std.testing.expect((try file.check()).valid);
             if (exhausted) break;
@@ -13536,7 +13538,7 @@ test "lite namespace index migrates legacy v3 directories atomically and preserv
         defer a.free(old_value);
         try std.testing.expectEqualStrings("old", old_value);
         file.close();
-        file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        file = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         try file.putDocument(&long_key, "updated");
         try std.testing.expect((try file.check()).valid);
         _ = try file.vacuum();
@@ -13546,11 +13548,11 @@ test "lite namespace index migrates legacy v3 directories atomically and preserv
 
 test "lite indexed namespace directory allocation failures release keys exactly once" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-load-oom.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -13578,11 +13580,11 @@ test "lite indexed namespace directory allocation failures release keys exactly 
 test "lite value windows cache requested pages and retain warm extent metadata" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |metadata_only| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "value-window-cache.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         file.page_cache_policy = if (metadata_only) .metadata_only else .normal;
@@ -13621,11 +13623,11 @@ test "lite value windows cache requested pages and retain warm extent metadata" 
 test "lite extent read ahead bounds bytes across fragmented appends and ranges" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |fragmented| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "fragmented-read.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         const value = try a.alloc(u8, 1024 * 1024);
@@ -13655,11 +13657,11 @@ test "lite extent read ahead bounds bytes across fragmented appends and ranges" 
 test "lite chain read ahead learns adjacency and resets at gaps" {
     const a = std.testing.allocator;
     for ([_]u64{ 1, 3 }) |stride| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "chain-read-locality.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var ids: [128]u64 = undefined;
@@ -13682,12 +13684,12 @@ test "lite chain read ahead learns adjacency and resets at gaps" {
 
 test "lite inline namespace cache survives hot commits and rolls back promotion" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "inline-cache.aflite");
     defer a.free(path);
     var counter = std.testing.FailingAllocator.init(a, .{});
-    var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(counter.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -13715,7 +13717,7 @@ test "lite inline namespace cache survives hot commits and rolls back promotion"
     try std.testing.expectEqual(@as(u32, 32), file.namespace_directory_cache.count());
     try std.testing.expect((try file.check()).valid);
     file.close();
-    file = try NativeFile.openWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+    file = try NativeFile.openWithIo(counter.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
     try file.putDocument("extra\x00key", "committed");
     try std.testing.expectEqual(@as(u32, 0), file.namespace_directory_cache.count());
     try std.testing.expect((try file.check()).valid);
@@ -13723,11 +13725,11 @@ test "lite inline namespace cache survives hot commits and rolls back promotion"
 
 test "lite inline namespace cache prepares ownership before publication under OOM" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "inline-cache-oom.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     try file.putDocument("old\x00key", "before");
@@ -13770,11 +13772,11 @@ test "lite inline namespace cache prepares ownership before publication under OO
 
 test "lite namespace batch reads share tree paths and physically regroup packed records" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-batch-reads.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -13796,7 +13798,7 @@ test "lite namespace batch reads share tree paths and physically regroup packed 
         try file.putDocumentBatch(group);
     }
     file.close();
-    file = try NativeFile.openWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    file = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     file.page_cache_enabled.store(false, .monotonic);
     const cold_before = file.test_page_reads.load(.monotonic);
     try file.putDocumentBatch(batch);
@@ -13812,12 +13814,12 @@ test "lite namespace batch reads share tree paths and physically regroup packed 
 
 test "lite namespace batch tracking memory depends on namespaces not documents" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "namespace-batch-memory.aflite");
     defer a.free(path);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-    var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -13841,16 +13843,16 @@ test "lite namespace batch tracking memory depends on namespaces not documents" 
 test "lite namespace batch resolution preserves mutation order and aborts allocation failures" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |packed_records| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "namespace-batch-ownership.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.header.packed_records = packed_records;
         var header: [header_size]u8 = undefined;
         encodeHeader(&header, file.header);
-        try file.file.writePositionalAll(std.testing.io, &header, 0);
+        try file.file.writePositionalAll(native_platform.testing.io, &header, 0);
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -13861,7 +13863,7 @@ test "lite namespace batch resolution preserves mutation order and aborts alloca
         try file.putDocumentBatch(seed);
         try file.putDocumentBatch(&.{ .{ .key = "plain", .value = "old" }, .{ .key = &long_key, .value = "old" } });
         const pinned = file.activeCheckpoint();
-        const size = (try file.file.stat(std.testing.io)).size;
+        const size = (try file.file.stat(native_platform.testing.io)).size;
         const mutations = [_]DocumentMutation{
             .{ .key = seed[5].key, .value = "intermediate" },
             .{ .key = "added\x00key", .value = "first" },
@@ -13893,7 +13895,7 @@ test "lite namespace batch resolution preserves mutation order and aborts alloca
             }
             file.abortTransaction();
             try std.testing.expectEqualDeep(pinned, file.activeCheckpoint());
-            try std.testing.expectEqual(size, (try file.file.stat(std.testing.io)).size);
+            try std.testing.expectEqual(size, (try file.file.stat(native_platform.testing.io)).size);
             if (exhausted) break;
         }
         try std.testing.expect(exhausted);
@@ -13918,13 +13920,13 @@ test "lite namespace batch resolution preserves mutation order and aborts alloca
 
 test "lite index views bound batch and cursor allocations and reuse seek buffers" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/reads.aflite", .{tmp.sub_path});
     defer a.free(path);
     var counter = std.testing.FailingAllocator.init(a, .{});
     const alloc = counter.allocator();
-    var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -13980,14 +13982,14 @@ test "lite index views bound batch and cursor allocations and reuse seek buffers
 test "lite index views resolve namespace snapshots without loading unrelated heads" {
     const a = std.testing.allocator;
     for ([_]usize{ 64, 4096, 16384 }) |count| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/snapshot.aflite", .{tmp.sub_path});
         defer a.free(path);
         var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
         var counter = std.testing.FailingAllocator.init(budget.allocator(), .{});
         const alloc = counter.allocator();
-        var file = try NativeFile.createWithIo(alloc, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(alloc, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -14021,16 +14023,16 @@ test "lite index views resolve namespace snapshots without loading unrelated hea
 test "lite index views preserve packed and unpacked overflow reads through OOM and retry" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |packed_records| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "view-overflow-oom.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.header.packed_records = packed_records;
         var header: [header_size]u8 = undefined;
         encodeHeader(&header, file.header);
-        try file.file.writePositionalAll(std.testing.io, &header, 0);
+        try file.file.writePositionalAll(native_platform.testing.io, &header, 0);
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -14141,11 +14143,11 @@ test "lite index views reject malformed slot layouts before exposing borrowed ke
 test "lite scan integrity scales with packed pages for documents and namespaces" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |many_namespaces| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "scan-integrity.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -14166,11 +14168,11 @@ test "lite scan integrity scales with packed pages for documents and namespaces"
 
 test "lite scan integrity resolves collisions and rejects stale missing and extra references" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "scan-collisions.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     const Runner = struct {
@@ -14215,12 +14217,12 @@ test "lite scan integrity resolves collisions and rejects stale missing and extr
 test "lite sorted editor bounds update and deletion heap across tree heights" {
     const a = std.testing.allocator;
     for ([_]usize{ 16384, 65536 }) |count| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "sorted-budget.aflite");
         defer a.free(path);
         var budget = MaintenanceTestAllocator{ .backing = a };
-        var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -14252,11 +14254,11 @@ test "lite sorted editor bounds update and deletion heap across tree heights" {
 test "lite sorted editor mixed widths duplicates sparse writes and rollback preserve roots" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |packed_records| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "sorted-mixed.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.header.packed_records = packed_records;
         file.page_cache_enabled.store(false, .monotonic);
@@ -14308,11 +14310,11 @@ test "lite sorted editor mixed widths duplicates sparse writes and rollback pres
 
 test "lite sorted editor releases ownership on every allocation failure" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "sorted-oom.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -14376,11 +14378,11 @@ test "lite sorted editor releases ownership on every allocation failure" {
 
 test "lite scan integrity allocation failures preserve reusable file state" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "scan-oom.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     try file.putDocumentBatch(&.{ .{ .key = "a", .value = "old" }, .{ .key = "b", .value = "old" }, .{ .key = "c", .value = "old" } });
@@ -14399,12 +14401,12 @@ test "lite scan integrity allocation failures preserve reusable file state" {
 
 test "lite single key edits retain arena allocation bounds" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "single-key-allocations.aflite");
     defer a.free(path);
     var counter = std.testing.FailingAllocator.init(a, .{});
-    var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(counter.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     const before = counter.alloc_index;
@@ -14420,11 +14422,11 @@ test "lite single key edits retain arena allocation bounds" {
 
 test "lite addressed writes retain late-page runs and poison partial flush failures" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "addressed-writes.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     const first = file.activeCheckpoint().page_count;
     var batch = PageWriteBatch{ .file = &file };
@@ -14440,7 +14442,7 @@ test "lite addressed writes retain late-page runs and poison partial flush failu
     try std.testing.expectEqual(@as(u64, 2), file.test_page_write_calls.load(.monotonic) - calls);
     var raw: [default_page_size]u8 = undefined;
     for (0..24) |i| {
-        try readExactAt(file.file, std.testing.io, &raw, (first + i) * default_page_size);
+        try readExactAt(file.file, native_platform.testing.io, &raw, (first + i) * default_page_size);
         try std.testing.expectEqualStrings(if (i == 8) "latest" else "ready", try decodePagePayload(&raw, .data));
     }
     var failing = PageWriteBatch{ .file = &file };
@@ -14450,7 +14452,7 @@ test "lite addressed writes retain late-page runs and poison partial flush failu
     try std.testing.expectError(error.TestPageWriteFailure, failing.flush());
     file.test_page_write_fail_after = null;
     // The first run reached disk, but none of this failed flush is admitted.
-    try readExactAt(file.file, std.testing.io, &raw, (first + 32) * default_page_size);
+    try readExactAt(file.file, native_platform.testing.io, &raw, (first + 32) * default_page_size);
     try std.testing.expectEqualStrings("first run", try decodePagePayload(&raw, .data));
     try std.testing.expect(!file.page_cache.pages.contains(first + 32));
     try std.testing.expect(!file.page_cache.pages.contains(first + 34));
@@ -14463,11 +14465,11 @@ test "lite addressed writes retain late-page runs and poison partial flush failu
 test "lite addressed writes coalesce sorted document and catalog updates" {
     const a = std.testing.allocator;
     inline for ([_]bool{ false, true }) |catalog| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "sorted-write-calls.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -14490,12 +14492,12 @@ test "lite sorted initial ingest bounds heap independently of input length" {
     const a = std.testing.allocator;
     for ([_]usize{ 16384, 131072 }) |count| {
         for ([_]bool{ false, true }) |grouped| {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = native_platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try testPath(a, tmp, "stream-initial-budget.aflite");
             defer a.free(path);
             var budget = MaintenanceTestAllocator{ .backing = a };
-            var file = try NativeFile.createWithIo(budget.allocator(), std.testing.io, path, .{ .no_sync = true });
+            var file = try NativeFile.createWithIo(budget.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
             defer file.close();
             file.page_cache_enabled.store(false, .monotonic);
             var arena = std.heap.ArenaAllocator.init(a);
@@ -14523,11 +14525,11 @@ test "lite sorted initial ingest preserves duplicate tombstones and unsorted fal
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |packed_records| {
         for ([_]bool{ false, true }) |sorted| {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = native_platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try testPath(a, tmp, "stream-initial-groups.aflite");
             defer a.free(path);
-            var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+            var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
             defer file.close();
             file.header.packed_records = packed_records;
             file.page_cache_enabled.store(false, .monotonic);
@@ -14565,11 +14567,11 @@ test "lite sorted initial ingest preserves duplicate tombstones and unsorted fal
 
 test "lite sorted initial ingest allocation and partial write failures roll back" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "stream-initial-failures.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -14619,12 +14621,12 @@ test "lite sorted initial ingest allocation and partial write failures roll back
 test "lite index snapshots ignore overwritten history with bounded reads and allocations" {
     const a = std.testing.allocator;
     for ([_]usize{ 1, 4096, 16384 }) |count| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "live-snapshot-bound.aflite");
         defer a.free(path);
         var counter = std.testing.FailingAllocator.init(a, .{});
-        var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(counter.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         const batch = try a.alloc(DocumentMutation, count);
@@ -14646,11 +14648,11 @@ test "lite index snapshots ignore overwritten history with bounded reads and all
 
 test "lite index snapshots preserve pinned external values through allocation failures" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "live-snapshot-ownership.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     file.page_cache_enabled.store(false, .monotonic);
     const large = @as([16384]u8, @splat('v'));
@@ -14670,7 +14672,7 @@ test "lite index snapshots preserve pinned external values through allocation fa
             try std.testing.expectEqualStrings("old", docs[1].value);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, pinned });
+    try native_platform.allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, pinned });
     const current = try file.snapshotDocumentsWithPrefixAlloc(a, "ns\x00");
     defer NativeFile.freeSnapshotDocuments(a, current);
     try std.testing.expectEqual(@as(usize, 1), current.len);
@@ -14693,12 +14695,12 @@ test "lite index snapshots preserve pinned external values through allocation fa
 test "lite ingest scratch and bulk key storage bound allocation churn" {
     const a = std.testing.allocator;
     for ([_]usize{ 16384, 65536 }) |count| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "ingest-allocation-churn.aflite");
         defer a.free(path);
         var counter = std.testing.FailingAllocator.init(a, .{});
-        var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(counter.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -14716,12 +14718,12 @@ test "lite ingest scratch and bulk key storage bound allocation churn" {
 test "lite record encoding scratch is shared across catalog and document writes" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |packed_records| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "record-encoding-scratch.aflite");
         defer a.free(path);
         var counter = std.testing.FailingAllocator.init(a, .{});
-        var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(counter.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var pages = try file.pageAllocatorFromFreeMap(file.activeCheckpoint());
@@ -14762,12 +14764,12 @@ test "lite record encoding scratch is shared across catalog and document writes"
 test "lite materialized snapshots group scattered pages and own each key once" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |scattered| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "snapshot-locality.aflite");
         defer a.free(path);
         var counter = std.testing.FailingAllocator.init(a, .{});
-        var file = try NativeFile.createWithIo(counter.allocator(), std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(counter.allocator(), native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -14798,11 +14800,11 @@ test "lite materialized snapshots group scattered pages and own each key once" {
 test "lite grouped snapshots preserve allocator ownership pinned values and mixed legacy tombstones" {
     const a = std.testing.allocator;
     for ([_]bool{ false, true }) |packed_records| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "snapshot-mixed-ownership.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.header.packed_records = packed_records;
         file.page_cache_enabled.store(false, .monotonic);
@@ -14840,7 +14842,7 @@ test "lite grouped snapshots preserve allocator ownership pinned values and mixe
                 try std.testing.expectEqualStrings("d", docs[2].key);
             }
         };
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, pinned });
+        try native_platform.allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, pinned });
         var output_budget = MaintenanceTestAllocator{ .backing = a };
         const docs = try file.snapshotDocumentsWithPrefixAtCheckpointAlloc(output_budget.allocator(), "", pinned);
         NativeFile.freeSnapshotDocuments(output_budget.allocator(), docs);
@@ -14855,11 +14857,11 @@ test "lite grouped snapshots preserve allocator ownership pinned values and mixe
 test "lite validated index views bound warm point work and preserve checkpoint results" {
     const a = std.testing.allocator;
     for ([_]bool{ true, false }) |packed_records| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "validated-views.aflite");
         defer a.free(path);
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         file.header.packed_records = packed_records;
         var arena = std.heap.ArenaAllocator.init(a);
@@ -14900,11 +14902,11 @@ test "lite validated index views bound warm point work and preserve checkpoint r
 
 test "lite validated index views retain evicted pins and account replacement storage" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "pinned-view.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     try file.putDocument("key", "value");
     const checkpoint = file.activeCheckpoint();
@@ -14937,11 +14939,11 @@ test "lite validated index views retain evicted pins and account replacement sto
 
 test "lite validated index views bypass integrity checks and support overflow keys" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "overflow-view.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
     defer file.close();
     var key: [600]u8 = @splat('x');
     var other: [600]u8 = @splat('y');
@@ -14967,7 +14969,7 @@ test "lite validated index views bypass integrity checks and support overflow ke
 test "lite validated index views survive concurrent overflow reads and eviction" {
     if (builtin.single_threaded) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "concurrent-views.aflite");
     defer a.free(path);
@@ -15034,11 +15036,11 @@ test "lite validated index views release residency under shared hard pressure" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
     budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 8192, .hard_limit_bytes = 16384 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "view-pressure.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
     defer file.close();
     try file.putDocument("key", "value");
     const checkpoint = file.activeCheckpoint();
@@ -15058,12 +15060,12 @@ test "lite validated index views release residency under shared hard pressure" {
 
 test "lite allocator v4 compact estimates match long keys values and migration" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "long-key-estimate.aflite");
     defer a.free(path);
     for ([_]bool{ false, true }) |source_indexed| {
-        var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = source_indexed, .no_sync = true });
+        var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = source_indexed, .no_sync = true });
         defer file.close();
         file.vacuum_target_indexed = true;
         var key: [1024]u8 = @splat('k');
@@ -15084,23 +15086,23 @@ test "lite allocator v4 compact estimates match long keys values and migration" 
 
 test "lite allocator v4 failed replacement create preserves original" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "review-create-replacement.aflite");
     defer a.free(path);
     for (0..96) |fail_index| {
         {
-            var original = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+            var original = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
             defer original.close();
             try original.putDocument("original", "must survive failed create");
         }
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
-        if (NativeFile.createWithIo(failing.allocator(), std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true })) |result| {
+        if (NativeFile.createWithIo(failing.allocator(), native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true })) |result| {
             var created = result;
             created.close();
         } else |err| {
             if (err != error.OutOfMemory) return err;
-            var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+            var reopened = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .read_only = true });
             defer reopened.close();
             const value = try reopened.getDocumentAlloc(a, "original");
             defer if (value) |bytes| a.free(bytes);
@@ -15111,11 +15113,11 @@ test "lite allocator v4 failed replacement create preserves original" {
 
 test "lite allocator v4 ownership graph cancels within an external value" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "cancel-value-graph.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     const payload = try a.alloc(u8, 256 * 1024);
     defer a.free(payload);
@@ -15139,11 +15141,11 @@ test "lite allocator v4 ownership graph cancels within an external value" {
 
 test "lite allocator v4 metadata chain retirement progresses behind data reader" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "metadata-chain-reader.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     file.retirement_work_pages = 0;
     try file.putDocument("key", "pinned");
@@ -15174,11 +15176,11 @@ test "lite allocator v4 metadata chain retirement progresses behind data reader"
 
 test "lite allocator v4 saturated queue drains with a single object budget" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "saturated-single-budget.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     file.retirement_work_pages = 0;
     const value = try a.alloc(u8, 512 * 1024);
@@ -15205,11 +15207,11 @@ test "lite allocator v4 saturated queue drains with a single object budget" {
 
 test "lite allocator v4 idle metadata advances recovery behind a pinned reader" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "idle-metadata-reader.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     file.retirement_work_pages = 0;
     const pinned = file.activeCheckpoint();
@@ -15234,11 +15236,11 @@ test "lite allocator v4 idle metadata advances recovery behind a pinned reader" 
 
 test "lite allocator v4 completed retirement preserves rollback and fallback bytes" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "retirement-completion-recovery.aflite");
     defer a.free(path);
-    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    var file = try NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
     defer file.close();
     file.retirement_work_pages = 0;
     const value: [8192]u8 = @splat('v');
@@ -15269,7 +15271,7 @@ test "lite allocator v4 completed retirement preserves rollback and fallback byt
     _ = try file.materializeTransactionCheckpoint();
     file.abortTransaction();
     try std.testing.expect((try file.check()).valid);
-    var fallback = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+    var fallback = try NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .read_only = true });
     defer fallback.close();
     fallback.header.active_checkpoint = 1 - fallback.header.active_checkpoint;
     try std.testing.expect((try fallback.check()).valid);
@@ -15277,8 +15279,8 @@ test "lite allocator v4 completed retirement preserves rollback and fallback byt
 
 test "lite allocator v4 external reader waits for in place reclamation lock" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reader-reclamation-lock.aflite");
     defer a.free(path);

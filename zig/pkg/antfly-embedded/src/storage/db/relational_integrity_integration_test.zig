@@ -13,12 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const server_test_adapter = if (builtin.is_test) @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter else struct {};
 const builtin = @import("builtin");
 const hot_standby_publisher_adapter = @import("antfly_server_test_sources").local_test_sources.storage_hot_standby_db_commit;
 const hot_standby_write_gate_adapter = @import("antfly_server_test_sources").local_test_sources.storage_hot_standby_write_gate;
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
+
 const db_mod = @import("db.zig");
 const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
@@ -29,7 +31,7 @@ test "relational integrity authenticated retirement summary survives abort reope
     const retirement = @import("relational_integrity_generation_retirement.zig");
     const summary = @import("retirement_set_summary.zig");
     const admission = @import("relational_integrity_generation_admission.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retirement-summary", .{tmp.sub_path});
     defer alloc.free(path);
@@ -89,7 +91,7 @@ fn retirementSummaryNativeWalBenchmark(batch_size: usize, count: usize) !void {
     const alloc = std.testing.allocator;
     const summary = @import("retirement_set_summary.zig");
     const retirement = @import("relational_integrity_generation_retirement.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var insert_bytes: [2]u64 = undefined;
     var gc_bytes: [2]u64 = undefined;
@@ -99,7 +101,7 @@ fn retirementSummaryNativeWalBenchmark(batch_size: usize, count: usize) !void {
         var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false });
         defer db.close();
         const before = db.snapshotLsmMaintenanceStats().wal_retained_bytes;
-        const started = @import("antfly_platform").time.monotonicNs();
+        const started = native_platform.time.monotonicNs();
         // Identical opaque retirement-sized payloads isolate the additional
         // authenticated-tree storage cost; semantic authority is tested above.
         const payload: [764]u8 = @splat(7);
@@ -123,9 +125,9 @@ fn retirementSummaryNativeWalBenchmark(batch_size: usize, count: usize) !void {
             var read = try db.core.store.beginReadTxn();
             defer read.abort();
             try std.testing.expectEqual(@as(u64, count), (try summary.read(&read)).?.count);
-            const read_started = @import("antfly_platform").time.monotonicNs();
+            const read_started = native_platform.time.monotonicNs();
             for (0..10_000) |_| _ = try summary.read(&read);
-            std.debug.print("retirement summary native point_reads=10000 elapsed_ns={d}\n", .{@import("antfly_platform").time.monotonicNs() -| read_started});
+            std.debug.print("retirement summary native point_reads=10000 elapsed_ns={d}\n", .{native_platform.time.monotonicNs() -| read_started});
         }
         // Replace one batch while keeping the retained-set cardinality stable.
         // This exercises path churn, not only construction and full teardown.
@@ -160,7 +162,7 @@ fn retirementSummaryNativeWalBenchmark(batch_size: usize, count: usize) !void {
             try txn.commit();
         }
         gc_bytes[variant] = db.snapshotLsmMaintenanceStats().wal_retained_bytes -| after_churn;
-        std.debug.print("retirement native WAF variant={d} n={d} batch={d} insert_wal={d} churn_wal={d} gc_wal={d} elapsed_ns={d}\n", .{ variant, count, batch_size, insert_bytes[variant], after_churn -| after_insert, gc_bytes[variant], @import("antfly_platform").time.monotonicNs() -| started });
+        std.debug.print("retirement native WAF variant={d} n={d} batch={d} insert_wal={d} churn_wal={d} gc_wal={d} elapsed_ns={d}\n", .{ variant, count, batch_size, insert_bytes[variant], after_churn -| after_insert, gc_bytes[variant], native_platform.time.monotonicNs() -| started });
     }
     try std.testing.expect(insert_bytes[0] > 0 and gc_bytes[0] > 0);
     // Guard against accidentally persisting the full 128-level sparse path.
@@ -184,7 +186,7 @@ test "relational integrity retirement summary native WAL amplification benchmark
 
 test "self-FK dual owner preserves one admission fence across begin stage and activation restarts" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/self-fk-dual-midphase", .{tmp.sub_path});
     defer alloc.free(path);
@@ -275,7 +277,7 @@ test "self-FK dual owner preserves one admission fence across begin stage and ac
 
 test "self-FK owner retains one fence through parent ACK and atomic child install across restart" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/self-fk-dual-owner", .{tmp.sub_path});
     defer alloc.free(path);
@@ -492,7 +494,7 @@ test "self-FK owner retains one fence through parent ACK and atomic child instal
 
 test "initial partial FK parent support remains unready until every owner index survives restart" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-partial-parent", .{tmp.sub_path});
     defer alloc.free(path);
@@ -554,7 +556,7 @@ test "initial partial FK parent support remains unready until every owner index 
 
 test "child FK generation schema install commits catalog and source release with Raft marker" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-generation-child", .{tmp.sub_path});
     defer alloc.free(path);
@@ -712,7 +714,7 @@ test "child FK generation schema install commits catalog and source release with
 
 test "initial FK child owner stays hidden across restart until replicated release" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-initial-child", .{tmp.sub_path});
     defer alloc.free(path);
@@ -900,7 +902,7 @@ test "initial FK child owner stays hidden across restart until replicated releas
 
 test "initial FK bootstrap denies direct writes before first Raft provision and survives reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-bootstrap", .{tmp.sub_path});
     defer alloc.free(path);
@@ -936,7 +938,7 @@ test "initial FK bootstrap denies direct writes before first Raft provision and 
 
 test "parent FK generation owner stages default-deny, activates atomically, and fences until metadata ACK" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-generation-parent", .{tmp.sub_path});
     defer alloc.free(path);
@@ -1035,7 +1037,7 @@ test "parent FK generation owner stages default-deny, activates atomically, and 
 
 test "relational integrity TRUNCATE parent pending generations survive restart and reject changed replay" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/truncate-parent", .{tmp.sub_path});
     defer alloc.free(path);
@@ -1095,7 +1097,7 @@ test "relational integrity TRUNCATE parent pending generations survive restart a
 
 test "relational integrity accepted generation survives restart and bounded two-phase GC never resurrects references" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retired-parent", .{tmp.sub_path});
     defer alloc.free(path);
@@ -1316,7 +1318,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
     const alloc = std.testing.allocator;
     const row_count = 600;
     const restore = @import("restore_staging.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1370,7 +1372,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
                     // Model the last physical projection watermark being
                     // lost at the crash cut while the primary Raft/HA receipt
                     // remains durable. Replay must restore this local proof.
-                    try @import("derived/apply_state.zig").clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, target.core.store, target.core.applied_sequence_checkpoint_path, "text");
+                    try @import("derived/apply_state.zig").clearAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, target.core.store, target.core.applied_sequence_checkpoint_path, "text");
                     // Import replay is intentionally idempotent; its durable
                     // receipt cannot falsely imply projections caught up.
                     const debt = try target.listDerivedReplayDebt(alloc);
@@ -1455,7 +1457,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
 test "relational integrity topology durable backup metadata scaling benchmark" {
     const alloc = std.testing.allocator;
     const lsm = @import("../lsm_backend.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const Case = struct { runs: usize, bytes: usize };
     for ([_]Case{ .{ .runs = 8, .bytes = 64 * 1024 }, .{ .runs = 8, .bytes = 1024 * 1024 }, .{ .runs = 64, .bytes = 64 * 1024 } }, 0..) |case, case_id| {
@@ -1476,17 +1478,17 @@ test "relational integrity topology durable backup metadata scaling benchmark" {
             try txn.put(.{}, try std.fmt.bufPrint(&key_buf, "row-{d:0>6}", .{row}), value);
             try txn.commit();
         }
-        const started = std.Io.Clock.awake.now(std.testing.io);
+        const started = std.Io.Clock.awake.now(native_platform.testing.io);
         var checkpoint = try backend.pinNativeCheckpoint();
         defer checkpoint.deinit();
-        const bytes = try checkpoint.seal(std.testing.io, target, .none);
-        const elapsed = started.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+        const bytes = try checkpoint.seal(native_platform.testing.io, target, .none);
+        const elapsed = started.durationTo(std.Io.Clock.awake.now(native_platform.testing.io)).toNanoseconds();
         // File identity proves the measured path does not accidentally copy
         // corpus bytes; timings are diagnostic rather than flaky assertions.
         const linked = try std.fmt.allocPrint(alloc, "{s}/runs/{d}.tbl", .{ target, checkpoint.run_ids[0] });
         defer alloc.free(linked);
-        const before = try @import("native_backup.zig").statRegularFile(std.testing.io, checkpoint.run_paths[0]);
-        const after = try @import("native_backup.zig").statRegularFile(std.testing.io, linked);
+        const before = try @import("native_backup.zig").statRegularFile(native_platform.testing.io, checkpoint.run_paths[0]);
+        const after = try @import("native_backup.zig").statRegularFile(native_platform.testing.io, linked);
         try std.testing.expectEqual(before.inode, after.inode);
         std.debug.print("\nbackup durable seal benchmark runs={} corpus_bytes={} metadata_ns={}\n", .{ checkpoint.run_ids.len, bytes, elapsed });
     }
@@ -1495,7 +1497,7 @@ test "relational integrity topology durable backup metadata scaling benchmark" {
 test "relational integrity topology durable backup seal survives restart and later writes" {
     const alloc = std.testing.allocator;
     const seal = @import("native_backup_seal.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/seal-source", .{tmp.sub_path});
     defer alloc.free(path);
@@ -1508,9 +1510,9 @@ test "relational integrity topology durable backup seal survives restart and lat
         const identity = try db.relationalTopologyIdentity();
         const fence: @import("relational_integrity_topology.zig").Fence = .{ .role = .backup_snapshot, .transition_id = 900, .attempt = 1, .peer_group_id = 701, .owner_group_id = 701, .admission_epoch = identity.next_epoch, .namespace = identity.namespace, .catalog_digest = identity.catalog_digest };
         try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .begin }, null);
-        const seal_start = std.Io.Clock.awake.now(std.testing.io);
+        const seal_start = std.Io.Clock.awake.now(native_platform.testing.io);
         handle = try db.sealBackupCohort("attempt", fence, .none);
-        std.debug.print("\nbackup seal DB fence-hold ns={}\n", .{seal_start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds()});
+        std.debug.print("\nbackup seal DB fence-hold ns={}\n", .{seal_start.durationTo(std.Io.Clock.awake.now(native_platform.testing.io)).toNanoseconds()});
         const repeated = try db.sealBackupCohort("attempt-retry", fence, .none);
         try std.testing.expectEqualSlices(u8, &handle.digest, &repeated.digest);
         try db.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
@@ -1552,7 +1554,7 @@ test "relational integrity topology durable backup seal survives restart and lat
         }
         const pin = try seal.pathAlloc(alloc, path, handle.fence);
         defer alloc.free(pin);
-        var opened = try seal.open(alloc, std.testing.io, pin, handle);
+        var opened = try seal.open(alloc, native_platform.testing.io, pin, handle);
         defer opened.deinit();
         try std.testing.expect(opened.parsed.value.files.len > 0);
         var wrong = handle;
@@ -1606,7 +1608,7 @@ test "relational integrity portable decoder resumes bounded row pages across LSM
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
     const decoded_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/decoded", .{tmp.sub_path});
@@ -1640,18 +1642,18 @@ test "relational integrity portable decoder resumes bounded row pages across LSM
     try source.applyRelationalTopologyControl(.{ .fence = fence, .action = .release }, null);
     const portable = @import("../portable_backup.zig");
     const proof: portable.CohortProof = .{ .seal = handle, .namespace = namespace };
-    var file = try std.Io.Dir.cwd().createFile(std.testing.io, file_path, .{ .read = true });
-    defer file.close(std.testing.io);
+    var file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, file_path, .{ .read = true });
+    defer file.close(native_platform.testing.io);
     var buffer: [65536]u8 = undefined;
-    var writer = file.writer(std.testing.io, &buffer);
+    var writer = file.writer(native_platform.testing.io, &buffer);
     try source.exportBackupCohortPortable(handle, &writer.interface, .{}, .none);
     try writer.end();
-    try file.sync(std.testing.io);
-    const size = (try file.stat(std.testing.io)).size;
+    try file.sync(native_platform.testing.io);
+    const size = (try file.stat(native_platform.testing.io)).size;
     var calls: usize = 0;
     while (calls < 200) : (calls += 1) {
         var options = @import("config.zig").portable_decoder_lsm_options_default;
-        options.read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(std.testing.io);
+        options.read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(native_platform.testing.io);
         var backend = try @import("../lsm_backend.zig").Backend.open(alloc, decoded_path, options);
         // Exactly the private decoder policy: each page's explicit sync, not
         // commit-time sync or graceful-close flushing, protects its checkpoint.
@@ -1659,12 +1661,12 @@ test "relational integrity portable decoder resumes bounded row pages across LSM
         var store = try @import("../docstore.zig").DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{ .name = "docs" }));
         defer store.close();
         const flushes_before = backend.write_stats.flushes;
-        const done = try portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(7), 17, .none);
+        const done = try portable.importCohortFilePage(alloc, &store, native_platform.testing.io, file, size, proof, @splat(7), 17, .none);
         try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_sync_records);
         try std.testing.expectEqual(flushes_before, backend.write_stats.flushes);
-        try std.testing.expectError(error.RestoreStagingScopeChanged, portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(8), 17, .none));
+        try std.testing.expectError(error.RestoreStagingScopeChanged, portable.importCohortFilePage(alloc, &store, native_platform.testing.io, file, size, proof, @splat(8), 17, .none));
         if (done) {
-            try std.testing.expect(try portable.importCohortFilePage(alloc, &store, std.testing.io, file, size, proof, @splat(7), 17, .none));
+            try std.testing.expect(try portable.importCohortFilePage(alloc, &store, native_platform.testing.io, file, size, proof, @splat(7), 17, .none));
             try @import("doc_identity.zig").validatePrimaryDocumentCoverageAlloc(alloc, &store);
             const stats = try @import("doc_identity.zig").fullStatsFromStore(&store);
             try std.testing.expectEqual(@as(u64, 300), stats.live_ordinals);
@@ -1715,7 +1717,7 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
     const restore = @import("restore_staging.zig");
     const primary_mod = @import("antfly_server_test_sources").local_test_sources.storage_hot_standby_primary;
     const effects = @import("replication_effects.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1793,7 +1795,7 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     const alloc = std.testing.allocator;
     const primary_mod = @import("antfly_server_test_sources").local_test_sources.storage_hot_standby_primary;
     const effects = @import("replication_effects.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1895,7 +1897,7 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
 
 test "relational integrity DB transactions atomically preserve cross-table parent dependencies" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var parent_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const parent_path = try std.fmt.bufPrint(&parent_path_buf, ".zig-cache/tmp/{s}/parent", .{tmp.sub_path});
@@ -2018,7 +2020,7 @@ fn activateOnePage(db: *db_mod.DB, txn_byte: u8) !bool {
 test "relational integrity topology quiesces new work while old decisions drain and resumes after release" {
     const alloc = std.testing.allocator;
     const topology = @import("relational_integrity_topology.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fenced", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2084,7 +2086,7 @@ test "relational integrity topology handoff transfers routed companions with res
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
     const destination_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/destination", .{tmp.sub_path});
@@ -2210,7 +2212,7 @@ test "relational integrity resolves private keys on non-first logical owner" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/owner", .{tmp.sub_path});
     var db = try db_mod.DB.open(alloc, path, .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 970, .shard_id = 971 }, .primary_backend = .{ .lsm = .{} } });
@@ -2272,7 +2274,7 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
     const destination_path = try std.fmt.allocPrint(owned, ".zig-cache/tmp/{s}/destination", .{tmp.sub_path});
@@ -2428,7 +2430,7 @@ fn verifyMergeReplicationReplay(primary: *@import("antfly_server_test_sources").
 test "relational integrity historical restore stays fenced while coherent HA seed preserves namespace" {
     const alloc = std.testing.allocator;
     const lifecycle = @import("generation_lifecycle.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
     defer alloc.free(source_path);
@@ -2468,7 +2470,7 @@ test "relational integrity historical restore stays fenced while coherent HA see
 test "relational integrity DB activation backfills atomically gates writers and resumes after restart" {
     const alloc = std.testing.allocator;
     const activation = @import("relational_integrity_activation.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/database", .{tmp.sub_path});

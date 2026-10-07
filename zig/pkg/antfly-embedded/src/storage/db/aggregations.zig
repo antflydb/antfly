@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 pub const contract = @import("aggregations_contract.zig");
 const types = @import("types.zig");
@@ -8555,12 +8557,12 @@ test "significant_terms can use distributed background stats without a local tex
 
 test "significant_terms local background stats use postings without stored index source" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const relative_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -8632,7 +8634,7 @@ test "significant_terms local background stats use postings without stored index
 
 test "significant_terms uses the configured field analyzer for foreground and background" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/configured-analyzer", .{tmp.sub_path});

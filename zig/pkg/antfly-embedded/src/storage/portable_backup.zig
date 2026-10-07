@@ -13,10 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 
 const backup_codec = @import("backup_codec.zig");
 const backup_bundle = @import("backup_bundle.zig");
@@ -3686,7 +3688,7 @@ test "portable archive accepts long history with a bounded decoded working set" 
     // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var source_tmp = @import("../common/test_directory.zig").fastTmpDir(.{});
     defer source_tmp.cleanup();
     var source = try openTestStore(alloc, &source_tmp);
@@ -3817,9 +3819,9 @@ fn validateSourceProofBatch(alloc: Allocator, payload: []const u8, archive: *Por
 test "ordered artifact inventory source proof export restores inert selected evidence" {
     const alloc = std.testing.allocator;
     const publication = @import("db/artifact_publication.zig");
-    var source_tmp = std.testing.tmpDir(.{});
+    var source_tmp = native_platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
-    var destination_tmp = std.testing.tmpDir(.{});
+    var destination_tmp = native_platform.testing.tmpDir(.{});
     defer destination_tmp.cleanup();
     var source = try openTestStore(alloc, &source_tmp);
     defer source.close();
@@ -4018,7 +4020,7 @@ fn validateAndImportDocumentEntries(alloc: Allocator, store: *DocStore, entries:
 test "relational index system portable empty catalog admits no retired claims or activation authority" {
     const alloc = std.testing.allocator;
     const catalog_mod = @import("db/relational_integrity_catalog.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(alloc, &tmp);
     defer store.close();
@@ -4054,7 +4056,7 @@ test "relational index system portable empty catalog admits no retired claims or
 
 test "relational index system source snapshot certificate survives transfer restart and rejects late failure" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const DB = @import("db/mod.zig").DB;
     const retained = @import("retained_effects.zig");
     const native = @import("db/native_backup.zig");
@@ -4248,7 +4250,7 @@ test "relational index system portable duplicate rows preserve partial membershi
         }
     };
     inline for (.{ false, true }) |separate_batches| {
-        var destination_tmp = std.testing.tmpDir(.{});
+        var destination_tmp = native_platform.testing.tmpDir(.{});
         defer destination_tmp.cleanup();
         var destination = try openTestStore(alloc, &destination_tmp);
         defer destination.close();
@@ -5222,9 +5224,9 @@ fn decodeEdgeBatch(alloc: Allocator, data: []const u8) !struct {
 // Tests
 // ============================================================================
 
-fn openTestStore(alloc: Allocator, tmp: *std.testing.TmpDir) !DocStore {
+fn openTestStore(alloc: Allocator, tmp: *native_platform.testing.TmpDir) !DocStore {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path_len = try tmp.dir.realPath(native_platform.testing.io, &path_buf);
     const path = path_buf[0..path_len];
     const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
@@ -5242,7 +5244,7 @@ fn freeAllocatedKVPairs(alloc: Allocator, pairs: *std.ArrayListUnmanaged(KVPair)
 test "portable backup round trips relational rows and schema metadata" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -5302,7 +5304,7 @@ test "portable backup round trips relational rows and schema metadata" {
     // avoiding a second store scan while preserving byte-for-byte output.
     const spool_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable.spool", .{tmp_src.sub_path});
     defer alloc.free(spool_path);
-    var spool_io_impl = std.Io.Threaded.init(alloc, .{});
+    var spool_io_impl = native_platform.Threaded.init(alloc, .{});
     defer spool_io_impl.deinit();
     const spool_io = spool_io_impl.io();
     var spool_file = try std.Io.Dir.cwd().createFile(spool_io, spool_path, .{ .read = true, .truncate = true });
@@ -5321,7 +5323,7 @@ test "portable backup round trips relational rows and schema metadata" {
     try std.testing.expectEqual(@as(u64, 5), spooled_stats.excluded_namespace_seeks);
     try std.testing.expect(spooled_stats.data_cursor_entries <= 7);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -5356,7 +5358,7 @@ test "portable backup round trips relational rows and schema metadata" {
     defer alloc.free(legacy_key);
     try std.testing.expectError(error.NotFound, dst.get(alloc, legacy_key));
 
-    var tmp_cancelled = std.testing.tmpDir(.{});
+    var tmp_cancelled = native_platform.testing.tmpDir(.{});
     defer tmp_cancelled.cleanup();
     var cancelled_dst = try openTestStore(alloc, &tmp_cancelled);
     defer cancelled_dst.close();
@@ -5383,7 +5385,7 @@ test "portable relational index metadata validates ordered ownership checksums a
         .storage_mode = .relational,
         .relational_columns = &.{.{ .name = "id", .path = "id", .column_type = .integer }},
     };
-    var registry = try @import("db/schema_registry.zig").Registry.initCloned(alloc, std.testing.io, schema);
+    var registry = try @import("db/schema_registry.zig").Registry.initCloned(alloc, native_platform.testing.io, schema);
     defer registry.deinit();
     var view = registry.acquire().?;
     defer view.release();
@@ -5434,7 +5436,7 @@ test "portable relational index metadata validates ordered ownership checksums a
         try validateMetadataEntries(alloc, &.{.{ .key = storage_schema.schema_key, .value = encoded }}, &archive);
         try std.testing.expectError(error.InvalidMetadataBatch, archive.finish(alloc));
     }
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(alloc, &tmp);
     defer store.close();
@@ -5544,7 +5546,7 @@ test "relational restore plans retain root-sensitive validation" {
 
 test "complete relational database image requires its public schema contract" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(alloc, &tmp);
     defer store.close();
@@ -5567,7 +5569,7 @@ test "complete relational database image requires its public schema contract" {
 
 test "portable backup refuses retained retirement and topology authority without a catalog" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(alloc, &tmp);
     defer store.close();
@@ -5663,7 +5665,7 @@ test "portable accepted-generation proof requires a sealed v3 reader and canonic
 test "portable accepted-generation proof page reads only canonical sealed decoder metadata" {
     const alloc = std.testing.allocator;
     const empty_summary_digest = try sourceGenerationAdmissionSummaryDigest(.{ .table_id = 10, .shard_id = 20, .range_id = 20 }, &.{});
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(alloc, &tmp);
     defer store.close();
@@ -5736,7 +5738,7 @@ test "portable accepted-generation proof page reads only canonical sealed decode
 
 test "complete database image rejects a public document schema without runtime schema" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(alloc, &tmp);
     defer store.close();
@@ -5818,7 +5820,7 @@ test "portable backup binds relational rows to archived runtime and public schem
     const invalid_row = try relational_store.encodeValueForSchemaAlloc(alloc, "{\"id\":\"a\",\"status\":\"inactive\"}", derived_schema);
     defer alloc.free(invalid_row);
     {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         var store = try openTestStore(alloc, &tmp);
         defer store.close();
@@ -5842,7 +5844,7 @@ test "portable backup binds relational rows to archived runtime and public schem
     }
 
     {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         var store = try openTestStore(alloc, &tmp);
         defer store.close();
@@ -5864,7 +5866,7 @@ test "portable backup binds relational rows to archived runtime and public schem
     const mismatched_runtime = try storage_schema.serializeSchema(alloc, mismatched_schema);
     defer alloc.free(mismatched_runtime);
     {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         var store = try openTestStore(alloc, &tmp);
         defer store.close();
@@ -5954,7 +5956,7 @@ fn readTestPortableBaseBlob(
 
 test "exportPortable empty store" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try openTestStore(alloc, &tmp);
     defer store.close();
@@ -5972,7 +5974,7 @@ test "exportPortable empty store" {
 test "export and import documents round trip" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -5997,7 +5999,7 @@ test "export and import documents round trip" {
     try exportPortable(alloc, &src, &out);
 
     // Import into fresh store
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6016,7 +6018,7 @@ test "export and import documents round trip" {
     // must produce an identical store without allocating the whole archive.
     const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/roundtrip.afb", .{tmp_src.sub_path});
     defer alloc.free(archive_path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var archive = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .truncate = true });
@@ -6030,7 +6032,7 @@ test "export and import documents round trip" {
     archive = try std.Io.Dir.cwd().openFile(io, archive_path, .{});
     defer archive.close(io);
 
-    var tmp_file_dst = std.testing.tmpDir(.{});
+    var tmp_file_dst = native_platform.testing.tmpDir(.{});
     defer tmp_file_dst.cleanup();
     var file_dst = try openTestStore(alloc, &tmp_file_dst);
     defer file_dst.close();
@@ -6046,7 +6048,7 @@ test "export and import documents round trip" {
 
 test "portable AFB2 delta resolves exact base and deduplicates physical blobs" {
     const alloc = std.testing.allocator;
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6087,7 +6089,7 @@ test "portable AFB2 delta resolves exact base and deduplicates physical blobs" {
     try std.testing.expectError(error.BackupBaseRequired, validatePortable(alloc, delta_archive.items));
 
     var base_context: TestPortableBaseContext = .{ .data = base_archive.items };
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6111,7 +6113,7 @@ test "file import restores Go cross-backend portable fixture" {
     const alloc = std.testing.allocator;
     const fixture = @embedFile("testdata/cross_backend_v1.afb");
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const archive_path = try std.fmt.allocPrint(
         alloc,
@@ -6120,7 +6122,7 @@ test "file import restores Go cross-backend portable fixture" {
     );
     defer alloc.free(archive_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try std.Io.Dir.cwd().writeFile(io, .{
@@ -6169,7 +6171,7 @@ test "file import restores production Go portable fixture" {
     // the real producer path and Zig's compressed streaming importer together.
     const fixture = @embedFile("testdata/production_portable_v1.afb");
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const archive_path = try std.fmt.allocPrint(
         alloc,
@@ -6178,7 +6180,7 @@ test "file import restores production Go portable fixture" {
     );
     defer alloc.free(archive_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try std.Io.Dir.cwd().writeFile(io, .{
@@ -6211,12 +6213,12 @@ test "file import restores production Go portable fixture" {
 
 test "file import reports a busy source without waiting for its writer" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/locked.afb", .{tmp.sub_path});
     defer alloc.free(archive_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var writer = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .read = true, .truncate = true });
@@ -6253,11 +6255,11 @@ test "file import rejects oversized portable blocks before allocation" {
     std.mem.writeInt(u32, env[2..6], backup_codec.max_block_payload_bytes + 1, .little);
     try encoded.appendSlice(alloc, &env);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const archive_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/oversized.afb", .{tmp.sub_path});
     defer alloc.free(archive_path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var archive = try std.Io.Dir.cwd().createFile(io, archive_path, .{ .truncate = true });
@@ -6278,7 +6280,7 @@ test "file import rejects oversized portable blocks before allocation" {
 test "import preflights full portable envelope before mutating destination" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6293,7 +6295,7 @@ test "import preflights full portable envelope before mutating destination" {
     try std.testing.expect(portable.items.len > backup_codec.header_size);
     const truncated = portable.items[0 .. portable.items.len - 1];
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6330,7 +6332,7 @@ test "import preflights logical block payloads before mutating destination" {
     const malformed_doc_payload = [_]u8{ 1, 0, 0, 0 };
     try backup_codec.writeBlock(&portable, alloc, .document_batch, &malformed_doc_payload);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6349,7 +6351,7 @@ test "import preflights durable catalogs before mutating destination" {
         .{ .key = "\x00\x00__metadata__:resolvers", .value = "not-json" },
     };
     for (cases) |case| {
-        var tmp_src = std.testing.tmpDir(.{});
+        var tmp_src = native_platform.testing.tmpDir(.{});
         defer tmp_src.cleanup();
         var src = try openTestStore(alloc, &tmp_src);
         defer src.close();
@@ -6364,7 +6366,7 @@ test "import preflights durable catalogs before mutating destination" {
         defer portable.deinit(alloc);
         try exportPortable(alloc, &src, &portable);
 
-        var tmp_dst = std.testing.tmpDir(.{});
+        var tmp_dst = native_platform.testing.tmpDir(.{});
         defer tmp_dst.cleanup();
         var dst = try openTestStore(alloc, &tmp_dst);
         defer dst.close();
@@ -6379,7 +6381,7 @@ test "import preflights durable catalogs before mutating destination" {
 test "export and import documents preserve timestamps" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6409,7 +6411,7 @@ test "export and import documents preserve timestamps" {
     try visitPortableBlocks(alloc, out.items, &timestamp_inspection, PortableTimestampInspection.visit);
     try std.testing.expect(timestamp_inspection.found);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6424,7 +6426,7 @@ test "export and import documents preserve timestamps" {
 test "export and import preserves doc identity metadata" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6467,7 +6469,7 @@ test "export and import preserves doc identity metadata" {
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6500,7 +6502,7 @@ test "export and import preserves doc identity metadata" {
 test "export and import preserves portable schema and catalog metadata" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6531,7 +6533,7 @@ test "export and import preserves portable schema and catalog metadata" {
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6548,7 +6550,7 @@ test "export and import preserves portable schema and catalog metadata" {
 test "import rejects doc identity metadata with invalid canonical ids" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6584,7 +6586,7 @@ test "import rejects doc identity metadata with invalid canonical ids" {
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6594,7 +6596,7 @@ test "import rejects doc identity metadata with invalid canonical ids" {
 test "import rejects doc identity namespace mismatch unless preserving existing namespace" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6624,7 +6626,7 @@ test "import rejects doc identity namespace mismatch unless preserving existing 
     try exportPortable(alloc, &src, &out);
 
     {
-        var tmp_dst = std.testing.tmpDir(.{});
+        var tmp_dst = native_platform.testing.tmpDir(.{});
         defer tmp_dst.cleanup();
         var dst = try openTestStore(alloc, &tmp_dst);
         defer dst.close();
@@ -6634,7 +6636,7 @@ test "import rejects doc identity namespace mismatch unless preserving existing 
     }
 
     {
-        var tmp_dst = std.testing.tmpDir(.{});
+        var tmp_dst = native_platform.testing.tmpDir(.{});
         defer tmp_dst.cleanup();
         var dst = try openTestStore(alloc, &tmp_dst);
         defer dst.close();
@@ -6649,7 +6651,7 @@ test "import rejects doc identity namespace mismatch unless preserving existing 
 
 test "online direct vector portable fallback preserves dense dimensions above u16 exactly" {
     const alloc = std.testing.allocator;
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6664,7 +6666,7 @@ test "online direct vector portable fallback preserves dense dimensions above u1
     var archive: ArrayList(u8) = .empty;
     defer archive.deinit(alloc);
     try exportPortable(alloc, &src, &archive);
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6676,7 +6678,7 @@ test "online direct vector portable fallback preserves dense dimensions above u1
 
 test "ordered artifact inventory portable backup preserves authored dense and sparse origin" {
     const alloc = std.testing.allocator;
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6692,7 +6694,7 @@ test "ordered artifact inventory portable backup preserves authored dense and sp
     var archive: ArrayList(u8) = .empty;
     defer archive.deinit(alloc);
     try exportPortable(alloc, &src, &archive);
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6707,7 +6709,7 @@ test "ordered artifact inventory portable backup preserves authored dense and sp
 test "export and import embeddings round trip" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6729,7 +6731,7 @@ test "export and import embeddings round trip" {
     try exportPortable(alloc, &src, &out);
 
     // Import into fresh store
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6760,7 +6762,7 @@ test "export and import embeddings round trip" {
 test "export and import sparse embeddings round trip" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6784,7 +6786,7 @@ test "export and import sparse embeddings round trip" {
     defer out.deinit(alloc);
     try exportPortable(alloc, &src, &out);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6805,7 +6807,7 @@ test "export and import sparse embeddings round trip" {
 test "export and import graph edge artifacts round trip with arbitrary ids" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6840,7 +6842,7 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
     }
 
     // Import into fresh store
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6866,7 +6868,7 @@ test "export and import graph edge artifacts round trip with arbitrary ids" {
 test "export and import chunk artifacts round trip with public artifact ids" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6896,7 +6898,7 @@ test "export and import chunk artifacts round trip with public artifact ids" {
     try visitPortableBlocks(alloc, out.items, &batch_inspection, PortableBatchInspection.visit);
     try std.testing.expectEqual(@as(usize, 2), batch_inspection.observed_count);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6914,7 +6916,7 @@ test "export and import chunk artifacts round trip with public artifact ids" {
 test "export and import asset artifacts round trip with public artifact ids" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6944,7 +6946,7 @@ test "export and import asset artifacts round trip with public artifact ids" {
     try visitPortableBlocks(alloc, out.items, &batch_inspection, PortableBatchInspection.visit);
     try std.testing.expectEqual(@as(usize, 2), batch_inspection.observed_count);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -6962,7 +6964,7 @@ test "export and import asset artifacts round trip with public artifact ids" {
 test "export and import resolution artifacts round trip with public artifact ids" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -6987,7 +6989,7 @@ test "export and import resolution artifacts round trip with public artifact ids
     try visitPortableBlocks(alloc, out.items, &batch_inspection, PortableBatchInspection.visit);
     try std.testing.expectEqual(@as(usize, 1), batch_inspection.observed_count);
 
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -7001,7 +7003,7 @@ test "export and import resolution artifacts round trip with public artifact ids
 test "export skips derived data" {
     const alloc = std.testing.allocator;
 
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -7027,7 +7029,7 @@ test "export skips derived data" {
     try exportPortable(alloc, &src, &out);
 
     // Import into fresh store
-    var tmp_dst = std.testing.tmpDir(.{});
+    var tmp_dst = native_platform.testing.tmpDir(.{});
     defer tmp_dst.cleanup();
     var dst = try openTestStore(alloc, &tmp_dst);
     defer dst.close();
@@ -7061,7 +7063,7 @@ test "export skips derived data" {
 
 test "portable relationships preserve parallel identities and arbitrary endpoints" {
     const alloc = std.testing.allocator;
-    var tmp_src = std.testing.tmpDir(.{});
+    var tmp_src = native_platform.testing.tmpDir(.{});
     defer tmp_src.cleanup();
     var src = try openTestStore(alloc, &tmp_src);
     defer src.close();
@@ -7091,7 +7093,7 @@ test "portable relationships preserve parallel identities and arbitrary endpoint
     }
 
     for ([_]bool{ false, true }) |staged| {
-        var tmp_dst = std.testing.tmpDir(.{});
+        var tmp_dst = native_platform.testing.tmpDir(.{});
         defer tmp_dst.cleanup();
         var dst = try openTestStore(alloc, &tmp_dst);
         defer dst.close();
@@ -7112,7 +7114,7 @@ test "portable graph retirements are primary and require reader version four" {
     const alloc = std.testing.allocator;
     const stamped = @import("graph_cleanup_contract.zig").retirementValue(42);
     for ([_][]const u8{ "1", &stamped }) |retirement| {
-        var tmp_src = std.testing.tmpDir(.{});
+        var tmp_src = native_platform.testing.tmpDir(.{});
         defer tmp_src.cleanup();
         var src = try openTestStore(alloc, &tmp_src);
         defer src.close();
@@ -7141,7 +7143,7 @@ test "portable graph retirements are primary and require reader version four" {
         }
         for ([_]bool{ false, true }) |staged| {
             for ([_]bool{ false, true }) |derived| {
-                var tmp_dst = std.testing.tmpDir(.{});
+                var tmp_dst = native_platform.testing.tmpDir(.{});
                 defer tmp_dst.cleanup();
                 var dst = try openTestStore(alloc, &tmp_dst);
                 defer dst.close();

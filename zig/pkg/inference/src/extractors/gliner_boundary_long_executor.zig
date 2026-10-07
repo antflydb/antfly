@@ -15,7 +15,9 @@
 
 //! Admitted serial windows followed by document-global task decisions. Model
 //! tensors die after each window; only bounded scalar evidence survives.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
@@ -836,13 +838,13 @@ test "gliner boundary long executor word splitter binds inference and window ide
 }
 
 test "gliner boundary long executor pinned small one-window task parity and global admission" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
     try testPinnedSmallWindows(directory, false);
 }
 
 test "gliner boundary long executor pinned small Metal one-window task parity and global admission" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
     try testPinnedSmallWindows(directory, true);
 }
 
@@ -868,8 +870,8 @@ fn testPinnedSmallWindows(directory: []const u8, metal: bool) !void {
     defer tokenizer.tokenizer().deinitTokenizer();
     const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
-    if (watchdog) |owner| try owner.start(std.testing.io);
-    const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
+    if (watchdog) |owner| try owner.start(native_platform.testing.io);
+    const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = native_platform.time.monotonicNs() + 180 * std.time.ns_per_s };
     var managed = try factory.getManagedComputeBackend(session, a, null, control);
     defer managed.deinit();
     for (reference.value.cases) |case| {
@@ -1019,7 +1021,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
 
 test "gliner boundary long executor fake windows preserve global decisions ownership and atomic limits" {
     for ([_]FakeMergeMode{ .success, .output_limit, .cancelled, .exhausted }) |mode| try exerciseFakeMerge(std.testing.allocator, mode);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseFakeMerge, .{FakeMergeMode.success});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseFakeMerge, .{FakeMergeMode.success});
 }
 
 // The current Zig arena can reject a larger speculative resize then try a
@@ -1053,7 +1055,7 @@ test "gliner boundary long executor evidence terminal allocation preserves backi
 // fails even at group size 1 (which would make this a resource-exhaustion
 // test instead of a recovery test).
 test "gliner boundary long executor adaptive group shrink recovers from real encode-phase OutOfMemory pressure" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = native_platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
     const factory = @import("../architectures/session_factory.zig");
     const session = try factory.createNativeSession(a, directory);

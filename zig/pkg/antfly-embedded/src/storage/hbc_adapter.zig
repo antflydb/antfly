@@ -55,7 +55,7 @@ const posting_segment_store_mod = @import("posting_segment_store.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const apply_rw_lock_mod = @import("db/apply_rw_lock.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const vec = @import("antfly_vector").vector;
 const proto = @import("antfly_vector").proto;
 const quantizer_mod = @import("antfly_vector").quantizer;
@@ -137,7 +137,7 @@ pub const LsmMaintenanceStats = lsm_backend.Backend.MaintenanceStats;
 pub const LsmOpenStats = lsm_backend.Backend.OpenStats;
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    @import("antfly_platform").sync.lockYielding(mutex);
+    platform.sync.lockYielding(mutex);
 }
 
 fn hbcRuntimeBatchMode(in_bulk_session: bool, lsm_direct_bulk_ingest_enabled: ?bool) vectorindex_store.BatchMode {
@@ -293,8 +293,8 @@ const HbcPhysicalAccounting = struct {
     mutex: std.atomic.Mutex = .unlocked,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     current_bytes: u64 = 0,
-    published_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    pinned_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    published_bytes: platform.atomic.Value(u64) = .init(0),
+    pinned_bytes: platform.atomic.Value(u64) = .init(0),
 
     fn attach(self: *HbcPhysicalAccounting, manager: *resource_manager_mod.ResourceManager) void {
         lockAtomic(&self.mutex);
@@ -687,7 +687,7 @@ fn hbcCacheStablePathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
     if (comptime builtin.os.tag == .freestanding) {
         return try alloc.dupe(u8, path);
     } else {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Threaded.init(alloc, .{});
         defer io_impl.deinit();
 
         const absolute_path = if (std.fs.path.isAbsolute(path))
@@ -817,7 +817,7 @@ fn noteHbcKindAdmissionSkip(stats: *HbcCacheStats, kind: HbcCacheKind) void {
     hbcKindStats(stats, kind).admission_skips += 1;
 }
 
-fn cacheFillEpochCurrent(fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64), expected_epoch: u64) bool {
+fn cacheFillEpochCurrent(fill_epoch: ?*const platform.atomic.Value(u64), expected_epoch: u64) bool {
     const epoch = fill_epoch orelse return true;
     return expected_epoch & 1 == 0 and epoch.load(.acquire) == expected_epoch;
 }
@@ -864,7 +864,7 @@ const CacheRwLock = struct {
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else {
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
         }
     }
 
@@ -1043,20 +1043,20 @@ pub const Cache = struct {
     reclaimer_identity: u64 = 0,
     physical_accounting: HbcPhysicalAccounting = .{},
     namespace_pinned_accounting: HbcNamespacePinnedAccounting,
-    admission_target_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    admission_target_bytes: platform.atomic.Value(u64) = .init(0),
     concurrent_vector_admission_stride: std.atomic.Value(u32) = .init(1),
-    concurrent_vector_admission_counter: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    concurrent_vector_admission_counter: platform.atomic.Value(u64) = .init(0),
     // Counts live query-level decoded-residency leases across namespaces.
     // Serial cold starts fill eagerly; only genuinely overlapping fills use
     // the normal-pressure sampling doorkeeper.
-    decoded_query_active_leases: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    decoded_query_reserved_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    decoded_query_active_leases: platform.atomic.Value(u64) = .init(0),
+    decoded_query_reserved_bytes: platform.atomic.Value(u64) = .init(0),
     // Query leases claim logical capacity before their primary-store batch is
     // read, then atomically transfer that entitlement to physical precharge.
     // This prevents concurrent cold-start requests from all observing the
     // same free bytes without charging the full request up front.
-    decoded_query_entitled_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    decoded_query_replacement_entitled_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    decoded_query_entitled_bytes: platform.atomic.Value(u64) = .init(0),
+    decoded_query_replacement_entitled_bytes: platform.atomic.Value(u64) = .init(0),
     /// Coalesce duplicate exact-vector publication and keep cloning outside
     /// the global map/admission lock. These locks do not guard visibility;
     /// the map lock plus HBC's mutation epoch remain authoritative.
@@ -1656,7 +1656,7 @@ pub const Cache = struct {
         self: *Cache,
         namespace: u64,
         node: *const Node,
-        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
+        fill_epoch: ?*const platform.atomic.Value(u64),
         expected_epoch: u64,
     ) !bool {
         const cloned = try node.clone(self.alloc);
@@ -1701,7 +1701,7 @@ pub const Cache = struct {
         namespace: u64,
         node_id: u64,
         qs: *const QuantizedSet,
-        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
+        fill_epoch: ?*const platform.atomic.Value(u64),
         expected_epoch: u64,
     ) !bool {
         var cloned = try qs.clone(self.alloc);
@@ -1785,7 +1785,7 @@ pub const Cache = struct {
         namespace: u64,
         vector_id: u64,
         vector_data: []const f32,
-        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
+        fill_epoch: ?*const platform.atomic.Value(u64),
         expected_epoch: u64,
         must_cache: bool,
         precharged: bool,
@@ -1874,7 +1874,7 @@ pub const Cache = struct {
         namespace: u64,
         vector_id: u64,
         metadata: []const u8,
-        fill_epoch: ?*const @import("antfly_platform").atomic.Value(u64),
+        fill_epoch: ?*const platform.atomic.Value(u64),
         expected_epoch: u64,
     ) ![]const u8 {
         const copied = try self.alloc.dupe(u8, metadata);
@@ -2651,7 +2651,7 @@ const ExperimentalPostingSequentialReclaimer = struct {
         const end = std.mem.alignBackward(usize, self.observed_end, page);
         if (end <= start) return;
         const reclaimable: []align(std.heap.page_size_min) u8 = @alignCast(mapped[start..end]);
-        std.posix.madvise(reclaimable.ptr, reclaimable.len, std.posix.MADV.DONTNEED) catch return;
+        platform.filesystem.adviseMemory(reclaimable.ptr, reclaimable.len, platform.c.MADV.DONTNEED) catch return;
         self.reclaimed_end = end;
     }
 };
@@ -2742,7 +2742,7 @@ const ExperimentalPostingReadState = struct {
             const mapped = retained.mappedBytes() orelse continue;
             const payload_len = std.mem.alignBackward(usize, @min(mapped.len, reader.payloadBytes().len), std.heap.page_size_min);
             if (payload_len == 0) continue;
-            std.posix.madvise(mapped.ptr, payload_len, std.posix.MADV.DONTNEED) catch {};
+            platform.filesystem.adviseMemory(mapped.ptr, payload_len, platform.c.MADV.DONTNEED) catch {};
         }
     }
 
@@ -3849,18 +3849,18 @@ const ExperimentalPostingReadGeneration = struct {
     /// Highest source-journal sequence durably represented by this immutable
     /// generation. This comes from the posting checkpoint/WAL commit boundary,
     /// not from the projection metadata value stored inside the generation.
-    covered_source_sequence: @import("antfly_platform").atomic.Value(u64),
+    covered_source_sequence: platform.atomic.Value(u64),
     /// Exact durable WAL boundary represented by this logical generation.
     /// Source sequences alone are insufficient because multiple ordered
     /// derived batches may commit at the same source sequence.
-    wal_generation: @import("antfly_platform").atomic.Value(u64),
-    wal_committed_bytes: @import("antfly_platform").atomic.Value(u64),
+    wal_generation: platform.atomic.Value(u64),
+    wal_committed_bytes: platform.atomic.Value(u64),
     /// Query-visible topology owned by this exact immutable posting
     /// generation. It is initialized before publication and never changes.
     search_view: SearchViewToken = .{},
     scan_admission: vectorindex_quantized_directory.AdmissionStats = .{},
     // Scheduling-only observations, isolated by immutable generation/filter mode.
-    scan_prediction: [2]@import("antfly_platform").atomic.Value(u64) = .{ .init(0), .init(0) },
+    scan_prediction: [2]platform.atomic.Value(u64) = .{ .init(0), .init(0) },
     /// Number of immutable in-memory delta maps above the mmap root. This is
     /// bounded by allocation-free ownership transfer when no query lease is
     /// active; foreground readers never trigger a cloned aggregate.
@@ -4839,7 +4839,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     staging_store: posting_segment_store_mod.Store,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     io: std.Io,
-    owned_io: ?(if (builtin.os.tag == .freestanding) void else std.Io.Threaded) = null,
+    owned_io: ?(if (builtin.os.tag == .freestanding) void else platform.Threaded) = null,
     projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource = null,
     projection_revision: u64 = 0,
     /// Hard recovery-debt enforcement and graceful close can promote an
@@ -5263,7 +5263,7 @@ pub const HBCIndex = struct {
     native_acceleration_retry: NativeAccelerationRetry = .{},
     experimental_posting_overlay_collapsed_wal_bytes: u64 = 0,
     experimental_posting_capture_started_ns: u64 = 0,
-    posting_publication_lock_deferrals: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    posting_publication_lock_deferrals: platform.atomic.Value(u64) = .init(0),
     /// Native authority can become durable while an opportunistic checkpoint
     /// still borrows storage owned by the compatibility LSM. Record the
     /// retirement request explicitly and drain it only at a boundary where no
@@ -5325,7 +5325,7 @@ pub const HBCIndex = struct {
     /// Seqlock-style epoch for optimistic complete-snapshot searches. Every
     /// mutation, including an aborted one that leaves the durable generation
     /// unchanged, advances this from even -> odd -> even.
-    published_mutation_epoch: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    published_mutation_epoch: platform.atomic.Value(u64) = platform.atomic.Value(u64).init(0),
     // Optional refresh state is protected by the index mutation owner. It is
     // deliberately volatile: reopen verifies the durable postings again.
     posting_refresh_next_node: u64 = 1,
@@ -5333,7 +5333,7 @@ pub const HBCIndex = struct {
     // Odd epochs are never clean. This atomic certificate lets operational
     // status observe bounded maintenance without traversing the tree or
     // racing the mutation owner's scan cursor. Reopen starts uncertified.
-    posting_refresh_clean_epoch: @import("antfly_platform").atomic.Value(u64) = .init(std.math.maxInt(u64)),
+    posting_refresh_clean_epoch: platform.atomic.Value(u64) = .init(std.math.maxInt(u64)),
     posting_refresh_scan_changed: bool = false,
     /// Publication commits may include durable I/O. Readers of an odd
     /// generation retain the active flight and sleep on its runtime event
@@ -5343,7 +5343,7 @@ pub const HBCIndex = struct {
     published_spare_flight: ?*PublishedSearchStateFlight = null,
     /// Exact reachable-vector coverage is immutable within a published
     /// generation, so only the first complete search needs to validate it.
-    complete_coverage_generation: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(std.math.maxInt(u64)),
+    complete_coverage_generation: platform.atomic.Value(u64) = platform.atomic.Value(u64).init(std.math.maxInt(u64)),
     /// Short state lock for the generation validation flight. Long waits use
     /// CompleteCoverageFlight.ready on the backend runtime's std.Io; they never
     /// spin on an OS-thread mutex or retain a search transaction/workspace.
@@ -5401,13 +5401,13 @@ pub const HBCIndex = struct {
     // rerank batch can therefore admit vectors read from one primary snapshot
     // with a single cache lock without repopulating an entry invalidated by a
     // concurrent update.
-    vector_cache_epoch: @import("antfly_platform").atomic.Value(u64),
+    vector_cache_epoch: platform.atomic.Value(u64),
     // A striped seqlock fences cache fills against uncommitted vector writes
     // without retaining one version record per vector. A dirty stripe is odd;
     // commit/abort publication returns it to even. Existing keys in the same
     // stripe remain usable because only miss admission consults this fence.
-    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]@import("antfly_platform").atomic.Value(u64) = @splat(@import("antfly_platform").atomic.Value(u64).init(0)),
-    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]@import("antfly_platform").atomic.Value(u64) = @splat(@import("antfly_platform").atomic.Value(u64).init(0)),
+    vector_cache_fill_epochs: [vector_cache_fill_stripe_count]platform.atomic.Value(u64) = @splat(platform.atomic.Value(u64).init(0)),
+    vector_cache_fill_dirty: [vector_cache_fill_dirty_word_count]platform.atomic.Value(u64) = @splat(platform.atomic.Value(u64).init(0)),
     hbc_cache_bytes_accounted: u64 = 0,
     detached_hbc_accounting: HbcPhysicalAccounting = .{},
     search_workspace_bytes_accounted: u64 = 0,
@@ -6911,7 +6911,7 @@ pub const HBCIndex = struct {
         return self.runtime_io orelse if (comptime builtin.os.tag == .freestanding)
             .failing
         else
-            std.Io.Threaded.global_single_threaded.io();
+            platform.Threaded.global_single_threaded.io();
     }
 
     fn releaseCompleteCoverageFlightRef(self: *HBCIndex, flight: *CompleteCoverageFlight) void {
@@ -9661,7 +9661,7 @@ pub const HBCIndex = struct {
                 // Embedded/single-threaded callers may provide an I/O runtime
                 // without a concurrent lane. Keep ownership in std.Io by creating
                 // one bounded task runtime instead of an unmanaged OS thread.
-                build.owned_io = std.Io.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(1) });
+                build.owned_io = platform.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(1) });
                 build.io = build.owned_io.?.io();
                 break :fallback build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch |fallback_err| {
                     build.deinit();
@@ -20347,7 +20347,7 @@ test "complete coverage validation waiter honors cancellation without canceling 
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20419,7 +20419,7 @@ test "complete coverage flight shares a deterministic producer failure" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20543,7 +20543,7 @@ test "flat centroid build single flight waits on backend runtime" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20588,7 +20588,7 @@ test "flat centroid build flight shares a completed stale generation result" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20638,7 +20638,7 @@ test "flat centroid build flight shares a deterministic producer failure" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20789,7 +20789,7 @@ test "search publication wait uses runtime wakeups and honors cancellation" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20910,7 +20910,7 @@ test "complete snapshot retry releases publication fence after durable txn captu
     try idx.insert(1, &.{ 0, 0 });
     try idx.insert(2, &.{ 1, 0 });
     try idx.insert(3, &.{ 0, 1 });
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -20993,7 +20993,7 @@ test "durable snapshot captures a publisher immediately before its fence" {
     try idx.insert(1, &.{ 0, 0 });
     try idx.insert(2, &.{ 1, 0 });
     try idx.insert(3, &.{ 0, 1 });
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const HookContext = struct {
@@ -21076,7 +21076,7 @@ test "durable incomplete snapshot terminates when publication advances during tr
     }
     idx.invalidateVectorCache(1);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const HookContext = struct {
@@ -21405,7 +21405,7 @@ test "hbc shared cache rejects node quantized and metadata fills from an older p
     var cache = Cache.init(alloc);
     defer cache.deinit();
     const namespace = hbcCacheNamespace("/tmp/hbc-publication-fill-guard");
-    var epoch = @import("antfly_platform").atomic.Value(u64).init(0);
+    var epoch = platform.atomic.Value(u64).init(0);
 
     var current_centroid = [_]f32{ 9, 9 };
     const current_node = Node{
@@ -21598,7 +21598,7 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
             ready: *std.atomic.Value(u32),
             start: *std.atomic.Value(bool),
             stop: *std.atomic.Value(bool),
-            borrows: *@import("antfly_platform").atomic.Value(u64),
+            borrows: *platform.atomic.Value(u64),
             failed: *std.atomic.Value(bool),
         ) void {
             const value_a = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
@@ -21629,17 +21629,17 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
     var ready = std.atomic.Value(u32).init(0);
     var start = std.atomic.Value(bool).init(false);
     var stop = std.atomic.Value(bool).init(false);
-    var borrows = @import("antfly_platform").atomic.Value(u64).init(0);
+    var borrows = platform.atomic.Value(u64).init(0);
     var failed = std.atomic.Value(bool).init(false);
     var readers: [8]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
     defer {
         start.store(true, .release);
         stop.store(true, .release);
-        for (readers[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (readers[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (&readers) |*reader| {
-        reader.* = try std.testing.io.concurrent(Reader.run, .{
+        reader.* = try platform.testing.io.concurrent(Reader.run, .{
             &cache,
             namespace,
             &ready,
@@ -21664,7 +21664,7 @@ test "hbc shared vector leases remain coherent during invalidate and replacement
     }
 
     stop.store(true, .release);
-    for (&readers) |*reader| reader.await(std.testing.io);
+    for (&readers) |*reader| reader.await(platform.testing.io);
     try std.testing.expect(!failed.load(.acquire));
     try std.testing.expect(borrows.load(.acquire) > 0);
 }
@@ -21787,8 +21787,8 @@ test "hbc retained node and quantized handles survive threaded eviction" {
             target.invalidateQuantized(ns, node_id);
         }
     };
-    var evictor = try std.testing.io.concurrent(Evict.run, .{ &cache, namespace, node.id });
-    evictor.await(std.testing.io);
+    var evictor = try platform.testing.io.concurrent(Evict.run, .{ &cache, namespace, node.id });
+    evictor.await(platform.testing.io);
 
     try std.testing.expectEqual(@as(u64, 3), node_lease.ptr().id);
     try std.testing.expectEqualSlices(f32, &centroid, node_lease.ptr().centroid);
@@ -22104,14 +22104,14 @@ test "hbc concurrent cold-start lease acquisition remains bounded" {
     var started_tasks: usize = 0;
     defer {
         start.store(true, .release);
-        for (workers[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (workers[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (&workers) |*worker| {
-        worker.* = try std.testing.io.concurrent(Worker.run, .{ &idx, &start, &admitted });
+        worker.* = try platform.testing.io.concurrent(Worker.run, .{ &idx, &start, &admitted });
         started_tasks += 1;
     }
     start.store(true, .release);
-    for (&workers) |*worker| worker.await(std.testing.io);
+    for (&workers) |*worker| worker.await(platform.testing.io);
 
     try std.testing.expectEqual(@as(u32, 1), admitted.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), cache.decoded_query_active_leases.load(.acquire));
@@ -22852,14 +22852,14 @@ test "hbc shared vector publication coalesces concurrent duplicate fills" {
     var started_tasks: usize = 0;
     defer {
         start.store(true, .release);
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (threads[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (&threads) |*thread| {
-        thread.* = try std.testing.io.concurrent(Worker.run, .{ &cache, namespace, &start, &failed });
+        thread.* = try platform.testing.io.concurrent(Worker.run, .{ &cache, namespace, &start, &failed });
         started_tasks += 1;
     }
     start.store(true, .release);
-    for (&threads) |*thread| thread.await(std.testing.io);
+    for (&threads) |*thread| thread.await(platform.testing.io);
 
     try std.testing.expect(!failed.load(.acquire));
     const stats = cache.namespaceStats(namespace).vector;
@@ -22908,16 +22908,16 @@ test "hbc shared cache lock reports striped reader wait" {
     const read_stripe = lock.lockVectorShared(1, 1);
     var writer_acquired = std.atomic.Value(bool).init(false);
     var release_writer = std.atomic.Value(bool).init(false);
-    var writer = try std.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired, &release_writer });
+    var writer = try platform.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired, &release_writer });
     while (!lock.vector_fence_pending.load(.acquire)) std.atomic.spinLoopHint();
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(10), .awake);
     lock.unlockVectorShared(read_stripe);
     while (!writer_acquired.load(.acquire)) std.atomic.spinLoopHint();
     try std.testing.expect(lock.vector_fence_pending.load(.acquire));
     release_writer.store(true, .release);
-    writer.await(std.testing.io);
+    writer.await(platform.testing.io);
 
     try std.testing.expect(writer_acquired.load(.acquire));
     try std.testing.expect(!lock.vector_fence_pending.load(.acquire));
@@ -22940,11 +22940,11 @@ test "hbc shared cache queued writer cannot be bypassed by nonblocking reclaim" 
     var lock: CacheRwLock = .{};
     lockAtomic(&lock.writer_gate);
     var writer_acquired = std.atomic.Value(bool).init(false);
-    var writer = try std.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired });
+    var writer = try platform.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired });
     var writer_awaited = false;
     defer if (!writer_awaited) {
         lock.writer_gate.unlock();
-        writer.await(std.testing.io);
+        writer.await(platform.testing.io);
     };
     while (lock.writers_waiting.load(.acquire) == 0) std.atomic.spinLoopHint();
 
@@ -22952,7 +22952,7 @@ test "hbc shared cache queued writer cannot be bypassed by nonblocking reclaim" 
     try std.testing.expect(!writer_acquired.load(.acquire));
 
     lock.writer_gate.unlock();
-    writer.await(std.testing.io);
+    writer.await(platform.testing.io);
     writer_awaited = true;
     try std.testing.expect(writer_acquired.load(.acquire));
 
@@ -22971,7 +22971,7 @@ test "hbc shared cache writer progresses under continuous striped reads" {
             ready: *std.atomic.Value(u32),
             start: *std.atomic.Value(bool),
             stop: *std.atomic.Value(bool),
-            reads: *@import("antfly_platform").atomic.Value(u64),
+            reads: *platform.atomic.Value(u64),
         ) void {
             _ = ready.fetchAdd(1, .release);
             while (!start.load(.acquire)) std.atomic.spinLoopHint();
@@ -22995,17 +22995,17 @@ test "hbc shared cache writer progresses under continuous striped reads" {
     var ready = std.atomic.Value(u32).init(0);
     var start = std.atomic.Value(bool).init(false);
     var stop = std.atomic.Value(bool).init(false);
-    var reads = @import("antfly_platform").atomic.Value(u64).init(0);
+    var reads = platform.atomic.Value(u64).init(0);
     var writer_acquired = std.atomic.Value(bool).init(false);
     var readers: [8]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
     defer {
         start.store(true, .release);
         stop.store(true, .release);
-        for (readers[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (readers[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (&readers, 0..) |*reader, index| {
-        reader.* = try std.testing.io.concurrent(Reader.run, .{
+        reader.* = try platform.testing.io.concurrent(Reader.run, .{
             &lock,
             @as(u64, @intCast(index + 1)),
             @as(u64, @intCast(index * 17 + 1)),
@@ -23020,12 +23020,12 @@ test "hbc shared cache writer progresses under continuous striped reads" {
     start.store(true, .release);
     while (reads.load(.acquire) < readers.len) std.atomic.spinLoopHint();
 
-    var writer = try std.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired });
+    var writer = try platform.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired });
     defer {
         stop.store(true, .release);
-        writer.await(std.testing.io);
+        writer.await(platform.testing.io);
     }
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var attempts: usize = 0;
     while (!writer_acquired.load(.acquire) and attempts < 1_000) : (attempts += 1) {
@@ -23033,8 +23033,8 @@ test "hbc shared cache writer progresses under continuous striped reads" {
     }
     const progressed_under_load = writer_acquired.load(.acquire);
     stop.store(true, .release);
-    for (&readers) |*reader| reader.await(std.testing.io);
-    writer.await(std.testing.io);
+    for (&readers) |*reader| reader.await(platform.testing.io);
+    writer.await(platform.testing.io);
 
     try std.testing.expect(progressed_under_load);
 }
@@ -23043,13 +23043,13 @@ test "hbc stable cache namespace canonicalizes equivalent path spellings" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hbc-cache-namespace", .{tmp.sub_path});
     defer alloc.free(root_rel);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -23878,7 +23878,7 @@ test "progressive scan growth releases old permits before FIFO reacquisition" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var tp: TestPath = .{};
@@ -23941,7 +23941,7 @@ test "progressive scan growth cancellation releases the old reservation and queu
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var tp: TestPath = .{};
@@ -24113,7 +24113,7 @@ test "hbc queued admission rebinds topology and reservation to the current gener
         .dense_search_bandwidth_capacity_bytes = capacity,
     });
     defer resource_manager.deinit(alloc);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{
@@ -24232,7 +24232,7 @@ test "hbc empty search bypasses saturated dense bandwidth" {
         .dense_search_bandwidth_capacity_bytes = capacity,
     });
     defer resource_manager.deinit(alloc);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -25565,7 +25565,7 @@ test "compact subgroup concurrent staging preserves resource accounting" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -25614,7 +25614,7 @@ fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMo
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -25761,7 +25761,7 @@ test "quantized native routing serves exact complete coverage across delta and r
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -26025,7 +26025,7 @@ test "native suffix checkpoint preserves pinned readers tombstones and a concurr
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const Fixture = struct {
         const vectors = [_][2]f32{ .{ 1, 0 }, .{ 0, 1 }, .{ 0.8, 0.2 }, .{ 0.2, 0.8 }, .{ 0.5, 0.5 } };
@@ -26156,7 +26156,7 @@ test "prepared posting activation rejects incompatible metadata before CURRENT a
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2, .leaf_size = 8, .storage_backend = .lsm });
     defer idx.close();
@@ -27056,7 +27056,7 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
     const query_k = if (dims == 1536) 100 else 10;
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
@@ -27132,7 +27132,7 @@ fn testNativeExternalUpdateReopen(comptime dims: usize) !void {
             try std.testing.expect(work.centroid_delta_removals > 0);
             try std.testing.expect(work.centroid_recompute_members_total < 110_000);
         }
-        if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+        if (platform.env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
             std.debug.print("\nWORK external-update dims={d} routes={d} centroid_recomputes={d} centroid_members={d}\n", .{ dims, work.insert_find_leaf_calls, work.centroid_recompute_calls, work.centroid_recompute_members_total });
         for (&expected, 0..) |*ids, query_id| {
             var result = try idx.searchWithRequest(.{ .query = &source.vectors[query_id * 7], .k = query_k, .search_width = if (dims == 1536) 17 else 4, .epsilon = if (dims == 1536) 1.45 else 0.1, .rerank_factor = if (dims == 1536) 9 else 3 });
@@ -27541,7 +27541,7 @@ test "stable generation finalization bootstraps capture-free rebuild into native
     for ([_][]const u8{ "runs", "wal", "manifest.bin" }) |name| {
         const legacy_path = try std.fs.path.join(alloc, &.{ std.mem.span(path), name });
         defer alloc.free(legacy_path);
-        try std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{});
+        try std.Io.Dir.cwd().access(platform.testing.io, legacy_path, .{});
     }
     var results = try reopened.search(&.{ 0.0, 1.0 }, 2);
     defer results.deinit();
@@ -27554,7 +27554,7 @@ test "stable generation finalization bootstraps capture-free rebuild into native
         defer alloc.free(legacy_path);
         try std.testing.expectError(
             error.FileNotFound,
-            std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{}),
+            std.Io.Dir.cwd().access(platform.testing.io, legacy_path, .{}),
         );
     }
 }
@@ -28248,7 +28248,7 @@ fn testMonotoneInsertionWork(count: usize, fanout: u32) !void {
     });
     defer result.results.deinit();
     try std.testing.expectEqual(@as(u64, @intCast(count)), result.results.getHits()[0].vector_id);
-    if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+    if (platform.env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
         std.debug.print("\nWORK insertion fanout={d} count={d} leaf_splits={d} internal_splits={d} saves={d} range_nodes={d}\n", .{ fanout, count, profile.split_leaf_calls, profile.split_internal_calls, profile.save_node_calls, profile.range_nodes_examined });
 }
 
@@ -28522,13 +28522,13 @@ test "searchWithRequest tolerates concurrent readers with runtime caches enabled
     var threads: [workers.len]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
     defer {
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (threads[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (&threads, &workers, 0..) |*thread, *worker, worker_index| {
-        thread.* = try std.testing.io.concurrent(Worker.run, .{ worker, worker_index });
+        thread.* = try platform.testing.io.concurrent(Worker.run, .{ worker, worker_index });
         started_tasks += 1;
     }
-    for (&threads) |*thread| thread.await(std.testing.io);
+    for (&threads) |*thread| thread.await(platform.testing.io);
     try std.testing.expectEqual(@as(u8, 0), failed.load(.monotonic));
 }
 
@@ -30461,7 +30461,7 @@ test "native posting row integration survives mutation checkpoint and reopen" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -35248,7 +35248,7 @@ fn testQuerySnapshotPublication(directory_mode: HBCConfig.CentroidDirectoryMode)
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var tp: TestPath = .{};
     const path = tp.init();

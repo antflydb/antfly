@@ -1,10 +1,24 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 test "Windows hardlinks preserve identity through relative directory handles and source removal" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "source");
     try tmp.dir.createDirPath(io, "destination");
@@ -53,10 +67,10 @@ test "Windows hardlinks preserve caller I/O authority" {
 }
 
 test "Windows hardlink cancellation prevents publication" {
-    var pool = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+    var pool = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
     defer pool.deinit();
     const io = pool.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "source", .{});
     file.close(io);

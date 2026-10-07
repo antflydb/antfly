@@ -13,9 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Crc32 = @import("antfly_hash").Crc32;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
@@ -23,7 +25,7 @@ const docstore_mod = @import("../../docstore.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const mem_backend = @import("../../mem_backend.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 
 const metadata_prefix = "\x00\x00__metadata__:derived_apply:";
 const checkpoint_file_name = "derived_apply.checkpoint";
@@ -601,7 +603,7 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = @import("../artifact_publication.zig");
     const epoch = @import("../artifact_projection_epoch.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-snapshot", .{tmp.sub_path});
     defer alloc.free(path);
@@ -609,7 +611,7 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
     defer db.close();
     const sidecar = try checkpointPathAlloc(alloc, path);
     defer alloc.free(sidecar);
-    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, native_platform.testing.io, db.core.store, sidecar) == null);
     var activation: publication.Command = .{ .mode = .activate, .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
     {
         var txn = try db.core.store.beginWriteTxn();
@@ -617,12 +619,12 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
         try publication.stageAuthority(&txn, activation);
         try txn.commit();
     }
-    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
-    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, null) == null);
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 11, .generation = 2, .config_hash = 7 });
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, native_platform.testing.io, db.core.store, sidecar) == null);
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, native_platform.testing.io, db.core.store, null) == null);
+    try saveProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 11, .generation = 2, .config_hash = 7 });
     const Check = struct {
         fn run(a: Allocator, store: *docstore_mod.DocStore, location: []const u8) !void {
-            var snapshot = (try tryAcquireProjectionSnapshot(a, std.testing.io, store, location)).?;
+            var snapshot = (try tryAcquireProjectionSnapshot(a, native_platform.testing.io, store, location)).?;
             defer snapshot.deinit();
             try std.testing.expectEqual(@as(u64, 11), snapshot.get("text").?.applied_sequence);
             try std.testing.expect(snapshot.get("missing") == null);
@@ -637,9 +639,9 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ db.core.store, sidecar });
-    var snapshot = (try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar)).?;
+    var snapshot = (try tryAcquireProjectionSnapshot(alloc, native_platform.testing.io, db.core.store, sidecar)).?;
     defer snapshot.deinit();
-    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, native_platform.testing.io, db.core.store, sidecar) == null);
     // Physical reset/open revocation need not replace a sidecar. A held file
     // lock therefore cannot replace the primary transaction's final CAS.
     {
@@ -669,7 +671,7 @@ test "ordered artifact inventory projection sidecar transitions revoke completio
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = @import("../artifact_publication.zig");
     const epoch = @import("../artifact_projection_epoch.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-epoch", .{tmp.sub_path});
     defer alloc.free(path);
@@ -693,32 +695,32 @@ test "ordered artifact inventory projection sidecar transitions revoke completio
         }
     };
     try std.testing.expectEqual(@as(u64, 0), try Probe.current(db.core.store));
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 10, .generation = 1, .config_hash = 7 });
+    try saveProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 10, .generation = 1, .config_hash = 7 });
     const first = try Probe.current(db.core.store);
     try std.testing.expectEqual(@as(u64, 1), first);
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, &.{.{ .index_name = "text", .sequence = 11, .config_hash = 7 }});
+    try saveAppliedSequencesWithCheckpoint(alloc, native_platform.testing.io, db.core.store, sidecar, &.{.{ .index_name = "text", .sequence = 11, .config_hash = 7 }});
     try std.testing.expectEqual(first, try Probe.current(db.core.store));
-    try saveAppliedSequenceUpdateWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, .{ .index_name = "text", .sequence = 12, .config_hash = 7 });
+    try saveAppliedSequenceUpdateWithCheckpoint(alloc, native_platform.testing.io, db.core.store, sidecar, .{ .index_name = "text", .sequence = 12, .config_hash = 7 });
     try std.testing.expectEqual(first, try Probe.current(db.core.store));
     // Rebuilding, even at the same source cut, invalidates prior completion.
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 12, .status = .rebuilding, .generation = 2, .config_hash = 7 });
+    try saveProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 12, .status = .rebuilding, .generation = 2, .config_hash = 7 });
     try std.testing.expectEqual(first + 1, try Probe.current(db.core.store));
     // Recovery may deliberately lower a watermark; it cannot retain a prefix
     // captured from the old physical projection.
-    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text", 3);
+    try saveAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, db.core.store, sidecar, "text", 3);
     try std.testing.expectEqual(first + 2, try Probe.current(db.core.store));
-    try clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text");
+    try clearAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, db.core.store, sidecar, "text");
     try std.testing.expectEqual(first + 3, try Probe.current(db.core.store));
     // A failed sidecar replacement is permitted to leave an extra revocation.
     // The reverse ordering would leave stale evidence after a crash.
     var failed_after_revoke = false;
     for (0..256) |fail_index| {
         var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
-        saveProjectionCheckpointWithSidecar(failing.allocator(), std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 20, .generation = 3, .config_hash = 7 }) catch |err| {
+        saveProjectionCheckpointWithSidecar(failing.allocator(), native_platform.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 20, .generation = 3, .config_hash = 7 }) catch |err| {
             if (err != error.OutOfMemory) return err;
             if (try Probe.current(db.core.store) > first + 3) {
                 failed_after_revoke = true;
-                try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text"));
+                try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, db.core.store, sidecar, "text"));
                 break;
             }
             continue;
@@ -1054,12 +1056,12 @@ test "derived apply state keeps latest lsm value across many flushed overwrites"
     // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var tmp = @import("../../../common/test_directory.zig").fastTmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path_len = try tmp.dir.realPath(native_platform.testing.io, &path_buf);
     const path = path_buf[0..path_len];
 
     {
@@ -1084,7 +1086,7 @@ test "derived apply state keeps latest lsm value across many flushed overwrites"
         const work = backend.snapshotWriteStats();
         try std.testing.expectEqual(@as(u64, 1025), work.flushes);
         try std.testing.expect(work.manifest_writes <= 2 * work.flushes);
-        if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+        if (native_platform.env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
             std.debug.print("\nWORK flushed-overwrites flushes={d} compactions={d} manifests={d}\n", .{ work.flushes, work.compactions, work.manifest_writes });
     }
 
@@ -1119,7 +1121,7 @@ test "derived apply state clear removes persisted sequence" {
 
 test "derived apply checkpoint is authoritative when configured" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1135,39 +1137,39 @@ test "derived apply checkpoint is authoritative when configured" {
     try saveAppliedSequence(runtime, "legacy_idx", 7);
     try std.testing.expectEqual(
         @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "legacy_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "legacy_idx"),
     );
     try std.testing.expectEqual(
         @as(u64, 7),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, null, "legacy_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, null, "legacy_idx"),
     );
 
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
+    try saveAppliedSequencesWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
         .{ .index_name = "dense_idx", .sequence = 10 },
         .{ .index_name = "sparse_idx", .sequence = 3 },
     });
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
+    try saveAppliedSequencesWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
         .{ .index_name = "dense_idx", .sequence = 12 },
         .{ .index_name = "sparse_idx", .sequence = 2 },
     });
 
     try std.testing.expectEqual(
         @as(u64, 12),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
     try std.testing.expectEqual(
         @as(u64, 3),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "sparse_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "sparse_idx"),
     );
     try std.testing.expectEqual(
         @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "legacy_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "legacy_idx"),
     );
 }
 
 test "derived apply checkpoint clear removes sidecar entry" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1180,21 +1182,21 @@ test "derived apply checkpoint clear removes sidecar entry" {
     var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", 22);
+    try saveAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx", 22);
     try std.testing.expectEqual(
         @as(u64, 22),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
-    try clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
+    try clearAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx");
     try std.testing.expectEqual(
         @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
 }
 
 test "projection checkpoint sidecar persists status and identity fields" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1207,7 +1209,7 @@ test "projection checkpoint sidecar persists status and identity fields" {
     var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
+    try saveProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx", .{
         .applied_sequence = 44,
         .status = .degraded,
         .generation = 9,
@@ -1215,7 +1217,7 @@ test "projection checkpoint sidecar persists status and identity fields" {
         .published_count = 37,
     });
 
-    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
+    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx");
     try std.testing.expectEqual(@as(u64, 44), checkpoint.applied_sequence);
     try std.testing.expectEqual(ProjectionStatus.degraded, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 9), checkpoint.generation);
@@ -1223,7 +1225,7 @@ test "projection checkpoint sidecar persists status and identity fields" {
     try std.testing.expectEqual(@as(?u64, 37), checkpoint.published_count);
     try std.testing.expectEqual(
         @as(u64, 44),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+        try loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
 }
 
@@ -1256,7 +1258,7 @@ test "projection checkpoint reads v2 without inventing a publication certificate
 
 test "projection checkpoint rejects plausible cursor corruption" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1269,14 +1271,14 @@ test "projection checkpoint rejects plausible cursor corruption" {
     var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
+    try saveProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx", .{
         .applied_sequence = 44,
         .status = .clean,
         .generation = 9,
         .config_hash = 0x1234,
     });
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const raw = try std.Io.Dir.cwd().readFileAlloc(
         io_impl.io(),
@@ -1287,19 +1289,19 @@ test "projection checkpoint rejects plausible cursor corruption" {
     defer alloc.free(raw);
     const applied_sequence_offset = checkpoint_magic.len + @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u32);
     raw[applied_sequence_offset] ^= 0x40;
-    try writeRawCheckpointTestFile(std.testing.io, checkpoint_path, raw);
+    try writeRawCheckpointTestFile(native_platform.testing.io, checkpoint_path, raw);
 
     try std.testing.expectError(
         error.InvalidDerivedApplyState,
-        loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+        loadProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
     try std.testing.expectError(
         error.InvalidDerivedApplyState,
-        loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+        loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
     try std.testing.expectError(
         error.InvalidDerivedApplyState,
-        setProjectionCheckpoints(alloc, std.testing.io, checkpoint_path, null, &.{.{
+        setProjectionCheckpoints(alloc, native_platform.testing.io, checkpoint_path, null, &.{.{
             .index_name = "other_idx",
             .sequence = 99,
         }}),
@@ -1335,7 +1337,7 @@ test "projection checkpoint encoding is deterministic by index name" {
 
 test "applied sequence checkpoint preserves projection metadata" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1348,22 +1350,22 @@ test "applied sequence checkpoint preserves projection metadata" {
     var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
+    try saveProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx", .{
         .applied_sequence = 44,
         .status = .repair_required,
         .generation = 9,
         .config_hash = 0x1234,
         .published_count = 37,
     });
-    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", 45);
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{.{
+    try saveAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx", 45);
+    try saveAppliedSequencesWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{.{
         .index_name = "dense_idx",
         .sequence = 40,
         .generation = 10,
         .config_hash = 0x5678,
     }});
 
-    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
+    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx");
     try std.testing.expectEqual(@as(u64, 45), checkpoint.applied_sequence);
     try std.testing.expectEqual(ProjectionStatus.repair_required, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 10), checkpoint.generation);
@@ -1385,7 +1387,7 @@ fn writeRawCheckpointTestFile(io: std.Io, path: []const u8, raw: []const u8) !vo
 
 test "projection checkpoint rejects unknown checkpoint format" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1400,7 +1402,7 @@ test "projection checkpoint rejects unknown checkpoint format" {
     try appendCheckpointInt(alloc, &raw, u32, @intCast("dense_idx".len));
     try appendCheckpointInt(alloc, &raw, u64, 77);
     try raw.appendSlice(alloc, "dense_idx");
-    try writeRawCheckpointTestFile(std.testing.io, checkpoint_path, raw.items);
+    try writeRawCheckpointTestFile(native_platform.testing.io, checkpoint_path, raw.items);
 
     var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
     defer backend.close();
@@ -1409,11 +1411,11 @@ test "projection checkpoint rejects unknown checkpoint format" {
 
     try std.testing.expectError(
         error.InvalidDerivedApplyState,
-        loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+        loadProjectionCheckpointWithSidecar(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
     try std.testing.expectError(
         error.InvalidDerivedApplyState,
-        loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
+        loadAppliedSequenceWithCheckpoint(alloc, native_platform.testing.io, runtime, checkpoint_path, "dense_idx"),
     );
 }
 
@@ -1429,7 +1431,7 @@ test "derived apply checkpoint write locks are scoped per checkpoint path" {
 
 test "derived apply checkpoint serializes concurrent sidecar writers" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1455,7 +1457,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -1489,27 +1491,27 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
         lockAtomicMutex(&barrier.mutex);
         barrier.open = true;
         barrier.mutex.unlock();
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (threads[0..started_tasks]) |*task| task.await(native_platform.testing.io);
     }
     for (&workers, 0..) |*worker, i| {
         worker.* = .{
             .alloc = alloc,
-            .io = std.testing.io,
+            .io = native_platform.testing.io,
             .path = checkpoint_path,
             .name = names[i],
             .sequence = @intCast(i + 1),
             .barrier = &barrier,
         };
-        threads[i] = try std.testing.io.concurrent(Worker.run, .{worker});
+        threads[i] = try native_platform.testing.io.concurrent(Worker.run, .{worker});
         started_tasks += 1;
     }
-    for (&threads) |*thread| thread.await(std.testing.io);
+    for (&threads) |*thread| thread.await(native_platform.testing.io);
     for (&workers) |*worker| {
         if (worker.err) |err| return err;
     }
 
     for (names, 0..) |name, i| {
-        const checkpoint = (try loadProjectionCheckpoint(alloc, std.testing.io, checkpoint_path, name)) orelse return error.TestUnexpectedResult;
+        const checkpoint = (try loadProjectionCheckpoint(alloc, native_platform.testing.io, checkpoint_path, name)) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(u64, @intCast(i + 1)), checkpoint.applied_sequence);
         try std.testing.expectEqual(ProjectionStatus.clean, checkpoint.status);
     }

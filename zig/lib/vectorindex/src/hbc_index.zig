@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
@@ -3440,7 +3442,7 @@ fn waitForStableSearchPublicationIfSupported(
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        @import("antfly_platform").time.yieldNow();
+        native_platform.time.yieldNow();
     }
 }
 
@@ -4035,7 +4037,7 @@ pub fn benchmarkFusedNativeCandidates() !void {
         for (0..2) |mode| {
             const fused = (round + mode) % 2 == 1;
             results.items.clearRetainingCapacity();
-            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            const start = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds;
             for (0..iterations) |_| {
                 if (fused) {
                     var sink = NativeCandidateScoreSink{ .results = &results, .ids = &ids, .plane = plane, .dims = dims };
@@ -4046,7 +4048,7 @@ pub fn benchmarkFusedNativeCandidates() !void {
                     results.addDeferredProjectionRange(&ids, &distances, &errors, plane, 0, dims);
                 }
             }
-            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
+            const elapsed = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds - start;
             std.debug.print("native-score round={} fused={} ns_per_vector={d:.3} retained={}\n", .{ round, fused, @as(f64, @floatFromInt(elapsed)) / (iterations * count), results.items.items.len });
         }
     }

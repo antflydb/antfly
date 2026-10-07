@@ -390,7 +390,7 @@ fn executeModelForwardViaDefinition(
 
         if (context.artifact_dir != null and context.model_dir != null) artifact_blk: {
             if (std.meta.activeTag(request) != .prefill) break :artifact_blk;
-            var io_check = std.Io.Threaded.init(allocator, .{});
+            var io_check = platform.Threaded.init(allocator, .{});
             defer io_check.deinit();
             const shape = wholeModelArtifactShape(request) orelse break :artifact_blk;
             if (try findMatchingPjrtWholeModelPackageManifest(
@@ -401,7 +401,7 @@ fn executeModelForwardViaDefinition(
                 shape,
             )) |package_manifest_path| {
                 defer allocator.free(package_manifest_path);
-                var io_impl = std.Io.Threaded.init(allocator, .{});
+                var io_impl = platform.Threaded.init(allocator, .{});
                 defer io_impl.deinit();
                 const model_executor_ctx = try pjrt_artifact_executor_mod.createModelExecutorFromPackageManifestPath(
                     allocator,
@@ -445,7 +445,7 @@ fn executeModelForwardViaDefinition(
                 decode_manifest_paths[i] = match.manifest_path;
             }
 
-            var io_impl = std.Io.Threaded.init(allocator, .{});
+            var io_impl = platform.Threaded.init(allocator, .{});
             defer io_impl.deinit();
             const model_executor_ctx = try pjrt_artifact_executor_mod.createModelExecutorFromManifestPaths(
                 allocator,
@@ -582,7 +582,7 @@ fn findMatchingPjrtWholeModelArtifact(
 ) !?PjrtArtifactMatch {
     const shape = wholeModelArtifactShape(request) orelse return null;
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1008,8 +1008,8 @@ pub const backend = compiled_backend.Definition{
 
 test "PJRT whole-model decode artifact lookup collects sorted decode buckets" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -1111,8 +1111,8 @@ test "PJRT whole-model decode artifact lookup collects sorted decode buckets" {
 
 test "PJRT whole-model decode artifact lookup rejects first missing decode bucket" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -1159,8 +1159,8 @@ test "PJRT whole-model decode artifact lookup rejects first missing decode bucke
 
 test "PJRT whole-model artifact lookup prefers embedded HLO over parameter-input HLO" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -1220,8 +1220,8 @@ test "PJRT whole-model artifact lookup prefers embedded HLO over parameter-input
 
 test "PJRT whole-model artifact lookup can resolve prefill from package index" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });

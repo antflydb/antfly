@@ -26,13 +26,15 @@
 //! and a lease. A pass whose lease expired (crashed or hung advance) is
 //! superseded; its late checkpoint is discarded.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const backend_erased = @import("antfly_local_sources").storage_backend_erased;
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const research_agent = @import("research_agent.zig");
 const agent_tools = @import("agent_tools.zig");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 
 pub const StoreConfig = struct {
     path: ?[]const u8 = null,
@@ -650,7 +652,7 @@ test "research job requests reject inline credentials and ids are well formed" {
 
 test "research job store survives reopen and recovers interrupted attempts" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const pid: u64 = @intCast(std.posix.system.getpid());
     const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/research-jobs-{d}-{x}", .{ tmp.sub_path, pid, std.testing.random_seed });

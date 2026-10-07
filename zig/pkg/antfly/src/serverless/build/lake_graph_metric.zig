@@ -18,7 +18,9 @@
 //! existing runtime, while large target-owned kernel ranges use that same
 //! std.Io instance for bounded deterministic fan-out.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const graph_mod = @import("antfly_local_sources").graph_graph;
@@ -3091,7 +3093,7 @@ pub fn freeArtifactRef(alloc: Allocator, artifact: artifact_ref.ArtifactRef) voi
 
 test "serverless immutable graph root metric entry points agree with packed numerical oracle" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/page-metrics", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3284,7 +3286,7 @@ test "serverless graph metric topology does not alias qualified endpoints with l
 
 test "serverless graph metric indexed preparation selects topology and cleans up allocation failures" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/indexed-topology", .{tmp.sub_path});
     defer alloc.free(root);
@@ -3354,7 +3356,7 @@ test "serverless graph metric indexed preparation selects topology and cleans up
             prepared.deinit(failing);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.run, .{ &artifacts, source, config });
+    try native_platform.allocator.checkAllAllocationFailures(alloc, Runner.run, .{ &artifacts, source, config });
     var tiny = graph_metric_policy.Budget{ .limits = .{ .max_peak_memory_bytes = 128 } };
     try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareSelectedGraphArtifactOracleAlloc(alloc, &artifacts, source, &.{config}, .none, tiny.limits, &tiny));
     var no_reads = graph_metric_policy.Budget{ .limits = .{ .max_total_graph_payload_bytes = 0 } };
@@ -3363,7 +3365,7 @@ test "serverless graph metric indexed preparation selects topology and cleans up
 
 test "serverless graph metric semantic reuse authenticates current provenance and skips numerical work" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/semantic-reuse", .{tmp.sub_path});
     defer alloc.free(root);
@@ -3423,7 +3425,7 @@ test "serverless graph metric semantic reuse authenticates current provenance an
 
 test "serverless graph metric directory reuse admits selected work and rejects selected growth" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/directory-admission", .{tmp.sub_path});
     defer alloc.free(root);
@@ -3511,7 +3513,7 @@ test "serverless packed topology matches reference kernels across filters and qu
             defer topology.deinit(failing_alloc);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Runner.prepare, .{payload});
+    try native_platform.allocator.checkAllAllocationFailures(alloc, Runner.prepare, .{payload});
     var filter_types = [_][]u8{@constCast("alpha")};
     for ([_]graph_mod.GraphMetricEdgeFilter{ .{}, .{ .mode = .types, .types = &filter_types } }) |filter| {
         for ([_]graph_mod.GraphMetricKind{ .degree, .pagerank, .eigenvector, .hits_authority, .hits_hub }) |kind| {
@@ -3582,7 +3584,7 @@ test "serverless lake graph metrics build immutable pagerank and degree vectors"
 
 test "serverless graph metric filter groups isolate preparation admission and reuse authenticated digests" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/filter-groups", .{tmp.sub_path});
     defer alloc.free(root);
@@ -3623,7 +3625,7 @@ test "serverless graph metric filter groups isolate preparation admission and re
 
 test "serverless lake graph metrics persist a budget rejection with exact provenance" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-metric-artifacts", .{tmp.sub_path});
     defer alloc.free(root);
@@ -3675,7 +3677,7 @@ test "serverless lake graph metrics persist a budget rejection with exact proven
 
 test "serverless graph metric warm starts read bounded sparse and dense primary windows" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/seed-windows", .{tmp.sub_path});
     defer alloc.free(root_path);
@@ -3737,7 +3739,7 @@ test "serverless graph metric warm starts read bounded sparse and dense primary 
 
 test "serverless graph metric warm start maps an authenticated prior vector onto new ordinals" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-metric-warm-start", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4025,7 +4027,7 @@ test "serverless graph metric output admission rejects before kernels and reserv
 
 test "serverless lake graph metrics share one bounded HITS execution for a compatible pair" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-metric-hits", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4098,7 +4100,7 @@ test "serverless lake graph metrics share one bounded HITS execution for a compa
 
 test "serverless lake graph metrics reject work beyond the aggregate publication budget" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-metric-aggregate", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4445,7 +4447,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
             }
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &artifacts, @as([]const artifact_ref.ArtifactRef, baseline), @as([]const PublicationRequest, &.{ request_alias, request_a, renamed }) });
+    try native_platform.allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{ &artifacts, @as([]const artifact_ref.ArtifactRef, baseline), @as([]const PublicationRequest, &.{ request_alias, request_a, renamed }) });
 
     // Cache reuse must not inherit admission from the request that populated
     // the cache. A later caller's stricter source-topology limit still wins.

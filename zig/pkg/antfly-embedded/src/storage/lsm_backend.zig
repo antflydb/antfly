@@ -42,7 +42,7 @@ const cache_mod = @import("lsm_backend/cache.zig");
 const wal_mod = @import("lsm_backend/wal.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const native_artifact_sink = @import("native_artifact_sink.zig");
@@ -86,8 +86,8 @@ const supports_waitable_immutable_flush = builtin.os.tag != .freestanding and
 /// unbounded generation.
 const ImmutableFlushCompletion = if (supports_waitable_immutable_flush)
     struct {
-        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+        mutex: platform.c.pthread_mutex_t = platform.c.PTHREAD_MUTEX_INITIALIZER,
+        cond: platform.c.pthread_cond_t = platform.c.PTHREAD_COND_INITIALIZER,
         epoch: CounterU64 = .init(0),
 
         fn snapshot(self: *@This()) u64 {
@@ -95,18 +95,18 @@ const ImmutableFlushCompletion = if (supports_waitable_immutable_flush)
         }
 
         fn waitForChange(self: *@This(), observed: u64) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+            defer if (platform.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
             while (self.epoch.load(.acquire) == observed) {
-                if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
+                if (platform.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
             }
         }
 
         fn advance(self: *@This()) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
             _ = self.epoch.fetchAdd(1, .release);
-            if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
-            if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
+            if (platform.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
         }
     }
 else
@@ -124,7 +124,7 @@ else
         }
     };
 
-var file_pin_release_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0);
+var file_pin_release_epoch: platform.atomic.Value(u64) = .init(0);
 
 const ObsoletePathRefRegistry = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -5567,7 +5567,7 @@ pub const Backend = struct {
         if (comptime builtin.os.tag == .freestanding) return null;
         if (self.options.read_runtime) |runtime| return runtime.io;
         if (self.storage_owner) |owner| return owner.state.threaded.io();
-        if (comptime builtin.is_test) return std.testing.io;
+        if (comptime builtin.is_test) return platform.testing.io;
         return null;
     }
 
@@ -8230,7 +8230,7 @@ pub const Backend = struct {
         }
         // Manifest-set inventory requires the native exclusive writer lease.
         if (builtin.os.tag != .freestanding) {
-            var io_impl = std.Io.Threaded.init(self.allocator, .{});
+            var io_impl = platform.Threaded.init(self.allocator, .{});
             defer io_impl.deinit();
             const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
             stats.files_deleted +|= manifest_stats.files_deleted;
@@ -8600,7 +8600,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     borrowed_io: ?std.Io,
     mutex: std.Io.Mutex = .init,
     wake_event: std.Io.Event = .unset,
-    owned_io: ?std.Io.Threaded = null,
+    owned_io: ?platform.Threaded = null,
     future: ?std.Io.Future(void) = null,
     stop_requested: bool = false,
     drain_on_stop: bool = false,
@@ -8629,7 +8629,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
 
     fn start(self: *InternalFlushWorker) !void {
         if (self.borrowed_io == null) {
-            self.owned_io = std.Io.Threaded.init(self.backend.allocator, .{
+            self.owned_io = platform.Threaded.init(self.backend.allocator, .{
                 .async_limit = .nothing,
                 .concurrent_limit = .limited(1),
             });
@@ -9173,11 +9173,11 @@ fn appendStateLevelRunsForTest(backend: *Backend, level: u32, count: usize) !voi
 
 fn sleepForTest(duration_ns: u64) void {
     if (comptime builtin.os.tag == .freestanding) return;
-    var req = std.posix.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
         .nsec = @intCast(duration_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -9185,7 +9185,7 @@ fn sleepForTest(duration_ns: u64) void {
 }
 
 fn pathExistsForTest(path: []const u8) bool {
-    std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch |err| switch (err) {
+    std.Io.Dir.cwd().access(platform.testing.io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => return false,
     };
@@ -9193,7 +9193,7 @@ fn pathExistsForTest(path: []const u8) bool {
 }
 
 fn writeMarkerForTest(path: []const u8) !void {
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "1" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = path, .data = "1" });
 }
 
 fn waitForPathForTest(path: []const u8, timeout_ns: u64) !void {
@@ -10468,14 +10468,14 @@ fn implementationTests() type {
                     target.finishImmutableFlushBuildLocked();
                 }
             };
-            var clear_thread = try std.testing.io.concurrent(ClearBuild.run, .{&backend});
-            defer clear_thread.await(std.testing.io);
+            var clear_thread = try platform.testing.io.concurrent(ClearBuild.run, .{&backend});
+            defer clear_thread.await(platform.testing.io);
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{}, "key:b", "b");
                 try txn.commit();
             }
-            clear_thread.await(std.testing.io);
+            clear_thread.await(platform.testing.io);
             try std.testing.expectEqual(@as(usize, 1), backend.activeImmutableMemtableCount());
             try std.testing.expectEqual(@as(usize, 1), backend.runs.count());
 
@@ -12282,7 +12282,7 @@ fn implementationTests() type {
 
         test "lsm backend runtime cursor seeks internal graph artifact prefix before replay keys" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -13992,7 +13992,7 @@ fn implementationTests() type {
                     };
 
                     const locked = runtime_mod.lockBackend(Backend, backend);
-                    var thread = try std.testing.io.concurrent(Worker.run, .{&ctx});
+                    var thread = try platform.testing.io.concurrent(Worker.run, .{&ctx});
 
                     while (stage.load(.acquire) == 0) {
                         platform.time.yieldBriefly();
@@ -14004,7 +14004,7 @@ fn implementationTests() type {
                     const blocked_stage = stage.load(.acquire);
 
                     if (locked) runtime_mod.unlockBackend(Backend, backend, locked);
-                    thread.await(std.testing.io);
+                    thread.await(platform.testing.io);
                     try std.testing.expectEqual(@as(u8, 1), blocked_stage);
                     try std.testing.expectEqual(@as(u8, 2), stage.load(.acquire));
                 }
@@ -14615,7 +14615,7 @@ fn implementationTests() type {
 
         test "lsm backend bulk ingest finish can flush without compaction for wal-backed stores" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -14656,7 +14656,7 @@ fn implementationTests() type {
 
         test "lsm backend flushes buffered writes outside bulk ingest" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -17971,16 +17971,16 @@ fn implementationTests() type {
 
             var ctx = Worker.Context{ .txn = &read };
             const locked = runtime_mod.lockBackend(Backend, &backend);
-            var thread = try std.testing.io.concurrent(Worker.run, .{&ctx});
+            var thread = try platform.testing.io.concurrent(Worker.run, .{&ctx});
             var joined = false;
-            defer if (!joined) thread.await(std.testing.io);
+            defer if (!joined) thread.await(platform.testing.io);
 
             while (ctx.stage.load(.acquire) == 0) platform.time.yieldBriefly();
             sleepForTest(100 * std.time.ns_per_ms);
             const completed_without_backend_lock = ctx.stage.load(.acquire) == 2;
 
             runtime_mod.unlockBackend(Backend, &backend, locked);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             joined = true;
 
             try std.testing.expect(completed_without_backend_lock);
@@ -18409,9 +18409,9 @@ fn implementationTests() type {
             var read = try backend.beginRead();
             var read_released = false;
             var state = CloseState{ .backend = &backend };
-            var thread = try std.testing.io.concurrent(CloseState.run, .{&state});
+            var thread = try platform.testing.io.concurrent(CloseState.run, .{&state});
             var thread_joined = false;
-            defer if (!thread_joined) thread.await(std.testing.io);
+            defer if (!thread_joined) thread.await(platform.testing.io);
             defer if (!read_released) read.abort();
 
             while (!state.started.load(.acquire)) platform.time.yieldBriefly();
@@ -18421,7 +18421,7 @@ fn implementationTests() type {
 
             read.abort();
             read_released = true;
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             thread_joined = true;
             try std.testing.expect(state.finished.load(.acquire));
         }
@@ -19336,7 +19336,7 @@ fn implementationTests() type {
 
             const lock_path = try walOperationLockPathAlloc(std.testing.allocator, root_path);
             defer std.testing.allocator.free(lock_path);
-            try std.Io.Dir.deleteFileAbsolute(std.testing.io, lock_path);
+            try std.Io.Dir.deleteFileAbsolute(platform.testing.io, lock_path);
             try std.testing.expect(!pathExistsForTest(lock_path));
 
             var reader = try Backend.open(std.testing.allocator, root_path, .{
@@ -21704,7 +21704,7 @@ fn implementationTests() type {
                 defer reopened.close();
 
                 try std.testing.expectEqual(@as(usize, 1), reopened.runs.count());
-                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}));
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, orphan_path, .{}));
 
                 var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
                 defer runtime.deinit();
@@ -21766,10 +21766,10 @@ fn implementationTests() type {
 
                 try std.testing.expectEqual(@as(usize, 1), reopened.runs.count());
                 try std.testing.expectEqual(@as(usize, 1), reopened.obsolete_paths.count());
-                try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
+                try std.Io.Dir.cwd().access(platform.testing.io, obsolete_path, .{});
                 try std.testing.expect(try reopened.runMaintenanceStep());
                 try std.testing.expectEqual(@as(usize, 0), reopened.obsolete_paths.count());
-                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{}));
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, obsolete_path, .{}));
 
                 var runtime = try reopened.runtimeStore(std.testing.allocator, .{ .name = "docs" });
                 defer runtime.deinit();
@@ -21856,7 +21856,7 @@ fn implementationTests() type {
             if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
             var storage = storage_io.MemoryStorage.init(std.testing.allocator);
             defer storage.deinit();
-            var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+            var unavailable = platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
             defer unavailable.deinit();
             try std.testing.expectError(error.ConcurrencyUnavailable, BackendHandle.openWithConfig(
                 std.testing.allocator,
@@ -21869,7 +21869,7 @@ fn implementationTests() type {
                 std.testing.allocator,
                 "/lsm-flush-start-failure",
                 .{ .storage = storage.storage() },
-                .{ .internal_flush_worker = true, .maintenance_io = std.testing.io },
+                .{ .internal_flush_worker = true, .maintenance_io = platform.testing.io },
             );
             defer reopened.close();
             try std.testing.expect(reopened.internal_flush_worker.?.owned_io == null);
@@ -21890,7 +21890,7 @@ fn implementationTests() type {
             try txn.put(.{}, "key", "value");
             try txn.commit();
 
-            var worker = InternalFlushWorker.init(&backend, std.testing.io);
+            var worker = InternalFlushWorker.init(&backend, platform.testing.io);
             defer worker.deinit();
             worker.stopAndJoin(false);
             worker.run();
@@ -21918,7 +21918,7 @@ fn implementationTests() type {
 
         test "lsm overlap scoring aggregate scaling benchmark" {
             if (builtin.mode != .fast) return error.SkipZigTest;
-            const time = @import("antfly_platform").time;
+            const time = platform.time;
             for ([_]usize{ 1000, 10000, 100000 }) |count| {
                 var backend = Backend.init(std.heap.smp_allocator, .{ .l0_hard_limit_runs = 16 });
                 defer backend.close();
@@ -22055,7 +22055,7 @@ fn implementationTests() type {
         test "lsm dependency continuation slice scaling benchmark" {
             if (builtin.mode != .fast) return error.SkipZigTest;
             const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
-            const time = @import("antfly_platform").time;
+            const time = platform.time;
             const allocator = std.heap.smp_allocator;
             for ([_]usize{ 1000, 10000, 100000 }) |count| {
                 var backend = Backend.init(allocator, .{});
@@ -22548,7 +22548,7 @@ fn implementationTests() type {
 
         test "lsm scoped reads bound retained values and preserve one disk snapshot" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -22773,7 +22773,7 @@ fn implementationTests() type {
                     var cursor = try read.openCursor(.{ .name = "docs" });
                     defer cursor.close();
                     cursor.test_full_forward_seek = restart;
-                    const started = @import("antfly_platform").time.monotonicNs();
+                    const started = platform.time.monotonicNs();
                     for (0..512) |row| {
                         var key_buf: [64]u8 = undefined;
                         const key = try std.fmt.bufPrint(&key_buf, "doc:{d:0>5}:0", .{row});
@@ -22781,7 +22781,7 @@ fn implementationTests() type {
                         try std.testing.expectEqualStrings(key, entry.key);
                         try std.testing.expectEqualStrings("new", entry.value);
                     }
-                    elapsed[mode] = @intCast(@import("antfly_platform").time.monotonicNs() - started);
+                    elapsed[mode] = @intCast(platform.time.monotonicNs() - started);
                     counts[mode] = cursor.test_seek_sources;
                     // Equal borrowed-key seeks, reverse movement, exhaustion,
                     // and reseeking after exhaustion retain public semantics.
@@ -23154,32 +23154,32 @@ fn implementationTests() type {
                         runtime_mod.unlockBackend(Backend, target, locked);
                         if (ready) return;
                         if (expired) return error.TestCheckpointDidNotRotateTail;
-                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
                     }
                 }
             };
-            var completion = std.testing.io.concurrent(Builder.complete, .{&backend}) catch |err| {
+            var completion = platform.testing.io.concurrent(Builder.complete, .{&backend}) catch |err| {
                 backend.finishImmutableFlushBuildLocked();
                 return err;
             };
             var completion_awaited = false;
             defer if (!completion_awaited) {
-                completion.await(std.testing.io) catch {};
+                completion.await(platform.testing.io) catch {};
             };
             var checkpoint = try backend.pinNativeCheckpoint();
             defer checkpoint.deinit();
-            const completed = completion.await(std.testing.io);
+            const completed = completion.await(platform.testing.io);
             completion_awaited = true;
             try completed;
             try std.testing.expectEqual(@as(?u64, 23), backend.maintenance_io_budget_remaining);
             try std.testing.expectEqual(@as(usize, 0), backend.activeImmutableMemtableCount());
             try std.testing.expectEqual(@as(usize, 0), backend.mutable.entryCount());
             try std.testing.expect(checkpoint.run_ids.len > 0);
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const restored_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checkpoint", .{tmp.sub_path});
             defer alloc.free(restored_path);
-            _ = try checkpoint.materialize(std.testing.io, restored_path, .none);
+            _ = try checkpoint.materialize(platform.testing.io, restored_path, .none);
             var restored = try Backend.open(alloc, restored_path, .{ .backend = .{ .read_only = true } });
             defer restored.close();
             var read = try Backend.BoundReadTxn.open(&restored, .{});
@@ -23998,7 +23998,7 @@ fn implementationTests() type {
             const allocator = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(allocator);
             defer storage.deinit();
-            var io_impl = std.Io.Threaded.init(allocator, .{});
+            var io_impl = platform.Threaded.init(allocator, .{});
             defer io_impl.deinit();
             const root = "/unknown-tombstone-manifest-failure";
             try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 3);
@@ -24141,7 +24141,7 @@ fn implementationTests() type {
         test "lsm split waits for publication before detaching live run ownership" {
             if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             const alloc = std.testing.allocator;
-            var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+            var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(4) });
             defer io_impl.deinit();
             const io = io_impl.io();
             var storage = storage_io.MemoryStorage.init(alloc);
@@ -24237,7 +24237,7 @@ fn implementationTests() type {
             if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             for ([_]bool{ false, true }) |fail_first| {
                 const alloc = std.testing.allocator;
-                var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+                var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(4) });
                 defer io_impl.deinit();
                 const io = io_impl.io();
                 var storage = storage_io.MemoryStorage.init(alloc);
@@ -24338,7 +24338,7 @@ fn implementationTests() type {
         test "lsm concurrent first readers pin epochs without projecting runs" {
             if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             const alloc = std.testing.allocator;
-            var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
+            var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(8) });
             defer io_impl.deinit();
             const io = io_impl.io();
             var storage = storage_io.MemoryStorage.init(alloc);
@@ -24559,7 +24559,7 @@ fn implementationTests() type {
         test "lsm native durability lane contention benchmark" {
             if (builtin.mode != .fast or builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             const alloc = std.heap.smp_allocator;
-            var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
+            var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(8) });
             defer io_impl.deinit();
             const io = io_impl.io();
             const Worker = struct {
@@ -24607,7 +24607,7 @@ fn implementationTests() type {
                 }
             };
             for (0..3) |trial| for ([_]bool{ trial % 2 == 0, trial % 2 != 0 }) |serialized| {
-                var tmp = std.testing.tmpDir(.{});
+                var tmp = platform.testing.tmpDir(.{});
                 defer tmp.cleanup();
                 var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
                 const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -25021,18 +25021,18 @@ fn implementationTests() type {
             {
                 var reader = try Backend.open(allocator, root, .{ .backend = .{ .read_only = true } });
                 defer reader.close();
-                try std.Io.Dir.cwd().access(std.testing.io, orphan, .{});
-                try std.Io.Dir.cwd().access(std.testing.io, temporary, .{});
-                try std.Io.Dir.cwd().access(std.testing.io, descriptor_temporary, .{});
+                try std.Io.Dir.cwd().access(platform.testing.io, orphan, .{});
+                try std.Io.Dir.cwd().access(platform.testing.io, temporary, .{});
+                try std.Io.Dir.cwd().access(platform.testing.io, descriptor_temporary, .{});
             }
             {
                 var writer = try Backend.open(allocator, root, .{});
                 defer writer.close();
-                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan, .{}));
-                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, temporary, .{}));
-                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, descriptor_temporary, .{}));
-                try std.Io.Dir.cwd().access(std.testing.io, unrelated, .{});
-                try std.Io.Dir.cwd().access(std.testing.io, unrelated_temporary, .{});
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, orphan, .{}));
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, temporary, .{}));
+                try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, descriptor_temporary, .{}));
+                try std.Io.Dir.cwd().access(platform.testing.io, unrelated, .{});
+                try std.Io.Dir.cwd().access(platform.testing.io, unrelated_temporary, .{});
                 var txn = try writer.beginRead();
                 defer txn.abort();
                 try std.testing.expectEqualStrings("value", try txn.get(.{}, "key"));

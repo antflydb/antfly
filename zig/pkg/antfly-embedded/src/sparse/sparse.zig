@@ -24,7 +24,9 @@
 //! stored as sparse segment blobs; legacy-shaped chunk rows remain as the small
 //! delta path for incremental writes.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -32,7 +34,7 @@ const Allocator = std.mem.Allocator;
 const backend_erased = @import("../storage/backend_erased.zig");
 const backend_types = @import("../storage/backend_types.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const mem_backend = @import("../storage/mem_backend.zig");
 const lsm_backend = @import("../storage/lsm_backend/mod.zig");
 
@@ -4708,14 +4710,14 @@ fn writeChunkWithRangeMetaToTxn(
 fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
     const ts = nowNs();
     const slice = std.fmt.bufPrint(buf, "/tmp/antfly-sparse-{s}-{d}\x00", .{ label, ts }) catch unreachable;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

@@ -493,8 +493,8 @@ fn onnxRunWithControl(
         .run_options = run_options.?,
         .control = control,
     };
-    var owned_io: ?std.Io.Threaded = if (control.io == null)
-        std.Io.Threaded.init(std.heap.page_allocator, .{})
+    var owned_io: ?platform.Threaded = if (control.io == null)
+        platform.Threaded.init(std.heap.page_allocator, .{})
     else
         null;
     defer if (owned_io) |*runtime| runtime.deinit();
@@ -711,8 +711,8 @@ pub fn runWithBoundValuesControl(
         .run_options = run_options.?,
         .control = active,
     };
-    var owned_io: ?std.Io.Threaded = if (active.io == null)
-        std.Io.Threaded.init(std.heap.page_allocator, .{})
+    var owned_io: ?platform.Threaded = if (active.io == null)
+        platform.Threaded.init(std.heap.page_allocator, .{})
     else
         null;
     defer if (owned_io) |*runtime| runtime.deinit();

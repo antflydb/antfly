@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 /// Borrowed cooperative cancellation for one synchronous maintenance pass.
@@ -85,7 +87,7 @@ pub const GraphBridge = struct {
 };
 
 test "serverless graph maintenance bridge serializes renewal and preserves lease failures" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    var threaded = native_platform.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const State = struct {

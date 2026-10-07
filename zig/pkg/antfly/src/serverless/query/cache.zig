@@ -13,9 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
+
+const platform_sync = native_platform.sync;
+const platform_time = native_platform.time;
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
@@ -1065,8 +1067,8 @@ fn authenticateSubranges(
     try cancellation.check();
 }
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() native_platform.Threaded {
+    return native_platform.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn lockFileExclusiveWithCancellation(
@@ -2171,7 +2173,7 @@ fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: Cancellati
         if (attempts < 64) {
             std.atomic.spinLoopHint();
         } else {
-            @import("antfly_platform").time.yieldNow();
+            native_platform.time.yieldNow();
         }
     }
     errdefer mutex.unlock();
@@ -2798,7 +2800,7 @@ test "serverless query cache supports relative cache directories" {
     var artifact_root_buf: [256]u8 = undefined;
     const artifact_root = tmpPath(&artifact_root_buf, "artifacts-relative-cache");
     defer cleanupTmp(artifact_root);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const relative_cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relative-cache", .{tmp.sub_path});
     defer alloc.free(relative_cache_root);
@@ -3016,7 +3018,7 @@ test "serverless query cache batch publication releases allocations and reservat
             };
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless query cache bypasses oversized entries without evicting useful data" {

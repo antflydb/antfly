@@ -127,8 +127,8 @@ const docstore_mod = if (builtin.is_test) @import("antfly_local_sources").storag
 const routes = @import("http_routes.zig");
 const runtime_status = @import("antfly_local_sources").api_runtime_status;
 const test_contract_helpers = @import("test_contract_helpers.zig");
-const platform_time = @import("antfly_platform").time;
-const platform_sync = @import("antfly_platform").sync;
+const platform_time = platform.time;
+const platform_sync = platform.sync;
 const foreign_mod = @import("../foreign/mod.zig");
 const foreign_sources_api = @import("foreign_sources.zig");
 const json_helpers = @import("antfly_local_sources").api_json_helpers;
@@ -4139,7 +4139,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn queryEmbeddingCacheIo(cfg: ApiHttpServerConfig) std.Io {
-        const fallback = std.Io.Threaded.global_single_threaded.io();
+        const fallback = platform.Threaded.global_single_threaded.io();
         return configuredApiIo(cfg) orelse fallback;
     }
 
@@ -4179,7 +4179,7 @@ pub const ApiHttpServer = struct {
     /// checkpoints stop verifying after a restart (durable jobs do not).
     pub fn researchStateKey(self: *ApiHttpServer, io: std.Io) ![32]u8 {
         if (self.research_state_key_ready.load(.acquire)) return self.research_state_key;
-        @import("antfly_platform").sync.lockYielding(&self.research_state_key_mutex);
+        platform.sync.lockYielding(&self.research_state_key_mutex);
         defer self.research_state_key_mutex.unlock();
         if (!self.research_state_key_ready.load(.acquire)) {
             if (self.cfg.internal_service_secret) |secret| {
@@ -4197,7 +4197,7 @@ pub const ApiHttpServer = struct {
     }
 
     pub fn inferenceIo(self: *const ApiHttpServer) std.Io {
-        const fallback = std.Io.Threaded.global_single_threaded.io();
+        const fallback = platform.Threaded.global_single_threaded.io();
         return configuredApiNetworkIo(self.cfg) orelse fallback;
     }
 
@@ -12242,8 +12242,8 @@ pub const ApiHttpServer = struct {
 
         const materialize_snapshot = !target_exists or replace_existing;
 
-        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(backup_location) == null)
-            std.Io.Threaded.init(std.heap.page_allocator, .{})
+        var fallback_io: ?platform.Threaded = if (self.backupLocationIo(backup_location) == null)
+            platform.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
@@ -12620,7 +12620,7 @@ pub const ApiHttpServer = struct {
             return error.BackupStagingUnavailable;
         };
         if (self.sharedApiFilesystemIo()) |io| return try createBackupStagingRootAt(self.alloc, io, configured_root, generation_id);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try createBackupStagingRootAt(self.alloc, io_impl.io(), configured_root, generation_id);
     }
@@ -12645,7 +12645,7 @@ pub const ApiHttpServer = struct {
         if (self.sharedApiIo()) |io| {
             try io.randomSecure(&entropy);
         } else {
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             try io_impl.io().randomSecure(&entropy);
         }
@@ -12658,7 +12658,7 @@ pub const ApiHttpServer = struct {
         if (self.sharedApiIo()) |io| {
             try io.randomSecure(&entropy);
         } else {
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             try io_impl.io().randomSecure(&entropy);
         }
@@ -12668,7 +12668,7 @@ pub const ApiHttpServer = struct {
 
     fn destroyBackupStagingRoot(self: *ApiHttpServer, path: []const u8) void {
         if (self.sharedApiFilesystemIo()) |io| return destroyBackupStagingRootAt(self.alloc, io, path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         destroyBackupStagingRootAt(self.alloc, io_impl.io(), path);
     }
@@ -13216,7 +13216,7 @@ pub const ApiHttpServer = struct {
                 if (try self.rowPolicyWriteProof(a, request, table.table_id, physical, target.database, signed[index].relational_schema_version)) |proof| {
                     signed[index].row_policy_principal_proof = proof;
                     signed[index].row_policy_database = target.database;
-                    signed[index].row_policy_admitted_at_seconds = @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s));
+                    signed[index].row_policy_admitted_at_seconds = @intCast(@divFloor(platform.time.realtimeNs(), std.time.ns_per_s));
                 }
             }
             start = end;
@@ -15148,8 +15148,8 @@ pub const ApiHttpServer = struct {
             break :table metadata_table_manager.cloneTable(self.alloc, record.*) catch return error.InternalFailure;
         };
         defer metadata_table_manager.freeTable(self.alloc, table);
-        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(location) == null)
-            std.Io.Threaded.init(std.heap.page_allocator, .{})
+        var fallback_io: ?platform.Threaded = if (self.backupLocationIo(location) == null)
+            platform.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
@@ -15420,7 +15420,7 @@ pub const ApiHttpServer = struct {
         };
         if (owner_count != 0 and definitions.len > 16_384 / owner_count) return error.Unavailable;
         var bounded = request;
-        const ceiling = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+        const ceiling = platform.time.monotonicNs() +| 5 * std.time.ns_per_s;
         bounded.deadline_ns = @min(bounded.deadline_ns orelse ceiling, ceiling);
         var collected = @import("relational_index_status.zig").collectAllWithParsedSchema(alloc, self.source, self.table_reads orelse return error.Unavailable, table.name, table.schema_json, parsed, bounded) catch |err| return switch (err) {
             error.Canceled, error.Cancelled => error.Canceled,
@@ -15495,7 +15495,7 @@ pub const ApiHttpServer = struct {
     fn relationalIndexResource(self: *ApiHttpServer, alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, parsed: *const schema_mod.ParsedTableSchema, definition: anytype, request: api_operation.RequestContext) public_table_http.TableApi.ExecuteGetIndexError![]u8 {
         const reader = self.table_reads orelse return error.Unavailable;
         var bounded = request;
-        const ceiling = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+        const ceiling = platform.time.monotonicNs() +| 5 * std.time.ns_per_s;
         bounded.deadline_ns = @min(bounded.deadline_ns orelse ceiling, ceiling);
         const status = @import("relational_index_status.zig").collect(alloc, self.source, reader, table.name, definition.name, table.schema_json, bounded) catch |err| return switch (err) {
             error.Canceled, error.Cancelled => error.Canceled,
@@ -16942,8 +16942,8 @@ pub const ApiHttpServer = struct {
             .remote => true,
         };
         const op_alloc = self.alloc;
-        var fallback_io: ?std.Io.Threaded = if (self.backupLocationIo(location) == null)
-            std.Io.Threaded.init(std.heap.page_allocator, .{})
+        var fallback_io: ?platform.Threaded = if (self.backupLocationIo(location) == null)
+            platform.Threaded.init(std.heap.page_allocator, .{})
         else
             null;
         defer if (fallback_io) |*owned| owned.deinit();
@@ -23164,7 +23164,7 @@ fn waitForRestoreBackoffEvent(
 }
 
 test "restore retry deadline wakeup is interruptible without polling" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var event: std.Io.Event = .unset;
@@ -23193,7 +23193,7 @@ test "restore retry deadline wakeup is interruptible without polling" {
 }
 
 test "restore ownership backoff is interruptible without polling" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var event: std.Io.Event = .unset;
@@ -23530,12 +23530,12 @@ test "staged restore published metadata wins cancellation only after every owner
             self.calls[index] += 1;
             // One successful slow RPC consumes the cooperative budget, not the
             // hard request deadline. Its durable prefix must survive the yield.
-            if (index == 0 and self.calls[index] == 1) try std.testing.io.sleep(.fromMilliseconds(300), .awake);
+            if (index == 0 and self.calls[index] == 1) try platform.testing.io.sleep(.fromMilliseconds(300), .awake);
             if (index == 128 and self.calls[index] == 1) return error.Timeout;
             return .{ .phase = .published, .rows = 1, .receipt = @splat(9) };
         }
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const job_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-jobs", .{tmp.sub_path});
     defer alloc.free(job_path);
@@ -23546,7 +23546,7 @@ test "staged restore published metadata wins cancellation only after every owner
     }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status } }, null, null);
     defer server.deinit();
     server.restore_job_store.deinit();
-    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, std.testing.io);
+    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, platform.testing.io);
     const job_store = try alloc.create(restore_jobs.OpenedStore);
     job_store.* = try restore_jobs.OpenedStore.open(alloc, job_path);
     try server.restore_job_store.attach(job_store);
@@ -24121,14 +24121,14 @@ fn writeTestRestoreManifestAndArtifact(
     });
     defer alloc.free(artifact_path);
     if (std.fs.path.dirname(artifact_path)) |parent|
-        try fs_paths.createDirPathPortable(std.testing.io, parent);
+        try fs_paths.createDirPathPortable(platform.testing.io, parent);
     var artifact = try fs_paths.createFilePortable(
-        std.testing.io,
+        platform.testing.io,
         artifact_path,
         .{ .truncate = true },
     );
-    defer artifact.close(std.testing.io);
-    try artifact.sync(std.testing.io);
+    defer artifact.close(platform.testing.io);
+    try artifact.sync(platform.testing.io);
     try backups_api.writeManifest(alloc, backup_root_abs, manifest);
 }
 
@@ -24165,13 +24165,13 @@ fn publishTestCommittedClusterAttempt(
     defer location.deinit(alloc);
     try backups_api.writeClusterBackupAttemptMarker(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         &marker,
     );
     try backups_api.writeClusterBackupAttemptHead(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         attempt_id,
     );
@@ -24186,7 +24186,7 @@ fn writeTestRestoreManifestLocationAlloc(
 ) ![]u8 {
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/{s}", .{ tmp_sub_path, directory_name });
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -24204,11 +24204,11 @@ fn attachTestRestoreJobStore(alloc: std.mem.Allocator, server: *ApiHttpServer, t
 
 test "public portable foreign-key restore rejects a new job without losing an exact retry" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-fk", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -24245,7 +24245,7 @@ test "public portable foreign-key restore rejects a new job without losing an ex
     // an admitted document restore into an unverified FK publication.
     const metadata_path = try backups_api.metadataPath(alloc, backup_root_abs, "snap-fk");
     defer alloc.free(metadata_path);
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, metadata_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, metadata_path);
     manifest.schema_json = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"foreign_keys\":[{\"name\":\"parent_fk\",\"child_columns\":[\"id\"],\"parent_table\":\"parent\",\"parent_columns\":[\"id\"]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
     manifest.read_schema_json = manifest.schema_json;
     try writeTestRestoreManifestAndArtifact(alloc, backup_root_abs, &manifest);
@@ -24275,10 +24275,10 @@ test "public portable foreign-key restore rejects a new job without losing an ex
 
 test "backup staging uses configured storage authority and exclusive generations" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const configured_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/storage-root", .{tmp.sub_path});
     defer alloc.free(configured_root);
@@ -24342,11 +24342,11 @@ fn waitForTerminalRestoreJobAlloc(alloc: std.mem.Allocator, server: *ApiHttpServ
 }
 
 fn sleepNs(duration_ns: u64) void {
-    var req = std.posix.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
         .nsec = @intCast(duration_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -27010,7 +27010,7 @@ test "storage migration command admission fences delayed starts across handlers"
     const migration = @import("antfly_local_sources").common_vector_migration;
     const Db = @import("antfly_source_root").antfly_sources.physical_db.DB;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/review-db", .{tmp.sub_path});
     defer alloc.free(path);
@@ -31882,7 +31882,7 @@ test "system catalog validates writes against table-specific extension data shap
         .value = "{\"body\":\"remember this\",\"unexpected\":\"owned by no shape\"}",
     }}));
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/extension-shape-batch", .{tmp.sub_path});
     defer alloc.free(path);
@@ -34677,7 +34677,7 @@ test "continuous HA freezes pre-existing restore workers and resumption" {
 
 test "continuous HA allows a configured RemoteApply batch write" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ha-remote-apply-batch", .{tmp.sub_path});
     defer alloc.free(path);
@@ -34717,7 +34717,7 @@ test "continuous HA allows a configured RemoteApply batch write" {
 
 test "api http server document scan requires table read permission" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-scan-auth", .{tmp.sub_path});
     defer alloc.free(path);
@@ -35258,7 +35258,7 @@ test "api http server serves secrets crud when backed by a local store" {
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-http-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
 
@@ -35393,7 +35393,7 @@ test "api http server status includes secret store reload health" {
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-status-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
 
@@ -35497,7 +35497,7 @@ test "api http server forbids non-admin secret access when auth is enabled" {
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-auth-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     defer std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
 
@@ -36288,7 +36288,7 @@ test "api http server serves table lookup with version header" {
     var path_tmp = try TestDirectory.init("antfly-api-http-lookup");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -36443,7 +36443,7 @@ test "api http server decodes percent-encoded lookup keys" {
     var path_tmp = try TestDirectory.init("antfly-api-http-lookup-encoded");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -36515,7 +36515,7 @@ test "api http server serves document lookup through mcp tool" {
     var path_tmp = try TestDirectory.init("antfly-api-http-mcp-get-document");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -36642,7 +36642,7 @@ test "api http server serves fielded full-text search through mcp tools" {
     var path_tmp = try TestDirectory.init("antfly-api-http-mcp-fielded-search");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -37196,7 +37196,7 @@ test "api http server serves table scan as ndjson" {
     var path_tmp = try TestDirectory.init("antfly-api-http-scan");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -37283,7 +37283,7 @@ test "api http server serves table query response envelope" {
     var path_tmp = try TestDirectory.init("antfly-api-http-query");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -37348,7 +37348,7 @@ test "api http server serves table query response envelope" {
 test "api http server query string boolean controls survive reopen" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-api-http-query-string-boolean";
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -37422,7 +37422,7 @@ test "api http server executes public Query filter roots and compositions" {
     var path_tmp = try TestDirectory.init("antfly-api-http-sdk-filter-roots");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -37579,7 +37579,7 @@ test "api http server serves table query with SearchAF-shaped terms aggregations
     var path_tmp = try TestDirectory.init("antfly-api-http-searchaf-aggregations");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -37658,7 +37658,7 @@ test "api http server serves retrieval agent response envelope" {
     var path_tmp = try TestDirectory.init("antfly-api-http-retrieval");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -37931,7 +37931,7 @@ test "api http server serves retrieval agent event stream" {
     var path_tmp = try TestDirectory.init("antfly-api-http-retrieval-stream");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -39028,7 +39028,7 @@ test "api http server serves table batch writes" {
     var path_tmp = try TestDirectory.init("antfly-api-http-batch");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -39158,7 +39158,7 @@ test "api http server coordinated batch outcomes retain prepared names and confl
     const public_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"pk","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}}}}
     ;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/outcome-lifetime", .{tmp.sub_path});
     defer alloc.free(path);
@@ -39579,7 +39579,7 @@ test "api http server serves table batch transforms" {
     var path_tmp = try TestDirectory.init("antfly-api-http-batch-transform");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -39662,7 +39662,7 @@ test "api http server serves table batch transforms" {
 
 test "api http graph push preserves projected edges across restart" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-push-restart", .{tmp.sub_path});
     defer alloc.free(path);
@@ -39787,7 +39787,7 @@ test "api http graph push preserves projected edges across restart" {
 
 test "api http server updates local table schema through bound write source" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/local-schema", .{tmp.sub_path});
@@ -39848,7 +39848,7 @@ test "api http server serves public transaction commit route" {
     const StoredTitle = struct {
         title: []const u8,
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-txn", .{tmp.sub_path});
@@ -40497,7 +40497,7 @@ test "api http server serves long-lived public transaction session routes" {
     var path_tmp = try TestDirectory.init("antfly-api-http-session-txn");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -40747,7 +40747,7 @@ test "api http server serves long-lived public transaction session routes" {
 
 test "api transaction sessions enforce principal permissions and row filters" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-transaction-auth", .{tmp.sub_path});
     defer alloc.free(path);
@@ -41025,7 +41025,7 @@ test "api http server reloads durable transaction sessions after restart" {
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-restart-sessions");
     defer session_path_tmp.cleanup();
     const session_path = session_path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -41258,7 +41258,7 @@ test "api session maintenance recovers crash window after durable 2pc commit" {
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-post-commit-recovery");
     defer session_path_tmp.cleanup();
     const session_path = session_path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -41365,7 +41365,7 @@ test "api session maintenance skips live commit execution and acknowledgement" {
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-live-commit");
     defer session_path_tmp.cleanup();
     const session_path = session_path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -41480,7 +41480,7 @@ test "api http server enforces configured savepoint limits and exposes remaining
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-savepoint-limit-sessions");
     defer session_path_tmp.cleanup();
     const session_path = session_path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -41588,7 +41588,7 @@ test "api http server enforces session adoption timeout when configured" {
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-adopt-timeout");
     defer session_path_tmp.cleanup();
     const session_path = session_path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -41686,7 +41686,7 @@ test "api http server keeps session maintenance off public request paths" {
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-renew-cadence");
     defer session_path_tmp.cleanup();
     const session_path = session_path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -41782,7 +41782,7 @@ test "api http server can renew owned session leases via explicit maintenance ho
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-renew-maintenance");
     defer session_path_tmp.cleanup();
     const session_path = session_path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -41895,7 +41895,7 @@ test "api http server keeps session maintenance off internal request paths" {
     var session_path_tmp = try TestDirectory.init("antfly-api-http-session-renew-internal-route");
     defer session_path_tmp.cleanup();
     const session_path = session_path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -42697,7 +42697,7 @@ test "api http server serves internal group transaction routes" {
     var path_tmp = try TestDirectory.init("antfly-api-http-txn");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -43264,7 +43264,7 @@ test "api http server reports table storage empty from read visibility" {
     var path_tmp = try TestDirectory.init("antfly-api-http-table-storage-empty");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -43628,7 +43628,7 @@ test "api http server serves local index runtime status" {
     var path_tmp = try TestDirectory.init("antfly-api-http-index-status");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -45008,7 +45008,7 @@ test "api http server serves provisioned index runtime backfill status across sh
     var path_tmp = try TestDirectory.init("antfly-api-http-provisioned-index-status");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48289,7 +48289,7 @@ test "api http server serves table metadata routes against real metadata service
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-table-metadata-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -48568,7 +48568,7 @@ test "api http server create table with replication sources returns encoded tabl
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-table-replication-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -48657,12 +48657,12 @@ test "api http server lists cluster backups through public route" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backups", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -48704,11 +48704,11 @@ test "api http server lists cluster backups through public route" {
         artifact_rel_path,
     });
     defer alloc.free(artifact_path);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, backup_root);
-    var artifact_file = try std.Io.Dir.cwd().createFile(std.testing.io, artifact_path, .{ .truncate = true });
-    try artifact_file.writePositionalAll(std.testing.io, artifact_payload, 0);
-    try artifact_file.sync(std.testing.io);
-    artifact_file.close(std.testing.io);
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, backup_root);
+    var artifact_file = try std.Io.Dir.cwd().createFile(platform.testing.io, artifact_path, .{ .truncate = true });
+    try artifact_file.writePositionalAll(platform.testing.io, artifact_payload, 0);
+    try artifact_file.sync(platform.testing.io);
+    artifact_file.close(platform.testing.io);
     try backups_api.writeManifest(alloc, backup_root, &table_manifest);
     var manifest = try backups_api.createClusterManifest(alloc, "snap1", location_uri, &table_entries);
     defer manifest.deinit(alloc);
@@ -49187,7 +49187,7 @@ test "api http server rejects an empty cluster backup without publishing a manif
         fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/empty-cluster-backup", .{tmp.sub_path});
     defer alloc.free(backup_root);
@@ -49216,14 +49216,14 @@ test "api http server rejects an empty cluster backup without publishing a manif
 
 test "api http server cluster backup succeeds after load balanced metadata timeout retry" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backup-retry-db", .{tmp.sub_path});
     defer alloc.free(db_path);
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backup-retry-out", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -49333,14 +49333,14 @@ test "api http server cluster backup succeeds after load balanced metadata timeo
 
 test "api http server does not advertise a retry after cluster backup side effects begin" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backup-partial-db", .{tmp.sub_path});
     defer alloc.free(db_path);
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-backup-partial-out", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -49525,7 +49525,7 @@ test "cluster backup retains its fenced attempt after an ambiguous table outcome
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-cluster", .{tmp.sub_path});
     defer alloc.free(root);
@@ -49571,13 +49571,13 @@ test "cluster backup retains its fenced attempt after an ambiguous table outcome
     try std.testing.expect(!(try backups_api.clusterManifestExistsAtLocation(alloc, &location, "ambiguous-cluster")));
     try std.testing.expectError(
         error.BackupAlreadyExists,
-        backups_api.reserveBackupAtLocation(alloc, std.testing.io, &location, "other", true),
+        backups_api.reserveBackupAtLocation(alloc, platform.testing.io, &location, "other", true),
     );
 }
 
 test "table backup retry preserves the retained ambiguous generation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-table-retry", .{tmp.sub_path});
     defer alloc.free(root);
@@ -49592,7 +49592,7 @@ test "table backup retry preserves the retained ambiguous generation" {
     };
     try backups_api.reserveTableBackupAttemptAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "logical",
         "retained-generation",
@@ -49622,7 +49622,7 @@ test "table backup retry preserves the retained ambiguous generation" {
     try std.testing.expectError(
         error.BackupOutcomeAmbiguous,
         server.backupOwnedTableWithArtifactId(
-            std.testing.io,
+            platform.testing.io,
             &table,
             fence,
             "docs",
@@ -49639,7 +49639,7 @@ test "table backup retry preserves the retained ambiguous generation" {
     );
     const retained = (try backups_api.tableBackupAttemptArtifactIdAlloc(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "logical",
     )).?;
@@ -49650,7 +49650,7 @@ test "table backup retry preserves the retained ambiguous generation" {
 
 test "table backup retry reclaims an eligible reservation and admits the new generation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/stale-table-retry", .{tmp.sub_path});
     defer alloc.free(root);
@@ -49665,7 +49665,7 @@ test "table backup retry reclaims an eligible reservation and admits the new gen
     };
     try backups_api.reserveTableBackupAttemptAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "logical",
         "stale-generation",
@@ -49674,7 +49674,7 @@ test "table backup retry reclaims an eligible reservation and admits the new gen
     );
     const reservation_path = try std.fmt.allocPrint(alloc, "{s}/logical-reservation", .{root});
     defer alloc.free(reservation_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = reservation_path,
         .data =
         \\{"format_version":1,"created_at_unix_ns":1,"backup_id":"logical","artifact_backup_id":"stale-generation","format":"portable","writer_not_after_unix_ns":2}
@@ -49705,7 +49705,7 @@ test "table backup retry reclaims an eligible reservation and admits the new gen
     try std.testing.expectError(
         error.UnsupportedOperation,
         server.backupOwnedTableWithArtifactId(
-            std.testing.io,
+            platform.testing.io,
             &table,
             fence,
             "docs",
@@ -49723,7 +49723,7 @@ test "table backup retry reclaims an eligible reservation and admits the new gen
     try std.testing.expectEqualStrings("new-generation", execution_receipt.artifactBackupId().?);
     try std.testing.expect((try backups_api.tableBackupAttemptArtifactIdAlloc(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "logical",
     )) == null);
@@ -49731,7 +49731,7 @@ test "table backup retry reclaims an eligible reservation and admits the new gen
 
 test "table backup lease conflict retains the retry address and live writer fence" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ambiguous-writer-lease", .{tmp.sub_path});
     defer alloc.free(root);
@@ -49746,7 +49746,7 @@ test "table backup lease conflict retains the retry address and live writer fenc
     };
     try backups_api.reserveTableBackupWriterLeaseAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "generation",
         std.math.maxInt(u64),
@@ -49773,7 +49773,7 @@ test "table backup lease conflict retains the retry address and live writer fenc
     try std.testing.expectError(
         error.BackupOutcomeAmbiguous,
         server.backupOwnedTableWithArtifactId(
-            std.testing.io,
+            platform.testing.io,
             &table,
             fence,
             table.name,
@@ -49791,14 +49791,14 @@ test "table backup lease conflict retains the retry address and live writer fenc
 
     try std.testing.expect(try backups_api.tableBackupAttemptMatchesAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "logical",
         "generation",
     ));
     try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "generation",
         std.math.maxInt(u64),
@@ -49872,11 +49872,11 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/writer-role-lifecycle", .{tmp.sub_path});
     defer alloc.free(root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const root_abs = try std.fs.path.resolve(alloc, &.{ cwd, root });
     defer alloc.free(root_abs);
@@ -49907,7 +49907,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
     };
 
     try server.backupOwnedTableWithArtifactId(
-        std.testing.io,
+        platform.testing.io,
         &table,
         fence,
         table.name,
@@ -49926,14 +49926,14 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
     runtime.durable_jobs.drainOwner(server.backup_maintenance_owner_id);
     try std.testing.expect(!try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "logical-artifact",
         std.math.maxInt(u64),
     ));
 
     try server.backupOwnedTableWithArtifactId(
-        std.testing.io,
+        platform.testing.io,
         &table,
         fence,
         table.name,
@@ -49949,7 +49949,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
     );
     try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "legacy",
         std.math.maxInt(u64),
@@ -49959,13 +49959,13 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
     adopt_fence.writer_not_after_unix_ns = std.math.maxInt(u64);
     try backups_api.reserveTableBackupWriterLeaseAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "adopt-artifact",
         std.math.maxInt(u64),
     );
     try server.backupOwnedTableWithArtifactId(
-        std.testing.io,
+        platform.testing.io,
         &table,
         adopt_fence,
         table.name,
@@ -49981,7 +49981,7 @@ test "table backup writer roles enforce rolling forwarded lease lifecycle" {
     );
     try std.testing.expect(try backups_api.renewTableBackupWriterLeaseAtLocation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &location,
         "adopt-artifact",
         std.math.maxInt(u64),
@@ -50048,7 +50048,7 @@ test "configured api http server attaches durable restore job persistence" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const restore_job_path = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -50082,13 +50082,13 @@ test "restore job list paginates after authorization filtering" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
     defer server.deinit();
     try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-job-list");
-    server.restore_job_store.io = std.testing.io;
+    server.restore_job_store.io = platform.testing.io;
 
     const requests = [_]restore_jobs.StartRequest{
         .{
@@ -50201,13 +50201,13 @@ test "restore job list bounds authorization scans with an empty continuation pag
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var source = FakeSource{};
     var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
     defer server.deinit();
     try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "restore-job-list-budget");
-    server.restore_job_store.io = std.testing.io;
+    server.restore_job_store.io = platform.testing.io;
 
     const visible = try server.restore_job_store.start(alloc, .{
         .scope = .table,
@@ -50258,7 +50258,7 @@ test "api http server backs up and restores a table through public routes" {
     const StoredTitle = struct {
         title: []const u8,
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-db", .{tmp.sub_path});
@@ -50360,7 +50360,7 @@ test "api http server backs up and restores a table through public routes" {
     defer server.deinit();
     try server.attachRestoreJobStorePath(restore_job_path);
 
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -50420,12 +50420,12 @@ test "api http server backs up and restores a table through public routes" {
 
 test "api http server durability-pending restore preserves committed metadata" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-out", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -50648,7 +50648,7 @@ test "api http server durability-pending restore preserves committed metadata" {
 
     const invalid_manifest_path = try backups_api.metadataPath(alloc, backup_root_abs, "snap1");
     defer alloc.free(invalid_manifest_path);
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, invalid_manifest_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, invalid_manifest_path);
     try writeTestRestoreManifestAndArtifact(alloc, backup_root_abs, &manifest);
     var restore_resp = try executeHttpxTestRequest(&server, .{
         .method = .POST,
@@ -50709,12 +50709,12 @@ test "api restore rollback preserves a concurrently replaced table definition" {
 
 test "api http server cluster overwrite restores from read-only repository without dropping live table" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-overwrite", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -50733,19 +50733,19 @@ test "api http server cluster overwrite restores from read-only repository witho
         &.{ backup_root_abs, snapshot_path },
     );
     defer alloc.free(snapshot_root);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, snapshot_root);
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, snapshot_root);
     const snapshot_file = try std.fs.path.join(
         alloc,
         &.{ snapshot_root, "state.sst" },
     );
     defer alloc.free(snapshot_file);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = snapshot_file,
         .data = "restored-state",
     });
     var snapshot_integrity = try backups_api.artifactIntegrityAlloc(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         .native,
         snapshot_root,
     );
@@ -50793,17 +50793,17 @@ test "api http server cluster overwrite restores from read-only repository witho
     );
 
     var backup_dir = try std.Io.Dir.openDirAbsolute(
-        std.testing.io,
+        platform.testing.io,
         backup_root_abs,
         .{ .iterate = true },
     );
-    defer backup_dir.close(std.testing.io);
-    const backup_dir_permissions = (try backup_dir.stat(std.testing.io)).permissions;
+    defer backup_dir.close(platform.testing.io);
+    const backup_dir_permissions = (try backup_dir.stat(platform.testing.io)).permissions;
     try backup_dir.setPermissions(
-        std.testing.io,
+        platform.testing.io,
         backup_dir_permissions.setReadOnly(true),
     );
-    defer backup_dir.setPermissions(std.testing.io, backup_dir_permissions) catch {};
+    defer backup_dir.setPermissions(platform.testing.io, backup_dir_permissions) catch {};
 
     const State = struct {
         present: bool = true,
@@ -51023,12 +51023,12 @@ test "api http server cluster overwrite restores from read-only repository witho
 
 test "api http server cluster restore rejects missing extension package digest" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-extension-preflight", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -51173,12 +51173,12 @@ test "api http server cluster restore rejects missing extension package digest" 
 
 test "api http server cluster restore rehydrates extension metadata" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cluster-extension-restore", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -51390,7 +51390,7 @@ test "api http server cluster restore rehydrates extension metadata" {
 
 test "api http server prefers metadata-owned restore over inline write-source restore" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const location_uri = try writeTestRestoreManifestLocationAlloc(alloc, &tmp.sub_path, "metadata-restore-backup", "snap1", "docs");
     defer alloc.free(location_uri);
@@ -51527,7 +51527,7 @@ test "api http server prefers metadata-owned restore over inline write-source re
 
 test "api http server does not retry authoritative metadata table-exists conflict" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const location_uri = try writeTestRestoreManifestLocationAlloc(alloc, &tmp.sub_path, "metadata-restore-race-backup", "snap1", "docs");
     defer alloc.free(location_uri);
@@ -51706,13 +51706,13 @@ test "api http server restore metadata spec uses range-scoped restore intent" {
 
 test "distributed restore verifies Go portable artifact bytes before metadata publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
     const metadata_path = try backups_api.metadataPath(alloc, root, "table-a");
     defer alloc.free(metadata_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = metadata_path,
         .data =
         \\{"version":2,"format":"portable","artifacts":[{"name":"go-cluster-1.afb","size_bytes":17,"sha256":"2042f5c3b5166c9f5cca6eb5c16a9d84c0df1dc673088ebe971e5f20e0e326a6"}],"table":{"name":"docs","shards":{"1":{"byte_range":["",""]}}}}
@@ -51720,7 +51720,7 @@ test "distributed restore verifies Go portable artifact bytes before metadata pu
     });
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}/go-cluster-1.afb", .{root});
     defer alloc.free(artifact_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = artifact_path,
         .data = "portable-artifact",
     });
@@ -51746,8 +51746,8 @@ test "distributed restore verifies Go portable artifact bytes before metadata pu
     }, null, null);
     defer server.deinit();
     try server.admitExternalRestoreArtifactIntegrity(
-        std.testing.io,
-        std.testing.io,
+        platform.testing.io,
+        platform.testing.io,
         &location,
         &manifest,
         null,
@@ -51756,13 +51756,13 @@ test "distributed restore verifies Go portable artifact bytes before metadata pu
     try std.testing.expectEqual(backups_api.ArtifactIntegrityMode.declared, manifest.artifact_integrity_mode);
     try std.testing.expectEqual(@as(u64, "portable-artifact".len), manifest.shards[0].artifact_size_bytes);
     try std.testing.expectEqual(@as(usize, 64), manifest.shards[0].artifact_sha256.len);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = artifact_path,
         .data = "corrupt!-artifact",
     });
     try std.testing.expectError(error.BackupArtifactIntegrityMismatch, server.admitExternalRestoreArtifactIntegrity(
-        std.testing.io,
-        std.testing.io,
+        platform.testing.io,
+        platform.testing.io,
         &location,
         &manifest,
         null,
@@ -51773,13 +51773,13 @@ test "owned restore verifies declared artifact identity instead of accepting sta
     const alloc = std.testing.allocator;
     var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}/snap1.afb", .{root});
     defer alloc.free(artifact_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = artifact_path,
         .data = "corrupted-after-manifest-publication",
     });
@@ -53250,7 +53250,7 @@ test "api http server distributed shuffle can use remote finalizer worker" {
 }
 
 test "api http server distributed shuffle prefers shared metadata lease owner" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const join_store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-join-lease-store.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(join_store_path);
@@ -53410,7 +53410,7 @@ test "api http server distributed shuffle prefers shared metadata lease owner" {
 }
 
 test "api http server distributed shuffle updates shared metadata lease after owner handoff" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const join_store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-join-lease-handoff-store.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(join_store_path);
@@ -53929,7 +53929,7 @@ test "api http server distributed shuffle finalizer resumes persisted job after 
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const session_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-join-job-sessions", .{tmp.sub_path});
     defer std.testing.allocator.free(session_path);
@@ -54076,7 +54076,7 @@ test "api http server distributed shuffle expired persisted job is recomputed af
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const session_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-join-job-expire", .{tmp.sub_path});
     defer std.testing.allocator.free(session_path);
@@ -54236,7 +54236,7 @@ test "api http server distributed shuffle resumes persisted partial job after re
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const session_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-join-job-partial-resume", .{tmp.sub_path});
     defer std.testing.allocator.free(session_path);
@@ -54525,7 +54525,7 @@ test "api http server distributed shuffle imports prior owner partial state duri
 }
 
 test "api http server distributed shuffle reuses completed result from prior owner" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const join_store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-join-owner-result-reuse-store.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(join_store_path);
@@ -54893,7 +54893,7 @@ test "api http server distributed shuffle expired persisted job clears shared me
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const session_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-join-job-expire-lease", .{tmp.sub_path});
     defer std.testing.allocator.free(session_path);
@@ -55812,13 +55812,13 @@ test "system catalog restore listing shares one projection and honors legacy ren
             return std.json.Stringify.valueAlloc(a, system_catalog.State{ .resources = &resources }, .{});
         }
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var fake = Fake{};
     var server = ApiHttpServer.init(alloc, .{}, .{ .ptr = &fake, .vtable = &.{ .status = Fake.status, .system_catalog = Fake.catalog } }, null, null);
     defer server.deinit();
     try attachTestRestoreJobStore(alloc, &server, &tmp.sub_path, "catalog-list");
-    server.restore_job_store.io = std.testing.io;
+    server.restore_job_store.io = platform.testing.io;
     for (0..40) |i| {
         const backup_id = try std.fmt.allocPrint(alloc, "backup-{d}", .{i});
         defer alloc.free(backup_id);
@@ -56093,7 +56093,7 @@ test "system catalog HTTP and MCP detail resolve and project in one observation"
     var handler = @import("httpx_handler.zig").AntflyApiHandler{ .api_server = &server };
     var request = try httpx.Request.init(alloc, .GET, "/db/v1/databases/tenant/namespaces/public/tables/docs");
     defer request.deinit();
-    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    var context = httpx.Context.init(alloc, platform.testing.io, &request);
     defer context.deinit();
     var response = try handler.getTable(&context, "docs");
     defer response.deinit();
@@ -56113,13 +56113,13 @@ const BackupHeartbeatTestPath = enum { cluster, table, shard };
 
 fn testBackupHeartbeatCapacity(path: BackupHeartbeatTestPath, reject_concurrent: bool) !void {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/heartbeat-db", .{tmp.sub_path});
     defer alloc.free(db_path);
     const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/heartbeat-backup", .{tmp.sub_path});
     defer alloc.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(alloc, &.{ cwd, backup_root });
     defer alloc.free(backup_root_abs);
@@ -56128,7 +56128,7 @@ fn testBackupHeartbeatCapacity(path: BackupHeartbeatTestPath, reject_concurrent:
     var location: backups_api.BackupLocation = .{ .file = try alloc.dupe(u8, backup_root_abs) };
     defer location.deinit(alloc);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{
+    var io_impl = platform.Threaded.init(alloc, .{
         .async_limit = if (reject_concurrent) .limited(8) else .nothing,
         .concurrent_limit = if (reject_concurrent) .nothing else .limited(8),
     });

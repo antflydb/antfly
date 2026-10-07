@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const runtime_mod = @import("../background_runtime.zig");
 const platform_time = @import("antfly_platform").time;
@@ -172,7 +173,7 @@ pub const Owner = struct {
         // The owner-scoped worker publishes completion. Wait outside the
         // lifecycle mutex so its final handshake cannot deadlock shutdown.
         while (self.worker_running.load(.acquire)) {
-            const io = port.runtime.io() orelse std.Options.debug_io;
+            const io = port.runtime.io() orelse native_platform.debug_io;
             io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
 
@@ -198,7 +199,7 @@ pub const Owner = struct {
     }
 
     fn sleepPortableActivationRetryWorker(self: *Owner, target_ns: u64) bool {
-        const io = self.port.runtime.io() orelse std.Options.debug_io;
+        const io = self.port.runtime.io() orelse native_platform.debug_io;
         var slept: u64 = 0;
         while (slept < target_ns) {
             if (self.stopping.load(.acquire)) return false;

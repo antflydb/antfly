@@ -13,14 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const hbs = @import("handlebars");
 const template_mod = @import("template.zig");
 const pdf_mod = @import("antfly_pdf");
 const scraping = @import("antfly_scraping");
 const common_secrets = @import("common/secrets.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 
 const Allocator = std.mem.Allocator;
 
@@ -604,7 +606,7 @@ test "template remote requires explicit IO for cancellable downloads" {
 
     try std.testing.expectError(error.MissingRemoteFetchIo, remoteFetchDownloadContext(&render_ctx, &security));
 
-    render_ctx.io = std.Io.Threaded.global_single_threaded.io();
+    render_ctx.io = native_platform.Threaded.global_single_threaded.io();
     const context = (try remoteFetchDownloadContext(&render_ctx, &security)) orelse
         return error.TestUnexpectedResult;
     try context.cancellation.?.check();
@@ -1453,7 +1455,7 @@ test "HTTP error bodies consume the aggregate render byte budget" {
 
 test "template remote S3 credentials observe same-length secret rotation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secrets.json", .{tmp.sub_path});
     defer alloc.free(store_path);
@@ -1582,7 +1584,7 @@ test "template remote S3 fetch passes rotated credentials to downloader" {
     };
     FakeDownloader.request_count = 0;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secrets.json", .{tmp.sub_path});
     defer alloc.free(store_path);
@@ -1979,20 +1981,20 @@ test "template remote validated text rejects oversized remote media directive" {
 
 test "template remote enforces one aggregate byte budget across helpers" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "first.txt", .data = "ab" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "exact.txt", .data = "cd" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "over.txt", .data = "cde" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "first.txt", .data = "ab" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "exact.txt", .data = "cd" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "over.txt", .data = "cde" });
 
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
-    const first_path = try tmp.dir.realPathFileAlloc(std.testing.io, "first.txt", alloc);
+    const first_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "first.txt", alloc);
     defer alloc.free(first_path);
-    const exact_path = try tmp.dir.realPathFileAlloc(std.testing.io, "exact.txt", alloc);
+    const exact_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "exact.txt", alloc);
     defer alloc.free(exact_path);
-    const over_path = try tmp.dir.realPathFileAlloc(std.testing.io, "over.txt", alloc);
+    const over_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "over.txt", alloc);
     defer alloc.free(over_path);
 
     const json_doc = try std.fmt.allocPrint(alloc,
@@ -2036,10 +2038,10 @@ test "template remote helpers deny local files without an explicit allowlist" {
     defer cfg.deinit(alloc);
     for ([_][]const u8{ "{{remoteText url=url}}", "{{remotePDF url=url}}", "{{remoteMedia url=url}}" }) |source| {
         try std.testing.expectError(RenderError.PermanentPromptFailure, renderJsonToValidatedTextWithConfig(alloc, source, doc, .{}));
-        try std.testing.expectError(RenderError.PermanentPromptFailure, renderJsonToValidatedTextWithConfig(alloc, source, doc, .{ .remote_content = &cfg, .io = std.testing.io }));
+        try std.testing.expectError(RenderError.PermanentPromptFailure, renderJsonToValidatedTextWithConfig(alloc, source, doc, .{ .remote_content = &cfg, .io = native_platform.testing.io }));
         try std.testing.expectError(RenderError.PermanentPromptFailure, renderJsonToValidatedTextWithConfig(alloc, source, doc, .{
             .remote_content = &cfg,
-            .io = std.testing.io,
+            .io = native_platform.testing.io,
             .deadline_ns = platform_time.monotonicNs() + 10 * std.time.ns_per_s,
         }));
     }
@@ -2047,17 +2049,17 @@ test "template remote helpers deny local files without an explicit allowlist" {
 
 test "template remote media limit skips later fetches without changing the default" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "first.png", .data = "first" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "second.png", .data = "second" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "first.png", .data = "first" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "second.png", .data = "second" });
 
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
-    const first_path = try tmp.dir.realPathFileAlloc(std.testing.io, "first.png", alloc);
+    const first_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "first.png", alloc);
     defer alloc.free(first_path);
-    const second_path = try tmp.dir.realPathFileAlloc(std.testing.io, "second.png", alloc);
+    const second_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "second.png", alloc);
     defer alloc.free(second_path);
     const missing_path = try std.fs.path.join(alloc, &.{ root, "missing.png" });
     defer alloc.free(missing_path);
@@ -2128,13 +2130,13 @@ test "data URI media consumes the aggregate decoded-byte budget" {
 
 test "PDF extract mode emits text even when the media-part limit is exhausted" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "doc.pdf", .data = "%PDF-fake" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "doc.pdf", .data = "%PDF-fake" });
 
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
-    const pdf_path = try tmp.dir.realPathFileAlloc(std.testing.io, "doc.pdf", alloc);
+    const pdf_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "doc.pdf", alloc);
     defer alloc.free(pdf_path);
     const json_doc = try std.fmt.allocPrint(alloc, "{{\"pdf\":\"file://{s}\"}}", .{pdf_path});
     defer alloc.free(json_doc);

@@ -18,7 +18,7 @@
     .version = "0.1.0",
     .fingerprint = 0xb8ac65b4a9982a6c,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{ .antfly_platform = .{ .path = "../platform" } },
     .paths = .{
         "build.zig",
         "build.zig.zon",

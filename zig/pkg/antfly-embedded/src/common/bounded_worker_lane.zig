@@ -20,6 +20,7 @@
 //! allocator. Scratch is reset after every job and retention is capped, while
 //! a lane-wide backing allocator enforces a hard aggregate byte ceiling.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -112,7 +113,7 @@ const ScratchBudget = struct {
     max_bytes: usize,
     live_bytes: std.atomic.Value(usize) = .init(0),
     peak_bytes: std.atomic.Value(usize) = .init(0),
-    rejections: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    rejections: native_platform.atomic.Value(u64) = .init(0),
 
     fn reserve(self: *ScratchBudget, bytes: usize) bool {
         var observed = self.live_bytes.load(.acquire);
@@ -269,13 +270,13 @@ pub const Executor = struct {
     space_available: Io.Condition = .init,
     scratch_budget: ScratchBudget,
     retained_scratch_bytes_per_worker: usize,
-    submitted_jobs: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    completed_jobs: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    submitted_jobs: native_platform.atomic.Value(u64) = .init(0),
+    completed_jobs: native_platform.atomic.Value(u64) = .init(0),
     peak_queued_jobs: std.atomic.Value(usize) = .init(0),
     active_jobs: std.atomic.Value(usize) = .init(0),
     peak_active_jobs: std.atomic.Value(usize) = .init(0),
-    scratch_resets: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    job_scratch_limit_rejections: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    scratch_resets: native_platform.atomic.Value(u64) = .init(0),
+    job_scratch_limit_rejections: native_platform.atomic.Value(u64) = .init(0),
 
     pub fn create(alloc: Allocator, options: Options) !*Executor {
         if (options.worker_count == 0 or options.queue_capacity == 0 or
@@ -291,7 +292,7 @@ pub const Executor = struct {
         errdefer alloc.free(queue);
         self.* = .{
             .alloc = alloc,
-            .sync_io = Io.Threaded.global_single_threaded.io(),
+            .sync_io = native_platform.Threaded.global_single_threaded.io(),
             .workers = workers,
             .queue = queue,
             .scratch_budget = .{ .max_bytes = options.max_scratch_bytes },
@@ -570,7 +571,7 @@ test "bounded worker lane drains partial enqueue before reporting close" {
         fn run(context: *anyopaque, _: Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(context));
             _ = self.started.fetchAdd(1, .monotonic);
-            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!self.release.load(.acquire)) native_platform.time.yieldNow();
             _ = self.completed.fetchAdd(1, .monotonic);
         }
     };
@@ -585,7 +586,7 @@ test "bounded worker lane drains partial enqueue before reporting close" {
             };
         }
     }.run, .{ executor, &contexts, &failure });
-    while (capture.started.load(.acquire) == 0) @import("antfly_platform").time.yieldNow();
+    while (capture.started.load(.acquire) == 0) native_platform.time.yieldNow();
     executor.close();
     capture.release.store(true, .release);
     submitter.join();

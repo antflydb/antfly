@@ -13,6 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const auth = @import("antfly_local_sources").usermgr_user_manager;
 const casbin = @import("antfly_casbin");
@@ -31,7 +32,7 @@ fn random(_: ?*anyopaque, bytes: []u8) std.Io.RandomSecureError!void {
     }
 }
 const vtable: std.Io.VTable = blk: {
-    var result = std.Options.debug_io.vtable.*;
+    var result = native_platform.debug_io.vtable.*;
     result.randomSecure = random;
     break :blk result;
 };
@@ -44,7 +45,7 @@ fn create() !*auth.UserManager {
     owner.policies = casbin.MemoryAdapter.init(alloc);
     errdefer owner.policies.deinit();
     owner.manager = try auth.UserManager.initWithIo(alloc, .{
-        .userdata = std.Options.debug_io.userdata,
+        .userdata = native_platform.debug_io.userdata,
         .vtable = &vtable,
     }, owner.users.iface(), try auth.initDefaultEnforcer(alloc, owner.policies.iface()));
     errdefer owner.manager.deinit();

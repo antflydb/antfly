@@ -15,10 +15,12 @@
 
 //! Scope-bound encrypted secrets in the native file's private metadata catalog.
 //! Host authorization selects the scope; the file/index is a trusted boundary.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
-const sync = @import("antfly_platform").sync;
+const sync = native_platform.sync;
 const contract = @import("../../common/secret_contract.zig");
 const record = @import("../../common/secret_record.zig");
 const Allocator = std.mem.Allocator;
@@ -264,7 +266,7 @@ const TestProvider = struct {
         errdefer alloc.free(id);
         const bytes = try alloc.alloc(u8, 24 + 32 + 16);
         errdefer alloc.free(bytes);
-        try std.Options.debug_io.randomSecure(bytes[0..24]);
+        try native_platform.debug_io.randomSecure(bytes[0..24]);
         var tag: [16]u8 = undefined;
         Aead.encrypt(bytes[24..56], &tag, key, identity.scope, bytes[0..24].*, self.key);
         @memcpy(bytes[56..72], &tag);
@@ -279,7 +281,7 @@ const TestProvider = struct {
     }
 };
 
-fn testPath(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
+fn testPath(alloc: Allocator, tmp: native_platform.testing.TmpDir) ![]u8 {
     return std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/secrets.aflite", .{tmp.sub_path});
 }
 
@@ -292,11 +294,11 @@ fn expectValue(store: *Store, key: []const u8, expected: []const u8, revision: u
 
 test "lite secrets admission failure rolls back without fencing readers" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp);
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = native.NativeFile.minimumOwnerStorageBytes(true) } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = native.NativeFile.minimumOwnerStorageBytes(true) } });
     defer docs.close();
     docs.maintenance_start_suppressed = true;
     var provider = TestProvider{};
@@ -304,10 +306,10 @@ test "lite secrets admission failure rolls back without fencing readers" {
     defer secrets.deinit();
     const value: [8192]u8 = @splat('s');
     const before = docs.file.activeCheckpoint();
-    const before_size = (try docs.file.file.stat(std.testing.io)).size;
+    const before_size = (try docs.file.file.stat(native_platform.testing.io)).size;
     try std.testing.expectError(error.LiteStorageBudgetExceeded, secrets.nativeStore().?.writer.put("scope", "key", &value, .absent));
     try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
-    try std.testing.expectEqual(before_size, (try docs.file.file.stat(std.testing.io)).size);
+    try std.testing.expectEqual(before_size, (try docs.file.file.stat(native_platform.testing.io)).size);
     try std.testing.expect(!docs.secret_store_uncertain);
     try std.testing.expectEqual(@as(u64, 0), (try secrets.source().refresh("scope")).revision);
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
@@ -320,7 +322,7 @@ test "lite secrets embedding host retains live resolver through rotation snapsho
     const alloc = std.testing.allocator;
     const Handle = @import("backend.zig").Handle;
     const resolver = @import("../../common/secrets.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);
@@ -334,7 +336,7 @@ test "lite secrets embedding host retains live resolver through rotation snapsho
         defer handle.deinit();
         var native_store = try handle.secretStore(alloc, "host-scope", keys.provider());
         defer native_store.deinit();
-        var facade = try resolver.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{
+        var facade = try resolver.FileStore.initConfiguredWithIo(alloc, native_platform.testing.io, .{
             // Embedding hosts supply the native capability directly.
             .native = .{ .backend = .distributed, .scope = "host-scope", .keyring_path = "host-provider" },
             .environment = false,
@@ -360,7 +362,7 @@ test "lite secrets embedding host retains live resolver through rotation snapsho
         var native_store = try reopened.secretStore(alloc, "host-scope", keys.provider());
         defer native_store.deinit();
         try std.testing.expect(native_store.nativeStore() == null);
-        var facade = try resolver.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{
+        var facade = try resolver.FileStore.initConfiguredWithIo(alloc, native_platform.testing.io, .{
             .native = .{ .backend = .distributed, .scope = "host-scope", .keyring_path = "host-provider" },
             .environment = false,
         });
@@ -370,7 +372,7 @@ test "lite secrets embedding host retains live resolver through rotation snapsho
         defer alloc.free(actual);
         try std.testing.expectEqualStrings("rotated-host-credential", actual);
         try std.testing.expectError(error.WriteUnavailable, facade.put(alloc, "provider.api_key", "denied"));
-        const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, reopen_path, alloc, .limited(16 * 1024 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, reopen_path, alloc, .limited(16 * 1024 * 1024));
         defer alloc.free(raw);
         try std.testing.expect(std.mem.indexOf(u8, raw, "rotated-host-credential") == null);
     }
@@ -378,7 +380,7 @@ test "lite secrets embedding host retains live resolver through rotation snapsho
 
 test "lite secrets persist encrypted scoped values alongside documents through vacuum and reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);
@@ -410,7 +412,7 @@ test "lite secrets persist encrypted scoped values alongside documents through v
         _ = try handle.native_docstore.?.vacuum();
         _ = try handle.copyStableSnapshot(snapshot_path, false);
         try expectValue(&other, "token", "other-tenant", 1);
-        const raw = try std.Io.Dir.cwd().readFileAlloc(std.Options.debug_io, path, alloc, .limited(16 * 1024 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(native_platform.debug_io, path, alloc, .limited(16 * 1024 * 1024));
         defer alloc.free(raw);
         try std.testing.expect(std.mem.indexOf(u8, raw, "unique-secret-plaintext-that-must-not-persist") == null);
         try std.testing.expect(std.mem.indexOf(u8, raw, large) == null);
@@ -445,7 +447,7 @@ test "lite secrets persist encrypted scoped values alongside documents through v
 
 test "lite secrets CAS deletion recreation freshness and provider failure" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);
@@ -489,7 +491,7 @@ test "lite secrets CAS deletion recreation freshness and provider failure" {
 
 test "lite secrets unsynced and read-only handles reject writes even with forged writer" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);
@@ -512,7 +514,7 @@ test "lite secrets unsynced and read-only handles reject writes even with forged
 
 test "lite secrets competing adapters serialize conditional writers" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);
@@ -553,7 +555,7 @@ test "lite secrets competing adapters serialize conditional writers" {
 
 test "lite secrets reject tampering mismatched indexes and revision exhaustion" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);
@@ -585,19 +587,19 @@ const SyncFault = struct {
             remaining -= 1;
             if (remaining == 0) return error.InputOutput;
         }
-        return std.Options.debug_io.vtable.fileSync(userdata, file);
+        return native_platform.debug_io.vtable.fileSync(userdata, file);
     }
 };
 
 test "lite secrets publication errors distinguish rollback from uncertain outcomes" {
     const alloc = std.testing.allocator;
-    var vtable = std.Options.debug_io.vtable.*;
+    var vtable = native_platform.debug_io.vtable.*;
     vtable.fileSync = SyncFault.fileSync;
-    const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
+    const io = std.Io{ .userdata = native_platform.debug_io.userdata, .vtable = &vtable };
     for (1..7) |scenario| {
         const fail_sync = (scenario - 1) % 3 + 1;
         const removing = scenario > 3;
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp);
         defer alloc.free(path);
@@ -646,7 +648,7 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
 
 test "lite secrets preserve index commits made during wrapping and reject stale read-only snapshots" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);
@@ -672,7 +674,7 @@ test "lite secrets preserve index commits made during wrapping and reject stale 
 test "lite secrets portable import rejects live secrets and retained scope revisions" {
     const alloc = std.testing.allocator;
     const LiteDb = @import("connection.zig").Connection;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);
@@ -706,7 +708,7 @@ test "lite secrets portable import rejects live secrets and retained scope revis
 
 test "lite secret metadata listing seeks its scope without loading unrelated catalogs" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp);
     defer alloc.free(path);

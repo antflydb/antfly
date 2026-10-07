@@ -14,22 +14,24 @@
 // limitations under the License.
 
 //! Reproducible storage workloads; wall-clock values are observations, not tests.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const resource = @import("../resource_manager.zig");
-const time = @import("antfly_platform").time;
+const time = native_platform.time;
 
 test "lite throughput benchmark capacity reclamation" {
     if (std.c.getenv("ANTFLY_LITE_BENCH") == null) return error.SkipZigTest;
     const a = std.heap.c_allocator;
     for ([_]u64{ 128, 512, 2048 }) |pages| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/capacity-bench.aflite", .{tmp.sub_path});
         defer a.free(path);
         const limit = pages * 4096;
-        var store = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+        var store = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
         defer store.close();
         // Isolate publication and cooperative service from scheduling noise.
         store.maintenance_cancel.request();
@@ -65,7 +67,7 @@ test "lite throughput benchmark capacity reclamation" {
             }
             try std.testing.expect(accepted);
             sample.* = time.monotonicNs() - write_started;
-            peak = @max(peak, (try store.file.file.stat(std.testing.io)).size);
+            peak = @max(peak, (try store.file.file.stat(native_platform.testing.io)).size);
             try std.testing.expect(peak <= limit);
         }
         const elapsed = time.monotonicNs() - started;
@@ -83,11 +85,11 @@ test "lite throughput benchmark" {
     // Avoid measuring the test allocator's leak-tracking overhead.
     const alloc = std.heap.c_allocator;
     for ([_]usize{ 1000, 4000, 16000 }) |count| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/throughput.aflite", .{tmp.sub_path});
         defer alloc.free(path);
-        var store = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        var store = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
         defer store.close();
         const buffers = try alloc.alloc([24]u8, count);
         defer alloc.free(buffers);
@@ -130,14 +132,14 @@ test "lite throughput benchmark vacuum catchup" {
     if (std.c.getenv("ANTFLY_LITE_BENCH") == null) return error.SkipZigTest;
     const a = std.heap.c_allocator;
     for ([_]usize{ 1024, 4096 }) |n| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catchup.aflite", .{tmp.sub_path});
         defer a.free(path);
         var budgets = resource.Options.defaultBudgets();
         budgets[@backingInt(resource.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
         var manager = resource.ResourceManager.init(.{ .budgets = budgets });
-        var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
+        var file = try native.NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
         defer file.close();
         try file.putDocument("seed", "value");
         var image = try file.prepareVacuum(null);
@@ -164,11 +166,11 @@ test "lite throughput benchmark vacuum catchup" {
 test "lite throughput benchmark packed cursor" {
     if (std.c.getenv("ANTFLY_LITE_BENCH") == null) return error.SkipZigTest;
     const a = std.heap.c_allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/cursor.aflite", .{tmp.sub_path});
     defer a.free(path);
-    var store = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    var store = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
     defer store.close();
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -210,11 +212,11 @@ test "lite throughput benchmark warm point views" {
     if (std.c.getenv("ANTFLY_LITE_BENCH") == null) return error.SkipZigTest;
     const a = std.heap.c_allocator;
     for ([_]usize{ 16384, 65536 }) |count| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/point.aflite", .{tmp.sub_path});
         defer a.free(path);
-        var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true });
+        var file = try native.NativeFile.createWithIo(a, native_platform.testing.io, path, .{ .no_sync = true });
         defer file.close();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();

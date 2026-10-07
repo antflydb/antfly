@@ -15,7 +15,9 @@
 
 //! Server-owned version-keyed range cache. The mutex protects memory only;
 //! provider I/O runs outside it. Bytes never live in a request allocator.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const parquet = @import("lake_parquet_rowgroup.zig");
 const ranges = @import("lake_range_io.zig");
 const Context = @import("lake_read_context.zig").Context;
@@ -372,7 +374,7 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     slow.vtable.get_object = Slow.get;
     var cache = Cache.init(a);
     defer cache.deinit();
-    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = native_platform.testing.io } };
     defer reader.drain(true);
     const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "data", .byte_len = 16, .version = .{ .etag = put.etag.? } };
     var reads: [4]ranges.RangeRead = undefined;
@@ -381,7 +383,7 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     defer slow.gate.store(true, .release);
     for (0..200) |_| {
         if (slow.entered.load(.acquire) >= 2) break;
-        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        try native_platform.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     try std.testing.expect(slow.entered.load(.acquire) >= 2);
     slow.gate.store(true, .release);
@@ -400,7 +402,7 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     try reader.prefetch(&.{ reads[0], reads[0], reads[0], reads[0] });
     for (0..200) |_| {
         if (slow.entered.load(.acquire) > identical_before) break;
-        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        try native_platform.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     try std.testing.expectEqual(identical_before + 1, slow.entered.load(.acquire));
     slow.gate.store(true, .release);
@@ -415,7 +417,7 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     try reader.prefetch(&reads);
     for (0..200) |_| {
         if (slow.entered.load(.acquire) > entered_before) break;
-        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        try native_platform.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     reader.drain(true);
     try std.testing.expect(slow.canceled.load(.acquire) > 0);

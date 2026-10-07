@@ -13,10 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 pub fn io() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return native_platform.Threaded.global_single_threaded.io();
 }
 
 pub fn cwd() std.Io.Dir {

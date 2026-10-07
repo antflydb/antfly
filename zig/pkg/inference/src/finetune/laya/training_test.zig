@@ -214,11 +214,11 @@ test "laya training interrupted accumulation resumes to identical serving weight
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const job = @import("job.zig");
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var temp = std.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
     const directory = try temp.dir.realPathFileAlloc(io, ".", scratch);
     var c = job.Config{
@@ -259,11 +259,11 @@ test "laya training with frozen lower layers keeps them exact and trains the res
     const root = platform.env.getenv("ANTFLY_LAYA_REFERENCE") orelse return error.SkipZigTest;
     const job = @import("job.zig");
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var temp = std.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
     const directory = try temp.dir.realPathFileAlloc(io, ".", scratch);
     const c = job.Config{
@@ -312,11 +312,11 @@ test "laya training with lora adapts only its targets, merges them at export, an
     const job = @import("job.zig");
     const architecture = @import("graph.zig");
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var temp = std.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
     const directory = try temp.dir.realPathFileAlloc(io, ".", scratch);
     var c = job.Config{

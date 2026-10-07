@@ -15,9 +15,11 @@
 
 //! Local portable generation construction and atomic publication. Remote
 //! backup locations and server promotion manifests stay in restore_staging.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
 
@@ -127,7 +129,7 @@ pub fn importPortableIntoLiteDb(
     );
     defer allocator.free(tmp_path);
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     scavengePortableRestoreGenerations(allocator, io, target_path) catch |err| {
@@ -247,7 +249,7 @@ pub fn scavengePortableRestoreGenerations(
 pub const RestoreWorkProfile = struct {
     started: u64,
     pub fn init() RestoreWorkProfile {
-        return .{ .started = if (builtin.is_test and @import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE")) platform_time.monotonicNs() else 0 };
+        return .{ .started = if (builtin.is_test and native_platform.env.getenvBool("ANTFLY_TEST_WORK_PROFILE")) platform_time.monotonicNs() else 0 };
     }
     pub fn markTime(self: *RestoreWorkProfile, label: []const u8) void {
         if (self.started == 0) return;

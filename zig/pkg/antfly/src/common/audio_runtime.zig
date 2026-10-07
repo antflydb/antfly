@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const config_mod = @import("antfly_local_sources").common_config;
 const transcribing = @import("antfly_transcribing");
@@ -208,7 +210,7 @@ pub const ActiveRuntime = struct {
 
 test "audio runtime activates configured transcribing and synthesizing providers" {
     const alloc = std.testing.allocator;
-    var io = std.Io.Threaded.init(alloc, .{});
+    var io = native_platform.Threaded.init(alloc, .{});
     defer io.deinit();
 
     var cfg = config_mod.Config{
@@ -249,7 +251,7 @@ test "audio runtime activates configured transcribing and synthesizing providers
 
 test "audio runtime rolls back globals when a later provider fails to load" {
     const alloc = std.testing.allocator;
-    var io = std.Io.Threaded.init(alloc, .{});
+    var io = native_platform.Threaded.init(alloc, .{});
     defer io.deinit();
 
     var cfg = config_mod.Config{
@@ -307,9 +309,9 @@ fn resolveProviderDefaults(alloc: std.mem.Allocator, cfg: anytype, store: ?*secr
 
 test "audio runtime provider defaults resolve OpenAI credentials and endpoint aliases" {
     const alloc = std.testing.allocator;
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-audio-defaults-{d}.json", .{std.Io.Clock.awake.now(std.testing.io).nanoseconds});
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-audio-defaults-{d}.json", .{std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds});
     defer alloc.free(path);
-    defer std.Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(native_platform.testing.io, path) catch {};
     var store = try secrets.FileStore.init(alloc, path);
     defer store.deinit();
     var entry = try store.put(alloc, "openai.api_key", "test-key");
@@ -408,7 +410,7 @@ fn NativeCredentialProvider(comptime lib: type, comptime Adapter: type, comptime
 
 test "audio runtime native credentials resolve after attachment and rotate" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const contract = @import("antfly_local_sources").common_secret_contract;
     const Fake = struct {
         revision: u64 = 1,

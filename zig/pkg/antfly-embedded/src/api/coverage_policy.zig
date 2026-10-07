@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const coverage_identity = @import("../storage/coverage_identity.zig");
 
 /// Private catalog identity for the desired index incarnation. It is assigned
@@ -96,7 +98,7 @@ pub fn withFreshIncarnationAllocWithIo(alloc: std.mem.Allocator, io: std.Io, val
 }
 
 pub fn withFreshIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    return try withFreshIncarnationAllocWithIo(alloc, std.Io.Threaded.global_single_threaded.io(), value);
+    return try withFreshIncarnationAllocWithIo(alloc, native_platform.Threaded.global_single_threaded.io(), value);
 }
 
 pub fn withIncarnationAlloc(alloc: std.mem.Allocator, value: std.json.Value, coverage_incarnation: u64) ![]u8 {
@@ -144,7 +146,7 @@ pub fn withMissingIncarnationsAlloc(alloc: std.mem.Allocator, indexes_json: []co
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidIndexConfig;
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {

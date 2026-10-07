@@ -15,7 +15,9 @@
 
 //! Bounded HA acknowledgement waits. The replication runtime owns polling
 //! and session progress; the database only invokes the configured wait hook.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const hot_standby_primary_mod = @import("primary.zig");
@@ -133,11 +135,11 @@ fn sleepNs(duration_ns: u64) void {
         return;
     }
 
-    var req = std.posix.timespec{
+    var req = native_platform.c.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
         .nsec = @intCast(duration_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(native_platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,

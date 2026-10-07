@@ -70,7 +70,7 @@ fn dispatch(a: Allocator, node: *Node, raw: []const u8) !httpx.Response {
     var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
     defer request.deinit();
     request.body = raw;
-    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    var ctx = httpx.Context.init(a, platform.testing.io, &request);
     defer ctx.deinit();
     ctx.max_request_body_size = 64 * 1024;
     ctx.application_deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s;
@@ -210,8 +210,8 @@ pub fn useNativeBackend(node: *Node) void {
 
 test "gliner boundary v2 lightweight model preflight avoids vocabulary and recovers model budget denial" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const parent = try temporary.dir.realPathFileAlloc(io, ".", a);
     defer a.free(parent);
@@ -281,9 +281,9 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
     const a = std.testing.allocator;
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = if (std.fs.path.isAbsolute(requested_directory))
-        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+        try std.Io.Dir.realPathFileAbsolute(platform.testing.io, requested_directory, &path_buffer)
     else
-        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+        try std.Io.Dir.cwd().realPathFile(platform.testing.io, requested_directory, &path_buffer);
     const directory = path_buffer[0..path_len];
     const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
     const name = std.fs.path.basename(directory);
@@ -314,7 +314,7 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
         // Backend selection is local to this owner; no environment policy or
         // global capability is changed by the qualification test.
         useNativeBackend(&node);
-        try node.attachIo(std.testing.io);
+        try node.attachIo(platform.testing.io);
         try std.testing.expect(!node.test_allow_unqualified_gliner_boundary);
         {
             var response = try dispatch(a, &node, raw);
@@ -339,7 +339,7 @@ test "gliner boundary v2 pinned small HTTP handler qualification and atomic reco
         // Verify that the real Node-owned monitor is live and releases its
         // request lease. Native CPU execution itself remains cooperative.
         {
-            const control = Control{ .io = std.testing.io, .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s };
+            const control = Control{ .io = platform.testing.io, .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s };
             var guard = try control.enterUninterruptible(.process_required);
             guard.deinit();
             _ = try idle(&node);
@@ -409,9 +409,9 @@ test "gliner boundary v2 upgrades a plain extraction request without schema_vers
     const a = std.testing.allocator;
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = if (std.fs.path.isAbsolute(requested_directory))
-        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+        try std.Io.Dir.realPathFileAbsolute(platform.testing.io, requested_directory, &path_buffer)
     else
-        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+        try std.Io.Dir.cwd().realPathFile(platform.testing.io, requested_directory, &path_buffer);
     const directory = path_buffer[0..path_len];
     const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
     const name = std.fs.path.basename(directory);
@@ -423,7 +423,7 @@ test "gliner boundary v2 upgrades a plain extraction request without schema_vers
         .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
     });
     defer node.deinit();
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     const plain_body = try std.fmt.allocPrint(a,
         \\{{"model":"{s}","inputs":[{{"id":"1","content":"The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection."}}],"schema":{{"entities":["component","subsystem","test"],"relations":[{{"type":"depends_on"}},{{"type":"tested_by"}}]}},"options":{{"include_confidence":true,"include_spans":true}}}}
@@ -467,7 +467,7 @@ test "gliner boundary provider extractDirect upgrades a plain request for the qu
     const a = std.testing.allocator;
     const directory = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino", "gliner2.5-base-v1" });
     defer a.free(directory);
-    std.Io.Dir.cwd().access(std.testing.io, directory, .{}) catch return error.SkipZigTest;
+    std.Io.Dir.cwd().access(platform.testing.io, directory, .{}) catch return error.SkipZigTest;
     const models_dir = try std.fs.path.join(a, &.{ home, ".antfly", "inference", "models", "fastino" });
     defer a.free(models_dir);
 
@@ -478,7 +478,7 @@ test "gliner boundary provider extractDirect upgrades a plain request for the qu
         .generation_budget_overrides = .{ .host_limit_bytes = 16 * 1024 * 1024 * 1024, .scratch_limit_bytes = 4 * 1024 * 1024 * 1024, .combined_limit_bytes = 16 * 1024 * 1024 * 1024, .backend_limit_bytes = 16 * 1024 * 1024 * 1024, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
     });
     defer node.deinit();
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     const content_json = try std.json.Stringify.valueAlloc(a, "The metadata server coordinates Raft groups. VOPR exercises the DataServer under fault injection.", .{});
     defer a.free(content_json);
@@ -586,7 +586,7 @@ fn throughputCorpusShape(backend: enum { auto, native, metal }, environment: [:0
             node.model_manager.session_manager.required_backend = .metal;
         },
     }
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
     const control = Control{ .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = platform.time.monotonicNs() + 900 * std.time.ns_per_s };
 
     // Warm-up call: load weights and prepare the Metal session once before
@@ -669,9 +669,9 @@ fn resolveModelDirectoryFromEnv(a: Allocator, environment: [:0]const u8) !?Resol
     const requested_directory = platform.env.getenv(environment) orelse return null;
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = if (std.fs.path.isAbsolute(requested_directory))
-        try std.Io.Dir.realPathFileAbsolute(std.testing.io, requested_directory, &path_buffer)
+        try std.Io.Dir.realPathFileAbsolute(platform.testing.io, requested_directory, &path_buffer)
     else
-        try std.Io.Dir.cwd().realPathFile(std.testing.io, requested_directory, &path_buffer);
+        try std.Io.Dir.cwd().realPathFile(platform.testing.io, requested_directory, &path_buffer);
     const directory = path_buffer[0..path_len];
     const models_dir = std.fs.path.dirname(directory) orelse return error.InvalidModelPath;
     const name = std.fs.path.basename(directory);
@@ -734,7 +734,7 @@ fn longExecutorHttpCanonicalShape(metal: bool, environment: [:0]const u8) !void 
         node.model_manager.session_manager.preferred_backends = &.{.metal};
         node.model_manager.session_manager.required_backend = .metal;
     }
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     // Path relative to the inference-test binary's working directory
     // (zig/pkg/inference, per zig/TESTING.md's build steps).
@@ -759,7 +759,7 @@ fn longExecutorHttpCanonicalShape(metal: bool, environment: [:0]const u8) !void 
     var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
     defer request.deinit();
     request.body = body;
-    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    var ctx = httpx.Context.init(a, platform.testing.io, &request);
     defer ctx.deinit();
     // The 37KB real section plus schema/JSON overhead exceeds the 64KB cap
     // other tests in this file use for short bodies.
@@ -853,7 +853,7 @@ fn longExecutorProviderCanonicalShape(metal: bool, environment: [:0]const u8) !v
         node.model_manager.session_manager.preferred_backends = &.{.metal};
         node.model_manager.session_manager.required_backend = .metal;
     }
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     // Uses examples/dogfood's real 11-entity/6-relation production schema
     // (not the narrower 3-entity repro schema from GLINER25.md's earlier
@@ -939,7 +939,7 @@ fn corpusMaximumHttpCanonicalShape(environment: [:0]const u8) !void {
     });
     defer node.deinit();
     useNativeBackend(&node);
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     // Path relative to the inference-test binary's working directory
     // (zig/pkg/inference, per zig/TESTING.md's build steps).
@@ -965,7 +965,7 @@ fn corpusMaximumHttpCanonicalShape(environment: [:0]const u8) !void {
     var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
     defer request.deinit();
     request.body = body;
-    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    var ctx = httpx.Context.init(a, platform.testing.io, &request);
     defer ctx.deinit();
     ctx.max_request_body_size = 128 * 1024;
     ctx.application_deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s;
@@ -1025,7 +1025,7 @@ fn corpusMaximumProviderCanonicalShape(environment: [:0]const u8) !void {
     });
     defer node.deinit();
     useNativeBackend(&node);
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     const full = try @import("../util/c_file.zig").readFile(a, "../../PDF.md");
     defer a.free(full);
@@ -1105,7 +1105,7 @@ fn corpusMinimumProviderShape(metal: bool, environment: [:0]const u8) !void {
         node.model_manager.session_manager.preferred_backends = &.{.metal};
         node.model_manager.session_manager.required_backend = .metal;
     }
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     // Exactly what examples/dogfood sends for doc:zig/SCHEMA.md#schema-related-docs.
     const documents = [_][]const u8{ "TODO.mdSERVERLESS.md", "a" };
@@ -1315,7 +1315,7 @@ fn fetchLongDocumentResponses(
         node.model_manager.session_manager.preferred_backends = &.{.metal};
         node.model_manager.session_manager.required_backend = .metal;
     }
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     const responses = try a.alloc([]const u8, documents.len);
     var filled: usize = 0;

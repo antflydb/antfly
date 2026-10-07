@@ -595,7 +595,7 @@ const TestSubmit = struct {
     permit: ?*session_mod.RunPermit = null,
 
     fn submit(self: *@This()) std.Io.Cancelable!void {
-        self.output = run(self.broker, std.testing.allocator, std.testing.io, self.task, self.session, self.permit, self.gate, self.inputs, self.control, null, 500_000) catch |err| {
+        self.output = run(self.broker, std.testing.allocator, platform.testing.io, self.task, self.session, self.permit, self.gate, self.inputs, self.control, null, 500_000) catch |err| {
             self.err = err;
             return;
         };
@@ -681,8 +681,8 @@ test "tensor microbatch keeps a live caller after a peer deadline expires" {
         if (slot.completed and slot.err == null) destroy(std.heap.smp_allocator, output);
     };
     var items = [_]micro.ExecuteItem{
-        .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[0], .slot = &slots[0], .control = .{ .io = std.testing.io, .deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake) } },
-        .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[1], .slot = &slots[1], .control = .{ .io = std.testing.io } },
+        .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[0], .slot = &slots[0], .control = .{ .io = platform.testing.io, .deadline = std.Io.Clock.Timestamp.now(platform.testing.io, .awake) } },
+        .{ .allocator = std.heap.smp_allocator, .identity = .{}, .payload = &tickets[1], .slot = &slots[1], .control = .{ .io = platform.testing.io } },
     };
     try executeGroup(&items);
     try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.monotonic));
@@ -722,9 +722,9 @@ test "tensor microbatch broadcasts scalar controls and separates unequal values"
     for (&callers, 0..) |*caller, i| caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &inputs[i % 2] };
     defer for (&callers) |*caller| caller.deinit();
     var group = std.Io.Group.init;
-    defer group.cancel(std.testing.io);
-    for (&callers) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-    try group.await(std.testing.io);
+    defer group.cancel(platform.testing.io);
+    for (&callers) |*caller| try group.concurrent(platform.testing.io, TestSubmit.submit, .{caller});
+    try group.await(platform.testing.io);
     for (&callers) |*caller| {
         if (caller.err) |err| return err;
         try std.testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, caller.output.?[0].asFloat32());
@@ -755,9 +755,9 @@ test "tensor microbatch rejoins shared encoder rows without repacking and restor
     defer for (&inputs) |*input| input.deinit();
     defer for (&first) |*caller| caller.deinit();
     var group = std.Io.Group.init;
-    defer group.cancel(std.testing.io);
-    for (&first) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-    try group.await(std.testing.io);
+    defer group.cancel(platform.testing.io);
+    for (&first) |*caller| try group.concurrent(platform.testing.io, TestSubmit.submit, .{caller});
+    try group.await(platform.testing.io);
     for (first) |caller| if (caller.err) |err| return err;
     const backing = first[0].output.?[0].shared_storage.?;
     // Retained source (80) + physical execution (896) fits; fictitious
@@ -775,8 +775,8 @@ test "tensor microbatch rejoins shared encoder rows without repacking and restor
         caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = input[0..1] };
     }
     defer for (&second) |*caller| caller.deinit();
-    for (&second) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-    try group.await(std.testing.io);
+    for (&second) |*caller| try group.concurrent(platform.testing.io, TestSubmit.submit, .{caller});
+    try group.await(platform.testing.io);
     try std.testing.expectEqual(@as(usize, 2), fake.calls.load(.monotonic));
     try std.testing.expectEqual(@intFromPtr(backing.ptr), fake.last_input);
     for (second, 0..) |caller, i| {
@@ -815,9 +815,9 @@ test "tensor microbatch yields idle workspace and permits remain reusable" {
     for (&callers, &permits) |*caller, *permit| caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &.{input}, .permit = permit };
     defer for (&callers) |*caller| caller.deinit();
     var group = std.Io.Group.init;
-    defer group.cancel(std.testing.io);
-    for (&callers) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-    try group.await(std.testing.io);
+    defer group.cancel(platform.testing.io);
+    for (&callers) |*caller| try group.concurrent(platform.testing.io, TestSubmit.submit, .{caller});
+    try group.await(platform.testing.io);
     for (callers) |caller| if (caller.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.monotonic));
     for (&callers) |*caller| caller.deinit();
@@ -857,9 +857,9 @@ test "tensor microbatch admits expanded GPU outputs before forwarding" {
     for (&callers) |*caller| caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &.{input} };
     defer for (&callers) |*caller| caller.deinit();
     var group = std.Io.Group.init;
-    defer group.cancel(std.testing.io);
-    for (&callers) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-    try group.await(std.testing.io);
+    defer group.cancel(platform.testing.io);
+    for (&callers) |*caller| try group.concurrent(platform.testing.io, TestSubmit.submit, .{caller});
+    try group.await(platform.testing.io);
     for (&callers) |*caller| {
         if (caller.err) |err| return err;
         try std.testing.expectEqual(@as(usize, 64), caller.output.?[0].asFloat32().len);
@@ -946,9 +946,9 @@ test "tensor microbatch isolates tasks and fails malformed fused output without 
         for (&callers, 0..) |*caller, i| caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &.{input}, .task = if (!malformed and i >= 4) .extract else .rerank };
         defer for (&callers) |*caller| caller.deinit();
         var group = std.Io.Group.init;
-        defer group.cancel(std.testing.io);
-        for (&callers) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-        try group.await(std.testing.io);
+        defer group.cancel(platform.testing.io);
+        for (&callers) |*caller| try group.concurrent(platform.testing.io, TestSubmit.submit, .{caller});
+        try group.await(platform.testing.io);
         try std.testing.expectEqual(@as(usize, if (malformed) 1 else 2), fake.calls.load(.monotonic));
         for (callers) |caller| {
             if (malformed) try std.testing.expectEqual(error.InvalidFusedOutputShape, caller.err.?) else if (caller.err) |err| return err;
@@ -981,7 +981,7 @@ test "tensor microbatch row-view ownership unwinds every allocation failure" {
             std.debug.assert(view[1].asFloat32()[0] == 4);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.check, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Probe.check, .{});
 }
 
 test "tensor microbatch admission subdivision happens before any fused forward" {
@@ -1006,9 +1006,9 @@ test "tensor microbatch admission subdivision happens before any fused forward" 
         for (&callers) |*caller| caller.* = .{ .broker = &broker, .session = session, .gate = &gate, .inputs = &.{input} };
         defer for (&callers) |*caller| caller.deinit();
         var group = std.Io.Group.init;
-        defer group.cancel(std.testing.io);
-        for (&callers) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-        try group.await(std.testing.io);
+        defer group.cancel(platform.testing.io);
+        for (&callers) |*caller| try group.concurrent(platform.testing.io, TestSubmit.submit, .{caller});
+        try group.await(platform.testing.io);
         try std.testing.expectEqual(@as(usize, 2), fake.calls.load(.monotonic));
         for (&callers) |*caller| {
             if (caller.err) |err| return err;
@@ -1016,8 +1016,8 @@ test "tensor microbatch admission subdivision happens before any fused forward" 
             caller.deinit();
         }
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
-        try std.testing.expectEqual(@as(u64, 8), broker.snapshot(std.testing.io).native_items);
-        try std.testing.expectEqual(@as(u64, 2), broker.snapshot(std.testing.io).native_batches);
+        try std.testing.expectEqual(@as(u64, 8), broker.snapshot(platform.testing.io).native_items);
+        try std.testing.expectEqual(@as(u64, 2), broker.snapshot(platform.testing.io).native_batches);
     }
 }
 
@@ -1041,9 +1041,9 @@ test "tensor microbatch canceled consumer does not discard healthy fused rows" {
     callers[0].control = .{ .cancellation = .{ .ptr = &canceled, .is_cancelled_fn = Probe.check } };
     defer for (&callers) |*caller| caller.deinit();
     var group = std.Io.Group.init;
-    defer group.cancel(std.testing.io);
-    for (&callers) |*caller| try group.concurrent(std.testing.io, TestSubmit.submit, .{caller});
-    try group.await(std.testing.io);
+    defer group.cancel(platform.testing.io);
+    for (&callers) |*caller| try group.concurrent(platform.testing.io, TestSubmit.submit, .{caller});
+    try group.await(platform.testing.io);
     try std.testing.expectEqual(@as(usize, 1), fake.calls.load(.monotonic));
     const canceled_error = callers[0].err orelse return error.ExpectedCancellation;
     try std.testing.expect(canceled_error == error.Canceled or canceled_error == error.Cancelled);

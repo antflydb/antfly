@@ -13,9 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
+
+const platform_sync = native_platform.sync;
+const platform_time = native_platform.time;
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_mod = @import("../api/mod.zig");
@@ -694,7 +696,7 @@ test "serverless managed runtime publishes and prunes based on namespace policy"
     var ingest_c = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 300, .mutations = &batch_c });
     defer ingest_c.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, native_platform.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
     const stats = try runtime.runOnce();
@@ -706,7 +708,7 @@ test "serverless managed runtime publishes and prunes based on namespace policy"
     try std.testing.expectEqual(@as(u64, 3), try progress_store.getHead("docs"));
 
     const lease = @import("../manifest/read_lease.zig");
-    const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    const gc_now = native_platform.time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
     runtime.pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
         fn now(ptr: *const anyopaque) u64 {
             return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
@@ -731,12 +733,12 @@ test "serverless managed runtime publishes and prunes based on namespace policy"
     runtime.stopWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMillisecondsWithIo(runtime.io, 0));
     try std.testing.expectEqual(@as(?anyerror, null), runtime.runtimeFailure());
     {
-        var unavailable = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
+        var unavailable = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
         defer unavailable.deinit();
         runtime.io = unavailable.io();
         defer {
             runtime.stop();
-            runtime.io = std.testing.io;
+            runtime.io = native_platform.testing.io;
         }
         try std.testing.expectError(error.ConcurrencyUnavailable, runtime.start());
         try std.testing.expect(runtime.future == null);
@@ -798,7 +800,7 @@ test "serverless managed runtime query-only role skips maintenance work" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
+    var runtime = ManagedRuntime.init(alloc, native_platform.testing.io, .{
         .tick_interval_ms = 1,
         .role = .query_only,
     }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
@@ -857,7 +859,7 @@ test "serverless managed runtime api-only role skips maintenance work" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
+    var runtime = ManagedRuntime.init(alloc, native_platform.testing.io, .{
         .tick_interval_ms = 1,
         .role = .api_only,
     }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
@@ -920,7 +922,7 @@ test "serverless managed runtime honors maintenance feature flags" {
     var ingest = try api.ingestBatch(.{ .namespace = "docs", .timestamp_ns = 123, .mutations = &batch });
     defer ingest.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{
+    var runtime = ManagedRuntime.init(alloc, native_platform.testing.io, .{
         .tick_interval_ms = 1,
         .publish_enabled = false,
         .compaction_enabled = false,
@@ -998,7 +1000,7 @@ test "serverless managed runtime compacts head when namespace exceeds compaction
     var build_second = try builder.publishNamespace("docs");
     defer build_second.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, native_platform.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setCompactor(build_mod.Compactor.init(alloc, &artifact_store, &manifest_store, &progress_store));
     defer runtime.deinit();
 
@@ -1075,7 +1077,7 @@ test "serverless managed runtime targets request-driven enrichment without globa
     var build = try catalog.buildNamespace("docs");
     defer build.deinit(alloc);
 
-    var runtime = ManagedRuntime.init(alloc, std.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
+    var runtime = ManagedRuntime.init(alloc, native_platform.testing.io, .{ .tick_interval_ms = 1 }, &catalog, build_mod.Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     runtime.setEnricher(enrichment_mod.SparseEnricher.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store));
     defer runtime.deinit();
 
@@ -1096,8 +1098,8 @@ test "serverless managed runtime targets request-driven enrichment without globa
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() native_platform.Threaded {
+    return native_platform.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

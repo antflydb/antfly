@@ -1,6 +1,19 @@
 // Copyright 2026 Antfly, Inc.
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: Elastic-2.0
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 /// Await mutation work without forwarding caller I/O cancellation to it.
@@ -12,7 +25,7 @@ pub fn wait(io: std.Io, future: *std.Io.Future(void)) void {
 }
 
 test "caller cancellation does not interrupt protected child work" {
-    var pool = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    var pool = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
     defer pool.deinit();
     const io = pool.io();
     const State = struct {

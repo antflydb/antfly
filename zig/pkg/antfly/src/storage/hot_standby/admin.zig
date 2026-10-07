@@ -20,7 +20,9 @@
 //! slot lifecycle, status, read freshness, sync durability, and fenced promotion
 //! semantics aligned with the storage primitives.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const backup_manifest = @import("backup_manifest.zig");
 const bootstrap = @import("bootstrap.zig");
@@ -404,7 +406,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     const fence_wal = try allocPrintPath(alloc, name, "fence-wal", nonce);
     defer alloc.free(fence_wal);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};

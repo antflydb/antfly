@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const objectstore = @import("objectstore");
 const common_secrets = @import("antfly_local_sources").common_secrets;
@@ -133,11 +135,11 @@ const S3ClientPool = struct {
     };
 
     alloc: Allocator,
-    io_impl: *std.Io.Threaded,
+    io_impl: *native_platform.Threaded,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
     fn init(alloc: Allocator) !S3ClientPool {
-        const io_impl = try alloc.create(std.Io.Threaded);
+        const io_impl = try alloc.create(native_platform.Threaded);
         errdefer alloc.destroy(io_impl);
         // This pool lives for the complete serverless process and is shared by
         // every object-store lane. Threaded retains concurrent workers, so
@@ -859,7 +861,7 @@ test "runtime bootstrap assembles serverless stack from uri config" {
         .tick_interval_ms = 1,
         .role = .combined,
         .combined_mode = true,
-    }, std.testing.io);
+    }, native_platform.testing.io);
     defer stack.deinit();
 
     try std.testing.expect(stack.status.combined_mode);
@@ -938,11 +940,11 @@ test "serverless runtime bootstrap failure unwinds query cache and runtime owner
     invalid.embedding_indexes_json = "{";
 
     var failed_stack: OwnedStack = undefined;
-    try std.testing.expectError(error.UnexpectedEndOfInput, failed_stack.init(alloc, invalid, std.testing.io));
+    try std.testing.expectError(error.UnexpectedEndOfInput, failed_stack.init(alloc, invalid, native_platform.testing.io));
 
     // A clean retry exercises file/lease release as well as allocator cleanup.
     var retry_stack: OwnedStack = undefined;
-    try retry_stack.init(alloc, base, std.testing.io);
+    try retry_stack.init(alloc, base, native_platform.testing.io);
     retry_stack.deinit();
 }
 
@@ -1023,7 +1025,7 @@ test "runtime bootstrap wires foreign registry into public join handler" {
         .role = .combined,
         .combined_mode = true,
         .foreign_registry = &foreign_registry,
-    }, std.testing.io);
+    }, native_platform.testing.io);
     defer stack.deinit();
 
     try std.testing.expect(try stack.catalog.ensureTable("orders", 100));
@@ -1180,7 +1182,7 @@ test "runtime bootstrap supports published semantic search with embedding_templa
         .query_cache_dir = null,
         .tick_interval_ms = 1,
         .role = .combined,
-    }, std.testing.io);
+    }, native_platform.testing.io);
     defer stack.deinit();
 
     try std.testing.expect(try stack.catalog.ensureTableWithDefinition(
@@ -1434,7 +1436,7 @@ test "runtime status describes configured backends" {
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
 fn nowNs() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const now = std.Io.Timestamp.now(io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());
@@ -1447,7 +1449,7 @@ fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

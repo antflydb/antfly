@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const ml = @import("ml");
 const optimizers = ml.graph.optimizers;
 const Graph = ml.graph.Graph;
@@ -492,8 +494,8 @@ fn bytesToMb(bytes: usize) f64 {
 }
 
 fn nowNs() u64 {
-    var timespec: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec))) {
+    var timespec: native_platform.c.timespec = undefined;
+    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &timespec))) {
         .SUCCESS => return @intCast(@as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec),
         else => return 0,
     }

@@ -79,13 +79,13 @@ const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []c
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: ?*std.Io.Threaded,
+    io_impl: ?*platform.Threaded,
     client: httpx.Client,
 
     fn init(alloc: Allocator, shared_io: ?std.Io) !HttpxTransport {
-        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
-            const owned = try alloc.create(std.Io.Threaded);
-            owned.* = std.Io.Threaded.init(alloc, .{});
+        const io_impl: ?*platform.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(platform.Threaded);
+            owned.* = platform.Threaded.init(alloc, .{});
             break :blk owned;
         } else null;
         errdefer if (io_impl) |owned| {
@@ -147,7 +147,7 @@ const HttpxTransport = struct {
 
 test "google auth transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
-    var shared = std.Io.Threaded.init(alloc, .{});
+    var shared = platform.Threaded.init(alloc, .{});
     defer shared.deinit();
     var transport = try HttpxTransport.init(alloc, shared.io());
     defer transport.deinit();
@@ -161,7 +161,7 @@ test "google auth transport borrows a shared io runtime" {
 
 test "google auth owns a filesystem fallback for a network-only authority" {
     const alloc = std.testing.allocator;
-    var network_impl = std.Io.Threaded.init(alloc, .{});
+    var network_impl = platform.Threaded.init(alloc, .{});
     defer network_impl.deinit();
     const network_io = network_impl.io();
 
@@ -292,7 +292,7 @@ pub const CachedTokenSource = struct {
     request_ctx: ?*anyopaque,
     request_fn: RequestFn,
     owned_httpx: ?*HttpxTransport,
-    owned_filesystem_io: ?*std.Io.Threaded,
+    owned_filesystem_io: ?*platform.Threaded,
     /// Network authority also used for cancellable refresh contention waits.
     io: ?std.Io,
     /// Filesystem authority for ADC and external-account subject-token files.
@@ -318,9 +318,9 @@ pub const CachedTokenSource = struct {
         errdefer alloc.destroy(transport);
         transport.* = try HttpxTransport.init(alloc, network_io);
         errdefer transport.deinit();
-        const owned_filesystem_io: ?*std.Io.Threaded = if (filesystem_io == null and network_io != null) blk: {
-            const owned = try alloc.create(std.Io.Threaded);
-            owned.* = std.Io.Threaded.init(alloc, .{});
+        const owned_filesystem_io: ?*platform.Threaded = if (filesystem_io == null and network_io != null) blk: {
+            const owned = try alloc.create(platform.Threaded);
+            owned.* = platform.Threaded.init(alloc, .{});
             break :blk owned;
         } else null;
         return .{
@@ -388,7 +388,7 @@ pub const CachedTokenSource = struct {
             if (self.io) |io| {
                 try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
             } else {
-                @import("antfly_platform").time.yieldNow();
+                platform.time.yieldNow();
             }
         }
         defer self.mutex.unlock();
@@ -708,7 +708,7 @@ test "google credential cache keys distinguish default ADC from every file path"
 }
 
 test "google credential manager releases its mutex before invalidation" {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var manager = CredentialManager.init(std.testing.allocator, io_impl.io());
     manager.deinit();
@@ -931,7 +931,7 @@ pub fn serviceAccountFromFileAlloc(alloc: Allocator, path: []const u8) !ServiceA
 }
 
 pub fn serviceAccountFromFileAllocWithIo(alloc: Allocator, path: []const u8, shared_io: ?std.Io) !ServiceAccount {
-    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+    var io_impl: ?platform.Threaded = if (shared_io == null) platform.Threaded.init(std.heap.page_allocator, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = shared_io orelse io_impl.?.io();
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(std.math.maxInt(usize)));
@@ -944,7 +944,7 @@ pub fn configFromFileAlloc(alloc: Allocator, path: []const u8, scope: []const u8
 }
 
 pub fn configFromFileAllocWithIo(alloc: Allocator, path: []const u8, scope: []const u8, shared_io: ?std.Io) !Config {
-    var io_impl: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+    var io_impl: ?platform.Threaded = if (shared_io == null) platform.Threaded.init(std.heap.page_allocator, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const io = shared_io orelse io_impl.?.io();
     const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(4 * 1024 * 1024));
@@ -1208,7 +1208,7 @@ fn envOwned(alloc: Allocator, comptime name: []const u8) !?[]u8 {
 }
 
 fn nowSeconds() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const now = std.Io.Timestamp.now(io_impl.io(), .real);
     return @intCast(now.toSeconds());
@@ -1295,7 +1295,7 @@ test "google auth token source exchanges and caches access token" {
     var state = State{};
     var source = CachedTokenSource.initWithRequestFn(alloc, cfg, &state, State.request);
     defer source.deinit();
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     source.io = io_impl.io();
 
@@ -1485,7 +1485,7 @@ fn expectHeader(headers: []const HeaderPair, name: []const u8, value: []const u8
 test "google auth cancellation interrupts refresh queueing without touching its owner" {
     const alloc = std.testing.allocator;
     const cfg = try configFromJsonAlloc(alloc, "{\"type\":\"authorized_user\",\"client_id\":\"client\",\"client_secret\":\"secret\",\"refresh_token\":\"refresh\"}", default_scope);
-    var source = try CachedTokenSource.initWithIo(alloc, cfg, std.testing.io);
+    var source = try CachedTokenSource.initWithIo(alloc, cfg, platform.testing.io);
     defer source.deinit();
     try std.testing.expect(source.mutex.tryLock());
     defer source.mutex.unlock();
@@ -1505,10 +1505,10 @@ test "google auth cancellation interrupts refresh queueing without touching its 
     try std.testing.expect(!source.mutex.tryLock());
     try std.testing.expect(source.cached_token == null);
 
-    var manager = CredentialManager.init(alloc, std.testing.io);
+    var manager = CredentialManager.init(alloc, platform.testing.io);
     defer manager.deinit();
     try std.testing.expect(manager.mutex.tryLock());
-    defer manager.mutex.unlock(std.testing.io);
+    defer manager.mutex.unlock(platform.testing.io);
     try std.testing.expectError(error.Timeout, manager.tokenSourceWithControl("unused.json", default_scope, RequestControl.fromTimeout(2, null)));
     try std.testing.expect(!manager.mutex.tryLock());
 }
@@ -1584,7 +1584,7 @@ test "google auth cache publishes tokens only after caller allocation succeeds" 
 test "google auth remaining budget includes previous exchanges" {
     const control = RequestControl.fromTimeout(10_000, null);
     const before = (try control.remainingTimeoutMs()).?;
-    try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
+    try platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(10), .awake);
     const after = (try control.remainingTimeoutMs()).?;
     try std.testing.expect(after < before);
     try std.testing.expectError(error.Timeout, projectIdFromDefaultCredentialsAllocWithControl(std.testing.allocator, .{ .deadline_ns = 0 }));

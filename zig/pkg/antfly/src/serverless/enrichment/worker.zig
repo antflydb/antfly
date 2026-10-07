@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_codec = @import("../api/codec.zig");
@@ -81,7 +83,7 @@ const SourcePin = struct {
         try maintenance_cancellation.check(self.parent);
         try self.cancellation.check();
         try self.lease.check();
-        if (self.lease.unix_deadline -| @import("antfly_platform").time.realtimeNs() < read_lease.reuse_min_ns)
+        if (self.lease.unix_deadline -| native_platform.time.realtimeNs() < read_lease.reuse_min_ns)
             self.lease = try self.cache.acquire(self.progress, self.namespace, self.version);
     }
 
@@ -2241,7 +2243,7 @@ test "serverless sparse enricher can use model-backed dense and sparse embedders
             .stage = .lexical_sparse,
             .model_preference = .prefer_model,
         }, .{
-            .io = std.Options.debug_io,
+            .io = native_platform.debug_io,
             .requested = &requested,
         }),
     );
@@ -2438,8 +2440,8 @@ fn publishEnrichmentFixture(builder: *@import("../build/builder.zig").Builder) !
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() native_platform.Threaded {
+    return native_platform.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

@@ -15,7 +15,9 @@
 
 //! RowSource batch assembly for the first supported Parquet scan path.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const external_binding = @import("../external_source/catalog_binding.zig");
 const external_source = @import("../external_source/types.zig");
@@ -6474,10 +6476,10 @@ test "parquet object range cache reuses coalesced projected chunks" {
 }
 
 test "lake persistent object range cache durability is cache-only by default and explicit when durable" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const default_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/default-cache", .{tmp.sub_path});
@@ -6493,10 +6495,10 @@ test "lake persistent object range cache durability is cache-only by default and
 }
 
 test "lake persistent object range cache bounds write-behind admission" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bounded-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
@@ -6522,10 +6524,10 @@ test "lake persistent object range cache bounds write-behind admission" {
 }
 
 test "lake persistent object range cache evicts least recently used entries within disk ceilings" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/lru-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
@@ -6564,11 +6566,11 @@ test "lake persistent object range cache evicts least recently used entries with
 }
 
 test "lake persistent object range cache removes interrupted and corrupted entries" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cleanup-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
@@ -6599,11 +6601,11 @@ test "lake persistent object range cache removes interrupted and corrupted entri
 }
 
 test "lake persistent object range cache bounds startup inventory and drains accepted writes" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/startup-cache", .{tmp.sub_path});
     defer alloc.free(cache_root);
@@ -6644,10 +6646,10 @@ test "lake persistent object range cache bounds startup inventory and drains acc
 }
 
 test "parquet object range cache reuses persistent validated ranges" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
@@ -6721,11 +6723,11 @@ test "parquet object range cache reuses persistent validated ranges" {
 }
 
 test "parquet object range cache ignores corrupted persistent ranges" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
@@ -6788,11 +6790,11 @@ test "parquet object range cache ignores corrupted persistent ranges" {
 }
 
 test "lake persistent object range cache rejects an otherwise valid overlong entry" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
@@ -6819,11 +6821,11 @@ test "lake persistent object range cache rejects an otherwise valid overlong ent
 }
 
 test "parquet object range cache rejects mismatched persistent provenance" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/range-cache", .{tmp.sub_path});
@@ -9491,7 +9493,7 @@ test "parquet page cursor reuses decoded dictionaries aligns nullable columns an
     const shared = @import("lake_serving_cache.zig");
     var cache = shared.Cache.init(a);
     defer cache.deinit();
-    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(client), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(client), .scope = @splat(0), .context = .{ .io = native_platform.testing.io } };
     var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{ "amount", "tenant", "optional" }, .{});
     defer cursor.deinit();
     defer reader.drain(true);
@@ -9629,7 +9631,7 @@ test "external lake speculative page prefetch defers errors and preserves reques
         var cache = shared.Cache.init(a);
         defer cache.deinit();
         var fault: Fault = .{ .base = client, .offset = next_offset, .mode = mode, .vtable = client.vtable.* };
-        var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(fault.iface()), .scope = @splat(0), .context = .{ .io = std.testing.io, .cancellation = storage.CancellationToken.fromAtomic(&fault.signal) } };
+        var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(fault.iface()), .scope = @splat(0), .context = .{ .io = native_platform.testing.io, .cancellation = storage.CancellationToken.fromAtomic(&fault.signal) } };
         fault.reader = &reader;
         defer reader.drain(true);
         var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = if (mode == .disabled or mode == .budget) 128 else 4096 });

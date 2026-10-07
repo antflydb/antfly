@@ -632,8 +632,8 @@ fn relDelta(a: f64, b: f64) f64 {
 }
 
 fn monotonicNowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -1527,7 +1527,7 @@ test "GLiNER2 CUDA checkpoint resume preserves resident AdamW trajectory" {
     const specs = try discoverParams(allocator, config, batch.targets_shape);
     defer freeSpecs(allocator, specs);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const resume_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/cuda_resume.safetensors", .{tmp.sub_path});
     defer allocator.free(resume_path);

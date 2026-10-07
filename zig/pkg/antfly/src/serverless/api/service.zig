@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const api_types = @import("types.zig");
 const api_codec = @import("codec.zig");
@@ -201,8 +203,8 @@ test "api service exposes the table public API over namespace-backed ingest and 
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() native_platform.Threaded {
+    return native_platform.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

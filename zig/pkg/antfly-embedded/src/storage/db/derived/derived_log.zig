@@ -13,12 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+
+const platform_sync = native_platform.sync;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("../../lsm_backend/mod.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const supports_native_derived_log = builtin.os.tag != .freestanding;
 const wal = if (supports_native_derived_log) @import("../../wal.zig") else struct {
     pub const CommitBackend = enum {
@@ -297,7 +299,7 @@ fn derivedLogTmpPath(buf: []u8) [*:0]const u8 {
 }
 
 fn cleanupDerivedLogDir(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
@@ -325,7 +327,7 @@ test "derived log propagates wal group commit settings" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -362,11 +364,11 @@ test "derived log propagates wal group commit settings" {
         var worker_a = Worker{ .log = &log, .barrier = &barrier, .payload = "alpha" };
         var worker_b = Worker{ .log = &log, .barrier = &barrier, .payload = "beta" };
 
-        var thread_a = try std.testing.io.concurrent(Worker.run, .{&worker_a});
-        defer thread_a.await(std.testing.io);
-        var thread_b = try std.testing.io.concurrent(Worker.run, .{&worker_b});
-        thread_a.await(std.testing.io);
-        thread_b.await(std.testing.io);
+        var thread_a = try native_platform.testing.io.concurrent(Worker.run, .{&worker_a});
+        defer thread_a.await(native_platform.testing.io);
+        var thread_b = try native_platform.testing.io.concurrent(Worker.run, .{&worker_b});
+        thread_a.await(native_platform.testing.io);
+        thread_b.await(native_platform.testing.io);
 
         if (worker_a.err) |err| return err;
         if (worker_b.err) |err| return err;

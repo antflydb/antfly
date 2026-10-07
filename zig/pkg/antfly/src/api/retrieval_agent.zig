@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const ascii_compat = @import("../common/ascii_compat.zig");
 const connections_api = @import("connections.zig");
 const agent_tools = @import("agent_tools.zig");
@@ -26,7 +28,7 @@ const generating_openapi = @import("antfly_generating_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const generating = @import("antfly_generating");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const query_api = @import("antfly_local_sources").api_query;
 const query_contract = @import("antfly_local_sources").api_query_contract;
 const query_builder_agent = @import("query_builder_agent.zig");
@@ -11866,11 +11868,11 @@ test "retrieval graph navigation terminal answer preserves embedded JSON provide
         }
     };
     const alloc = std.testing.allocator;
-    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(alloc, native_platform.testing.io, .{});
     defer client.deinit();
     var factory = @import("antfly_local_sources").generating_mod.BackendFactory.initWithOptions(alloc, &client, .{
         .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
-        .request_context = .{ .io = std.testing.io, .deadline_ns = null },
+        .request_context = .{ .io = native_platform.testing.io, .deadline_ns = null },
     });
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();

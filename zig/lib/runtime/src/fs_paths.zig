@@ -126,7 +126,7 @@ pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
 pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
     if (builtin.os.tag == .windows) {
         const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-        return file.sync(std.Io.Threaded.global_single_threaded.io());
+        return file.sync(platform.Threaded.global_single_threaded.io());
     }
     if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableFileSyncUnsupported;
@@ -300,10 +300,10 @@ fn realPathAlloc(allocator: std.mem.Allocator, io: anytype, path: []const u8) ![
 }
 
 test "syncDirPortable opens a real directory fd" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -313,10 +313,10 @@ test "syncDirPortable opens a real directory fd" {
 }
 
 test "syncDirectoryHandlePortable supports cwd and traversal-only handles" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -332,10 +332,10 @@ test "syncDirectoryHandlePortable supports cwd and traversal-only handles" {
 }
 
 test "createDirPathPortable creates absolute nested directories" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
 
     const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".zig-cache/tmp", std.testing.allocator);
@@ -350,10 +350,10 @@ test "createDirPathPortable creates absolute nested directories" {
 }
 
 test "pathsReferToSameExistingFile resolves aliases" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
 
     const relative = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -369,7 +369,7 @@ test "pathsReferToSameExistingFile resolves aliases" {
 
 fn createDirAbsolutePortable(path: []const u8) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.createDirAbsolute(io_impl.io(), path, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => return,

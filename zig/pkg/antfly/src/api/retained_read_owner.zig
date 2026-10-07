@@ -16,13 +16,15 @@
 //! Transport-neutral owner operations. Ingress must derive Scope from current
 //! authentication and routing authority on EVERY call. The lifetime registry
 //! and its periodic expiry task must outlive every RPC task using this owner.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const registry_mod = @import("../storage/retained_read_registry.zig");
 const reads = @import("antfly_local_sources").api_table_read_source;
 const types = @import("antfly_local_sources").storage_db_types;
 const metadata = @import("../metadata/api.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const time = @import("antfly_platform").time;
+const time = native_platform.time;
 
 /// Stable owner lifetime with one bounded sweeper, never one timer per cursor.
 /// Stop ingress and join in-flight RPCs before deinit; their borrows must have
@@ -314,7 +316,7 @@ fn consumerTests() type {
                     self.cursors_closed += 1;
                 }
             };
-            var registry = try registry_mod.Registry.init(std.testing.allocator, std.testing.io, 1, 8, 8, 10 * std.time.ns_per_s);
+            var registry = try registry_mod.Registry.init(std.testing.allocator, native_platform.testing.io, 1, 8, 8, 10 * std.time.ns_per_s);
             defer registry.deinit();
             var fixture: Fixture = .{};
             const owner = Owner{ .registry = &registry, .source = .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .try_statement_read_fence_group_local_routed = Fixture.capture } } };
@@ -345,7 +347,7 @@ fn consumerTests() type {
         }
 
         test "retained read owner expiry runtime joins maintenance before freeing registry" {
-            const runtime = try Runtime.create(std.testing.allocator, std.testing.io, 1, 8, 4, std.time.ns_per_s);
+            const runtime = try Runtime.create(std.testing.allocator, native_platform.testing.io, 1, 8, 4, std.time.ns_per_s);
             runtime.deinit();
         }
     };

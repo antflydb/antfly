@@ -21,6 +21,7 @@
 // rows: tokenization + encoder/head forward + postprocess, without model-load
 // or process-startup noise.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 const build_options = @import("build_options");
@@ -992,8 +993,8 @@ fn percentileMs(sorted: []const Sample, ratio: f64) f64 {
 }
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+    var ts: native_platform.c.timespec = undefined;
+    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }

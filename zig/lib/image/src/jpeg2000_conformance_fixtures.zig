@@ -24,6 +24,7 @@
 //! the explicit conformance target fails. Ordinary unit tests can still
 //! skip the external corpus when it is absent.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -99,7 +100,7 @@ fn checkConformanceDirPresent(allocator: Allocator, root_dir: []const u8) bool {
     const conf_path = std.fs.path.join(allocator, &.{ root_dir, "input", "conformance" }) catch return false;
     defer allocator.free(conf_path);
 
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = native_platform.Threaded.global_single_threaded.io();
     var dir = std.Io.Dir.openDirAbsolute(io, conf_path, .{}) catch return false;
     dir.close(io);
     return true;

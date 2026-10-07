@@ -25,7 +25,9 @@
 //   - tokenizer.json
 //   - config.json (model_type: t5, bart, etc.)
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const backends = @import("../backends/backends.zig");
 const tokenizer_mod = @import("inference_tokenizer");
 const enc_dec_mod = @import("encoder_decoder.zig");
@@ -221,8 +223,8 @@ pub const RewritingPipeline = struct {
 };
 
 test "rewrite arrays preserve bounded stage work under opportunistic scheduling" {
-    try testRewriteScheduling(std.testing.io, 1_000, false);
-    var serial_io = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing });
+    try testRewriteScheduling(native_platform.testing.io, 1_000, false);
+    var serial_io = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing });
     defer serial_io.deinit();
     try testRewriteScheduling(serial_io.io(), 0, true);
 }

@@ -17,7 +17,9 @@
 //! A verifier is trusted owner code, never a sender-supplied acceptance bit.
 //! Ordered completion must prepare on each receiver and stage its own local
 //! obligation revision; root identities and work revisions are not transferable.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const publication = @import("artifact_publication.zig");
 const obligations = @import("artifact_producer_obligations.zig");
 const Observation = @import("artifact_stream_observation.zig").Observation;
@@ -360,13 +362,13 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, root: u128, plan: *const 
     const initial = state;
     var witnesses: std.ArrayList(Witness) = .empty;
     errdefer for (witnesses.items) |*witness| witness.deinit();
-    const deadline = if (limits.time_budget_ns) |budget| @import("antfly_platform").time.monotonicNs() +| budget else std.math.maxInt(u64);
+    const deadline = if (limits.time_budget_ns) |budget| native_platform.time.monotonicNs() +| budget else std.math.maxInt(u64);
     var bytes: usize = 0;
     while (state.next < state.total) {
         const node = &plan.nodes[state.next];
         const cost = node.byteCost() +| document.len +| @sizeOf(Witness);
         if (cost > publication.max_payload_bytes) return error.ResourceBudgetExceeded;
-        if (witnesses.items.len != 0 and (witnesses.items.len >= limits.visits or bytes +| cost > limits.bytes or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
+        if (witnesses.items.len != 0 and (witnesses.items.len >= limits.visits or bytes +| cost > limits.bytes or native_platform.time.monotonicNs() >= deadline)) break;
         var witness = (try verifier.verify(alloc, txn, root, document, node)) orelse break;
         errdefer witness.deinit();
         if (witness.root != root or !std.mem.eql(u8, &witness.requirement, &node.id)) return error.ArtifactCatalogDrift;
@@ -576,9 +578,9 @@ pub fn refreshProjectionsWithAdoption(alloc: std.mem.Allocator, store: anytype, 
     var projection = (try @import("derived/apply_state.zig").tryAcquireProjectionSnapshot(alloc, manager.checkpointIo(), store, checkpoint_path)) orelse return;
     defer projection.deinit();
     if (!std.meta.eql(projection.authority, authority)) return error.ArtifactCatalogDrift;
-    const deadline = if (limits.time_budget_ns) |budget| @import("antfly_platform").time.monotonicNs() +| budget else std.math.maxInt(u64);
+    const deadline = if (limits.time_budget_ns) |budget| native_platform.time.monotonicNs() +| budget else std.math.maxInt(u64);
     for (pending[0..count], 0..) |ordinal, visited| {
-        if (visited != 0 and @import("antfly_platform").time.monotonicNs() >= deadline) break;
+        if (visited != 0 and native_platform.time.monotonicNs() >= deadline) break;
         const node = &plan.nodes[ordinal];
         var missing_seal = false;
         var guard = (try manager.tryValidateFullTextProjectionWithAdoptionHint(alloc, &projection, node.name, node.generation, &missing_seal)) orelse {
@@ -621,7 +623,7 @@ test "ordered artifact inventory projection completion reconstructs independent 
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const certificates = @import("artifact_projection_certificate.zig");
     const native = @import("artifact_native_stream.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-source", .{tmp.sub_path});
     defer alloc.free(source_path);
@@ -696,7 +698,7 @@ test "ordered artifact inventory completion control verifies independent roots b
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const native = @import("artifact_native_stream.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-source", .{tmp.sub_path});
     defer alloc.free(source_path);
@@ -830,7 +832,7 @@ test "ordered artifact inventory completion control verifies independent roots b
 test "ordered artifact inventory completion leaves extraction-owned scope pending until certified" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-pending-extraction", .{tmp.sub_path});
     defer alloc.free(path);
@@ -860,7 +862,7 @@ test "ordered artifact inventory completion leaves extraction-owned scope pendin
 test "ordered artifact inventory completion never skips an unverified index requirement" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-pending-index", .{tmp.sub_path});
     defer alloc.free(path);
@@ -974,10 +976,10 @@ test "ordered artifact inventory completion checkpoint resumes all requirements 
             return .{ .root = root, .requirement = node.id, .observation = try Observation.capture(txn, document) };
         }
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path_len = try tmp.dir.realPath(native_platform.testing.io, &path_buffer);
     const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
     defer alloc.free(path);
     var store = try docstore.DocStore.open(alloc, path, .{});

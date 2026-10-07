@@ -13,9 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const db_mod = struct {
     pub const types = @import("../storage/db/types.zig");
 };
@@ -970,23 +972,23 @@ pub const TableRuntimeSnapshotCache = struct {
     }
 
     fn lockExistingTableMutation(self: *@This(), table_name: []const u8) ?*TableState {
-        self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+        self.mutation_barrier.lockSharedUncancelable(native_platform.debug_io);
         lockAtomic(&self.mutex);
         const state = self.tables.get(table_name);
         if (state) |value| value.retain();
         self.mutex.unlock();
-        self.mutation_barrier.unlockShared(std.Options.debug_io);
+        self.mutation_barrier.unlockShared(native_platform.debug_io);
         if (state == null) {
             return null;
         }
-        state.?.mutation_mutex.lockUncancelable(std.Options.debug_io);
-        self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+        state.?.mutation_mutex.lockUncancelable(native_platform.debug_io);
+        self.mutation_barrier.lockSharedUncancelable(native_platform.debug_io);
         lockAtomic(&self.mutex);
         const still_current = self.tables.get(table_name) == state.?;
         self.mutex.unlock();
         if (!still_current) {
-            self.mutation_barrier.unlockShared(std.Options.debug_io);
-            state.?.mutation_mutex.unlock(std.Options.debug_io);
+            self.mutation_barrier.unlockShared(native_platform.debug_io);
+            state.?.mutation_mutex.unlock(native_platform.debug_io);
             state.?.release(self.alloc);
             return null;
         }
@@ -995,31 +997,31 @@ pub const TableRuntimeSnapshotCache = struct {
 
     fn lockEnsuredTableMutation(self: *@This(), table_name: []const u8) !*TableState {
         while (true) {
-            self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+            self.mutation_barrier.lockSharedUncancelable(native_platform.debug_io);
             lockAtomic(&self.mutex);
             const state = self.ensureTableLocked(table_name) catch |err| {
                 self.mutex.unlock();
-                self.mutation_barrier.unlockShared(std.Options.debug_io);
+                self.mutation_barrier.unlockShared(native_platform.debug_io);
                 return err;
             };
             state.retain();
             self.mutex.unlock();
-            self.mutation_barrier.unlockShared(std.Options.debug_io);
-            state.mutation_mutex.lockUncancelable(std.Options.debug_io);
-            self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
+            self.mutation_barrier.unlockShared(native_platform.debug_io);
+            state.mutation_mutex.lockUncancelable(native_platform.debug_io);
+            self.mutation_barrier.lockSharedUncancelable(native_platform.debug_io);
             lockAtomic(&self.mutex);
             const still_current = self.tables.get(table_name) == state;
             self.mutex.unlock();
             if (still_current) return state;
-            self.mutation_barrier.unlockShared(std.Options.debug_io);
-            state.mutation_mutex.unlock(std.Options.debug_io);
+            self.mutation_barrier.unlockShared(native_platform.debug_io);
+            state.mutation_mutex.unlock(native_platform.debug_io);
             state.release(self.alloc);
         }
     }
 
     fn unlockTableMutation(self: *@This(), state: *TableState) void {
-        state.mutation_mutex.unlock(std.Options.debug_io);
-        self.mutation_barrier.unlockShared(std.Options.debug_io);
+        state.mutation_mutex.unlock(native_platform.debug_io);
+        self.mutation_barrier.unlockShared(native_platform.debug_io);
         state.release(self.alloc);
     }
 
@@ -1035,7 +1037,7 @@ pub const TableRuntimeSnapshotCache = struct {
     }
 
     pub fn deinit(self: *@This()) void {
-        self.mutation_barrier.lockUncancelable(std.Options.debug_io);
+        self.mutation_barrier.lockUncancelable(native_platform.debug_io);
         lockAtomic(&self.mutex);
         self.clearTablesLocked();
         self.tables.deinit(self.alloc);
@@ -1044,13 +1046,13 @@ pub const TableRuntimeSnapshotCache = struct {
         lockAtomic(&self.read_view_mutex);
         self.read_views.deinit(self.read_view_alloc);
         self.read_view_mutex.unlock();
-        self.mutation_barrier.unlock(std.Options.debug_io);
+        self.mutation_barrier.unlock(native_platform.debug_io);
         self.* = undefined;
     }
 
     pub fn clear(self: *@This()) void {
-        self.mutation_barrier.lockUncancelable(std.Options.debug_io);
-        defer self.mutation_barrier.unlock(std.Options.debug_io);
+        self.mutation_barrier.lockUncancelable(native_platform.debug_io);
+        defer self.mutation_barrier.unlock(native_platform.debug_io);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         self.advanceInvalidationEpochLocked();
@@ -1662,8 +1664,8 @@ pub const TableRuntimeSnapshotCache = struct {
         };
         errdefer token.deinit();
 
-        self.mutation_barrier.lockSharedUncancelable(std.Options.debug_io);
-        defer self.mutation_barrier.unlockShared(std.Options.debug_io);
+        self.mutation_barrier.lockSharedUncancelable(native_platform.debug_io);
+        defer self.mutation_barrier.unlockShared(native_platform.debug_io);
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         token.topology_revision = self.topology_revision;
@@ -2420,11 +2422,11 @@ pub const TableRuntimeSnapshotCache = struct {
         // Only catalog absence/topology commitment is global. All expensive
         // per-table merge, clone, and read-view construction above ran through
         // exact table ownership while unrelated publishers remained runnable.
-        self.mutation_barrier.lockUncancelable(std.Options.debug_io);
+        self.mutation_barrier.lockUncancelable(native_platform.debug_io);
         lockAtomic(&self.mutex);
         if (catalog_token.topology_revision != self.topology_revision) {
             self.mutex.unlock();
-            self.mutation_barrier.unlock(std.Options.debug_io);
+            self.mutation_barrier.unlock(native_platform.debug_io);
             result.removals_deferred = true;
             return result;
         }
@@ -2458,7 +2460,7 @@ pub const TableRuntimeSnapshotCache = struct {
             result.removed_tables += 1;
         }
         self.mutex.unlock();
-        self.mutation_barrier.unlock(std.Options.debug_io);
+        self.mutation_barrier.unlock(native_platform.debug_io);
         return result;
     }
 
@@ -4976,7 +4978,7 @@ fn findMatchingIndexStatus(
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    @import("antfly_platform").sync.lockYielding(mutex);
+    native_platform.sync.lockYielding(mutex);
 }
 
 fn freeAlgebraicCandidateStatuses(alloc: std.mem.Allocator, candidates: []const db_mod.types.AlgebraicCandidateStatus) void {
@@ -6132,17 +6134,17 @@ fn consumerTests() type {
             };
             var snapshot = Snapshot{ .cache = &cache };
             lockAtomic(&cache.mutex);
-            var thread = try std.testing.io.concurrent(Snapshot.run, .{&snapshot});
+            var thread = try native_platform.testing.io.concurrent(Snapshot.run, .{&snapshot});
             var completed_while_locked = false;
             for (0..10_000) |_| {
                 if (snapshot.done.load(.acquire)) {
                     completed_while_locked = true;
                     break;
                 }
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             cache.mutex.unlock();
-            thread.await(std.testing.io);
+            thread.await(native_platform.testing.io);
             try std.testing.expect(completed_while_locked);
             try std.testing.expect(!snapshot.failed.load(.acquire));
         }
@@ -6235,7 +6237,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
                     self.entered.store(true, .release);
-                    while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                    while (!self.release.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
             };
             const Publish = struct {
@@ -6265,24 +6267,24 @@ fn consumerTests() type {
             defer test_read_group_preparation_hook = null;
             var publish_a = Publish{ .cache = &cache, .token = token_a, .table_name = "table-a", .group_id = 1 };
             var publish_b = Publish{ .cache = &cache, .token = token_b, .table_name = "table-b", .group_id = 2 };
-            var thread_a = try std.testing.io.concurrent(Publish.run, .{&publish_a});
+            var thread_a = try native_platform.testing.io.concurrent(Publish.run, .{&publish_a});
             defer {
                 blocker.release.store(true, .release);
-                thread_a.await(std.testing.io);
+                thread_a.await(native_platform.testing.io);
             }
-            while (!blocker.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-            var thread_b = try std.testing.io.concurrent(Publish.run, .{&publish_b});
+            while (!blocker.entered.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            var thread_b = try native_platform.testing.io.concurrent(Publish.run, .{&publish_b});
             var unrelated_completed = false;
             for (0..100_000) |_| {
                 if (publish_b.done.load(.acquire)) {
                     unrelated_completed = true;
                     break;
                 }
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             blocker.release.store(true, .release);
-            thread_a.await(std.testing.io);
-            thread_b.await(std.testing.io);
+            thread_a.await(native_platform.testing.io);
+            thread_b.await(native_platform.testing.io);
             try std.testing.expect(unrelated_completed);
             try std.testing.expect(!publish_a.failed.load(.acquire));
             try std.testing.expect(!publish_b.failed.load(.acquire));
@@ -6324,7 +6326,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (self.calls.fetchAdd(1, .acq_rel) != 0) return;
                     self.entered.store(true, .release);
-                    while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                    while (!self.release.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
             };
             const Refresh = struct {
@@ -6366,33 +6368,33 @@ fn consumerTests() type {
             defer test_read_group_preparation_hook = null;
             var refresh = Refresh{ .cache = &cache, .token = &refresh_token, .snapshots = snapshots };
             var publish = Publish{ .cache = &cache, .token = token_b };
-            var refresh_thread = try std.testing.io.concurrent(Refresh.run, .{&refresh});
+            var refresh_thread = try native_platform.testing.io.concurrent(Refresh.run, .{&refresh});
             var preparation_entered = false;
             for (0..100_000) |_| {
                 if (blocker.entered.load(.acquire)) {
                     preparation_entered = true;
                     break;
                 }
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             if (!preparation_entered) {
                 blocker.release.store(true, .release);
-                refresh_thread.await(std.testing.io);
+                refresh_thread.await(native_platform.testing.io);
                 try std.testing.expect(preparation_entered);
                 return;
             }
-            var publish_thread = try std.testing.io.concurrent(Publish.run, .{&publish});
+            var publish_thread = try native_platform.testing.io.concurrent(Publish.run, .{&publish});
             var unrelated_completed = false;
             for (0..100_000) |_| {
                 if (publish.done.load(.acquire)) {
                     unrelated_completed = true;
                     break;
                 }
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             blocker.release.store(true, .release);
-            refresh_thread.await(std.testing.io);
-            publish_thread.await(std.testing.io);
+            refresh_thread.await(native_platform.testing.io);
+            publish_thread.await(native_platform.testing.io);
             try std.testing.expect(unrelated_completed);
             try std.testing.expect(!refresh.failed.load(.acquire));
             try std.testing.expect(!publish.failed.load(.acquire));

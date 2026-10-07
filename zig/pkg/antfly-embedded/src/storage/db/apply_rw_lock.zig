@@ -16,7 +16,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const AtomicU64 = platform.atomic.Value(u64);
 
 /// Writer-preferring service fence. Shared acquisition is intentionally not
@@ -69,7 +69,7 @@ pub const ApplyRwLock = struct {
             return;
         }
         if (comptime builtin.os.tag != .freestanding and !builtin.single_threaded) {
-            std.Io.Threaded.global_single_threaded.io().futexWake(u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+            platform.Threaded.global_single_threaded.io().futexWake(u32, &self.wake_epoch.raw, std.math.maxInt(u32));
         }
     }
 
@@ -92,7 +92,7 @@ pub const ApplyRwLock = struct {
         } else {
             // The epoch is sampled before testing the predicate, so an unlock
             // between that test and parking cannot become a lost wakeup.
-            std.Io.Threaded.global_single_threaded.io().futexWaitUncancelable(u32, &self.wake_epoch.raw, epoch);
+            platform.Threaded.global_single_threaded.io().futexWaitUncancelable(u32, &self.wake_epoch.raw, epoch);
         }
     }
 
@@ -433,15 +433,15 @@ test "apply rw lock lets queued readers through sustained exclusive loop" {
     };
 
     var ctx = Context{};
-    var writer_thread = try std.testing.io.concurrent(Context.writer, .{&ctx});
-    defer writer_thread.await(std.testing.io);
+    var writer_thread = try platform.testing.io.concurrent(Context.writer, .{&ctx});
+    defer writer_thread.await(platform.testing.io);
 
-    var reader_thread = try std.testing.io.concurrent(Context.reader, .{&ctx});
-    defer reader_thread.await(std.testing.io);
+    var reader_thread = try platform.testing.io.concurrent(Context.reader, .{&ctx});
+    defer reader_thread.await(platform.testing.io);
 
     var spins: usize = 0;
     while (!ctx.reader_done.load(.acquire) and spins < 100_000) : (spins += 1) {
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(ctx.reader_ready.load(.acquire));
     try std.testing.expect(ctx.reader_done.load(.acquire));
@@ -459,7 +459,7 @@ test "apply rw lock runtime shared wait cancellation clears priority handoff" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var cancelled = std.atomic.Value(bool).init(true);
@@ -485,7 +485,7 @@ test "apply rw lock runtime writer cancellation clears intent and reader gate" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var cancelled = std.atomic.Value(bool).init(true);
@@ -527,7 +527,7 @@ test "apply rw lock preserves backend task cancellation" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var lock: ApplyRwLock = .{ .io = io };
@@ -619,7 +619,7 @@ test "apply rw lock cooperative writer yields to queued reader on one-worker run
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{
         .async_limit = .limited(1),
     });
     defer io_impl.deinit();
@@ -644,10 +644,10 @@ test "apply rw lock cooperative writer yields to queued reader on one-worker run
     // still owns the lock makes the test itself deadlock before it can unlock.
     // Use an independent caller for the writer while both lock waits continue
     // to use the same one-worker backend Io.
-    var writer_thread = try std.testing.io.concurrent(Context.writerThread, .{&ctx});
-    defer writer_thread.await(std.testing.io);
+    var writer_thread = try platform.testing.io.concurrent(Context.writerThread, .{&ctx});
+    defer writer_thread.await(platform.testing.io);
     while (lock.exclusive_waiters.load(.acquire) == 0) {
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     lock.unlockExclusive();
     exclusive_held = false;
@@ -686,7 +686,7 @@ test "apply rw lock queued io writer blocks later shared barging" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var lock: ApplyRwLock = .{ .io = io };
@@ -695,10 +695,10 @@ test "apply rw lock queued io writer blocks later shared barging" {
     defer if (shared_held) lock.unlockShared();
 
     var ctx = Context{ .lock = &lock, .io = io };
-    var writer_thread = try std.testing.io.concurrent(Context.writer, .{&ctx});
-    defer writer_thread.await(std.testing.io);
+    var writer_thread = try platform.testing.io.concurrent(Context.writer, .{&ctx});
+    defer writer_thread.await(platform.testing.io);
     while (lock.exclusive_waiters.load(.acquire) == 0) {
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     // Once writer intent is visible, neither opportunistic nor blocking-new
@@ -745,14 +745,14 @@ test "apply rw lock concurrent readers preserve writer exclusion through repeate
         }
     };
     for ([_]bool{ false, true }) |bound| {
-        var context: Context = .{ .lock = .{ .io = if (bound) std.testing.io else null } };
+        var context: Context = .{ .lock = .{ .io = if (bound) platform.testing.io else null } };
         var tasks: std.Io.Group = .init;
-        defer tasks.cancel(std.testing.io);
+        defer tasks.cancel(platform.testing.io);
         // A failed task launch must also release the uncancelable readers.
         errdefer context.done.store(2, .release);
-        for (0..8) |_| try tasks.concurrent(std.testing.io, Context.reader, .{&context});
-        for (0..2) |_| try tasks.concurrent(std.testing.io, Context.writer, .{&context});
-        try tasks.await(std.testing.io);
+        for (0..8) |_| try tasks.concurrent(platform.testing.io, Context.reader, .{&context});
+        for (0..2) |_| try tasks.concurrent(platform.testing.io, Context.writer, .{&context});
+        try tasks.await(platform.testing.io);
         try std.testing.expect(!context.failed.load(.acquire));
         try std.testing.expectEqual(@as(u64, 10000), context.value);
         try std.testing.expectEqual(@as(u32, 0), context.lock.parked_waiters.load(.acquire));
@@ -807,10 +807,10 @@ test "apply rw lock VOPR wakes shared and exclusive waiters without advancing ti
             if (shared) {
                 // Even a caller's native fallback must not move this wait
                 // away from the bound VOPR synchronization authority.
-                if (cancellable) try lock.lockSharedIo(std.testing.io, null) else lock.lockShared();
+                if (cancellable) try lock.lockSharedIo(platform.testing.io, null) else lock.lockShared();
                 lock.unlockShared();
             } else {
-                if (cancellable) try lock.lockExclusiveIo(std.testing.io, null) else lock.lockExclusive();
+                if (cancellable) try lock.lockExclusiveIo(platform.testing.io, null) else lock.lockExclusive();
                 lock.unlockExclusive();
             }
             done.* = true;

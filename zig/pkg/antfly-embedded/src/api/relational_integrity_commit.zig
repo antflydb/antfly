@@ -16,7 +16,9 @@
 //! Public mutation adapter. Read versions become durable 2PC predicates, and
 //! semantic claim/reference commands execute on their independently routed
 //! owners. No preflight-only parent lookup can authorize a child write.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const contract = @import("distributed_txn_contract.zig");
 const reads = @import("table_read_source.zig");
 const schema_api = @import("../schema/mod.zig");
@@ -46,7 +48,7 @@ fn boundedControl(request: RequestContext) !RequestContext {
     const now_ns = if (request.deadline_io) |borrow| blk: {
         var receiver = try borrow.receive();
         break :blk @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
-    } else @import("antfly_platform").time.monotonicNs();
+    } else native_platform.time.monotonicNs();
     result.deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), now_ns +| 5 * std.time.ns_per_s);
     try result.ensureActive();
     return result;
@@ -286,7 +288,7 @@ const Builder = struct {
         opts.execution_io = self.control.deadline_io;
         opts.cancellation = self.control.cancellation;
         return self.source.lookup(self.alloc, table, key, opts, .read_index) catch |err| {
-            if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs())) std.log.warn("preparation lookup failed catalog={} jobs={} work={d} class={s}", .{ opts.relational_integrity_catalog, opts.relational_integrity_jobs_json.len != 0, self.work.items.len, @errorName(err) });
+            if (preparation_diagnostic_gate.admit(native_platform.time.monotonicNs())) std.log.warn("preparation lookup failed catalog={} jobs={} work={d} class={s}", .{ opts.relational_integrity_catalog, opts.relational_integrity_jobs_json.len != 0, self.work.items.len, @errorName(err) });
             return err;
         };
     }
@@ -1396,7 +1398,7 @@ pub fn prepareWithCoverageControlled(alloc: Allocator, source: reads.TableReadSo
 pub fn preparationError(err: anyerror) anyerror {
     return switch (err) {
         error.ReadIndexTimeout, error.CatalogRoutingSnapshotTimeout, error.Timeout, error.NotLeader, error.GroupLeaderUnavailable, error.LeaderUnavailable, error.DistributedQueryUnavailable, error.StorageReadTemporarilyUnavailable, error.ConcurrencyUnavailable, error.ResourceTemporarilyUnavailable => blk: {
-            if (preparation_diagnostic_gate.admit(@import("antfly_platform").time.monotonicNs()))
+            if (preparation_diagnostic_gate.admit(native_platform.time.monotonicNs()))
                 std.log.warn("relational preparation read deferred class={s}", .{@errorName(err)});
             break :blk error.IntegrityCatalogUnavailable;
         },
@@ -1434,13 +1436,13 @@ test "distributed txn partial witness scan translates distinct clock epochs with
         }
     };
     var now: u64 = 17;
-    var vtable = std.testing.io.vtable.*;
+    var vtable = native_platform.testing.io.vtable.*;
     vtable.now = FakeClock.now;
     const io: std.Io = .{ .userdata = &now, .vtable = &vtable };
     const control: RequestContext = .{ .deadline_ns = now + std.time.ns_per_s, .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) };
-    const before = @import("antfly_platform").time.monotonicNs();
+    const before = native_platform.time.monotonicNs();
     const options = try partialWitnessScanOptions(control, "query");
-    const after = @import("antfly_platform").time.monotonicNs();
+    const after = native_platform.time.monotonicNs();
     try std.testing.expect(options.execution_deadline_ns.? >= before + std.time.ns_per_s);
     try std.testing.expect(options.execution_deadline_ns.? <= after + std.time.ns_per_s);
     try std.testing.expectEqualStrings("query", options.relational_query_json);
@@ -1889,14 +1891,14 @@ test "distributed txn primary prefetch retries transient owner reads once after 
         }
     };
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     inline for (std.meta.tags(Mode)) |mode| {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         var fixture: Fixture = .{ .mode = mode };
-        var clock_vtable = std.testing.io.vtable.*;
+        var clock_vtable = native_platform.testing.io.vtable.*;
         clock_vtable.now = Fixture.now;
         const clock: std.Io = .{ .userdata = &fixture, .vtable = &clock_vtable };
         var table: Loaded = undefined;
@@ -1957,7 +1959,7 @@ test "distributed txn primary prefetch owns observations and drains failed batch
         }
     };
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     for ([_]bool{ false, true }) |fail| {
@@ -2725,7 +2727,7 @@ fn testNativeCascade(generated: bool) !void {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const gate = @import("../storage/read_consistency.zig");
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/cascade", .{tmp.sub_path});
@@ -2836,7 +2838,7 @@ test "distributed txn MATCH PARTIAL nullable witnesses survive alternate deletio
     const gate = @import("../storage/read_consistency.zig");
     const alloc = std.testing.allocator;
     inline for (.{ "restrict", "cascade", "set_null" }) |action| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/partial", .{tmp.sub_path});
         defer alloc.free(path);

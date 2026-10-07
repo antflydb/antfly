@@ -18,7 +18,9 @@
 //! Loads a PJRT plugin (e.g., CPU or TPU) via dlopen and provides
 //! Zig-idiomatic wrappers for compilation and execution.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const c = @import("pjrt_c_types.zig");
 const hlo = @import("hlo.zig");
 
@@ -261,11 +263,11 @@ pub const Client = struct {
     api: *const c.Api,
     handle: *c.PjrtClient,
     device: *c.PjrtDevice,
-    lib: std.DynLib,
+    lib: native_platform.DynLib,
 
     pub fn init(plugin_path: [:0]const u8) PjrtError!Client {
         // Load plugin shared library
-        var lib = std.DynLib.open(plugin_path) catch return PjrtError.PluginLoadFailed;
+        var lib = native_platform.DynLib.open(plugin_path) catch return PjrtError.PluginLoadFailed;
         errdefer lib.close();
 
         // Get API function pointer table

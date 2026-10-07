@@ -102,9 +102,9 @@ pub fn main(init: std.process.Init) !void {
     const directory = args.next() orelse return error.ExpectedExistingTemporaryDirectory;
     const samples = if (args.next()) |value| try std.fmt.parseInt(usize, value, 10) else 7;
     if (samples == 0 or args.next() != null) return error.InvalidArguments;
-    const threaded = try init.gpa.create(std.Io.Threaded);
+    const threaded = try init.gpa.create(@import("root.zig").Threaded);
     defer init.gpa.destroy(threaded);
-    threaded.* = std.Io.Threaded.init(init.gpa, .{ .concurrent_limit = .limited(64), .async_limit = .nothing });
+    threaded.* = @import("root.zig").Threaded.init(init.gpa, .{ .concurrent_limit = .limited(64), .async_limit = .nothing });
     defer threaded.deinit();
     const io = threaded.io();
     const evented = try init.gpa.create(platform.Evented);

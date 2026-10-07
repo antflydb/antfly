@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const antfly = @import("../cli_root.zig");
 const lite_restore_staging = @import("../standalone/restore_staging_bridge.zig");
 const portable_backup = antfly.portable_backup;
@@ -21,10 +23,10 @@ const portable_backup = antfly.portable_backup;
 test "restore input plan stages aflite as portable table restore" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = native_platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const box = @import("box.zig");
 const codeblock = @import("codeblock.zig");
 const codestream = @import("codestream.zig");
@@ -160,7 +162,7 @@ pub const SuiteReport = struct {
 };
 
 pub fn discoverFixtures(allocator: std.mem.Allocator, root_path: []const u8) ![]FixtureCase {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = native_platform.Threaded.global_single_threaded.io();
     var dir = try std.Io.Dir.openDirAbsolute(io, root_path, .{ .iterate = true });
     defer dir.close(io);
 
@@ -1236,7 +1238,7 @@ fn findExpectedImageForFixture(allocator: std.mem.Allocator, root_path: []const 
     const stem = relative_input_path[0 .. relative_input_path.len - std.fs.path.extension(relative_input_path).len];
     const ppm_path = try std.fmt.allocPrint(allocator, "{s}/{s}.ppm", .{ root_path, stem });
     defer allocator.free(ppm_path);
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = native_platform.Threaded.global_single_threaded.io();
     if (std.Io.Dir.accessAbsolute(io, ppm_path, .{})) |_| return try allocator.dupe(u8, ppm_path) else |_| {}
 
     const pgm_path = try std.fmt.allocPrint(allocator, "{s}/{s}.pgm", .{ root_path, stem });
@@ -1640,11 +1642,11 @@ fn copyInterleavedPlanePreview(dst: *[3][4]u8, pixels: []const u8, components: u
 
 test "discover fixtures finds jp2/j2k inputs and sidecar images" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.jp2", .data = "x" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.ppm", .data = "P6\n1 1\n255\n\xff\x00\x00" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.j2k", .data = "x" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "a.jp2", .data = "x" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "a.ppm", .data = "P6\n1 1\n255\n\xff\x00\x00" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "b.j2k", .data = "x" });
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
 
@@ -1661,7 +1663,7 @@ test "discover fixtures finds jp2/j2k inputs and sidecar images" {
 
 test "run suite validates a generated jp2 fixture with a sidecar oracle" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -1670,7 +1672,7 @@ test "run suite validates a generated jp2 fixture with a sidecar oracle" {
     defer allocator.free(jp2_path);
     _ = try encode.encodeU8(allocator, jp2_path, 2, 1, 3, &.{ 255, 0, 0, 0, 255, 0 });
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "fixture.ppm", .data = "P6\n2 1\n255\n\xff\x00\x00\x00\xff\x00" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "fixture.ppm", .data = "P6\n2 1\n255\n\xff\x00\x00\x00\xff\x00" });
 
     var report = try runSuite(allocator, root);
     defer report.deinit(allocator);
@@ -1688,7 +1690,7 @@ test "run suite validates a generated jp2 fixture with a sidecar oracle" {
 
 test "run suite reports current bounded generated matrix status" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -1696,12 +1698,12 @@ test "run suite reports current bounded generated matrix status" {
     const g3x1_path = try std.fs.path.join(allocator, &.{ root, "g3x1.jp2" });
     defer allocator.free(g3x1_path);
     _ = try encode.encodeU8(allocator, g3x1_path, 3, 1, 1, &.{ 255, 128, 0 });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "g3x1.pgm", .data = "P5\n3 1\n255\n\xff\x80\x00" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "g3x1.pgm", .data = "P5\n3 1\n255\n\xff\x80\x00" });
 
     const g2x2_path = try std.fs.path.join(allocator, &.{ root, "g2x2.jp2" });
     defer allocator.free(g2x2_path);
     _ = try encode.encodeU8(allocator, g2x2_path, 2, 2, 1, &.{ 255, 0, 128, 64 });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "g2x2.pgm", .data = "P5\n2 2\n255\n\xff\x00\x80\x40" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "g2x2.pgm", .data = "P5\n2 2\n255\n\xff\x00\x80\x40" });
 
     const rgb2x2_path = try std.fs.path.join(allocator, &.{ root, "rgb2x2.jp2" });
     defer allocator.free(rgb2x2_path);
@@ -1711,7 +1713,7 @@ test "run suite reports current bounded generated matrix status" {
         0,   0,   255,
         255, 255, 0,
     });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rgb2x2.ppm", .data = "P6\n2 2\n255\n\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\x00" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "rgb2x2.ppm", .data = "P6\n2 2\n255\n\xff\x00\x00\x00\xff\x00\x00\x00\xff\xff\xff\x00" });
 
     var report = try runSuite(allocator, root);
     defer report.deinit(allocator);
@@ -1727,7 +1729,7 @@ test "run suite reports current bounded generated matrix status" {
 
 test "run suite reports current generated grayscale and rgb through 13x2" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -1849,7 +1851,7 @@ fn writeCanonicalGrayFixture(
     defer allocator.free(oracle_sub_path);
     const data = try buildPortableImageData(allocator, "P5", width, height, 1, canonical_gray_nx2_pixels[0..pixel_len]);
     defer allocator.free(data);
-    try dir.writeFile(std.testing.io, .{ .sub_path = oracle_sub_path, .data = data });
+    try dir.writeFile(native_platform.testing.io, .{ .sub_path = oracle_sub_path, .data = data });
 }
 
 fn writeCanonicalRgbNx2Fixture(
@@ -1881,7 +1883,7 @@ fn writeCanonicalRgbFixture(
     defer allocator.free(oracle_sub_path);
     const data = try buildPortableImageData(allocator, "P6", width, height, 3, canonical_rgb_nx2_pixels[0..pixel_len]);
     defer allocator.free(data);
-    try dir.writeFile(std.testing.io, .{ .sub_path = oracle_sub_path, .data = data });
+    try dir.writeFile(native_platform.testing.io, .{ .sub_path = oracle_sub_path, .data = data });
 }
 
 fn buildPortableImageData(
@@ -1902,7 +1904,7 @@ fn buildPortableImageData(
 
 test "real generated 3x2 grayscale fixture reaches pure-zig packet model and reconstruction path" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -1978,7 +1980,7 @@ fn expectVerifiedCase(report: *const SuiteReport, suffix: []const u8, expected_p
 
 test "runCase on real generated 3x3 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2003,7 +2005,7 @@ test "runCase on real generated 3x3 grayscale fixture reports current bounded st
 
 test "runCase on real generated 3x3 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2013,7 +2015,7 @@ test "runCase on real generated 3x3 rgb fixture reports current bounded state" {
     _ = try encode.encodeU8(allocator, rgb3x3_path, 3, 3, 3, canonical_rgb_nx2_pixels[0..27]);
     const oracle_data = try buildPortableImageData(allocator, "P6", 3, 3, 3, canonical_rgb_nx2_pixels[0..27]);
     defer allocator.free(oracle_data);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "rgb3x3.ppm", .data = oracle_data });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "rgb3x3.ppm", .data = oracle_data });
     const oracle_path = try std.fs.path.join(allocator, &.{ root, "rgb3x3.ppm" });
     defer allocator.free(oracle_path);
 
@@ -2031,7 +2033,7 @@ test "runCase on real generated 3x3 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 4x3 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2056,7 +2058,7 @@ test "runCase on real generated 4x3 grayscale fixture reports current bounded st
 
 test "runCase on real generated 4x3 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2081,7 +2083,7 @@ test "runCase on real generated 4x3 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 5x3 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2106,7 +2108,7 @@ test "runCase on real generated 5x3 grayscale fixture reports current bounded st
 
 test "runCase on real generated 5x3 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2131,7 +2133,7 @@ test "runCase on real generated 5x3 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 6x3 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2156,7 +2158,7 @@ test "runCase on real generated 6x3 grayscale fixture reports current bounded st
 
 test "runCase on real generated 6x3 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2181,7 +2183,7 @@ test "runCase on real generated 6x3 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 3x4 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2206,7 +2208,7 @@ test "runCase on real generated 3x4 grayscale fixture reports current bounded st
 
 test "runCase on real generated 3x4 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2231,7 +2233,7 @@ test "runCase on real generated 3x4 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 4x4 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2256,7 +2258,7 @@ test "runCase on real generated 4x4 grayscale fixture reports current bounded st
 
 test "runCase on real generated 4x4 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2281,7 +2283,7 @@ test "runCase on real generated 4x4 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 5x4 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2306,7 +2308,7 @@ test "runCase on real generated 5x4 grayscale fixture reports current bounded st
 
 test "runCase on real generated 5x4 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2331,7 +2333,7 @@ test "runCase on real generated 5x4 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 6x4 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2356,7 +2358,7 @@ test "runCase on real generated 6x4 grayscale fixture reports current bounded st
 
 test "runCase on real generated 6x4 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2381,7 +2383,7 @@ test "runCase on real generated 6x4 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 7x4 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2406,7 +2408,7 @@ test "runCase on real generated 7x4 grayscale fixture reports current bounded st
 
 test "runCase on real generated 7x4 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2431,7 +2433,7 @@ test "runCase on real generated 7x4 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 8x4 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2456,7 +2458,7 @@ test "runCase on real generated 8x4 grayscale fixture reports current bounded st
 
 test "runCase on real generated 8x4 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2481,7 +2483,7 @@ test "runCase on real generated 8x4 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 9x4 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2506,7 +2508,7 @@ test "runCase on real generated 9x4 grayscale fixture reports current bounded st
 
 test "runCase on real generated 9x4 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2531,7 +2533,7 @@ test "runCase on real generated 9x4 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 10x4 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2556,7 +2558,7 @@ test "runCase on real generated 10x4 grayscale fixture reports current bounded s
 
 test "runCase on real generated 10x4 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2581,7 +2583,7 @@ test "runCase on real generated 10x4 rgb fixture reports current bounded state" 
 
 test "runCase on real generated 3x5 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2606,7 +2608,7 @@ test "runCase on real generated 3x5 grayscale fixture reports current bounded st
 
 test "runCase on real generated 3x5 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2631,7 +2633,7 @@ test "runCase on real generated 3x5 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 4x5 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2656,7 +2658,7 @@ test "runCase on real generated 4x5 grayscale fixture reports current bounded st
 
 test "runCase on real generated 4x5 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2681,7 +2683,7 @@ test "runCase on real generated 4x5 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 5x5 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2706,7 +2708,7 @@ test "runCase on real generated 5x5 grayscale fixture reports current bounded st
 
 test "runCase on real generated 5x5 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2731,7 +2733,7 @@ test "runCase on real generated 5x5 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 6x5 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2756,7 +2758,7 @@ test "runCase on real generated 6x5 grayscale fixture reports current bounded st
 
 test "runCase on real generated 6x5 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2781,7 +2783,7 @@ test "runCase on real generated 6x5 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 7x5 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2806,7 +2808,7 @@ test "runCase on real generated 7x5 grayscale fixture reports current bounded st
 
 test "runCase on real generated 7x5 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2831,7 +2833,7 @@ test "runCase on real generated 7x5 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 8x5 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2856,7 +2858,7 @@ test "runCase on real generated 8x5 grayscale fixture reports current bounded st
 
 test "runCase on real generated 8x5 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2881,7 +2883,7 @@ test "runCase on real generated 8x5 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 9x5 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2906,7 +2908,7 @@ test "runCase on real generated 9x5 grayscale fixture reports current bounded st
 
 test "runCase on real generated 9x5 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2931,7 +2933,7 @@ test "runCase on real generated 9x5 rgb fixture reports current bounded state" {
 
 test "runCase on real generated 10x5 grayscale fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2956,7 +2958,7 @@ test "runCase on real generated 10x5 grayscale fixture reports current bounded s
 
 test "runCase on real generated 10x5 rgb fixture reports current bounded state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -2981,7 +2983,7 @@ test "runCase on real generated 10x5 rgb fixture reports current bounded state" 
 
 test "representative multi-row MxN cases currently depend on pixel fixup" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -3001,7 +3003,7 @@ test "representative multi-row MxN cases currently depend on pixel fixup" {
 
 test "grayscale multi-row MxN family verifies without bounded fixups" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -3033,7 +3035,7 @@ test "grayscale multi-row MxN family verifies without bounded fixups" {
 
 test "real generated 3x2 grayscale fixture survives runCase metadata path before assemble" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -3041,7 +3043,7 @@ test "real generated 3x2 grayscale fixture survives runCase metadata path before
     const g3x2_path = try std.fs.path.join(allocator, &.{ root, "g3x2.jp2" });
     defer allocator.free(g3x2_path);
     _ = try encode.encodeU8(allocator, g3x2_path, 3, 2, 1, &.{ 255, 128, 64, 32, 192, 0 });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "g3x2.pgm", .data = "P5\n3 2\n255\n\xff\x80\x40\x20\xc0\x00" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "g3x2.pgm", .data = "P5\n3 2\n255\n\xff\x80\x40\x20\xc0\x00" });
 
     const fixture = FixtureCase{
         .input_path = try allocator.dupe(u8, g3x2_path),
@@ -3122,7 +3124,7 @@ test "real generated 3x2 grayscale fixture survives runCase metadata path before
 
 test "runCase on real generated 3x2 grayscale fixture reports its true current state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -3132,7 +3134,7 @@ test "runCase on real generated 3x2 grayscale fixture reports its true current s
     _ = try encode.encodeU8(allocator, g3x2_path, 3, 2, 1, &.{ 255, 128, 64, 32, 192, 0 });
     const oracle_path = try std.fs.path.join(allocator, &.{ root, "g3x2.pgm" });
     defer allocator.free(oracle_path);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "g3x2.pgm", .data = "P5\n3 2\n255\n\xff\x80\x40\x20\xc0\x00" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "g3x2.pgm", .data = "P5\n3 2\n255\n\xff\x80\x40\x20\xc0\x00" });
 
     const fixture = FixtureCase{
         .input_path = try allocator.dupe(u8, g3x2_path),
@@ -3152,7 +3154,7 @@ test "runCase on real generated 3x2 grayscale fixture reports its true current s
 
 test "encodeU8 direct 3x2 grayscale codestream payload matches the current external probe fixture" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -3178,7 +3180,7 @@ test "encodeU8 direct 3x2 grayscale codestream payload matches the current exter
 
 test "runCase on real generated 3x2 grayscale fixture without sidecar still reports its true current state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -3205,7 +3207,7 @@ test "runCase on real generated 3x2 grayscale fixture without sidecar still repo
 
 test "runSuite on single generated 3x2 grayscale fixture without sidecar still reports its true current state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -3226,7 +3228,7 @@ test "runSuite on single generated 3x2 grayscale fixture under GPA still reports
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
     defer allocator.free(root);
@@ -3264,7 +3266,7 @@ test "MxN parity: lossless decode matches for various grayscale dimensions" {
         const pixel_count: usize = @as(usize, w) * @as(usize, h);
         const pixels = canonical_pixels[0..pixel_count];
 
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
         defer allocator.free(root);
@@ -3306,7 +3308,7 @@ test "MxN parity: lossless decode matches for various RGB dimensions" {
         if (pixel_count > canonical_rgb.len) continue;
         const pixels = canonical_rgb[0..pixel_count];
 
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try @import("test_support.zig").tmpDirPath(allocator, &tmp);
         defer allocator.free(root);
@@ -5127,7 +5129,7 @@ fn isoReferenceDirAbsolute(allocator: std.mem.Allocator, root: []const u8) ![]u8
 }
 
 fn isoConformanceDirPresent(conformance_dir: []const u8) bool {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = native_platform.Threaded.global_single_threaded.io();
     var dir = std.Io.Dir.openDirAbsolute(io, conformance_dir, .{}) catch return false;
     dir.close(io);
     return true;

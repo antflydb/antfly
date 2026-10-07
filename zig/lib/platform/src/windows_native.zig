@@ -1,9 +1,23 @@
-//! Win32-backed stand-ins for POSIX declarations that Zig 0.17's std.c leaves
-//! as `void` on Windows. Installed into an experimental zig lib overlay by
-//! make_zig_lib_overlay.py; not part of upstream std.
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-const std = @import("../std.zig");
+//! Windows native primitives for the platform API and its owning I/O backend.
+
+const std = @import("std");
 const c = std.c;
+pub const timespec = extern struct { sec: i64, nsec: i64 };
 
 const BOOL = c_int;
 
@@ -215,14 +229,14 @@ pub const clockid_t = enum(u32) {
     _,
 };
 
-fn setTimespec(tp: *c.timespec, ns: u128) void {
+fn setTimespec(tp: *timespec, ns: u128) void {
     tp.* = .{
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
     };
 }
 
-pub fn clock_gettime(clk_id: clockid_t, tp: *c.timespec) c_int {
+pub fn clock_gettime(clk_id: clockid_t, tp: *timespec) c_int {
     switch (clk_id) {
         .REALTIME => {
             // FILETIME counts 100ns intervals since 1601-01-01.
@@ -244,7 +258,7 @@ pub fn clock_gettime(clk_id: clockid_t, tp: *c.timespec) c_int {
     return 0;
 }
 
-pub fn nanosleep(rqtp: *const c.timespec, rmtp: ?*c.timespec) c_int {
+pub fn nanosleep(rqtp: *const timespec, rmtp: ?*timespec) c_int {
     const ns: u128 = @as(u128, @intCast(@max(rqtp.sec, 0))) * std.time.ns_per_s + @as(u128, @intCast(@max(rqtp.nsec, 0)));
     const ms = (ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
     Sleep(@intCast(@min(ms, std.math.maxInt(u32) - 1)));
@@ -312,8 +326,8 @@ pub fn pthread_cond_wait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_
 }
 
 /// `abstime` is CLOCK_REALTIME, matching POSIX's default condattr.
-pub fn pthread_cond_timedwait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t, noalias abstime: *const c.timespec) c.E {
-    var now: c.timespec = undefined;
+pub fn pthread_cond_timedwait(noalias cond: *pthread_cond_t, noalias mutex: *pthread_mutex_t, noalias abstime: *const timespec) c.E {
+    var now: timespec = undefined;
     _ = clock_gettime(.REALTIME, &now);
     const deadline_ns: i128 = @as(i128, abstime.sec) * std.time.ns_per_s + abstime.nsec;
     const now_ns: i128 = @as(i128, now.sec) * std.time.ns_per_s + now.nsec;

@@ -13,11 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
-const platform_sync = @import("antfly_platform").sync;
-const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
+const platform_sync = native_platform.sync;
+const AtomicU64 = native_platform.atomic.Value(u64);
 const adaptive_mod = @import("adaptive.zig");
 const algebra = @import("algebra.zig");
 const cylinder = @import("cylinder.zig");
@@ -3074,7 +3076,7 @@ pub const Index = struct {
     hll_observation_mutex: std.atomic.Mutex = .unlocked,
     hll_pending_observations: std.StringHashMapUnmanaged(u64) = .empty,
     hll_pending_observation_bytes: usize = 0,
-    hll_dropped_observations: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    hll_dropped_observations: native_platform.atomic.Value(u64) = .init(0),
     // Coalesces dirty notifications into at most one queued/running maintenance
     // job. The persisted dirty/progress keys remain the source of truth.
     hll_maintenance_scheduled: std.atomic.Value(bool) = .init(false),
@@ -3486,7 +3488,7 @@ pub const Index = struct {
     // for std.atomic.Mutex, which has no blocking lock()). Held only around a
     // write transaction, so contention is brief.
     fn lockWrites(self: *Index) void {
-        @import("antfly_platform").sync.lockYielding(&self.write_mutex);
+        native_platform.sync.lockYielding(&self.write_mutex);
     }
 
     fn unlockWrites(self: *Index) void {
@@ -3528,7 +3530,7 @@ pub const Index = struct {
     }
 
     fn lockHllObservations(self: *Index) void {
-        @import("antfly_platform").sync.lockYielding(&self.hll_observation_mutex);
+        native_platform.sync.lockYielding(&self.hll_observation_mutex);
     }
 
     fn hllObservationStatus(self: *const Index) struct { count: usize, bytes: usize } {
@@ -20669,7 +20671,7 @@ test "algebraic storage accounting serializes concurrent generation writes" {
     var spawned: usize = 0;
     errdefer {
         start.store(true, .release);
-        for (threads[0..spawned]) |*thread| thread.await(std.testing.io);
+        for (threads[0..spawned]) |*thread| thread.await(native_platform.testing.io);
     }
     for (&workers, 0..) |*worker, worker_id| {
         worker.* = .{
@@ -20678,11 +20680,11 @@ test "algebraic storage accounting serializes concurrent generation writes" {
             .start = &start,
             .worker_id = worker_id,
         };
-        threads[worker_id] = try std.testing.io.concurrent(Worker.run, .{worker});
+        threads[worker_id] = try native_platform.testing.io.concurrent(Worker.run, .{worker});
         spawned += 1;
     }
     start.store(true, .release);
-    for (&threads) |*thread| thread.await(std.testing.io);
+    for (&threads) |*thread| thread.await(native_platform.testing.io);
     spawned = 0;
     for (workers) |worker| if (worker.failure) |err| return err;
 
@@ -22294,10 +22296,10 @@ test "adaptive HLL registry publication is synchronized with readers" {
             }
         }
     };
-    var reader = try std.testing.io.concurrent(Reader.run, .{ &idx, &stop });
+    var reader = try native_platform.testing.io.concurrent(Reader.run, .{ &idx, &stop });
     defer {
         stop.store(true, .release);
-        reader.await(std.testing.io);
+        reader.await(native_platform.testing.io);
     }
     for (0..max_hll_cardinality_materializations - 1) |i| {
         const name = try std.fmt.allocPrint(alloc, "adaptive-{d}", .{i});
@@ -22571,13 +22573,13 @@ test "algebraic HLL event waits tolerate spurious wakeups without extending the 
             if (self.mode == .canceled and self.waits == 2) return error.Canceled;
             if ((self.mode == .signal and self.waits == 2) or
                 (self.mode == .signal_at_deadline and self.waits == 3))
-                self.event.set(std.testing.io);
+                self.event.set(native_platform.testing.io);
             // Otherwise return a spurious wake while the event remains unset.
         }
     };
     for (std.enums.values(Mode)) |mode| {
         var clock: Clock = .{ .mode = mode };
-        var vtable = std.testing.io.vtable.*;
+        var vtable = native_platform.testing.io.vtable.*;
         vtable.now = Clock.now;
         vtable.futexWait = Clock.wait;
         const io: std.Io = .{ .userdata = &clock, .vtable = &vtable };
@@ -22660,8 +22662,8 @@ test "algebraic HLL cardinality stays correct under a concurrent threaded mainte
         fn maintenanceLocked(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.maintenance_passes += 1;
-            self.locked.set(std.testing.io);
-            self.release.waitUncancelable(std.testing.io);
+            self.locked.set(native_platform.testing.io);
+            self.release.waitUncancelable(native_platform.testing.io);
         }
 
         fn foregroundLock(raw: *anyopaque) void {
@@ -22670,7 +22672,7 @@ test "algebraic HLL cardinality stays correct under a concurrent threaded mainte
             // the background job is parked holding that same lock.
             self.contended = !self.index.write_mutex.tryLock();
             if (!self.contended) self.index.write_mutex.unlock();
-            self.foreground_attempted.set(std.testing.io);
+            self.foreground_attempted.set(native_platform.testing.io);
         }
 
         fn apply(self: *@This()) void {
@@ -22687,21 +22689,21 @@ test "algebraic HLL cardinality stays correct under a concurrent threaded mainte
     // Always release and drain before the hook context or index can disappear,
     // including an assertion error or failure to create the foreground thread.
     defer {
-        race.release.set(std.testing.io);
+        race.release.set(native_platform.testing.io);
         runtime.durable_jobs.drainOwner(idx.hll_maintenance_owner_id);
         idx.test_hll_hooks = null;
     }
     idx.resumeHllMaintenance(&store);
-    try waitForHllTestEvent(&race.locked, std.testing.io, .{ .raw = .fromSeconds(10), .clock = .awake });
+    try waitForHllTestEvent(&race.locked, native_platform.testing.io, .{ .raw = .fromSeconds(10), .clock = .awake });
     const foreground = try std.Thread.spawn(.{}, Race.apply, .{&race});
     var joined = false;
     defer if (!joined) {
-        race.release.set(std.testing.io);
+        race.release.set(native_platform.testing.io);
         foreground.join();
     };
-    try waitForHllTestEvent(&race.foreground_attempted, std.testing.io, .{ .raw = .fromSeconds(10), .clock = .awake });
+    try waitForHllTestEvent(&race.foreground_attempted, native_platform.testing.io, .{ .raw = .fromSeconds(10), .clock = .awake });
     try std.testing.expect(race.contended);
-    race.release.set(std.testing.io);
+    race.release.set(native_platform.testing.io);
     foreground.join();
     joined = true;
     if (race.failure) |err| return err;

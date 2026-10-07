@@ -42,8 +42,8 @@ const internal_keys = @import("../internal_keys.zig");
 const mapper = @import("document_mapper.zig");
 const merge_state_mod = @import("merge_state.zig");
 const platform = @import("antfly_platform");
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
+const platform_clock = platform.clock;
+const platform_time = platform.time;
 const range_cardinality = @import("range_cardinality.zig");
 const range_state_mod = @import("range_state.zig");
 const relational_index_catalog = @import("relational_index_catalog.zig");
@@ -60,6 +60,7 @@ const row_policy_authority_mod = @import("../../usermgr/row_policy_authority.zig
 const row_policy_bundle_mod = @import("row_policy_bundle.zig");
 const runtime_failure_abi = @import("runtime_failure_abi");
 const schema_registry_mod = @import("schema_registry.zig");
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const table_catalog_mod = @import("table_catalog.zig");
 const transactions_mod = @import("../transactions.zig");
@@ -786,7 +787,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (builtin.is_test) {
                 if (D.test_portable_runtime_batch_prelock_hook.*) |hook| {
                     hook.entered.store(true, .release);
-                    while (!hook.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+                    while (!hook.release.load(.acquire)) platform.time.yieldNow();
                 }
             }
 
@@ -3154,7 +3155,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             while (self.async_context.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
             if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
                 !self.local_execution.row_policy_replication_outbox_pending.load(.acquire)) return;
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
+            const io = self.backend_runtime.io() orelse native_platform.debug_io;
             self.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
             defer self.local_execution.durable_replication_flush_mutex.unlock(io);
             if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
@@ -3256,7 +3257,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         pub fn flushDurableReplicationOutboxes(self: anytype) !void {
             if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
             if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) return;
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
+            const io = self.backend_runtime.io() orelse native_platform.debug_io;
             self.local_execution.durable_replication_flush_mutex.lockUncancelable(io);
             defer self.local_execution.durable_replication_flush_mutex.unlock(io);
             try self.flushDurableReplicationOutboxesLocked();
@@ -4081,7 +4082,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
         pub fn applyCommittedBatchToShadowOrdered(self: anytype, batch: derived_types.DerivedBatch, ticket: u64) void {
             const shadow = activeSplitShadow(self) orelse return;
-            const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
+            const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse native_platform.debug_io;
             shadow.apply_mutex.lockUncancelable(io);
             while (shadow.applied_ticket != ticket) {
                 shadow.apply_advanced.waitUncancelable(io, &shadow.apply_mutex);
@@ -4516,7 +4517,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     continue;
                 }
                 if (attempts < 128) {
-                    @import("antfly_platform").time.yieldNow();
+                    platform.time.yieldNow();
                     continue;
                 }
                 const backoff_step = @min(attempts - 128, 5);
@@ -4567,7 +4568,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     continue;
                 }
                 if (attempts < 128) {
-                    @import("antfly_platform").time.yieldNow();
+                    platform.time.yieldNow();
                     yield_loops += 1;
                     continue;
                 }
@@ -4790,11 +4791,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return;
             }
 
-            var req = std.posix.timespec{
+            var req = platform.c.timespec{
                 .sec = @intCast(duration_ns / std.time.ns_per_s),
                 .nsec = @intCast(duration_ns % std.time.ns_per_s),
             };
-            while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+            while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
                 .SUCCESS => return,
                 .INTR => continue,
                 else => return,

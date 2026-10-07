@@ -13,6 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const extension_domain = @import("mod.zig");
@@ -421,7 +422,7 @@ pub fn installOnService(
     extension_name: []const u8,
     request: extension_domain.InstallExtensionRequest,
 ) !extension_domain.InstalledExtension {
-    return installOnServiceWithIo(service, alloc, std.Options.debug_io, extension_name, request);
+    return installOnServiceWithIo(service, alloc, native_platform.debug_io, extension_name, request);
 }
 
 pub fn installOnServiceWithIo(

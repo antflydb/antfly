@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const schema_mod = @import("../schema.zig");
 const schema_api = @import("../../schema/mod.zig");
@@ -168,10 +170,10 @@ pub const Registry = struct {
     /// suspending the current std.Io task. Replacement flips banks, then waits
     /// only for the old load-and-retain windows; returned SchemaViews own epoch
     /// references and never delay publication or reclamation admission.
-    acquisition_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    acquisition_generation: native_platform.atomic.Value(u64) = .init(0),
     acquisition_readers: [acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe =
         @as([acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe, @splat(@as([acquisition_stripe_count]AcquisitionStripe, @splat(.{})))),
-    namespace_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    namespace_generation: native_platform.atomic.Value(u64) = .init(0),
     pending_publications: usize = 0,
     historical_clock: u64 = 0,
     historical_admission: Admission = .{},
@@ -582,7 +584,7 @@ fn acquisitionStripeIndex() usize {
 
 test "schema views keep retired epochs alive" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
+    var registry = try Registry.initCloned(alloc, native_platform.testing.io, .{ .version = 1 });
     defer registry.deinit();
 
     var old = registry.acquire().?;
@@ -599,7 +601,7 @@ test "schema views keep retired epochs alive" {
 
 test "same-version publication preserves immutable epoch identity" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 4 });
+    var registry = try Registry.initCloned(alloc, native_platform.testing.io, .{ .version = 4 });
     defer registry.deinit();
 
     var pinned = registry.acquire().?;
@@ -619,7 +621,7 @@ test "same-version publication preserves immutable epoch identity" {
 
 test "historical schema cache survives a cyclic over-capacity working set" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1000 });
+    var registry = try Registry.initCloned(alloc, native_platform.testing.io, .{ .version = 1000 });
     defer registry.deinit();
     var faults: usize = 0;
     for (0..3300) |index| {
@@ -636,18 +638,18 @@ test "historical schema cache survives a cyclic over-capacity working set" {
 }
 
 test "historical schema fault lanes coalesce same versions independently" {
-    var registry = try Registry.initCloned(std.testing.allocator, std.testing.io, null);
+    var registry = try Registry.initCloned(std.testing.allocator, native_platform.testing.io, null);
     defer registry.deinit();
     registry.lockHistoricalFault(1);
     defer registry.unlockHistoricalFault(1);
     try std.testing.expect(!registry.historical_fault_mutexes[1].tryLock());
     try std.testing.expect(registry.historical_fault_mutexes[2].tryLock());
-    registry.historical_fault_mutexes[2].unlock(std.testing.io);
+    registry.historical_fault_mutexes[2].unlock(native_platform.testing.io);
 }
 
 test "historical epoch residency is bounded while pinned views remain valid" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
+    var registry = try Registry.initCloned(alloc, native_platform.testing.io, .{ .version = 1 });
     defer registry.deinit();
 
     var pinned = registry.acquire().?;
@@ -669,7 +671,7 @@ test "historical epoch residency is bounded while pinned views remain valid" {
 
 test "historical epoch residency remains bounded when every installed epoch is pinned" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
+    var registry = try Registry.initCloned(alloc, native_platform.testing.io, .{ .version = 1 });
     defer registry.deinit();
 
     const pinned_count = max_resident_historical_epochs + 20;
@@ -695,7 +697,7 @@ test "historical epoch residency remains bounded when every installed epoch is p
 test "whole generation replacement does not wait for pinned views" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var registry = try Registry.initCloned(std.testing.allocator, io, .{ .version = 1 });
@@ -731,7 +733,7 @@ test "whole generation replacement does not wait for pinned views" {
 
 test "concurrent publication reservations preserve capacity and generation fences" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 1 });
+    var registry = try Registry.initCloned(alloc, native_platform.testing.io, .{ .version = 1 });
     defer registry.deinit();
 
     var first = try registry.preparePublish(2);
@@ -752,7 +754,7 @@ test "concurrent publication reservations preserve capacity and generation fence
 
 test "whole generation replacement isolates reused schema versions" {
     const alloc = std.testing.allocator;
-    var registry = try Registry.initCloned(alloc, std.testing.io, .{ .version = 7 });
+    var registry = try Registry.initCloned(alloc, native_platform.testing.io, .{ .version = 7 });
     defer registry.deinit();
 
     var old = registry.acquire().?;
@@ -779,7 +781,7 @@ test "banked acquisition remains safe across repeated concurrent replacement" {
 
     const alloc = std.testing.allocator;
     const reader_count = 8;
-    var io_impl = std.Io.Threaded.init(alloc, .{
+    var io_impl = native_platform.Threaded.init(alloc, .{
         .concurrent_limit = .limited(reader_count),
     });
     defer io_impl.deinit();

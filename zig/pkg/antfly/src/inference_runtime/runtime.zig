@@ -1424,10 +1424,10 @@ test "inference run config CLI kernel_jit and keep_alive_ms flags override confi
             [_][*:0]const u8{ "--kernel-jit-mode", "required", "--config", "/nonexistent-config.json" }
         else
             [_][*:0]const u8{ "--config", "/nonexistent-config.json", "--kernel-jit-mode", "required" };
-        var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+        var iter = platform.process.argsIterator(argv[0..]);
         // Reaching the (expected) file-read failure, rather than
         // error.InvalidArguments, proves both flags were accepted.
-        try std.testing.expectError(error.FileNotFound, runServer(std.heap.page_allocator, std.testing.io, &iter));
+        try std.testing.expectError(error.FileNotFound, runServer(std.heap.page_allocator, platform.testing.io, &iter));
     }
 }
 
@@ -1479,26 +1479,26 @@ test "inference runtime preserves effective process envelope provenance" {
 
 test "inference run detects trailing help without consuming arguments" {
     var argv = [_][*:0]const u8{ "--host", "127.0.0.1", "--help" };
-    var args = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var args = platform.process.argsIterator(argv[0..]);
     try std.testing.expect(runHelpRequested(&args));
     try std.testing.expectEqualStrings("--host", args.next().?);
 
     var no_help_argv = [_][*:0]const u8{ "--host", "127.0.0.1" };
-    var no_help_args = @import("antfly_platform").process.argsIterator(no_help_argv[0..]);
+    var no_help_args = platform.process.argsIterator(no_help_argv[0..]);
     try std.testing.expect(!runHelpRequested(&no_help_args));
 }
 
 test "inference list accepts models directory before or after flags" {
     var flag_argv = [_][*:0]const u8{ "--models-dir", "/tmp/models" };
-    var flag_args = @import("antfly_platform").process.argsIterator(flag_argv[0..]);
+    var flag_args = platform.process.argsIterator(flag_argv[0..]);
     try std.testing.expectEqualStrings("/tmp/models", (try parseListModelsDir(&flag_args)).?);
 
     var positional_argv = [_][*:0]const u8{"/tmp/positional-models"};
-    var positional_args = @import("antfly_platform").process.argsIterator(positional_argv[0..]);
+    var positional_args = platform.process.argsIterator(positional_argv[0..]);
     try std.testing.expectEqualStrings("/tmp/positional-models", (try parseListModelsDir(&positional_args)).?);
 
     var invalid_argv = [_][*:0]const u8{ "--unknown", "/tmp/models" };
-    var invalid_args = @import("antfly_platform").process.argsIterator(invalid_argv[0..]);
+    var invalid_args = platform.process.argsIterator(invalid_argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseListModelsDir(&invalid_args));
 }
 
@@ -1586,10 +1586,10 @@ test "kernel JIT mode precedence is CLI then environment then config then defaul
 
 test "inference run rejects unknown flags instead of silently disabling policy" {
     var argv = [_][*:0]const u8{ "--kernel-jti-mode", "required" };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     try std.testing.expectError(
         error.InvalidArguments,
-        runServer(std.heap.page_allocator, std.testing.io, &iter),
+        runServer(std.heap.page_allocator, platform.testing.io, &iter),
     );
 }
 

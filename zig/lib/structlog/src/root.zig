@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const Field = @import("fields.zig").Field;
@@ -93,8 +94,8 @@ pub fn logFn(
 }
 
 fn writeTimestamp(writer: *std.Io.Writer) !void {
-    var ts: std.posix.timespec = undefined;
-    const epoch_secs: i64 = switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+    var ts: native_platform.c.timespec = undefined;
+    const epoch_secs: i64 = switch (std.posix.errno(native_platform.c.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => ts.sec,
         else => 0,
     };
@@ -196,8 +197,8 @@ pub const Logger = struct {
         const extra_info = @typeInfo(ExtraType);
         switch (extra_info) {
             .@"struct" => |s| {
-                inline for (s.fields) |f| {
-                    const field = structFieldToLogField(f.name, @field(extra_fields, f.name));
+                inline for (s.field_names) |field_name| {
+                    const field = structFieldToLogField(field_name, @field(extra_fields, field_name));
                     try writer.writeAll(",\"");
                     try writer.writeAll(field.key);
                     try writer.writeAll("\":");
@@ -248,8 +249,8 @@ pub const Logger = struct {
         const extra_info = @typeInfo(ExtraType);
         switch (extra_info) {
             .@"struct" => |s| {
-                inline for (s.fields) |f| {
-                    const field = structFieldToLogField(f.name, @field(extra_fields, f.name));
+                inline for (s.field_names) |field_name| {
+                    const field = structFieldToLogField(field_name, @field(extra_fields, field_name));
                     try writer.writeByte(' ');
                     try writer.writeAll(field.key);
                     try writer.writeByte('=');

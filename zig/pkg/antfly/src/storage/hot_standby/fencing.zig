@@ -22,7 +22,9 @@
 //! that receipt. Later Kubernetes Lease or cloud-control-plane integrations can
 //! wrap this same durable receipt format.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Crc32 = @import("antfly_hash").Crc32;
 const replication_record = @import("antfly_local_sources").storage_db_replication_record;
@@ -570,7 +572,7 @@ fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
         .{ std.testing.random_seed, nonce },
     );
     defer alloc.free(raw);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
     return try alloc.dupeSentinel(u8, raw, 0);
@@ -609,7 +611,7 @@ fn standbyPaths(alloc: Allocator, comptime name: []const u8) !StandbyPaths {
     );
     defer alloc.free(fence_raw);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), receive_raw) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), progress_raw) catch {};

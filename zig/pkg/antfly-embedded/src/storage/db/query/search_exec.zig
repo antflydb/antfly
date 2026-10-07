@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
@@ -45,7 +46,7 @@ const mapper_mod = @import("../document_mapper.zig");
 const schema_api = @import("../../../schema/mod.zig");
 const persistent_mod = @import("../../persistent.zig");
 const hbc_mod = @import("../../hbc_adapter.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const platform = @import("antfly_platform");
 const AtomicU64 = platform.atomic.Value(u64);
 const vectorindex_mod = @import("antfly_vectorindex");
@@ -86,10 +87,10 @@ const default_distributed_sort_shard_window_budget: u32 = 100_000;
 const default_sorted_segment_scan_budget: u64 = 100_000;
 const sorted_segment_deadline_check_interval: u64 = 1024;
 const default_match_all_primary_key_scan_batch_size: usize = 4096;
-var bench_query_profile_counter: @import("antfly_platform").atomic.Value(u64) = .init(0);
+var bench_query_profile_counter: platform.atomic.Value(u64) = .init(0);
 const bench_query_profile_unknown = std.math.maxInt(u64);
 const bench_query_profile_disabled = std.math.maxInt(u64) - 1;
-var bench_query_profile_every_cache: @import("antfly_platform").atomic.Value(u64) = .init(bench_query_profile_unknown);
+var bench_query_profile_every_cache: platform.atomic.Value(u64) = .init(bench_query_profile_unknown);
 
 pub const SortRejectionDiagnostic = runtime_preflight.SortRejectionDiagnostic;
 pub const resetLastSortRejectionDiagnostic = runtime_preflight.resetLastSortRejectionDiagnostic;
@@ -12568,7 +12569,7 @@ pub fn executeBackgroundQuery(
 
 test "text stats use postings when segment source is omitted" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/background-postings", .{tmp.sub_path});
     defer alloc.free(path);
@@ -12605,7 +12606,7 @@ test "text stats use postings when segment source is omitted" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -14045,7 +14046,7 @@ test "raw multi-source member search avoids fixed-factor reranking" {
     const alloc = std.testing.allocator;
     const active_count: usize = 512;
     const requested: usize = 10;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/multi-source-member-window", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14346,7 +14347,7 @@ inline fn checkVectorSearchCancelled(req: vectorindex_mod.SearchRequest) !void {
 
 test "built-in exact dense scorer filters metadata before vector reads" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/builtin-exact-prefix", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14424,7 +14425,7 @@ test "one percent filtered route preserves exact recall with candidate-linear IO
     const dims: usize = 8;
     const result_count: usize = 10;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/selective-exact-recall", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14537,7 +14538,7 @@ test "one percent native filter routes through integrated dense search exactly" 
     const dims: usize = 2;
     const result_count: usize = 10;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrated-selective-exact", .{tmp.sub_path});
     defer alloc.free(path);
@@ -21132,7 +21133,7 @@ test "native match_all ordinal map allows all-deleted covered snapshots" {
 test "match_all native doc values sort streams candidates without exact candidate cap" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-sort-stream", .{tmp.sub_path});
     defer alloc.free(path);
@@ -21182,7 +21183,7 @@ test "match_all native doc values sort streams candidates without exact candidat
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -21320,7 +21321,7 @@ test "match_all native doc values sort streams candidates without exact candidat
 test "match_all native doc values sort consumes selective ordinal candidates directly" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-sort-ordinal-candidates", .{tmp.sub_path});
     defer alloc.free(path);
@@ -21370,7 +21371,7 @@ test "match_all native doc values sort consumes selective ordinal candidates dir
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24542,7 +24543,7 @@ fn testSortedPriceSchema() runtime_schema_mod.TableSchema {
 test "match_all sorted segment seek merges sorted segments and applies cursors" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-seek", .{tmp.sub_path});
     defer alloc.free(path);
@@ -24571,7 +24572,7 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -24858,7 +24859,7 @@ test "match_all sorted segment seek merges sorted segments and applies cursors" 
 test "match_all sorted segment seek honors deleted old sort values after upsert" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-upsert-live-docs", .{tmp.sub_path});
     defer alloc.free(path);
@@ -24889,7 +24890,7 @@ test "match_all sorted segment seek honors deleted old sort values after upsert"
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25009,7 +25010,7 @@ test "match_all sorted segment seek honors deleted old sort values after upsert"
 test "match_all index sort uses doc values collector for selective native filters" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-selective-filter-plan", .{tmp.sub_path});
     defer alloc.free(path);
@@ -25045,7 +25046,7 @@ test "match_all index sort uses doc values collector for selective native filter
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25205,7 +25206,7 @@ test "match_all index sort uses doc values collector for selective native filter
 test "text field sort uses exact native doc values filter path without index sort" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-native-doc-values-filter-sort", .{tmp.sub_path});
     defer alloc.free(path);
@@ -25253,7 +25254,7 @@ test "text field sort uses exact native doc values filter path without index sor
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25497,7 +25498,7 @@ test "text field sort uses exact native doc values filter path without index sor
 test "text score query exposes score top k sort profile" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-score-top-k-profile", .{tmp.sub_path});
     defer alloc.free(path);
@@ -25533,7 +25534,7 @@ test "text score query exposes score top k sort profile" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25673,7 +25674,7 @@ test "text score query exposes score top k sort profile" {
 test "text query drops hits with missing stored documents and lowers total_hits" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-missing-stored-drop", .{tmp.sub_path});
     defer alloc.free(path);
@@ -25712,7 +25713,7 @@ test "text query drops hits with missing stored documents and lowers total_hits"
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25808,7 +25809,7 @@ test "text query drops hits with missing stored documents and lowers total_hits"
 test "text ordered query rejects unresolved stored pattern filters" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-ordered-unresolved-filter", .{tmp.sub_path});
     defer alloc.free(path);
@@ -25837,7 +25838,7 @@ test "text ordered query rejects unresolved stored pattern filters" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -25947,7 +25948,7 @@ test "text ordered query rejects unresolved stored pattern filters" {
 test "text field sort uses sorted segment membership path when index sort matches" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-sorted-segment-membership", .{tmp.sub_path});
     defer alloc.free(path);
@@ -26001,7 +26002,7 @@ test "text field sort uses sorted segment membership path when index sort matche
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -26212,7 +26213,7 @@ test "text field sort uses sorted segment membership path when index sort matche
 test "text index sort uses doc values collector for selective term filters" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-selective-index-sort-doc-values", .{tmp.sub_path});
     defer alloc.free(path);
@@ -26268,7 +26269,7 @@ test "text index sort uses doc values collector for selective term filters" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -26425,7 +26426,7 @@ test "text index sort uses doc values collector for selective term filters" {
 test "match_all sorted segment seek uses cursor seek within each segment" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-cursor-seek", .{tmp.sub_path});
     defer alloc.free(path);
@@ -26458,7 +26459,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -26608,7 +26609,7 @@ test "match_all sorted segment seek uses cursor seek within each segment" {
 test "match_all sorted segment seek enforces scan budget" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-scan-budget", .{tmp.sub_path});
     defer alloc.free(path);
@@ -26641,7 +26642,7 @@ test "match_all sorted segment seek enforces scan budget" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -26705,7 +26706,7 @@ test "match_all sorted segment seek enforces scan budget" {
 test "match_all sorted segment seek checks deadline while scanning" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-scan-deadline", .{tmp.sub_path});
     defer alloc.free(path);
@@ -26728,7 +26729,7 @@ test "match_all sorted segment seek checks deadline while scanning" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -26804,7 +26805,7 @@ test "match_all sorted segment seek checks deadline while scanning" {
 test "match_all sorted segment seek zero limit returns profile without scanning" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-zero-limit", .{tmp.sub_path});
     defer alloc.free(path);
@@ -26826,7 +26827,7 @@ test "match_all sorted segment seek zero limit returns profile without scanning"
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -26887,7 +26888,7 @@ test "match_all sorted segment seek zero limit returns profile without scanning"
 test "match_all sorted segment seek rejects cursor when segment bounds are unavailable" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sorted-segment-invalid-bounds-fallback", .{tmp.sub_path});
     defer alloc.free(path);
@@ -26942,7 +26943,7 @@ test "match_all sorted segment seek rejects cursor when segment bounds are unava
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -27001,7 +27002,7 @@ test "match_all sorted segment seek rejects cursor when segment bounds are unava
 test "match_all native ordinal doc values path enforces exact candidate budget" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-native-doc-values-budget", .{tmp.sub_path});
     defer alloc.free(path);
@@ -27027,7 +27028,7 @@ test "match_all native ordinal doc values path enforces exact candidate budget" 
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -27094,7 +27095,7 @@ test "match_all native ordinal doc values path enforces exact candidate budget" 
 test "text doc values sort zero limit avoids budget and decoration" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-doc-values-zero-limit", .{tmp.sub_path});
     defer alloc.free(path);
@@ -27120,7 +27121,7 @@ test "text doc values sort zero limit avoids budget and decoration" {
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -27244,7 +27245,7 @@ test "text doc values sort zero limit avoids budget and decoration" {
 test "match_all native ordinal doc values zero limit avoids budget and decoration" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-ordinal-doc-values-zero-limit", .{tmp.sub_path});
     defer alloc.free(path);
@@ -27270,7 +27271,7 @@ test "match_all native ordinal doc values zero limit avoids budget and decoratio
 
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,
@@ -28486,7 +28487,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
                 defer self.alloc.free(key);
                 if (i == 1023) {
                     self.reached_checkpoint.store(true, .release);
-                    while (!self.release_checkpoint.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                    while (!self.release_checkpoint.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
                 if (try callback(scan_ctx, key, "{}") == .stop) return;
             }
@@ -28520,14 +28521,14 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
     var harness = Harness{ .alloc = std.heap.page_allocator };
     var cancellation = std.atomic.Value(bool).init(false);
     var worker = Worker{ .harness = &harness, .cancellation = &cancellation };
-    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var thread = try platform.testing.io.concurrent(Worker.run, .{&worker});
     var joined = false;
     defer if (!joined) {
         harness.release_checkpoint.store(true, .release);
-        thread.await(std.testing.io);
+        thread.await(platform.testing.io);
     };
 
-    var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    var wait_io = platform.Threaded.init(std.testing.allocator, .{});
     defer wait_io.deinit();
     for (0..2_000) |_| {
         if (harness.reached_checkpoint.load(.acquire)) break;
@@ -28536,7 +28537,7 @@ test "match_all primary scan aborts promptly when cancellation arrives mid-fligh
     try std.testing.expect(harness.reached_checkpoint.load(.acquire));
     cancellation.store(true, .release);
     harness.release_checkpoint.store(true, .release);
-    thread.await(std.testing.io);
+    thread.await(platform.testing.io);
     joined = true;
     try std.testing.expect(worker.observed_cancel.load(.acquire));
 }
@@ -29247,7 +29248,7 @@ test "match_all id-only sort without stream reports bounded candidate collector"
 test "match_all native doc values without stream reports bounded exact collector" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/match-all-native-no-stream", .{tmp.sub_path});
     defer alloc.free(path);
@@ -29283,7 +29284,7 @@ test "match_all native doc values without stream reports bounded exact collector
     const schema = runtime_schema_mod.TableSchema{ .dynamic_templates = &templates };
     var apply_mutex = std.atomic.Mutex.unlocked;
     var text_entry = index_manager_mod.IndexManager.TextIndex{
-        .io = std.Options.debug_io,
+        .io = native_platform.debug_io,
         .apply_mutex = &apply_mutex,
         .config = .{ .name = "ft", .kind = .full_text, .config_json = "{}" },
         .chunk_name = null,

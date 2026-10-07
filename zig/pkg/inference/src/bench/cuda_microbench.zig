@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const build_options = @import("build_options");
 
 const cuda_buffer = if (build_options.enable_cuda) @import("../ops/cuda/buffer.zig") else struct {};
@@ -4527,7 +4529,7 @@ test "cuda microbench promotion evidence requires manifest ptx path" {
 }
 
 test "cuda microbench writes quant compiler evidence json" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const evidence_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "evidence", "q4.json" });
@@ -4535,7 +4537,7 @@ test "cuda microbench writes quant compiler evidence json" {
 
     try writeQuantCompilerEvidence(
         std.testing.allocator,
-        std.testing.io,
+        native_platform.testing.io,
         evidence_path,
         quant_kernel_compiler.first_lazy_benchmark,
         quant_compiler_lazy_shape,
@@ -4550,10 +4552,10 @@ test "cuda microbench writes quant compiler evidence json" {
         0.001,
     );
 
-    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, evidence_path, std.testing.allocator, .limited(4096));
+    const actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, evidence_path, std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(actual);
     try checkQuantCompilerEvidenceJson(std.testing.allocator, actual, false);
-    try checkQuantCompilerEvidenceFile(std.testing.allocator, std.testing.io, evidence_path, false);
+    try checkQuantCompilerEvidenceFile(std.testing.allocator, native_platform.testing.io, evidence_path, false);
     try std.testing.expectError(error.QuantCompilerEvidencePromotionNotReady, checkQuantCompilerEvidenceJson(std.testing.allocator, actual, true));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"schema\":\"antfly.quant_kernel_benchmark_evidence.v1\""));
     try std.testing.expect(std.mem.containsAtLeast(u8, actual, 1, "\"generated_source_fingerprint\":"));
@@ -4576,8 +4578,8 @@ test "cuda microbench writes quant compiler evidence json" {
 
     const copied_evidence_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "evidence", "q4_copied.json" });
     defer std.testing.allocator.free(copied_evidence_path);
-    try writeFileCreatingParent(std.testing.io, copied_evidence_path, actual);
-    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceFile(std.testing.allocator, std.testing.io, copied_evidence_path, false));
+    try writeFileCreatingParent(native_platform.testing.io, copied_evidence_path, actual);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceFile(std.testing.allocator, native_platform.testing.io, copied_evidence_path, false));
 
     const wrong_speedup = try replaceOnce(std.testing.allocator, actual, "\"measured_speedup\":1.250000", "\"measured_speedup\":1.100000");
     defer std.testing.allocator.free(wrong_speedup);
@@ -4596,14 +4598,14 @@ test "cuda microbench writes quant compiler evidence json" {
     try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceJson(std.testing.allocator, loose_tolerance, false));
     const bad_evidence_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "evidence", "q4_bad.json" });
     defer std.testing.allocator.free(bad_evidence_path);
-    try writeFileCreatingParent(std.testing.io, bad_evidence_path, wrong_speedup);
-    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceFile(std.testing.allocator, std.testing.io, bad_evidence_path, false));
+    try writeFileCreatingParent(native_platform.testing.io, bad_evidence_path, wrong_speedup);
+    try std.testing.expectError(error.InvalidQuantCompilerEvidence, checkQuantCompilerEvidenceFile(std.testing.allocator, native_platform.testing.io, bad_evidence_path, false));
 
     const slow_evidence_path = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "evidence", "q4_slow.json" });
     defer std.testing.allocator.free(slow_evidence_path);
     try writeQuantCompilerEvidence(
         std.testing.allocator,
-        std.testing.io,
+        native_platform.testing.io,
         slow_evidence_path,
         quant_kernel_compiler.first_lazy_benchmark,
         quant_compiler_lazy_shape,
@@ -4617,7 +4619,7 @@ test "cuda microbench writes quant compiler evidence json" {
         0.001,
         0.001,
     );
-    const slow_actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, slow_evidence_path, std.testing.allocator, .limited(4096));
+    const slow_actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, slow_evidence_path, std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(slow_actual);
     try checkQuantCompilerEvidenceJson(std.testing.allocator, slow_actual, false);
     try std.testing.expect(std.mem.containsAtLeast(u8, slow_actual, 1, "\"benchmark_passed\":false"));
@@ -4644,14 +4646,14 @@ fn replaceOnce(allocator: std.mem.Allocator, input: []const u8, needle: []const 
 test "cuda microbench evidence writer creates absolute parent directories" {
     const root = try std.fmt.allocPrint(std.testing.allocator, "/tmp/antfly_quant_evidence_test_{d}", .{std.posix.system.getpid()});
     defer std.testing.allocator.free(root);
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    std.Io.Dir.cwd().deleteTree(native_platform.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(native_platform.testing.io, root) catch {};
 
     const evidence_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/q4.json", .{root});
     defer std.testing.allocator.free(evidence_path);
 
-    try writeFileCreatingParent(std.testing.io, evidence_path, "evidence");
-    const actual = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, evidence_path, std.testing.allocator, .limited(64));
+    try writeFileCreatingParent(native_platform.testing.io, evidence_path, "evidence");
+    const actual = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, evidence_path, std.testing.allocator, .limited(64));
     defer std.testing.allocator.free(actual);
     try std.testing.expectEqualStrings("evidence", actual);
 }
@@ -5695,8 +5697,8 @@ fn runFullTextEmbedBench(allocator: std.mem.Allocator, io: std.Io, cfg: Config, 
 }
 
 fn nowNs() u64 {
-    var timespec: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec))) {
+    var timespec: native_platform.c.timespec = undefined;
+    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &timespec))) {
         .SUCCESS => return @intCast(@as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec),
         else => return 0,
     }

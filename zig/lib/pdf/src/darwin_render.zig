@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const image = @import("antfly_image");
 const render = @import("render.zig");
 
@@ -81,7 +83,7 @@ pub const SharedSession = struct {
     pub fn init(pdf_bytes: []const u8) @This() {
         return .{
             .pdf_bytes = pdf_bytes,
-            .sync_io = std.Io.Threaded.global_single_threaded.io(),
+            .sync_io = native_platform.Threaded.global_single_threaded.io(),
         };
     }
 

@@ -148,21 +148,21 @@ test "embedding trace bounds private inputs and records actual padding" {
     const large = try std.testing.allocator.alloc(u8, max_input_bytes + 1);
     defer std.testing.allocator.free(large);
     try std.testing.expect(!captureFits(&.{large}, null));
-    var trace = Trace{ .allocator = std.testing.allocator, .io = std.testing.io, .directory = "", .id = 0, .started_ns = 0, .path = "test", .model = "test", .inputs = &.{}, .task_type = "RETRIEVAL_DOCUMENT", .instruction = null };
+    var trace = Trace{ .allocator = std.testing.allocator, .io = platform.testing.io, .directory = "", .id = 0, .started_ns = 0, .path = "test", .model = "test", .inputs = &.{}, .task_type = "RETRIEVAL_DOCUMENT", .instruction = null };
     trace.shape(&.{ 20, 100 }, 2, 100);
     try std.testing.expectEqual(@as(usize, 120), trace.shapes[0].active_tokens);
     try std.testing.expectEqual(@as(usize, 200), trace.shapes[0].padded_tokens);
 }
 
 test "embedding trace writes replayable private JSON without overwriting" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    var trace = Trace{ .allocator = std.testing.allocator, .io = std.testing.io, .directory = path_buffer[0..path_len], .id = 2, .started_ns = 1, .path = "managed_direct", .model = "test", .inputs = &.{"quotes \" and newline\n한국"}, .task_type = "RETRIEVAL_DOCUMENT", .instruction = null };
+    const path_len = try tmp.dir.realPath(platform.testing.io, &path_buffer);
+    var trace = Trace{ .allocator = std.testing.allocator, .io = platform.testing.io, .directory = path_buffer[0..path_len], .id = 2, .started_ns = 1, .path = "managed_direct", .model = "test", .inputs = &.{"quotes \" and newline\n한국"}, .task_type = "RETRIEVAL_DOCUMENT", .instruction = null };
     try trace.write(&.{&.{ 0.5, 0.5 }});
     try std.testing.expectError(error.PathAlreadyExists, trace.write(null));
-    const data = try tmp.dir.readFileAlloc(std.testing.io, "embed-1-2.json", std.testing.allocator, .limited(4096));
+    const data = try tmp.dir.readFileAlloc(platform.testing.io, "embed-1-2.json", std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(data);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, data, .{});
     defer parsed.deinit();

@@ -35,14 +35,14 @@ const short_timeout_ms = 5_000;
 const request_timeout_ms = 180_000;
 
 /// Stable addresses for Server, its ListenerTask, executors and allocator.
-/// Node and its watchdog borrow std.testing.io, whose lifetime extends beyond
+/// Node and its watchdog borrow platform.testing.io, whose lifetime extends beyond
 /// this transport owner. Per-request controls borrow server_io only until the
 /// listener joins. Model weights and request scratch retain Node admission.
 pub const Loopback = struct {
     allocator: Allocator,
     budget: BoundedAllocator,
-    server_io: Io.Threaded,
-    client_io: Io.Threaded,
+    server_io: platform.Threaded,
+    client_io: platform.Threaded,
     server: httpx.Server,
     client: httpx.Client,
     listener: httpx.Server.ListenerTask,
@@ -58,9 +58,9 @@ pub const Loopback = struct {
         self.allocator = a;
         self.budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
         const transport_allocator = self.budget.allocator();
-        self.server_io = Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
+        self.server_io = platform.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
         errdefer self.server_io.deinit();
-        self.client_io = Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
+        self.client_io = platform.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
         errdefer self.client_io.deinit();
         self.server = httpx.Server.initWithConfig(transport_allocator, self.server_io.io(), .{
             .host = "127.0.0.1",
@@ -123,7 +123,7 @@ pub const Loopback = struct {
         while (!self.server.listen_started.load(.acquire)) {
             if (self.listener.runtimeFailure()) |err| return err;
             if (clock() >= until) return error.LoopbackStartTimeout;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
 
@@ -150,7 +150,7 @@ pub const Loopback = struct {
                 self.server.httpRuntimeStats().active_h1_cancellation_observers == 0) break;
             if (self.listener.runtimeFailure()) |err| return err;
             if (clock() >= until) return error.LoopbackDrainTimeout;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
         try std.testing.expectEqual(@as(usize, 0), self.server.runtimeStats().body_buffer_in_use_bytes);
     }
@@ -282,7 +282,7 @@ const CancellationBarrier = struct {
         const until = clock() + short_timeout_ms * std.time.ns_per_ms;
         while (self.entered.load(.acquire) != count) {
             if (clock() >= until) return error.CancellationBarrierStartTimeout;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
 };
@@ -290,18 +290,18 @@ const CancellationBarrier = struct {
 test "gliner boundary socket transport gate disconnect retry metrics and shutdown without model" {
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var temporary = std.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const parent = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const parent = try temporary.dir.realPathFileAlloc(platform.testing.io, ".", a);
     defer a.free(parent);
     const config = try fixtures.fixtureBytes(a, "models/small/config.json");
     defer a.free(config);
     const encoder = try fixtures.fixtureBytes(a, "models/small/encoder_config.json");
     defer a.free(encoder);
-    try temporary.dir.createDirPath(std.testing.io, "socket-gate/encoder_config");
-    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "socket-gate/config.json", .data = config });
-    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "socket-gate/encoder_config/config.json", .data = encoder });
-    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "socket-gate/model.safetensors", .data = "never loaded" });
+    try temporary.dir.createDirPath(platform.testing.io, "socket-gate/encoder_config");
+    try temporary.dir.writeFile(platform.testing.io, .{ .sub_path = "socket-gate/config.json", .data = config });
+    try temporary.dir.writeFile(platform.testing.io, .{ .sub_path = "socket-gate/encoder_config/config.json", .data = encoder });
+    try temporary.dir.writeFile(platform.testing.io, .{ .sub_path = "socket-gate/model.safetensors", .data = "never loaded" });
     var node = try Node.init(a, .{
         .models_dir = parent,
         .max_concurrent_requests = 1,
@@ -310,7 +310,7 @@ test "gliner boundary socket transport gate disconnect retry metrics and shutdow
     });
     defer node.deinit();
     shared.useNativeBackend(&node);
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
     var barrier = CancellationBarrier{ .node = &node };
     const transport = try Loopback.init(a, &node);
     defer transport.deinit();
@@ -382,9 +382,9 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
     const a = std.testing.allocator;
     var path: [Io.Dir.max_path_bytes]u8 = undefined;
     const length = if (std.fs.path.isAbsolute(requested))
-        try Io.Dir.realPathFileAbsolute(std.testing.io, requested, &path)
+        try Io.Dir.realPathFileAbsolute(platform.testing.io, requested, &path)
     else
-        try Io.Dir.cwd().realPathFile(std.testing.io, requested, &path);
+        try Io.Dir.cwd().realPathFile(platform.testing.io, requested, &path);
     const directory = path[0..length];
     const name = std.fs.path.basename(directory);
     const bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
@@ -408,7 +408,7 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
         });
         defer node.deinit();
         shared.useNativeBackend(&node);
-        try node.attachIo(std.testing.io);
+        try node.attachIo(platform.testing.io);
         const transport = try Loopback.init(a, &node);
         defer transport.deinit();
         try transport.start();
@@ -425,7 +425,7 @@ test "gliner boundary socket pinned small real HTTP success atomic recovery and 
         // representation is void and the global published gate stays false.
         node.test_allow_unqualified_gliner_boundary = true;
         {
-            const control = Control{ .io = std.testing.io, .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = clock() + request_timeout_ms * std.time.ns_per_ms };
+            const control = Control{ .io = platform.testing.io, .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(), .deadline_ns = clock() + request_timeout_ms * std.time.ns_per_ms };
             var lease = try control.enterUninterruptible(.process_required);
             lease.deinit();
             _ = try shared.idle(&node);

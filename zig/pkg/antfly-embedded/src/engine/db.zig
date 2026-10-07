@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const support = @import("embedded_support");
 const db_mod = support.db;
 const db_core = support.db_core;
@@ -439,14 +441,14 @@ fn openModeCanWrite(open_mode: db_mod.OpenOptions.OpenMode) bool {
     };
 }
 
-fn testLitePath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+fn testLitePath(allocator: Allocator, tmp: native_platform.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
 test "embedded db openLite persists documents in aflite file" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-open-lite.aflite");
@@ -485,7 +487,7 @@ test "embedded db openLite persists documents in aflite file" {
 test "embedded db openLite close syncs unsynced batch before readonly reopen" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-close-sync.aflite");
@@ -520,7 +522,7 @@ test "embedded db openLite close syncs unsynced batch before readonly reopen" {
 test "embedded db openLite propagates no_sync to aflite backend" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-no-sync.aflite");
@@ -538,7 +540,7 @@ test "embedded db openLite propagates no_sync to aflite backend" {
 test "embedded db openLite does not fall back to internal bridge files" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-bridge.aflite");
@@ -581,7 +583,7 @@ test "embedded db openLite does not fall back to internal bridge files" {
 test "embedded db liteStatus exposes storage stats work and capabilities" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const plain_path = try testLitePath(alloc, tmp, "embedded-status-plain");
@@ -647,7 +649,7 @@ test "embedded db liteStatus exposes storage stats work and capabilities" {
 test "embedded db liteStatus reflects explicitly configured remote inference" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-status-remote-inference.aflite");
@@ -681,7 +683,7 @@ test "embedded db liteStatus reflects explicitly configured remote inference" {
 test "embedded db liteStatus reports local inference request according to build support" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-status-local-inference.aflite");
@@ -735,7 +737,7 @@ test "embedded db liteStatus reports local inference request according to build 
 test "embedded db openLite can run ttl cleanup over aflite file" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-ttl-cleanup.aflite");
@@ -771,7 +773,7 @@ test "embedded db openLite can run ttl cleanup over aflite file" {
     defer types.freeDBStats(alloc, stats);
     var attempts: usize = 0;
     while ((stats.ttl_cleanup.deleted_docs == 0 or stats.ttl_cleanup.scanned_timestamps == 0) and attempts < 200) : (attempts += 1) {
-        std.testing.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
+        native_platform.testing.io.sleep(.fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
         types.freeDBStats(alloc, stats);
         stats = try db.stats(alloc);
     }
@@ -786,7 +788,7 @@ test "embedded db openLite can run ttl cleanup over aflite file" {
 test "embedded db openLiteHosted exposes manual maintenance capabilities" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-hosted.aflite");
@@ -808,7 +810,7 @@ test "embedded db openLiteHosted exposes manual maintenance capabilities" {
 test "embedded db openLite query_readonly rejects writes" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-readonly.aflite");
@@ -851,7 +853,7 @@ test "embedded db openLite query_readonly rejects writes" {
 test "embedded db openLite persists schema json in aflite file" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-schema.aflite");
@@ -888,7 +890,7 @@ test "embedded db openLite persists schema json in aflite file" {
 test "embedded db portable relational restore is immediately readable and validated" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try testLitePath(alloc, tmp, "embedded-relational-source.aflite");
     defer alloc.free(source_path);
@@ -927,7 +929,7 @@ test "embedded db portable relational restore is immediately readable and valida
 test "embedded db openLite persists index and enrichment catalogs in aflite file" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testLitePath(alloc, tmp, "embedded-open-lite-catalogs.aflite");
@@ -992,7 +994,7 @@ test "embedded db openLite persists index and enrichment catalogs in aflite file
 test "embedded db createLite files are openable through the CLI's lite Connection and vice versa" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // Created through this native embedded facade, opened through the CLI's

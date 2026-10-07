@@ -16,7 +16,9 @@
 //! Bounded all-owner retirement. Metadata phase barriers separate admission
 //! fencing, outgoing-reference drain, unique-claim drain, and publication.
 //! Each row page and its checkpoint share the ordinary durable 2PC decision.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const metadata = @import("../metadata/relational_retirement.zig");
 const records = @import("antfly_local_sources").common_topology_records;
 const native = @import("antfly_local_sources").storage_db_relational_integrity_retirement_contract;
@@ -106,7 +108,7 @@ pub const Replacement = struct {
 /// intent. The returned private record is admitted with the ordinary metadata
 /// exact-definition CAS, never accepted through public TableSchema fields.
 pub fn begin(alloc: Allocator, reader: reads.TableReadSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, table_name: []const u8, target_input: []const u8, drop: bool) !Replacement {
-    return beginControlled(alloc, reader, tables, ranges, table_name, target_input, drop, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s });
+    return beginControlled(alloc, reader, tables, ranges, table_name, target_input, drop, .{ .deadline_ns = native_platform.time.monotonicNs() +| 5 * std.time.ns_per_s });
 }
 
 pub fn beginControlled(alloc: Allocator, reader: reads.TableReadSource, tables: []const records.TableRecord, ranges: []const records.RangeRecord, table_name: []const u8, target_input: []const u8, drop: bool, control: Control) !Replacement {
@@ -325,11 +327,11 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
         arena.deinit();
         return null;
     }
-    const deadline = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+    const deadline = native_platform.time.monotonicNs() +| 5 * std.time.ns_per_s;
     const control: Control = .{ .deadline_ns = deadline, .cancellation = .{ .ptr = &deadline, .is_cancelled_fn = struct {
         fn expired(ptr: *const anyopaque) bool {
             const value: *const u64 = @ptrCast(@alignCast(ptr));
-            return @import("antfly_platform").time.monotonicNs() >= value.*;
+            return native_platform.time.monotonicNs() >= value.*;
         }
     }.expired } };
     const state = try readStatus(owned, reader, table.name, owner_start, control, true);
@@ -525,7 +527,7 @@ fn testRetirementDrain(pressure: RetirementPressure) !void {
     const types = @import("antfly_local_sources").storage_db_types;
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/retirement", .{tmp.sub_path});

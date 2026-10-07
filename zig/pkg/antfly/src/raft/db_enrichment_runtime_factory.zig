@@ -13,6 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const db_enrichment_executor = @import("db_enrichment_executor.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
@@ -71,9 +72,9 @@ pub const OpenDbRuntimeFactory = struct {
         const path = try self.resolver.resolvePath(self.alloc, group_id);
         defer self.alloc.free(path);
         const io = self.cfg.io orelse if (open_options.backend_runtime) |runtime|
-            runtime.io() orelse std.Options.debug_io
+            runtime.io() orelse native_platform.debug_io
         else
-            std.Options.debug_io;
+            native_platform.debug_io;
         try fs_paths.createDirPathPortable(io, path);
 
         const db = try self.alloc.create(db_mod.DB);

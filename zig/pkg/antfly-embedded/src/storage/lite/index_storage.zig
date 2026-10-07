@@ -21,10 +21,12 @@
 //! rather than in the internal bridge container. Public Lite status reports the
 //! native catalog-page layout; this adapter is not a user-visible file format.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
@@ -585,7 +587,7 @@ const NativeAtomicWriteSink = struct {
     }
 };
 
-fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+fn testPath(allocator: Allocator, tmp: native_platform.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
@@ -593,7 +595,7 @@ test "lite native repeated WAL reset does not publish unchanged control records"
     const wal = @import("../lsm_backend/wal.zig");
     const State = @import("../lsm_backend/state.zig").State;
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-wal-reset.aflite");
     defer allocator.free(path);
@@ -627,7 +629,7 @@ test "lite native repeated WAL reset does not publish unchanged control records"
 test "lite native index storage persists logical files across reopen" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage.aflite");
     defer allocator.free(path);
@@ -713,7 +715,7 @@ test "lite native index storage lists immediate live files within its namespace"
 
 test "lite native index storage root identity is physical and namespaced" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-identity.aflite");
     defer allocator.free(path);
@@ -751,7 +753,7 @@ test "lite native index storage root identity is physical and namespaced" {
 
 test "lite native index reads remain pinned while newer checkpoints publish" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/index-pinned-checkpoint.aflite", .{tmp.sub_path});
     defer allocator.free(path);
@@ -775,7 +777,7 @@ test "lite native index reads remain pinned while newer checkpoints publish" {
 test "lite native index storage can be scoped to the Lite index namespace" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-namespace.aflite");
     defer allocator.free(path);
@@ -807,7 +809,7 @@ test "lite native index storage can be scoped to the Lite index namespace" {
 test "lite native index storage handles large files rename and delete tree" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-large.aflite");
     defer allocator.free(path);
@@ -862,7 +864,7 @@ test "lite native index storage handles large files rename and delete tree" {
 test "lite native index storage aborts atomic writes without publishing partial files" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-atomic-abort.aflite");
     defer allocator.free(path);
@@ -905,11 +907,11 @@ test "lite native index storage aborts atomic writes without publishing partial 
 
 test "lite native staged abort removes staging despite pending cancellation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    var tmp = native_platform.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "canceled-staging.aflite");
     defer alloc.free(path);
-    var pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
+    var pool = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
     defer pool.deinit();
     const io = pool.io();
     var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = io });
@@ -951,7 +953,7 @@ test "lite native staged abort removes staging despite pending cancellation" {
 test "lite native index storage read-only open rejects mutations" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-readonly.aflite");
     defer allocator.free(path);
@@ -1001,7 +1003,7 @@ test "lite native index storage read-only open rejects mutations" {
 test "lite native index storage recovers previous checkpoint after interrupted update" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-crash-recovery.aflite");
     defer allocator.free(path);
@@ -1043,7 +1045,7 @@ test "lite native index storage recovers previous checkpoint after interrupted u
 test "lite native index storage serializes physical writes without taking document writer slot" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-single-writer.aflite");
     defer allocator.free(path);
@@ -1067,7 +1069,7 @@ test "lite native index storage serializes physical writes without taking docume
 
 test "lite native directory operations seek bounded prefixes independent of catalog history" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-directory-seek.aflite");
     defer alloc.free(path);
@@ -1112,7 +1114,7 @@ test "lite native directory operations seek bounded prefixes independent of cata
 
 test "lite native staged atomic writes bound heap and survive concurrent commits and vacuum" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "staged-atomic.aflite");
     defer alloc.free(path);
@@ -1121,7 +1123,7 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
     for (expected, 0..) |*byte, i| byte.* = @intCast(i % 251);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = alloc, .limit = 512 * 1024 };
     {
-        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
         var indexes = Store.init(budget.allocator(), &docs);
@@ -1189,11 +1191,11 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
 
 test "lite native staged atomic writes discard failed imports and poisoned sources" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "failed-staging.aflite");
     defer alloc.free(path);
-    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
     defer docs.close();
     var indexes = Store.init(alloc, &docs);
     const storage = indexes.storage();
@@ -1204,7 +1206,7 @@ test "lite native staged atomic writes discard failed imports and poisoned sourc
         var writer = try storage.beginAtomicWrite(alloc, "/stable");
         try writer.appendSlice(&bytes);
         const impl: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
-        try impl.file.?.setLength(std.testing.io, 65536);
+        try impl.file.?.setLength(native_platform.testing.io, 65536);
         if (checksum_first) {
             try std.testing.expectError(error.EndOfStream, writer.crc32Prefix(bytes.len));
             try std.testing.expectError(error.EndOfStream, writer.appendSlice("must not recover silently"));
@@ -1233,7 +1235,7 @@ test "lite native staged atomic writes discard failed imports and poisoned sourc
 
 test "lite native atomic writes spill with long database basenames" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     // Valid under NAME_MAX=255, including the writer lock's .lock suffix.
     // Appending the former 50-byte staging suffix would exceed that limit.
@@ -1242,7 +1244,7 @@ test "lite native atomic writes spill with long database basenames" {
     defer alloc.free(path);
     const bytes: [128 * 1024 + 17]u8 = @splat('s');
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
         defer docs.close();
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -1269,7 +1271,7 @@ test "lite native atomic writes spill with long database basenames" {
 
 test "lite native cold atomic writes preserve hot pages with bounded cache admission" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "cold-atomic.aflite");
     defer alloc.free(path);
@@ -1277,7 +1279,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
     defer alloc.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
         defer docs.close();
         docs.file.page_cache.limit_bytes = 256 * 1024;
         var indexes = Store.init(alloc, &docs);
@@ -1344,12 +1346,12 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
 
 test "lite native directory cursor skips large subtrees and preserves boundary files" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "directory-subtree-skip.aflite");
     defer alloc.free(path);
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
         defer docs.close();
         var indexes = Store.initWithNamespace(alloc, &docs, "/a");
         const storage = indexes.storage();
@@ -1404,7 +1406,7 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
 
 test "lite native atomic imports batch writes and preserve publication on failed flush" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "batched-import.aflite");
     defer alloc.free(path);
@@ -1412,7 +1414,7 @@ test "lite native atomic imports batch writes and preserve publication on failed
     defer alloc.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
         defer docs.close();
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -1473,7 +1475,7 @@ test "lite native atomic imports batch writes and preserve publication on failed
 
 test "lite native unscoped listings preserve accepted non-normalized keys" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "unscoped-path-listing.aflite");
     defer alloc.free(path);
@@ -1491,7 +1493,7 @@ test "lite native unscoped listings preserve accepted non-normalized keys" {
     };
     const expected = [_][]const u8{ "file", "dir", "dir0", "file", "renamed" };
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
         defer docs.close();
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -1535,11 +1537,11 @@ test "lite native unscoped listings preserve accepted non-normalized keys" {
 
 test "lite index read limits reject from pinned metadata before payload allocation" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/limited-read.aflite", .{tmp.sub_path});
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
     defer docs.close();
     // Isolate query I/O accounting from background reclamation; foreground reuse remains enabled.
     docs.maintenance_cancel.request();
@@ -1582,12 +1584,12 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         .{ .count = 4096, .key_len = 1024 },
     }) |case| {
         const count = case.count;
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-delete.aflite", .{tmp.sub_path});
         defer a.free(path);
         var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -1628,11 +1630,11 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
 
 test "lite subtree deletion rolls back earlier private batches on failure" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delete-rollback.aflite", .{tmp.sub_path});
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
     defer docs.close();
     docs.file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1644,7 +1646,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     };
     try docs.file.putIndexCatalogBatch(mutations);
     const pinned = docs.file.activeCheckpoint();
-    const size = (try docs.file.file.stat(std.testing.io)).size;
+    const size = (try docs.file.file.stat(native_platform.testing.io)).size;
     var store = Store.initWithNamespace(a, &docs, "/scope");
     const before = docs.file.test_page_writes.load(.monotonic);
     docs.file.test_page_write_fail_after = 30;
@@ -1652,7 +1654,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     docs.file.test_page_write_fail_after = null;
     try std.testing.expect(docs.file.test_page_writes.load(.monotonic) > before);
     try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
-    try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
+    try std.testing.expectEqual(size, (try docs.file.file.stat(native_platform.testing.io)).size);
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
     const retained = (try docs.file.getIndexCatalogRecordAlloc(a, mutations[0].key)).?;
     defer a.free(retained);
@@ -1667,7 +1669,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
         docs.file.allocator = a;
         try std.testing.expectError(error.OutOfMemory, result);
         try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
-        try std.testing.expectEqual(size, (try docs.file.file.stat(std.testing.io)).size);
+        try std.testing.expectEqual(size, (try docs.file.file.stat(native_platform.testing.io)).size);
         try std.testing.expect((try docs.checkWithCancel(null)).valid);
     }
     try store.storage().deleteTree("/scope");

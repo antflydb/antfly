@@ -21,7 +21,9 @@
 //!   - DynamicTemplate: glob-based pattern matching for field names
 //!   - TableSchema: version, TTL config, default type, dynamic templates
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
@@ -29,10 +31,10 @@ const docstore = @import("docstore.zig");
 const DocStore = docstore.DocStore;
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 
 fn cleanupTestDir(path: []const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }

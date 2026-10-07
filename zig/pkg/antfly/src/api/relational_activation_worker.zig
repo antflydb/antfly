@@ -16,7 +16,9 @@
 //! One bounded, restartable activation page. Source read guards, globally
 //! routed claims/references, and the owner-bound continuation share ONE durable
 //! transaction. Concurrent supervisors may race safely on the progress CAS.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const reads = @import("antfly_local_sources").api_table_read_source;
 const writes = @import("antfly_local_sources").api_table_write_source;
 const planner = @import("antfly_local_sources").api_relational_integrity_commit;
@@ -26,7 +28,7 @@ const contract = @import("antfly_local_sources").api_distributed_txn_contract;
 const Allocator = std.mem.Allocator;
 const RequestContext = @import("antfly_local_sources").api_operation.RequestContext;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const time = @import("antfly_platform").time;
+const time = native_platform.time;
 
 const Attempt = enum { idle, progressed, shrink };
 
@@ -286,7 +288,7 @@ test "distributed txn activation worker adapts pages and atomically publishes na
         const singleton_too_large = scenario == 2;
         const source_too_large = scenario == 3;
         const wide_unrelated = scenario == 4;
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/activation", .{tmp.sub_path});
@@ -563,7 +565,7 @@ test "distributed txn CHECK activation shares durable repair retry and physical 
     try std.testing.expect(try planner.requiresActivation(alloc, checked));
     try std.testing.expect(!try planner.requiresCoordination(alloc, checked));
     for ([_]bool{ false, true }) |race_repair| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}/check", .{tmp.sub_path});

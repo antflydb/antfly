@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const change_journal_mod = @import("change_journal.zig");
 const catch_up_policy = @import("catch_up_policy.zig");
@@ -26,7 +28,7 @@ const internal_keys = @import("../../internal_keys.zig");
 const docstore_mod = @import("../../docstore.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 
 pub const ApplyFn = batcher.ApplyFn;
 pub const PersistProgressFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64) anyerror!void;
@@ -1127,7 +1129,7 @@ fn testInMemoryJournalOpenOptions() change_journal_mod.OpenOptions {
 
 test "catchUpIndex batches dense replay records before applying" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-batched-log", .{tmp.sub_path});
@@ -1257,7 +1259,7 @@ test "catchUpIndex batches replay-stream records and respects from_sequence" {
 
 test "catchUpIndex window hooks fire once per replay window" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-window-hooks-journal", .{tmp.sub_path});
@@ -1312,7 +1314,7 @@ test "catchUpIndex window hooks fire once per replay window" {
 
 test "catchUpIndex refuses to open an apply window after its deadline" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-expired-deadline-journal", .{tmp.sub_path});
@@ -1338,7 +1340,7 @@ test "catchUpIndex refuses to open an apply window after its deadline" {
 
 test "catchUpIndex can stop after bounded replay windows" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-window-limit-journal", .{tmp.sub_path});
@@ -1395,7 +1397,7 @@ test "catchUpIndex can stop after bounded replay windows" {
 
 test "coalesced replay byte and time quanta stop only after a complete record" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/coalesced-quanta", .{tmp.sub_path}, 0);
     defer alloc.free(path);
@@ -1424,7 +1426,7 @@ test "coalesced replay byte and time quanta stop only after a complete record" {
 
 test "catchUpIndex catch-up hooks fire once per replay run" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-catch-up-hooks-journal", .{tmp.sub_path});
@@ -1479,7 +1481,7 @@ test "catchUpIndex catch-up hooks fire once per replay run" {
 
 test "catchUpIndex persists replay progress after finishing replay window" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-persist-order-journal", .{tmp.sub_path});
@@ -1523,7 +1525,7 @@ test "catchUpIndex persists replay progress after finishing replay window" {
 
 test "catchUpIndex removes pending chunk dense vectors by parent document" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-parent-log", .{tmp.sub_path});
@@ -1578,7 +1580,7 @@ test "catchUpIndex removes pending chunk dense vectors by parent document" {
 
 test "catchUpIndex chunks large replay windows" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-chunked-journal", .{tmp.sub_path});
@@ -1626,7 +1628,7 @@ test "catchUpIndex chunks large replay windows" {
 
 test "catchUpIndex chunks replay by byte budget" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-byte-chunked-journal", .{tmp.sub_path});
@@ -1676,7 +1678,7 @@ test "catchUpIndex chunks replay by byte budget" {
 
 test "catchUpIndex chunks dense replay by item budget" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-item-chunked-journal", .{tmp.sub_path});
@@ -1726,7 +1728,7 @@ test "catchUpIndex chunks dense replay by item budget" {
 
 test "catchUpIndex subchunks one oversized full text record before advancing its sequence" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-full-text-item-chunked-journal", .{tmp.sub_path});
@@ -1769,7 +1771,7 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
 
 test "catchUpIndex chunks dense replay by estimated vector byte budget" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-vector-byte-chunked-journal", .{tmp.sub_path});
@@ -1823,7 +1825,7 @@ test "catchUpIndex chunks dense replay by estimated vector byte budget" {
 
 test "catchUpIndex batches full-text replay records before applying" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-unbatched-log", .{tmp.sub_path});
@@ -1881,7 +1883,7 @@ test "catchUpIndex batches full-text replay records before applying" {
 
 test "catchUpIndex batches sparse replay records before applying" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-sparse-batched-log", .{tmp.sub_path});
@@ -1938,7 +1940,7 @@ test "catchUpIndex batches sparse replay records before applying" {
 
 test "catchUpIndex batches graph artifact journal records before applying" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-graph-journal-log", .{tmp.sub_path});
@@ -1988,7 +1990,7 @@ test "catchUpIndex batches graph artifact journal records before applying" {
 
 test "catchUpIndex batches resolution artifact graph journal records before applying" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-resolution-graph-journal", .{tmp.sub_path});
@@ -2416,7 +2418,7 @@ test "dense replay work ceiling bounds delete and mixed records independently of
 
 test "catchUpIndex enforces the unscaled work ceiling across Lite windows" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-vector-work-chunked-journal", .{tmp.sub_path});

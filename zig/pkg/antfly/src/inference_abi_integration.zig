@@ -18,7 +18,9 @@
 //! declarations and resolves the exported function table from the linked
 //! archive; it cannot inline or directly call pkg/inference/src/host/host.zig.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const bridge = @import("antfly_inference_bridge");
 
 pub fn main() !void {
@@ -26,7 +28,7 @@ pub fn main() !void {
     if (!bridge.validFunctionTable(table, bridge.Capability.provider))
         return error.InvalidLinkedInferenceFunctionTable;
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

@@ -8,7 +8,9 @@
 //! - Optional native socket tuning
 //! - Io.Reader/Io.Writer adapters for TLS integration
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const posix = std.posix;
 const Io = std.Io;
 const net = Io.net;
@@ -108,13 +110,13 @@ test "resolveAddressFiltered applies policy to literal and DNS results" {
 
     try std.testing.expectError(
         error.AddressRejected,
-        resolveAddressFiltered(std.testing.io, "127.0.0.1", 80, .{ .acceptsFn = Policy.rejectLoopback }),
+        resolveAddressFiltered(native_platform.testing.io, "127.0.0.1", 80, .{ .acceptsFn = Policy.rejectLoopback }),
     );
-    const accepted = try resolveAddressFiltered(std.testing.io, "8.8.8.8", 53, .{ .acceptsFn = Policy.rejectLoopback });
+    const accepted = try resolveAddressFiltered(native_platform.testing.io, "8.8.8.8", 53, .{ .acceptsFn = Policy.rejectLoopback });
     try std.testing.expectEqual(@as(u8, 8), accepted.ip4.bytes[0]);
     try std.testing.expectError(
         error.AddressRejected,
-        resolveAddressFiltered(std.testing.io, "localhost", 80, .{ .acceptsFn = Policy.rejectAll }),
+        resolveAddressFiltered(native_platform.testing.io, "localhost", 80, .{ .acceptsFn = Policy.rejectAll }),
     );
 }
 
@@ -142,7 +144,7 @@ fn readAtLeastOne(reader: *Io.Reader, buf: []u8) Io.Reader.Error!usize {
 /// implementations whose handles are virtual rather than OS descriptors.
 fn isThreadedNetworkIo(io: Io) bool {
     if (comptime builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return false;
-    return io.vtable.netListenIp == Io.Threaded.global_single_threaded.io().vtable.netListenIp;
+    return io.vtable.netListenIp == native_platform.Threaded.global_single_threaded.io().vtable.netListenIp;
 }
 
 /// TCP socket abstraction backed by std.Io.net.
@@ -1338,7 +1340,7 @@ fn listenPosix(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.S
         .ip6 => posix.AF.INET6,
     };
     const socket_flags = posix.SOCK.STREAM |
-        if (Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
+        if (native_platform.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
     const socket_fd: posix.socket_t = socket: while (true) {
         const rc = posix.system.socket(family, socket_flags, @backingInt(net.Protocol.tcp));
         switch (posix.errno(rc)) {
@@ -1357,7 +1359,7 @@ fn listenPosix(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.S
     var owned_socket = net.Socket{ .handle = socket_fd, .address = addr };
     errdefer owned_socket.close(io);
 
-    if (Io.Threaded.socket_flags_unsupported) {
+    if (native_platform.Threaded.socket_flags_unsupported) {
         while (true) switch (posix.errno(posix.system.fcntl(
             socket_fd,
             posix.F.SETFD,
@@ -1485,7 +1487,7 @@ const BufferOnlyReader = struct {
 };
 
 test "Socket connect and close" {
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
     // Listen on a random port
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
@@ -1501,7 +1503,7 @@ test "Socket connect and close" {
 }
 
 test "TcpListener accept" {
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try TcpListener.init(listen_addr, io);
@@ -1519,7 +1521,7 @@ test "TcpListener accept" {
 }
 
 test "Socket.writer writeAll and print over TCP" {
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const allocator = std.testing.allocator;
 
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
@@ -1576,7 +1578,7 @@ test "Socket.writer writeAll and print over TCP" {
 }
 
 test "UdpSocket send/recv localhost" {
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
     const bind_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var recv_sock = try UdpSocket.bind(bind_addr, io);
@@ -1596,7 +1598,7 @@ test "UdpSocket send/recv localhost" {
 }
 
 test "SocketIoWriter flush sends buffered bytes" {
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try TcpListener.init(listen_addr, io);
     defer listener.deinit();
@@ -1621,7 +1623,7 @@ test "SocketIoWriter flush sends buffered bytes" {
 test "Socket recv timeout returns error.Timeout" {
     if (is_windows) return;
 
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try TcpListener.init(listen_addr, io);
     defer listener.deinit();
@@ -1648,7 +1650,7 @@ test "Socket recv timeout returns error.Timeout" {
 test "Socket cancellation polling preserves the configured receive timeout" {
     if (is_windows) return;
 
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try TcpListener.init(listen_addr, io);
     defer listener.deinit();
@@ -1680,7 +1682,7 @@ test "Socket cancellation polling preserves the configured receive timeout" {
 
 test "Socket abort interrupts a backpressured native send" {
     if (is_windows) return error.SkipZigTest;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     var listener = try TcpListener.init(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }, io);
     defer listener.deinit();
     var sender = try Socket.connect(listener.getLocalAddress(), io);
@@ -1733,7 +1735,7 @@ test "Socket abort interrupts a backpressured native send" {
 test "Socket send timeout reports backpressure without panicking" {
     if (is_windows) return;
 
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const listen_addr = Address{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
     var listener = try TcpListener.init(listen_addr, io);
     defer listener.deinit();
@@ -1866,7 +1868,7 @@ const TimedFallbackTest = struct {
     }
 
     fn healthy(comptime write: bool) !void {
-        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+        var lane = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
         defer lane.deinit();
         const io = lane.io();
         var sockets = try pair(io);
@@ -1904,7 +1906,7 @@ const TimedFallbackTest = struct {
     }
 
     fn stalled(comptime write: bool) !void {
-        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
+        var lane = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(4) });
         defer lane.deinit();
         const io = lane.io();
         var sockets = try pair(io);
@@ -1923,7 +1925,7 @@ const TimedFallbackTest = struct {
     }
 
     fn denied(comptime write: bool, limit: usize) !void {
-        var lane = Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(limit) });
+        var lane = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(limit) });
         defer lane.deinit();
         const io = lane.io();
         var sockets = try pair(io);

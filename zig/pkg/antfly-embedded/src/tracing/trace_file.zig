@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 /// Each producer owns its file. Exclusive creation also preserves evidence if
@@ -33,9 +34,9 @@ pub fn openProcessFile(directory: []const u8, pid: std.c.pid_t) !std.c.fd_t {
 }
 
 test "trace files preserve overlapping producers and reused process identities" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     const first = try openProcessFile(root, 11);
     defer _ = std.c.close(first);
@@ -50,7 +51,7 @@ test "trace files preserve overlapping producers and reused process identities" 
     // Resume the original descriptor after both other producers have opened.
     try std.testing.expectEqual(@as(isize, line.len), std.c.write(first, line.ptr, line.len));
     for ([_][]const u8{ "trace-11-0.ndjson", "trace-22-0.ndjson", "trace-11-1.ndjson" }, [_][]const u8{ line ++ line, line, line }) |name, expected| {
-        const bytes = try tmp.dir.readFileAlloc(std.testing.io, name, std.testing.allocator, .limited(1024));
+        const bytes = try tmp.dir.readFileAlloc(native_platform.testing.io, name, std.testing.allocator, .limited(1024));
         defer std.testing.allocator.free(bytes);
         try std.testing.expectEqualStrings(expected, bytes);
     }

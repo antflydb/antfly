@@ -16,7 +16,9 @@
 //! Versioned, named, explicit-offset JSONL training data. A bounded owned
 //! snapshot binds the bytes actually consumed to resume identity. Schemas are
 //! supplied independently of answers; no importer infers the label universe.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const schema_mod = @import("../../pipelines/extraction_schema.zig");
 const target = @import("boundary_targets.zig");
 const processor = @import("../../pipelines/gliner_boundary_processor.zig");
@@ -525,7 +527,7 @@ test "boundary training dataset resolves named mixed tasks and keeps exact occur
 }
 
 test "boundary training dataset allocation failures release snapshots schemas samples and split indexes" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseDataset, .{});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseDataset, .{});
 }
 
 test "boundary training dataset rejects invalid rows duplicates version schema omissions and byte boundaries" {
@@ -552,7 +554,7 @@ test "boundary training dataset rejects invalid rows duplicates version schema o
 test "boundary training dataset owns immutable file bytes and preflights real tokenizer targets" {
     const a = std.testing.allocator;
     const compat = @import("../../io/compat.zig");
-    var temporary = std.testing.tmpDir(.{});
+    var temporary = native_platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/train.jsonl", .{temporary.sub_path});
     defer a.free(path);

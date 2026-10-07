@@ -13,12 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Crc32 = @import("antfly_hash").Crc32;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const raft_engine = @import("raft_engine");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const wal_mod = @import("../../storage/wal_runtime.zig");
 const storage_mod = @import("mod.zig");
 const snapshot_payload_store = @import("snapshot_payload_store.zig");
@@ -101,7 +103,7 @@ fn metadataOnlySnapshot(snapshot: raft_engine.core.types.Snapshot) raft_engine.c
 pub const WalReplicaState = struct {
     alloc: std.mem.Allocator,
     cfg: WalReplicaStateConfig,
-    io_impl: std.Io.Threaded,
+    io_impl: native_platform.Threaded,
     layout: storage_mod.ReplicaPathLayout,
     wal_dir: []u8,
     wal_dir_z: [:0]u8,
@@ -1471,7 +1473,7 @@ fn encodeLegacyWalReadyDeltaForTest(alloc: std.mem.Allocator, file_version: u32)
 }
 
 test "wal replica state migrates legacy checkpoints and delta tails" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     for ([_]u32{ 1, 2, 3 }) |file_version| {
@@ -1479,11 +1481,11 @@ test "wal replica state migrates legacy checkpoints and delta tails" {
         defer std.testing.allocator.free(root);
         var layout = try storage_mod.ReplicaPathLayout.initForReplica(std.testing.allocator, root, 170 + file_version, 3);
         defer layout.deinit(std.testing.allocator);
-        try fs_paths.createDirPathPortable(std.testing.io, layout.log_dir);
-        try fs_paths.createDirPathPortable(std.testing.io, layout.snapshot_dir);
+        try fs_paths.createDirPathPortable(native_platform.testing.io, layout.log_dir);
+        try fs_paths.createDirPathPortable(native_platform.testing.io, layout.snapshot_dir);
         const wal_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/state-wal", .{layout.log_dir});
         defer std.testing.allocator.free(wal_dir);
-        try fs_paths.createDirPathPortable(std.testing.io, wal_dir);
+        try fs_paths.createDirPathPortable(native_platform.testing.io, wal_dir);
         const wal_dir_z = try std.testing.allocator.dupeSentinel(u8, wal_dir, 0);
         defer std.testing.allocator.free(wal_dir_z);
 
@@ -1495,7 +1497,7 @@ test "wal replica state migrates legacy checkpoints and delta tails" {
         if (file_version == legacy_external_snapshot_version) {
             try snapshot_payload_store.writeAtomically(
                 std.testing.allocator,
-                std.testing.io,
+                native_platform.testing.io,
                 layout.snapshot_dir,
                 5,
                 4,
@@ -1503,7 +1505,7 @@ test "wal replica state migrates legacy checkpoints and delta tails" {
             );
             try snapshot_payload_store.writeAtomically(
                 std.testing.allocator,
-                std.testing.io,
+                native_platform.testing.io,
                 layout.snapshot_dir,
                 6,
                 6,
@@ -1552,7 +1554,7 @@ test "wal replica state defaults to lsm backend" {
 }
 
 test "wal replica state persists ready updates across reopen" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-replica", .{tmp.sub_path});
@@ -1590,7 +1592,7 @@ test "wal replica state persists ready updates across reopen" {
 }
 
 test "wal replica state replays committed entries when append persisted before applied watermark" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-append-before-apply", .{tmp.sub_path});
@@ -1641,7 +1643,7 @@ test "wal replica state replays committed entries when append persisted before a
 }
 
 test "wal replica state persists snapshots across reopen" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-replica", .{tmp.sub_path});
@@ -1685,7 +1687,7 @@ test "wal replica state persists snapshots across reopen" {
 }
 
 test "wal replica state persists applied watermark in sidecar and replays only unapplied suffix" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-applied-replay", .{tmp.sub_path});
@@ -1752,7 +1754,7 @@ test "wal replica state persists applied watermark in sidecar and replays only u
 
 test "wal replica completion survives checkpoint and pending snapshot reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completed-wal", .{tmp.sub_path});
     defer alloc.free(root);
@@ -1789,7 +1791,7 @@ test "wal replica completion survives checkpoint and pending snapshot reopen" {
         try state.persistCheckpoint();
         // Checkpoint remains authoritative even without the optional batched
         // watermark file, as after WAL compaction or a stale sidecar.
-        try std.Io.Dir.cwd().deleteFile(std.testing.io, state.applied_watermark_path);
+        try std.Io.Dir.cwd().deleteFile(native_platform.testing.io, state.applied_watermark_path);
     }
     var state = try WalReplicaState.init(alloc, layout, cfg);
     defer state.deinit();
@@ -1798,7 +1800,7 @@ test "wal replica completion survives checkpoint and pending snapshot reopen" {
 
 test "wal replica completion never infers native completion from legacy watermark" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy-completed-wal", .{tmp.sub_path});
     defer alloc.free(root);
@@ -1816,7 +1818,7 @@ test "wal replica completion never infers native completion from legacy watermar
         std.mem.writeInt(u32, legacy[4..8], 2, .little);
         std.mem.writeInt(u64, legacy[8..16], 1, .little);
         std.mem.writeInt(u32, legacy[16..20], Crc32.hash(legacy[0..16]), .little);
-        try WalReplicaState.writeFileAtomically(std.testing.io, state.applied_watermark_path, &legacy);
+        try WalReplicaState.writeFileAtomically(native_platform.testing.io, state.applied_watermark_path, &legacy);
     }
     var state = try WalReplicaState.init(alloc, layout, .{});
     defer state.deinit();
@@ -1825,7 +1827,7 @@ test "wal replica completion never infers native completion from legacy watermar
 }
 
 test "wal replica state tracks persist reasons separately" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-stats", .{tmp.sub_path});
@@ -1861,7 +1863,7 @@ test "wal replica state tracks persist reasons separately" {
 }
 
 test "wal replica state rejects corrupt or oversized applied watermark sidecars" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-watermark-integrity", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -1885,14 +1887,14 @@ test "wal replica state rejects corrupt or oversized applied watermark sidecars"
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/applied-watermark.bin", .{layout.log_dir});
     defer std.testing.allocator.free(path);
     const payload = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        native_platform.testing.io,
         path,
         std.testing.allocator,
         .limited(applied_watermark_payload_len + 1),
     );
     defer std.testing.allocator.free(payload);
     payload[8] ^= 0x40;
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = payload });
+    try std.Io.Dir.cwd().writeFile(native_platform.testing.io, .{ .sub_path = path, .data = payload });
     try std.testing.expectError(
         error.InvalidReplicaState,
         WalReplicaState.init(std.testing.allocator, layout, .{}),
@@ -1903,7 +1905,7 @@ test "wal replica state rejects corrupt or oversized applied watermark sidecars"
     defer std.testing.allocator.free(oversized);
     @memcpy(oversized[0..payload.len], payload);
     oversized[payload.len] = 0;
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = oversized });
+    try std.Io.Dir.cwd().writeFile(native_platform.testing.io, .{ .sub_path = path, .data = oversized });
     try std.testing.expectError(
         error.InvalidReplicaState,
         WalReplicaState.init(std.testing.allocator, layout, .{}),
@@ -1911,7 +1913,7 @@ test "wal replica state rejects corrupt or oversized applied watermark sidecars"
 }
 
 test "wal replica state checkpoints and compacts delta records when replay debt crosses threshold" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-checkpoint-compact", .{tmp.sub_path});
@@ -1982,7 +1984,7 @@ test "wal replica state checkpoints and compacts delta records when replay debt 
 }
 
 test "wal replica state async append publishes on completion and retirement preserves durable log" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-async-append", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -2018,7 +2020,7 @@ test "wal replica state async append publishes on completion and retirement pres
         defer operation.deinit();
         const deadline = WalReplicaState.nowNs() + 5 * std.time.ns_per_s;
         while (!operation.isComplete() and WalReplicaState.nowNs() < deadline) {
-            try std.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake);
+            try native_platform.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake);
         }
         try std.testing.expect(operation.isComplete());
         try std.testing.expectEqual(@as(u64, 1), try state.storage().lastIndex());
@@ -2029,7 +2031,7 @@ test "wal replica state async append publishes on completion and retirement pres
 }
 
 test "wal replica state commit-only Ready avoids sync and recovers only proven commit" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-commit-only", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -2096,7 +2098,7 @@ test "wal replica state commit-only Ready avoids sync and recovers only proven c
 }
 
 test "wal replica state checkpoints when replay debt crosses byte threshold" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-checkpoint-bytes", .{tmp.sub_path});
@@ -2126,7 +2128,7 @@ test "wal replica state checkpoints when replay debt crosses byte threshold" {
 }
 
 test "wal replica state keeps replay debt bounded across repeated checkpoints" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-bounded-replay-debt", .{tmp.sub_path});
@@ -2182,7 +2184,7 @@ test "wal replica state keeps replay debt bounded across repeated checkpoints" {
 }
 
 test "wal replica state batches applied watermark persistence between durable checkpoints" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-batched-watermark", .{tmp.sub_path});
@@ -2245,7 +2247,7 @@ test "wal replica state batches applied watermark persistence between durable ch
 }
 
 test "wal replica state persists semantic compaction snapshot and preserves suffix" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-applied-compaction", .{tmp.sub_path});
@@ -2321,7 +2323,7 @@ test "wal replica state persists semantic compaction snapshot and preserves suff
 }
 
 test "wal replica state refuses a missing durable snapshot payload on reopen" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/missing-wal-snapshot", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -2343,12 +2345,12 @@ test "wal replica state refuses a missing durable snapshot payload on reopen" {
         });
     }
 
-    snapshot_payload_store.delete(std.testing.allocator, std.testing.io, layout.snapshot_dir, 6, 10);
+    snapshot_payload_store.delete(std.testing.allocator, native_platform.testing.io, layout.snapshot_dir, 6, 10);
     try std.testing.expectError(error.FileNotFound, WalReplicaState.init(std.testing.allocator, layout, cfg));
 }
 
 test "wal replica state reopens from full-image checkpoint plus newer delta tail" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-mixed-checkpoint-tail", .{tmp.sub_path});
@@ -2421,7 +2423,7 @@ test "wal replica state reopens from full-image checkpoint plus newer delta tail
 }
 
 test "wal replica state reopens from checkpoint when applied watermark sidecar is missing" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-checkpoint-without-watermark", .{tmp.sub_path});
@@ -2483,7 +2485,7 @@ test "wal replica state reopens from checkpoint when applied watermark sidecar i
 }
 
 test "wal replica state reopens with applied watermark newer than checkpoint" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-watermark-newer-than-checkpoint", .{tmp.sub_path});
@@ -2550,7 +2552,7 @@ test "wal replica state reopens with applied watermark newer than checkpoint" {
 }
 
 test "wal replica state stats report replay debt without checkpoint" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-replay-debt-stats", .{tmp.sub_path});
@@ -2601,7 +2603,7 @@ test "wal replica state stats report replay debt without checkpoint" {
 }
 
 test "wal replica state flush for shutdown checkpoints outstanding replay debt" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-shutdown-flush", .{tmp.sub_path});
@@ -2673,13 +2675,13 @@ test "wal replica state flush for shutdown checkpoints outstanding replay debt" 
 }
 fn awaitPersistence(operation: storage_iface.PendingReadyPersistence) !void {
     const deadline = WalReplicaState.nowNs() + 5 * std.time.ns_per_s;
-    while (!operation.isComplete() and WalReplicaState.nowNs() < deadline) try std.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake);
+    while (!operation.isComplete() and WalReplicaState.nowNs() < deadline) try native_platform.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake);
     try std.testing.expect(operation.isComplete());
     try operation.complete();
 }
 
 test "wal replica state async maintenance bounds debt and preserves newer application across checkpoint completion" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-async-maintenance", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -2733,7 +2735,7 @@ test "wal replica state async maintenance bounds debt and preserves newer applic
 }
 
 test "wal replica state async incoming snapshot owns payload and gates installation proof" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-async-snapshot", .{tmp.sub_path});
     defer std.testing.allocator.free(root);

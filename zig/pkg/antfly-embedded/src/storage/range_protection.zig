@@ -15,7 +15,9 @@
 
 //! Durable logical range generations. Activation is an explicit replicated
 //! capability transition, never a side effect of opening a database or reading.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const keys = @import("internal_keys.zig");
 
 pub const activation_key = "\x00\x00__metadata__:range_tracking";
@@ -255,9 +257,9 @@ test "range tracking inactive and same bucket mutation work is constant per batc
     inline for (.{ false, true }) |active| {
         var probe: Probe = .{ .active = active };
         var mutation: Mutation = .{};
-        const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        const start = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds;
         for (0..100_000) |_| try mutation.touch(&probe, physical);
-        const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
+        const elapsed = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds - start;
         try std.testing.expectEqual(@as(usize, if (active) 2 else 1), probe.gets);
         try std.testing.expectEqual(@as(usize, if (active) 1 else 0), probe.puts);
         std.debug.print("range tracking active={any} touches=100000 probes={d} counter_writes={d} elapsed_ns={d}\n", .{ active, probe.gets, probe.puts, elapsed });

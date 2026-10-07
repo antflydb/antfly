@@ -89,9 +89,9 @@ test "laya packed training graph matches packed serving logits, alone and in a p
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", scratch);
+    const dir = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", scratch);
     var words = synthetic.WordTokenizer{};
     const tok = words.tokenizer();
     // `fuse_layers` 3 fuses the head and the top encoder layer.
@@ -99,7 +99,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
     const pointer = ",\"decision_head\":\"pointer\"";
     for ([_]Case{ .{ .packing = "{\"mode\":\"question\"}" }, .{ .packing = "{\"mode\":\"candidate\"}" }, .{ .packing = "{\"mode\":\"question\",\"fuse_layers\":3}" }, .{ .packing = "{\"mode\":\"question\",\"question_first\":true}" }, .{ .packing = "{\"mode\":\"candidate\",\"question_first\":true}" }, .{ .packing = "{\"mode\":\"question\"}", .extra = pointer }, .{ .packing = "{\"mode\":\"question\",\"question_first\":true}", .extra = pointer } }) |case| for ([_]bool{ false, true }) |use_fused_attention| {
         const packing = case.packing;
-        try synthetic.writeModelWith(a, std.testing.io, dir, packing, case.extra, 128, 719);
+        try synthetic.writeModelWith(a, platform.testing.io, dir, packing, case.extra, 128, 719);
         const config = try modern.parseConfig(scratch, try files.readFileFromDir(scratch, dir, "config.json"));
         const laya = config.laya.?;
         var examples: [states.len]train.Example = undefined;
@@ -140,7 +140,7 @@ test "laya packed training graph matches packed serving logits, alone and in a p
         }
         std.debug.print("Laya packed {s}{s} (fused attention {}): training-graph vs serving max logit error={d}\n", .{ packing, case.extra, use_fused_attention, worst });
         try std.testing.expect(worst < 1e-4);
-        try tmp.dir.deleteFile(std.testing.io, "model.safetensors");
+        try tmp.dir.deleteFile(platform.testing.io, "model.safetensors");
     };
 }
 
@@ -221,12 +221,12 @@ test "laya pointer head gradients agree between native and resident Metal" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", scratch);
+    const dir = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", scratch);
     var words = synthetic.WordTokenizer{};
     const tok = words.tokenizer();
-    try synthetic.writeModelWith(a, std.testing.io, dir, "{\"mode\":\"question\"}", ",\"decision_head\":\"pointer\"", 128, 719);
+    try synthetic.writeModelWith(a, platform.testing.io, dir, "{\"mode\":\"question\"}", ",\"decision_head\":\"pointer\"", 128, 719);
     const config = try modern.parseConfig(scratch, try files.readFileFromDir(scratch, dir, "config.json"));
     var examples: [states.len]train.Example = undefined;
     for (&examples, states) |*e, state| e.* = try packedExample(scratch, (try tree.build(scratch, tok, config.laya.?, state, &questions, null))[0]);
@@ -337,11 +337,11 @@ fn exerciseParity(force_fused_attention: bool, trunk_sees_questions: bool, fuse_
     const job = @import("job.zig");
     const hf = @import("inference_hf_tokenizer");
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var temp = std.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
     const directory = try temp.dir.realPathFileAlloc(io, ".", scratch);
     const c = job.Config{

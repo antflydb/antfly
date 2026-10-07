@@ -473,8 +473,8 @@ fn noteNativeQuantDispatch(kind: NativeQuantDispatchKind) void {
 
 fn nativeQuantPhaseStart() u64 {
     if (!nativeQuantDispatchStatsEnabled()) return 0;
-    var timespec: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec))) {
+    var timespec: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &timespec))) {
         .SUCCESS => return @intCast(@as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec),
         else => return 0,
     }
@@ -48381,8 +48381,8 @@ test "native weight handle lifetime is bounded and releases reservations and laz
 
 test "native weight handle lifetime unwinds allocation failures" {
     inline for (.{ false, true }) |stack_owned| {
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ false, stack_owned });
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ true, stack_owned });
+        try platform.allocator.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ false, stack_owned });
+        try platform.allocator.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ true, stack_owned });
     }
 }
 
@@ -50332,7 +50332,7 @@ fn testNativeSplitLastDim3Lifetime(allocator: std.mem.Allocator, view_input: boo
 
 test "native splitLastDim3 allocation failures preserve input and release partial outputs" {
     for ([_]bool{ false, true }) |view_input| {
-        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testNativeSplitLastDim3Lifetime, .{view_input});
+        try platform.allocator.checkAllAllocationFailures(std.testing.allocator, testNativeSplitLastDim3Lifetime, .{view_input});
         try testNativeSplitLastDim3Lifetime(std.testing.allocator, view_input);
     }
 }

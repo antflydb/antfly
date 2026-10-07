@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
 const graph_mod = @import("graph.zig");
@@ -5438,7 +5440,7 @@ test "local pattern reader serves cross-table nodes only under a complete snapsh
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-xtable", .{tmp.sub_path});
@@ -5494,7 +5496,7 @@ test "pattern match supports linear alias bindings and cycles" {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-pattern", .{tmp.sub_path});

@@ -17,10 +17,12 @@
 //! and native generated-artifact caches cross the source/target boundary;
 //! identities and constraints are allocated by the target schema/row pipeline.
 
+const native_platform = @import("antfly_platform");
 const server_test_adapter = if (builtin.is_test) @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter else struct {};
 const builtin = @import("builtin");
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
+
 const identity = @import("doc_identity.zig");
 const activation = @import("relational_integrity_activation.zig");
 const catalog_mod = @import("relational_integrity_catalog.zig");
@@ -53,7 +55,7 @@ test "restore empty generation proves pristine owner and rejects source import" 
     for ([_][]const u8{ "{}", "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" }) |definition| {
         const db = @import("antfly_source_root").antfly_sources.physical_db;
         const alloc = std.testing.allocator;
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/empty-owner", .{tmp.sub_path});
         defer alloc.free(path);
@@ -99,7 +101,7 @@ test "restore graph empty generation rejects physical artifacts before staging" 
     const db = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     for ([_]enum { clean, edge, primary_artifact }{ .clean, .edge, .primary_artifact }) |case| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-empty-owner", .{tmp.sub_path});
         defer alloc.free(path);
@@ -341,7 +343,7 @@ test "relational integrity restore staging imports typed and document rows with 
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const types = @import("types.zig");
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_][]const u8{
         "{}",

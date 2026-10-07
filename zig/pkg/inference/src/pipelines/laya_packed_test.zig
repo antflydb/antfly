@@ -16,7 +16,9 @@
 //! Tree-packing invariants on a seeded synthetic checkpoint (LAYA.md,
 //! "Verification"). These need no fixtures; PyTorch agreement for the same
 //! layout is `laya_packed_parity_test.zig`.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const model = @import("../models/laya.zig");
 const pipeline = @import("laya.zig");
 const tree = @import("laya_tree.zig");
@@ -35,18 +37,18 @@ const questions = [_]pipeline.Question{
 };
 
 const Fixture = struct {
-    tmp: std.testing.TmpDir,
+    tmp: native_platform.testing.TmpDir,
     path: [:0]const u8,
     session: Session,
     cfg: model.Config,
     encoder: modern.Config,
 
     fn init(a: std.mem.Allocator, packing: ?[]const u8) !Fixture {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+        const path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
         errdefer a.free(path);
-        try synthetic.writeModel(a, std.testing.io, path, packing, 128, 717);
+        try synthetic.writeModel(a, native_platform.testing.io, path, packing, 128, 717);
         // ANTFLY_LAYA_BACKEND=metal runs the same invariants on Metal.
         const session = try @import("../util/laya_test_support.zig").createSession(a, path);
         errdefer session.close();
@@ -819,13 +821,13 @@ test "laya packed benchmark shared-state cost against unpacked" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const s = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const packed_dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", s);
-    var src = try std.Io.Dir.cwd().openDir(std.testing.io, source, .{ .iterate = true });
-    defer src.close(std.testing.io);
+    const packed_dir = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", s);
+    var src = try std.Io.Dir.cwd().openDir(native_platform.testing.io, source, .{ .iterate = true });
+    defer src.close(native_platform.testing.io);
     var it = src.iterate();
-    while (try it.next(std.testing.io)) |entry| {
+    while (try it.next(native_platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         const from = try std.fs.path.join(s, &.{ source, entry.name });
         if (std.mem.eql(u8, entry.name, "config.json")) {
@@ -835,8 +837,8 @@ test "laya packed benchmark shared-state cost against unpacked" {
             try object.put(s, "mode", .{ .string = "question" });
             try object.put(s, "max_packed_len", .{ .integer = 8192 });
             try parsed.value.object.getPtr("laya").?.object.put(s, "packing", .{ .object = object });
-            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = entry.name, .data = try std.json.Stringify.valueAlloc(s, parsed.value, .{}) });
-        } else try src.copyFile(entry.name, tmp.dir, entry.name, std.testing.io, .{});
+            try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = entry.name, .data = try std.json.Stringify.valueAlloc(s, parsed.value, .{}) });
+        } else try src.copyFile(entry.name, tmp.dir, entry.name, native_platform.testing.io, .{});
     }
     const tokenizer = try hf.HfTokenizer.loadFromBytes(a, try c_file.readFileFromDir(s, source, "tokenizer.json"));
     const tok = tokenizer.tokenizer();

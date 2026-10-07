@@ -16,7 +16,9 @@
 //! Physical retirement of an exact terminal obsolete initial-FK replica.
 //! The prepared ticket survives process death before/after rename. A receipt
 //! is created only after both rename parents and the unlinked intent are synced.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const fs = @import("antfly_runtime_fs").fs_paths;
 const contract = @import("../metadata/fk_initial_retirement_contract.zig");
 const auth = @import("../metadata/fk_initial_retirement_auth.zig");
@@ -713,10 +715,10 @@ fn testWorker(alloc: std.mem.Allocator, io: std.Io, root: []const u8, owner: *Te
 
 test "FK retirement worker recovers every durable unlink and ACK crash boundary" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     inline for (std.meta.tags(FaultPoint)) |point| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         defer alloc.free(root);
@@ -752,9 +754,9 @@ test "FK retirement worker recovers every durable unlink and ACK crash boundary"
 
 test "FK retirement worker refuses replaced roots hidden publication and missing proof" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -781,9 +783,9 @@ test "FK retirement worker refuses replaced roots hidden publication and missing
 
 test "FK retirement worker terminal ticket cancels offline hidden owner before unlink" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -809,9 +811,9 @@ test "FK retirement worker terminal ticket cancels offline hidden owner before u
 
 test "FK retirement worker published obsolete released root survives crash without cancellation or replacement deletion" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -845,9 +847,9 @@ test "FK retirement worker published obsolete released root survives crash witho
 
 test "FK retirement worker trash GC is bounded restartable no-follow and replacement fenced" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root_path);
@@ -907,9 +909,9 @@ test "FK retirement worker trash GC is bounded restartable no-follow and replace
 
 test "FK retirement worker recovery cursor skips bounded poison entries without starvation" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root_path);

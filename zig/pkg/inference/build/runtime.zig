@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Translator = @import("translate_c").Translator;
 const onnx_build = @import("onnx_graph").support;
 pub const OnnxModules = onnx_build.Modules;
@@ -414,7 +416,7 @@ pub fn create(config: Config) Graph {
     inference_mod.addImport("inference_internal", inference_mod);
     inference_internal_mod.addImport("inference_internal", inference_internal_mod);
 
-    return .{
+    const graph: Graph = .{
         .build_info_mod = shared.build_info_mod,
         .build_info_object = shared.build_info_object,
         .identities = identities,
@@ -460,6 +462,8 @@ pub fn create(config: Config) Graph {
         .inference_internal_mod = inference_internal_mod,
         .c_bindings = c_bindings,
     };
+    @import("antfly_platform").bindPlatform(graph, platform_mod);
+    return graph;
 }
 
 pub const CBindings = struct {
@@ -481,7 +485,7 @@ fn createCBindings(
 
     const include_dir = b.fmt("{s}/include", .{backend.onnx_root});
     const onnx = Translator.init(b.dependency("translate_c", .{}), .{
-        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
+        .libc_file = native_platform.macosSdkLibCFile(b, target),
         .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
         .target = target,
         .optimize = .debug,
@@ -489,7 +493,7 @@ fn createCBindings(
     });
     onnx.addIncludePath(b.graph.cwdRelativePath(include_dir));
     const ortgenai = Translator.init(b.dependency("translate_c", .{}), .{
-        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
+        .libc_file = native_platform.macosSdkLibCFile(b, target),
         .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
         .target = target,
         .optimize = .debug,
@@ -837,7 +841,7 @@ pub fn configureMetal(
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    @import("antfly_platform").addMacosSdkPaths(b, module, target);
+    native_platform.addMacosSdkPaths(b, module, target);
 }
 
 fn pathJoin(b: *std.Build, root: []const u8, relative_path: []const u8) []const u8 {

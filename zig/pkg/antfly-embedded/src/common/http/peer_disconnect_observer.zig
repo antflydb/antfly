@@ -13,9 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const builtin = @import("builtin");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+
+const platform_sync = native_platform.sync;
 const http_common = @import("http_common.zig");
 const thread_config = @import("../../runtime_thread_config.zig");
 
@@ -27,11 +29,11 @@ const linux_poll_rdhup: i16 = 0x2000;
 
 fn sleepMs(ms: u64) void {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
-    var req = std.posix.timespec{
+    var req = native_platform.c.timespec{
         .sec = @intCast(ms / std.time.ms_per_s),
         .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(native_platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -40,8 +42,8 @@ fn sleepMs(ms: u64) void {
 
 fn monotonicNowNs() ?u64 {
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return null;
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return null;
+    var ts: native_platform.c.timespec = undefined;
+    if (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return null;
     const seconds = std.math.cast(u64, ts.sec) orelse return null;
     const nanos = std.math.cast(u64, ts.nsec) orelse return null;
     return std.math.add(u64, std.math.mul(u64, seconds, std.time.ns_per_s) catch return null, nanos) catch null;
@@ -81,14 +83,14 @@ pub const Observer = struct {
 
     const PeerAction = struct {
         cancellation: *http_common.RequestCancellation,
-        peer_disconnects_total: ?*@import("antfly_platform").atomic.Value(u64),
-        observer_failures_total: ?*@import("antfly_platform").atomic.Value(u64),
+        peer_disconnects_total: ?*native_platform.atomic.Value(u64),
+        observer_failures_total: ?*native_platform.atomic.Value(u64),
     };
 
     const DeadlineAction = struct {
         state: *Deadline,
         expires_at_ns: u64,
-        expirations_total: ?*@import("antfly_platform").atomic.Value(u64),
+        expirations_total: ?*native_platform.atomic.Value(u64),
     };
 
     const ProbeAction = struct {
@@ -142,11 +144,11 @@ pub const Observer = struct {
     active_count: std.atomic.Value(usize) = .init(0),
     active_peer_count: std.atomic.Value(usize) = .init(0),
     active_deadline_count: std.atomic.Value(usize) = .init(0),
-    deadline_expirations_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    deadline_expirations_total: native_platform.atomic.Value(u64) = .init(0),
     stopping: std.atomic.Value(bool) = .init(false),
     // One reserved worker for all registrations, independent of request Io.
     scheduling_io: ?std.Io = null,
-    control_io: ?std.Io.Threaded = null,
+    control_io: ?native_platform.Threaded = null,
     future: ?std.Io.Future(void) = null,
     running: std.atomic.Value(bool) = .init(false),
     stop_event: std.Io.Event = .unset,
@@ -169,7 +171,7 @@ pub const Observer = struct {
     // The explicit limit also exercises partial-start rollback in tests.
     fn startWithControlLimit(self: *Observer, limit: std.Io.Limit) !void {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return;
-        const lifecycle_io = std.Io.Threaded.global_single_threaded.io();
+        const lifecycle_io = native_platform.Threaded.global_single_threaded.io();
         self.lifecycle_mutex.lockUncancelable(lifecycle_io);
         defer self.lifecycle_mutex.unlock(lifecycle_io);
         if (self.future != null) return error.AlreadyStarted;
@@ -185,7 +187,7 @@ pub const Observer = struct {
         };
         self.stopping.store(false, .release);
         self.stop_event = .unset;
-        if (self.scheduling_io == null) self.control_io = std.Io.Threaded.init(self.alloc, .{
+        if (self.scheduling_io == null) self.control_io = native_platform.Threaded.init(self.alloc, .{
             .stack_size = thread_config.minimum_partitioned_stack_size,
             .async_limit = .nothing,
             .concurrent_limit = limit,
@@ -199,7 +201,7 @@ pub const Observer = struct {
     }
 
     pub fn deinit(self: *Observer) void {
-        const lifecycle_io = std.Io.Threaded.global_single_threaded.io();
+        const lifecycle_io = native_platform.Threaded.global_single_threaded.io();
         self.lifecycle_mutex.lockUncancelable(lifecycle_io);
         defer self.lifecycle_mutex.unlock(lifecycle_io);
         self.stopping.store(true, .release);
@@ -228,8 +230,8 @@ pub const Observer = struct {
         self: *Observer,
         fd: std.posix.fd_t,
         cancellation: *http_common.RequestCancellation,
-        peer_disconnects_total: ?*@import("antfly_platform").atomic.Value(u64),
-        observer_failures_total: ?*@import("antfly_platform").atomic.Value(u64),
+        peer_disconnects_total: ?*native_platform.atomic.Value(u64),
+        observer_failures_total: ?*native_platform.atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding) return .{};
         if (!self.running.load(.acquire) or self.stopping.load(.acquire)) return error.ObserverUnavailable;
@@ -263,7 +265,7 @@ pub const Observer = struct {
         fd: std.posix.fd_t,
         timeout_ms: u32,
         state: *Deadline,
-        expirations_total: ?*@import("antfly_platform").atomic.Value(u64),
+        expirations_total: ?*native_platform.atomic.Value(u64),
     ) !Registration {
         if (comptime builtin.os.tag == .windows or builtin.os.tag == .freestanding)
             return error.ObserverUnavailable;
@@ -452,7 +454,7 @@ pub const Observer = struct {
         var events: std.ArrayListUnmanaged(std.posix.Kevent) = .empty;
         defer events.deinit(self.alloc);
         const kq = self.kernel_fd orelse return;
-        const timeout = std.posix.timespec{ .sec = 0, .nsec = observation_interval_ms * std.time.ns_per_ms };
+        const timeout = native_platform.c.timespec{ .sec = 0, .nsec = observation_interval_ms * std.time.ns_per_ms };
         events.resize(self.alloc, self.capacity) catch return self.stopAfterRuntimeFailure();
 
         while (!self.stopping.load(.acquire)) {
@@ -504,7 +506,7 @@ pub const Observer = struct {
             .udata = @intCast(id),
         }};
         var ignored: [1]std.posix.Kevent = undefined;
-        const timeout = std.posix.timespec{ .sec = 0, .nsec = 0 };
+        const timeout = native_platform.c.timespec{ .sec = 0, .nsec = 0 };
         const rc = std.posix.system.kevent(kq, &changes, changes.len, &ignored, 0, &timeout);
         if (std.posix.errno(rc) != .SUCCESS) return error.ObserverUnavailable;
     }
@@ -880,9 +882,9 @@ test "peer observer rolls back refused control capacity before retry" {
 
 test "observer borrows reserved capacity without owning its executor" {
     if (builtin.os.tag == .freestanding or builtin.os.tag == .windows) return error.SkipZigTest;
-    var unavailable = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    var unavailable = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
     defer unavailable.deinit();
-    var lane = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    var lane = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
     defer lane.deinit();
     var observer = Observer.init(std.testing.allocator, 2);
     defer observer.deinit();

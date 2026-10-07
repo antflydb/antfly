@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const ant_json = @import("antfly-json");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -67,7 +69,7 @@ pub fn addIndexToTableIndexesJson(
 ) ![]u8 {
     return try addIndexToTableIndexesJsonWithIo(
         alloc,
-        std.Io.Threaded.global_single_threaded.io(),
+        native_platform.Threaded.global_single_threaded.io(),
         current_indexes_json,
         index_name,
         index_json,

@@ -17,7 +17,9 @@
 //! derived from the existing optimizer owner's durable counters: there is no
 //! second cursor file that can commit before or after its checkpoint. This is a
 //! native replay protocol, not a claim to reproduce PyTorch's RNG bitstream.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const optimizers = @import("ml").graph.optimizers;
 const controller = @import("../seeded_gradient_trainer.zig");
 const bundle = @import("../../models/gliner_boundary_bundle.zig");
@@ -342,7 +344,7 @@ test "boundary training run resumes ordered examples from optimizer counters acr
     const parameters = [_]controller.Parameter{.{ .name = "classifier.3.bias", .dimensions = &.{1}, .values = &.{0.5}, .group = 1 }};
     var trainer = try controller.Trainer.init(a, &cb, &parameters, plan.optimizerConfig(.{}));
     defer trainer.deinit();
-    var temporary = std.testing.tmpDir(.{});
+    var temporary = native_platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/run.safetensors", .{temporary.sub_path});
     defer a.free(path);
@@ -422,7 +424,7 @@ test "boundary training run bounds memory rejects quantized profiles and replays
 }
 
 test "boundary training run allocation failures reclaim order and fingerprint buffers" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseOrder, .{});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseOrder, .{});
 }
 
 test "boundary training run clipping order resolves canonical aliases" {

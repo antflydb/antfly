@@ -541,24 +541,24 @@ test "boundary training job rejects invalid paths modes precision and combined a
     invalid.version = 2;
     var admission = memory.AdmissionController{};
     defer admission.deinit();
-    try std.testing.expectError(error.InvalidBoundaryTrainingJob, execute(a, std.testing.io, invalid, &admission, .{}, null));
+    try std.testing.expectError(error.InvalidBoundaryTrainingJob, execute(a, platform.testing.io, invalid, &admission, .{}, null));
     try std.testing.expectEqual(@as(usize, 0), admission.snapshot().hostTotalBytes());
-    var temporary = std.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const relative = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer a.free(relative);
-    const existing = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, relative, a);
+    const existing = try std.Io.Dir.cwd().realPathFileAlloc(platform.testing.io, relative, a);
     defer a.free(existing);
     var reuse = parsed.value;
     reuse.source_dir = "/nonexistent-gliner25-source";
     reuse.output_dir = existing;
-    try std.testing.expectError(error.PathAlreadyExists, execute(a, std.testing.io, reuse, &admission, .{}, null));
+    try std.testing.expectError(error.PathAlreadyExists, execute(a, platform.testing.io, reuse, &admission, .{}, null));
     try std.testing.expectEqual(@as(usize, 0), admission.snapshot().hostTotalBytes());
 }
 
 fn exerciseReceipt(a: Allocator) !void {
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    const io = platform.testing.io;
+    var temporary = platform.testing.tmpDir(.{ .iterate = true });
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/result.json", .{temporary.sub_path});
     defer a.free(path);
@@ -584,7 +584,7 @@ fn exerciseReceipt(a: Allocator) !void {
 
 test "boundary training job receipts publish atomically without replacement and clean allocation failures" {
     try exerciseReceipt(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseReceipt, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseReceipt, .{});
 }
 
 fn admissionTestConfig() Config {
@@ -725,8 +725,8 @@ test "boundary training job cooperative pause combines callback and invocation l
 }
 
 fn exerciseConfigSnapshot(a: Allocator) !void {
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/job.json", .{temporary.sub_path});
     defer a.free(path);
@@ -759,7 +759,7 @@ fn exerciseConfigSnapshot(a: Allocator) !void {
 
 test "boundary training job config snapshot binds consumed bytes and cleans allocation failures" {
     try exerciseConfigSnapshot(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseConfigSnapshot, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseConfigSnapshot, .{});
 }
 
 test "boundary training job dataset open preserves declared and backing allocation errors before model loading" {

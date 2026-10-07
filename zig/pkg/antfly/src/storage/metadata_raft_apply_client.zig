@@ -17,7 +17,9 @@
 //! Each projection crosses as one owned control-plane JSON envelope; backend
 //! transactions, cursors, and individual records remain inside the kernel.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
 const contract = @import("../metadata/storage/raft_apply_contract.zig");
@@ -231,7 +233,7 @@ pub const RaftApplyStore = struct {
         const Adapter = @import("metadata_hot_standby_adapter.zig").Adapter;
         const next = try self.alloc.create(Adapter);
         errdefer self.alloc.destroy(next);
-        next.* = .{ .alloc = self.alloc, .io_impl = std.Io.Threaded.init(self.alloc, .{}), .gate = gate, .mirror = mirror };
+        next.* = .{ .alloc = self.alloc, .io_impl = native_platform.Threaded.init(self.alloc, .{}), .gate = gate, .mirror = mirror };
         errdefer next.io_impl.deinit();
         const port = next.asPort();
         try statusToError(abi.antfly_metadata_apply_store_bind_ha(self.handle, &.{ .port = &port }));
@@ -919,8 +921,8 @@ pub const RaftApplyStore = struct {
 
     fn addListeners(self: *RaftApplyStore, projection_listener: ?ProjectionListener, committed_listener: ?CommittedKeyListener) !LifecycleListenerRegistration {
         if (projection_listener) |listener| try listener.validate();
-        self.listeners_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.listeners_mutex.unlock(std.Options.debug_io);
+        self.listeners_mutex.lockUncancelable(native_platform.debug_io);
+        defer self.listeners_mutex.unlock(native_platform.debug_io);
         try self.listeners.ensureUnusedCapacity(self.alloc, 1);
         const registration = try self.alloc.create(ListenerRegistration);
         errdefer self.alloc.destroy(registration);
@@ -965,8 +967,8 @@ pub const RaftApplyStore = struct {
         return try self.addListeners(projection_listener, committed_listener);
     }
     pub fn removeLifecycleListeners(self: *RaftApplyStore, token: LifecycleListenerRegistration) bool {
-        self.listeners_mutex.lockUncancelable(std.Options.debug_io);
-        defer self.listeners_mutex.unlock(std.Options.debug_io);
+        self.listeners_mutex.lockUncancelable(native_platform.debug_io);
+        defer self.listeners_mutex.unlock(native_platform.debug_io);
         for (self.listeners.items, 0..) |registration, index| {
             if (registration.id != token.id) continue;
             if (abi.antfly_metadata_apply_store_remove_listeners(self.handle, token.id) == 0) return false;

@@ -13,11 +13,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const bridge = @import("antfly_runtime_abi").io_abi;
 var inject = false;
 const vtable: std.Io.VTable = blk: {
-    var table = std.Options.debug_io.vtable.*;
+    var table = native_platform.debug_io.vtable.*;
     table.dirOpenFile = open;
     table.sleep = sleep;
     table.operate = operate;
@@ -28,18 +30,18 @@ const vtable: std.Io.VTable = blk: {
 
 fn open(ptr: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
     if (inject) return error.AccessDenied;
-    return std.Options.debug_io.vtable.dirOpenFile(ptr, dir, path, options);
+    return native_platform.debug_io.vtable.dirOpenFile(ptr, dir, path, options);
 }
 fn sleep(ptr: ?*anyopaque, timeout: std.Io.Timeout) std.Io.Cancelable!void {
     if (inject) return error.Canceled;
-    return std.Options.debug_io.vtable.sleep(ptr, timeout);
+    return native_platform.debug_io.vtable.sleep(ptr, timeout);
 }
 fn operate(ptr: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
     if (inject) return switch (operation) {
         .net_send => .{ .net_send = .{ error.NetworkDown, 0 } },
         else => .{ .file_read_streaming = error.InputOutput },
     };
-    return std.Options.debug_io.vtable.operate(ptr, operation);
+    return native_platform.debug_io.vtable.operate(ptr, operation);
 }
 fn copyFile(ptr: ?*anyopaque, file: std.Io.File, header: []const u8, reader: *std.Io.File.Reader, limit: std.Io.Limit, offset: u64) std.Io.File.WriteFilePositionalError!usize {
     if (inject) {
@@ -50,10 +52,10 @@ fn copyFile(ptr: ?*anyopaque, file: std.Io.File, header: []const u8, reader: *st
         reader.seek_err = error.EndOfStream;
         return error.ReadFailed;
     }
-    return std.Options.debug_io.vtable.fileWriteFilePositional(ptr, file, header, reader, limit, offset);
+    return native_platform.debug_io.vtable.fileWriteFilePositional(ptr, file, header, reader, limit, offset);
 }
 fn batchAwait(ptr: ?*anyopaque, batch: *std.Io.Batch) std.Io.Cancelable!void {
-    if (!inject) return std.Options.debug_io.vtable.batchAwaitAsync(ptr, batch);
+    if (!inject) return native_platform.debug_io.vtable.batchAwaitAsync(ptr, batch);
     // A completed result may be retained by the caller across await calls.
     var index = batch.completed.head;
     while (index != .none) {
@@ -64,13 +66,13 @@ fn batchAwait(ptr: ?*anyopaque, batch: *std.Io.Batch) std.Io.Cancelable!void {
     }
 }
 export fn runtime_io_abi_test_borrow(output: *bridge.Borrow) callconv(.c) void {
-    const runtime = std.heap.page_allocator.create(std.Io.Threaded) catch @panic("test allocator exhausted");
-    runtime.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    const runtime = std.heap.page_allocator.create(native_platform.Threaded) catch @panic("test allocator exhausted");
+    runtime.* = native_platform.Threaded.init(std.heap.page_allocator, .{});
     const io: std.Io = .{ .userdata = runtime, .vtable = &vtable };
     output.* = bridge.Borrow.init(&io);
 }
 export fn runtime_io_abi_test_destroy(borrow: *const bridge.Borrow) callconv(.c) void {
-    const runtime: *std.Io.Threaded = @ptrCast(@alignCast(borrow.userdata.?));
+    const runtime: *native_platform.Threaded = @ptrCast(@alignCast(borrow.userdata.?));
     runtime.deinit();
     std.heap.page_allocator.destroy(runtime);
 }

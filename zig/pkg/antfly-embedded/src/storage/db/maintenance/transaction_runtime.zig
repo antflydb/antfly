@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const driver = @import("transaction_recovery_driver.zig");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -22,7 +24,7 @@ const lsm_backend = @import("../../lsm_backend.zig");
 const mem_backend = @import("../../mem_backend.zig");
 const transactions_mod = @import("../../transactions.zig");
 const types = @import("../types.zig");
-const platform_clock = @import("antfly_platform").clock;
+const platform_clock = native_platform.clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
 
 pub const Config = @import("../transaction_recovery_contract.zig").Config;
@@ -208,7 +210,7 @@ test "local transaction recovery factory releases owned adapters on initializati
     defer backend.close();
     var store = try backend.runtimeStore(alloc, .{ .name = "factory-failure" });
     defer store.deinit();
-    var background = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .filesystem_io = std.testing.io });
+    var background = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .filesystem_io = native_platform.testing.io });
     defer background.deinit();
     const Failure = struct {
         fn create(_: *anyopaque, _: Allocator, _: backend_erased.Store, _: *background_runtime_mod.BackendRuntime, _: contract.CreateContext) !contract.OwnedRuntime {

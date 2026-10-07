@@ -35,13 +35,13 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
 }
 
-fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
+fn threadedIo() if (builtin.os.tag == .freestanding) void else platform.Threaded {
     if (builtin.os.tag == .freestanding) return;
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+    return platform.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn spinOrYield() void {
-    if (builtin.os.tag == .freestanding) std.atomic.spinLoopHint() else @import("antfly_platform").time.yieldNow();
+    if (builtin.os.tag == .freestanding) std.atomic.spinLoopHint() else platform.time.yieldNow();
 }
 
 fn sleepPollInterval() void {

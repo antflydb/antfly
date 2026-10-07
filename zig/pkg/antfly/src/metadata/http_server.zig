@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const store_report_baseline = @import("store_report_baseline.zig");
 const snapshot_transfer = @import("snapshot_transfer.zig");
 const store_report_update = @import("store_report_update.zig");
@@ -47,8 +49,8 @@ const indexes_api = @import("../api/indexes.zig");
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const tables_api = @import("../api/tables.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
+const platform_clock = native_platform.clock;
+const platform_time = native_platform.time;
 const routes = @import("http_routes.zig");
 const service = @import("service.zig");
 const table_topology_mutations = @import("table_topology_mutations.zig");
@@ -1344,8 +1346,8 @@ pub const AdminSource = struct {
 
     fn metadataServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
-        svc.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
-        defer svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
+        svc.cdc_runtime_mutex.lockUncancelable(native_platform.debug_io);
+        defer svc.cdc_runtime_mutex.unlock(native_platform.debug_io);
         return try reseedReplicationSourceExactCutoverForService(service.MetadataService, svc, alloc, table_name, source_ordinal, flushMetadataServiceMutation);
     }
 
@@ -1814,8 +1816,8 @@ pub const AdminSource = struct {
 
     fn metadataHttpServiceReseedReplicationSourceExactCutover(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, source_ordinal: u32) !ReseedExactCutoverResult {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        svc.cdc_runtime_mutex.lockUncancelable(std.Options.debug_io);
-        defer svc.cdc_runtime_mutex.unlock(std.Options.debug_io);
+        svc.cdc_runtime_mutex.lockUncancelable(native_platform.debug_io);
+        defer svc.cdc_runtime_mutex.unlock(native_platform.debug_io);
         return try reseedReplicationSourceExactCutoverForService(service.MetadataHttpService, svc, alloc, table_name, source_ordinal, flushMetadataHttpServiceMutation);
     }
 
@@ -2103,7 +2105,7 @@ pub const MetadataHttpServer = struct {
                 self.setting_authority_issuer orelse return ctx.status(403).text("setting authority unavailable"),
                 if (admin_grant) .admin else .read,
                 body,
-                @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)),
+                @intCast(@divFloor(native_platform.time.realtimeNs(), std.time.ns_per_s)),
                 ctx.header(authority.header_name) orelse return ctx.status(403).text("setting authority grant required"),
             ) catch return ctx.status(403).text("invalid setting authority grant");
         }
@@ -2361,7 +2363,7 @@ pub const MetadataHttpServer = struct {
     ) !httpx.Response {
         var request = try httpx.Request.init(std.testing.allocator, method, uri);
         defer request.deinit();
-        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
         defer ctx.deinit();
         ctx.params = params;
         return handler(self, &ctx);
@@ -2378,7 +2380,7 @@ pub const MetadataHttpServer = struct {
         var request = try httpx.Request.init(std.testing.allocator, method, uri);
         defer request.deinit();
         try request.setBody(body);
-        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
         defer ctx.deinit();
         ctx.params = params;
         return handler(self, &ctx);
@@ -5244,7 +5246,7 @@ test "metadata route wire conversion preserves its absolute deadline" {
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
     var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_await_route);
     defer request.deinit();
-    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
     defer ctx.deinit();
     var response = try server.trackedCatalogRouteResultUntil(
         &ctx,
@@ -5267,7 +5269,7 @@ test "metadata route wire conversion preserves its absolute deadline" {
     };
     var expired_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer expired_request.deinit();
-    var expired_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &expired_request);
+    var expired_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &expired_request);
     defer expired_ctx.deinit();
     expired_ctx.application_deadline_ns = 1;
     var expired_response = try server.trackedRoutingSnapshotJsonUntil(&expired_ctx, empty_snapshot);
@@ -5279,7 +5281,7 @@ test "metadata route wire conversion preserves its absolute deadline" {
     var canceled = std.atomic.Value(bool).init(true);
     var canceled_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer canceled_request.deinit();
-    var canceled_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &canceled_request);
+    var canceled_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &canceled_request);
     defer canceled_ctx.deinit();
     canceled_ctx.cancellation = &canceled;
     var canceled_response = try server.trackedRoutingSnapshotJsonUntil(&canceled_ctx, empty_snapshot);
@@ -5308,7 +5310,7 @@ test "metadata route wire conversion preserves its absolute deadline" {
     var cancellation_probe = CancelAfterCheckpoints{};
     var interrupted_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer interrupted_request.deinit();
-    var interrupted_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &interrupted_request);
+    var interrupted_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &interrupted_request);
     defer interrupted_ctx.deinit();
     interrupted_ctx.cancellation_probe = .{
         .ptr = &cancellation_probe,
@@ -5323,7 +5325,7 @@ test "metadata route wire conversion preserves its absolute deadline" {
 
     var snapshot_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer snapshot_request.deinit();
-    var snapshot_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &snapshot_request);
+    var snapshot_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &snapshot_request);
     defer snapshot_ctx.deinit();
     snapshot_ctx.application_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
     var snapshot_response = try server.trackedRoutingSnapshotJsonUntil(&snapshot_ctx, empty_snapshot);
@@ -5438,7 +5440,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
         try request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
         try request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
         try request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
-        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
         defer ctx.deinit();
         var response = try server.metadataSystemCatalog(&ctx);
         defer response.deinit();
@@ -5460,7 +5462,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     try status_request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
     try status_request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
     try status_request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
-    var unauthenticated_ctx = httpx.Context.init(alloc, std.testing.io, &status_request);
+    var unauthenticated_ctx = httpx.Context.init(alloc, native_platform.testing.io, &status_request);
     defer unauthenticated_ctx.deinit();
     var unauthenticated = try server.metadataSystemCatalog(&unauthenticated_ctx);
     defer unauthenticated.deinit();
@@ -5468,7 +5470,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     try std.testing.expectEqual(@as(usize, 0), fixture.status_reads);
     vtable.catalog_identity = Fixture.identity;
     try status_request.headers.append(@import("../api/internal_service_auth.zig").header_name, "host-verified-service-token");
-    var authenticated_ctx = httpx.Context.init(alloc, std.testing.io, &status_request);
+    var authenticated_ctx = httpx.Context.init(alloc, native_platform.testing.io, &status_request);
     defer authenticated_ctx.deinit();
     var authenticated = try server.metadataSystemCatalog(&authenticated_ctx);
     defer authenticated.deinit();
@@ -5481,7 +5483,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     var admin_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
     defer admin_request.deinit();
     try admin_request.setBody(admin_body);
-    var admin_ctx = httpx.Context.init(alloc, std.testing.io, &admin_request);
+    var admin_ctx = httpx.Context.init(alloc, native_platform.testing.io, &admin_request);
     defer admin_ctx.deinit();
     var rejected = try server.metadataSystemCatalog(&admin_ctx);
     defer rejected.deinit();
@@ -5489,11 +5491,11 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     // Even a service-authenticated caller cannot invent an administrator
     // grant; the second proof is signed over this exact mutation body.
     const service_auth = @import("../api/internal_service_auth.zig");
-    const service_token = try service_auth.tokenAlloc(alloc, .{ .secret = "0123456789abcdef0123456789abcdef", .issuer = "cluster-a" }, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    const service_token = try service_auth.tokenAlloc(alloc, .{ .secret = "0123456789abcdef0123456789abcdef", .issuer = "cluster-a" }, @intCast(@divFloor(native_platform.time.realtimeNs(), std.time.ns_per_s)));
     defer alloc.free(service_token);
     try admin_request.headers.append(service_auth.header_name, service_token);
     try admin_request.headers.append(@import("../system_catalog/setting_authority.zig").header_name, "v1:9999999999:0000");
-    var spoofed_ctx = httpx.Context.init(alloc, std.testing.io, &admin_request);
+    var spoofed_ctx = httpx.Context.init(alloc, native_platform.testing.io, &admin_request);
     defer spoofed_ctx.deinit();
     var spoofed = try server.metadataSystemCatalog(&spoofed_ctx);
     defer spoofed.deinit();
@@ -5501,7 +5503,7 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     const scope_body = try std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/server_call.zig").Call{ .setting_snapshot = .{ .principal = "alice", .database = "main" } }, .{});
     defer alloc.free(scope_body);
     const authority = @import("../system_catalog/setting_authority.zig");
-    const read_grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, scope_body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+    const read_grant = try authority.sign(alloc, "separate-setting-authority-secret", "cluster-a", .read, scope_body, @intCast(@divFloor(native_platform.time.realtimeNs(), std.time.ns_per_s)));
     defer alloc.free(read_grant);
     var read_request = try httpx.Request.init(alloc, .POST, "/internal/v1/system-catalog");
     defer read_request.deinit();
@@ -5511,14 +5513,14 @@ test "system catalog read identity avoids diagnostic inventories and fences repl
     try read_request.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
     try read_request.headers.append(routes.Routes.raft_mutation_forwards_remaining_header, "0");
     try read_request.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
-    var read_ctx = httpx.Context.init(alloc, std.testing.io, &read_request);
+    var read_ctx = httpx.Context.init(alloc, native_platform.testing.io, &read_request);
     defer read_ctx.deinit();
     vtable.catalog_identity = Fixture.identity;
     var read_response = try server.metadataSystemCatalog(&read_ctx);
     defer read_response.deinit();
     try std.testing.expectEqual(@as(u16, 200), read_response.status.code);
     try read_request.setBody("{\"setting_snapshot\":{\"principal\":\"mallory\",\"database\":\"main\"}}");
-    var changed_ctx = httpx.Context.init(alloc, std.testing.io, &read_request);
+    var changed_ctx = httpx.Context.init(alloc, native_platform.testing.io, &read_request);
     defer changed_ctx.deinit();
     var changed = try server.metadataSystemCatalog(&changed_ctx);
     defer changed.deinit();
@@ -5635,7 +5637,7 @@ test "metadata routing server converts relative budget to local deadline" {
     var request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer request.deinit();
     try request.headers.append(routes.routing_remaining_ms_header, "250");
-    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
     defer ctx.deinit();
 
     const before_ns = platform_time.monotonicNs();
@@ -5648,7 +5650,7 @@ test "metadata routing server converts relative budget to local deadline" {
 
     var default_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer default_request.deinit();
-    var default_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &default_request);
+    var default_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &default_request);
     defer default_ctx.deinit();
     const default_before_ns = platform_time.monotonicNs();
     try MetadataHttpServer.applyRoutingBudget(&default_ctx);
@@ -5659,7 +5661,7 @@ test "metadata routing server converts relative budget to local deadline" {
     var capped_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer capped_request.deinit();
     try capped_request.headers.append(routes.routing_remaining_ms_header, "60000");
-    var capped_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &capped_request);
+    var capped_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &capped_request);
     defer capped_ctx.deinit();
     const capped_before_ns = platform_time.monotonicNs();
     try MetadataHttpServer.applyRoutingBudget(&capped_ctx);
@@ -5670,7 +5672,7 @@ test "metadata routing server converts relative budget to local deadline" {
     var ingress_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer ingress_request.deinit();
     try ingress_request.headers.append(routes.routing_remaining_ms_header, "2000");
-    var ingress_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &ingress_request);
+    var ingress_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &ingress_request);
     defer ingress_ctx.deinit();
     const ingress_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
     ingress_ctx.application_deadline_ns = ingress_deadline_ns;
@@ -5681,7 +5683,7 @@ test "metadata routing server converts relative budget to local deadline" {
     var canceled = std.atomic.Value(bool).init(true);
     var canceled_request = try httpx.Request.init(std.testing.allocator, .GET, routes.Routes.routing_snapshot);
     defer canceled_request.deinit();
-    var canceled_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &canceled_request);
+    var canceled_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &canceled_request);
     defer canceled_ctx.deinit();
     canceled_ctx.cancellation = &canceled;
     var canceled_response = try server.metadataRoutingSnapshot(&canceled_ctx);
@@ -5697,7 +5699,7 @@ test "metadata routing server converts relative budget to local deadline" {
     );
     defer linearizable_request.deinit();
     try linearizable_request.headers.append(routes.routing_remaining_ms_header, "125");
-    var linearizable_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &linearizable_request);
+    var linearizable_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &linearizable_request);
     defer linearizable_ctx.deinit();
     const linearizable_before_ns = platform_time.monotonicNs();
     var linearizable_response = try server.metadataLinearizableRoutingSnapshot(&linearizable_ctx);
@@ -5716,7 +5718,7 @@ test "metadata routing server converts relative budget to local deadline" {
     defer table_request.deinit();
     table_request.body = "{\"table_name\":\"docs\"}";
     try table_request.headers.append(routes.routing_remaining_ms_header, "125");
-    var table_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &table_request);
+    var table_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &table_request);
     defer table_ctx.deinit();
     var table_response = try server.metadataTableRoutingSnapshot(&table_ctx);
     defer table_response.deinit();
@@ -5737,7 +5739,7 @@ test "metadata routing server converts relative budget to local deadline" {
     defer change_request.deinit();
     change_request.body = "{\"observed_token\":{\"metadata_group_id\":4,\"revision\":8},\"confirm_absence\":true}";
     try change_request.headers.append(routes.routing_remaining_ms_header, "100");
-    var change_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &change_request);
+    var change_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &change_request);
     defer change_ctx.deinit();
     var change_response = try server.metadataRoutingChange(&change_ctx);
     defer change_response.deinit();
@@ -5757,7 +5759,7 @@ test "metadata routing server converts relative budget to local deadline" {
     defer route_request.deinit();
     route_request.body = "{\"query\":{\"table_name\":\"docs\",\"selector\":\"all_ranges\"}}";
     try route_request.headers.append(routes.routing_remaining_ms_header, "100");
-    var route_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &route_request);
+    var route_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &route_request);
     defer route_ctx.deinit();
     var route_response = try server.metadataAwaitRoute(&route_ctx);
     defer route_response.deinit();
@@ -8155,7 +8157,7 @@ test "forwarded table mutation uses its single campaign allowance" {
     try request.setHeader(routes.Routes.raft_mutation_forwards_remaining_header, "1");
     try request.setHeader(routes.Routes.raft_mutation_campaign_allowed_header, "true");
     try request.setBody(body);
-    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
     defer ctx.deinit();
 
     var source = FakeSource{};
@@ -8220,7 +8222,7 @@ test "invalid forwarded table mutation never preflights or campaigns" {
     try request.setHeader(routes.Routes.raft_mutation_forwards_remaining_header, "1");
     try request.setHeader(routes.Routes.raft_mutation_campaign_allowed_header, "true");
     try request.setBody(body);
-    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
     defer ctx.deinit();
 
     var source = FakeSource{};
@@ -8239,7 +8241,7 @@ test "invalid forwarded table mutation never preflights or campaigns" {
 test "table topology mutation non-application response never claims non-admission" {
     var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_forwarded_table_mutation);
     defer request.deinit();
-    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
     defer ctx.deinit();
     try ctx.setHeader(routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown);
     var response = try MetadataHttpServer.metadataMutationError(&ctx, error.MetadataMutationNotApplied);
@@ -8258,7 +8260,7 @@ test "metadata mutation pre-admission responses prove proposal was not admitted"
     for (errors) |err| {
         var request = try httpx.Request.init(std.testing.allocator, .POST, "/internal/v1/reallocate");
         defer request.deinit();
-        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
         defer ctx.deinit();
 
         var resp = try MetadataHttpServer.metadataMutationError(&ctx, err);
@@ -8274,7 +8276,7 @@ test "metadata mutation pre-admission responses prove proposal was not admitted"
 test "metadata node lifecycle distinguishes pre-admission rejection from partial outcome" {
     var rejected_request = try httpx.Request.init(std.testing.allocator, .PUT, "/internal/v1/nodes/9/shutdown");
     defer rejected_request.deinit();
-    var rejected_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &rejected_request);
+    var rejected_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &rejected_request);
     defer rejected_ctx.deinit();
 
     var rejected = try MetadataHttpServer.nodeLifecycleMutationError(&rejected_ctx, error.ProposalDropped);
@@ -8287,7 +8289,7 @@ test "metadata node lifecycle distinguishes pre-admission rejection from partial
 
     var partial_request = try httpx.Request.init(std.testing.allocator, .PUT, "/internal/v1/nodes/9/shutdown");
     defer partial_request.deinit();
-    var partial_ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &partial_request);
+    var partial_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &partial_request);
     defer partial_ctx.deinit();
 
     var partial = try MetadataHttpServer.nodeLifecycleMutationError(&partial_ctx, error.MetadataMutationOutcomeUnknown);
@@ -8303,7 +8305,7 @@ test "metadata node lifecycle distinguishes pre-admission rejection from partial
 test "metadata node protocol readiness is unavailable without whole-request retry proof" {
     var request = try httpx.Request.init(std.testing.allocator, .POST, routes.Routes.internal_nodes);
     defer request.deinit();
-    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
     defer ctx.deinit();
     var response = try MetadataHttpServer.nodeMutationError(&ctx, error.RuntimeStatusProtocolUnavailable);
     defer response.deinit();

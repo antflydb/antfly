@@ -20,6 +20,7 @@
 // forward pass, score extraction, and sigmoid/softmax postprocess, but not
 // process startup or model loading.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 const inference = @import("inference_internal");
@@ -347,8 +348,8 @@ fn docsForCount(allocator: std.mem.Allocator, source: []const []const u8, count:
 }
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+    var ts: native_platform.c.timespec = undefined;
+    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }

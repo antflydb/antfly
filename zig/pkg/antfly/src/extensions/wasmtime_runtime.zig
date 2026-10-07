@@ -13,6 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const wasmtime_lib_env = "ANTFLY_WASMTIME_LIB";
@@ -40,7 +41,7 @@ pub const HostImports = struct {
 };
 
 pub const InvokeOptions = struct {
-    io: std.Io = std.Options.debug_io,
+    io: std.Io = native_platform.debug_io,
     host_imports: HostImports = .{},
     package_store_root: ?[]const u8 = null,
     fuel: u64 = 50_000_000,
@@ -87,7 +88,7 @@ pub fn invokeExtensionWithOptions(
 }
 
 fn resolveArtifactPathAlloc(alloc: std.mem.Allocator, binding: RuntimeBinding, package_store_root: ?[]const u8) InvokeError![]u8 {
-    return resolveArtifactPathAllocWithIo(alloc, std.Options.debug_io, binding, package_store_root);
+    return resolveArtifactPathAllocWithIo(alloc, native_platform.debug_io, binding, package_store_root);
 }
 
 fn resolveArtifactPathAllocWithIo(alloc: std.mem.Allocator, io: std.Io, binding: RuntimeBinding, package_store_root: ?[]const u8) InvokeError![]u8 {
@@ -156,10 +157,10 @@ fn artifactPathExistsWithIo(io: std.Io, path: []const u8) !void {
 }
 
 test "wasmtime runtime resolves canonical package store artifacts" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf/target/wasm32-wasip2/release");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(native_platform.testing.io, "extensions/memoryaf/target/wasm32-wasip2/release");
+    try tmp.dir.writeFile(native_platform.testing.io, .{
         .sub_path = "extensions/memoryaf/target/wasm32-wasip2/release/memoryaf_extension.wasm",
         .data = &component_magic,
     });
@@ -179,15 +180,15 @@ test "wasmtime runtime resolves canonical package store artifacts" {
 }
 
 test "wasmtime runtime resolves content-addressed package store artifacts first" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "extensions/sha256/abc123/target/wasm32-wasip2/release");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(native_platform.testing.io, "extensions/sha256/abc123/target/wasm32-wasip2/release");
+    try tmp.dir.writeFile(native_platform.testing.io, .{
         .sub_path = "extensions/sha256/abc123/target/wasm32-wasip2/release/memoryaf_extension.wasm",
         .data = &component_magic,
     });
-    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf/target/wasm32-wasip2/release");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(native_platform.testing.io, "extensions/memoryaf/target/wasm32-wasip2/release");
+    try tmp.dir.writeFile(native_platform.testing.io, .{
         .sub_path = "extensions/memoryaf/target/wasm32-wasip2/release/memoryaf_extension.wasm",
         .data = &component_magic,
     });
@@ -214,7 +215,7 @@ test "wasmtime runtime rejects unsafe content-addressed package digests" {
 }
 
 test "wasmtime runtime rejects unsafe relative artifact paths" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/extensions", .{tmp.sub_path});
     defer std.testing.allocator.free(root_path);
@@ -240,10 +241,10 @@ test "wasmtime runtime rejects unsafe relative artifact paths" {
 }
 
 test "wasmtime runtime preserves legacy versioned artifact layout" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "extensions/memoryaf/0.0.1/target/wasm32-wasip2/release");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(native_platform.testing.io, "extensions/memoryaf/0.0.1/target/wasm32-wasip2/release");
+    try tmp.dir.writeFile(native_platform.testing.io, .{
         .sub_path = "extensions/memoryaf/0.0.1/target/wasm32-wasip2/release/memoryaf_extension.wasm",
         .data = &component_magic,
     });
@@ -262,7 +263,7 @@ test "wasmtime runtime preserves legacy versioned artifact layout" {
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    return readFileAllocWithIo(alloc, std.Options.debug_io, path);
+    return readFileAllocWithIo(alloc, native_platform.debug_io, path);
 }
 
 fn readFileAllocWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -443,7 +444,7 @@ const HostImportContext = struct {
 };
 
 const WasmtimeLib = struct {
-    dynlib: std.DynLib,
+    dynlib: native_platform.DynLib,
     wasm_byte_vec_new: *const fn (*WasmName, usize, [*]const u8) callconv(.c) void,
     wasm_config_new: *const fn () callconv(.c) ?*wasm_config_t,
     wasm_engine_new_with_config: *const fn (?*wasm_config_t) callconv(.c) ?*wasm_engine_t,
@@ -505,7 +506,7 @@ const WasmtimeLib = struct {
     }
 
     fn openPath(path: []const u8) InvokeError!WasmtimeLib {
-        var dynlib = std.DynLib.open(path) catch return error.WasmtimeUnavailable;
+        var dynlib = native_platform.DynLib.open(path) catch return error.WasmtimeUnavailable;
         errdefer dynlib.close();
         return .{
             .dynlib = dynlib,
@@ -1007,7 +1008,7 @@ fn wasmNameDupe(alloc: std.mem.Allocator, name: WasmName) ![]u8 {
     return try alloc.dupe(u8, wasmNameSlice(name));
 }
 
-fn lookup(dynlib: *std.DynLib, name: [:0]const u8, comptime T: type) InvokeError!T {
+fn lookup(dynlib: *native_platform.DynLib, name: [:0]const u8, comptime T: type) InvokeError!T {
     return dynlib.lookup(T, name) orelse error.WasmtimeSymbolMissing;
 }
 

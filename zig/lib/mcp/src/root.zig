@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const testing = @import("testing.zig");
@@ -134,7 +135,7 @@ pub const InMemorySessionStore = struct {
     pub fn init(alloc: std.mem.Allocator) InMemorySessionStore {
         return .{
             .alloc = alloc,
-            .io = std.Io.Threaded.global_single_threaded.io(),
+            .io = native_platform.Threaded.global_single_threaded.io(),
         };
     }
 
@@ -144,7 +145,7 @@ pub const InMemorySessionStore = struct {
 
     pub fn deinit(self: *InMemorySessionStore, alloc: std.mem.Allocator) void {
         const store_alloc = self.alloc orelse alloc;
-        const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
+        const io = self.io orelse native_platform.Threaded.global_single_threaded.io();
         self.mutex.lockUncancelable(io);
         var iter = self.sessions.keyIterator();
         while (iter.next()) |key| store_alloc.free(key.*);
@@ -898,7 +899,7 @@ test "mcp session store enforces capacity and reclaims expired sessions" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var sessions = InMemorySessionStore.initWithOptions(alloc, io_impl.io(), .{
         .max_sessions = 2,
@@ -930,7 +931,7 @@ test "mcp session close is synchronized across callers" {
     const session_count = 32;
     const worker_count = 4;
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var sessions = InMemorySessionStore.initWithOptions(alloc, io_impl.io(), .{});
     defer sessions.deinit(alloc);
@@ -948,16 +949,16 @@ test "mcp session close is synchronized across callers" {
     const per_worker = session_count / worker_count;
     var started_tasks: usize = 0;
     defer {
-        for (workers[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (workers[0..started_tasks]) |*task| task.await(native_platform.testing.io);
     }
     for (&workers, 0..) |*worker, i| {
-        worker.* = try std.testing.io.concurrent(Worker.run, .{
+        worker.* = try native_platform.testing.io.concurrent(Worker.run, .{
             &sessions,
             ids[i * per_worker .. (i + 1) * per_worker],
         });
         started_tasks += 1;
     }
-    for (&workers) |*worker| worker.await(std.testing.io);
+    for (&workers) |*worker| worker.await(native_platform.testing.io);
     for (ids) |id| try std.testing.expect(!sessions.iface().exists(id));
 }
 

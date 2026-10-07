@@ -18,7 +18,9 @@
 // Decodes JPEG/PNG/GIF/BMP/WebP through the shared antfly image layer, then routes
 // decoded pixels through the shared resize/normalize/CHW preprocessing path.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const linalg = @import("inference_linalg");
 const antfly_image = @import("antfly_image");
 const shared = antfly_image.processing;
@@ -367,13 +369,13 @@ test "encoded image inspection distinguishes malformed and configured limits" {
 test "decode webp fixture returns rgb image" {
     const alloc = std.testing.allocator;
     const bytes = std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        native_platform.testing.io,
         "testdata/image/webp/lossless/literal-rgba-2x3.webp",
         alloc,
         .limited(64 * 1024),
     ) catch |err| switch (err) {
         error.FileNotFound => try std.Io.Dir.cwd().readFileAlloc(
-            std.testing.io,
+            native_platform.testing.io,
             "../../testdata/image/webp/lossless/literal-rgba-2x3.webp",
             alloc,
             .limited(64 * 1024),
@@ -429,7 +431,7 @@ test "clip preprocessing encoded production path matches full tensor contract" {
     const alloc = std.testing.allocator;
     const target_size: usize = 224;
     const output = try preprocessClipBatch(
-        std.testing.io,
+        native_platform.testing.io,
         alloc,
         &.{&clip_contract_png_16x8},
         target_size,
@@ -537,9 +539,9 @@ test "clip batch preprocessing matches single image preprocessing" {
     const alloc = std.testing.allocator;
     const images = [_][]const u8{ red_png_2x2[0..], red_png_2x2[0..] };
 
-    var inline_io = std.Io.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    var inline_io = native_platform.Threaded.init(alloc, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
     defer inline_io.deinit();
-    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+    for ([_]std.Io{ native_platform.testing.io, inline_io.io() }) |io| {
         const batch = try preprocessClipBatch(
             io,
             alloc,
@@ -550,7 +552,7 @@ test "clip batch preprocessing matches single image preprocessing" {
         );
         defer alloc.free(batch);
         const single = try preprocessClipBatch(
-            std.testing.io,
+            native_platform.testing.io,
             alloc,
             images[0..1],
             2,
@@ -747,7 +749,7 @@ test "borrowed raster preprocessing uses caller executor without reordering" {
         .{ 0.0, 0.0, 0.0 },
         .{ 1.0, 1.0, 1.0 },
         .nearest,
-        .{ .max_workers = 2, .io = std.testing.io },
+        .{ .max_workers = 2, .io = native_platform.testing.io },
     );
     try std.testing.expectEqualSlices(f32, &serial, &parallel);
     try std.testing.expectApproxEqAbs(@as(f32, 1), parallel[0], 1e-6);
@@ -778,7 +780,7 @@ test "bounded batch preprocessing uses a caller-owned executor without changing 
         .{
             .max_workers = 2,
             .max_inflight_decoded_bytes = 16 * 1024,
-            .io = std.testing.io,
+            .io = native_platform.testing.io,
         },
     );
 
@@ -845,7 +847,7 @@ test "image kernel cancellation interrupts PNG decode and restores nested contro
 
 fn readPipelineImageFixture(allocator: std.mem.Allocator, relative_path: []const u8) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        native_platform.testing.io,
         relative_path,
         allocator,
         .limited(4 * 1024 * 1024),
@@ -854,7 +856,7 @@ fn readPipelineImageFixture(allocator: std.mem.Allocator, relative_path: []const
             const prefixed = try std.fmt.allocPrint(allocator, "../../{s}", .{relative_path});
             defer allocator.free(prefixed);
             return std.Io.Dir.cwd().readFileAlloc(
-                std.testing.io,
+                native_platform.testing.io,
                 prefixed,
                 allocator,
                 .limited(4 * 1024 * 1024),
@@ -2534,10 +2536,10 @@ fn toSharedImage(img: Image) ImageU8 {
 }
 
 test "clip batch preprocessing drains workers before returning an image error" {
-    var inline_io = std.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    var inline_io = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
     defer inline_io.deinit();
     const images = [_][]const u8{ red_png_2x2[0..], "invalid image", red_png_2x2[0..] };
-    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+    for ([_]std.Io{ native_platform.testing.io, inline_io.io() }) |io| {
         try std.testing.expectError(error.ImageDecodeFailed, preprocessClipBatch(
             io,
             std.testing.allocator,

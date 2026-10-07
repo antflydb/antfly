@@ -15,7 +15,9 @@
 
 //! Transport-independent execution over the native catalog/read/write boundary.
 //! No durable state, global apply lock, or protocol-specific types live here.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 const compiler = @import("compiler.zig");
@@ -1440,7 +1442,7 @@ test "SQL commit serialization is released before the statement result" {
             try std.testing.expect(budget.live < 64 * 1024);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Provider.run, .{});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Provider.run, .{});
 }
 
 test "SQL EXPLAIN binds authorized plans without reading or writing rows" {
@@ -1931,7 +1933,7 @@ test "SQL relation cursors close on early limit quota failure and every allocati
     };
     var compiled = try compiler.compile(std.testing.allocator, "WITH q AS (SELECT _id FROM things) SELECT a._id, b._id FROM q a FULL JOIN q b ON a._id = b._id LIMIT 1", .{});
     defer compiled.deinit();
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
     var backend: TestBackend = .{ .row_count = 3 };
     try std.testing.expectError(error.SqlProgramLimitExceeded, execute(std.testing.allocator, backend.coordinated(), &compiled, &.{}, .{ .page_rows = 1, .scan_rows = 2 }));
     try std.testing.expectEqual(@as(usize, 1), backend.statement_opens);
@@ -1983,7 +1985,7 @@ test "SQL aggregate parameter inference and allocation failures are statement wi
             try std.testing.expectEqualStrings("4", result.output.rows[0][1].string);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
 
 test "SQL DISTINCT aggregates use semantic values and FILTER skips unused expressions" {
@@ -2301,7 +2303,7 @@ test "SQL executor frees every partial allocation on failure" {
     };
     var compiled = try compiler.compile(std.testing.allocator, "SELECT id FROM things", .{});
     defer compiled.deinit();
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
 }
 
 test "SQL bounded JSON copy rejects nesting before exhausting the stack" {
@@ -2850,7 +2852,7 @@ fn deferredDecisionAllocationScenario(a: std.mem.Allocator) !void {
 }
 
 test "SQL deferred decision projections unwind every allocation failure" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, deferredDecisionAllocationScenario, .{});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, deferredDecisionAllocationScenario, .{});
 }
 
 test "SQL grouped and window decisions defer independent projections and reuse sort outputs" {
@@ -2897,7 +2899,7 @@ fn groupedWindowAllocationScenario(a: std.mem.Allocator) !void {
     }
 }
 test "SQL grouped and window deferred projections unwind allocation failures" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, groupedWindowAllocationScenario, .{});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, groupedWindowAllocationScenario, .{});
 }
 
 const InsertDecisionFixture = struct {
@@ -2992,7 +2994,7 @@ fn insertDecisionAllocationScenario(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), fixture.writes);
 }
 test "SQL INSERT decision pages unwind allocation failures before commit" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, insertDecisionAllocationScenario, .{});
+    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, insertDecisionAllocationScenario, .{});
 }
 
 fn constantDecisionAllocationScenario(a: std.mem.Allocator) !void {
@@ -3021,7 +3023,7 @@ test "SQL constant decisions release discarded provider payloads and own final v
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 16), fixture.calls);
     for (result.output.rows[0]) |cell| try std.testing.expectApproxEqAbs(@as(f64, 0.9), cell.float, 0.001);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, constantDecisionAllocationScenario, .{});
+    try native_platform.allocator.checkAllAllocationFailures(a, constantDecisionAllocationScenario, .{});
 }
 
 test "SQL decisions retain trusted routing across reads CTEs grouped and window inputs" {
@@ -3054,7 +3056,7 @@ test "SQL runtime executes spilled order group distinct and join under a small s
         var fixture: TestBackend = .{ .row_count = 2000 };
         var backend = fixture.coordinated();
         backend.pinned_statement_snapshot = true;
-        backend.execution_io = std.testing.io;
+        backend.execution_io = native_platform.testing.io;
         var compiled = try compiler.compile(a, case.sql, .{});
         defer compiled.deinit();
         var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
@@ -3084,7 +3086,7 @@ test "SQL external window partitions match memory frames ranks and navigation un
         var native = try execute(std.heap.page_allocator, fixture.iface(), &compiled, &.{}, .{ .retained_bytes = 8 * 1024 * 1024, .page_rows = 16 });
         defer native.deinit();
         var backend = fixture.iface();
-        backend.execution_io = std.testing.io;
+        backend.execution_io = native_platform.testing.io;
         var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
         defer std.debug.assert(quota.live == 0);
         var spilled = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
@@ -3105,7 +3107,7 @@ test "SQL quantified subqueries retain spilled pattern sources through relationa
         defer compiled.deinit();
         var fixture: TestBackend = .{ .row_count = 2000 };
         var backend = fixture.coordinated();
-        backend.execution_io = std.testing.io;
+        backend.execution_io = native_platform.testing.io;
         var output = try execute(std.heap.page_allocator, backend, &compiled, &.{}, .{ .retained_bytes = 1024 * 1024, .page_rows = 32 });
         defer output.deinit();
         try std.testing.expectEqual(@as(usize, 1), output.output.rows.len);
@@ -3144,7 +3146,7 @@ test "SQL nested blocking results drain within the shared statement budget" {
     }) |sql| {
         var fixture: TestBackend = .{ .row_count = 5000 };
         var backend = fixture.coordinated();
-        backend.execution_io = std.testing.io;
+        backend.execution_io = native_platform.testing.io;
         var compiled = try compiler.compile(a, sql, .{});
         defer compiled.deinit();
         // Track statement admission without retaining debug-allocator quarantine for thousands of spill frames.
@@ -3201,7 +3203,7 @@ test "SQL nested blocking result ownership unwinds allocation failures" {
         fn run(a: std.mem.Allocator) !void {
             var fixture: TestBackend = .{ .row_count = 5 };
             var backend = fixture.coordinated();
-            backend.execution_io = std.testing.io;
+            backend.execution_io = native_platform.testing.io;
             var compiled = try compiler.compile(a, "SELECT COUNT(*) FROM (SELECT _id FROM things ORDER BY _id) q", .{});
             defer compiled.deinit();
             var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 2 });

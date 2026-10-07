@@ -32,6 +32,20 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main(init: std.process.Init) void {
+    if (@import("builtin").os.tag == .windows) {
+        var executor = @import("antfly_platform").Threaded.init(init.gpa, .{
+            .argv0 = .init(init.minimal.args),
+            .environ = init.minimal.environ,
+        });
+        defer executor.deinit();
+        var platform_init = init;
+        platform_init.io = executor.io();
+        return runMain(platform_init);
+    }
+    runMain(init);
+}
+
+fn runMain(init: std.process.Init) void {
     mainImpl(init) catch |err| {
         const message = switch (err) {
             error.FileNotFound => "required file was not found; check the configured path",

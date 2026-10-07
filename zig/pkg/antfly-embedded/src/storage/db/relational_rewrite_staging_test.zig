@@ -13,9 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const server_test_adapter = if (builtin.is_test) @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter else struct {};
 const builtin = @import("builtin");
 const std = @import("std");
+
 const rewrite = @import("relational_rewrite_staging.zig");
 const contract = @import("relational_rewrite_contract.zig");
 const staging = @import("restore_staging.zig");
@@ -51,7 +53,7 @@ fn runRewrite(preserve_document: bool) !void {
     const document_schema = "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}},\"required\":[\"x\"],\"additionalProperties\":false}}}}";
     const from_schema = if (preserve_document) document_schema else source_schema;
     const to_schema = if (preserve_document) document_schema else target_schema;
-    var directory = std.testing.tmpDir(.{});
+    var directory = native_platform.testing.tmpDir(.{});
     defer directory.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -100,11 +102,11 @@ fn runRewrite(preserve_document: bool) !void {
         var decoder = try db_mod.DB.open(alloc, decoder_path, source_options);
         defer decoder.close();
         const proof: @import("../portable_backup.zig").SourceCopyProof = .{ .scope = source_scope, .applied_index = certificate.cut.applied_index, .retained_start = start };
-        const file = try std.Io.Dir.cwd().openFile(std.testing.io, artifact_path, .{});
-        defer file.close(std.testing.io);
-        const size = (try file.stat(std.testing.io)).size;
+        const file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, artifact_path, .{});
+        defer file.close(native_platform.testing.io);
+        const size = (try file.stat(native_platform.testing.io)).size;
         for (0..1000) |_| {
-            if (try @import("../portable_backup.zig").importSourceCopyFilePage(alloc, decoder.core.store, std.testing.io, file, size, proof, source_scope.pin(), 1, .none)) break;
+            if (try @import("../portable_backup.zig").importSourceCopyFilePage(alloc, decoder.core.store, native_platform.testing.io, file, size, proof, source_scope.pin(), 1, .none)) break;
         } else return error.TestUnexpectedResult;
         try @import("../portable_backup.zig").validateCompleteSourceCopyImage(alloc, decoder.core.store, proof);
     }
@@ -170,7 +172,7 @@ fn runRewrite(preserve_document: bool) !void {
     const spool_root = try std.fmt.allocPrint(a, "{s}.spool", .{target_path});
     var frame_digest: [32]u8 = undefined;
     var frame_cache: @import("../rewrite_tail_spool.zig").Cache = .{};
-    defer frame_cache.deinit(std.testing.io);
+    defer frame_cache.deinit(native_platform.testing.io);
     for (0..10000) |_| {
         const wire_json = try @import("online_merge_io.zig").executeJson(&source, alloc, .{ .scope = source_scope, .operation = .{ .rewrite_tail = .{ .after = start, .offset = @intCast(wire_frame.items.len), .max_bytes = 7 } } }, .none);
         defer alloc.free(wire_json);
@@ -183,11 +185,11 @@ fn runRewrite(preserve_document: bool) !void {
         try std.testing.expectEqual(wire_frame.items.len, value.offset);
         if (wire_frame.items.len != 0) try std.testing.expectEqualSlices(u8, &frame_digest, &value.frame_digest);
         frame_digest = value.frame_digest;
-        const spooled = try @import("../rewrite_tail_spool.zig").receive(alloc, std.testing.io, spool_root, scope, start, value, &frame_cache, alloc, null);
-        const repeated = try @import("../rewrite_tail_spool.zig").receive(alloc, std.testing.io, spool_root, scope, start, value, &frame_cache, alloc, null);
+        const spooled = try @import("../rewrite_tail_spool.zig").receive(alloc, native_platform.testing.io, spool_root, scope, start, value, &frame_cache, alloc, null);
+        const repeated = try @import("../rewrite_tail_spool.zig").receive(alloc, native_platform.testing.io, spool_root, scope, start, value, &frame_cache, alloc, null);
         try std.testing.expectEqual(value.offset + value.data.len, spooled.next);
         try std.testing.expectEqual(spooled.next, repeated.next);
-        try std.testing.expectEqual(if (spooled.next == value.total) spooled.next - 1 else spooled.next, try @import("../rewrite_tail_spool.zig").resumeOffset(alloc, std.testing.io, spool_root, scope, start));
+        try std.testing.expectEqual(if (spooled.next == value.total) spooled.next - 1 else spooled.next, try @import("../rewrite_tail_spool.zig").resumeOffset(alloc, native_platform.testing.io, spool_root, scope, start));
         try wire_frame.appendSlice(alloc, value.data);
         if (wire_frame.items.len == value.total) {
             try std.testing.expectEqualSlices(u8, wire_frame.items, spooled.frame.?.reader.encoded_frame);
@@ -223,7 +225,7 @@ fn runRewrite(preserve_document: bool) !void {
     var repeated_finish = try rewrite.prepareFinish(&target, alloc, scope, final_receipt.cut);
     defer repeated_finish.deinit();
     try std.testing.expect(repeated_finish.batch == null);
-    try std.testing.expectEqual(@as(u32, 0), try @import("../rewrite_tail_spool.zig").resumeOffset(alloc, std.testing.io, spool_root, scope, cut.sequence));
+    try std.testing.expectEqual(@as(u32, 0), try @import("../rewrite_tail_spool.zig").resumeOffset(alloc, native_platform.testing.io, spool_root, scope, cut.sequence));
     _ = try target.finishRestoreStaging(alloc, scope.digest(), .validated);
     _ = try target.finishRestoreStaging(alloc, scope.digest(), .published);
     const a_json = (try target.get(alloc, "a")).?;

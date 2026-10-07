@@ -20,11 +20,13 @@
 //!   - Reverse index (incoming edges) in separate backing store
 //!   - Edge value: [weight:f64 LE][created_at:u64 LE][updated_at:u64 LE][metadata_json]
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const edge_type_mod = @import("edge_type.zig");
 const edge_weight = @import("edge_weight.zig");
 const metric_kernels = @import("metrics.zig");
@@ -765,7 +767,7 @@ fn hasConfiguredEdgeType(edge_type_configs: []const EdgeTypeConfig, edge_type: [
 
 pub const GraphIndexOptions = struct {
     /// Owner-supplied time for lease fencing and publication metadata.
-    clock: @import("antfly_platform").clock.Clock = .real(),
+    clock: native_platform.clock.Clock = .real(),
     /// DB-owned indexes activate prepared fences from the authoritative
     /// primary range, not from a separately committed private-store marker.
     managed_ownership_range: bool = false,
@@ -1084,7 +1086,7 @@ pub var test_artifact_rebuild_abort_after_outgoing: std.atomic.Value(bool) = .in
 
 pub const GraphIndex = struct {
     has_relationship_ids: bool = false,
-    clock: @import("antfly_platform").clock.Clock = .real(),
+    clock: native_platform.clock.Clock = .real(),
     /// Topology task views borrow stores and live ownership from this owner.
     /// Never copy a live GraphIndex: its mutexes and caches have identity.
     borrowed_owner: ?*GraphIndex = null,
@@ -1244,7 +1246,7 @@ pub const GraphIndex = struct {
 
     fn beginReadOutgoingTxn(self: *GraphIndex) !backend_erased.ReadTxn {
         if (self.borrowed_owner) |owner| return owner.beginReadOutgoingTxn();
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         if (self.ownership_handoff) |handoff| return handoff.outgoing.forkRead();
         return self.beginOwnershipRead(false);
@@ -1261,7 +1263,7 @@ pub const GraphIndex = struct {
 
     fn beginReadReverseTxn(self: *GraphIndex) !backend_erased.ReadTxn {
         if (self.borrowed_owner) |owner| return owner.beginReadReverseTxn();
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         if (self.ownership_handoff) |handoff| return handoff.reverse.forkRead();
         return self.beginOwnershipRead(true);
@@ -1285,7 +1287,7 @@ pub const GraphIndex = struct {
 
     fn beginReadEdgeTxns(self: *GraphIndex, direction: EdgeDirection) !OwnershipReads {
         if (self.borrowed_owner) |owner| return owner.beginReadEdgeTxns(direction);
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         var reads: OwnershipReads = .{};
         errdefer if (reads.outgoing) |*txn| txn.abort();
@@ -1296,7 +1298,7 @@ pub const GraphIndex = struct {
     }
 
     fn startOwnershipHandoff(self: *GraphIndex, handoff: *OwnershipHandoff) !void {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         std.debug.assert(self.ownership_handoff == null);
         var outgoing = try self.beginOwnershipRead(false);
@@ -1313,7 +1315,7 @@ pub const GraphIndex = struct {
     }
 
     fn finishOwnershipHandoff(self: *GraphIndex, handoff: *OwnershipHandoff) void {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         std.debug.assert(self.ownership_handoff == null or self.ownership_handoff == handoff);
         self.ownership_handoff = null;
         self.ownership_mutex.unlock();
@@ -1398,14 +1400,14 @@ pub const GraphIndex = struct {
 
     pub fn ownershipCleanupPending(self: *GraphIndex) bool {
         if (self.borrowed_owner) |owner| return owner.ownershipCleanupPending();
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         return self.ownership_handoff == null and self.ownership_active and self.ownership_fence != null;
     }
 
     pub fn ownershipTransitionPending(self: *GraphIndex) bool {
         if (self.borrowed_owner) |owner| return owner.ownershipTransitionPending();
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         return self.ownership_handoff != null or self.ownership_fence != null;
     }
@@ -1425,9 +1427,9 @@ pub const GraphIndex = struct {
     /// reopen before publication of the catalog. A prepared transition whose
     /// primary commit failed remains invisible to readers and to cleanup.
     pub fn reconcileOwnershipRange(self: *GraphIndex, start: []const u8, end: []const u8) void {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_write_mutex);
+        native_platform.sync.lockYielding(&self.ownership_write_mutex);
         defer self.ownership_write_mutex.unlock();
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         const raw = self.ownership_fence orelse return;
         const scope = maintenance.RangeProgress.decode(raw) catch unreachable;
@@ -1439,7 +1441,7 @@ pub const GraphIndex = struct {
     /// Admit every authoritative range transition before its durable commit.
     /// An existing task owns its excluded interval until retirement finishes.
     pub fn validateOwnershipRange(self: *GraphIndex, start: []const u8, end: []const u8) !void {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         if (self.ownership_handoff != null) return error.GraphMaintenanceInProgress;
         const raw = self.ownership_fence orelse return;
@@ -2069,7 +2071,7 @@ pub const GraphIndex = struct {
     }
 
     fn committedStats(self: *GraphIndex) Stats {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         return .{ .edge_count = self.edge_count, .node_count = self.node_count, .edge_generation = self.edge_generation, .has_relationship_ids = self.has_relationship_ids };
     }
@@ -2077,7 +2079,7 @@ pub const GraphIndex = struct {
     /// Call only after the counter transaction commits, with graph mutation
     /// admission still held. The status lock never covers backend I/O.
     fn publishCounters(self: *GraphIndex, counters: Stats) void {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         self.edge_count = counters.edge_count;
         self.node_count = counters.node_count;
@@ -6942,7 +6944,7 @@ pub const GraphIndex = struct {
         if (self.borrowed_owner) |owner| return owner.operationalStats();
         // Sample after acquiring the fence lock so completion cannot clear
         // uncertainty between reading old physical counts and their flag.
-        @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+        native_platform.sync.lockYielding(&self.ownership_mutex);
         defer self.ownership_mutex.unlock();
         return .{ .edge_count = self.edge_count, .node_count = self.node_count, .counts_pending = self.ownership_fence != null };
     }
@@ -7145,7 +7147,7 @@ pub const GraphIndex = struct {
 
     pub fn batchApply(self: *GraphIndex, writes: []const BatchWrite, deletes: []const BatchDelete) !void {
         {
-            @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+            native_platform.sync.lockYielding(&self.ownership_mutex);
             defer self.ownership_mutex.unlock();
             if (self.ownership_active) if (self.ownership_fence) |raw| {
                 const scope = try maintenance.RangeProgress.decode(raw);
@@ -9589,7 +9591,7 @@ pub const GraphIndex = struct {
     }
 
     pub fn rebuildReverseFromOwnedOutgoingEdges(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8) !usize {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = native_platform.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         return try self.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(alloc, io_impl.io(), lower, upper, null);
     }
@@ -9658,7 +9660,7 @@ pub const GraphIndex = struct {
         upper: []const u8,
         resume_from: ?[]const u8,
     ) !usize {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = native_platform.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         return try self.rebuildReverseFromOwnedOutgoingEdgesResumeWithIo(alloc, io_impl.io(), lower, upper, resume_from);
     }
@@ -9781,7 +9783,7 @@ pub const GraphIndex = struct {
     }
 
     fn startPruneRange(self: *GraphIndex, alloc: Allocator, lower: []const u8, upper: []const u8, fence: bool) !void {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_write_mutex);
+        native_platform.sync.lockYielding(&self.ownership_write_mutex);
         defer self.ownership_write_mutex.unlock();
         const range_lower_owned = if (lower.len > 0) try internal_keys.documentRangeLowerAlloc(alloc, lower) else null;
         defer if (range_lower_owned) |key| alloc.free(key);
@@ -9832,7 +9834,7 @@ pub const GraphIndex = struct {
             if (builtin.is_test) if (test_ownership_commit_hook) |hook| hook(self);
             // Adopt immediately after commit, even if the durability barrier
             // fails. Retry must never serve a broader view than persisted state.
-            @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+            native_platform.sync.lockYielding(&self.ownership_mutex);
             defer self.ownership_mutex.unlock();
             if (fence) {
                 self.ownership_fence = owned;
@@ -9854,7 +9856,7 @@ pub const GraphIndex = struct {
     /// One bounded, replayable unit. Null means there is no remaining task.
     /// Callers may release graph/apply ownership between invocations.
     pub fn pruneOwnedRangePage(self: *GraphIndex) !?usize {
-        @import("antfly_platform").sync.lockYielding(&self.ownership_write_mutex);
+        native_platform.sync.lockYielding(&self.ownership_write_mutex);
         defer self.ownership_write_mutex.unlock();
         if (self.ownershipTransitionPending() and !self.ownershipCleanupPending()) return null;
         const recovered = try self.resumePrunePage();
@@ -9908,7 +9910,7 @@ pub const GraphIndex = struct {
                     batch.delete(maintenance.ownership_key) catch |err| if (err != error.NotFound) return err;
                     try batch.commit();
                     if (builtin.is_test) if (test_ownership_commit_hook) |hook| hook(self);
-                    @import("antfly_platform").sync.lockYielding(&self.ownership_mutex);
+                    native_platform.sync.lockYielding(&self.ownership_mutex);
                     defer self.ownership_mutex.unlock();
                     if (self.ownership_fence) |scope| self.alloc.free(scope);
                     self.ownership_fence = null;
@@ -20549,14 +20551,14 @@ fn openTestGraphIndex(alloc: Allocator, store: anytype, path: [*:0]const u8, nam
 fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
     const ns = platform_time.monotonicNs();
     const slice = std.fmt.bufPrint(buf, "/tmp/antfly-graph-{s}-{d}\x00", .{ label, ns }) catch unreachable;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
@@ -22367,7 +22369,7 @@ test "graph metric membership private store serializes read modify write across 
     defer cleanupTmp(store_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const Worker = struct {
@@ -23846,7 +23848,7 @@ fn testSparseGraphMetricVectorChunks(dictionary_count: usize) !void {
     // backtraces when diagnosing a failure.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var store_buf: [256]u8 = undefined;
     const store_path = tmpPath(&store_buf, "store-metric-vector-chunks");
     defer cleanupTmp(store_path);
@@ -34708,7 +34710,7 @@ test "graph hits reduce pages only write their planned node range" {
 test "graph hits planned build drains partitioned paired pages across workers" {
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     const Fixture = struct {
         fn seed(graph: *GraphIndex) !void {
             // Preserve both fan-outs beyond the scan-page boundary. This test
@@ -36955,7 +36957,7 @@ test "graph edge ttl hides expired rows in adjacency and exact probes" {
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var manual_clock = @import("antfly_platform").clock.ManualClock{};
+    var manual_clock = native_platform.clock.ManualClock{};
     manual_clock.setRealtimeNs(5 * std.time.ns_per_s);
     var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
         .clock = manual_clock.clock(),
@@ -37066,7 +37068,7 @@ test "graph edge ttl native scan pins expiration time across pages" {
     defer cleanupTmp(rev_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var manual_clock = @import("antfly_platform").clock.ManualClock{};
+    var manual_clock = native_platform.clock.ManualClock{};
     manual_clock.setRealtimeNs(5 * std.time.ns_per_s);
     var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
         .clock = manual_clock.clock(),
@@ -37218,7 +37220,7 @@ test "graph metric becomes stale when a source contribution expires without a wr
     defer cleanupTmp(rev_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var manual_clock = @import("antfly_platform").clock.ManualClock{};
+    var manual_clock = native_platform.clock.ManualClock{};
     manual_clock.setRealtimeNs(5 * std.time.ns_per_s);
     const metrics = [_]GraphMetricConfig{.{ .name = "degree", .kind = .degree, .refresh = .manual }};
     var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{
@@ -38111,7 +38113,7 @@ test "graph maintenance commit handoff forks the old epoch without holding the v
 
 test "graph maintenance both direction snapshots exclude an interleaved ownership epoch" {
     const a = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(a, .{});
+    var io_impl = native_platform.Threaded.init(a, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const Hook = struct {
@@ -38922,7 +38924,7 @@ test "graph edge ttl contribution selection shares physical admission" {
         defer cleanupTmp(rev_path);
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var manual_clock = @import("antfly_platform").clock.ManualClock{};
+        var manual_clock = native_platform.clock.ManualClock{};
         manual_clock.setRealtimeNs(5 * std.time.ns_per_s);
         var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .ttl_duration_ns = std.time.ns_per_s, .clock = manual_clock.clock() });
         defer graph.close();
@@ -39088,7 +39090,7 @@ test "graph edge ttl incoming existence charges expired reverse rows across keys
     defer cleanupTmp(rev_path);
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var manual_clock = @import("antfly_platform").clock.ManualClock{};
+    var manual_clock = native_platform.clock.ManualClock{};
     manual_clock.setRealtimeNs(5 * std.time.ns_per_s);
     var graph = try openTestGraphIndex(alloc, &store, rev_path, "links", .{ .clock = manual_clock.clock(), .ttl_duration_ns = std.time.ns_per_s });
     defer graph.close();
@@ -39129,7 +39131,7 @@ test "graph relationship integration isolates TTL contributors and recovers inte
     const alloc = std.testing.allocator;
     var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
     defer graph.close();
-    var clock = @import("antfly_platform").clock.ManualClock{};
+    var clock = native_platform.clock.ManualClock{};
     clock.setRealtimeNs(10);
     graph.clock = clock.clock();
     graph.ttl_duration_ns = 5;
@@ -39249,7 +39251,7 @@ test "graph owned cleanup bounds workspace across large contributor histories an
     const alloc = std.testing.allocator;
     var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
     defer graph.close();
-    var clock = @import("antfly_platform").clock.ManualClock{};
+    var clock = native_platform.clock.ManualClock{};
     clock.setRealtimeNs(10);
     graph.clock = clock.clock();
     graph.ttl_duration_ns = 5;

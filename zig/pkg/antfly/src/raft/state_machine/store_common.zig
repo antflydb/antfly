@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const mod = @import("mod.zig");
@@ -32,7 +34,7 @@ pub fn ApplyStore(comptime namespace: []const u8) type {
         };
 
         alloc: std.mem.Allocator,
-        io_impl: std.Io.Threaded,
+        io_impl: native_platform.Threaded,
         root_dir: []u8,
         batches: std.AutoHashMapUnmanaged(u64, OwnedBatch) = .empty,
 
@@ -159,7 +161,7 @@ test "metadata and data apply stores persist batches across reopen" {
     const MetadataStore = ApplyStore("metadata");
     const DataStore = ApplyStore("data");
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/apply-store", .{tmp.sub_path});
     defer std.testing.allocator.free(root);

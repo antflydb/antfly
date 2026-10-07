@@ -13,10 +13,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 
 pub const StoreConfig = struct {
     artifact_reprocess_job_store_path: ?[]const u8 = null,
@@ -702,7 +704,7 @@ test "artifact reprocess job store guards duplicate advances and stale pass reco
 
 test "artifact reprocess job store recovers durable jobs and reseeds ids" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reprocess-jobs", .{tmp.sub_path});
     defer alloc.free(path);
@@ -747,7 +749,7 @@ test "artifact reprocess job store recovers durable jobs and reseeds ids" {
 
 test "artifact reprocess job store persists monotonic next id across stale durable writes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reprocess-jobs-monotonic-next-id", .{tmp.sub_path});
     defer alloc.free(path);
@@ -829,7 +831,7 @@ test "artifact reprocess job store persists monotonic next id across stale durab
 
 test "artifact reprocess job cleanup removes recovered durable expired jobs" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reprocess-job-cleanup", .{tmp.sub_path});
     defer alloc.free(path);

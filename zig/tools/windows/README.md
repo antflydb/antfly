@@ -10,48 +10,42 @@ platform.
 ## Build
 
 ```sh
-python3 tools/windows/make_zig_lib_overlay.py \
-  --zig-lib ~/.local/zig-0.17.0/lib --out /path/to/zig-lib-windows-overlay
-ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
-  python3 tools/run_bounded_zig_build.py --zig zig -- build antfly \
-  -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast -Donnx=false -Dblas=off
+python3 tools/run_bounded_zig_build.py --zig zig -- build antfly \
+  -Dtarget=x86_64-windows-gnu -Doptimize=Debug -Donnx=false -Dblas=off -j1
 ```
 
-`zig build --zig-lib-dir` is rejected after the step name, so the overlay is
-selected with `ZIG_LIB_DIR`.
+Use the installed, unmodified Zig 0.17.0 library. No `ZIG_LIB_DIR` overlay or
+compiler patch is needed. Debug is suitable for edit/test loops; use
+ReleaseFast for optimized qualification. Set dedicated `ZIG_LOCAL_CACHE_DIR`
+and `ZIG_GLOBAL_CACHE_DIR` directories when other builds share a cache.
 
-Use `-Doptimize=Debug` for frequent edit/test loops to avoid optimizing every
-runtime library. Use `ReleaseFast` for final release-behavior qualification.
-The full target includes the partitioned storage and inference libraries even
-when the smoke workload does not use local inference.
+## Repository-owned Windows platform and I/O
 
-When other builds share a cache, set `ZIG_LOCAL_CACHE_DIR` and
-`ZIG_GLOBAL_CACHE_DIR` to dedicated directories and use `-j1` to limit compiler
-concurrency. A suspended compiler can hold cache locks needed by other builds.
+`lib/platform` now supplies the Windows implementations. Its `c` API adapts
+native clocks, synchronization, directory entries, positional reads and
+mapping hints; `DynLib` supplies Windows dynamic loading. Existing Unix
+implementations remain selected on their targets.
 
-The generator rejects overlapping input/output paths and stages its patches
-before replacing an existing overlay, so a mismatched Zig release leaves the
-previous overlay intact.
+`platform.Threaded` selects `threaded_windows.zig` on Windows and stock
+`std.Io.Threaded` elsewhere. The Windows backend is a checked-in adaptation
+of Zig 0.17's Threaded backend, with its MIT notice and upstream source hash.
+It owns its worker TLS, cancellation, path conversion and I/O vtable. Locks,
+hardlinks and Wine socket/entropy adapters execute inside this owner.
+`lib/runtime` also exports this executor. Libraries accept borrowed `std.Io`
+values and dispatch through their caller's vtable.
 
-## Maintaining the Zig patch
+All executor constructors and affected C/dynamic-library callers use platform
+APIs. Product graphs and standalone libraries bind the platform dependency;
+independent runtime archives retain their own executor ownership.
+Windows process entry points replace Zig's default `std.process.Init.io` with
+the platform executor. Legacy diagnostic I/O uses `platform.debug_io`; runtime
+operations continue to use their caller-supplied executor. Test fixtures
+use `platform.testing` for Windows I/O, with per-test teardown in the repository
+runner. The overlay generator and its compatibility source files are removed.
 
-The build currently requires a standard-library overlay. Start from an
-unmodified Zig 0.17.0 library: the generator copies it, patches `std/c.zig`,
-`std/dynamic_library.zig` and `std/Io/Threaded.zig`, and installs the compatibility
-module under `std/c/`. The hardlink implementation is appended inside
-`Io.Threaded` so it uses that executor's syscall and cancellation state.
-The compiler binary and its installed library are unchanged.
-
-Use `ZIG_LIB_DIR` for every Windows test and build, including all runtime
-archives linked into the executable. Regenerate the overlay whenever its
-source adapters change. When upgrading Zig, update the exact source anchors
-in `make_zig_lib_overlay.py`, then rerun overlay safety tests, compatibility
-and owning-runtime tests, and native Windows qualification before using it.
-The generator refuses a library whose expected anchors do not match.
-
-```sh
-python3 -m unittest discover -s tools/windows -p 'test_*.py'
-```
+When upgrading Zig, adapt the checked-in backend to the new public `std.Io`
+interface, retain upstream license/provenance, and rerun the stock-Zig suites
+and native NTFS qualification. Nothing rewrites the installed standard library.
 
 ## CrossOver smoke testing on macOS
 
@@ -76,77 +70,34 @@ Paths contain spaces to exercise argument forwarding into runtime units.
 Wine does not establish native NTFS power-loss durability, console shutdown,
 or Windows Server compatibility; those still need a real Windows runner.
 
-The Windows argument parser can also be tested without a full Antfly build:
+## Focused qualification with stock Zig
+
+From `zig/`, build all seven suites in Debug and ReleaseFast:
 
 ```sh
-ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test \
-  lib/platform/src/process.zig -target x86_64-windows-gnu -lc \
-  --test-no-exec -femit-bin=/private/tmp/antfly-windows-args.exe
-/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine \
-  --bottle antfly-test --no-update /private/tmp/antfly-windows-args.exe
-python3 -m unittest discover -s tools/windows -p 'test_*.py'
+python3 tools/windows/build_tests.py --zig zig --out /private/tmp/antfly-windows-tests
 ```
 
-Use the same `zig test` command with `tools/windows/compat_test.zig` and a
-different output executable to check positional reads, EOF, clocks, and
-condition-variable timeout/lock behavior, secure entropy, and loopback TCP
-through the overlay. The file-lock test checks exclusion, header reads through
-a separate handle, explicit unlock, reacquisition, shared locks, and
-exclusive-to-shared downgrade. The TCP test checks connection, byte transfer,
-half-close, and EOF.
+The builder explicitly selects the installed Zig library, clears `ZIG_LIB_DIR`,
+and creates hashed executables, `manifest.json`, and `tests.zip`. It covers
+compatibility primitives, hardlinks, backup/staging cancellation, object-store
+filesystem publication, Lite index/vacuum, storage I/O, and a separately compiled
+archive borrower that dispatches 64 times after owning workers park. Use
+`--suite backup --mode Debug` for a focused loop, or `--target native` for macOS
+comparison. It uses the repository test runner and checks expected error logs.
 
-## What the overlay does
+Run each Windows executable in the dedicated CrossOver bottle or use
+`gce_hardlink_qualify.ps1` with the archive on a disposable NTFS VM. The native
+runner requires matching binary hashes and reports every process exit code.
+CrossOver's four open-destination replacement failures require native comparison;
+atomic publication is not weakened to accommodate Wine.
 
-Zig 0.17's `std.c` leaves these POSIX declarations as `void` or as unresolved
-externs on Windows. Antfly calls them directly from dozens of modules, so the
-overlay (`antfly_windows_compat.zig`) supplies Win32-backed versions instead
-of patching every call site:
-
-| std.c declaration | Windows backing |
-| --- | --- |
-| `time_t`, `clockid_t`, `clock_gettime` | `QueryPerformanceCounter`, `GetSystemTimePreciseAsFileTime` |
-| `nanosleep` | `Sleep` (millisecond resolution) |
-| `pthread_mutex_*`, `pthread_cond_*` | SRW locks and condition variables |
-| `MADV`, `madvise` | accepted and ignored |
-| `dirent`, `readdir` | mingw-w64 `misc/dirent.c` (already in mingwex) |
-| `pread` | `ReadFile` with an `OVERLAPPED` offset |
-| `munmap` | `UnmapViewOfFile` |
-| `std.DynLib` | `LoadLibraryW`, `GetProcAddress` |
-| `Io.Threaded` file lock range | sentinel byte at offset 2^62 instead of offset 0 |
-| `Io.Threaded` lock/unlock under Wine | synchronous lock ABI and contention status adapters |
-| `Io.Threaded` directory/file hardlinks | `NtSetInformationFile(FileLinkInformation)` through the owning runtime |
-| `Io.Threaded` secure entropy under Wine | `BCryptGenRandom` system-preferred RNG |
-| `Io.Threaded` TCP under Wine | Winsock initialization, creation, options, connect/accept, vectored send/receive, shutdown, and close |
-
-The lock change matters most. Zig locks byte 0 of a file, and Windows byte-range
-locks are mandatory, so any other handle (even in the same process) that reads
-a Lite header or writer-lock marker gets `LockViolation`. SQLite avoids this
-by locking a byte range past real data, and the overlay does the same.
-
-Wine rejects a non-null `NtLockFile` status block and reports contention as
-`FILE_LOCK_CONFLICT`. It also declares the `NtUnlockFile` key as a pointer
-instead of native Windows' `ULONG`. The overlay detects Wine through ntdll's
-`wine_get_version`, uses Wine's synchronous locking arguments, and normalizes
-contention to Zig's `WouldBlock`. It retains real byte-range locks and preserves
-native Windows calls. See [Wine's implementation](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/unix/file.c).
-
-Zig's direct `\\Device\\CNG` entropy source is unavailable under CrossOver.
-For Wine only, the overlay uses [`BCryptGenRandom`](https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcryptgenrandom)
-with the system-preferred cryptographic RNG. API errors remain
-`EntropyUnavailable`; there is no predictable entropy fallback. The native
-Windows CNG path and the I/O cancellation check are preserved.
-
-Wine does not implement all of the native AFD socket IOCTLs used by Zig.
-The overlay therefore uses Winsock for TCP operations under Wine, including
-balanced `WSASocketW`/`accept` and `closesocket` bookkeeping. Wine detection is
-cached so native Windows I/O does not repeatedly probe DLL exports. Wine's
-unsupported outbound `REUSE_UNICASTPORT` hint is omitted; normal ephemeral
-port allocation remains. Native Windows keeps the AFD path. These Wine calls
-are synchronous, so cancellation and timeout behavior needs separate
-qualification. UDP and Unix-domain sockets are not covered by this adapter.
-
-A supported port should move these behind `antfly_platform`, since modules
-like `lib/generating` cannot import it today, or upstream them to Zig.
+The file-lock implementation uses a sentinel byte at offset 2^62 to avoid
+Windows mandatory locks blocking Lite header reads. Wine's lock ABI is adapted
+inside the backend. Secure entropy uses `BCryptGenRandom` under Wine; native
+Windows retains CNG. TCP uses Winsock under Wine and native AFD elsewhere.
+Hardlinks use `NtSetInformationFile(FileLinkInformation)`, preserve source
+identity, and refuse replacing an existing destination.
 
 ## Source changes and their limits
 
@@ -271,192 +222,12 @@ the binary hash, Windows build, volume type, reset mechanism, ledger, server
 logs, and check result. Repeat with fresh ledgers/databases around table creation
 and compaction. Lite qualification does not qualify the separate LSM engine.
 
-For focused staging tests without the full application:
-
-```sh
-ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test \
-  pkg/antfly-embedded/src/storage/lsm_backend/staged_file.zig \
-  -target x86_64-windows-gnu -O ReleaseFast -lc --test-no-exec \
-  -femit-bin=/path/to/staged-test.exe
-```
-
-The cancellation-protected batch wait has a standalone regression:
-
-```sh
-ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test \
-  pkg/antfly/src/api/protected_future.zig -target x86_64-windows-gnu \
-  -O ReleaseFast -lc --test-no-exec -femit-bin=/path/to/protected-future-test.exe
-```
-
-The parked-worker regression must compile its executor owner and borrower as
-separate archives. From `zig/`, using the overlay for both commands:
-
-```sh
-zig build-lib -lc -static -target x86_64-windows-gnu -O Debug \
-  -femit-bin=/path/to/executor-worker.lib --dep antfly_executor_abi \
-  -Mroot=tools/windows/executor_bridge_worker.zig \
-  -Mantfly_executor_abi=lib/runtime/src/runtime_io_abi.zig
-zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
-  -femit-bin=/path/to/executor-bridge-test.exe /path/to/executor-worker.lib \
-  --dep antfly_executor_abi -Mroot=tools/windows/executor_bridge_host.zig \
-  -Mantfly_executor_abi=lib/runtime/src/runtime_io_abi.zig
-```
-
-It parks the owning workers before each of 64 borrowed dispatches/completions.
-Busy background tasks can conceal a reconstructed vtable's missed wakeups.
-
-Run `staged-test.exe` directly on Windows or through the isolated CrossOver
-bottle. It exercises an 8 MiB output, boundary-crossing patches, checksums,
-range validation, and a read failure that must prevent later publication.
-
-The integrated writer tests also exercise finish, replacement, abort cleanup,
-and runtime ownership after storage shutdown. From `zig/`:
-
-```sh
-ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test -lc \
-  -target x86_64-windows-gnu -O ReleaseFast --test-no-exec \
-  -femit-bin=/path/to/storage-test.exe --test-filter 'storage_io.' \
-  --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
-  -Mroot=pkg/antfly-embedded/src/windows_storage_test.zig \
-  -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
-  --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig
-```
-
-An 80 KiB fixed allocator must accommodate an 8 MiB atomic output. Use
-`gce_qualify.ps1` as a disposable VM startup script for the native qualification.
-It downloads `tests.zip` from the private bucket named in instance metadata
-`antfly-artifact-bucket`; set `antfly-artifact-sha256` to the application's SHA-256.
-Set `antfly-mode=serve` to start the HTTP runner, or `antfly-mode=check`
-to publish an offline integrity result in the `antfly/check` guest attribute.
-The archive contains `antfly.exe`, `compat-test.exe`, `staged-test.exe`,
-`storage-test.exe`, `object-durability-test.exe`, `protected-future-test.exe`,
-and `executor-bridge-test.exe`. Give the VM identity object-viewer access only
-to that bucket. Enable guest attributes and allow ports 8080/9090
-only through authenticated IAP forwarding. The script records the NTFS volume,
-Windows version, binary hash, and unit-test results in `antfly/status` guest
-attributes and `/status` on port 9090. `POST /check` on that port stops only the
-test Antfly server and returns the offline Lite integrity result. The endpoint
-is intended only for the isolated test VM. Fixed diagnostic endpoints expose
-the test process's minidump (`POST /dump`), CPU/memory use and database size
-(`GET /diagnostics`), and the OS's ntdll binary for stack unwinding
-(`GET /ntdll`). These endpoints must remain private; dumps and logs can contain
-test data.
-
-The broader filesystem suite can be compiled directly with the overlay:
-
-```sh
-zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
-  --test-filter filesystem -femit-bin=/path/to/filesystem-test.exe \
-  lib/objectstore/src/filesystem.zig
-```
-
-Nested listing and prefix download pass after object-key normalization.
-CrossOver still fails the two open-reader replacement tests with `AccessDenied`;
-see the qualification report. Both pass on native NTFS in Debug and ReleaseFast.
-
-Vector-block cleanup and empty/trailing-separator root regressions have a focused root:
-
-```sh
-zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
-  --test-filter 'owned staged base removes blocks after pre-CURRENT rejection' \
-  --test-filter 'checkpoint paths preserve' \
-  -femit-bin=/path/to/vector-cleanup-test.exe \
-  --dep antfly_source_root=root --dep antfly_hash --dep antfly_platform \
-  --dep antfly_runtime_fs --dep antfly_vectorindex --dep antfly_test_error_logs \
-  --dep antfly_vector -Mroot=pkg/antfly-embedded/src/windows_vector_test.zig \
-  -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
-  --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
-  --dep antfly_hash --dep antfly_platform --dep antfly_vector \
-  -Mantfly_vectorindex=lib/vectorindex/src/mod.zig \
-  -Mantfly_test_error_logs=pkg/antfly-embedded/src/test_error_logs.zig \
-  -Mantfly_vector=lib/vector/src/mod.zig
-```
-
-Lite's index writer has separate staging cleanup, also protected from pending
-I/O cancellation. Run its focused suite with:
-
-```sh
-zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
-  --test-filter 'storage.lite.index_storage.' \
-  -femit-bin=/path/to/lite-index-test.exe \
-  --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
-  --dep antfly_cache_budget \
-  -Mroot=pkg/antfly-embedded/src/windows_lite_index_test.zig \
-  -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
-  --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
-  --dep antfly_platform -Mantfly_cache_budget=lib/runtime/src/cache_budget.zig
-```
-
-For macOS execution, omit the Windows target and output/no-exec options and
-add `lib/platform/src/filesystem_capacity.c` before `-Mroot`.
-The suite passes all 24 tests on macOS. CrossOver passes 23 and fails the vacuum
-replacement test with `AccessDenied` in both Debug and ReleaseFast. Native
-NTFS passes all 24 tests in both modes; see the report.
-
-For all three cancellation cleanup regressions, substitute the filter
-`--test-filter 'pending cancellation'`. The root also includes native Lite
-tests, so `--test-filter 'lite native streaming vacuum rejects corrupt values before publication'`
-exercises corrupt-input cleanup and the subsequent successful-vacuum attempt.
-CrossOver fails that final replacement with `AccessDenied`; macOS and native
-NTFS in both Windows build modes pass. The cancellation regressions use a canceled event and re-arm the
-request before cleanup, without a timed release.
-
-Backup seal and generation inventory paths normalize Windows walker output to
-'/' before validating or matching portable manifests. Run the focused suite:
-
-```sh
-ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
-  zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
-  --test-runner pkg/antfly-embedded/src/test_runner.zig \
-  --test-filter 'storage.db.native_backup' \
-  --test-filter 'storage.db.snapshot_staging' \
-  -femit-bin=/path/to/backup-test.exe \
-  --dep antfly_source_root=root --dep antfly_test_error_logs \
-  --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
-  --dep antfly_cancellation --dep antfly_cache_budget \
-  -Mroot=pkg/antfly-embedded/src/windows_backup_test.zig \
-  -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
-  --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
-  --dep antfly_platform -Mantfly_cancellation=lib/runtime/src/cancellation.zig \
-  --dep antfly_platform -Mantfly_cache_budget=lib/runtime/src/cache_budget.zig \
-  -Mantfly_test_error_logs=pkg/antfly-embedded/src/test_error_logs.zig
-```
-
-The repository runner verifies expected error logs. With the current overlay,
-all 14 tests pass under CrossOver in Debug and ReleaseFast and on macOS
-(include the filesystem capacity C source as above). This includes the five
-previously blocked by hardlinks and a new pending-cancellation pin cleanup
-regression, plus two snapshot staging cleanup regressions. The earlier 11-test
-suite also passed on native Windows NTFS in both configurations; the cleanup follow-up has not been rerun there.
-
-The overlay appends `threaded_windows_hardlink.zig` inside `std.Io.Threaded`.
-Directory and file hardlinks therefore retain the caller's I/O authority and
-use that runtime's directory handles, Unicode path conversion and cancellation
-checks. Existing destinations are rejected; backup pins retain the original
-file identity. Stock Zig's unsupported Windows operation still requires this
-overlay. Use the same overlay for every runtime archive and the executable.
-Windows backup WAL readers now retain a file handle and executor through
-storage shutdown, with memory proportional to requested ranges.
-
-The standalone hardlink checks need no Antfly module dependencies:
-
-```sh
-ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test -lc \
-  -target x86_64-windows-gnu -O Debug --test-no-exec \
-  -femit-bin=/path/to/hardlink-test.exe tools/windows/hardlink_test.zig
-```
-
-They check separate relative directory handles, Unicode paths, file identity,
-source removal, destination conflicts, caller I/O authority and cancellation.
-Use `-O ReleaseFast` to repeat with optimization.
-
-`gce_hardlink_qualify.ps1` runs a manifest of hashed test executables on a
-private disposable Windows VM. It fetches `tests.zip` from the bucket named by
-`antfly-artifact-bucket` metadata, requires NTFS, publishes status through guest
-attributes and uploads `results.json` to that bucket. Enable guest attributes
-and grant its service account access only to the temporary artifact bucket;
-delete the VM and its supporting resources after collecting results. See the
-qualification report for measured native results.
+The focused suite builder above replaces the old overlay-specific manual
+commands. `gce_hardlink_qualify.ps1` fetches `tests.zip` from the private bucket
+named by `antfly-artifact-bucket` metadata, requires NTFS, publishes status
+through guest attributes and uploads `results.json`. Enable guest attributes
+and grant its service account access only to that temporary bucket; delete the
+VM and supporting resources after collecting evidence.
 
 ## Prior native Windows qualification
 
@@ -473,8 +244,8 @@ limited to Windows). After the cleanup it was only compile-checked for Windows
 ## Known gaps for supported Windows
 
 - No Windows CI. `zig build test` has not run on Windows.
-- Native backup pinning requires the Zig overlay. The focused backup tests
-  pass; LSM backup recovery across abrupt resets remains unqualified.
+- Native backup pinning uses the repository-owned executor. Focused backup
+  tests pass; LSM backup recovery across abrupt resets remains unqualified.
 - Untested: vector or hybrid search, enrichments, the distributed
   (Raft) runtime, TLS client calls (CryptoAPI trust store), and long-running
   or concurrent load.

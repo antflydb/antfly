@@ -40,8 +40,8 @@ fn traceMetalEncoderTimingEnabled() bool {
 
 fn monotonicNowNs() u128 {
     if (@import("builtin").target.cpu.arch.isWasm()) return 0;
-    var ts: std.posix.timespec = undefined;
-    return switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    return switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => 0,
     };

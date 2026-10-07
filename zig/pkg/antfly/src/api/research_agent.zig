@@ -30,13 +30,15 @@
 //! the declared worst case. Each phase ends at a checkpoint that a client (or
 //! the durable job store) can carry forward.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const agent_tools = @import("agent_tools.zig");
 const retrieval_agent = @import("retrieval_agent.zig");
 const metadata = @import("antfly_metadata_openapi");
 const generating_openapi = @import("antfly_generating_openapi");
 const generating = @import("antfly_generating");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 
 pub const QueryRunner = retrieval_agent.QueryRunner;
 pub const GenerationRunner = retrieval_agent.GenerationRunner;
@@ -1915,7 +1917,7 @@ test "research agent runs researchers concurrently on a threaded runtime" {
     const body =
         \\{"query":"How do hybrid search and reranking interact?","queries":[{"table":"docs","filter_query":{"term":"tenant-a","field":"tenant"},"full_text_search":{"match":"hybrid"}}],"generator":{"provider":"antfly","model":"test"},"stream":false,"budget":{"max_rounds":1,"max_parallel":2}}
     ;
-    const parsed = try runJson(&fake, std.testing.io, body, .{});
+    const parsed = try runJson(&fake, native_platform.testing.io, body, .{});
     defer parsed.deinit();
     try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
     try std.testing.expectEqual(@as(usize, 2), fake.researcher_turns.load(.monotonic));

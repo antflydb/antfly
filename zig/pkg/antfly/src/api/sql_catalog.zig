@@ -14,7 +14,9 @@
 // limitations.
 
 //! Authorized SQL catalog mutations use the same durable authority as REST.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const server_mod = @import("http_server.zig");
 const catalog = @import("antfly_local_sources").sql_catalog;
 const domain = @import("antfly_local_sources").system_catalog_domain;
@@ -440,7 +442,7 @@ fn awaitActivation(server: *server_mod.ApiHttpServer, context: operation.Request
     const now = if (context.deadline_io) |borrow| blk: {
         var receiver = try borrow.receive();
         break :blk @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
-    } else @import("antfly_platform").time.monotonicNs();
+    } else native_platform.time.monotonicNs();
     bounded.deadline_ns = @min(context.deadline_ns orelse std.math.maxInt(u64), now +| (2 * std.time.ns_per_s));
     while (true) {
         try bounded.ensureActive();
@@ -682,7 +684,7 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
         }
     };
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-uuid-catalog", .{tmp.sub_path});
     defer alloc.free(root);
@@ -728,7 +730,7 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
     var output = std.Io.Writer.Allocating.init(alloc);
     defer output.deinit();
     source.output = &output;
-    var session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = std.testing.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer };
+    var session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = native_platform.testing.io, .source = adapter.backend(), .reader = &reader, .writer = &output.writer };
     defer session.deinit();
     try session.run();
     var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = output.written() };

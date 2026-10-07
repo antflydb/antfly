@@ -13,8 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const builtin = @import("builtin");
 const std = @import("std");
+
 const testing = std.testing;
 
 pub const std_options: std.Options = .{
@@ -141,7 +143,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     // Use independent I/O so teardown of the test's I/O remains measurable.
     const trace_timings = getenvBool("ANTFLY_TEST_TIMINGS");
-    var timing_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var timing_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer timing_io.deinit();
     const clock_io = timing_io.io();
     var watchdog_done: std.Io.Event = .unset;
@@ -173,6 +175,7 @@ pub fn main(init: std.process.Init.Minimal) void {
             .argv0 = .init(init.args),
             .environ = init.environ,
         });
+        native_platform.testing.init(.{ .argv0 = .init(init.args), .environ = init.environ });
         testing.environ = init.environ;
         testing.log_level = .warn;
         expected_error_log_count.store(0, .release);
@@ -200,6 +203,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         const body_end = timingNow(trace_timings, clock_io);
         if (progress) |p| p.record("IO_DEINIT", test_fn.name);
         if (trace_cleanup) std.debug.print("CLEANUP io_deinit begin {s}\n", .{test_fn.name});
+        native_platform.testing.deinit();
         testing.io_instance.deinit();
         const io_end = timingNow(trace_timings, clock_io);
         if (progress) |p| p.record("ALLOCATOR_DEINIT", test_fn.name);

@@ -13,8 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+
+const platform_sync = native_platform.sync;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const manifest_types = @import("types.zig");
@@ -295,8 +297,8 @@ pub const FsStore = struct {
     }
 };
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() native_platform.Threaded {
+    return native_platform.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn fileExists(path: []const u8) bool {
@@ -598,11 +600,11 @@ test "serverless fs manifest store compareAndSwapHead is serialized across threa
 
     var worker_a = Worker{ .store = &store, .target = 2 };
     var worker_b = Worker{ .store = &store, .target = 3 };
-    var thread_a = try std.testing.io.concurrent(Worker.run, .{&worker_a});
-    defer thread_a.await(std.testing.io);
-    var thread_b = try std.testing.io.concurrent(Worker.run, .{&worker_b});
-    thread_a.await(std.testing.io);
-    thread_b.await(std.testing.io);
+    var thread_a = try native_platform.testing.io.concurrent(Worker.run, .{&worker_a});
+    defer thread_a.await(native_platform.testing.io);
+    var thread_b = try native_platform.testing.io.concurrent(Worker.run, .{&worker_b});
+    thread_a.await(native_platform.testing.io);
+    thread_b.await(native_platform.testing.io);
 
     try std.testing.expect(worker_a.result != worker_b.result);
     const head = try store.getHead("docs");

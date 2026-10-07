@@ -64,8 +64,8 @@ const RelativePositionEmb = struct {
 fn monotonicNowNs() u64 {
     // wasm-freestanding has no posix clock; profiling is best-effort there.
     if (@import("builtin").target.cpu.arch.isWasm()) return 0;
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }

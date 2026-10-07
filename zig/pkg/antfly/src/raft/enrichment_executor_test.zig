@@ -13,13 +13,15 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 test "evented enrichment executor initializes when supported" {
     try @import("enrichment_executor.zig").testEventedExecutor(true);
 }
 
 const std = @import("std");
+
 const builtin = @import("builtin");
-const Evented = @import("antfly_platform").Evented;
+const Evented = native_platform.Evented;
 
 test "Dispatch stderr mutex hands ownership past canceled waiters" {
     if (builtin.os.tag != .macos or !std.Io.fiber.supported) return error.SkipZigTest;
@@ -83,7 +85,7 @@ test "Dispatch teardown drains group child cleanup after join" {
             // touching the large stack reservation or relying on scheduling luck.
             if (memory.len > 60 * 1024 * 1024) {
                 self.freeing.store(true, .release);
-                _ = std.c.nanosleep(&.{ .sec = 0, .nsec = 50 * std.time.ns_per_ms }, null);
+                _ = native_platform.c.nanosleep(&.{ .sec = 0, .nsec = 50 * std.time.ns_per_ms }, null);
             }
             std.heap.c_allocator.rawFree(memory, alignment, ra);
             _ = self.outstanding.fetchSub(1, .release);

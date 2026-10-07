@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 pub const antfly_sources = @import("source_owner_physical.zig");
 const collection = @import("common/secret_collection.zig");
 const contract = @import("antfly_local_sources").common_secret_contract;
@@ -43,7 +45,7 @@ const TestProvider = struct {
         errdefer allocator.free(id);
         const bytes = try allocator.alloc(u8, 24 + 32 + 16);
         errdefer allocator.free(bytes);
-        try std.Options.debug_io.randomSecure(bytes[0..24]);
+        try native_platform.debug_io.randomSecure(bytes[0..24]);
         var tag: [16]u8 = undefined;
         Aead.encrypt(bytes[24..56], &tag, key, identity.scope, bytes[0..24].*, self.key);
         @memcpy(bytes[56..72], &tag);
@@ -94,11 +96,11 @@ test "secret backend serverless conditional persistence scope isolation and rest
     var keys = TestProvider{};
     const backend = serverless.Backend{ .client = client, .bucket = "secrets", .prefix = "deployment", .consistency = .linearizable_cas };
     {
-        var store = try serverless.Store.init(alloc, std.testing.io, "scope", keys.provider(), backend);
+        var store = try serverless.Store.init(alloc, native_platform.testing.io, "scope", keys.provider(), backend);
         defer store.deinit();
         try checkContract(&store, &keys);
     }
-    var reopened = try serverless.Store.init(alloc, std.testing.io, "scope", keys.provider(), backend);
+    var reopened = try serverless.Store.init(alloc, native_platform.testing.io, "scope", keys.provider(), backend);
     defer reopened.deinit();
     var value = try reopened.source().resolve(alloc, "scope", "token", .{});
     defer value.deinit(alloc);
@@ -108,7 +110,7 @@ test "secret backend serverless conditional persistence scope isolation and rest
     var raw = try client.getObject("secrets", key, .{});
     defer raw.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, raw.body, "recreated") == null);
-    var other = try serverless.Store.init(alloc, std.testing.io, "other", keys.provider(), backend);
+    var other = try serverless.Store.init(alloc, native_platform.testing.io, "other", keys.provider(), backend);
     defer other.deinit();
     var absent = try other.source().resolve(alloc, "other", "token", .{});
     defer absent.deinit(alloc);
@@ -158,9 +160,9 @@ fn apply(store: *raft_store.RaftApplyStore, index: *u64, command: []const u8) !v
 }
 
 test "secret backend raft atomic CAS durable reopen snapshot and stale command replay" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const follower_root = try std.fs.path.join(alloc, &.{ root, "follower" });
     defer alloc.free(follower_root);
@@ -170,7 +172,7 @@ test "secret backend raft atomic CAS durable reopen snapshot and stale command r
     {
         var db = try raft_store.RaftApplyStore.init(alloc, .{ .root_dir = root });
         defer db.deinit();
-        var store = try Store.init(alloc, std.testing.io, "scope", keys.provider(), .{ .store = &db, .index = &index });
+        var store = try Store.init(alloc, native_platform.testing.io, "scope", keys.provider(), .{ .store = &db, .index = &index });
         defer store.deinit();
         try checkContract(&store, &keys);
         const bytes = (try db.getSecretCollection(alloc, 1, "scope")).?;
@@ -193,7 +195,7 @@ test "secret backend raft atomic CAS durable reopen snapshot and stale command r
     }
     var reopened = try raft_store.RaftApplyStore.init(alloc, .{ .root_dir = root });
     defer reopened.deinit();
-    var store = try Store.init(alloc, std.testing.io, "scope", keys.provider(), .{ .store = &reopened, .index = &index });
+    var store = try Store.init(alloc, native_platform.testing.io, "scope", keys.provider(), .{ .store = &reopened, .index = &index });
     defer store.deinit();
     var found = try store.source().resolve(alloc, "scope", "token", .{});
     defer found.deinit(alloc);
@@ -221,19 +223,19 @@ const DeliveryExecutor = struct {
 };
 
 test "secret backend runtime facade encrypted delivery grants replay freshness and API" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "reader.key", .data = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" });
-    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "reader.key", alloc);
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "reader.key", .data = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n" });
+    const path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "reader.key", alloc);
     defer alloc.free(path);
     var memory = objects.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
     var client = memory.client();
     try client.makeBucket("secrets");
     var keys = TestProvider{};
-    var backend = try serverless.Store.init(alloc, std.testing.io, "scope", keys.provider(), .{ .client = client, .bucket = "secrets", .prefix = "cluster", .consistency = .linearizable_cas });
+    var backend = try serverless.Store.init(alloc, native_platform.testing.io, "scope", keys.provider(), .{ .client = client, .bucket = "secrets", .prefix = "cluster", .consistency = .linearizable_cas });
     defer backend.deinit();
-    var facade = try secrets.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{ .native = .{
+    var facade = try secrets.FileStore.initConfiguredWithIo(alloc, native_platform.testing.io, .{ .native = .{
         .backend = .distributed,
         .scope = "scope",
         .keyring_path = "bootstrap-only",
@@ -249,7 +251,7 @@ test "secret backend runtime facade encrypted delivery grants replay freshness a
     _ = try native_handle.writer.put("scope", "private", "do-not-deliver", .any);
     var executor = DeliveryExecutor{ .store = &facade };
     defer if (executor.capture) |bytes| alloc.free(bytes);
-    var remote = delivery.Remote{ .alloc = alloc, .io = std.testing.io, .scope = "scope", .config = .{ .name = "data-1", .credential_path = path, .urls = &.{"http://metadata"} }, .executor = .{ .ptr = &executor, .vtable = &.{ .execute = DeliveryExecutor.execute } } };
+    var remote = delivery.Remote{ .alloc = alloc, .io = native_platform.testing.io, .scope = "scope", .config = .{ .name = "data-1", .credential_path = path, .urls = &.{"http://metadata"} }, .executor = .{ .ptr = &executor, .vtable = &.{ .execute = DeliveryExecutor.execute } } };
     var result = try remote.source().resolve(alloc, "scope", "token", .{});
     defer result.deinit(alloc);
     try std.testing.expectEqualStrings("first", result.value.?.secret.bytes);
@@ -281,7 +283,7 @@ test "secret backend runtime facade encrypted delivery grants replay freshness a
     };
     var handler = Handler{};
     var api = api_mod.ServerlessHttpServer.init(alloc, .{ .secret_store = &facade, .secret_admin_token = "admin-token-at-least-32-bytes-long" }, &handler);
-    var http_runtime = try api_mod.HttpxRuntime.start(alloc, std.testing.io, &api);
+    var http_runtime = try api_mod.HttpxRuntime.start(alloc, native_platform.testing.io, &api);
     defer http_runtime.deinit();
     var wire = @import("common/http/std_http_executor.zig").StdHttpExecutor.init(alloc, .{});
     defer wire.deinit();
@@ -314,7 +316,7 @@ test "secret backend runtime facade encrypted delivery grants replay freshness a
     var rotated = try remote.source().resolve(alloc, "scope", "token", .{ .min_revision = 4 });
     defer rotated.deinit(alloc);
     try std.testing.expectEqualStrings("rotated", rotated.value.?.secret.bytes);
-    var data_facade = try secrets.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{ .native = .{ .backend = .distributed, .scope = "scope", .reader = remote.config }, .environment = true });
+    var data_facade = try secrets.FileStore.initConfiguredWithIo(alloc, native_platform.testing.io, .{ .native = .{ .backend = .distributed, .scope = "scope", .reader = remote.config }, .environment = true });
     defer data_facade.deinit();
     data_facade.attachNative(remote.source(), null);
     try std.testing.expectError(error.WriteUnavailable, data_facade.put(alloc, "token", "bad"));
@@ -323,33 +325,33 @@ test "secret backend runtime facade encrypted delivery grants replay freshness a
 }
 
 test "secret backend mounted keyring rotation retained decrypt keys and identity authentication" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const first = "{\"active\":\"one\",\"keys\":[{\"id\":\"one\",\"key\":\"1111111111111111111111111111111111111111111111111111111111111111\"}]}";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keys.json", .data = first });
-    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "keys.json", alloc);
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "keys.json", .data = first });
+    const path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "keys.json", alloc);
     defer alloc.free(path);
-    var keyring = @import("common/secret_keyring.zig").Keyring{ .alloc = alloc, .io = std.testing.io, .path = path };
+    var keyring = @import("common/secret_keyring.zig").Keyring{ .alloc = alloc, .io = native_platform.testing.io, .path = path };
     const identity = record.Identity{ .scope = "scope", .key = "token", .revision = 1 };
-    const encoded = try record.seal(alloc, std.testing.io, keyring.provider(), identity, "secret");
+    const encoded = try record.seal(alloc, native_platform.testing.io, keyring.provider(), identity, "secret");
     defer alloc.free(encoded);
     const rotated = "{\"active\":\"two\",\"keys\":[{\"id\":\"one\",\"key\":\"1111111111111111111111111111111111111111111111111111111111111111\"},{\"id\":\"two\",\"key\":\"2222222222222222222222222222222222222222222222222222222222222222\"}]}";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keys.json", .data = rotated });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "keys.json", .data = rotated });
     var opened = try record.open(alloc, keyring.provider(), identity, encoded);
     defer opened.deinit(alloc);
     try std.testing.expectEqualStrings("secret", opened.bytes);
-    const new_record = try record.seal(alloc, std.testing.io, keyring.provider(), identity, "new");
+    const new_record = try record.seal(alloc, native_platform.testing.io, keyring.provider(), identity, "new");
     defer alloc.free(new_record);
     try std.testing.expectEqualStrings("two", (try record.decode(new_record)).key_id);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keys.json", .data = first });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "keys.json", .data = first });
     try std.testing.expectError(error.Unavailable, record.open(alloc, keyring.provider(), identity, new_record));
 }
 
 test "secret backend live metadata API commits Raft and authenticated data delivery" {
     const runtime = @import("metadata/runtime.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const replicas = try std.fs.path.join(alloc, &.{ root, "replicas" });
     defer alloc.free(replicas);
@@ -357,10 +359,10 @@ test "secret backend live metadata API commits Raft and authenticated data deliv
     defer alloc.free(catalog);
     const snapshots = try std.fs.path.join(alloc, &.{ root, "snapshots" });
     defer alloc.free(snapshots);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "reader.key", .data = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" });
-    const credential_path = try tmp.dir.realPathFileAlloc(std.testing.io, "reader.key", alloc);
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "reader.key", .data = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" });
+    const credential_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "reader.key", alloc);
     defer alloc.free(credential_path);
-    var facade = try secrets.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{ .native = .{ .backend = .distributed, .scope = "scope", .keyring_path = "host-provider", .grants = &.{.{ .name = "data-1", .credential_path = credential_path, .keys = &.{"token"} }} }, .environment = false });
+    var facade = try secrets.FileStore.initConfiguredWithIo(alloc, native_platform.testing.io, .{ .native = .{ .backend = .distributed, .scope = "scope", .keyring_path = "host-provider", .grants = &.{.{ .name = "data-1", .credential_path = credential_path, .keys = &.{"token"} }} }, .environment = false });
     defer facade.deinit();
     var keys = TestProvider{};
     var native: ?distributed.Store = null;
@@ -378,7 +380,7 @@ test "secret backend live metadata API commits Raft and authenticated data deliv
         .api_server_cfg = .{ .auth_enabled = false, .secret_store = &facade, .internal_service_secret = service_secret, .internal_service_issuer = "secret-test" },
     });
     defer server.deinit();
-    native = try distributed.Store.init(alloc, std.testing.io, "scope", keys.provider(), .{ .service = server.server.svc });
+    native = try distributed.Store.init(alloc, native_platform.testing.io, "scope", keys.provider(), .{ .service = server.server.svc });
     const native_handle = native.?.nativeStore();
     facade.attachNative(native_handle.source, native_handle.writer);
     try server.start();
@@ -408,7 +410,7 @@ test "secret backend live metadata API commits Raft and authenticated data deliv
         }
     };
     var checked_delivery = CheckedDelivery{ .inner = executor.executor() };
-    var remote = delivery.Remote{ .alloc = alloc, .io = std.testing.io, .scope = "scope", .config = .{ .name = "data-1", .credential_path = credential_path, .urls = &.{base} }, .executor = .{ .ptr = &checked_delivery, .vtable = &.{ .execute = CheckedDelivery.execute } }, .internal_service = .{ .secret = service_secret, .issuer = "secret-test" } };
+    var remote = delivery.Remote{ .alloc = alloc, .io = native_platform.testing.io, .scope = "scope", .config = .{ .name = "data-1", .credential_path = credential_path, .urls = &.{base} }, .executor = .{ .ptr = &checked_delivery, .vtable = &.{ .execute = CheckedDelivery.execute } }, .internal_service = .{ .secret = service_secret, .issuer = "secret-test" } };
     var read = try remote.source().resolve(alloc, "scope", "token", .{ .min_revision = 1 });
     defer read.deinit(alloc);
     try std.testing.expect(checked_delivery.checked);
@@ -448,7 +450,7 @@ test "secret backend GCS uses observed generation for conditional upload" {
     defer gcs.deinit();
     var keys = TestProvider{};
     const backend = serverless.Backend{ .client = gcs.client(), .gcs_client = &gcs, .bucket = "bucket", .prefix = "native", .consistency = .linearizable_cas };
-    var store = try serverless.Store.init(alloc, std.testing.io, "scope", keys.provider(), backend);
+    var store = try serverless.Store.init(alloc, native_platform.testing.io, "scope", keys.provider(), backend);
     defer store.deinit();
     _ = try store.nativeStore().writer.put("scope", "token", "one", .absent);
     var persistence = backend;
@@ -488,9 +490,9 @@ test "secret backend retries known CAS races and never replays uncertain publica
     try client.makeBucket("secrets");
     var keys = TestProvider{};
     const backend = serverless.Backend{ .client = client, .bucket = "secrets", .prefix = "native", .consistency = .linearizable_cas };
-    var competitor = try serverless.Store.init(alloc, std.testing.io, "scope", keys.provider(), backend);
+    var competitor = try serverless.Store.init(alloc, native_platform.testing.io, "scope", keys.provider(), backend);
     defer competitor.deinit();
-    var racing = try collection.Store(RacingBackend).init(alloc, std.testing.io, "scope", keys.provider(), .{ .delegate = backend, .competitor = &competitor });
+    var racing = try collection.Store(RacingBackend).init(alloc, native_platform.testing.io, "scope", keys.provider(), .{ .delegate = backend, .competitor = &competitor });
     defer racing.deinit();
     try std.testing.expectEqual(@as(u64, 2), (try racing.nativeStore().writer.put("scope", "token", "our-write", .absent)).revision);
     try std.testing.expectEqual(@as(usize, 2), racing.backend.calls);
@@ -508,7 +510,7 @@ test "secret backend retries known CAS races and never replays uncertain publica
 
 test "secret backend startup keeps operational references before native attachment" {
     const config = @import("antfly_local_sources").common_config;
-    var facade = try secrets.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{ .native = .{ .backend = .distributed, .keyring_path = "bootstrap-keyring" }, .environment = false });
+    var facade = try secrets.FileStore.initConfiguredWithIo(alloc, native_platform.testing.io, .{ .native = .{ .backend = .distributed, .keyring_path = "bootstrap-keyring" }, .environment = false });
     defer facade.deinit();
     var cfg = try config.Config.parseFromSliceWithSecrets(alloc,
         \\{"secrets":{"native":{"backend":"distributed","keyring_path":"bootstrap-keyring"},"environment":false},
@@ -529,15 +531,15 @@ test "secret backend publication identities distinguish competing deletes and re
     var empty = try collection.decode(alloc, "scope", null);
     defer empty.deinit(alloc);
     var keys = TestProvider{};
-    const envelope = try record.seal(alloc, std.testing.io, keys.provider(), .{ .scope = "scope", .key = "token", .revision = 1 }, "value");
+    const envelope = try record.seal(alloc, native_platform.testing.io, keys.provider(), .{ .scope = "scope", .key = "token", .revision = 1 }, "value");
     defer alloc.free(envelope);
-    const initial = try collection.replace(alloc, std.testing.io, "scope", empty, "token", envelope);
+    const initial = try collection.replace(alloc, native_platform.testing.io, "scope", empty, "token", envelope);
     defer alloc.free(initial);
     var previous = try collection.decode(alloc, "scope", initial);
     defer previous.deinit(alloc);
-    const first = try collection.replace(alloc, std.testing.io, "scope", previous, "token", null);
+    const first = try collection.replace(alloc, native_platform.testing.io, "scope", previous, "token", null);
     defer alloc.free(first);
-    const second = try collection.replace(alloc, std.testing.io, "scope", previous, "token", null);
+    const second = try collection.replace(alloc, native_platform.testing.io, "scope", previous, "token", null);
     defer alloc.free(second);
     try std.testing.expect(!std.mem.eql(u8, first, second));
     // AFSC v1 has the same fixed fields but no publication identity.
@@ -552,10 +554,10 @@ test "secret backend publication identities distinguish competing deletes and re
 
 test "secret backend S3 opening uses refreshable bootstrap credential sources" {
     const support = @import("antfly_local_sources").serverless_object_store_support;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials", .data = "[native-test]\naws_access_key_id = native-access\naws_secret_access_key = native-secret\naws_session_token = native-session\n" });
-    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "credentials", alloc);
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "credentials", .data = "[native-test]\naws_access_key_id = native-access\naws_secret_access_key = native-secret\naws_session_token = native-session\n" });
+    const path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "credentials", alloc);
     defer alloc.free(path);
     var opened = try support.OpenedObjectStore.initS3UriWithS3AndOpenOptions(alloc, "secrets", "prefix", .{
         .endpoint = "http://127.0.0.1:1",
@@ -611,13 +613,13 @@ fn secretFollowerForwardingCase(unknown_after_commit: bool) !void {
         }
     };
     const runtime = @import("metadata/runtime.zig");
-    const time = @import("antfly_platform").time;
-    var tmp = std.testing.tmpDir(.{});
+    const time = native_platform.time;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
     var servers: [2]runtime.Server = undefined;
     var facades: [2]secrets.FileStore = undefined;
     var natives: [2]distributed.Store = undefined;
@@ -636,7 +638,7 @@ fn secretFollowerForwardingCase(unknown_after_commit: bool) !void {
         .{ .node_id = 2, .raft_url = "http://127.0.0.1:1" },
     };
     for (0..2) |i| {
-        facades[i] = try secrets.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{ .native = .{ .backend = .distributed, .scope = "scope", .keyring_path = "host-provider" }, .environment = false });
+        facades[i] = try secrets.FileStore.initConfiguredWithIo(alloc, native_platform.testing.io, .{ .native = .{ .backend = .distributed, .scope = "scope", .keyring_path = "host-provider" }, .environment = false });
         errdefer facades[i].deinit();
         servers[i] = try runtime.Server.init(alloc, .{
             .replica_root_dir = try std.fmt.allocPrint(a, "{s}/{d}/replicas", .{ root, i }),
@@ -649,7 +651,7 @@ fn secretFollowerForwardingCase(unknown_after_commit: bool) !void {
             .api_server_cfg = .{ .auth_enabled = false, .secret_store = &facades[i] },
         });
         errdefer servers[i].deinit();
-        natives[i] = try distributed.Store.init(alloc, std.testing.io, "scope", keys[i].provider(), .{ .service = servers[i].server.svc });
+        natives[i] = try distributed.Store.init(alloc, native_platform.testing.io, "scope", keys[i].provider(), .{ .service = servers[i].server.svc });
         const handle = natives[i].nativeStore();
         unknown_writers[i] = .{ .delegate = handle.writer };
         facades[i].attachNative(handle.source, if (unknown_after_commit) unknown_writers[i].writer() else handle.writer);
@@ -665,8 +667,8 @@ fn secretFollowerForwardingCase(unknown_after_commit: bool) !void {
     // driver for each node. A peer's WAL cannot suspend the whole fixture.
     const Driver = @import("raft/runtime_loop.zig").ManagedProgressDriver;
     var progress = [_]Driver{
-        Driver.init(std.testing.io, servers[0].raftProgressSource(), 100 * std.time.ns_per_ms),
-        Driver.init(std.testing.io, servers[1].raftProgressSource(), 100 * std.time.ns_per_ms),
+        Driver.init(native_platform.testing.io, servers[0].raftProgressSource(), 100 * std.time.ns_per_ms),
+        Driver.init(native_platform.testing.io, servers[1].raftProgressSource(), 100 * std.time.ns_per_ms),
     };
     var started: usize = 0;
     defer for (progress[0..started]) |*driver| driver.deinit();
@@ -725,7 +727,7 @@ fn expectSecretMutationResponse(response: @import("raft/transport/http_common.zi
 }
 
 fn awaitSecretRevision(source: @import("antfly_local_sources").common_secret_contract.Source, revision: u64) !@import("antfly_local_sources").common_secret_contract.Lookup {
-    const time = @import("antfly_platform").time;
+    const time = native_platform.time;
     const deadline = time.monotonicNs() + 10 * std.time.ns_per_s;
     while (time.monotonicNs() < deadline) {
         const lookup = source.resolve(alloc, "scope", "token", .{ .min_revision = revision }) catch |err| {

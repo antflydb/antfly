@@ -17,8 +17,10 @@
 //! caller's topology/apply fence and the destination remains unpublished.
 //! Each page drops its cursor before committing a bounded destination batch;
 //! no whole-memtable snapshot, primary row decode or per-parent lookup occurs.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
-const time = @import("antfly_platform").time;
+
+const time = native_platform.time;
 const integrity = @import("relational_integrity.zig");
 const catalog = @import("relational_integrity_catalog.zig");
 const docstore = @import("../docstore.zig");
@@ -113,7 +115,7 @@ pub fn pruneOutside(alloc: Allocator, io: ?std.Io, store: *docstore.DocStore, lo
 test "relational integrity range transfer follows logical claim routing and preserves companions" {
     const alloc = std.testing.allocator;
     const lsm = @import("../lsm_backend.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var source_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const source_path = try std.fmt.bufPrint(&source_path_buf, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});

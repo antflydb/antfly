@@ -54,8 +54,8 @@ const runs = 7;
 const sentence = "The committee in Geneva reviewed the quarterly report from Acme Robotics, and Maria Lopez asked whether the new factory in Osaka would open before the winter holidays. ";
 
 fn nowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    var ts: platform.c.timespec = undefined;
+    _ = platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts);
     return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
 }
 

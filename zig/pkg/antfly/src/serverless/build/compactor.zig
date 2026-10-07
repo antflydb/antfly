@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_types = @import("../catalog/types.zig");
@@ -83,7 +85,7 @@ pub const Compactor = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !CompactionResult {
-        var fallback: ?std.Io.Threaded = if (cancellation == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+        var fallback: ?native_platform.Threaded = if (cancellation == null) native_platform.Threaded.init(std.heap.page_allocator, .{}) else null;
         defer if (fallback) |*value| value.deinit();
         const io = if (cancellation) |token| token.io else fallback.?.io();
         if (publication_guard == null) {
@@ -234,7 +236,7 @@ pub const Compactor = struct {
         const graph_metric_refs = try builder_mod.buildGraphMetricArtifactRefsAlloc(self.alloc, self.artifacts, current, graph_refs, graph_metric_specs, cancellation, .{
             .published_generation = next_version,
             .edge_generation = next_version,
-            .computed_at_ms = @divTrunc(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_ms),
+            .computed_at_ms = @divTrunc(native_platform.time.realtimeNs(), std.time.ns_per_ms),
         }, cancellation.?.io, 1);
         defer builder_mod.freeArtifactRefs(self.alloc, graph_metric_refs);
         const published_graph_refs = try builder_mod.concatArtifactRefSlicesAlloc(self.alloc, graph_refs, graph_metric_refs);
@@ -500,7 +502,7 @@ test "serverless compactor document entry views borrow payloads and only own the
             try std.testing.expectEqual(source[0].body.ptr, view[0].body.ptr);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Run.run, .{&docs});
+    try native_platform.allocator.checkAllAllocationFailures(a, Run.run, .{&docs});
 }
 
 fn allocDocumentEntries(
@@ -1420,8 +1422,8 @@ test "serverless adaptive vector build policy for policy uses namespace threshol
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() native_platform.Threaded {
+    return native_platform.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

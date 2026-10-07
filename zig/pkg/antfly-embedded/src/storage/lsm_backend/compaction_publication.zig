@@ -16,7 +16,9 @@
 //! An admitted compaction installs three immutable roots, not K locked edits.
 //! The caller owns inputs/outputs until this registered job finishes. All
 //! allocating preparation, rebase, and ledger cleanup is sliced off-lock.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Directory = @import("run_directory.zig").Directory;
 const Store = @import("run_store.zig").Store;
 const Ledger = @import("obsolete_ledger.zig").Ledger;
@@ -521,9 +523,9 @@ test "compaction publication uses the borrowed clock for bounded preparation" {
     // only the clock, retaining the native I/O context for synchronization.
     // Composed VOPR tests separately cover scheduling and cancellation.
     Clock.now_ns = 0;
-    var vtable = std.testing.io.vtable.*;
+    var vtable = native_platform.testing.io.vtable.*;
     vtable.now = Clock.now;
-    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const io: std.Io = .{ .userdata = native_platform.testing.io.userdata, .vtable = &vtable };
     const Backend = @import("../lsm_backend.zig").Backend;
     var backend = Backend.init(allocator, .{
         .wal_enabled = false,
@@ -574,7 +576,7 @@ test "compaction publication atomic fence scaling benchmark" {
     if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Backend = @import("../lsm_backend.zig").Backend;
     const allocator = std.heap.smp_allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = native_platform.Threaded.global_single_threaded.io();
     for ([_]usize{ 1000, 10000, 50000 }) |count| {
         var backend = Backend.init(allocator, .{ .wal_enabled = false });
         defer backend.close();

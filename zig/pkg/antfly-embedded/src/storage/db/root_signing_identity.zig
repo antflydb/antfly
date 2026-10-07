@@ -19,7 +19,9 @@
 //! key durably registered for that exact root. This module alone grants no
 //! permission to delete a replica or acknowledge retirement.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Crc32 = @import("antfly_hash").Crc32;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const root_identity = @import("root_identity.zig");
@@ -194,16 +196,16 @@ fn decode(bytes: []const u8) !State {
 
 test "root signing identity survives reopen, rotates with root, and rejects corruption" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const first_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/signing-a", .{tmp.sub_path});
     defer alloc.free(first_path);
     const second_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/signing-b", .{tmp.sub_path});
     defer alloc.free(second_path);
-    const first = try loadOrCreate(alloc, std.testing.io, first_path);
-    const reopened = try load(alloc, std.testing.io, first_path);
+    const first = try loadOrCreate(alloc, native_platform.testing.io, first_path);
+    const reopened = try load(alloc, native_platform.testing.io, first_path);
     try std.testing.expectEqualDeep(first, reopened);
-    const second = try loadOrCreate(alloc, std.testing.io, second_path);
+    const second = try loadOrCreate(alloc, native_platform.testing.io, second_path);
     try std.testing.expect(first.root_incarnation != second.root_incarnation);
     try std.testing.expect(!std.mem.eql(u8, &first.public_key, &second.public_key));
     const message = "initial-fk-retirement-ticket";
@@ -217,54 +219,54 @@ test "root signing identity survives reopen, rotates with root, and rejects corr
 
 test "root signing identity recovers an interrupted temporary checkpoint" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/interrupted-signing", .{tmp.sub_path});
     defer alloc.free(path);
-    const root = try root_identity.loadOrCreate(alloc, std.testing.io, path);
+    const root = try root_identity.loadOrCreate(alloc, native_platform.testing.io, path);
     const checkpoint = try checkpointPathAlloc(alloc, path);
     defer alloc.free(checkpoint);
     const stale = try std.fmt.allocPrint(alloc, "{s}.tmp-{x}", .{ checkpoint, root.incarnation });
     defer alloc.free(stale);
     {
-        const file = try fs_paths.createFilePortable(std.testing.io, stale, .{ .exclusive = true, .permissions = privateFilePermissions() });
-        file.close(std.testing.io);
+        const file = try fs_paths.createFilePortable(native_platform.testing.io, stale, .{ .exclusive = true, .permissions = privateFilePermissions() });
+        file.close(native_platform.testing.io);
     }
-    const state = try loadOrCreate(alloc, std.testing.io, path);
+    const state = try loadOrCreate(alloc, native_platform.testing.io, path);
     try std.testing.expectEqual(root.incarnation, state.root_incarnation);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, stale, .{}));
-    try std.testing.expectEqualDeep(state, try load(alloc, std.testing.io, path));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(native_platform.testing.io, stale, .{}));
+    try std.testing.expectEqualDeep(state, try load(alloc, native_platform.testing.io, path));
 }
 
 test "root signing identity refuses a world-readable restored checkpoint" {
     if (comptime @import("builtin").os.tag == .windows) return;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/permissive-signing", .{tmp.sub_path});
     defer alloc.free(path);
-    _ = try loadOrCreate(alloc, std.testing.io, path);
+    _ = try loadOrCreate(alloc, native_platform.testing.io, path);
     const checkpoint = try checkpointPathAlloc(alloc, path);
     defer alloc.free(checkpoint);
-    try std.Io.Dir.cwd().setFilePermissions(std.testing.io, checkpoint, @fromBackingInt(0o644), .{});
-    try std.testing.expectError(error.InsecureRootSigningIdentity, load(alloc, std.testing.io, path));
+    try std.Io.Dir.cwd().setFilePermissions(native_platform.testing.io, checkpoint, @fromBackingInt(0o644), .{});
+    try std.testing.expectError(error.InsecureRootSigningIdentity, load(alloc, native_platform.testing.io, path));
 }
 
 test "root signing identity refuses a symlinked checkpoint" {
     if (comptime @import("builtin").os.tag == .windows) return;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-root", .{tmp.sub_path});
     defer alloc.free(source_path);
     const target_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/target-root", .{tmp.sub_path});
     defer alloc.free(target_path);
-    _ = try loadOrCreate(alloc, std.testing.io, source_path);
-    _ = try root_identity.loadOrCreate(alloc, std.testing.io, target_path);
+    _ = try loadOrCreate(alloc, native_platform.testing.io, source_path);
+    _ = try root_identity.loadOrCreate(alloc, native_platform.testing.io, target_path);
     const target_checkpoint = try checkpointPathAlloc(alloc, target_path);
     defer alloc.free(target_checkpoint);
     const source_checkpoint = try checkpointPathAlloc(alloc, source_path);
     defer alloc.free(source_checkpoint);
-    try std.Io.Dir.cwd().symLink(std.testing.io, source_checkpoint, target_checkpoint, .{});
-    try std.testing.expectError(error.SymLinkLoop, load(alloc, std.testing.io, target_path));
+    try std.Io.Dir.cwd().symLink(native_platform.testing.io, source_checkpoint, target_checkpoint, .{});
+    try std.testing.expectError(error.SymLinkLoop, load(alloc, native_platform.testing.io, target_path));
 }

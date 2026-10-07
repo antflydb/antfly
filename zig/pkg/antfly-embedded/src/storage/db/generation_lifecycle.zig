@@ -93,7 +93,7 @@ fn openPublicationLockWithIo(io: std.Io, alloc: Allocator, canonical_path: []con
 }
 
 fn openPublicationLock(alloc: Allocator, canonical_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try openPublicationLockWithIo(io_impl.io(), alloc, canonical_path, lock);
 }
@@ -112,7 +112,7 @@ fn closePublicationLock(file: std.Io.File) void {
     if (comptime builtin.os.tag == .freestanding) {
         unreachable;
     } else {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         file.close(io_impl.io());
     }
@@ -163,7 +163,7 @@ fn canonicalPathAllocWithIo(alloc: Allocator, io: std.Io, path: []const u8) ![]u
 }
 
 fn canonicalPathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try canonicalPathAllocWithIo(alloc, io_impl.io(), path);
 }
@@ -258,7 +258,7 @@ const Manager = struct {
     }
 
     pub fn beginExclusive(self: *Manager, path: []const u8) !ExclusiveTransition {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         var transition = try self.beginExclusiveWithIo(path, io_impl.io());
         transition.io = null;
@@ -310,7 +310,7 @@ const Manager = struct {
     }
 
     pub fn beginPreparation(self: *Manager, path: []const u8, cleanup_scheduler: ?CleanupScheduler) !PreparationTransition {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         var transition = try self.beginPreparationWithIo(path, cleanup_scheduler, io_impl.io());
         transition.io = null;
@@ -362,7 +362,7 @@ const Manager = struct {
     }
 
     fn beginReconciliation(self: *Manager, path: []const u8) !?ReconciliationLease {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.beginReconciliationWithIo(path, io_impl.io());
     }
@@ -469,7 +469,7 @@ const Manager = struct {
     }
 
     fn hasReaders(self: *Manager, path: []const u8) !bool {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.hasReadersWithIo(path, io_impl.io());
     }
@@ -707,11 +707,11 @@ pub const PreparationTransition = struct {
 
     pub fn promote(self: *PreparationTransition) !ExclusiveTransition {
         if (!self.active) return error.InvalidGenerationTransition;
-        var fallback_io_impl: std.Io.Threaded = undefined;
+        var fallback_io_impl: platform.Threaded = undefined;
         var fallback_io_owned = false;
         defer if (fallback_io_owned) fallback_io_impl.deinit();
         const io = self.io orelse blk: {
-            fallback_io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            fallback_io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
             fallback_io_owned = true;
             break :blk fallback_io_impl.io();
         };
@@ -806,7 +806,7 @@ pub const ExclusiveTransition = struct {
             _ = try reconcilePublishedGenerationExclusive(self.alloc, io, self.path, self.cleanup_scheduler);
             return;
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         _ = try reconcilePublishedGenerationExclusive(self.alloc, io_impl.io(), self.path, self.cleanup_scheduler);
     }
@@ -911,7 +911,7 @@ fn beginStagingGeneration(
             reconcile,
         );
     }
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var staged = try beginStagingGenerationWithIo(
         alloc,
@@ -1014,7 +1014,7 @@ pub const StagedGeneration = struct {
     /// contract and require another seal before publication.
     pub fn seal(self: *StagedGeneration) !void {
         if (self.io) |io| return try self.sealWithIo(io);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.sealWithIo(io_impl.io());
     }
@@ -1036,7 +1036,7 @@ pub const StagedGeneration = struct {
     /// or rollbackPublication.
     pub fn publishPrepared(self: *StagedGeneration) !PublicationOutcome {
         if (self.io) |io| return try self.publishPreparedWithIo(io);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.publishPreparedWithIo(io_impl.io());
     }
@@ -1081,7 +1081,7 @@ pub const StagedGeneration = struct {
     /// Asynchronous cleanup scheduling failures remain reconciliation debt.
     pub fn commitPublication(self: *StagedGeneration) !void {
         if (self.io) |io| return try self.commitPublicationWithIo(io);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.commitPublicationWithIo(io_impl.io());
     }
@@ -1156,7 +1156,7 @@ pub const StagedGeneration = struct {
     /// being admitted while this exchange is in flight.
     pub fn rollbackPublication(self: *StagedGeneration) !void {
         if (self.io) |io| return try self.rollbackPublicationWithIo(io);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.rollbackPublicationWithIo(io_impl.io());
     }
@@ -1203,7 +1203,7 @@ pub const StagedGeneration = struct {
     pub fn deinit(self: *StagedGeneration) void {
         if (self.closed) return;
         if (self.io) |io| return self.deinitWithIo(io);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         self.deinitWithIo(io_impl.io());
     }
@@ -1849,7 +1849,7 @@ fn acquirePublishedGenerationReadWithRuntimeAndIo(
     io_override: ?std.Io,
 ) !?ReadLease {
     if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-    var fallback_io_impl: std.Io.Threaded = undefined;
+    var fallback_io_impl: platform.Threaded = undefined;
     var fallback_io_owned = false;
     defer if (fallback_io_owned) fallback_io_impl.deinit();
     const io = if (runtime) |active|
@@ -1857,7 +1857,7 @@ fn acquirePublishedGenerationReadWithRuntimeAndIo(
     else if (io_override) |shared_io|
         shared_io
     else blk: {
-        fallback_io_impl = std.Io.Threaded.init(alloc, .{});
+        fallback_io_impl = platform.Threaded.init(alloc, .{});
         fallback_io_owned = true;
         break :blk fallback_io_impl.io();
     };
@@ -2098,7 +2098,7 @@ test "generation publication replays durable identities on borrowed VoprIo" {
 
 test "generation lifecycle serializes the same root and validates capability target" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     // Keep roots inside the fixture so cleanup also removes their sibling locks.
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-a", .{tmp.sub_path});
@@ -2124,7 +2124,7 @@ test "generation lifecycle serializes the same root and validates capability tar
 
 test "generation preparation overlaps reads but promotion requires reader drain" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2145,7 +2145,7 @@ test "generation preparation overlaps reads but promotion requires reader drain"
 
 test "generation preparation excludes cross-manager publishers" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-cross-manager", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2161,7 +2161,7 @@ test "generation preparation excludes cross-manager publishers" {
 
 test "generation lifecycle returns cross-manager filesystem lock contention" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cross-manager", .{tmp.sub_path});
@@ -2178,7 +2178,7 @@ test "generation lifecycle returns cross-manager filesystem lock contention" {
 
 test "generation lifecycle retains shared readers until the final owner closes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-readers", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2206,7 +2206,7 @@ test "generation lifecycle retains shared readers until the final owner closes" 
 
 test "serving reconciliation serializes with exclusive generation transition" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reconciliation-serialization", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2222,14 +2222,14 @@ test "serving reconciliation serializes with exclusive generation transition" {
 
 test "reconciliation cache canonicalizes aliases for transition invalidation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var manager = Manager.init(alloc);
     defer manager.deinit();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/live", .{tmp.sub_path});
     defer alloc.free(path);
-    try fs_paths.createDirPathPortable(std.testing.io, path);
+    try fs_paths.createDirPathPortable(platform.testing.io, path);
     const path_alias = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/./{s}/live", .{tmp.sub_path});
     defer alloc.free(path_alias);
     const canonical_path = try canonicalPathAlloc(alloc, path);
@@ -2247,7 +2247,7 @@ test "reconciliation cache canonicalizes aliases for transition invalidation" {
 
 test "reconciliation cache expires when the final reader drains" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reconciliation-reader-cache", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2269,11 +2269,11 @@ test "reconciliation cache expires when the final reader drains" {
 
 test "cached read admission revalidates after filesystem lock acquisition" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cached-read-revalidation", .{tmp.sub_path});
     defer alloc.free(path);
-    try fs_paths.createDirPathPortable(std.testing.io, path);
+    try fs_paths.createDirPathPortable(platform.testing.io, path);
 
     var manager = Manager.init(alloc);
     defer manager.deinit();
@@ -2295,11 +2295,11 @@ test "cached read admission revalidates after filesystem lock acquisition" {
 
 test "process cached read admission retains shared publication locks" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/process-cached-read", .{tmp.sub_path});
     defer alloc.free(path);
-    try fs_paths.createDirPathPortable(std.testing.io, path);
+    try fs_paths.createDirPathPortable(platform.testing.io, path);
 
     var first = (try acquirePublishedGenerationRead(alloc, path)) orelse return error.TestUnexpectedResult;
     var first_active = true;
@@ -2321,7 +2321,7 @@ test "process cached read admission retains shared publication locks" {
 
 test "staged generation cannot publish after its exclusive capability is released" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/released", .{tmp.sub_path});
@@ -2341,7 +2341,7 @@ test "staged generation cannot publish after its exclusive capability is release
 
 test "staged generation preserves live root until publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/live", .{tmp.sub_path});
@@ -2349,7 +2349,7 @@ test "staged generation preserves live root until publication" {
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, live_path);
@@ -2378,7 +2378,7 @@ test "staged generation preserves live root until publication" {
 
 test "staged generation seals while readers remain admitted before atomic publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-live", .{tmp.sub_path});
@@ -2386,8 +2386,8 @@ test "staged generation seals while readers remain admitted before atomic public
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
 
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "old" });
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = live_value_path, .data = "old" });
 
     var manager = Manager.init(alloc);
     defer manager.deinit();
@@ -2401,12 +2401,12 @@ test "staged generation seals while readers remain admitted before atomic public
 
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "new" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = staged_value_path, .data = "new" });
 
     try staged.seal();
     try std.testing.expect(staged.sealed);
     try std.testing.expectError(error.GenerationTransitionActive, preparation.promote());
-    const before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    const before = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(before);
     try std.testing.expectEqualStrings("old", before);
 
@@ -2415,7 +2415,7 @@ test "staged generation seals while readers remain admitted before atomic public
     var transition = try preparation.promote();
     defer transition.deinit();
     try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
-    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    const after = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(after);
     try std.testing.expectEqualStrings("new", after);
 }
@@ -2423,15 +2423,15 @@ test "staged generation seals while readers remain admitted before atomic public
 test "prepared generation publication rolls back before serving admission" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rollback-live", .{tmp.sub_path});
     defer alloc.free(live_path);
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "old" });
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = live_value_path, .data = "old" });
 
     var transition = try beginProcessExclusive(live_path);
     defer transition.deinit();
@@ -2439,10 +2439,10 @@ test "prepared generation publication rolls back before serving admission" {
     defer staged.deinit();
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
 
     try std.testing.expectEqual(PublicationOutcome.durable, try staged.publishPrepared());
-    const candidate = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    const candidate = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(candidate);
     try std.testing.expectEqualStrings("candidate", candidate);
 
@@ -2451,22 +2451,22 @@ test "prepared generation publication rolls back before serving admission" {
     try staged.rollbackPublication();
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
-    const restored = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    const restored = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(restored);
     try std.testing.expectEqualStrings("old", restored);
 }
 
 test "prepared generation reconciliation rolls back an exchanged candidate" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-crash-live", .{tmp.sub_path});
     defer alloc.free(live_path);
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
 
     var manager = Manager.init(alloc);
     defer manager.deinit();
@@ -2476,24 +2476,24 @@ test "prepared generation reconciliation rolls back an exchanged candidate" {
     defer staged.deinit();
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
 
     try std.testing.expectEqual(PublicationOutcome.durable, try staged.publishPrepared());
-    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, std.testing.io, live_path, null));
+    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, platform.testing.io, live_path, null));
     staged.published = false;
     staged.preserve_retired = false;
     staged.had_live_generation = false;
     staged.publication_outcome = null;
 
-    const restored = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(32));
+    const restored = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(32));
     defer alloc.free(restored);
     try std.testing.expectEqualStrings("previous", restored);
-    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+    try std.testing.expect(!pathExists(platform.testing.io, staged.path()));
 }
 
 test "prepared first generation reconciliation removes an unvalidated candidate" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-first-live", .{tmp.sub_path});
@@ -2507,29 +2507,29 @@ test "prepared first generation reconciliation removes an unvalidated candidate"
     defer staged.deinit();
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
 
     try std.testing.expectEqual(PublicationOutcome.durable, try staged.publishPrepared());
-    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, std.testing.io, live_path, null));
+    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, platform.testing.io, live_path, null));
     staged.published = false;
     staged.preserve_retired = false;
     staged.publication_outcome = null;
 
-    try std.testing.expect(!pathExists(std.testing.io, live_path));
-    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+    try std.testing.expect(!pathExists(platform.testing.io, live_path));
+    try std.testing.expect(!pathExists(platform.testing.io, staged.path()));
 }
 
 test "committed generation reconciliation preserves the validated candidate" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/committed-crash-live", .{tmp.sub_path});
     defer alloc.free(live_path);
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
 
     var manager = Manager.init(alloc);
     defer manager.deinit();
@@ -2539,34 +2539,34 @@ test "committed generation reconciliation preserves the validated candidate" {
     defer staged.deinit();
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = staged_value_path, .data = "candidate" });
 
     try std.testing.expectEqual(PublicationOutcome.durable, try staged.publishPrepared());
-    try writePublicationMarker(alloc, std.testing.io, live_path, .{
+    try writePublicationMarker(alloc, platform.testing.io, live_path, .{
         .phase = .committed,
         .retained_name = std.fs.path.basename(staged.path()),
         .had_live_generation = true,
     });
     staged.publication_committed = true;
-    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, std.testing.io, live_path, null));
+    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, platform.testing.io, live_path, null));
 
-    const published = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(32));
+    const published = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(32));
     defer alloc.free(published);
     try std.testing.expectEqualStrings("candidate", published);
-    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+    try std.testing.expect(!pathExists(platform.testing.io, staged.path()));
 }
 
 test "published generation reports post-commit sync failure without returning an error" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/uncertain", .{tmp.sub_path});
     defer alloc.free(live_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
     const old_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(old_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = old_value_path, .data = "previous" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = old_value_path, .data = "previous" });
 
     var manager = Manager.init(alloc);
     defer manager.deinit();
@@ -2577,7 +2577,7 @@ test "published generation reports post-commit sync failure without returning an
 
     const value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = value_path, .data = "committed" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = value_path, .data = "committed" });
 
     test_fail_post_publish_sync = true;
     defer test_fail_post_publish_sync = false;
@@ -2585,11 +2585,11 @@ test "published generation reports post-commit sync failure without returning an
 
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
-    const value = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(32));
+    const value = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(32));
     defer alloc.free(value);
     try std.testing.expectEqualStrings("committed", value);
 
-    const retired_value = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, value_path, alloc, .limited(32));
+    const retired_value = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, value_path, alloc, .limited(32));
     defer alloc.free(retired_value);
     try std.testing.expectEqualStrings("previous", retired_value);
 
@@ -2601,11 +2601,11 @@ test "published generation reports post-commit sync failure without returning an
     try std.testing.expectError(error.GenerationTransitionActive, beginProcessExclusive(live_path));
     const marker_path = try publicationMarkerPathAlloc(alloc, live_path);
     defer alloc.free(marker_path);
-    try std.testing.expect(!pathExists(std.testing.io, marker_path));
+    try std.testing.expect(!pathExists(platform.testing.io, marker_path));
     read_lease.deinit();
     cleanup_runtime.deinit();
     cleanup_runtime_active = false;
-    try std.testing.expect(!pathExists(std.testing.io, value_path));
+    try std.testing.expect(!pathExists(platform.testing.io, value_path));
 
     var next_transition = try beginProcessExclusive(live_path);
     next_transition.deinit();
@@ -2613,7 +2613,7 @@ test "published generation reports post-commit sync failure without returning an
 
 test "manual generation runtime uses an explicit filesystem io authority" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/manual-runtime-io", .{tmp.sub_path});
     defer alloc.free(live_path);
@@ -2624,22 +2624,22 @@ test "manual generation runtime uses an explicit filesystem io authority" {
         error.BackendRuntimeIoUnavailable,
         beginProcessExclusiveWithRuntime(live_path, runtime.ptr()),
     );
-    var transition = try beginProcessExclusiveWithRuntimeAndIo(live_path, runtime.ptr(), std.testing.io);
+    var transition = try beginProcessExclusiveWithRuntimeAndIo(live_path, runtime.ptr(), platform.testing.io);
     defer transition.deinit();
     try std.testing.expect(transition.io != null);
 }
 
 test "durable publication retires the previous generation through the cleanup runtime" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-retire", .{tmp.sub_path});
     defer alloc.free(live_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
 
     var runtime = try background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
@@ -2651,7 +2651,7 @@ test "durable publication retires the previous generation through the cleanup ru
     try std.testing.expect(staged.io != null);
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "current" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = staged_value_path, .data = "current" });
 
     test_retired_cleanup_started.store(false, .release);
     test_block_retired_cleanup.store(true, .release);
@@ -2661,36 +2661,36 @@ test "durable publication retires the previous generation through the cleanup ru
     var attempts: usize = 0;
     while (!test_retired_cleanup_started.load(.acquire) and attempts < 10_000) : (attempts += 1) platform.time.yieldBriefly();
     try std.testing.expect(test_retired_cleanup_started.load(.acquire));
-    try std.testing.expect(pathExists(std.testing.io, staged.path()));
+    try std.testing.expect(pathExists(platform.testing.io, staged.path()));
     const marker_path = try publicationMarkerPathAlloc(alloc, live_path);
     defer alloc.free(marker_path);
     const intent_path = try cleanupIntentPathAlloc(alloc, live_path, std.fs.path.basename(staged.path()));
     defer alloc.free(intent_path);
-    try std.testing.expect(!pathExists(std.testing.io, marker_path));
-    try std.testing.expect(pathExists(std.testing.io, intent_path));
-    const current = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    try std.testing.expect(!pathExists(platform.testing.io, marker_path));
+    try std.testing.expect(pathExists(platform.testing.io, intent_path));
+    const current = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(current);
     try std.testing.expectEqualStrings("current", current);
 
     test_block_retired_cleanup.store(false, .release);
     const scheduler = staged.cleanup_scheduler orelse return error.TestUnexpectedResult;
     scheduler.lane.drainOwner(scheduler.owner_id);
-    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
-    try std.testing.expect(!pathExists(std.testing.io, marker_path));
-    try std.testing.expect(!pathExists(std.testing.io, intent_path));
+    try std.testing.expect(!pathExists(platform.testing.io, staged.path()));
+    try std.testing.expect(!pathExists(platform.testing.io, marker_path));
+    try std.testing.expect(!pathExists(platform.testing.io, intent_path));
 }
 
 test "durable cleanup debt is rescheduled until the retired generation is reclaimed" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retry-retire", .{tmp.sub_path});
     defer alloc.free(live_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = live_value_path, .data = "previous" });
 
     var runtime = try background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
@@ -2700,7 +2700,7 @@ test "durable cleanup debt is rescheduled until the retired generation is reclai
     defer staged.deinit();
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "current" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = staged_value_path, .data = "current" });
 
     test_retired_cleanup_failures_remaining.store(3, .release);
     defer test_retired_cleanup_failures_remaining.store(0, .release);
@@ -2713,24 +2713,24 @@ test "durable cleanup debt is rescheduled until the retired generation is reclai
     const scheduler = staged.cleanup_scheduler orelse return error.TestUnexpectedResult;
     scheduler.lane.drainOwner(scheduler.owner_id);
     try std.testing.expectEqual(@as(usize, 0), test_retired_cleanup_failures_remaining.load(.acquire));
-    try std.testing.expect(!pathExists(std.testing.io, retired_path));
-    try std.testing.expect(!pathExists(std.testing.io, intent_path));
-    const current = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    try std.testing.expect(!pathExists(platform.testing.io, retired_path));
+    try std.testing.expect(!pathExists(platform.testing.io, intent_path));
+    const current = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(current);
     try std.testing.expectEqualStrings("current", current);
 }
 
 test "older cleanup cannot acknowledge a newer prepared publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cleanup-publication-race", .{tmp.sub_path});
     defer alloc.free(live_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "zero" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = live_value_path, .data = "zero" });
 
     var runtime = try background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
@@ -2743,7 +2743,7 @@ test "older cleanup cannot acknowledge a newer prepared publication" {
     defer first.deinit();
     const first_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{first.path()});
     defer alloc.free(first_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = first_value_path, .data = "one" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = first_value_path, .data = "one" });
     try std.testing.expectEqual(PublicationOutcome.durable, try first.publish());
     var attempts: usize = 0;
     while (!test_retired_cleanup_started.load(.acquire) and attempts < 10_000) : (attempts += 1) platform.time.yieldBriefly();
@@ -2756,17 +2756,17 @@ test "older cleanup cannot acknowledge a newer prepared publication" {
     defer second.deinit();
     const second_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{second.path()});
     defer alloc.free(second_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = second_value_path, .data = "two" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = second_value_path, .data = "two" });
     try std.testing.expectEqual(PublicationOutcome.durable, try second.publishPrepared());
 
     test_block_retired_cleanup.store(false, .release);
     const scheduler = first.cleanup_scheduler orelse return error.TestUnexpectedResult;
     scheduler.lane.drainOwner(scheduler.owner_id);
 
-    var marker = (try readPublicationMarker(alloc, std.testing.io, live_path)) orelse return error.TestUnexpectedResult;
+    var marker = (try readPublicationMarker(alloc, platform.testing.io, live_path)) orelse return error.TestUnexpectedResult;
     defer marker.deinit(alloc);
     try std.testing.expectEqual(PublicationPhase.prepared, marker.phase);
-    const published = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    const published = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(published);
     try std.testing.expectEqualStrings("two", published);
 
@@ -2775,14 +2775,14 @@ test "older cleanup cannot acknowledge a newer prepared publication" {
 
 test "cleanup submission failure preserves a durable retry intent" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/submission-debt", .{tmp.sub_path});
     defer alloc.free(live_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
     const stale_path = try std.fmt.allocPrint(alloc, "{s}.restore-stage-a-b", .{live_path});
     defer alloc.free(stale_path);
-    try fs_paths.createDirPathPortable(std.testing.io, stale_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, stale_path);
 
     const RejectingLane = struct {
         fn submit(_: *anyopaque, _: background_runtime.Job) !void {
@@ -2803,7 +2803,7 @@ test "cleanup submission failure preserves a durable retry intent" {
     var lane_state: u8 = 0;
     const scheduler = CleanupScheduler{
         .alloc = alloc,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .lane = .{ .ptr = &lane_state, .vtable = &RejectingLane.vtable },
         .owner_id = 1,
     };
@@ -2812,57 +2812,57 @@ test "cleanup submission failure preserves a durable retry intent" {
         for (deferred.items) |path| alloc.free(path);
         deferred.deinit(alloc);
     }
-    try std.testing.expect(!try reconcilePublishedGeneration(alloc, std.testing.io, live_path, scheduler, &deferred));
+    try std.testing.expect(!try reconcilePublishedGeneration(alloc, platform.testing.io, live_path, scheduler, &deferred));
     const intent_path = try cleanupIntentPathAlloc(alloc, live_path, std.fs.path.basename(stale_path));
     defer alloc.free(intent_path);
-    try std.testing.expect(pathExists(std.testing.io, stale_path));
-    try std.testing.expect(pathExists(std.testing.io, intent_path));
+    try std.testing.expect(pathExists(platform.testing.io, stale_path));
+    try std.testing.expect(pathExists(platform.testing.io, intent_path));
 
-    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, std.testing.io, live_path, null));
-    try std.testing.expect(!pathExists(std.testing.io, stale_path));
-    try std.testing.expect(!pathExists(std.testing.io, intent_path));
+    try std.testing.expect(try reconcilePublishedGenerationExclusive(alloc, platform.testing.io, live_path, null));
+    try std.testing.expect(!pathExists(platform.testing.io, stale_path));
+    try std.testing.expect(!pathExists(platform.testing.io, intent_path));
 }
 
 test "generation publication reclaims retired roots synchronously without a cleanup runtime" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sync-retire", .{tmp.sub_path});
     defer alloc.free(live_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
     const old_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(old_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = old_value_path, .data = "previous" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = old_value_path, .data = "previous" });
 
     var transition = try beginProcessExclusive(live_path);
     var staged = try transition.beginStaging();
     defer staged.deinit();
     const new_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(new_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = new_value_path, .data = "current" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = new_value_path, .data = "current" });
     try std.testing.expectEqual(PublicationOutcome.durable, try staged.publish());
-    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+    try std.testing.expect(!pathExists(platform.testing.io, staged.path()));
     transition.deinit();
 
     var lease = (try acquirePublishedGenerationRead(alloc, live_path)) orelse return error.TestUnexpectedResult;
     lease.deinit();
-    try std.testing.expect(!pathExists(std.testing.io, staged.path()));
+    try std.testing.expect(!pathExists(platform.testing.io, staged.path()));
 }
 
 test "retired generation cleanup is idempotent across concurrent workers" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const parent = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(parent);
     const retired = try std.fmt.allocPrint(alloc, "{s}/table.restore-stage-a-b", .{parent});
     defer alloc.free(retired);
-    try fs_paths.createDirPathPortable(std.testing.io, retired);
+    try fs_paths.createDirPathPortable(platform.testing.io, retired);
     const value_path = try std.fs.path.join(alloc, &.{ retired, "value" });
     defer alloc.free(value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = value_path, .data = "retired" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = value_path, .data = "retired" });
 
     const Worker = struct {
         path: []const u8,
@@ -2870,7 +2870,7 @@ test "retired generation cleanup is idempotent across concurrent workers" {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             deleteRetiredGenerationPaths(std.heap.page_allocator, io_impl.io(), &.{self.path}, self.parent) catch |err| {
                 self.err = err;
@@ -2879,28 +2879,28 @@ test "retired generation cleanup is idempotent across concurrent workers" {
     };
     var first = Worker{ .path = retired, .parent = parent };
     var second = Worker{ .path = retired, .parent = parent };
-    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
-    defer first_thread.await(std.testing.io);
-    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
-    first_thread.await(std.testing.io);
-    second_thread.await(std.testing.io);
+    var first_thread = try platform.testing.io.concurrent(Worker.run, .{&first});
+    defer first_thread.await(platform.testing.io);
+    var second_thread = try platform.testing.io.concurrent(Worker.run, .{&second});
+    first_thread.await(platform.testing.io);
+    second_thread.await(platform.testing.io);
 
     try std.testing.expect(first.err == null);
     try std.testing.expect(second.err == null);
-    try std.testing.expect(!pathExists(std.testing.io, retired));
+    try std.testing.expect(!pathExists(platform.testing.io, retired));
 }
 
 test "atomic exchange failure leaves live and staged generations unchanged" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const live_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/exchange-unavailable", .{tmp.sub_path});
     defer alloc.free(live_path);
-    try fs_paths.createDirPathPortable(std.testing.io, live_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, live_path);
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = live_value_path, .data = "live" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = live_value_path, .data = "live" });
 
     var manager = Manager.init(alloc);
     defer manager.deinit();
@@ -2910,16 +2910,16 @@ test "atomic exchange failure leaves live and staged generations unchanged" {
     defer staged.deinit();
     const staged_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{staged.path()});
     defer alloc.free(staged_value_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = staged_value_path, .data = "staged" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = staged_value_path, .data = "staged" });
 
     test_disable_atomic_exchange = true;
     defer test_disable_atomic_exchange = false;
     try std.testing.expectError(error.AtomicGenerationExchangeUnavailable, staged.publish());
 
-    const live_value = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, live_value_path, alloc, .limited(16));
+    const live_value = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, live_value_path, alloc, .limited(16));
     defer alloc.free(live_value);
     try std.testing.expectEqualStrings("live", live_value);
-    const staged_value = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, staged_value_path, alloc, .limited(16));
+    const staged_value = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, staged_value_path, alloc, .limited(16));
     defer alloc.free(staged_value);
     try std.testing.expectEqualStrings("staged", staged_value);
 }

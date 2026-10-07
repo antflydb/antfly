@@ -132,7 +132,7 @@ test "reader execution report preserves mixed native and fallback completion" {
 test "asset producer runtime apple OCR uses local media without embedded inference" {
     if (!readers.apple.enabled) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{});
     defer client.deinit();
@@ -189,7 +189,7 @@ test "asset producer runtime apple OCR uses local media without embedded inferen
 test "Apple transcription admission uses the effective download ceiling" {
     if (!transcribing.apple_native.enabled) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(alloc, platform.testing.io, .{});
     defer client.deinit();
     var runtime = Runtime.init(alloc, &client);
     defer runtime.deinit();
@@ -213,7 +213,7 @@ test "Apple transcription admission uses the effective download ceiling" {
 
 test "asset producer runtime derives coherent logical and wire result ceilings" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{
         .keep_alive = false,
@@ -247,7 +247,7 @@ test "asset producer runtime derives coherent logical and wire result ceilings" 
 
 test "asset producer runtime applies result ceilings to non-model producers" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -302,7 +302,7 @@ test "asset producer runtime local invocation ownership fails closed without exe
 // qualified bound is comfortably admitted.
 test "asset producer runtime floors the local extractor allocator ceiling at the qualified document bound" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -359,7 +359,7 @@ test "asset producer runtime floors the local extractor allocator ceiling at the
 // InferenceInvocationMemoryExceeded before the invocation.
 test "asset producer runtime resolves a plan for a tiny local extractor request" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -3404,7 +3404,7 @@ pub const Runtime = struct {
 
 test "asset producer runtime invocation context can only tighten configured controls" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -3563,7 +3563,7 @@ test "antfly transcription requires an explicit routing model" {
 
 test "asset producer runtime routes every remote model family through the distributed default before admission" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.init(alloc, io_impl.io());
     defer client.deinit();
@@ -4323,7 +4323,7 @@ test "asset producer runtime media accounting follows attachment transport" {
 
 test "asset producer runtime remote planning uses resolved framed transport" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     for ([_]bool{ false, true }) |framed| {
         inline for (.{ .reader, .generator, .extractor }) |kind| {
@@ -4686,7 +4686,7 @@ test "asset producer runtime extractor shape is allocation-failure safe" {
             defer shape.deinit(alloc);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "asset producer runtime local reader chunks stop at source boundaries before the Florence cap" {
@@ -5361,7 +5361,7 @@ test "asset producer runtime typed extractor response parsing is allocation-fail
             }
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 const extraction_v2_response_fixture =
@@ -5388,7 +5388,7 @@ fn exerciseSingleExtractionResponse(alloc: Allocator) !void {
 
 test "asset producer runtime single extractor response preserves v2 extensions and ownership" {
     try exerciseSingleExtractionResponse(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseSingleExtractionResponse, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseSingleExtractionResponse, .{});
 }
 
 test "asset producer runtime single extractor response rejects malformed envelopes and typed values" {
@@ -5881,7 +5881,7 @@ test "remote generator batch streams attachments into one exact JSON body" {
             try std.testing.expectEqualStrings("attachment:0", framed_content[1].object.get("data").?.string);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn normalizeAntflyInferenceBaseUrl(alloc: Allocator, raw: []const u8) ![]u8 {
@@ -6125,7 +6125,7 @@ fn freeGeneratorContentParts(alloc: Allocator, parts: []generating_runtime.Conte
 
 test "asset producer runtime external inference endpoint is canonical and authoritative" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
 
     const runtime = try Runtime.createOwned(alloc, io_impl.io(), .{
@@ -6200,7 +6200,7 @@ fn expectOpenAiMultimodalGeneratorRequest(req: httpx.testing_mod.RequestInfo) !v
 
 test "asset producer runtime passes rendered media parts to generators" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6255,7 +6255,7 @@ test "asset producer runtime passes rendered media parts to generators" {
 
 test "asset producer runtime passes rendered bytes to embedded generators without base64" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -6386,7 +6386,7 @@ fn expectOpenAiToolGeneratorRequest(req: httpx.testing_mod.RequestInfo) !void {
 
 test "asset producer runtime stores generator tool call arguments" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6444,7 +6444,7 @@ test "asset producer runtime stores generator tool call arguments" {
 
 test "asset producer runtime stores forced tool arguments from plain json content" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6572,7 +6572,7 @@ fn testNativeReaderCapabilities(
 
 test "owned asset producer foreground contract follows the selected route" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
 
     const Local = struct {
@@ -6644,7 +6644,7 @@ test "asset producer runtime preserves generator policies for single and batch d
     const alloc = std.testing.allocator;
     var registry = provider_limits.Registry.init(alloc);
     defer registry.deinit();
-    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(alloc, platform.testing.io, .{});
     defer client.deinit();
     var runtime = Runtime.initWithOptions(alloc, &client, .{ .limits = &registry });
     defer runtime.deinit();
@@ -6661,7 +6661,7 @@ test "asset producer runtime preserves generator policies for single and batch d
 
 test "asset producer runtime batches compatible antfly generator requests" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6737,7 +6737,7 @@ test "asset producer runtime batches compatible antfly generator requests" {
 
 test "asset producer runtime preserves remote reader identity and native execution" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6817,7 +6817,7 @@ test "asset producer runtime preserves remote reader identity and native executi
 
 test "asset producer runtime preserves generator item failures" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var server = try httpx.TestServer.start(alloc, io, &.{
@@ -6908,7 +6908,7 @@ test "generator item failures preserve remote retry guidance" {
 
 test "asset producer runtime routes antfly reader without url to local provider" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -6971,7 +6971,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
 
 test "asset producer runtime batches compatible antfly reader requests" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7061,7 +7061,7 @@ test "asset producer runtime batches compatible antfly reader requests" {
 
 test "asset producer raw raster selection requires local physical capability and borrows pixels" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -7177,7 +7177,7 @@ test "asset producer raw raster selection requires local physical capability and
 
 test "asset producer runtime batches local encoded media without base64 adaptation" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7278,7 +7278,7 @@ fn expectSingleImageOpenAiReaderRequest(req: httpx.testing_mod.RequestInfo) !voi
 
 test "asset producer runtime keeps prompt-level remote readers sequential" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7344,7 +7344,7 @@ test "asset producer runtime keeps prompt-level remote readers sequential" {
 
 test "asset producer runtime chunks local antfly reader batches to inference cap" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7445,7 +7445,7 @@ test "asset producer runtime chunks local antfly reader batches to inference cap
 
 test "asset producer runtime batches compatible antfly transcriber requests" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7539,7 +7539,7 @@ test "asset producer runtime batches compatible antfly transcriber requests" {
 
 test "asset producer runtime routes antfly transcriber without url to local provider" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7598,7 +7598,7 @@ test "asset producer runtime routes antfly transcriber without url to local prov
 
 test "asset producer runtime routes antfly extractor without url to local provider" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7694,7 +7694,7 @@ test "asset producer runtime routes antfly extractor without url to local provid
 
 test "asset producer runtime batches compatible antfly extractor requests" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7798,7 +7798,7 @@ test "asset producer runtime batches compatible antfly extractor requests" {
 // group after admission.
 test "asset producer runtime never batches an extractor that advertises max_items=1" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -7919,7 +7919,7 @@ test "decision functions materialized enrichment records version model and sourc
             return alloc.dupe(u8, "{\"model\":\"resolved-model\",\"answers\":{\"refund\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}");
         }
     };
-    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(a, platform.testing.io, .{});
     defer client.deinit();
     var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } });
     defer runtime.deinit();

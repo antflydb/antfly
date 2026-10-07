@@ -13,45 +13,46 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 /// An empty CI environment value disables the opt-in workspace just like an
 /// absent variable. GitHub Actions clears job-scoped values by writing `NAME=`.
 pub fn workspaceRoot() ?[]const u8 {
-    const root = @import("antfly_platform").env.getenv("ANTFLY_TEST_WORKSPACE") orelse return null;
+    const root = native_platform.env.getenv("ANTFLY_TEST_WORKSPACE") orelse return null;
     return if (root.len == 0) null else root;
 }
 
 /// Opt-in workspace for correctness fixtures. Durability tests keep using
-/// std.testing.tmpDir and therefore remain on the ordinary filesystem.
-pub fn fastTmpDir(opts: std.Io.Dir.OpenOptions) std.testing.TmpDir {
-    const root = workspaceRoot() orelse return std.testing.tmpDir(opts);
+/// native_platform.testing.tmpDir and therefore remain on the ordinary filesystem.
+pub fn fastTmpDir(opts: std.Io.Dir.OpenOptions) native_platform.testing.TmpDir {
+    const root = workspaceRoot() orelse return native_platform.testing.tmpDir(opts);
     std.debug.assert(std.fs.path.isAbsolute(root));
     var random: [12]u8 = undefined;
-    std.testing.io.random(&random);
+    native_platform.testing.io.random(&random);
     var sub_path: [16]u8 = undefined;
     _ = std.base64.url_safe.Encoder.encode(&sub_path, &random);
-    const parent = std.Io.Dir.cwd().openDir(std.testing.io, root, .{}) catch @panic("cannot open test workspace");
-    const dir = parent.createDirPathOpen(std.testing.io, &sub_path, .{ .open_options = opts }) catch @panic("cannot create test workspace fixture");
+    const parent = std.Io.Dir.cwd().openDir(native_platform.testing.io, root, .{}) catch @panic("cannot open test workspace");
+    const dir = parent.createDirPathOpen(native_platform.testing.io, &sub_path, .{ .open_options = opts }) catch @panic("cannot create test workspace fixture");
     return .{ .dir = dir, .parent_dir = parent, .sub_path = sub_path };
 }
 
 /// Owns a temporary parent around a database/file path. Locks, staging roots,
 /// and other siblings of path() are removed along with the fixture.
 pub const TestDirectory = struct {
-    tmp: std.testing.TmpDir,
+    tmp: native_platform.testing.TmpDir,
     path_buffer: [std.fs.max_path_bytes]u8,
     path_len: usize,
 
     pub fn init(comptime name: []const u8) !TestDirectory {
-        return initWithTmp(name, std.testing.tmpDir(.{}));
+        return initWithTmp(name, native_platform.testing.tmpDir(.{}));
     }
 
     pub fn initFast(comptime name: []const u8) !TestDirectory {
         return initWithTmp(name, fastTmpDir(.{}));
     }
 
-    fn initWithTmp(comptime name: []const u8, tmp: std.testing.TmpDir) !TestDirectory {
+    fn initWithTmp(comptime name: []const u8, tmp: native_platform.testing.TmpDir) !TestDirectory {
         comptime std.debug.assert(name.len > 0 and std.mem.indexOfAny(u8, name, "/\\") == null and
             !std.mem.eql(u8, name, ".") and !std.mem.eql(u8, name, ".."));
         var result: TestDirectory = .{
@@ -60,7 +61,7 @@ pub const TestDirectory = struct {
             .path_len = undefined,
         };
         errdefer result.tmp.cleanup();
-        const root_len = try result.tmp.dir.realPath(std.testing.io, &result.path_buffer);
+        const root_len = try result.tmp.dir.realPath(native_platform.testing.io, &result.path_buffer);
         const suffix = try std.fmt.bufPrintSentinel(result.path_buffer[root_len..], "/{s}", .{name}, 0);
         result.path_len = root_len + suffix.len;
         return result;
@@ -84,15 +85,15 @@ test "test directory isolates identical child names and removes sibling files" {
     defer second.cleanup();
     try std.testing.expect(!std.mem.eql(u8, first.path(), second.path()));
 
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, first.path());
+    try std.Io.Dir.cwd().createDirPath(native_platform.testing.io, first.path());
     const lock_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.lock", .{first.path()});
     defer std.testing.allocator.free(lock_path);
-    const file = try std.Io.Dir.cwd().createFile(std.testing.io, lock_path, .{});
-    file.close(std.testing.io);
+    const file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, lock_path, .{});
+    file.close(native_platform.testing.io);
     first.cleanup();
     first_active = false;
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, lock_path, .{}));
-    try second.tmp.dir.access(std.testing.io, ".", .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(native_platform.testing.io, lock_path, .{}));
+    try second.tmp.dir.access(native_platform.testing.io, ".", .{});
 }
 
 test "test directory fast workspace isolates fixtures and cleans siblings" {
@@ -103,16 +104,16 @@ test "test directory fast workspace isolates fixtures and cleans siblings" {
     defer second.cleanup();
     try std.testing.expect(!std.mem.eql(u8, first.path(), second.path()));
     if (workspaceRoot()) |root| {
-        const resolved = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, root, std.testing.allocator);
+        const resolved = try std.Io.Dir.cwd().realPathFileAlloc(native_platform.testing.io, root, std.testing.allocator);
         defer std.testing.allocator.free(resolved);
         try std.testing.expect(std.mem.startsWith(u8, first.path(), resolved));
     }
     const sibling = try std.fmt.allocPrint(std.testing.allocator, "{s}.lock", .{first.path()});
     defer std.testing.allocator.free(sibling);
-    const file = try std.Io.Dir.cwd().createFile(std.testing.io, sibling, .{});
-    file.close(std.testing.io);
+    const file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, sibling, .{});
+    file.close(native_platform.testing.io);
     first.cleanup();
     active = false;
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, sibling, .{}));
-    try second.tmp.dir.access(std.testing.io, ".", .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(native_platform.testing.io, sibling, .{}));
+    try second.tmp.dir.access(native_platform.testing.io, ".", .{});
 }

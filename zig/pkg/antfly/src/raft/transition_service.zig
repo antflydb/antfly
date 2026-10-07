@@ -13,12 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const metadata = @import("../metadata/domain.zig");
 const shard_ops = @import("shard_ops.zig");
 const transition_runtime = @import("transition_runtime.zig");
 const data = @import("../data/domain.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const raft_state_machine = @import("state_machine/mod.zig");
 
 const transition_retry_initial_ms: u64 = 100;
@@ -1050,7 +1052,7 @@ fn realMonotonicMillis(_: ?*anyopaque) u64 {
 
 fn randomRetryJitterSalt() u64 {
     var salt: u64 = undefined;
-    std.Options.debug_io.random(std.mem.asBytes(&salt));
+    native_platform.debug_io.random(std.mem.asBytes(&salt));
     return if (salt == 0) 1 else salt;
 }
 
@@ -2763,7 +2765,7 @@ test "transition service retains terminal records until terminal observation suc
 }
 
 test "transition service steps real split coordinator from prepared source state" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/svc-real-split-src", .{tmp.sub_path});
@@ -2821,7 +2823,7 @@ test "transition service steps real split coordinator from prepared source state
 }
 
 test "transition service steps real merge coordinator from prepared donor state" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/svc-real-merge-donor", .{tmp.sub_path});

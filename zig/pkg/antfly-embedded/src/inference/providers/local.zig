@@ -18,7 +18,9 @@
 // Wraps the inference API client to implement the
 // provider-neutral Embedder, Generator, and Reranker interfaces.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
@@ -1012,7 +1014,7 @@ test "antfly provider compiles" {
 }
 
 pub fn testAntflyProviderRequestControls() !void {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var http = httpx.Client.init(std.testing.allocator, io_impl.io());
     defer http.deinit();
@@ -1039,7 +1041,7 @@ test "antfly provider applies task-neutral request controls to every wire reques
 }
 
 test "antfly provider composes authorization and capability lease headers" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var http = httpx.Client.init(std.testing.allocator, io_impl.io());
     defer http.deinit();
@@ -1152,7 +1154,7 @@ test "antfly numeric responses negotiate dense and score frames with JSON fallba
 
 fn testEmbedPartsRequestRoundTrip(comptime binary_response: bool, comptime required: bool) !void {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1254,7 +1256,7 @@ test "generating backend local HTTP preserves capability refresh alongside capac
 
 fn testGenerationStatus(status: u16, body: []const u8, expected: anyerror) !void {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var server = try httpx.TestServer.start(alloc, io, &.{.{ .method = .POST, .path = "/generate", .respond = .{
@@ -1287,7 +1289,7 @@ fn testGenerationStatus(status: u16, body: []const u8, expected: anyerror) !void
 
 test "antfly generate round trip" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1342,7 +1344,7 @@ test "antfly generate round trip" {
 
 test "antfly sparse embed round trip" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1415,7 +1417,7 @@ test "antfly sparse embed round trip" {
 
 test "antfly rerank round trip" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1475,7 +1477,7 @@ test "antfly rerank accepts scores array response" {
 
 fn testRerankScoresResponse(binary_response: bool) !void {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1544,7 +1546,7 @@ test "antfly embed round trip preserves supplied task and instruction" {
 
 fn testDenseEmbedRequest(comptime task_type: ?[]const u8, comptime instruction: ?[]const u8) !void {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1629,7 +1631,7 @@ fn testDenseEmbedRequest(comptime task_type: ?[]const u8, comptime instruction: 
 
 test "antfly embed treats service unavailability as transient" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

@@ -21,6 +21,7 @@ const materialized_sources = @import("materialized_sources.zig");
 
 const document_child_range_outbox = @import("document_child_range_outbox.zig");
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 const replication_contract = @import("replication_contract.zig");
@@ -873,7 +874,7 @@ pub const RequestPreparationContext = struct {
             null;
         self.guard = .{
             .child = if (self.budget) |*tracked| tracked.allocator() else db.alloc,
-            .io = db.backend_runtime.io() orelse std.Options.debug_io,
+            .io = db.backend_runtime.io() orelse native_platform.debug_io,
         };
     }
 

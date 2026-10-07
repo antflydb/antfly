@@ -15,6 +15,7 @@
 
 //! Compiled independently so the consumer cannot share this archive's Zig
 //! error numbering or std.Io implementation.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const secrets = @import("antfly_local_sources").common_secrets;
 const error_abi = @import("antfly_runtime_abi").error_abi;
@@ -23,14 +24,14 @@ const error_abi = @import("antfly_runtime_abi").error_abi;
 // must receive cancellation through stable callback status transport.
 var open_fault: u8 = 0;
 const io_vtable: std.Io.VTable = blk: {
-    var result = std.Options.debug_io.vtable.*;
+    var result = native_platform.debug_io.vtable.*;
     result.dirOpenFile = openFile;
     break :blk result;
 };
 
 fn openFile(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
     return switch (open_fault) {
-        0 => std.Options.debug_io.vtable.dirOpenFile(userdata, dir, path, options),
+        0 => native_platform.debug_io.vtable.dirOpenFile(userdata, dir, path, options),
         1 => error.Canceled,
         2 => error.FileNotFound,
         else => unreachable,
@@ -38,7 +39,7 @@ fn openFile(userdata: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: s
 }
 
 fn ownerIo() std.Io {
-    return .{ .userdata = std.Options.debug_io.userdata, .vtable = &io_vtable };
+    return .{ .userdata = native_platform.debug_io.userdata, .vtable = &io_vtable };
 }
 
 export fn secret_store_abi_set_open_fault(fault: u8) callconv(.c) void {

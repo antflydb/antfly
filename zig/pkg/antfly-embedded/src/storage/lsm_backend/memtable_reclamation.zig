@@ -16,11 +16,13 @@
 //! FIFO retirement, independent of storage admission and cancellation. The
 //! already-owned State header supplies the queue link; starting a continuation
 //! never allocates. Only the destructive cursor changes while unlocked.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const State = @import("state.zig").State;
 const Account = @import("memory_account.zig").Account;
 const runtime = @import("runtime.zig");
-const clock = @import("antfly_platform").time;
+const clock = native_platform.time;
 
 pub const Job = struct {
     header: *State,
@@ -214,9 +216,9 @@ test "memtable reclamation bounds last-reader release and drains FIFO under fenc
     Hook.wakes = 0;
     Hook.sleeps = 0;
     var manager = resources.ResourceManager.init(.{});
-    var vtable = std.testing.io.vtable.*;
+    var vtable = native_platform.testing.io.vtable.*;
     vtable.sleep = Hook.sleep;
-    var io = std.testing.io;
+    var io = native_platform.testing.io;
     io.vtable = &vtable;
     var backend = Backend.init(std.testing.allocator, .{ .resource_manager = &manager, .read_runtime = .{ .io = io }, .maintenance_waker = .{ .ptr = &manager, .wake_fn = Hook.wake } });
     defer backend.close();
@@ -352,9 +354,9 @@ test "memtable reclamation honors the borrowed work deadline" {
         }
     };
     Clock.first = true;
-    var vtable = std.testing.io.vtable.*;
+    var vtable = native_platform.testing.io.vtable.*;
     vtable.now = Clock.now;
-    var io = std.testing.io;
+    var io = native_platform.testing.io;
     io.vtable = &vtable;
     var backend = Backend.init(std.testing.allocator, .{ .read_runtime = .{ .io = io } });
     defer backend.close();

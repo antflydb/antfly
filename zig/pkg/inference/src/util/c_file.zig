@@ -19,7 +19,9 @@
 // This module wraps C library calls (open, read, mmap) for absolute
 // path access that all modules share.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 
 pub const link_libc = builtin.link_libc;
@@ -53,7 +55,7 @@ const PosixC = struct {
             type: u8,
             d_name: [1024]u8,
         },
-        else => std.c.dirent,
+        else => native_platform.c.dirent,
     };
 
     fn flag(o: std.c.O) c_int {
@@ -67,9 +69,9 @@ const PosixC = struct {
     pub const O_EXCL = flag(.{ .EXCL = true });
     pub const O_TRUNC = flag(.{ .TRUNC = true });
 
-    pub const MADV_RANDOM = std.c.MADV.RANDOM;
-    pub const MADV_SEQUENTIAL = std.c.MADV.SEQUENTIAL;
-    pub const MADV_DONTNEED = std.c.MADV.DONTNEED;
+    pub const MADV_RANDOM = native_platform.c.MADV.RANDOM;
+    pub const MADV_SEQUENTIAL = native_platform.c.MADV.SEQUENTIAL;
+    pub const MADV_DONTNEED = native_platform.c.MADV.DONTNEED;
 
     pub const POSIX_FADV_NORMAL = std.os.linux.POSIX_FADV.NORMAL;
     pub const POSIX_FADV_SEQUENTIAL = std.os.linux.POSIX_FADV.SEQUENTIAL;
@@ -88,9 +90,9 @@ const PosixC = struct {
     pub const getcwd = std.c.getcwd;
     pub const getpid = std.c.getpid;
     pub const link = std.c.link;
-    pub const madvise = std.c.madvise;
+    pub const madvise = native_platform.c.madvise;
     pub const mkdir = std.c.mkdir;
-    pub const pread = std.c.pread;
+    pub const pread = native_platform.c.pread;
     pub const pwrite = std.c.pwrite;
     pub const symlink = std.c.symlink;
     pub const unlink = std.c.unlink;
@@ -105,7 +107,7 @@ const PosixC = struct {
     }
 
     pub fn readdir(dp: ?*DIR) ?*struct_dirent {
-        const entry = std.c.readdir(dp.?) orelse return null;
+        const entry = native_platform.c.readdir(dp.?) orelse return null;
         return @ptrCast(@alignCast(entry));
     }
 };
@@ -682,7 +684,7 @@ fn fileSizeFromFd(fd: std.posix.fd_t) !usize {
         return @intCast(statSize(stat_buf));
     } else {
         const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-        const stat = try file.stat(std.Options.debug_io);
+        const stat = try file.stat(native_platform.debug_io);
         return @intCast(stat.size);
     }
 }
@@ -695,7 +697,7 @@ fn statSize(stat: c.struct_stat) std.c.off_t {
 const Advice = enum { sequential, random, dont_need };
 
 fn windowsIo() std.Io {
-    return std.Io.Threaded.global_single_threaded.io();
+    return native_platform.Threaded.global_single_threaded.io();
 }
 
 fn handleFile(fd: std.posix.fd_t) std.Io.File {
@@ -731,7 +733,7 @@ fn unmap(data: []align(std.heap.page_size_min) u8) void {
         _ = WindowsMapping.UnmapViewOfFile(data.ptr);
         return;
     }
-    std.posix.munmap(data);
+    native_platform.filesystem.unmapMemory(data);
 }
 
 fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
@@ -843,9 +845,9 @@ test "fileExistsZ on nonexistent" {
 
 test "readFile preserves non-missing open failures" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "not-a-directory", .data = "file" });
+    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "not-a-directory", .data = "file" });
 
     const path = try std.fs.path.join(allocator, &.{
         ".zig-cache",
@@ -867,11 +869,11 @@ test "MmapRegion advice preserves readable mapped data" {
     defer allocator.free(path_buf);
     const payload = "Hello, mmap! This is test data for the MmapRegion verification test.";
     {
-        var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path_buf, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, payload);
+        var file = try std.Io.Dir.createFileAbsolute(native_platform.testing.io, path_buf, .{ .truncate = true });
+        defer file.close(native_platform.testing.io);
+        try file.writeStreamingAll(native_platform.testing.io, payload);
     }
-    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path_buf) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(native_platform.testing.io, path_buf) catch {};
 
     // mmap and verify contents
     var region = try MmapRegion.init(allocator, path_buf);
@@ -913,17 +915,17 @@ test "prefetchFile reads every byte with bounded workers" {
         .{std.posix.system.getpid()},
     );
     defer allocator.free(path);
-    defer std.Io.Dir.deleteFileAbsolute(std.testing.io, path) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(native_platform.testing.io, path) catch {};
     const payload = try allocator.alloc(u8, 1024 * 1024 + 37);
     defer allocator.free(payload);
     for (payload, 0..) |*byte, index| byte.* = @truncate(index);
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
-    try file.writeStreamingAll(std.testing.io, payload);
-    file.close(std.testing.io);
+    var file = try std.Io.Dir.createFileAbsolute(native_platform.testing.io, path, .{ .truncate = true });
+    try file.writeStreamingAll(native_platform.testing.io, payload);
+    file.close(native_platform.testing.io);
 
-    var inline_io = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    var inline_io = native_platform.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
     defer inline_io.deinit();
-    for ([_]std.Io{ std.testing.io, inline_io.io() }) |io| {
+    for ([_]std.Io{ native_platform.testing.io, inline_io.io() }) |io| {
         for ([_]u8{ 0, 4, 32 }) |workers| {
             const result = if (comptime supports_posix_file_advice)
                 try prefetchFile(io, allocator, path, workers)

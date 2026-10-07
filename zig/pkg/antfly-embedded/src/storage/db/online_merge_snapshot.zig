@@ -17,9 +17,11 @@
 //! positions are committed with receiver row receipts; no primary scan or live
 //! recapture is permitted. A replica-local cache only avoids repeated decoding
 //! of the same oversized row and is never authoritative progress.
+const native_platform = @import("antfly_platform");
 const server_test_adapter = if (builtin.is_test) @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter else struct {};
 const builtin = @import("builtin");
 const std = @import("std");
+
 const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const source = @import("online_source.zig");
 const pages = @import("merge_page_contract.zig");
@@ -458,7 +460,7 @@ fn testVectorReceiver(active_vectors: bool, full_sync: bool, transfer_proof: boo
     const alloc = std.testing.allocator;
     const io_contract = @import("online_merge_io_contract.zig");
     const online_io = @import("online_merge_io.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const donor_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vector-donor", .{tmp.sub_path});
     defer alloc.free(donor_path);
@@ -789,7 +791,7 @@ fn expectSparseSourceHits(db: *DB, stage: []const u8, expected: usize) !void {
 test "relational index system online snapshot locator resumes immutable rows and chunk receipts after owner reopen" {
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |relational| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = native_platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/snapshot", .{tmp.sub_path});
         defer alloc.free(path);

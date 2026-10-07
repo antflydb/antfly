@@ -19,6 +19,7 @@
 //! Seed capture belongs to the distributed runtime, while materialization into
 //! a live storage tree belongs to the compiled storage owner.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -417,7 +418,7 @@ pub fn validateTableIdentityName(name: []const u8) !void {
 
 test "empty standalone seed retains epoch and rejects incomplete topology" {
     const alloc = std.testing.allocator;
-    const io = std.Options.debug_io;
+    const io = native_platform.debug_io;
     const empty = Topology{
         .generation = "empty-1",
         .catalog = .{ .epoch = 1, .tables = &.{}, .ranges = &.{}, .system_catalog = .{} },

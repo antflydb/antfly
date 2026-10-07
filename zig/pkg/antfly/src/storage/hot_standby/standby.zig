@@ -20,14 +20,16 @@
 //! apply implementation plugs in through an idempotent callback; this module owns
 //! the ordering, identity validation, and restart/catch-up invariants.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Crc32 = @import("antfly_hash").Crc32;
 const replication_log = @import("replication_log.zig");
 const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const wal_mod = @import("../wal_runtime.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 
 const progress_magic = [8]u8{ 'A', 'F', 'H', 'A', 'P', 'R', 'G', '\n' };
 const progress_version: u16 = 1;
@@ -1003,7 +1005,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     );
     defer alloc.free(progress_raw);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), receive_raw) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), progress_raw) catch {};
@@ -1146,15 +1148,15 @@ test "storage.hot_standby standby snapshots do not wait behind the operation lea
     var operation_locked = true;
     defer if (operation_locked) standby.unlockExclusive();
     var worker = Worker{ .standby = &standby };
-    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var thread = try native_platform.testing.io.concurrent(Worker.run, .{&worker});
     while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
     var attempts: usize = 0;
     while (!worker.done.load(.acquire) and attempts < 1_000) : (attempts += 1)
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const completed_while_operation_locked = worker.done.load(.acquire);
     standby.unlockExclusive();
     operation_locked = false;
-    thread.await(std.testing.io);
+    thread.await(native_platform.testing.io);
     try std.testing.expect(completed_while_operation_locked);
 }
 
@@ -1165,7 +1167,7 @@ test "storage.hot_standby standby path observation is fenced after consumption" 
     defer paths.deinit(alloc);
 
     var standby = try Standby.open(alloc, paths.receive_log.ptr, paths.progress_wal.ptr, identity, .{});
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try std.testing.expectEqual(
         PathMatchResult.match,

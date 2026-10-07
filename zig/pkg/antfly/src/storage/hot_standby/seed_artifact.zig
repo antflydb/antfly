@@ -20,7 +20,9 @@
 //! digest, and a generation aggregate. Uploads are safe to retry after process
 //! or Job restarts: an existing object is accepted only when its bytes match.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -375,7 +377,7 @@ fn publishWithOptions(alloc: Allocator, store: Store, request: PublishRequest, o
     var manifest_digest: [Sha256.digest_length]u8 = undefined;
     Sha256.hash(request.manifest_bytes, &manifest_digest, .{});
     aggregate.update(&manifest_digest);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const chunk_buffer = try alloc.alloc(u8, request.limits.max_chunk_bytes);
@@ -669,7 +671,7 @@ pub fn restoreToStaging(alloc: Allocator, store: Store, request: RestoreRequest)
         .prepared => {},
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     errdefer std.Io.Dir.cwd().deleteTree(io, request.staging_root) catch {};
@@ -739,7 +741,7 @@ pub fn verifyStaged(alloc: Allocator, staging_root: []const u8, expected: Expect
     const manifest_digest = try decodeHexDigest(parsed.value.manifest_sha256);
     aggregate.update(&manifest_digest);
     var total_bytes: u64 = 0;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     for (parsed.value.files) |file| {
         const path = try std.fs.path.join(alloc, &.{ staging_root, file.path });
@@ -873,7 +875,7 @@ fn prepareStaging(
         if (!std.mem.eql(u8, marker_json, existing_marker)) return error.SeedTargetGenerationConflict;
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try std.Io.Dir.cwd().deleteTree(io, staging_root);
@@ -883,7 +885,7 @@ fn prepareStaging(
 }
 
 fn directoryEmptyOrMissing(alloc: Allocator, path: []const u8) !bool {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
@@ -1268,7 +1270,7 @@ fn restoreArtifactFile(
     const parent = std.fs.path.dirname(destination) orelse return error.InvalidArtifactPath;
     const temp = try std.fmt.allocPrint(alloc, "{s}.tmp", .{destination});
     defer alloc.free(temp);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try std.Io.Dir.cwd().createDirPath(io, parent);
@@ -1365,7 +1367,7 @@ fn getRequiredObjectResult(store: Store, key: []const u8, options: object_storag
 }
 
 fn readFileAlloc(alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
 }
@@ -1374,7 +1376,7 @@ fn writeFileAtomically(alloc: Allocator, path: []const u8, body: []const u8) !vo
     const parent = std.fs.path.dirname(path) orelse return error.InvalidArtifactPath;
     const temp = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(temp);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try std.Io.Dir.cwd().createDirPath(io, parent);
@@ -1498,9 +1500,9 @@ fn writeTestFile(alloc: Allocator, path: []const u8, body: []const u8) !void {
 
 test "storage.hot_standby seed artifact publishes last and restores verified staging" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
     defer alloc.free(content_root);
@@ -1583,7 +1585,7 @@ test "storage.hot_standby seed artifact publishes last and restores verified sta
 
     const staged_manifest = try std.fs.path.join(alloc, &.{ staging_root, staged_manifest_name });
     defer alloc.free(staged_manifest);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), staged_manifest);
     try std.testing.expectError(error.FileNotFound, verifyStaged(alloc, staging_root, .{
@@ -1608,9 +1610,9 @@ test "storage.hot_standby seed artifact publishes last and restores verified sta
 
 test "storage.hot_standby seed artifact v2 chunks every data object within the configured bound" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
     defer alloc.free(content_root);
@@ -1689,9 +1691,9 @@ test "storage.hot_standby seed artifact v2 chunks every data object within the c
 
 test "storage.hot_standby seed artifact does not publish COMPLETE before all v2 chunks are durable" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
     defer alloc.free(content_root);
@@ -1743,9 +1745,9 @@ test "storage.hot_standby seed artifact does not publish COMPLETE before all v2 
 
 test "storage.hot_standby seed artifact restores a legacy v1 single-object generation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const staging_root = try std.fs.path.join(alloc, &.{ root, "legacy-staging" });
     defer alloc.free(staging_root);
@@ -1867,9 +1869,9 @@ test "storage.hot_standby seed artifact rejects incomplete stale and cross-clust
 
 test "storage.hot_standby seed artifact refuses a non-empty unowned target" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
     defer alloc.free(content_root);
@@ -1922,9 +1924,9 @@ test "storage.hot_standby seed artifact refuses a non-empty unowned target" {
 
 test "storage.hot_standby seed artifact prunes older complete generations publish marker first" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
     defer alloc.free(content_root);
@@ -1978,9 +1980,9 @@ test "storage.hot_standby seed artifact prunes older complete generations publis
 
 test "storage.hot_standby portable seed v4 binds immutable COMPLETE to exact capture topology and pvc authority" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const content_root = try std.fs.path.join(alloc, &.{ root, "source" });
     defer alloc.free(content_root);

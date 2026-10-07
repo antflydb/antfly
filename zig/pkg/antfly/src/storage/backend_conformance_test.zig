@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const backend_erased = @import("antfly_local_sources").storage_backend_erased;
 const backend_types = @import("antfly_local_sources").storage_backend_types;
 const mem_backend = @import("antfly_local_sources").storage_mem_backend;
@@ -173,7 +175,7 @@ fn expectReopenedBoundState(runtime: *backend_erased.Store) !void {
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
 fn nowNs() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const now = std.Io.Timestamp.now(io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());
@@ -186,14 +188,14 @@ fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
         nowNs(),
         nonce,
     }) catch unreachable;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

@@ -13,9 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
 const metadata_mod = @import("../metadata/domain.zig");
@@ -6037,7 +6039,7 @@ fn consumerTests() type {
             var path_tmp = try TestDirectory.init("antfly-api-http-client-txn");
             defer path_tmp.cleanup();
             const path = path_tmp.path();
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -6136,7 +6138,7 @@ fn consumerTests() type {
             var path_tmp = try TestDirectory.init("antfly-api-http-client-session-txn");
             defer path_tmp.cleanup();
             const path = path_tmp.path();
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 

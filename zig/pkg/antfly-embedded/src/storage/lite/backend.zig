@@ -13,9 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 const db_core = @import("../db/core.zig");
 const db_types = @import("../db/types.zig");
@@ -836,7 +838,7 @@ fn nativeStableSnapshot(handle: *Handle, dest_path: []const u8, replace: bool) !
     return try store.file.copyStableSnapshotToPath(dest_path, replace);
 }
 
-fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]u8 {
+fn testPath(allocator: Allocator, tmp: native_platform.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
@@ -849,27 +851,27 @@ fn hasMode(modes: []const []const u8, expected: []const u8) bool {
 
 test "lite reclamation backend reopen activates idle retirement" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reopen-retirement.aflite");
     defer a.free(path);
     {
-        var handle = try Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+        var handle = try Handle.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
         defer handle.deinit();
         const owner = handle.native_docstore.?;
         owner.maintenance_cancel.request();
         try owner.putCatalogRecord("meta", "old");
         try owner.putCatalogRecord("meta", "new");
     }
-    var handle = try Handle.open(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    var handle = try Handle.open(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
     defer handle.deinit();
     const owner = handle.native_docstore.?;
     try std.testing.expect(owner.maintenance_future != null);
-    const deadline = std.Io.Clock.awake.now(std.testing.io).addDuration(.fromSeconds(5));
+    const deadline = std.Io.Clock.awake.now(native_platform.testing.io).addDuration(.fromSeconds(5));
     // No mutations, transactions, or explicit maintainOnce calls after open.
     while ((try owner.reclamationStatus()).pending_data_retirement_objects != 0) {
-        if (std.Io.Clock.awake.now(std.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        if (std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        try native_platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expect((try owner.checkWithCancel(null)).valid);
 }
@@ -1096,7 +1098,7 @@ test "lite backend inference status reflects explicit remote provider configurat
 test "lite backend native engine creates and checks aflite file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-backend.aflite");
@@ -1144,7 +1146,7 @@ test "lite backend native engine creates and checks aflite file" {
     const vacuumed = try handle.vacuum();
     try std.testing.expectEqual(configured_report.file_size, vacuumed.before_size);
     // Publishing the replacement adds allocator metadata beyond the image estimate.
-    try std.testing.expectEqual((try handle.native_docstore.?.file.file.stat(std.testing.io)).size, vacuumed.after_size);
+    try std.testing.expectEqual((try handle.native_docstore.?.file.file.stat(native_platform.testing.io)).size, vacuumed.after_size);
     try std.testing.expect(vacuumed.after_size >= configured_report.compact_size);
     try std.testing.expectEqual(vacuumed.before_size -| vacuumed.after_size, vacuumed.reclaimed_bytes);
 }
@@ -1152,7 +1154,7 @@ test "lite backend native engine creates and checks aflite file" {
 test "lite backend propagates no_sync to native engine" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-backend-no-sync.aflite");
@@ -1192,7 +1194,7 @@ test "lite backend propagates no_sync to native engine" {
 test "lite backend reports native storage status from active checkpoint" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-status.aflite");
@@ -1221,7 +1223,7 @@ test "lite backend reports native storage status from active checkpoint" {
 test "lite backend native stable snapshot uses open handle checkpoint" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-backend-snapshot.aflite");
@@ -1263,7 +1265,7 @@ test "lite backend native stable snapshot uses open handle checkpoint" {
 test "lite backend native stable snapshot is consistent with active writer" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-backend-snapshot-writer.aflite");
@@ -1296,7 +1298,7 @@ test "lite backend native stable snapshot is consistent with active writer" {
 test "lite backend auto open requires existing native aflite file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "auto-native.aflite");
@@ -1317,7 +1319,7 @@ test "lite backend auto open requires existing native aflite file" {
 test "lite backend rejects non-aflite paths" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "not-lite.db");
@@ -1339,7 +1341,7 @@ test "lite backend rejects non-aflite paths" {
 test "lite backend auto rejects internal bridge aflite files" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "auto-bridge.aflite");
@@ -1362,7 +1364,7 @@ test "lite backend auto rejects internal bridge aflite files" {
 test "lite backend auto rejects invalid native headers without fallback" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const invalid_magic_path = try testPath(allocator, tmp, "auto-invalid-magic.aflite");
@@ -1373,9 +1375,9 @@ test "lite backend auto rejects invalid native headers without fallback" {
     {
         var encoded: [native.header_size]u8 = @splat(0);
         @memcpy(encoded[0.."AFLITE0X".len], "AFLITE0X");
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, invalid_magic_path, .{});
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, &encoded, 0);
+        var file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, invalid_magic_path, .{});
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, &encoded, 0);
     }
 
     try std.testing.expectError(error.InvalidNativeMagic, Handle.open(allocator, invalid_magic_path, .{}));
@@ -1387,9 +1389,9 @@ test "lite backend auto rejects invalid native headers without fallback" {
         var encoded: [native.header_size]u8 = undefined;
         native.encodeHeader(&encoded, .{});
         std.mem.writeInt(u32, encoded[native.magic.len..][0..4], native.format_version + 1, .little);
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, unsupported_version_path, .{});
-        defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, &encoded, 0);
+        var file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, unsupported_version_path, .{});
+        defer file.close(native_platform.testing.io);
+        try file.writePositionalAll(native_platform.testing.io, &encoded, 0);
     }
 
     try std.testing.expectError(error.UnsupportedNativeFormatVersion, Handle.open(allocator, unsupported_version_path, .{}));
@@ -1401,7 +1403,7 @@ test "lite backend auto rejects invalid native headers without fallback" {
 test "lite backend native engine can back db primary documents" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-db.aflite");
@@ -1465,7 +1467,7 @@ test "lite backend native engine can back db primary documents" {
 
 test "lite vector storage isolates containers with the same logical namespace" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path_a = try testPath(allocator, tmp, "vectors-a.aflite");
     defer allocator.free(path_a);
@@ -1506,7 +1508,7 @@ test "lite vector storage isolates containers with the same logical namespace" {
 
 test "lite backend namespaced db options isolate tables in one file" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-namespaced-db.aflite");
     defer allocator.free(path);
@@ -1542,7 +1544,7 @@ test "lite backend namespaced db options isolate tables in one file" {
 
 test "lite backend adopts embedded root into a move-stable standalone namespace" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "embedded-standalone.aflite");
     defer allocator.free(path);
@@ -1598,7 +1600,7 @@ test "lite backend adopts embedded root into a move-stable standalone namespace"
 
 test "lite backend rejects root adoption after the target namespace opens" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "embedded-adoption-open.aflite");
     defer allocator.free(path);
@@ -1613,7 +1615,7 @@ test "lite backend rejects root adoption after the target namespace opens" {
 
 test "lite backend fails closed on unknown artifact profile and invalid root alias" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const profile_path = try testPath(allocator, tmp, "invalid-profile.aflite");
@@ -1638,7 +1640,7 @@ test "lite backend fails closed on unknown artifact profile and invalid root ali
 test "lite backend native open requires an existing file" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-missing.aflite");

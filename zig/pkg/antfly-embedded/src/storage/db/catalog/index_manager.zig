@@ -25,8 +25,8 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const full_text_index_defaults = @import("../../../common/full_text_index_defaults.zig");
 const native_artifact_sink = @import("../../native_artifact_sink.zig");
 const native_backup = @import("../native_backup.zig");
-const process_memory = @import("antfly_platform").process_memory;
-const platform_time = @import("antfly_platform").time;
+const process_memory = platform.process_memory;
+const platform_time = platform.time;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const backend_types = @import("../../backend_types.zig");
 const backend_erased = @import("../../backend_erased.zig");
@@ -147,7 +147,7 @@ const repair_shadow_root_prefix = ".repair-shadow-";
 const canonical_algebraic_generation = "canonical";
 const repair_shadow_in_progress_file = ".antfly-repair-shadow-in-progress";
 const repair_shadow_in_progress_magic = "antfly-repair-shadow-in-progress-v1\n";
-var fresh_dense_native_generation_nonce: @import("antfly_platform").atomic.Value(u64) = .init(1);
+var fresh_dense_native_generation_nonce: platform.atomic.Value(u64) = .init(1);
 
 const RepairShadowCleanupTestHook = struct {
     context: *anyopaque,
@@ -1264,7 +1264,7 @@ const SharedVectorBlockGeneration = struct {
     opened: vector_block_store_mod.Opened,
     source_snapshot: ?vector_block_store_mod.Opened = null,
     member_bindings: ?*vector_block_store_mod.member_bindings.Cache = null,
-    refs: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    refs: platform.atomic.Value(u64) = .init(1),
 
     fn create(alloc: Allocator, opened: vector_block_store_mod.Opened) !*SharedVectorBlockGeneration {
         const generation = try alloc.create(SharedVectorBlockGeneration);
@@ -1383,20 +1383,20 @@ pub const IndexManager = struct {
     // posting state for this same source transaction. Ordinary maintenance
     // must never infer mutation identity from cardinality and a merely newer
     // generation.
-    vector_block_stable_tip_sequence: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    vector_block_stable_tip_sequence: platform.atomic.Value(u64) = .init(0),
     vector_block_stable_tip_index: std.atomic.Value(usize) = .init(0),
     vector_block_generation: ?*SharedVectorBlockGeneration = null,
     /// Wake deferred posting acceleration for same-sequence vector rebuilds
     /// as well as new source writes. No borrowed pointer/ABA identity escapes.
-    vector_block_publication_revision: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    vector_block_publication_revision: platform.atomic.Value(u64) = .init(1),
     // Once a source transaction changes dense artifacts, an older immutable
     // base must never receive later coverage-only watermarks. Keeping CURRENT
     // at its last genuinely covered sequence is also the crash-safe dirty
     // marker: restart can prove that a replacement base is required without
     // relying on this process-local bit.
     vector_block_projection_dirty: std.atomic.Value(bool) = .init(false),
-    vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
-    vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
+    vector_block_candidate_sequence: platform.atomic.Value(u64) = platform.atomic.Value(u64).init(0),
+    vector_block_candidate_since_ns: platform.atomic.Value(u64) = platform.atomic.Value(u64).init(0),
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     /// Serialize local receipt counter preparation through its physical commit.
     /// Acquire after primary/graph/index guards; never acquire an index guard
@@ -1415,19 +1415,19 @@ pub const IndexManager = struct {
     // compacting an older schema generation) for CPU, mmap residency, and the
     // shared text-merge resource budget.
     text_backfill_active: std.atomic.Value(u32) = .init(0),
-    next_text_index_instance_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    next_text_index_instance_id: platform.atomic.Value(u64) = .init(1),
     /// Process-local generation of the extraction plan consumed by writes.
     /// Prepared batches compare this scalar instead of rereading and hashing
     /// the serialized catalog under the DB apply lock.
-    write_plan_generation: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    write_plan_generation: platform.atomic.Value(u64) = .init(1),
     write_plan_cache_mutex: std.Io.Mutex = .init,
     /// Non-zero while one request is constructing the immutable plan for a
     /// cold generation. Publication is rare; acquisitions remain lock-free
     /// apart from the short cache pointer fence and never duplicate the owned
     /// catalog clone under a thundering herd.
-    write_plan_build_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    write_plan_build_generation: platform.atomic.Value(u64) = .init(0),
     write_plan_cache: ?*WritePlanSnapshotEpoch = null,
-    next_dense_capture_incarnation: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    next_dense_capture_incarnation: platform.atomic.Value(u64) = .init(1),
     load_parallelism: ?usize = null,
     full_text_pending_bytes_accounted: u64 = 0,
     text_indexes: std.ArrayListUnmanaged(TextIndex),
@@ -1476,7 +1476,7 @@ pub const IndexManager = struct {
     /// A fresh value is assigned on every insertion, including same-name,
     /// same-config recreation, so detached work never derives identity from
     /// mutable record contents. Zero remains reserved as "no incarnation".
-    next_failed_index_load_incarnation_id: @import("antfly_platform").atomic.Value(u64) = .init(1),
+    next_failed_index_load_incarnation_id: platform.atomic.Value(u64) = .init(1),
     /// Stable resident retry ring. Every quarantined index is safe to reopen,
     /// even when destructive reconstruction requires operator authorization.
     /// Entries borrow the owned map keys and are updated under catalog_mutex.
@@ -5276,7 +5276,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(canonical_path);
         const pointer_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(pointer_path);
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const raw = std.Io.Dir.cwd().readFileAlloc(
             io_impl.io(),
@@ -6907,7 +6907,7 @@ pub const IndexManager = struct {
         // Manually configured managers may not own an executor. Their worker
         // sweeps are normally synchronous; retain the established teardown
         // fallback for a structural mutation racing such a sweep.
-        while (self.graph_metric_schedule_pins.load(.acquire) != 0) @import("antfly_platform").time.yieldNow();
+        while (self.graph_metric_schedule_pins.load(.acquire) != 0) platform.time.yieldNow();
     }
 
     pub fn deinit(self: *IndexManager) void {
@@ -11753,7 +11753,7 @@ pub const IndexManager = struct {
         return self.io orelse if (comptime builtin.os.tag == .freestanding)
             .failing
         else
-            std.Io.Threaded.global_single_threaded.io();
+            platform.Threaded.global_single_threaded.io();
     }
 
     /// Binds rebuild cursors to the same storage backend as their index kind.
@@ -13309,7 +13309,7 @@ pub const IndexManager = struct {
         defer alloc.free(relative_path);
         if (!validRelativeRepairIndexRoot(index_name, relative_path)) return error.InvalidIndexRootPointer;
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         const target_exists = blk: {
@@ -13521,7 +13521,7 @@ pub const IndexManager = struct {
             if (test_repair_shadow_cleanup_after_pointer_snapshot) |hook| try hook.callback(hook.context);
         }
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, self.base_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -20120,7 +20120,7 @@ pub const IndexManager = struct {
             try std.Io.Dir.cwd().deleteTree(io, path);
             return;
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
     }
@@ -20131,7 +20131,7 @@ pub const IndexManager = struct {
 
     pub fn writeRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
         if (is_hostless) return;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         try fs_paths.createDirPathPortable(io, shadow_root_path);
@@ -20147,7 +20147,7 @@ pub const IndexManager = struct {
 
     pub fn clearRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
         if (is_hostless) return;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_root_path, repair_shadow_in_progress_file });
@@ -20174,7 +20174,7 @@ pub const IndexManager = struct {
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), marker_path, self.alloc, .limited(4096)) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -20247,7 +20247,7 @@ pub const IndexManager = struct {
                 else => return err,
             }
         else blk: {
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             break :blk std.Io.Dir.cwd().readFileAlloc(
                 io_impl.io(),
@@ -20287,7 +20287,7 @@ pub const IndexManager = struct {
     fn writeActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, relative_active_path: []const u8) !void {
         if (is_hostless) return;
         if (!validRelativeRepairIndexRoot(std.fs.path.basename(canonical_path), relative_active_path)) return error.InvalidIndexRootPointer;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         try fs_paths.createDirPathPortable(io, canonical_path);
@@ -20307,7 +20307,7 @@ pub const IndexManager = struct {
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| switch (err) {
@@ -20351,7 +20351,7 @@ pub const IndexManager = struct {
         const path = try self.activeIndexPath(name);
         defer self.alloc.free(path);
         if (is_hostless) return 0;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
@@ -20438,7 +20438,7 @@ pub const IndexManager = struct {
         const indexes_path = try std.fs.path.join(self.alloc, &.{ self.base_path, "indexes" });
         defer self.alloc.free(indexes_path);
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -20594,7 +20594,7 @@ pub const IndexManager = struct {
 
     fn pruneCanonicalIndexRootAfterPointerInstall(canonical_path: []const u8) !void {
         if (is_hostless) return;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, canonical_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -21467,7 +21467,7 @@ pub const IndexManager = struct {
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
                 const reverse_store_missing = if (self.effectiveGraphStorage() != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
-                    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
                     defer io_impl.deinit();
                     var reverse_dir = std.Io.Dir.cwd().openDir(io_impl.io(), reverse_path, .{}) catch |err| switch (err) {
                         error.FileNotFound => break :blk true,
@@ -30266,8 +30266,8 @@ test "dense rebuild state uses configured durable storage" {
         .config_json = "{}",
         .coverage_generation = 11,
     });
-    try state.updateWithIo(std.testing.io, "doc:m");
-    const loaded = (try state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+    try state.updateWithIo(platform.testing.io, "doc:m");
+    const loaded = (try state.checkWithIo(alloc, platform.testing.io)) orelse return error.TestExpectedEqual;
     defer alloc.free(loaded);
     try std.testing.expectEqualStrings("doc:m", loaded);
 }
@@ -30431,7 +30431,7 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
 fn newCoverageGeneration(runtime_io: ?std.Io) !u64 {
     if (runtime_io) |io| return try coverage_identity.generate(io);
     if (builtin.os.tag == .freestanding) return try coverage_identity.generate(.failing);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try coverage_identity.generate(io_impl.io());
 }
@@ -30701,7 +30701,7 @@ test "index catalog preserves coverage generation and migrates legacy generation
 
 test "index create preserves authoritative coverage generation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -31740,7 +31740,7 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
-    const debug_open = @import("antfly_platform").env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    const debug_open = platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         if (debug_open) {
@@ -31786,11 +31786,11 @@ fn sleepBeforeTextPersistentOpenRetry(attempt: usize) void {
     const capped = @min(attempt, 5);
     const delay_ns: u64 = (@as(u64, 5) << @intCast(capped)) * std.time.ns_per_ms;
     if (comptime builtin.os.tag != .freestanding) {
-        var req = std.posix.timespec{
+        var req = platform.c.timespec{
             .sec = @intCast(delay_ns / std.time.ns_per_s),
             .nsec = @intCast(delay_ns % std.time.ns_per_s),
         };
-        while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+        while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
             .SUCCESS => return,
             .INTR => continue,
             else => return,
@@ -33321,7 +33321,7 @@ fn ensureIndexDir(alloc: Allocator, base_path: []const u8, path: []const u8) !vo
     defer alloc.free(parent_path);
 
     if (!is_hostless) {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), parent_path);
         try fs_paths.createDirPathPortable(io_impl.io(), path);
@@ -33342,7 +33342,7 @@ fn ensureIndexDirDurable(
     if (shared_io) |io| {
         return ensureIndexDirDurableWithIo(alloc, io, base_path, path);
     }
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     try ensureIndexDirDurableWithIo(alloc, io_impl.io(), base_path, path);
 }
@@ -33367,7 +33367,7 @@ fn ensureIndexDirDurableWithIo(
 fn deleteIndexDirIfPresent(path: []const u8) void {
     if (is_hostless) return;
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
@@ -33375,7 +33375,7 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
 fn repairShadowRootInProgress(path: []const u8) bool {
     if (is_hostless) return false;
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const marker_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ path, repair_shadow_in_progress_file }) catch return true;
@@ -33450,7 +33450,7 @@ test "active repair shadow root validation rejects escapes" {
 
 test "repair shadow cleanup revalidates a pointer published after inventory" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const base_path = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33466,11 +33466,11 @@ test "repair shadow cleanup revalidates a pointer published after inventory" {
     defer alloc.free(shadow_path);
     const active_path = try std.fs.path.join(alloc, &.{ base_path, relative });
     defer alloc.free(active_path);
-    try fs_paths.createDirPathPortable(std.testing.io, active_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, active_path);
     try IndexManager.writeRepairShadowInProgressMarker(alloc, shadow_path);
     const sentinel_path = try std.fs.path.join(alloc, &.{ active_path, "sentinel" });
     defer alloc.free(sentinel_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sentinel_path, .data = "live" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = sentinel_path, .data = "live" });
 
     const PublishContext = struct {
         manager: *IndexManager,
@@ -33499,13 +33499,13 @@ test "repair shadow cleanup revalidates a pointer published after inventory" {
     defer test_repair_shadow_cleanup_after_pointer_snapshot = null;
 
     _ = try cleaner.cleanupInactiveRepairShadowRootsPage();
-    try std.Io.Dir.cwd().access(std.testing.io, sentinel_path, .{});
-    try std.testing.expect(try cleaner.publishedRepairShadowRootSelected(std.testing.io, root_name));
+    try std.Io.Dir.cwd().access(platform.testing.io, sentinel_path, .{});
+    try std.testing.expect(try cleaner.publishedRepairShadowRootSelected(platform.testing.io, root_name));
 }
 
 test "repair shadow cleanup isolates malformed pointer ownership" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const base_path = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33524,39 +33524,39 @@ test "repair shadow cleanup isolates malformed pointer ownership" {
     defer alloc.free(protected_path);
     const unrelated_path = try std.fs.path.join(alloc, &.{ base_path, unrelated_root, "indexes", "other" });
     defer alloc.free(unrelated_path);
-    try fs_paths.createDirPathPortable(std.testing.io, protected_path);
-    try fs_paths.createDirPathPortable(std.testing.io, unrelated_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, protected_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, unrelated_path);
 
     const canonical_path = try manager.indexPath(corrupt_name);
     defer alloc.free(canonical_path);
     try ensureIndexDirDurable(alloc, null, base_path, canonical_path);
     const pointer_path = try manager.activeIndexRootPointerPath(canonical_path);
     defer alloc.free(pointer_path);
-    try writeFileAtomicallyDurable(alloc, std.testing.io, pointer_path, "not-an-index-root-pointer\n");
+    try writeFileAtomicallyDurable(alloc, platform.testing.io, pointer_path, "not-an-index-root-pointer\n");
 
     _ = try manager.cleanupInactiveRepairShadowRootsPage();
-    try std.Io.Dir.cwd().access(std.testing.io, protected_path, .{});
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, unrelated_path, .{}));
+    try std.Io.Dir.cwd().access(platform.testing.io, protected_path, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, unrelated_path, .{}));
 
     // Bounded pointer reads classify oversized files as the same isolated
     // corruption instead of surfacing StreamTooLong on every cleanup pass.
     const oversized_pointer = try alloc.alloc(u8, 4097);
     defer alloc.free(oversized_pointer);
     @memset(oversized_pointer, 'x');
-    try writeFileAtomicallyDurable(alloc, std.testing.io, pointer_path, oversized_pointer);
+    try writeFileAtomicallyDurable(alloc, platform.testing.io, pointer_path, oversized_pointer);
     _ = try manager.cleanupInactiveRepairShadowRootsPage();
-    try std.Io.Dir.cwd().access(std.testing.io, protected_path, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, protected_path, .{});
 
     // Once catalog-owned retirement removes the corrupt canonical namespace,
     // the formerly ambiguous generation is an ordinary orphan.
     deleteIndexDirIfPresent(canonical_path);
     _ = try manager.cleanupInactiveRepairShadowRootsPage();
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, protected_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, protected_path, .{}));
 }
 
 test "native physical generation pointer is versioned and fails closed without authority" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const base_path = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33569,7 +33569,7 @@ test "native physical generation pointer is versioned and fails closed without a
     defer alloc.free(active_path);
     const posting_path = try std.fs.path.join(alloc, &.{ active_path, "posting-segments" });
     defer alloc.free(posting_path);
-    try fs_paths.createDirPathPortable(std.testing.io, posting_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, posting_path);
     try index_generation_manifest.writeReadyForPhysicalFormat(
         alloc,
         active_path,
@@ -33581,7 +33581,7 @@ test "native physical generation pointer is versioned and fails closed without a
     );
     const authority_path = try std.fs.path.join(alloc, &.{ posting_path, "AUTHORITY" });
     defer alloc.free(authority_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = authority_path,
         .data = posting_segment_store_mod.authority_value,
     });
@@ -33590,14 +33590,14 @@ test "native physical generation pointer is versioned and fails closed without a
     try manager.writeActiveIndexRootPointer(canonical_path, relative);
     const pointer_path = try manager.activeIndexRootPointerPath(canonical_path);
     defer alloc.free(pointer_path);
-    const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, pointer_path, alloc, .limited(4096));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, pointer_path, alloc, .limited(4096));
     defer alloc.free(raw);
     try std.testing.expect(std.mem.startsWith(u8, raw, active_index_root_pointer_magic_v2));
     const selected = (try manager.readActiveIndexRootPointer(canonical_path, index_name)).?;
     defer alloc.free(selected);
     try std.testing.expectEqualStrings(relative, selected);
 
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, authority_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, authority_path);
     try std.testing.expectError(
         error.InvalidIndexRootPointer,
         manager.readActiveIndexRootPointer(canonical_path, index_name),
@@ -33615,7 +33615,7 @@ test "dense native migration policy is fail closed when provisioned" {
     };
     var gate = Gate{};
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33662,7 +33662,7 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     };
     var gate = Gate{ .permitted = true };
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33715,7 +33715,7 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
             defer alloc.free(legacy_path);
             try std.testing.expectError(
                 error.FileNotFound,
-                std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{}),
+                std.Io.Dir.cwd().access(platform.testing.io, legacy_path, .{}),
             );
         }
     }
@@ -33741,7 +33741,7 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
         defer alloc.free(relative_path);
         const active_path = try std.fs.path.join(alloc, &.{ path, relative_path });
         defer alloc.free(active_path);
-        try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
+        try std.Io.Dir.cwd().access(platform.testing.io, active_path, .{});
     }
 
     // Restart selects the incompatible pointer directly. It must not reopen a
@@ -33776,14 +33776,14 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     defer alloc.free(marker_path);
     const stale_marker = try std.fmt.allocPrint(alloc, "{s}pid={d}\n", .{ repair_shadow_in_progress_magic, std.math.maxInt(u32) });
     defer alloc.free(stale_marker);
-    try writeFileAtomicallyDurable(alloc, std.testing.io, marker_path, stale_marker);
+    try writeFileAtomicallyDurable(alloc, platform.testing.io, marker_path, stale_marker);
     _ = try reopened.cleanupInactiveRepairShadowRootsPage();
-    try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, active_path, .{});
 }
 
 test "native pointer validation reads authority through configured storage" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33806,7 +33806,7 @@ test "native pointer validation reads authority through configured storage" {
         const relative = ".repair-shadow-configured/indexes/dv_v2";
         const active_path = try std.fs.path.join(alloc, &.{ path, relative });
         defer alloc.free(active_path);
-        try std.Io.Dir.cwd().createDirPath(std.testing.io, active_path);
+        try std.Io.Dir.cwd().createDirPath(platform.testing.io, active_path);
         try index_generation_manifest.writeReadyForPhysicalFormat(
             alloc,
             active_path,
@@ -33841,7 +33841,7 @@ test "fresh dense admission remains legacy before the native capability floor" {
     };
     var gate: u8 = 0;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33876,7 +33876,7 @@ test "fresh dense admission remains legacy before the native capability floor" {
 
 test "fresh dense admission reclaims a broken orphan construction pointer" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33904,7 +33904,7 @@ test "fresh dense admission reclaims a broken orphan construction pointer" {
         .{ active_index_root_pointer_magic_v2, cfg.name },
     );
     defer alloc.free(broken_pointer);
-    try writeFileAtomicallyDurable(alloc, std.testing.io, pointer_path, broken_pointer);
+    try writeFileAtomicallyDurable(alloc, platform.testing.io, pointer_path, broken_pointer);
     try std.testing.expectError(
         error.InvalidIndexRootPointer,
         manager.readActiveIndexRootPointer(canonical_path, cfg.name),
@@ -33920,7 +33920,7 @@ test "fresh dense admission reclaims a broken orphan construction pointer" {
 
 test "fresh dense admission reclaims a certified generation orphaned before catalog commit" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -33965,13 +33965,13 @@ test "fresh dense admission reclaims a certified generation orphaned before cata
     try std.testing.expect(entry.index.experimentalPostingWalAuthoritative());
     try std.testing.expectError(
         error.FileNotFound,
-        std.Io.Dir.cwd().access(std.testing.io, orphan_path, .{}),
+        std.Io.Dir.cwd().access(platform.testing.io, orphan_path, .{}),
     );
 }
 
 test "fresh native dense backfill certifies one pinned source snapshot" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -34028,7 +34028,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
 
 test "fresh native dense backfill extends a shared vector generation without a source rescan" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -34078,7 +34078,7 @@ test "fresh native dense backfill extends a shared vector generation without a s
 
 test "standalone dense native migration still requires an explicit physical generation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -34110,7 +34110,7 @@ test "standalone dense native migration still requires an explicit physical gene
 
 test "restored native projection publishes an idempotent v2 physical generation without copying" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -34122,14 +34122,14 @@ test "restored native projection publishes an idempotent v2 physical generation 
     defer alloc.free(canonical_path);
     const posting_path = try std.fmt.allocPrint(alloc, "{s}/posting-segments", .{canonical_path});
     defer alloc.free(posting_path);
-    try fs_paths.createDirPathPortable(std.testing.io, posting_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, posting_path);
     const authority_path = try std.fmt.allocPrint(
         alloc,
         "{s}/{s}",
         .{ posting_path, posting_segment_store_mod.authority_name },
     );
     defer alloc.free(authority_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = authority_path,
         .data = posting_segment_store_mod.authority_value,
     });
@@ -34172,8 +34172,8 @@ test "restored native projection publishes an idempotent v2 physical generation 
         .{ active_path, posting_segment_store_mod.authority_name },
     );
     defer alloc.free(restored_authority);
-    try std.Io.Dir.cwd().access(std.testing.io, restored_authority, .{});
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, authority_path, .{}));
+    try std.Io.Dir.cwd().access(platform.testing.io, restored_authority, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, authority_path, .{}));
 }
 
 fn denseDocMappingKey(alloc: Allocator, index_name: []const u8, doc_key: []const u8) ![]u8 {
@@ -34416,7 +34416,7 @@ test "dense vector mapping codec accepts released rows and rejects unknown versi
 
 test "dense metadata lookups read legacy textual rows" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -35412,17 +35412,17 @@ fn indexManagerReplayArtifactPath(buf: []u8, suffix: []const u8) []const u8 {
 }
 
 fn cleanupIndexManagerDir(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
 
 fn writeIndexManagerReplayArtifactFile(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
+    var file = try std.Io.Dir.createFileAbsolute(platform.testing.io, path, .{});
+    defer file.close(platform.testing.io);
 
     var file_buf: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &file_buf);
+    var writer = file.writer(platform.testing.io, &file_buf);
     try writer.interface.writeAll(contents);
     try writer.end();
 }
@@ -35679,8 +35679,8 @@ fn runIndexManagerCrashCase(
 
 fn runIndexManagerReplayFixtures(alloc: Allocator) !void {
     const root_dir = "pkg/antfly-embedded/src/storage/db/catalog/index_manager_sim_fixtures";
-    var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
-    defer fixture_dir.close(std.testing.io);
+    var fixture_dir = try std.Io.Dir.cwd().openDir(platform.testing.io, root_dir, .{ .iterate = true });
+    defer fixture_dir.close(platform.testing.io);
 
     var walker = try fixture_dir.walk(alloc);
     defer walker.deinit();
@@ -35691,7 +35691,7 @@ fn runIndexManagerReplayFixtures(alloc: Allocator) !void {
         fixture_paths.deinit(alloc);
     }
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_paths.append(alloc, try alloc.dupe(u8, entry.path));
@@ -35707,7 +35707,7 @@ fn runIndexManagerReplayFixtures(alloc: Allocator) !void {
         const fixture_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_dir, fixture_rel_path });
         defer alloc.free(fixture_path);
 
-        const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_path, alloc, .limited(64 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, fixture_path, alloc, .limited(64 * 1024));
         defer alloc.free(raw);
 
         var fixture = try index_manager_sim_fixture.parseFixture(alloc, raw);
@@ -35733,8 +35733,8 @@ fn runIndexManagerReplayFixtures(alloc: Allocator) !void {
 
 fn runModeledIndexManagerReplayFixtures(alloc: Allocator) !void {
     const root_dir = "pkg/antfly-embedded/src/storage/db/catalog/index_manager_sim_fixtures/replay";
-    var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
-    defer fixture_dir.close(std.testing.io);
+    var fixture_dir = try std.Io.Dir.cwd().openDir(platform.testing.io, root_dir, .{ .iterate = true });
+    defer fixture_dir.close(platform.testing.io);
 
     var walker = try fixture_dir.walk(alloc);
     defer walker.deinit();
@@ -35745,7 +35745,7 @@ fn runModeledIndexManagerReplayFixtures(alloc: Allocator) !void {
         fixture_paths.deinit(alloc);
     }
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_paths.append(alloc, try alloc.dupe(u8, entry.path));
@@ -35761,7 +35761,7 @@ fn runModeledIndexManagerReplayFixtures(alloc: Allocator) !void {
         const fixture_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_dir, fixture_rel_path });
         defer alloc.free(fixture_path);
 
-        const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_path, alloc, .limited(64 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, fixture_path, alloc, .limited(64 * 1024));
         defer alloc.free(raw);
 
         var fixture = try index_manager_sim_fixture.parseFixture(alloc, raw);
@@ -35839,8 +35839,8 @@ fn replayModeledIndexManagerCrashFixture(
 
 fn runModeledIndexManagerCrashFixtures(alloc: Allocator) !void {
     const root_dir = "pkg/antfly-embedded/src/storage/db/catalog/index_manager_sim_fixtures/crash";
-    var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
-    defer fixture_dir.close(std.testing.io);
+    var fixture_dir = try std.Io.Dir.cwd().openDir(platform.testing.io, root_dir, .{ .iterate = true });
+    defer fixture_dir.close(platform.testing.io);
 
     var walker = try fixture_dir.walk(alloc);
     defer walker.deinit();
@@ -35851,7 +35851,7 @@ fn runModeledIndexManagerCrashFixtures(alloc: Allocator) !void {
         fixture_paths.deinit(alloc);
     }
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_paths.append(alloc, try alloc.dupe(u8, entry.path));
@@ -35867,7 +35867,7 @@ fn runModeledIndexManagerCrashFixtures(alloc: Allocator) !void {
         const fixture_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_dir, fixture_rel_path });
         defer alloc.free(fixture_path);
 
-        const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_path, alloc, .limited(64 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, fixture_path, alloc, .limited(64 * 1024));
         defer alloc.free(raw);
 
         var fixture = try index_manager_sim_fixture.parseFixture(alloc, raw);
@@ -36126,7 +36126,7 @@ test "parseDenseConfig accepts multiple embedding artifact sources" {
 
 test "dense index unions multiple embedding artifact sources without overwriting members" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -36370,7 +36370,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
 
 test "sparse multi-source requests carry semantic producer identity" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -36465,7 +36465,7 @@ test "configUsesExternalCoverage distinguishes caller-populated vector indexes" 
 
 test "sparse single-source embedding name drives generation replay and search" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -36937,7 +36937,7 @@ test "parseTextConfig canonicalizes artifact name and accepts internal chunk nam
 
 test "full text single artifact name accepts textual asset source" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -37087,12 +37087,12 @@ test "initRuntimeStore borrows backend_erased.Store values" {
 
 test "dense vector id uses deterministic key hash with legacy mapping fallback" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37131,10 +37131,10 @@ test "production exact dense scorer cancels during bounded vector work" {
     const alloc = std.testing.allocator;
     const candidate_count = exact_dense_cancellation_stride * 3;
     const dims: usize = 2;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37215,12 +37215,12 @@ test "production exact dense scorer cancels during bounded vector work" {
 
 test "dense vector id ignores ordinal metadata for a different doc" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37306,12 +37306,12 @@ test "dense vector id ignores ordinal metadata for a different doc" {
 
 test "dense vector id allocator spills preferred-id collisions without aliasing members" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37403,12 +37403,12 @@ test "dense vector id allocator spills preferred-id collisions without aliasing 
 
 test "dense metadata prefetch includes legacy ordinal vector ids" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37539,12 +37539,12 @@ test "dense vector metadata presence memo accepts memo-owned metadata input" {
 
 test "dense index manager accepts explicit embedding writes after addAllNoBackfill" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37663,7 +37663,7 @@ test "unit grouping capability requires durable document extraction ancestry" {
 
 test "index manager advertises typed tensor access paths for vector and graph indexes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -37853,7 +37853,7 @@ test "index manager advertises typed tensor access paths for vector and graph in
 
 test "full text dictionary publication rejects duplicate semantic owners" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -37902,7 +37902,7 @@ test "full text dictionary publication rejects duplicate semantic owners" {
 
 test "observed full text analyzers publish shared dictionary ownership" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -37979,7 +37979,7 @@ test "observed full text analyzers publish shared dictionary ownership" {
 
 test "observed analyzer publication leaves runtime and metadata unchanged on registry conflict" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38038,7 +38038,7 @@ test "observed analyzer publication leaves runtime and metadata unchanged on reg
 test "observed analyzer publication waits for active analysis readers" {
     if (builtin.single_threaded) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38087,17 +38087,17 @@ test "observed analyzer publication waits for active analysis readers" {
     };
 
     entry.lockAnalysisShared();
-    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var thread = try platform.testing.io.concurrent(Worker.run, .{&worker});
     var thread_awaited = false;
     defer if (!thread_awaited) {
         entry.unlockAnalysisShared();
-        thread.await(std.testing.io);
+        thread.await(platform.testing.io);
     };
     while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
-    for (0..128) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    for (0..128) |_| platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!worker.finished.load(.acquire));
     entry.unlockAnalysisShared();
-    thread.await(std.testing.io);
+    thread.await(platform.testing.io);
     thread_awaited = true;
 
     if (worker.err) |err| return err;
@@ -38108,7 +38108,7 @@ test "observed analyzer publication waits for active analysis readers" {
 
 test "text query lease retains snapshot and analyzer across catalog removal" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38145,7 +38145,7 @@ test "text query lease retains snapshot and analyzer across catalog removal" {
 
 test "text publication planning rejects a same-name catalog replacement" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38190,7 +38190,7 @@ test "text publication planning rejects a same-name catalog replacement" {
 
 test "text publication admission refreshes a projection revision change" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38278,7 +38278,7 @@ test "text publication admission refreshes a projection revision change" {
 
 test "observed dynamic sortable field capability reports covered queryable state" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38346,7 +38346,7 @@ test "observed dynamic sortable field capability reports covered queryable state
 
 test "dynamic field observation keeps status cached and validates only selected sort fields" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38435,7 +38435,7 @@ test "dynamic field observation keeps status cached and validates only selected 
 
 test "declared runtime sortable field capability reports covered queryable state" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38508,7 +38508,7 @@ test "declared runtime sortable field capability reports covered queryable state
 
 test "declared runtime geo field capability reports covered filterable state" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38583,7 +38583,7 @@ test "declared runtime geo field capability reports covered filterable state" {
 
 test "declared runtime sortable field capability is queryable for empty index" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38636,7 +38636,7 @@ test "declared runtime sortable field capability is queryable for empty index" {
 
 test "empty text index refreshes schema committed after index provisioning" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38683,7 +38683,7 @@ test "empty text index refreshes schema committed after index provisioning" {
 
 test "fresh text generation persists provenance before its first segment" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38725,7 +38725,7 @@ test "fresh text generation persists provenance before its first segment" {
 
 test "non-empty text generation accepts deployed v11 schema provenance" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38782,7 +38782,7 @@ test "non-empty text generation accepts deployed v11 schema provenance" {
 
 test "empty generation adopts schema provenance after schema-only crash boundary" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38831,7 +38831,7 @@ test "empty generation adopts schema provenance after schema-only crash boundary
 
 test "non-empty schema-less text generation fails closed when a schema appears" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38884,7 +38884,7 @@ test "non-empty schema-less text generation fails closed when a schema appears" 
 
 test "non-empty text generation without provenance fails closed" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38921,7 +38921,7 @@ test "non-empty text generation without provenance fails closed" {
 
 test "deleted-only text generation cannot adopt different schema provenance" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -38978,7 +38978,7 @@ test "deleted-only text generation cannot adopt different schema provenance" {
 
 test "shadow text generation owns provenance without mutating active generation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39051,7 +39051,7 @@ test "shadow text generation owns provenance without mutating active generation"
 
 test "observed dynamic sortable field capability stays declared for sparse doc values" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39137,7 +39137,7 @@ fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
 
 test "observed dynamic sortable field capability stays declared for duplicate doc value rows" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39291,7 +39291,7 @@ test "observed full text analyzer metadata reads legacy analyzer-only format" {
 
 test "dense bulk-ingest uses recursive bulk build for large empty index batch" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39355,7 +39355,7 @@ test "dense bulk-ingest uses recursive bulk build for large empty index batch" {
 
 test "dense bulk-ingest populates primary ordinal vector cache before first lookup" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39450,7 +39450,7 @@ test "dense bulk-ingest populates primary ordinal vector cache before first look
 
 test "dense embedding writes prefer inline vectors over artifact reloads" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39543,7 +39543,7 @@ test "index load recovery classification only auto rebuilds missing publication"
 
 test "loadConfiguredIndexesParallel quarantines worker errors on borrowed std Io tasks" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39577,7 +39577,7 @@ test "loadConfiguredIndexesParallel quarantines worker errors on borrowed std Io
         try setup_manager.openConfiguredIndex(&store, configs[0], false, false);
     }
 
-    for ([_]?std.Io{ std.testing.io, null }) |scheduling_io| {
+    for ([_]?std.Io{ platform.testing.io, null }) |scheduling_io| {
         var manager = try IndexManager.init(alloc, path);
         defer manager.deinit();
         manager.setIo(scheduling_io);
@@ -39600,7 +39600,7 @@ test "loadConfiguredIndexesParallel quarantines worker errors on borrowed std Io
 
 test "dense apply resource manager accounts working bytes and releases them" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39653,7 +39653,7 @@ test "dense apply resource manager accounts working bytes and releases them" {
 
 test "dense replay-shaped bulk apply skips identical and replaces changed vector atomically" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -39923,7 +39923,7 @@ test "dense vector load session switches to retained LSM ownership before reserv
         .index_name = try alloc.dupe(u8, "dv_v1"),
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/residency-fallback", .{tmp.sub_path});
@@ -40682,7 +40682,7 @@ test "orphan algebraic generation cleanup resumes from deleted durable pages" {
     const index_name = "alg_v1";
     const orphan_index_path = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ path, generation, index_name });
     defer alloc.free(orphan_index_path);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, orphan_index_path);
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, orphan_index_path);
 
     const storage_namespace = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ generation, index_name });
     defer alloc.free(storage_namespace);
@@ -41531,7 +41531,7 @@ test "index load state allocation failure leaves no borrowed key behind" {
 
 test "dense artifact preload session reuses cached raw values across calls" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -41627,7 +41627,7 @@ test "dense artifact preload session reuses cached raw values across calls" {
 
 test "dense mapping commit failure rolls back inserted HBC vectors" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -41864,7 +41864,7 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
 
 test "dense index manager accepts external embedding indexes without enrichments" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -41920,7 +41920,7 @@ test "production external scorers use bounded cache-first artifact batches" {
     const dims: usize = 3;
     const external_rerank_batch_size: usize = 128;
     const candidate_count = exact_dense_score_batch_size + 17;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -42250,7 +42250,7 @@ test "production external scorers use bounded cache-first artifact batches" {
 
 test "external dense embedding writes persist deterministic vector mappings" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -42306,7 +42306,7 @@ test "external dense embedding writes persist deterministic vector mappings" {
 
 test "external dense embedding writes use stable vector ids and ordinal member rows" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -42436,7 +42436,7 @@ test "external dense embedding writes use stable vector ids and ordinal member r
 
 test "primary dense stable vector ids survive identity namespace reassignment" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -42529,7 +42529,7 @@ test "primary dense stable vector ids survive identity namespace reassignment" {
 
 test "external dense embedding writes keep search working after incremental replay-style applies" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -42754,7 +42754,7 @@ test "dense index manager stress applies explicit embedding writes on lsm backen
     const batch_size = @max(@as(usize, 1), stressEnvUsize("ANTFLY_STRESS_DENSE_BATCH", 256));
     const progress_interval = @max(batch_size, stressEnvUsize("ANTFLY_STRESS_DENSE_PROGRESS", batch_size * 8));
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -42860,7 +42860,7 @@ test "dense index manager stress applies explicit embedding writes on lsm backen
 
 test "dense HBC batchInsertWithMetadata works after addAllNoBackfill" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -42898,7 +42898,7 @@ test "dense HBC batchInsertWithMetadata works after addAllNoBackfill" {
 
 test "dense HBC batchInsertWithMetadata works after text batch setup" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -42985,7 +42985,7 @@ test "dense HBC batchInsertWithMetadata works after text batch setup" {
 
 test "text merge task carries concurrent deletes into publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -43157,7 +43157,7 @@ test "text merge publication keeps every chunk member sharing one parent ordinal
     // it; keying by the always-unique stored id first (this fix) must keep
     // all of them.
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -43359,7 +43359,7 @@ test "text merge deletion states synchronize recording with per-index detach" {
     defer state_b.destroy();
     state_b.segment_ids[0] = source_b[0].id;
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var entry: IndexManager.TextIndex = undefined;
@@ -43486,7 +43486,7 @@ test "text merge persistent publication charges share the admitted task byte cei
 
 test "heap-backed text merge reservation covers output and publication working set" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -43582,7 +43582,7 @@ test "heap-backed text merge reservation covers output and publication working s
 
 test "text merge task retires all-deleted file-backed inputs" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -43662,7 +43662,7 @@ test "dense artifact rerank cosine distance includes candidate norm" {
 
 test "posting locality policy only disables optional projection publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/posting-locality", .{tmp.sub_path}, 0);
     defer alloc.free(path);
@@ -43698,7 +43698,7 @@ test "posting locality policy only disables optional projection publication" {
 
 test "posting locality defaults to no copy and preserves explicit opt in and training" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/posting-default", .{tmp.sub_path}, 0);
     defer alloc.free(path);
@@ -43806,7 +43806,7 @@ fn testNativeRerankLocationReuse(pooled_query: bool, borrow_pages: bool) !void {
     const alloc = std.testing.allocator;
     var resources = resource_manager_mod.ResourceManager.init(.{});
     defer resources.deinit(alloc);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var manager_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const manager_path = try std.fmt.bufPrint(&manager_path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -44108,7 +44108,7 @@ fn testNativeReadScratchReclamation(cross_pool: bool) !void {
 
 test "native read scratch pool keeps concurrent leases isolated" {
     const alloc = std.testing.allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(8) });
+    var runtime = platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(8) });
     defer runtime.deinit();
     var resources = resource_manager_mod.ResourceManager.init(.{});
     defer resources.deinit(alloc);
@@ -44146,7 +44146,7 @@ test "native read scratch pool keeps concurrent leases isolated" {
 
 test "native residual scratch reuses capacity and releases its bounded reservation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -44186,7 +44186,7 @@ test "native residual scratch reuses capacity and releases its bounded reservati
 
 test "force text compaction supersedes in-flight scheduled merge" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -44255,7 +44255,7 @@ test "force text compaction supersedes in-flight scheduled merge" {
 
 test "text merge task records input and output bytes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -44328,7 +44328,7 @@ test "text merge task records input and output bytes" {
 
 test "text delete clears handed-off stale docs outside current range" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -44379,7 +44379,7 @@ test "text delete clears handed-off stale docs outside current range" {
 
 test "text merge failure quarantines source segments" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -44455,7 +44455,7 @@ test "text merge failure quarantines source segments" {
 
 test "text merge resource manager accounts pending bytes and active buffers" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -44590,7 +44590,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
 
 test "text merge resource pressure defers background merges" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -44671,7 +44671,7 @@ test "text merge resource pressure defers background merges" {
 
 test "force compact skips clean text indexes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -44724,7 +44724,7 @@ test "force compact skips clean text indexes" {
 
 test "force compact accounts text merge buffers via resource manager" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -44794,7 +44794,7 @@ test "force compact accounts text merge buffers via resource manager" {
 
 test "best effort force compact defers under text merge pressure" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -44862,7 +44862,7 @@ test "best effort force compact defers under text merge pressure" {
 
 test "best effort force compact stops on resource budget rejection" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
@@ -44929,7 +44929,7 @@ test "best effort force compact stops on resource budget rejection" {
 
 test "best effort force compact resumes after modeled reopen under relaxed pressure" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var modeled_device = storage_sim.ModeledDevice.init(alloc);
@@ -45078,7 +45078,7 @@ test "dense hbc batch options preserve known-new ids outside offline bulk mode" 
 
 test "authoritative posting capture starts inside an existing replay session" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -45188,11 +45188,11 @@ test "authoritative posting capture starts inside an existing replay session" {
 
 test "completed native publication defers to capture ownership without starting maintenance" {
     const alloc = std.testing.allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var resources = resource_manager_mod.ResourceManager.init(.{});
     defer resources.deinit(alloc);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -45293,7 +45293,7 @@ test "read-only vector generation load preserves unpublished writer files" {
 
 test "stable native finalization certifies an empty dense index" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -45326,7 +45326,7 @@ test "stable native finalization certifies an empty dense index" {
 
 test "quiescent vector finalization defers to another index owner without losing debt" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -45756,7 +45756,7 @@ test "graph projection preserves numeric literals in configured templates" {
 
 test "replay matrix reads exact native base plus captured updates and fences deletes and newer generations" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -45898,7 +45898,7 @@ test "replay matrix reads exact native base plus captured updates and fences del
 
 test "source checkpoint leaves ANN capture admission open after pinning the native cut" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -45962,7 +45962,7 @@ test "source checkpoint leaves ANN capture admission open after pinning the nati
 
 test "native member bindings preserve updates deletes old readers and restart" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -46113,7 +46113,7 @@ test "native member bindings preserve updates deletes old readers and restart" {
 test "dense query bundle pins primary metadata and exact source through replacement" {
     if (IndexManager.denseVectorBlockPreferredEncoding() != .float32) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -46191,7 +46191,7 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     if (IndexManager.denseVectorBlockPreferredEncoding() != .float32) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -46351,7 +46351,7 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
 
 test "detached posting input pins native references across source replacement and index removal" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path_z = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path}, 0);
     defer alloc.free(path_z);
@@ -46430,7 +46430,7 @@ test "graph artifact rebuild lease drains scheduler pins and excludes new snapsh
             var lease = ctx.manager.beginGraphArtifactRebuild();
             defer lease.deinit();
             ctx.acquired.store(true, .release);
-            while (!ctx.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!ctx.release.load(.acquire)) platform.time.yieldNow();
             lease.complete();
         }
     };
@@ -46443,19 +46443,19 @@ test "graph artifact rebuild lease drains scheduler pins and excludes new snapsh
     // Once the writer owns the catalog it must still wait for this pin.
     while (manager.catalog_mutex.tryLockShared()) {
         manager.catalog_mutex.unlockShared();
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     const acquired_while_pinned = pending.acquired.load(.acquire);
     snapshot.deinit();
     try std.testing.expect(!acquired_while_pinned);
-    while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
+    while (!pending.acquired.load(.acquire)) platform.time.yieldNow();
     try std.testing.expect(!manager.catalog_mutex.tryLockShared());
     pending.release.store(true, .release);
 }
 
 test "text force drain schedules policy misses above the tier target" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = 1, .floor_segment_size = 0 });
     defer setBenchmarkTextMergePolicyOverride(null);

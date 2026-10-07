@@ -18,7 +18,9 @@
 //! mutable mapping is reopened, and only one adapted matrix is live at once.
 //! Every tensor and sidecar is independently verified before publication.
 //! These integrity receipts do not qualify model quality or interoperability.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const source_mod = @import("boundary_training_source.zig");
 const run = @import("boundary_run.zig");
@@ -580,17 +582,17 @@ fn testExecute(a: Allocator, output: []const u8, dora: bool, control: ?Control) 
     var fixture = TestFixture.init(dora);
     var scratch = Scratch.init(a, 2 * mib);
     defer scratch.deinit();
-    var result = execute(scratch.allocator(), std.testing.io, TestFixture.view(), fixture.prepared(), output, TestFixture.provenance(), .{}, control) catch |err| return scratch.mapError(err);
+    var result = execute(scratch.allocator(), native_platform.testing.io, TestFixture.view(), fixture.prepared(), output, TestFixture.provenance(), .{}, control) catch |err| return scratch.mapError(err);
     result.peak_scratch_bytes = scratch.budget.peak;
     return result;
 }
 
 test "boundary immutable merge streams LoRA DoRA preserves frozen bytes and never overwrites" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const safetensors = @import("../../models/safetensors.zig");
     for ([_]bool{ false, true }) |dora| {
-        var temporary = std.testing.tmpDir(.{});
+        var temporary = native_platform.testing.tmpDir(.{});
         defer temporary.cleanup();
         const parent = try temporary.dir.realPathFileAlloc(io, ".", a);
         defer a.free(parent);
@@ -647,19 +649,19 @@ fn testAllocationFailures(a: Allocator, output: []const u8) !void {
     // Production error cleanup never traverses a published output directory.
     const result = try testExecute(a, output, true, null);
     _ = result;
-    try std.Io.Dir.cwd().deleteTree(std.testing.io, output);
+    try std.Io.Dir.cwd().deleteTree(native_platform.testing.io, output);
 }
 
 test "boundary immutable merge cleans every allocation failure and cancelled publication" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    const io = native_platform.testing.io;
+    var temporary = native_platform.testing.tmpDir(.{ .iterate = true });
     defer temporary.cleanup();
     const parent = try temporary.dir.realPathFileAlloc(io, ".", a);
     defer a.free(parent);
     const output = try std.fs.path.join(a, &.{ parent, "merged" });
     defer a.free(output);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, testAllocationFailures, .{output});
+    try native_platform.allocator.checkAllAllocationFailures(a, testAllocationFailures, .{output});
     var iterator = temporary.dir.iterate();
     try std.testing.expect((try iterator.next(io)) == null);
     const Cancel = struct {
@@ -685,8 +687,8 @@ test "boundary immutable merge cleans every allocation failure and cancelled pub
 
 test "boundary immutable merge rejects mutated tensors sidecars header and declared scratch" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var temporary = native_platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const parent = try temporary.dir.realPathFileAlloc(io, ".", a);
     defer a.free(parent);
@@ -723,13 +725,13 @@ test "boundary immutable merge rejects mutated tensors sidecars header and decla
 
 test "boundary immutable merge protects private cleanup from pending Io cancellation" {
     const a = std.testing.allocator;
-    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    var temporary = native_platform.testing.tmpDir(.{ .iterate = true });
     defer temporary.cleanup();
-    const parent = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const parent = try temporary.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
     defer a.free(parent);
     const output = try std.fs.path.join(a, &.{ parent, "merged" });
     defer a.free(output);
-    var threaded = std.Io.Threaded.init(a, .{});
+    var threaded = native_platform.Threaded.init(a, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const Context = struct {
@@ -780,5 +782,5 @@ test "boundary immutable merge protects private cleanup from pending Io cancella
     try std.testing.expectError(error.Cancelled, result);
     try std.testing.expect(context.injected);
     var iterator = temporary.dir.iterate();
-    try std.testing.expect((try iterator.next(std.testing.io)) == null);
+    try std.testing.expect((try iterator.next(native_platform.testing.io)) == null);
 }

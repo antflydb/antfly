@@ -13,11 +13,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const scraping = @import("antfly_scraping");
 const config_mod = @import("antfly_local_sources").common_config;
 const secrets = @import("antfly_local_sources").common_secrets;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = native_platform.sync;
 
 const request_refresh_interval_ns: u64 = std.time.ns_per_s;
 const health_refresh_interval_ns: u64 = 500 * std.time.ns_per_ms;
@@ -98,7 +100,7 @@ pub const Runtime = struct {
         secret_store: ?*secrets.FileStore,
         expected_deployment: ?config_mod.DeploymentMode,
     ) !Runtime {
-        return initWithIo(alloc, std.Options.debug_io, path, secret_store, expected_deployment);
+        return initWithIo(alloc, native_platform.debug_io, path, secret_store, expected_deployment);
     }
 
     pub fn initWithIo(
@@ -452,7 +454,7 @@ const FileImage = struct {
 };
 
 fn readFileImage(alloc: std.mem.Allocator, path: []const u8) !FileImage {
-    return readFileImageWithIo(alloc, std.Options.debug_io, path);
+    return readFileImageWithIo(alloc, native_platform.debug_io, path);
 }
 
 fn readFileImageWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !FileImage {
@@ -482,7 +484,7 @@ fn readFileImageWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !
 
 fn statFileMetadata(alloc: std.mem.Allocator, path: []const u8) !FileMetadata {
     _ = alloc;
-    return statFileMetadataWithIo(std.Options.debug_io, path);
+    return statFileMetadataWithIo(native_platform.debug_io, path);
 }
 
 fn statFileMetadataWithIo(io: std.Io, path: []const u8) !FileMetadata {
@@ -509,7 +511,7 @@ fn writeTestConfigAtomically(path: []const u8, contents: []const u8) !void {
     const alloc = std.testing.allocator;
     const next_path = try std.fmt.allocPrint(alloc, "{s}.next", .{path});
     defer alloc.free(next_path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     {
@@ -524,7 +526,7 @@ fn writeTestConfigAtomically(path: []const u8, contents: []const u8) !void {
 }
 
 fn writeTestConfigInPlacePreservingMtime(path: []const u8, contents: []const u8, mtime: std.Io.Timestamp) !void {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     {
@@ -540,7 +542,7 @@ fn writeTestConfigInPlacePreservingMtime(path: []const u8, contents: []const u8,
 
 test "remote content runtime publishes validated snapshots and retains readers" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/config.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -563,7 +565,7 @@ test "remote content runtime publishes validated snapshots and retains readers" 
         \\{"remote_content":{"default_s3":"archive","s3":{"archive":{"access_key_id":"access","secret_access_key":"secret"}}}}
     ;
     try std.testing.expectEqual(initial_metadata.size, @as(u64, @intCast(replacement.len)));
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = native_platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const initial_stat = try std.Io.Dir.cwd().statFile(io_impl.io(), path, .{});
     try writeTestConfigInPlacePreservingMtime(path, replacement, initial_stat.mtime);
@@ -598,27 +600,27 @@ test "remote content runtime publishes validated snapshots and retains readers" 
         }
     };
     var concurrent_reader = ConcurrentReader{ .facade = &facade };
-    var first_thread = try std.testing.io.concurrent(ConcurrentReader.run, .{&concurrent_reader});
+    var first_thread = try native_platform.testing.io.concurrent(ConcurrentReader.run, .{&concurrent_reader});
     defer {
         concurrent_reader.stop.store(true, .release);
-        first_thread.await(std.testing.io);
+        first_thread.await(native_platform.testing.io);
     }
-    var second_thread = try std.testing.io.concurrent(ConcurrentReader.run, .{&concurrent_reader});
+    var second_thread = try native_platform.testing.io.concurrent(ConcurrentReader.run, .{&concurrent_reader});
     defer {
         concurrent_reader.stop.store(true, .release);
-        second_thread.await(std.testing.io);
+        second_thread.await(native_platform.testing.io);
     }
-    while (concurrent_reader.reads.load(.acquire) < 20) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (concurrent_reader.reads.load(.acquire) < 20) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try writeTestConfigAtomically(path,
         \\{"remote_content":{"default_s3":"primary","s3":{"primary":{"access_key_id":"access","secret_access_key":"secret"}}}}
     );
     try std.testing.expect(runtime.refreshIfChanged());
     var published_again = facade.acquire();
     published_again.deinit();
-    while (concurrent_reader.reads.load(.acquire) < 40) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (concurrent_reader.reads.load(.acquire) < 40) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     concurrent_reader.stop.store(true, .release);
-    first_thread.await(std.testing.io);
-    second_thread.await(std.testing.io);
+    first_thread.await(native_platform.testing.io);
+    second_thread.await(native_platform.testing.io);
     try std.testing.expect(!concurrent_reader.invalid.load(.acquire));
 
     try writeTestConfigAtomically(path, "{not-json");
@@ -634,7 +636,7 @@ test "remote content runtime publishes validated snapshots and retains readers" 
 
 test "remote content runtime rejects incomplete and startup-only replacements" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/config.json", .{tmp.sub_path});
     defer alloc.free(path);

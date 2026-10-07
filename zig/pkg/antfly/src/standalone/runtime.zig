@@ -16,14 +16,15 @@
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
 const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const hot_standby_wal = @import("../storage/wal_runtime.zig");
 const inference_provider = @import("inference_provider.zig");
 const lease_executor = @import("lease_executor.zig");
 const builtin = @import("builtin");
-const platform_sync = @import("antfly_platform").sync;
-const platform_clock = @import("antfly_platform").clock;
+const platform_sync = platform.sync;
+const platform_clock = platform.clock;
 const httpx = @import("httpx");
 const antfly = @import("runtime_root.zig");
 const group_ids = @import("antfly_local_sources").common_group_ids;
@@ -31,7 +32,7 @@ const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 const preload_model_spec = @import("../common/preload_model_spec.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("antfly_inference_bridge");
 const inference_connection_abi = @import("antfly_local_sources").inference_connection_abi;
@@ -988,7 +989,7 @@ const LocalStandaloneMetadata = struct {
             };
             self.lifecycle_store = lifecycle;
             if (try lifecycle.getMetadataIncarnation(group_ids.main_metadata_group_id) == null) {
-                const incarnation = try @import("antfly_local_sources").metadata_incarnation.generate(backend_runtime.io() orelse std.Options.debug_io);
+                const incarnation = try @import("antfly_local_sources").metadata_incarnation.generate(backend_runtime.io() orelse native_platform.debug_io);
                 try lifecycle.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .initialize_metadata_incarnation = incarnation });
             }
             self.metadata_incarnation = try lifecycle.getMetadataIncarnation(group_ids.main_metadata_group_id);
@@ -3942,7 +3943,7 @@ const LocalStandaloneMetadata = struct {
             break :blk try self.alloc.dupe(u8, value);
         } else readFileAlloc(
             self.alloc,
-            self.backend_runtime.io() orelse std.Options.debug_io,
+            self.backend_runtime.io() orelse native_platform.debug_io,
             self.catalog_path,
             64 * 1024 * 1024,
         ) catch |err| switch (err) {
@@ -4434,7 +4435,7 @@ pub fn runFromIterator(
     defer termination_signals.deinit();
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
-    var setup_io = std.Io.Threaded.init(alloc, .{});
+    var setup_io = platform.Threaded.init(alloc, .{});
     defer setup_io.deinit();
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
@@ -5500,7 +5501,7 @@ pub fn runFromIterator(
         cli.control_tick_ms,
     ) catch return error.InvalidArguments;
     const tick_ms = @divExact(runtime_cadence.control_tick_ns, std.time.ns_per_ms);
-    var req = std.posix.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(tick_ms / std.time.ms_per_s),
         .nsec = @intCast((tick_ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
@@ -5522,7 +5523,7 @@ pub fn runFromIterator(
                 else => return supervisor.fail("standalone", "metadata-round", err),
             };
         }
-        const err = std.posix.errno(std.posix.system.nanosleep(&req, &req));
+        const err = std.posix.errno(platform.c.nanosleep(&req, &req));
         switch (err) {
             .SUCCESS => {},
             .INTR => continue,
@@ -5601,7 +5602,7 @@ pub fn runLite(
         owned_extra_count += 1;
         try argv.append(init.gpa, owned_extra[i].ptr);
     }
-    var args = @import("antfly_platform").process.argsIterator(argv.items);
+    var args = platform.process.argsIterator(argv.items);
     try runFromIterator(init, "antfly standalone", &args);
 }
 
@@ -7011,7 +7012,7 @@ fn configLocalBaseDirHintFromRaw(alloc: std.mem.Allocator, raw: []const u8) !?[]
 }
 
 fn configLocalBaseDirHintFromPath(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
@@ -7155,7 +7156,7 @@ fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 
 
     var probe = path;
     while (true) {
-        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, probe, alloc) catch |err| switch (err) {
+        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(native_platform.debug_io, probe, alloc) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -7874,17 +7875,17 @@ test "embedded provider lifetime rejects new calls and joins admitted calls" {
         }
     };
     var quiesce = Quiesce{ .lifetime = &lifetime };
-    var thread = try std.testing.io.concurrent(Quiesce.run, .{&quiesce});
+    var thread = try platform.testing.io.concurrent(Quiesce.run, .{&quiesce});
     defer {
         guard.deinit();
-        thread.await(std.testing.io);
+        thread.await(platform.testing.io);
     }
     while (lifetime.isAccepting()) std.atomic.spinLoopHint();
 
     try std.testing.expect(!quiesce.returned.load(.acquire));
     try std.testing.expectError(error.InferenceProviderShuttingDown, lifetime.acquire());
     guard.deinit();
-    thread.await(std.testing.io);
+    thread.await(platform.testing.io);
 
     try std.testing.expect(quiesce.returned.load(.acquire));
     try std.testing.expectEqual(@as(usize, 0), lifetime.activeCallCount());
@@ -8667,7 +8668,7 @@ test "standalone Lite enforces one shard and one replica" {
 
 test "standalone table storage defaults persist without migrating legacy tables" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -8718,7 +8719,7 @@ test "standalone table storage defaults persist without migrating legacy tables"
 
 test "standalone Lite adoption preserves deterministic embedded document identity" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/identity-adoption.aflite", .{tmp.sub_path});
     defer alloc.free(path);
@@ -8878,8 +8879,8 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
     var fake = FakeReader{ .first_ptr = png[0..].ptr, .second_ptr = jpeg[0..].ptr };
     var state = inference_host.LinkedInferenceState{
         .alloc = alloc,
-        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io).receive(),
-        .io = std.testing.io,
+        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&platform.testing.io).receive(),
+        .io = platform.testing.io,
         .node = undefined, // The model-free override must not enter Node.
         .warm_models = undefined,
         .content_security = null,
@@ -9010,8 +9011,8 @@ test "standalone raster reader ABI preserves borrowed strided pages and identity
     var fake = FakeReader{ .expected = .{ first[0..].ptr, second[0..].ptr } };
     var state = inference_host.LinkedInferenceState{
         .alloc = alloc,
-        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io).receive(),
-        .io = std.testing.io,
+        .executor = try @import("antfly_runtime_abi").io_abi.Borrow.init(&platform.testing.io).receive(),
+        .io = platform.testing.io,
         .node = undefined, // The model-free override must not enter Node.
         .warm_models = undefined,
         .content_security = null,
@@ -9148,7 +9149,7 @@ test "standalone continuous HA mutation guard follows role lifecycle" {
 
 test "standalone runtime parses experimental flag" {
     const argv = [_][*:0]const u8{"--experimental"};
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var parsed = try parseCli(std.testing.allocator, &iter);
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expect(parsed.experimental);
@@ -9181,7 +9182,7 @@ test "standalone inference middleware reuses public API authentication" {
             defer request.deinit();
             if (authorization) |value| try request.setHeader("authorization", value);
 
-            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+            var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
             defer ctx.deinit();
             var next_handler = httpx.Next{ ._call = next };
             var response = try middleware.invoke(&ctx, &next_handler);
@@ -9309,7 +9310,7 @@ test "standalone CORS middleware finalizes independently owned responses" {
         var request = try httpx.Request.init(alloc, .POST, "/db/v1/agents/retrieval");
         defer request.deinit();
         try request.setHeader("Origin", origin);
-        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var next = httpx.Next{ ._call = Harness.next };
         var response = try corsRequest(&route_context, &ctx, &next);
@@ -9351,7 +9352,7 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
             if (requested_method) |value| try request.setHeader("access-control-request-method", value);
             if (requested_headers) |value| try request.setHeader("access-control-request-headers", value);
 
-            var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+            var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
             defer ctx.deinit();
             var next_handler = httpx.Next{ ._call = next };
             var route_context = StandaloneHttpContext{ .api_server = null, .cors_config = config };
@@ -9569,8 +9570,8 @@ test "standalone runtime registers antfarm static routes" {
 
 test "standalone runtime antfarm assets support archive and prefix layouts outside cwd" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root);
@@ -9621,7 +9622,7 @@ test "standalone runtime antfarm path guards keep api routes reserved" {
 
 test "parse cli accepts config path" {
     var argv = [_][*:0]const u8{ "--config", "antfly.json" };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
@@ -9629,7 +9630,7 @@ test "parse cli accepts config path" {
 
 test "parse cli accepts secret store path" {
     var argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
@@ -9637,7 +9638,7 @@ test "parse cli accepts secret store path" {
 
 test "parse cli accepts extension package store path" {
     var argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
@@ -9654,7 +9655,7 @@ test "parse cli accepts ARD identity flags" {
         "--ard-public-catalog",
         "true",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
@@ -9678,7 +9679,7 @@ test "parse cli accepts canonical host port and models dir flags" {
         "--data-dir",
         "/tmp/antfly-data",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("127.0.0.1", cfg.bind_host.?);
@@ -9699,7 +9700,7 @@ test "parse cli preserves registry variants and recognizes explicit preload back
         "--preload-model",
         "generator:metal:owner/model:Q4_K_M",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
 
@@ -9743,7 +9744,7 @@ test "parse cli accepts HA primary runtime flags" {
         "--hot-standby-epoch",
         "4",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(hotStandbyPrimaryRequested(cfg));
@@ -9793,7 +9794,7 @@ test "parse cli accepts HA primary sync policy flags" {
         "--hot-standby-sync-failure",
         "fail-closed",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
 
@@ -9835,7 +9836,7 @@ test "parse cli treats ALL HA sync policy as all named standbys" {
         "--hot-standby-sync-standby",
         "standby-b",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
 
@@ -9875,7 +9876,7 @@ test "parse cli accepts HA primary retention policy flags" {
         "--hot-standby-retention-max-retained-age-ns",
         "1000000",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
 
@@ -9983,7 +9984,7 @@ test "parse cli accepts HA standby runtime flags" {
         "--hot-standby-epoch",
         "4",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try validateHotStandbyRole(cfg);
@@ -10115,12 +10116,12 @@ test "deprecated --ha-* flags remain aliases for --hot-standby-* flags" {
 
     inline for (pairs) |pair| {
         var canonical_argv = [_][*:0]const u8{ pair.canonical, pair.value };
-        var canonical_iter = @import("antfly_platform").process.argsIterator(canonical_argv[0..]);
+        var canonical_iter = platform.process.argsIterator(canonical_argv[0..]);
         var canonical_cfg = try parseCli(std.testing.allocator, &canonical_iter);
         defer canonical_cfg.deinit(std.testing.allocator);
 
         var legacy_argv = [_][*:0]const u8{ pair.legacy, pair.value };
-        var legacy_iter = @import("antfly_platform").process.argsIterator(legacy_argv[0..]);
+        var legacy_iter = platform.process.argsIterator(legacy_argv[0..]);
         var legacy_cfg = try parseCli(std.testing.allocator, &legacy_iter);
         defer legacy_cfg.deinit(std.testing.allocator);
 
@@ -10130,12 +10131,12 @@ test "deprecated --ha-* flags remain aliases for --hot-standby-* flags" {
     // hot_standby_sync_standby_names is list-appended rather than assigned, so it is
     // checked separately from the scalar/string table above.
     var canonical_sync_standby_argv = [_][*:0]const u8{ "--hot-standby-sync-standby", "standby-a" };
-    var canonical_sync_standby_iter = @import("antfly_platform").process.argsIterator(canonical_sync_standby_argv[0..]);
+    var canonical_sync_standby_iter = platform.process.argsIterator(canonical_sync_standby_argv[0..]);
     var canonical_sync_standby_cfg = try parseCli(std.testing.allocator, &canonical_sync_standby_iter);
     defer canonical_sync_standby_cfg.deinit(std.testing.allocator);
 
     var legacy_sync_standby_argv = [_][*:0]const u8{ "--ha-sync-standby", "standby-a" };
-    var legacy_sync_standby_iter = @import("antfly_platform").process.argsIterator(legacy_sync_standby_argv[0..]);
+    var legacy_sync_standby_iter = platform.process.argsIterator(legacy_sync_standby_argv[0..]);
     var legacy_sync_standby_cfg = try parseCli(std.testing.allocator, &legacy_sync_standby_iter);
     defer legacy_sync_standby_cfg.deinit(std.testing.allocator);
 
@@ -10559,9 +10560,9 @@ test "standalone HA runtime rejects ambiguous role flags" {
 
 test "standalone hot-standby startup migrates a legacy layout before opening local handles" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root: [:0]u8 = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root: [:0]u8 = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
 
     const writeFile = struct {
@@ -10569,15 +10570,15 @@ test "standalone hot-standby startup migrates a legacy layout before opening loc
             const a = std.testing.allocator;
             const path = try std.fs.path.join(a, &.{ dir_path, name });
             defer a.free(path);
-            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
-            var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
-            defer file.close(std.testing.io);
-            try file.writeStreamingAll(std.testing.io, body);
+            if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(platform.testing.io, parent);
+            var file = try std.Io.Dir.cwd().createFile(platform.testing.io, path, .{ .truncate = true });
+            defer file.close(platform.testing.io);
+            try file.writeStreamingAll(platform.testing.io, body);
         }
     }.call;
     const testPathExists = struct {
         fn call(path: []const u8) bool {
-            std.Io.Dir.cwd().access(std.testing.io, path, .{}) catch return false;
+            std.Io.Dir.cwd().access(platform.testing.io, path, .{}) catch return false;
             return true;
         }
     }.call;
@@ -10615,7 +10616,7 @@ test "standalone hot-standby startup migrates a legacy layout before opening loc
         .hot_standby_seed_capture_root = seed_capture_root,
     };
 
-    try migrateHotStandbyLegacyLayoutFromCli(alloc, std.testing.io, cli);
+    try migrateHotStandbyLegacyLayoutFromCli(alloc, platform.testing.io, cli);
 
     try std.testing.expect(!testPathExists(legacy));
     try std.testing.expect(testPathExists(primary_log));
@@ -10629,12 +10630,12 @@ test "standalone hot-standby startup migrates a legacy layout before opening loc
 
     // Calling again with an already-canonical tree is a no-op that must not
     // error, matching every later startup on this node.
-    try migrateHotStandbyLegacyLayoutFromCli(alloc, std.testing.io, cli);
+    try migrateHotStandbyLegacyLayoutFromCli(alloc, platform.testing.io, cli);
     try std.testing.expect(testPathExists(primary_log));
 }
 
 test "standalone hot-standby startup migration is a no-op with no hot-standby paths configured" {
-    try migrateHotStandbyLegacyLayoutFromCli(std.testing.allocator, std.testing.io, .{});
+    try migrateHotStandbyLegacyLayoutFromCli(std.testing.allocator, platform.testing.io, .{});
 }
 
 test "standalone HA runtime requires HA paths under resolved data root" {
@@ -10733,7 +10734,7 @@ test "standalone HA runtime requires HA paths under resolved data root" {
 
 test "standalone activated seed bootstraps exact standby checkpoint and rejects older progress" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const receive_path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/standby.wal", .{tmp.sub_path}, 0);
@@ -10840,7 +10841,7 @@ test "standalone rejects configured server TLS instead of serving plaintext" {
 
 test "standalone Lite transaction sessions survive file reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sessions.aflite", .{tmp.sub_path});
     defer alloc.free(path);
@@ -10933,7 +10934,7 @@ test "standalone public ready endpoint fails closed before API initialization" {
 
     var request = try httpx.Request.init(std.testing.allocator, .GET, "/readyz");
     defer request.deinit();
-    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try readyzHandler(&route_context, &ctx);
     defer response.deinit();
@@ -10960,7 +10961,7 @@ test "parse cli accepts inference budget overrides" {
         "--kernel-jit-mode",
         "required",
     };
-    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 4096), cfg.inference_host_budget_mb);
@@ -11291,7 +11292,7 @@ test "standalone runtime resolves extension package store env before local defau
 test "standalone default secret store follows projected symlink rotation" {
     const projection_test = @import("../common/secret_projection_test_support.zig");
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     // Cover both a symlinked secrets.json and a symlink in the base directory.
     for ([_]bool{ false, true }) |from_config| {
@@ -11372,7 +11373,7 @@ test "standalone runtime data dir overrides common storage base dir" {
 
 test "standalone shared catalog resumes private restore and publishes atomically" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone", .{tmp.sub_path});
     defer alloc.free(root);
@@ -11441,7 +11442,7 @@ test "standalone shared catalog resumes private restore and publishes atomically
 
 test "standalone shared restore worker imports a mixed dependency cohort without Raft" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-worker", .{tmp.sub_path});
     defer alloc.free(root);
@@ -11477,10 +11478,10 @@ test "standalone initial external MATCH PARTIAL FK cancellation retires private 
 fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     var preserve = false;
     defer if (!preserve) tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-initial-external", .{tmp.sub_path});
@@ -11561,8 +11562,8 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     var terminal = false;
     var last_step_error: ?anyerror = null;
     var last_reconcile: antfly.metadata.table_provisioner.ProvisionSummary = .{};
-    const deadline = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s;
-    while (@import("antfly_platform").time.monotonicNs() < deadline) {
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
         try LocalStandaloneMetadata.runRound(&metadata);
         last_reconcile = try reconcileStandaloneInitialFkVisible(&metadata, &server, alloc);
         try server.runControlRoundOnly();
@@ -11760,8 +11761,8 @@ fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     const child_lookup_uri = try std.fmt.allocPrint(alloc, "{s}/db/v1/tables/children/documents/valid-child", .{base});
     defer alloc.free(child_lookup_uri);
     var child_visible = false;
-    const read_deadline = @import("antfly_platform").time.monotonicNs() +| 10 * std.time.ns_per_s;
-    while (@import("antfly_platform").time.monotonicNs() < read_deadline) {
+    const read_deadline = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < read_deadline) {
         var lookup = try transport.execute(alloc, .{ .method = .GET, .uri = child_lookup_uri, .timeout_ms = 2_000 });
         defer lookup.deinit(alloc);
         if (lookup.status == 200) {
@@ -11811,7 +11812,7 @@ fn reconcileStandaloneInitialFkVisible(
     // The production startup catch-up worker and this explicit test drain
     // share the same per-group writer activity lock. Wait for that exact
     // transient exclusion; do not bypass it or retry structural failures.
-    const deadline = @import("antfly_platform").time.monotonicNs() +| 10 * std.time.ns_per_s;
+    const deadline = platform.time.monotonicNs() +| 10 * std.time.ns_per_s;
     while (true) {
         const result = runLocalReplicaRootReconcileHook(server, .{
             .metadata_group_id = group_id,
@@ -11819,8 +11820,8 @@ fn reconcileStandaloneInitialFkVisible(
             .tables = tables,
             .ranges = ranges,
         }) catch |err| {
-            if (err != error.WriterLocked or @import("antfly_platform").time.monotonicNs() >= deadline) return err;
-            try std.testing.io.sleep(.fromMilliseconds(20), .awake);
+            if (err != error.WriterLocked or platform.time.monotonicNs() >= deadline) return err;
+            try platform.testing.io.sleep(.fromMilliseconds(20), .awake);
             continue;
         };
         return result;
@@ -11835,10 +11836,10 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
     const control = antfly.public_api.relational_fk_generation_publication;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     var preserve = false;
     defer if (!preserve) tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-initial-self", .{tmp.sub_path});
@@ -12136,8 +12137,8 @@ fn nativeTruncateWait(alloc: std.mem.Allocator, metadata: *LocalStandaloneMetada
     var receipt = try std.json.parseFromSlice(struct { ddl_receipt: struct { restore_job_id: []const u8 } }, alloc, accepted.body, .{ .ignore_unknown_fields = true });
     defer receipt.deinit();
     const job_id = try std.fmt.parseUnsigned(u64, receipt.value.ddl_receipt.restore_job_id, 10);
-    const deadline = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s;
-    while (@import("antfly_platform").time.monotonicNs() < deadline) {
+    const deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
+    while (platform.time.monotonicNs() < deadline) {
         try LocalStandaloneMetadata.runRound(metadata);
         const bytes = (try server.restore_job_store.load(alloc, job_id)) orelse return error.TestUnexpectedResult;
         defer alloc.free(bytes);
@@ -12194,7 +12195,7 @@ fn nativeTruncateWait(alloc: std.mem.Allocator, metadata: *LocalStandaloneMetada
             _ = try reconcileStandaloneInitialFkVisible(metadata, data, alloc);
             return;
         }
-        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     const bytes = (try server.restore_job_store.load(alloc, job_id)) orelse return error.TestUnexpectedResult;
     defer alloc.free(bytes);
@@ -12209,15 +12210,15 @@ fn exerciseNativeTruncatePublishedOwners(alloc: std.mem.Allocator, metadata: *Lo
     // maintenance: old read schemas must finish their real migration before
     // a dependency-closed TRUNCATE can validate the current FK cohort.
     metadata.local_schema_progress_provider = localSchemaProgressProvider(data);
-    const schema_deadline = @import("antfly_platform").time.monotonicNs() +| 30 * std.time.ns_per_s;
+    const schema_deadline = platform.time.monotonicNs() +| 30 * std.time.ns_per_s;
     while (true) {
         _ = try reconcileStandaloneInitialFkVisible(metadata, data, alloc);
         try data.runControlRoundOnly();
         try LocalStandaloneMetadata.runRound(metadata);
         const current = (try metadata.resolveSystemCatalogLocked(.{ .table = "nodes" })) orelse return error.TestUnexpectedResult;
         if (current.read_schema_json.len == 0) break;
-        if (@import("antfly_platform").time.monotonicNs() >= schema_deadline) return error.NativeTruncateSchemaFinalizationTimeout;
-        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+        if (platform.time.monotonicNs() >= schema_deadline) return error.NativeTruncateSchemaFinalizationTimeout;
+        try platform.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     metadata.attachRestoreRetirementOwnership();
     try server.restore_job_store.attachReplicated(metadata.restorePersistence());
@@ -12253,7 +12254,7 @@ test "standalone canceled initial self FK retires exact private owners after res
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
     const control = antfly.public_api.relational_fk_generation_publication;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-initial-cancel", .{tmp.sub_path});
     defer alloc.free(root);
@@ -12455,7 +12456,7 @@ test "standalone canceled initial self FK retires exact private owners after res
 
 test "standalone shared canceled owner retirement resumes from exact metadata proof" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-cancel", .{tmp.sub_path});
     defer alloc.free(root);
@@ -12542,9 +12543,9 @@ test "standalone shared canceled owner retirement resumes from exact metadata pr
 
 test "standalone catalog remote apply outage preserves committed creation and retry authority" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/catalog.json", .{root});
     defer alloc.free(path);
@@ -12634,12 +12635,12 @@ test "standalone catalog remote apply outage preserves committed creation and re
 
 test "standalone metadata replay refreshes colliding revisions and only publishes complete effects" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", scratch);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", scratch);
     const log = try std.fmt.allocPrintSentinel(scratch, "{s}/primary-log", .{root}, 0);
     const slots = try std.fmt.allocPrintSentinel(scratch, "{s}/primary-slots", .{root}, 0);
     var primary = try antfly.hot_standby.primary.Primary.open(alloc, log, slots, .{ .cluster_id = 77, .timeline_id = 1, .epoch = 1 }, .{});
@@ -12728,9 +12729,9 @@ test "standalone metadata replay refreshes colliding revisions and only publishe
 
 test "standalone shared mutation refreshes a committed catalog before retry" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/catalog.json", .{root});
     defer alloc.free(path);
@@ -12755,9 +12756,9 @@ test "standalone shared mutation refreshes a committed catalog before retry" {
 
 test "standalone shared restore HA policy mirrors mixed publication and durable user job" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/catalog.json", .{root});
     defer alloc.free(path);
@@ -12773,7 +12774,7 @@ test "standalone shared restore HA policy mirrors mixed publication and durable 
     defer runtime.deinit();
     var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, runtime.ptr(), null, .local);
     defer metadata.deinit();
-    const baseline = try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(std.testing.io, checkpoint);
+    const baseline = try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(platform.testing.io, checkpoint);
     var barrier: antfly.db.MutationBarrier = .{};
     // Metadata and all restored DB owners publish into this one WAL.
     var transition_mutex: std.atomic.Mutex = .unlocked;
@@ -12789,7 +12790,7 @@ test "standalone shared restore HA policy mirrors mixed publication and durable 
     defer alloc.free(standby_root);
     var standby = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = standby_root });
     defer standby.deinit();
-    try standby.importHotStandbyCheckpoint(std.testing.io, checkpoint, baseline.size_bytes);
+    try standby.importHotStandbyCheckpoint(platform.testing.io, checkpoint, baseline.size_bytes);
     const entries = try primary.log.iterateFrom(alloc, 1);
     defer antfly.hot_standby.replication_log.freeEntries(alloc, entries);
     var metadata_records: usize = 0;
@@ -12818,9 +12819,9 @@ test "standalone shared public HA table backup and restore use one coordinated e
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", a);
     const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
     const log = try std.fmt.allocPrintSentinel(a, "{s}/primary-log", .{root}, 0);
     const slots = try std.fmt.allocPrintSentinel(a, "{s}/primary-slots", .{root}, 0);
@@ -12926,11 +12927,11 @@ test "standalone standby catalog create rejects before contended locks" {
 
 test "standalone metadata rolls back an undurable catalog mutation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-directory", .{tmp.sub_path});
     defer alloc.free(catalog_dir);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try ensureDirPath(io_impl.io(), catalog_dir);
 
@@ -12970,7 +12971,7 @@ test "system catalog standby create replays physical rows and logical binding du
     const alloc = std.testing.allocator;
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -13034,7 +13035,7 @@ test "standalone metadata advertises a linearizable owned snapshot" {
     const alloc = std.testing.allocator;
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
@@ -13087,7 +13088,7 @@ test "standalone metadata advertises a linearizable owned snapshot" {
 
 test "standalone schema mutation supports atomic merge patch and version CAS" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
@@ -13240,11 +13241,11 @@ test "standalone routing watch confirms absence before deadline and retries afte
 
 test "standalone metadata rejects corrupt catalog without double-freeing owned paths" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/corrupt-catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
-    try writeFileAtomically(alloc, std.Options.debug_io, catalog_path, "{not-json");
+    try writeFileAtomically(alloc, native_platform.debug_io, catalog_path, "{not-json");
 
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();
@@ -13268,7 +13269,7 @@ test "standalone metadata rejects corrupt catalog without double-freeing owned p
 
 test "standalone metadata finalizes schema migration from resident runtime evidence" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
@@ -13316,7 +13317,7 @@ test "standalone metadata finalizes schema migration from resident runtime evide
 
 test "standalone schema finalizer defers fenced tables independently and resumes from durable progress" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
@@ -13384,7 +13385,7 @@ test "standalone schema finalizer defers fenced tables independently and resumes
 
 test "standalone metadata finalizes schema migration through split shard adapter fallback" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
@@ -13477,7 +13478,7 @@ test "standalone metadata finalizes schema migration through split shard adapter
 }
 
 test "standalone unified server lifecycle propagates startup failure" {
-    var lifecycle = UnifiedServerLifecycle.init(std.testing.io);
+    var lifecycle = UnifiedServerLifecycle.init(platform.testing.io);
     lifecycle.publishFailure(error.AddressInUse);
     var cancellation = antfly.common.runtime_lifecycle.CancellationSource{};
     try std.testing.expectError(
@@ -13505,7 +13506,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
             .grace_ns = 10 * std.time.ns_per_s,
             .sentinel_path = "/tmp/lease-fenced",
         }, null, null),
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .executor = undefined,
         .uri = undefined,
         .token_path = "",
@@ -13544,7 +13545,7 @@ test "standalone metadata catalog source provides compact routing" {
 
 test "system catalog standalone join planning retains and replaces compact generations" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -13586,7 +13587,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
                 .grace_ns = 10 * std.time.ns_per_s,
                 .sentinel_path = "/tmp/lease-fenced",
             }, null, null),
-            .io = std.testing.io,
+            .io = platform.testing.io,
             .executor = undefined,
             .uri = undefined,
             .token_path = "",
@@ -13627,7 +13628,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
             .grace_ns = 10 * std.time.ns_per_s,
             .sentinel_path = "/tmp/lease-fenced",
         }, null, null),
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .executor = undefined,
         .uri = undefined,
         .token_path = "",
@@ -13670,7 +13671,7 @@ test "runtime lease watchdog prefers a DNS-verified Kubernetes API host and reta
 
 test "system catalog standalone checkpoint preserves bindings and rolls back undurable changes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -13718,13 +13719,13 @@ test "system catalog standalone checkpoint preserves bindings and rolls back und
     try std.testing.expect(seed.value.system_catalog != null);
     const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/seeded/catalog.json", .{tmp.sub_path});
     defer alloc.free(destination);
-    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(destination).?);
+    try fs_paths.createDirPathPortable(platform.testing.io, std.fs.path.dirname(destination).?);
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, destination, .{});
-        defer file.close(std.testing.io);
+        var file = try std.Io.Dir.cwd().createFile(platform.testing.io, destination, .{});
+        defer file.close(platform.testing.io);
         const encoded = try std.json.Stringify.valueAlloc(alloc, seed.value, .{ .emit_null_optional_fields = false });
         defer alloc.free(encoded);
-        try file.writeStreamingAll(std.testing.io, encoded);
+        try file.writeStreamingAll(platform.testing.io, encoded);
     }
     var seeded = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", destination, backend.ptr(), null, .local);
     defer seeded.deinit();
@@ -13744,7 +13745,7 @@ test "system catalog standalone checkpoint preserves bindings and rolls back und
 test "system catalog native authority writes bounded deltas and recovers logical bindings" {
     if (comptime control_only_storage_sources) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -13782,7 +13783,7 @@ test "system catalog native authority writes bounded deltas and recovers logical
 
 test "system catalog cancellation callbacks run outside the authority mutex" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -13823,7 +13824,7 @@ test "system catalog cancellation callbacks run outside the authority mutex" {
 test "standalone catalog journal preserves imported policy publication as fail closed" {
     if (comptime control_only_storage_sources) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/policy-catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -13880,7 +13881,7 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
     const alloc = std.testing.allocator;
     const policies = @import("antfly_local_sources").system_catalog_policies;
     const coordinator = @import("../api/row_policy_publication_coordinator.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-policy", .{tmp.sub_path});
     defer alloc.free(root);
@@ -13922,7 +13923,7 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
         .mutation = .{ .action = .set_tablespace, .kind = .table, .name = "policy_rows" },
     } });
     alloc.free(binding);
-    const baseline = if (use_hot_standby) try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(std.testing.io, checkpoint) else null;
+    const baseline = if (use_hot_standby) try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(platform.testing.io, checkpoint) else null;
     var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = root,
         .replica_catalog_path = path,
@@ -14031,7 +14032,7 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
         defer alloc.free(standby_root);
         var standby = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = standby_root });
         defer standby.deinit();
-        try standby.importHotStandbyCheckpoint(std.testing.io, checkpoint, baseline.?.size_bytes);
+        try standby.importHotStandbyCheckpoint(platform.testing.io, checkpoint, baseline.?.size_bytes);
         const owner_path = try std.fmt.allocPrint(alloc, "{s}/policy-standby-owner", .{root});
         defer alloc.free(owner_path);
         const range = metadata.manager.ranges.get(owner_group) orelse return error.UnknownGroup;
@@ -14158,7 +14159,7 @@ test "native HA policy publication replays metadata and owner phases and resumes
 test "system catalog imports released row journal once into native authority" {
     if (comptime control_only_storage_sources) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14202,7 +14203,7 @@ test "system catalog imports released row journal once into native authority" {
 test "system catalog standalone setting publication survives native restart and failed mutation rolls back" {
     if (comptime control_only_storage_sources) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/settings-catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14249,7 +14250,7 @@ test "system catalog standalone setting publication survives native restart and 
 
 test "system catalog borrowed journal writes bounded deltas and recovers an ambiguous sync" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14326,7 +14327,7 @@ test "system catalog borrowed journal writes bounded deltas and recovers an ambi
 
 test "system catalog standalone routing generation retains old identity through publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14352,7 +14353,7 @@ test "system catalog standalone routing generation retains old identity through 
 
 test "system catalog standalone imports main checkpoints and current logical seeds atomically" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer runtime.deinit();
@@ -14442,7 +14443,7 @@ test "system catalog standalone imports main checkpoints and current logical see
 
 test "system catalog standalone ordered pages own captured data across rename drop and restart" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ordered.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14531,7 +14532,7 @@ test "standalone fills ha flags from the config ha section without overriding fl
 
 test "system catalog offline migration publishes rows and fences server startup" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});
     defer alloc.free(path);
@@ -14546,7 +14547,7 @@ test "system catalog offline migration publishes rows and fences server startup"
     }
     const Offline = @import("offline_catalog.zig").Catalog;
     {
-        var catalog = try Offline.open(alloc, std.testing.io, path);
+        var catalog = try Offline.open(alloc, platform.testing.io, path);
         defer catalog.deinit();
         const table = &catalog.document.value.object.getPtr("tables").?.array.items[0];
         const a = catalog.document.arena.allocator();
@@ -14556,7 +14557,7 @@ test "system catalog offline migration publishes rows and fences server startup"
     }
     try std.testing.expectError(error.VectorMigrationOfflineAdmission, LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), null, .local));
     {
-        var catalog = try Offline.open(alloc, std.testing.io, path);
+        var catalog = try Offline.open(alloc, platform.testing.io, path);
         defer catalog.deinit();
         const table = &catalog.document.value.object.getPtr("tables").?.array.items[0];
         _ = table.object.swapRemove("storage_migration");

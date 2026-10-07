@@ -1032,7 +1032,7 @@ fn runServerChat(allocator: std.mem.Allocator, io: std.Io, opts: Options, server
     const resolved_ref = registry_mod.resolveFriendlyRef(opts.model) orelse opts.model;
     const model_name = resolved_ref;
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var http = httpx.Client.init(allocator, io_impl.io());
     defer http.deinit();
@@ -1304,11 +1304,11 @@ test "parseArgs parses model, flags, and rejects unknown options" {
 test "prompt cache is rejected before local or server chat starts" {
     try std.testing.expectError(
         error.InvalidArguments,
-        main(std.testing.allocator, std.testing.io, &.{ "owner/model", "--prompt-cache" }),
+        main(std.testing.allocator, platform.testing.io, &.{ "owner/model", "--prompt-cache" }),
     );
     try std.testing.expectError(
         error.InvalidArguments,
-        main(std.testing.allocator, std.testing.io, &.{ "owner/model", "--server", "http://127.0.0.1:1", "--prompt-cache" }),
+        main(std.testing.allocator, platform.testing.io, &.{ "owner/model", "--server", "http://127.0.0.1:1", "--prompt-cache" }),
     );
 }
 
@@ -1343,7 +1343,7 @@ test "server request carries backend and sampling options" {
 
 test "server request cancellation interrupts a blocked response" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     chat_interrupt.store(false, .release);
     defer chat_interrupt.store(false, .release);
 

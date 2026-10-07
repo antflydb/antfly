@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const leader_runtime = @import("leader_runtime.zig");
 const read_state_observer_mod = @import("antfly_read_state_observer");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
@@ -100,7 +102,7 @@ pub const SimulatedExecutor = struct {
 
 pub const ThreadedExecutor = struct {
     alloc: std.mem.Allocator,
-    threaded: std.Io.Threaded,
+    threaded: native_platform.Threaded,
     active_groups: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) ThreadedExecutor {

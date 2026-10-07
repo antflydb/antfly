@@ -85,8 +85,8 @@ pub const ManualClock = struct {
 };
 
 fn realNowRealtimeNs(_: ?*anyopaque) u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+    var ts: @import("root.zig").c.timespec = undefined;
+    switch (std.posix.errno(@import("root.zig").c.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => {},
         else => unreachable,
     }
@@ -94,7 +94,7 @@ fn realNowRealtimeNs(_: ?*anyopaque) u64 {
 }
 
 fn realSleepMs(_: ?*anyopaque, ms: u64) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = @import("root.zig").Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const sleep_ms = if (ms == 0) @as(u64, 1) else ms;
     std.Io.Clock.Duration.sleep(.{

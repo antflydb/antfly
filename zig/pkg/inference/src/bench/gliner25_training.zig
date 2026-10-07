@@ -15,7 +15,9 @@
 
 //! Diagnostic worker over the production trainer. Snapshots are explicitly
 //! outside measured steps; no alternative optimizer or training graph lives here.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const inference = @import("inference_internal");
 const native = inference.finetune.gliner_boundary_native_trainer;
 const sources = inference.finetune.gliner_boundary_training_source;
@@ -30,8 +32,8 @@ comptime {
 }
 const Command = struct { request_id: u32, op: enum { validate, run, stop }, case_id: []const u8 = "" };
 fn now() !u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return error.ClockUnavailable;
+    var ts: native_platform.c.timespec = undefined;
+    if (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return error.ClockUnavailable;
     return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
 }
 fn emit(a: Allocator, out: *std.Io.Writer, value: anytype) !void {

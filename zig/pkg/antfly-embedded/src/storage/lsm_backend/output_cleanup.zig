@@ -17,9 +17,11 @@
 //! allocation-free queue transfer, never filesystem I/O from a destructor.
 //! The backend transfers queued paths to its durable obsolete ledger before
 //! freeing tickets; failed admission leaves the original ownership intact.
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const resources = @import("../resource_manager.zig");
-const sync = @import("antfly_platform").sync;
+const sync = native_platform.sync;
 
 pub const Queue = struct {
     allocator: std.mem.Allocator,
@@ -28,7 +30,7 @@ pub const Queue = struct {
     tail: ?*Ticket = null,
     pending: std.atomic.Value(usize) = .init(0),
     live: std.atomic.Value(usize) = .init(0),
-    bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    bytes: native_platform.atomic.Value(u64) = .init(0),
     manager: ?*resources.ResourceManager = null,
     wake_context: ?*anyopaque = null,
     wake_fn: ?*const fn (*anyopaque) void = null,
@@ -311,9 +313,9 @@ test "output cleanup off-lock handoff scaling benchmark" {
             outputs.appendAssumeCapacity(.{ .id = i + 1, .level = 0, .size_bytes = 1, .path = @constCast("unpublished.sst"), .smallest_namespace_name = null, .smallest_key = &.{}, .largest_namespace_name = null, .largest_key = &.{}, .entry_count = 1, .bloom_filter = null, .state = null, .owns_metadata = false, .output_ticket = ticket });
         }
         try std.testing.expect(backend.mu.tryLock());
-        const start = std.Io.Clock.awake.now(std.testing.io);
+        const start = std.Io.Clock.awake.now(native_platform.testing.io);
         compaction.discardOutputRunsLocked(Backend, &backend, &outputs);
-        const elapsed = start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+        const elapsed = start.durationTo(std.Io.Clock.awake.now(native_platform.testing.io)).toNanoseconds();
         backend.mu.unlock();
         const queue = backend.options.unpublished_outputs.?;
         try std.testing.expectEqual(count, queue.pending.load(.acquire));

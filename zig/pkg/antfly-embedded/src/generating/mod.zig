@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const chatgpt_manager = @import("../chatgpt/manager.zig");
 const chatgpt_responses = @import("../chatgpt/responses.zig");
 const httpx = @import("httpx");
@@ -26,7 +28,7 @@ const antfly_provider = @import("antfly_inference_local");
 const vertex_provider = @import("antfly_inference_vertex");
 const common_secrets = @import("../common/secrets.zig");
 const execution_context = @import("antfly_inference_execution_context");
-const platform_time = @import("antfly_platform").time;
+const platform_time = native_platform.time;
 const provider_limits = @import("../common/provider_limits.zig");
 const credential_identity = @import("../common/credential_source_identity.zig");
 const provider_defaults = @import("antfly_inference_provider_defaults");
@@ -64,11 +66,11 @@ test "embedded canonical generation preserves tool definitions returned calls an
             );
         }
     };
-    var client = httpx.Client.initWithConfig(std.testing.allocator, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(std.testing.allocator, native_platform.testing.io, .{});
     defer client.deinit();
     var factory = BackendFactory.initWithOptions(std.testing.allocator, &client, .{
         .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .generate_json = Fake.generate },
-        .request_context = .{ .io = std.testing.io, .deadline_ns = null },
+        .request_context = .{ .io = native_platform.testing.io, .deadline_ns = null },
     });
     var cfg = GeneratorConfig.fromAntfly(.{ .model = "gemma", .url = "" });
     cfg.tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"search\",\"parameters\":{\"type\":\"object\"}}}]";
@@ -84,10 +86,10 @@ pub const parseConfigFromValue = lib.parseConfigFromValue;
 
 test "Apple generation backend bypasses HTTP quotas and honors request deadlines" {
     const alloc = std.testing.allocator;
-    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(alloc, native_platform.testing.io, .{});
     defer client.deinit();
     var factory = BackendFactory.initWithOptions(alloc, &client, .{
-        .request_context = .{ .io = std.testing.io, .deadline_ns = 1 },
+        .request_context = .{ .io = native_platform.testing.io, .deadline_ns = 1 },
     });
     const cfg = GeneratorConfig{ .provider = .apple, .model = "", .url = "" };
     if (!lib.apple_native.enabled) {
@@ -498,7 +500,7 @@ const BackendState = struct {
                 if (self.cfg.tools_json != null or self.cfg.tool_choice_json != null) return error.UnsupportedGeneratorProvider;
                 const options = try inference.GenerationOptions.fromMaxTokens(self.cfg.max_tokens);
                 const linked_context = self.request_context orelse self.execution.requestContext(
-                    self.execution.io orelse self.io orelse std.Io.Threaded.global_single_threaded.io(),
+                    self.execution.io orelse self.io orelse native_platform.Threaded.global_single_threaded.io(),
                 );
                 if (local.generate_messages_with_context) |generate_messages| {
                     const content = try managed_embedder.AntflyProviderBoundary.call(
@@ -686,7 +688,7 @@ test "generating backend enforces shared policies and token budgets before dispa
     const alloc = std.testing.allocator;
     var limits = provider_limits.Registry.init(alloc);
     defer limits.deinit();
-    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(alloc, native_platform.testing.io, .{});
     defer client.deinit();
     var factory = BackendFactory.initWithOptions(alloc, &client, .{ .limits = &limits });
     var cfg = GeneratorConfig.fromOpenAI(.{ .model = "quota-test", .url = "http://127.0.0.1:1" });
@@ -706,7 +708,7 @@ test "generating backend enforces shared policies and token budgets before dispa
 
 test "generating backend factory executes fallback chain across providers" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -776,7 +778,7 @@ test "generating backend factory executes fallback chain across providers" {
 
 test "generating backend routes antfly and url-less antfly to local provider" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -890,7 +892,7 @@ test "generating backend routes antfly and url-less antfly to local provider" {
 
 test "generating backend passes multimodal messages to local provider callback" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -987,7 +989,7 @@ test "generating backend passes multimodal messages to local provider callback" 
 
 test "generating antfly backend treats missing default api key env as optional" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1147,11 +1149,11 @@ test "generating backend batch preserves cancellation alongside quota policy" {
     const alloc = std.testing.allocator;
     var limits = provider_limits.Registry.init(alloc);
     defer limits.deinit();
-    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(alloc, native_platform.testing.io, .{});
     defer client.deinit();
     var cfg = GeneratorConfig.fromAntfly(.{ .model = "budget", .url = "http://127.0.0.1:1" });
     cfg.rate_limit = .{ .requests_per_minute = 1 };
-    var context = RequestContext{ .io = std.testing.io, .deadline_ns = 0 };
+    var context = RequestContext{ .io = native_platform.testing.io, .deadline_ns = 0 };
     try std.testing.expectError(error.Timeout, generateAntflyTextBatchResponse(alloc, &client, cfg, .{
         .limits = &limits,
         .request_context = context,
@@ -1169,7 +1171,7 @@ test "generating backend batch reserves all output caps before dispatch" {
     const alloc = std.testing.allocator;
     var limits = provider_limits.Registry.init(alloc);
     defer limits.deinit();
-    var client = httpx.Client.initWithConfig(alloc, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(alloc, native_platform.testing.io, .{});
     defer client.deinit();
     var cfg = GeneratorConfig.fromAntfly(.{ .model = "budget", .url = "http://127.0.0.1:1" });
     cfg.max_tokens = 100;
@@ -1183,7 +1185,7 @@ test "generating backend batch reserves all output caps before dispatch" {
 
 test "generating backend batch shares single-request quotas and credentials" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     var limits = provider_limits.Registry.init(alloc);
     defer limits.deinit();
     const Check = struct {
@@ -1283,7 +1285,7 @@ fn appendBatchFloatField(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
 
 test "generating backend sends OpenAI completion options and preserves compatible providers" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const Check = struct {
         fn modern(req: httpx.testing_mod.RequestInfo) !void {
             const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
@@ -1370,7 +1372,7 @@ test "generating backend quota charges the completion budget including reasoning
 test "generating backend tools complete agent conversations across all remote adapters" {
     const agent_tools = @import("antfly_server_test_sources").local_test_sources.api_agent_tools;
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const Check = struct {
         fn request(req: httpx.testing_mod.RequestInfo) !void {
             const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, req.body, .{});
@@ -1465,14 +1467,14 @@ test "generating backend tools complete agent conversations across all remote ad
 
 test "chatgpt disabled factory rejects inference without upstream work" {
     const a = std.testing.allocator;
-    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    var client = httpx.Client.initWithConfig(a, native_platform.testing.io, .{});
     defer client.deinit();
     try std.testing.expectError(error.ChatGPTDisabled, executeChainWithOptions(a, &client, &.{.{ .generator = .{ .provider = .chatgpt, .connection_id = "one", .model = "model", .url = "" } }}, .{}, &.{}));
 }
 
 test "generating backend defaults OpenAI and OpenRouter credentials from the store" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/test-generator-defaults-{d}.json", .{std.Io.Clock.awake.now(io).nanoseconds});
     defer alloc.free(path);
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};

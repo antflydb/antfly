@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -327,9 +329,9 @@ pub fn pathAlloc(alloc: std.mem.Allocator, snapshot_dir: []const u8, index: u64,
 }
 
 test "raft snapshot payload envelope validates identity length and checksum" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const snapshot_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
@@ -384,9 +386,9 @@ test "raft snapshot payload publication rejects an artifact length contract viol
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const snapshot_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/artifact-length", .{tmp.sub_path});
@@ -406,9 +408,9 @@ test "raft snapshot payload publication rejects an artifact length contract viol
 }
 
 test "raft snapshot payload cleanup retains only the durable identity" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const snapshot_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});

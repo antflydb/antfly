@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const db_mod = @import("mod.zig");
 const records = @import("relational_index_records.zig");
 const rows = @import("relational_rows.zig");
@@ -34,7 +36,7 @@ fn ready(db: *db_mod.DB) !void {
 fn scan(db: *db_mod.DB, request: rows.Request) !rows.Page {
     var reader = try db.beginRelationalRows(alloc, request);
     defer reader.deinit();
-    return reader.nextPage(alloc, std.testing.io, .{ .rows = 4096, .records = 4096, .time_ns = std.time.ns_per_s });
+    return reader.nextPage(alloc, native_platform.testing.io, .{ .rows = 4096, .records = 4096, .time_ns = std.time.ns_per_s });
 }
 
 test "relational index system covering preserves row metadata, updates included values and falls back for authorization" {
@@ -126,7 +128,7 @@ test "relational index system covering corruption fails closed and bounded owner
 fn prepareCoverAllocationFailure(test_alloc: std.mem.Allocator) !void {
     const registry = @import("schema_registry.zig");
     const plans = @import("relational_index_plan.zig");
-    var schemas = try registry.Registry.initCloned(test_alloc, std.testing.io, .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+    var schemas = try registry.Registry.initCloned(test_alloc, native_platform.testing.io, .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
         .{ .name = "id", .path = "id", .column_type = .integer },
         .{ .name = "label", .path = "label", .column_type = .string },
     } });

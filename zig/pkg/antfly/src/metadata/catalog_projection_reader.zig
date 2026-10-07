@@ -13,9 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
+
+const platform_clock = native_platform.clock;
+const platform_time = native_platform.time;
 const metadata_api = @import("api.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const metadata_storage = @import("storage/raft_apply_store.zig");
@@ -201,11 +203,11 @@ pub const CatalogProjectionReader = struct {
     }
 
     pub fn lock(self: *CatalogProjectionReader) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
+        self.mutex.lockUncancelable(native_platform.debug_io);
     }
 
     pub fn unlock(self: *CatalogProjectionReader) void {
-        self.mutex.unlock(std.Options.debug_io);
+        self.mutex.unlock(native_platform.debug_io);
     }
 
     pub fn lockUntil(self: *CatalogProjectionReader, deadline_ns: ?u64) bool {
@@ -390,7 +392,7 @@ pub const CatalogProjectionReader = struct {
         std.debug.assert(self.build_flight == flight);
         self.build_flight = null;
         flight.failure = failure;
-        flight.ready.set(std.Options.debug_io);
+        flight.ready.set(native_platform.debug_io);
         self.unlock();
 
         if (old) |snapshot| snapshot.release();
@@ -407,7 +409,7 @@ pub const CatalogProjectionReader = struct {
         std.debug.assert(self.build_flight == flight);
         self.build_flight = null;
         flight.failure = failure;
-        flight.ready.set(std.Options.debug_io);
+        flight.ready.set(native_platform.debug_io);
         self.unlock();
         flight.release();
     }
@@ -674,13 +676,13 @@ fn deadlineExpired(deadline_ns: ?u64) bool {
 
 fn waitForBuildFlight(flight: *CatalogProjectionReader.BuildFlight, deadline_ns: ?u64) !void {
     const deadline = deadline_ns orelse {
-        flight.ready.waitUncancelable(std.Options.debug_io);
+        flight.ready.waitUncancelable(native_platform.debug_io);
         return;
     };
     while (!flight.ready.isSet()) {
         const now = platform_time.monotonicNs();
         if (now >= deadline) return error.CatalogRoutingSnapshotTimeout;
-        flight.ready.waitTimeout(std.Options.debug_io, .{
+        flight.ready.waitTimeout(native_platform.debug_io, .{
             .duration = .{
                 .raw = std.Io.Duration.fromNanoseconds(@intCast(deadline - now)),
                 .clock = .awake,
@@ -957,8 +959,8 @@ test "catalog projection cache coalesces concurrent refreshes outside its mutex"
         ) !metadata_storage.CatalogProjectionSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.captures.fetchAdd(1, .acq_rel);
-            self.entered.set(std.Options.debug_io);
-            self.proceed.waitUncancelable(std.Options.debug_io);
+            self.entered.set(native_platform.debug_io);
+            self.proceed.waitUncancelable(native_platform.debug_io);
             return .{ .metadata_incarnation = null, .catalog_revision = 1, .tables = &.{}, .ranges = &.{} };
         }
     };
@@ -981,16 +983,16 @@ test "catalog projection cache coalesces concurrent refreshes outside its mutex"
     defer reader.deinit(std.testing.allocator);
     var first = Worker{ .reader = &reader, .source = fake.source() };
     var second = Worker{ .reader = &reader, .source = fake.source() };
-    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
+    var first_thread = try native_platform.testing.io.concurrent(Worker.run, .{&first});
     defer {
-        fake.proceed.set(std.Options.debug_io);
-        first_thread.await(std.testing.io);
+        fake.proceed.set(native_platform.debug_io);
+        first_thread.await(native_platform.testing.io);
     }
-    fake.entered.waitUncancelable(std.Options.debug_io);
-    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
+    fake.entered.waitUncancelable(native_platform.debug_io);
+    var second_thread = try native_platform.testing.io.concurrent(Worker.run, .{&second});
     defer {
-        fake.proceed.set(std.Options.debug_io);
-        second_thread.await(std.testing.io);
+        fake.proceed.set(native_platform.debug_io);
+        second_thread.await(native_platform.testing.io);
     }
 
     const waiter_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
@@ -1002,9 +1004,9 @@ test "catalog projection cache coalesces concurrent refreshes outside its mutex"
         if (platform_time.monotonicNs() >= waiter_deadline) return error.TestUnexpectedResult;
         platform_clock.Clock.real().sleepMs(1);
     }
-    fake.proceed.set(std.Options.debug_io);
-    first_thread.await(std.testing.io);
-    second_thread.await(std.testing.io);
+    fake.proceed.set(native_platform.debug_io);
+    first_thread.await(native_platform.testing.io);
+    second_thread.await(native_platform.testing.io);
 
     try std.testing.expect(first.failure == null);
     try std.testing.expect(second.failure == null);
@@ -1041,8 +1043,8 @@ test "catalog projection waiter retries a shorter builder timeout" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const ordinal = self.captures.fetchAdd(1, .acq_rel);
             if (ordinal == 0) {
-                self.first_entered.set(std.Options.debug_io);
-                self.release_first.waitUncancelable(std.Options.debug_io);
+                self.first_entered.set(native_platform.debug_io);
+                self.release_first.waitUncancelable(native_platform.debug_io);
             }
             return .{ .metadata_incarnation = null, .catalog_revision = 1, .tables = &.{}, .ranges = &.{} };
         }
@@ -1072,12 +1074,12 @@ test "catalog projection waiter retries a shorter builder timeout" {
         .source = fake.source(),
         .timeout_ns = std.time.ns_per_s,
     };
-    var short_thread = try std.testing.io.concurrent(Worker.run, .{&short});
+    var short_thread = try native_platform.testing.io.concurrent(Worker.run, .{&short});
     defer {
-        fake.release_first.set(std.Options.debug_io);
-        short_thread.await(std.testing.io);
+        fake.release_first.set(native_platform.debug_io);
+        short_thread.await(native_platform.testing.io);
     }
-    try fake.first_entered.waitTimeout(std.Options.debug_io, .{
+    try fake.first_entered.waitTimeout(native_platform.debug_io, .{
         .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
     });
     var patient = Worker{
@@ -1085,10 +1087,10 @@ test "catalog projection waiter retries a shorter builder timeout" {
         .source = fake.source(),
         .timeout_ns = 5 * std.time.ns_per_s,
     };
-    var patient_thread = try std.testing.io.concurrent(Worker.run, .{&patient});
+    var patient_thread = try native_platform.testing.io.concurrent(Worker.run, .{&patient});
     defer {
-        fake.release_first.set(std.Options.debug_io);
-        patient_thread.await(std.testing.io);
+        fake.release_first.set(native_platform.debug_io);
+        patient_thread.await(native_platform.testing.io);
     }
 
     const waiter_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
@@ -1103,9 +1105,9 @@ test "catalog projection waiter retries a shorter builder timeout" {
     while (platform_time.monotonicNs() < short.deadline_ns) {
         platform_clock.Clock.real().sleepMs(1);
     }
-    fake.release_first.set(std.Options.debug_io);
-    short_thread.await(std.testing.io);
-    patient_thread.await(std.testing.io);
+    fake.release_first.set(native_platform.debug_io);
+    short_thread.await(native_platform.testing.io);
+    patient_thread.await(native_platform.testing.io);
 
     try std.testing.expectEqualStrings("CatalogRoutingSnapshotTimeout", @errorName(short.failure.?));
     try std.testing.expect(patient.failure == null);
@@ -1139,8 +1141,8 @@ test "catalog projection timeout does not publish a late build" {
             _: ?u64,
         ) !metadata_storage.CatalogProjectionSnapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.entered.set(std.Options.debug_io);
-            self.proceed.waitUncancelable(std.Options.debug_io);
+            self.entered.set(native_platform.debug_io);
+            self.proceed.waitUncancelable(native_platform.debug_io);
             return .{ .metadata_incarnation = null, .catalog_revision = 1, .tables = &.{}, .ranges = &.{} };
         }
     };
@@ -1169,21 +1171,21 @@ test "catalog projection timeout does not publish a late build" {
         .reader = &reader,
         .source = fake.source(),
     };
-    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var thread = try native_platform.testing.io.concurrent(Worker.run, .{&worker});
     defer {
-        fake.proceed.set(std.Options.debug_io);
-        thread.await(std.testing.io);
+        fake.proceed.set(native_platform.debug_io);
+        thread.await(native_platform.testing.io);
     }
     // A worker that exits before capture must fail the test instead of
     // leaving the harness blocked on an event that can never be signaled.
-    try fake.entered.waitTimeout(std.Options.debug_io, .{
+    try fake.entered.waitTimeout(native_platform.debug_io, .{
         .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
     });
     while (platform_time.monotonicNs() < worker.deadline_ns) {
         platform_clock.Clock.real().sleepMs(1);
     }
-    fake.proceed.set(std.Options.debug_io);
-    thread.await(std.testing.io);
+    fake.proceed.set(native_platform.debug_io);
+    thread.await(native_platform.testing.io);
 
     try std.testing.expect(worker.failure != null);
     try std.testing.expectEqualStrings("CatalogRoutingSnapshotTimeout", @errorName(worker.failure.?));
@@ -1240,7 +1242,7 @@ test "catalog retained WAL replay preserves durable metadata while applied water
             return self.store.captureCatalogProjection(allocator, group, deadline_ns);
         }
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retained-catalog", .{tmp.sub_path});
     defer alloc.free(root);

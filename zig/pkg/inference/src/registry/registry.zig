@@ -15,7 +15,9 @@
 
 // Model registry: discovers local models and downloads from HuggingFace Hub.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const ascii_compat = @import("../util/ascii_compat.zig");
 const Io = std.Io;
 const Dir = Io.Dir;
@@ -822,8 +824,8 @@ pub const ModelRegistry = struct {
     }
 
     fn monotonicNowNs() i128 {
-        var ts: std.posix.timespec = undefined;
-        return switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+        var ts: native_platform.c.timespec = undefined;
+        return switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &ts))) {
             .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
             else => 0,
         };
@@ -987,8 +989,8 @@ fn resolvedEntryKind(dir: Dir, io: Io, entry: Dir.Entry) !std.Io.File.Kind {
 }
 
 test "registry resolves unknown directory entry kinds" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "model");
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "model" });
@@ -1177,7 +1179,7 @@ fn isKnownDecideSource(source: managed_receipt.DownloadSource) bool {
 }
 
 fn isKnownDecideStagingSource(allocator: std.mem.Allocator, dest_dir: []const u8) !bool {
-    var plan = try managed_receipt.loadValidatedPlan(allocator, std.Options.debug_io, dest_dir);
+    var plan = try managed_receipt.loadValidatedPlan(allocator, native_platform.debug_io, dest_dir);
     defer plan.deinit();
     const source = plan.parsed.value.source orelse return false;
     return isKnownDecideSource(source);
@@ -1776,9 +1778,9 @@ test "format duration uses seconds then minutes" {
 
 test "discover skips empty owner subdirectories and keeps multistage readers" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "readers/monkt/paddleocr-onnx");
@@ -1818,9 +1820,9 @@ test "discover skips empty owner subdirectories and keeps multistage readers" {
 
 test "shallow discovery cleans up every allocation failure" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "owner/model-a");
     try tmp.dir.writeFile(io, .{ .sub_path = "owner/model-a/config.json", .data = "{}" });
@@ -1833,7 +1835,7 @@ test "shallow discovery cleans up every allocation failure" {
     const Runner = struct {
         fn run(alloc: std.mem.Allocator, root: []const u8) !void {
             var registry = ModelRegistry.init(alloc, root);
-            const models = try registry.discoverShallow(std.testing.io);
+            const models = try registry.discoverShallow(native_platform.testing.io);
             defer {
                 for (models) |model| {
                     alloc.free(model.name);
@@ -1843,14 +1845,14 @@ test "shallow discovery cleans up every allocation failure" {
             }
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{models_dir});
+    try native_platform.allocator.checkAllAllocationFailures(allocator, Runner.run, .{models_dir});
 }
 
 test "model discovery rejects incomplete or invalid managed downloads" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/owner/model");
@@ -1887,8 +1889,8 @@ test "model discovery rejects incomplete or invalid managed downloads" {
 
 test "pull manifest synthesis operates on private staging and remains receipted" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "staging" });
@@ -1918,8 +1920,8 @@ test "pull manifest synthesis operates on private staging and remains receipted"
 
 test "pull upgrades a large Laya manifest without tasks and preserves metadata" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "staging" });
     defer allocator.free(model_dir);
@@ -1985,8 +1987,8 @@ test "decision task augmentation keeps existing manifest tasks" {
 
 test "managed discovery recognizes receipted nested payloads" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "model/artifacts");
     try tmp.dir.writeFile(io, .{ .sub_path = "model/artifacts/model.gguf", .data = "decoder" });
@@ -2001,8 +2003,8 @@ test "managed discovery recognizes receipted nested payloads" {
 
 test "managed discovery preserves distinct receipt request names for coexisting variants" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/owner/model--antfly-0123456789abcdef");
@@ -2067,9 +2069,9 @@ test "managed discovery preserves distinct receipt request names for coexisting 
 
 test "synthesized pulled manifest marks splade embedders as sparse" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/sparse-encoder-testing/splade-bert-tiny-nq-onnx/onnx");
@@ -2101,9 +2103,9 @@ test "synthesized pulled manifest marks splade embedders as sparse" {
 
 test "synthesized pulled manifest accepts plural task directory hints" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/florence-reader");
@@ -2126,9 +2128,9 @@ test "synthesized pulled manifest accepts plural task directory hints" {
 
 test "synthesized pulled manifest records a vad task as an audio classifier" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/silero-vad/onnx");
@@ -2152,9 +2154,9 @@ test "synthesized pulled manifest records a vad task as an audio classifier" {
 
 test "synthesized pulled manifest keeps generate read gguf as generator" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/google/gemma-4-E4B-it-qat-q4_0-gguf");
@@ -2181,9 +2183,9 @@ test "synthesized pulled manifest keeps generate read gguf as generator" {
 
 test "synthesized pulled manifest infers a multimodal decoder GGUF as generator" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/ggml-org/gemma-4-E4B-it-GGUF");
@@ -2234,9 +2236,9 @@ test "synthesized pulled manifest infers a multimodal decoder GGUF as generator"
 
 test "synthesized pulled manifest treats rerank-named sequence classifiers as rerankers" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/mixedbread-ai/mxbai-rerank-base-v1/onnx");
@@ -2261,9 +2263,9 @@ test "synthesized pulled manifest treats rerank-named sequence classifiers as re
 
 test "synthesized pulled manifest preserves explicit sparse capability" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/plain-embedder/onnx");
@@ -2287,9 +2289,9 @@ test "synthesized pulled manifest preserves explicit sparse capability" {
 
 test "synthesized pulled manifest does not infer sparse from path name alone" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/not-really-splade/onnx");
@@ -2386,14 +2388,14 @@ test "resolveVariant preserves allocation failure" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(
         error.OutOfMemory,
-        resolveVariant(failing.allocator(), std.testing.io, "/models", "acme/model"),
+        resolveVariant(failing.allocator(), native_platform.testing.io, "/models", "acme/model"),
     );
 }
 
 test "resolveVariant treats a missing model directory as no match" {
     try std.testing.expect(try resolveVariant(
         std.testing.allocator,
-        std.testing.io,
+        native_platform.testing.io,
         "/definitely-not-an-antfly-model-directory",
         "acme/model",
     ) == null);
@@ -2455,9 +2457,9 @@ test "explicit model variants use distinct stable install directories" {
 
 test "resolveVariant ignores opaque managed variant install hashes" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "models/owner/model--antfly-0123456789abcdef");
 
@@ -2468,9 +2470,9 @@ test "resolveVariant ignores opaque managed variant install hashes" {
 
 test "resolveVariant retains legacy suffix resolution" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = native_platform.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "models/owner/model-q4_0");
 
@@ -2487,8 +2489,8 @@ test "resolveVariant retains legacy suffix resolution" {
 
 test "pull preserves the pinned Qwen3 BF16 executable profile through manifest finalization" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = native_platform.testing.io;
+    var tmp = native_platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const model_dir = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "staging" });
     defer alloc.free(model_dir);

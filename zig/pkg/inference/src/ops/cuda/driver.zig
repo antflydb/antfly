@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const CUresult = c_int;
@@ -96,7 +97,7 @@ pub const Error = error{
 };
 
 pub const CudaDriver = struct {
-    lib: std.DynLib,
+    lib: native_platform.DynLib,
     fns: Table,
 
     pub const Table = struct {
@@ -158,7 +159,7 @@ pub const CudaDriver = struct {
     };
 
     pub fn open() Error!CudaDriver {
-        var lib = std.DynLib.open("libcuda.so.1") catch return error.CudaUnavailable;
+        var lib = native_platform.DynLib.open("libcuda.so.1") catch return error.CudaUnavailable;
         errdefer lib.close();
         return .{
             .lib = lib,
@@ -238,17 +239,17 @@ pub const CudaDriver = struct {
     }
 };
 
-fn lookup(lib: *std.DynLib, comptime T: type, name: [:0]const u8) Error!T {
+fn lookup(lib: *native_platform.DynLib, comptime T: type, name: [:0]const u8) Error!T {
     return lib.lookup(T, name) orelse error.CudaSymbolMissing;
 }
 
-fn lookupOptional(lib: *std.DynLib, comptime T: type, name: [:0]const u8) ?T {
+fn lookupOptional(lib: *native_platform.DynLib, comptime T: type, name: [:0]const u8) ?T {
     return lib.lookup(T, name);
 }
 
 // Some CUDA 12 drivers expose the unversioned dlsym entry with the legacy
 // four-argument ABI. Prefer the explicit three-argument symbol we bind here.
-fn lookupGraphExecUpdate(lib: *std.DynLib) ?CUgraphExecUpdateFn {
+fn lookupGraphExecUpdate(lib: *native_platform.DynLib) ?CUgraphExecUpdateFn {
     return lookupOptional(lib, CUgraphExecUpdateFn, "cuGraphExecUpdate_v2") orelse
         lookupOptional(lib, CUgraphExecUpdateFn, "cuGraphExecUpdate");
 }

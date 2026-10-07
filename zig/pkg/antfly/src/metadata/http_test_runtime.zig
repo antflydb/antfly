@@ -15,20 +15,22 @@
 
 //! Real `httpx` transport ownership for integration and simulation tests.
 
+const native_platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const metadata_http_server = @import("http_server.zig");
 
 pub const Runtime = struct {
     alloc: std.mem.Allocator,
-    owned_io: ?*std.Io.Threaded,
+    owned_io: ?*native_platform.Threaded,
     server: *httpx.Server,
     listener_task: *httpx.ListenerTask,
 
     pub fn startOwned(alloc: std.mem.Allocator, admin: *metadata_http_server.MetadataHttpServer) !Runtime {
-        const io_impl = try alloc.create(std.Io.Threaded);
+        const io_impl = try alloc.create(native_platform.Threaded);
         errdefer alloc.destroy(io_impl);
-        io_impl.* = std.Io.Threaded.init(alloc, .{});
+        io_impl.* = native_platform.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
         var runtime = try startShared(alloc, io_impl.io(), admin);
         runtime.owned_io = io_impl;

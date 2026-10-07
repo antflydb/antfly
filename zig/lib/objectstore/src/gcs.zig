@@ -26,7 +26,7 @@ const google_auth = @import("antfly_google").auth;
 const Allocator = std.mem.Allocator;
 
 test "standalone objectstore wires Google credential identity dependencies" {
-    var manager = google_auth.CredentialManager.init(std.testing.allocator, std.testing.io);
+    var manager = google_auth.CredentialManager.init(std.testing.allocator, platform.testing.io);
     defer manager.deinit();
     try std.testing.expectError(
         error.MissingGoogleCredentials,
@@ -146,13 +146,13 @@ const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []c
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: ?*std.Io.Threaded,
+    io_impl: ?*platform.Threaded,
     client: httpx.Client,
 
     fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
-        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
-            const owned = try alloc.create(std.Io.Threaded);
-            owned.* = std.Io.Threaded.init(alloc, .{});
+        const io_impl: ?*platform.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(platform.Threaded);
+            owned.* = platform.Threaded.init(alloc, .{});
             break :blk owned;
         } else null;
         errdefer if (io_impl) |owned| {
@@ -249,7 +249,7 @@ fn transportResponseAlloc(
 
 test "gcs http transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
-    var shared = std.Io.Threaded.init(alloc, .{});
+    var shared = platform.Threaded.init(alloc, .{});
     defer shared.deinit();
     var transport = try HttpxTransport.init(alloc, null, shared.io());
     defer transport.deinit();
@@ -1148,7 +1148,7 @@ pub fn localGrpcReferencePathAlloc(alloc: Allocator) !?[]u8 {
     }
 
     for (candidates) |root| {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
 
@@ -1593,7 +1593,7 @@ test "gcs transport response construction cleans up every allocation failure" {
 
 test "gcs file upload completes a resumable lifecycle with bounded chunks" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const source_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-gcs-resumable-{d}", .{test_support.integrationNonce()});
     defer alloc.free(source_path);
     defer std.Io.Dir.deleteFileAbsolute(io, source_path) catch {};
