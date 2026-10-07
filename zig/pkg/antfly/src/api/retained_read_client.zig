@@ -13,14 +13,16 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const rpc = @import("retained_read_rpc.zig");
 const registry = @import("../storage/retained_read_registry.zig");
 const reads = @import("antfly_local_sources").api_table_read_source;
 const types = @import("antfly_local_sources").storage_db_types;
 const metadata = @import("../metadata/api.zig");
 const http = @import("antfly_local_sources").common_http_http_common;
-const time = @import("antfly_platform").time;
+const time = platform.time;
 
 /// Owns endpoint and catalog capability bytes. Executor must be a stable
 /// server-owned authenticated transport, never a stack-built hosted adapter.
@@ -274,7 +276,7 @@ fn consumerTests() type {
             };
             var fixture: Fixture = .{};
             const alloc = std.testing.allocator;
-            const client = try Client.create(alloc, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "a/b", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
+            const client = try Client.create(alloc, .{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&platform.testing.io), .vtable = &.{ .execute = Fixture.execute } }, "http://peer", "a/b", .{ .metadata_group_id = 1, .catalog_revision = 1, .table_id = 2, .topology_epoch = 4, .route = .{ .group_id = 3, .range_id = 3, .identity_namespace = .{ .table_id = 2, .shard_id = 3, .range_id = 3 } } }, 5, null);
             defer client.destroy();
             client.token = .{ .incarnation = 1, .sequence = 1, .slot = 0 };
             try std.testing.expect(std.mem.endsWith(u8, client.uri, "/tables/a%2Fb/retained-read"));
@@ -346,10 +348,10 @@ fn consumerTests() type {
                 }
             };
             const alloc = std.testing.allocator;
-            var lifetime = try registry.Registry.init(alloc, std.testing.io, 1, 8, 8, 30 * std.time.ns_per_s);
+            var lifetime = try registry.Registry.init(alloc, platform.testing.io, 1, 8, 8, 30 * std.time.ns_per_s);
             defer lifetime.deinit();
             var fixture: Fixture = .{ .registry_owner = &lifetime };
-            const executor = http.RequestExecutor{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io), .vtable = &.{ .execute = Fixture.execute } };
+            const executor = http.RequestExecutor{ .ptr = &fixture, .clock_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&platform.testing.io), .vtable = &.{ .execute = Fixture.execute } };
             const fence = (try Client.capture(alloc, executor, "http://peer", "rows", Fixture.route, 5, null)).?;
             const view = try fence.open(alloc, "", "", .{ .relational_query = .{ .fields = &.{ "n", "j" } }, .sql_document_preimage = true, .include_content_hashes = true, .include_range_proofs = true });
             try fence.validate();

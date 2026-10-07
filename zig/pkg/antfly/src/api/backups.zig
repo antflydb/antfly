@@ -13,9 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const ant_json = @import("antfly-json");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const group_ids = @import("antfly_local_sources").common_group_ids;
@@ -1451,7 +1453,7 @@ pub const RepositoryLocationBackend = struct {
 
 test "canonical repository file adapter streams blobs and compare-and-swaps refs" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repository", .{tmp.sub_path});
     defer alloc.free(root);
@@ -1461,7 +1463,7 @@ test "canonical repository file adapter streams blobs and compare-and-swaps refs
     defer alloc.free(restored_path);
     try writeFileAbsolute(source_path, "shared immutable bytes");
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var location: BackupLocation = .{ .file = try alloc.dupe(u8, root) };
     defer location.deinit(alloc);
@@ -2125,8 +2127,8 @@ test "restore filesystem scope containment handles filesystem roots and componen
 test "filesystem backup location returns the canonical authorized identity" {
     if (std.fs.path.sep != '/') return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
@@ -2184,7 +2186,7 @@ pub const readManifestFromLocation = @import("antfly_local_sources").api_local_b
 pub const readManifestFromLocationWithArtifactBackupId = @import("antfly_local_sources").api_local_backups.readManifestFromLocationWithArtifactBackupId;
 
 pub fn manifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return manifestExistsAtLocationWithIo(alloc, io_impl.io(), location, backup_id);
 }
@@ -9531,7 +9533,7 @@ pub fn writeClusterManifestToLocation(
     location: *BackupLocation,
     manifest: *const ClusterBackupManifest,
 ) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return writeClusterManifestToLocationWithIo(alloc, io_impl.io(), location, manifest);
 }
@@ -9883,7 +9885,7 @@ fn goTableMetadataLocationParts(location: []const u8) !GoTableMetadataLocationPa
 }
 
 pub fn clusterManifestExistsAtLocation(alloc: std.mem.Allocator, location: *BackupLocation, backup_id: []const u8) !bool {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return clusterManifestExistsAtLocationWithIo(alloc, io_impl.io(), location, backup_id);
 }
@@ -10924,7 +10926,7 @@ fn backupInfoFromManifest(alloc: std.mem.Allocator, manifest: *const ClusterBack
 
 pub fn listClusterBackups(alloc: std.mem.Allocator, backup_root: []const u8, location: []const u8, options: BackupListOptions) !BackupListPage {
     try validateBackupListOptions(options);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var dir = std.Io.Dir.cwd().openDir(io, backup_root, .{ .iterate = true }) catch |err| switch (err) {
@@ -11526,7 +11528,7 @@ pub fn copyFileToLocationUsingIoWithCancellation(
     // The explicit I/O authority is for the local source, not transport.
     try cancellation.check();
     try validateArtifactRelativePath(snapshot_path);
-    var io_impl: ?std.Io.Threaded = if (filesystem_io == null) std.Io.Threaded.init(alloc, .{}) else null;
+    var io_impl: ?platform.Io.Threaded = if (filesystem_io == null) platform.Io.Threaded.init(alloc, .{}) else null;
     defer if (io_impl) |*owned| owned.deinit();
     const source_io = filesystem_io orelse io_impl.?.io();
     switch (location.*) {
@@ -11902,7 +11904,7 @@ const readFileAbsoluteAlloc = @import("antfly_local_sources").api_local_backups.
 const readFileAbsoluteAllocWithIo = @import("antfly_local_sources").api_local_backups.readFileAbsoluteAllocWithIo;
 
 fn pathExists(path: []const u8) !bool {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return pathExistsWithIo(io_impl.io(), path);
 }
@@ -11924,7 +11926,7 @@ fn copyFileAbsoluteWithDurability(
     dest_path: []const u8,
     durability: CopyDurability,
 ) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try copyFileAbsoluteWithIoOptions(io, src_path, dest_path, durability);
@@ -11946,9 +11948,9 @@ const stringifyJsonAlloc = @import("antfly_local_sources").api_local_backups.str
 
 test "native artifact copy observes cancellation between io chunks" {
     const alloc = std.testing.allocator;
-    var source_tmp = std.testing.tmpDir(.{});
+    var source_tmp = platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
-    var destination_tmp = std.testing.tmpDir(.{});
+    var destination_tmp = platform.testing.tmpDir(.{});
     defer destination_tmp.cleanup();
     const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{source_tmp.sub_path});
     defer alloc.free(source);
@@ -11956,10 +11958,10 @@ test "native artifact copy observes cancellation between io chunks" {
     defer alloc.free(destination);
     const source_file = try std.fmt.allocPrint(alloc, "{s}/large.bin", .{source});
     defer alloc.free(source_file);
-    var file = try fs_paths.createFilePortable(std.testing.io, source_file, .{ .truncate = true });
-    defer file.close(std.testing.io);
+    var file = try fs_paths.createFilePortable(platform.testing.io, source_file, .{ .truncate = true });
+    defer file.close(platform.testing.io);
     var writer_buffer: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &writer_buffer);
+    var writer = file.writer(platform.testing.io, &writer_buffer);
     const zeros = @as([(256 * 1024)]u8, @splat(0));
     for (0..4) |_| try writer.interface.writeAll(&zeros);
     try writer.end();
@@ -11977,7 +11979,7 @@ test "native artifact copy observes cancellation between io chunks" {
         error.Canceled,
         copyNativeDirectoryWithIntegrityUsingIo(
             alloc,
-            std.testing.io,
+            platform.testing.io,
             source,
             destination,
             .{ .ptr = &state, .is_cancelled_fn = CancelAfter.isCancelled },
@@ -12141,7 +12143,7 @@ fn currentTimestampRfc3339(alloc: std.mem.Allocator) ![]u8 {
 }
 
 test "backup manifest round trips through metadata path" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-manifest", .{tmp.sub_path});
@@ -12189,7 +12191,7 @@ test "backup manifest round trips through metadata path" {
 }
 
 test "cluster backup manifest round trips extension metadata" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/cluster-backup-manifest", .{tmp.sub_path});
@@ -12325,19 +12327,19 @@ test "backup location parsing requires absolute file uri" {
 
 test "authorized filesystem location returns canonical ancestor for no-follow traversal" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDir(std.testing.io, "canonical", .default_dir);
-    try tmp.dir.symLink(std.testing.io, "canonical", "alias", .{ .is_directory = true });
+    try tmp.dir.createDir(platform.testing.io, "canonical", .default_dir);
+    try tmp.dir.symLink(platform.testing.io, "canonical", "alias", .{ .is_directory = true });
 
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const alias_location = try std.fmt.allocPrint(alloc, "file://{s}/alias/new-backup", .{root});
     defer alloc.free(alias_location);
     const expected = try std.fmt.allocPrint(alloc, "{s}/canonical/new-backup", .{root});
     defer alloc.free(expected);
 
-    const resolved = try resolveFilesystemLocationAlloc(alloc, "/", alias_location, std.testing.io);
+    const resolved = try resolveFilesystemLocationAlloc(alloc, "/", alias_location, platform.testing.io);
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings(expected, resolved);
 }
@@ -12488,7 +12490,7 @@ test "current Go portable metadata envelope materializes into a verified Zig man
     var reparsed = try parseTableBackupManifest(alloc, current, manifest.backup_id);
     reparsed.deinit(alloc);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -12554,7 +12556,7 @@ test "current Go portable cluster envelope resolves table metadata ids" {
     try std.testing.expectEqualStrings("table-a", table_manifest.backup_id);
     try std.testing.expectEqualStrings("go-cluster-1.afb", table_manifest.shards[0].snapshot_path);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -12709,7 +12711,7 @@ test "remote backup key joins canonicalize only the prefix boundary" {
 
 test "remote portable file transfer uses objectstore file paths" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/object-store", .{tmp.sub_path});
     defer alloc.free(root);
@@ -12717,7 +12719,7 @@ test "remote portable file transfer uses objectstore file paths" {
     defer alloc.free(source_path);
     const restored_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restored.afb", .{tmp.sub_path});
     defer alloc.free(restored_path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     std.Io.Dir.cwd().deleteTree(io, root) catch {};
@@ -12749,7 +12751,7 @@ test "remote portable file transfer uses objectstore file paths" {
 test "remote backup directory download paginates and enforces segment prefix" {
     const alloc = std.testing.allocator;
     const dest_root = ".zig-cache/test-paginated-backup-download";
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     std.Io.Dir.cwd().deleteTree(io, dest_root) catch {};
@@ -12906,7 +12908,7 @@ test "cluster backup list uses top-level remote manifests without recursing into
 
 test "incomplete cluster backup attempts do not hide committed backups" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -13381,7 +13383,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol agai
         }
 
         fn nonce() u64 {
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             return @intCast(std.Io.Timestamp.now(io_impl.io(), .awake).toNanoseconds());
         }
@@ -13539,7 +13541,7 @@ test "cluster backup list canonicalizes trailing prefix through s3 protocol agai
 }
 
 test "remote backup reservations fence duplicate execution and can be released after cleanup" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(std.testing.allocator);
@@ -13560,7 +13562,7 @@ test "remote backup reservations fence duplicate execution and can be released a
 
 test "cluster repository reservation serializes distinct backup ids and owners" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -13615,7 +13617,7 @@ test "cluster repository reservation serializes distinct backup ids and owners" 
 
 test "attempt head ordering ignores producer wall clocks and journal scans" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -13687,7 +13689,7 @@ test "attempt head ordering ignores producer wall clocks and journal scans" {
 
 test "attempt head generation detects publication and retirement ABA" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -13750,10 +13752,10 @@ test "attempt head generation detects publication and retirement ABA" {
 
 test "newest attempt exact verification detects corruption and receipts revalidate identity" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrity", .{tmp.sub_path});
     defer alloc.free(root);
@@ -13898,7 +13900,7 @@ test "newest attempt exact verification detects corruption and receipts revalida
 
 test "unpublished remote cleanup preserves a conflicting manifest" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -13937,7 +13939,7 @@ test "unpublished remote cleanup preserves a conflicting manifest" {
 
 test "forwarded backup envelope retirement preserves canonical payload" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -13961,7 +13963,7 @@ test "forwarded backup envelope retirement preserves canonical payload" {
 
 test "table backup reservation durably binds logical and artifact ids" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14067,7 +14069,7 @@ test "table backup reservation durably binds logical and artifact ids" {
 
 test "stale table reclaim reports a concurrently replaced generation" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14140,7 +14142,7 @@ test "stale table reclaim reports a concurrently replaced generation" {
 
 test "stale table reclaim honors cancellation before storage mutation" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14193,7 +14195,7 @@ test "stale table reclaim honors cancellation before storage mutation" {
 
 test "table backup collision commit check is bounded and exact" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14234,7 +14236,7 @@ test "table backup collision commit check is bounded and exact" {
 
 test "table backup writer lease fences cleanup until the storage owner expires" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14296,7 +14298,7 @@ test "table backup writer lease fences cleanup until the storage owner expires" 
 
 test "standalone table backup stale reclamation fences delayed writers" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14339,7 +14341,7 @@ test "standalone table backup stale reclamation fences delayed writers" {
 
 test "deadline-fenced stale table cleanup retires its generation tombstone" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14383,7 +14385,7 @@ test "deadline-fenced stale table cleanup retires its generation tombstone" {
 
 test "unpublished table cleanup retains its retry address until writer state retires" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14457,7 +14459,7 @@ test "unpublished table cleanup retains its retry address until writer state ret
 
 test "unpublished table cleanup preserves its reservation on writer owner mismatch" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14518,7 +14520,7 @@ test "unpublished table cleanup preserves its reservation on writer owner mismat
 
 test "unpublished table cleanup exposes bounded resumable progress" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14595,7 +14597,7 @@ test "unpublished table cleanup exposes bounded resumable progress" {
 
 test "standalone stale reclaim bounds foreground native artifact deletion" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14662,7 +14664,7 @@ test "standalone stale reclaim bounds foreground native artifact deletion" {
 
 test "standalone table backup stale reclamation preserves committed manifests and legacy missing leases" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14704,7 +14706,7 @@ test "standalone table backup stale reclamation preserves committed manifests an
 
 test "committed table reconciliation retires writer state but preserves forwarded envelopes" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14763,7 +14765,7 @@ test "committed table reconciliation retires writer state but preserves forwarde
 
 test "committed cluster writer reconciliation charges actual remote operations" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14821,7 +14823,7 @@ test "committed cluster writer reconciliation charges actual remote operations" 
 
 test "cluster writer lease reclamation persists bounded scan progress" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14901,7 +14903,7 @@ test "cluster writer lease reclamation persists bounded scan progress" {
 
 test "legacy cluster attempts without writer fencing are retained" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -14942,7 +14944,7 @@ test "legacy cluster attempts without writer fencing are retained" {
 
 test "remote cluster artifact cleanup advances within a strict operation budget" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -15064,7 +15066,7 @@ test "remote cluster artifact cleanup advances within a strict operation budget"
 
 test "table backup cleanup removes the forwarded artifact envelope before payload" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -15134,7 +15136,7 @@ test "cluster backup attempt markers reject overlapping cleanup identities" {
 
 test "stale owned cluster backup attempt retains generation fences and retires authoritative head" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -15224,7 +15226,7 @@ test "stale owned cluster backup attempt retains generation fences and retires a
 
 test "deadline-fenced cluster cleanup retires table writer tombstones" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -15285,7 +15287,7 @@ test "deadline-fenced cluster cleanup retires table writer tombstones" {
 
 test "expired recovery preserves an oversized remote commit record" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -15341,7 +15343,7 @@ test "expired recovery preserves an oversized remote commit record" {
 
 test "cluster backup reservation heartbeat fences premature and stale recovery" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -15433,10 +15435,10 @@ test "cluster backup reservation heartbeat fences premature and stale recovery" 
 
 test "filesystem reservation publication shares the cleanup claim lock" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -15517,10 +15519,10 @@ test "filesystem reservation publication shares the cleanup claim lock" {
 
 test "filesystem publication lock wait observes cancellation promptly" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -15571,10 +15573,10 @@ test "filesystem publication lock wait observes cancellation promptly" {
 
 test "backup root publication cancellation leaves no visible control record" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -15613,10 +15615,10 @@ test "backup root publication cancellation leaves no visible control record" {
 
 test "filesystem cluster backup lease supports the maximum owner identity" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -15654,7 +15656,7 @@ test "filesystem cluster backup lease supports the maximum owner identity" {
 
 test "cluster cleanup lease supports the maximum public attempt identity" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -15704,7 +15706,7 @@ test "cluster cleanup lease supports the maximum public attempt identity" {
 
 test "legacy cleanup prefix remains a valid public attempt identity" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -15747,10 +15749,10 @@ test "legacy cleanup prefix remains a valid public attempt identity" {
 
 test "filesystem artifact cleanup stops at its operation budget and resumes" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bounded-cleanup", .{tmp.sub_path});
     defer alloc.free(root);
@@ -15793,10 +15795,10 @@ test "filesystem artifact cleanup stops at its operation budget and resumes" {
 
 test "filesystem artifact cleanup unlinks symlinks without traversing their targets" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/symlink-cleanup", .{tmp.sub_path});
     defer alloc.free(root);
@@ -15832,10 +15834,10 @@ test "filesystem artifact cleanup unlinks symlinks without traversing their targ
 
 test "filesystem artifact cleanup refuses a symlinked repository ancestor" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const parent = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ancestor-cleanup", .{tmp.sub_path});
     defer alloc.free(parent);
@@ -15881,10 +15883,10 @@ test "filesystem artifact cleanup refuses a symlinked repository ancestor" {
 
 test "filesystem control cleanup refuses a symlinked repository ancestor" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const parent = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/control-ancestor", .{tmp.sub_path});
     defer alloc.free(parent);
@@ -16116,10 +16118,10 @@ test "filesystem control cleanup refuses a symlinked repository ancestor" {
 
 test "filesystem attempt maintenance refuses a symlinked reclaim shard" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -16178,10 +16180,10 @@ test "filesystem attempt maintenance refuses a symlinked reclaim shard" {
 test "filesystem reclaim removes invalid POSIX tickets containing backslashes" {
     if (std.fs.path.sep != '/') return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -16230,10 +16232,10 @@ test "filesystem reclaim removes invalid POSIX tickets containing backslashes" {
 
 test "local reclaim stays bound to its opened repository after a root swap" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -16395,10 +16397,10 @@ test "local reclaim stays bound to its opened repository after a root swap" {
 
 test "filesystem artifact cleanup rejects adversarial depth within a fixed traversal bound" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/deep-cleanup", .{tmp.sub_path});
     defer alloc.free(root);
@@ -16429,7 +16431,7 @@ test "filesystem artifact cleanup rejects adversarial depth within a fixed trave
 
 test "stale committed marker retires when the authoritative head is unchanged" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -16537,7 +16539,7 @@ test "stale committed marker retires when the authoritative head is unchanged" {
 
 test "committed cluster reconciliation quarantines a different marker generation" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -16690,10 +16692,10 @@ test "committed cluster reconciliation quarantines a different marker generation
 
 test "filesystem stale attempt reclamation index prevents directory-order starvation" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -16761,10 +16763,10 @@ test "filesystem stale attempt reclamation index prevents directory-order starva
 
 test "filesystem completed attempt tickets are deleted instead of durably rotated" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -16871,10 +16873,10 @@ test "filesystem completed attempt tickets are deleted instead of durably rotate
 
 test "filesystem attempt publication tolerates concurrent bounded maintenance" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -17010,10 +17012,10 @@ test "filesystem attempt publication tolerates concurrent bounded maintenance" {
 
 test "filesystem attempt maintenance removes only stale staged tickets" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -17088,10 +17090,10 @@ test "filesystem stale attempt reclamation recovers an abandoned claim" {
         1 + backup_attempt_reclaim_claim_timeout_ns +
             backup_attempt_lease_clock_skew_allowance_ns,
     ));
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -17173,7 +17175,7 @@ test "filesystem stale attempt reclamation recovers an abandoned claim" {
 
 test "remote stale attempt reclamation cursor prevents prefix starvation" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -17453,7 +17455,7 @@ test "legacy quarantine equivalence rejects a borrowed marker digest" {
 
 test "stale cluster backup attempt preserves aggregate referenced artifacts" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -17542,7 +17544,7 @@ test "stale cluster backup attempt preserves aggregate referenced artifacts" {
 
 test "filesystem backup listing is bounded and cursor stable" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-list", .{tmp.sub_path});
     defer alloc.free(root);
@@ -17582,10 +17584,10 @@ test "filesystem backup listing is bounded and cursor stable" {
 
 test "native backup directory copy preserves nested files" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -17695,7 +17697,7 @@ test "native backup directory copy preserves nested files" {
         ),
     };
     defer remote_location.deinit(alloc);
-    try remote_location.remote.uploadDirectoryRecursive(alloc, std.testing.io, src, expected.snapshot_path, .none);
+    try remote_location.remote.uploadDirectoryRecursive(alloc, platform.testing.io, src, expected.snapshot_path, .none);
     const remote_verified_top_path = try std.fmt.allocPrint(alloc, "{s}/verified/remote-top.sst", .{root});
     defer alloc.free(remote_verified_top_path);
     try copyFileFromLocationVerifiedUsingIo(
@@ -17741,10 +17743,10 @@ test "native backup directory copy preserves nested files" {
 
 test "native artifact verification consistently rejects empty directories" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const empty = try std.fmt.allocPrint(
         alloc,
@@ -17767,10 +17769,10 @@ test "native artifact verification consistently rejects empty directories" {
 
 test "native verification receipt rejects membership changes after exact pass" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -17985,7 +17987,7 @@ test "backup manifest validation rejects ambiguous or unbound artifacts" {
 
 test "portable backup integrity rejects changed staged bytes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable.afb", .{tmp.sub_path});
     defer alloc.free(path);
@@ -18069,9 +18071,9 @@ test "remote backup connection retains network io instead of filesystem io" {
     var config = try common_config.Config.parseFromSlice(alloc, json);
     defer config.deinit();
 
-    var network_impl = std.Io.Threaded.init(alloc, .{});
+    var network_impl = platform.Io.Threaded.init(alloc, .{});
     defer network_impl.deinit();
-    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    var filesystem_impl = platform.Io.Threaded.init(alloc, .{});
     defer filesystem_impl.deinit();
     const network_io = network_impl.io();
     const filesystem_io = filesystem_impl.io();
@@ -18097,13 +18099,13 @@ test "remote backup connection retains network io instead of filesystem io" {
 
 test "dynamic gcs credentials borrow distinct network and filesystem authorities" {
     const alloc = std.testing.allocator;
-    var network_impl = std.Io.Threaded.init(alloc, .{});
+    var network_impl = platform.Io.Threaded.init(alloc, .{});
     defer network_impl.deinit();
-    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    var filesystem_impl = platform.Io.Threaded.init(alloc, .{});
     defer filesystem_impl.deinit();
     const network_io = network_impl.io();
     const filesystem_io = filesystem_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const service_account_json =
@@ -18164,13 +18166,13 @@ test "dynamic gcs credentials borrow distinct network and filesystem authorities
 
 test "dynamic s3 profile and web identity retain explicit credential authorities" {
     const alloc = std.testing.allocator;
-    var network_impl = std.Io.Threaded.init(alloc, .{});
+    var network_impl = platform.Io.Threaded.init(alloc, .{});
     defer network_impl.deinit();
-    var filesystem_impl = std.Io.Threaded.init(alloc, .{});
+    var filesystem_impl = platform.Io.Threaded.init(alloc, .{});
     defer filesystem_impl.deinit();
     const network_io = network_impl.io();
     const filesystem_io = filesystem_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const credentials_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/aws-credentials", .{tmp.sub_path});
@@ -18293,7 +18295,7 @@ test "restore manifest preserves trusted coverage incarnation metadata" {
 
 test "restore admission validates the stable newest current Go attempt" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
@@ -18556,7 +18558,7 @@ test "current Go attempt parser is strict in one pass" {
 
 test "current Go migration head is strict" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
@@ -18588,7 +18590,7 @@ test "current Go migration head is strict" {
 
 test "current Go migration head selects only the digest-pinned marker" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
@@ -18644,7 +18646,7 @@ test "current Go migration head selects only the digest-pinned marker" {
 
 test "current Go migration head rejects marker digest mismatch" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var memory = object_storage.MemoryObjectStorage.init(alloc);
     defer memory.deinit();
@@ -18685,10 +18687,10 @@ test "current Go migration head rejects marker digest mismatch" {
 
 test "portable artifact availability rejects empty and non-regular local payloads" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const backup_root = try std.fmt.allocPrint(
         alloc,

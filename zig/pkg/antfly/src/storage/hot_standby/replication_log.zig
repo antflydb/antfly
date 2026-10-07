@@ -20,7 +20,9 @@
 //! Later streaming, slot, base-backup catch-up, and standby receive/apply paths
 //! should use this API instead of appending raw bytes directly.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const wal_mod = @import("../wal_runtime.zig");
@@ -202,7 +204,7 @@ fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
         .{ std.testing.random_seed, nonce },
     );
     defer alloc.free(raw);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
     return try alloc.dupeSentinel(u8, raw, 0);

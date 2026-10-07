@@ -16,7 +16,9 @@
 //! Import-facing table read callback contract.
 //! Implementations stay in table_reads.zig.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const read_gate = @import("../storage/read_consistency.zig");
 const db_types = @import("../storage/db/types.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
@@ -1354,7 +1356,7 @@ fn consumerTests() type {
                 },
             };
             fence.admission_deadline_ns = 999;
-            fence.admission_deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&std.testing.io);
+            fence.admission_deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&platform.testing.io);
             fence.admission_cancellation = CancellationToken.fromAtomic(&wire_cancellation);
             const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, fence, .{});
             defer std.testing.allocator.free(encoded);

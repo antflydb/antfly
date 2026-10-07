@@ -3157,7 +3157,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
         fn run(self: *@This()) void {
             self.gate.lockExclusive();
             self.acquired.store(true, .release);
-            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             self.gate.unlockExclusive();
         }
     };
@@ -3168,7 +3168,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
     defer if (shared_held) gate.unlockShared();
 
     var writer = Writer{ .gate = &gate };
-    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
+    var writer_thread = try platform.testing.io.concurrent(Writer.run, .{&writer});
     var writer_joined = false;
     defer if (!writer_joined) {
         if (shared_held) {
@@ -3176,7 +3176,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             shared_held = false;
         }
         writer.release.store(true, .release);
-        writer_thread.await(std.testing.io);
+        writer_thread.await(platform.testing.io);
     };
 
     var writer_queued = false;
@@ -3186,7 +3186,7 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             break;
         }
         gate.unlockShared();
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_queued) return error.TestTimeout;
 
@@ -3202,13 +3202,13 @@ test "embedding asset gate blocks late readers behind a queued writer" {
             writer_acquired = true;
             break;
         }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_acquired) return error.TestTimeout;
     try std.testing.expect(!gate.tryLockShared());
 
     writer.release.store(true, .release);
-    writer_thread.await(std.testing.io);
+    writer_thread.await(platform.testing.io);
     writer_joined = true;
 
     try std.testing.expect(gate.tryLockShared());
@@ -3442,7 +3442,7 @@ const LoadTask = struct {
 };
 
 test "manager load flight remains active until its final waiter leaves" {
-    var flight = LoadFlight{ .io = std.testing.io };
+    var flight = LoadFlight{ .io = platform.testing.io };
     var load_control = LoadFlightControl{ .flight = &flight };
     try load_control.control().check();
     try std.testing.expect(flight.tryAddWaiter());
@@ -3454,7 +3454,7 @@ test "manager load flight remains active until its final waiter leaves" {
 }
 
 test "load flight retirement reservations exclude the manager task" {
-    var flight = LoadFlight{ .io = std.testing.io, .refs = 3 };
+    var flight = LoadFlight{ .io = platform.testing.io, .refs = 3 };
     try std.testing.expectEqual(@as(usize, 2), flight.unadoptedWaiterRefs());
     flight.task_ref_pending = false;
     try std.testing.expectEqual(@as(usize, 3), flight.unadoptedWaiterRefs());
@@ -3719,12 +3719,12 @@ pub const ResourceOwnership = enum {
 /// transfer. The manager and teardown domain therefore hold independent refs.
 const OwnedManagerIo = struct {
     allocator: std.mem.Allocator,
-    runtime: std.Io.Threaded,
+    runtime: platform.Io.Threaded,
     refs: std.atomic.Value(usize) = .init(1),
 
     fn create(allocator: std.mem.Allocator) !*OwnedManagerIo {
         const self = try allocator.create(OwnedManagerIo);
-        self.* = .{ .allocator = allocator, .runtime = std.Io.Threaded.init(allocator, .{}) };
+        self.* = .{ .allocator = allocator, .runtime = platform.Io.Threaded.init(allocator, .{}) };
         return self;
     }
 
@@ -4080,7 +4080,7 @@ pub const ModelManager = struct {
     load_io: ?std.Io = null,
     /// Lazily allocated at a stable address for offline/direct callers. Never
     /// borrow a request's Io: shared loads and resident sessions outlive it.
-    owned_load_runtime: ?*std.Io.Threaded = null,
+    owned_load_runtime: ?*platform.Io.Threaded = null,
     owned_load_io_owner: ?*OwnedManagerIo = null,
     teardown_domain: ?*TeardownDomain = null,
     owned_load_watchdog: ?*HardCancellationWatchdog = null,
@@ -7174,7 +7174,7 @@ pub const ModelManager = struct {
         } else {
             // Startup preloads and direct/offline callers have no request lifetime
             // to protect. Retain the permissive path for executors such as
-            // std.testing.io that intentionally do not offer concurrency.
+            // platform.testing.io that intentionally do not offer concurrency.
             self.load_group.async(coordination_io, runLoadTask, .{task});
         }
         return self.waitForLoadFlight(flight_key, flight, control);
@@ -7215,7 +7215,7 @@ pub const ModelManager = struct {
             if (sm.kernel_jit.qualified_profile_path) |path|
                 try kernel_jit_profile_output.loadQualifiedProfileBundleIfPresent(
                     self.allocator,
-                    sm.io orelse std.Options.debug_io,
+                    sm.io orelse platform.debug_io,
                     path,
                 )
             else
@@ -8198,7 +8198,7 @@ test "failed loaded model retires from lookup while active handles unwind" {
     const flight = try allocator.create(LoadFlight);
     defer allocator.destroy(flight);
     flight.* = .{
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .model = &model,
         .refs = 2,
         .task_ref_pending = false,
@@ -9414,13 +9414,13 @@ fn loadSessionForPreferredBackends(
 
 fn writeCancellationTestModel(dir: std.Io.Dir, allocator: std.mem.Allocator) !void {
     try writeTinyDebertaEncoderGgufForModelManagerTest(dir, allocator, "model.gguf");
-    try dir.writeFile(std.testing.io, .{
+    try dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"model_type":"deberta","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
-    try dir.writeFile(std.testing.io, .{
+    try dir.writeFile(platform.testing.io, .{
         .sub_path = "tokenizer.json",
         .data =
         \\{"version":"1.0","model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}
@@ -9456,7 +9456,7 @@ const LoadCancellationTrace = struct {
 
 test "cold direct loads own a concurrent runtime beyond the request lifetime" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeCancellationTestModel(dir.dir, allocator);
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
@@ -9465,7 +9465,7 @@ test "cold direct loads own a concurrent runtime beyond the request lifetime" {
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
     {
-        var request_io = std.Io.Threaded.init(allocator, .{});
+        var request_io = platform.Io.Threaded.init(allocator, .{});
         defer request_io.deinit();
         var handle = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{ .io = request_io.io() });
         defer handle.release();
@@ -9482,14 +9482,14 @@ test "cold direct loads own a concurrent runtime beyond the request lifetime" {
     defer reloaded.release();
     // A late attachment must not move an existing Group to a different Io.
     const owned_io = manager.load_io.?;
-    try manager.attachIo(std.testing.io);
+    try manager.attachIo(platform.testing.io);
     manager.lockLoadedModels();
     defer manager.unlockLoadedModels();
     try std.testing.expectEqual(owned_io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
 }
 
 test "model eviction attachment returns with zero async workers and cancels on teardown" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .limited(1),
     });
@@ -9505,12 +9505,12 @@ test "model eviction attachment returns with zero async workers and cancels on t
 }
 
 test "model eviction attachment failure leaves maintenance retryable" {
-    var unavailable_io = std.Io.Threaded.init(std.testing.allocator, .{
+    var unavailable_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
     defer unavailable_io.deinit();
-    var available_io = std.Io.Threaded.init(std.testing.allocator, .{
+    var available_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .limited(1),
     });
@@ -9528,16 +9528,16 @@ test "model eviction attachment failure leaves maintenance retryable" {
 test "cold load coordination reuses an attached runtime without a fallback" {
     var manager = ModelManager.init(std.testing.allocator, .{ .allocator = std.testing.allocator, .preferred_backends = &.{.native} });
     defer manager.deinit();
-    try manager.attachIo(std.testing.io);
+    try manager.attachIo(platform.testing.io);
     manager.lockLoadedModels();
     defer manager.unlockLoadedModels();
-    try std.testing.expectEqual(std.testing.io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
+    try std.testing.expectEqual(platform.testing.io.userdata, (try manager.loadCoordinationIoLocked()).userdata);
     try std.testing.expect(manager.owned_load_runtime == null);
 }
 
 test "ColQwen query forward observes managed backend cancellation after tokenization" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeCancellationTestModel(dir.dir, allocator);
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
@@ -9568,7 +9568,7 @@ test "ColQwen query forward observes managed backend cancellation after tokeniza
 
 test "cold load rollback owns manifest and constructed session before cancellation checkpoints" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeCancellationTestModel(dir.dir, allocator);
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
@@ -9605,7 +9605,7 @@ test "cold load rollback owns manifest and constructed session before cancellati
 
 test "load flight waiter exits release retirement reservations and admission" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeCancellationTestModel(dir.dir, allocator);
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
@@ -9644,7 +9644,7 @@ test "load flight waiter exits release retirement reservations and admission" {
 
             const flight = try allocator.create(LoadFlight);
             flight.* = .{
-                .io = std.testing.io,
+                .io = platform.testing.io,
                 .refs = 1 + @as(usize, @intFromBool(task_ref_pending)),
                 .task_ref_pending = task_ref_pending,
             };
@@ -9686,7 +9686,7 @@ test "load flight waiter exits release retirement reservations and admission" {
 
 test "optional session adoption owns rollback and transfers admission exactly once" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeCancellationTestModel(dir.dir, allocator);
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
@@ -9730,7 +9730,7 @@ test "optional session adoption owns rollback and transfers admission exactly on
 
 test "component construction arms cancellation before backend entry and releases admission on failure" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeCancellationTestModel(dir.dir, allocator);
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
@@ -9767,7 +9767,7 @@ test "component construction arms cancellation before backend entry and releases
 
 test "managed constructors retain cooperative fallback without a process boundary" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeCancellationTestModel(dir.dir, allocator);
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
@@ -9796,11 +9796,11 @@ test "managed constructors retain cooperative fallback without a process boundar
 
 test "preferred load attempt releases admission on cancellation and guard failure" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     // Admission only needs artifact bytes. These cases must fail before any
     // backend constructor sees the deliberately invalid artifact.
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "weights.bin", .data = "weights" });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "weights.bin", .data = "weights" });
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
     defer allocator.free(root);
     const path = try std.fs.path.join(allocator, &.{ root, "weights.bin" });
@@ -10079,9 +10079,9 @@ test "managed tokenizer safely outlives ModelManager shutdown" {
         \\  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false}
         \\}
     ;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "tokenizer.json",
         .data = tokenizer_json,
     });
@@ -10583,14 +10583,14 @@ test "hybrid artifact candidates are isolated by backend" {
 
 test "native compatibility ignores an unrelated primary ONNX graph" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeTinyHeadSafetensorsForModelManagerTest(
         dir.dir,
         allocator,
         "model.safetensors",
     );
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "stale.onnx",
         .data = "not an ONNX model",
     });
@@ -10620,9 +10620,9 @@ test "native compatibility ignores an unrelated primary ONNX graph" {
 
 test "unknown opt in rejects a structurally invalid primary GGUF" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.gguf",
         .data = "not a GGUF",
     });
@@ -10665,9 +10665,9 @@ test "unknown opt in rejects a structurally invalid primary GGUF" {
 
 test "safetensors compatibility rejects a missing referenced shard" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.safetensors.index.json",
         .data =
         \\{"weight_map":{"model.embed_tokens.weight":"missing-00001-of-00001.safetensors"}}
@@ -10702,7 +10702,7 @@ test "safetensors compatibility rejects a missing referenced shard" {
 
 test "native compatibility rejects a missing lazy GGUF companion" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeTinyHeadSafetensorsForModelManagerTest(
         dir.dir,
@@ -10736,14 +10736,14 @@ test "native compatibility rejects a missing lazy GGUF companion" {
 
 test "native compatibility rejects a corrupt GGUF projector" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeTinyHeadSafetensorsForModelManagerTest(
         dir.dir,
         allocator,
         "model.safetensors",
     );
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "mmproj.gguf",
         .data = "not a GGUF",
     });
@@ -10774,7 +10774,7 @@ test "native compatibility rejects a corrupt GGUF projector" {
 
 test "native compatibility rejects an unrecognized GGUF projector format" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeTinyHeadSafetensorsForModelManagerTest(
         dir.dir,
@@ -10813,7 +10813,7 @@ test "native compatibility rejects an unrecognized GGUF projector format" {
 
 test "native compatibility rejects a projector for a different decoder family" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeTinyHeadSafetensorsForModelManagerTest(
         dir.dir,
@@ -10919,7 +10919,7 @@ test "native compatibility rejects a projector for a different decoder family" {
 
 test "native compatibility rejects unsupported companion GGUF tensor types" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeTinyHeadSafetensorsForModelManagerTest(
         dir.dir,
@@ -11059,13 +11059,13 @@ test "component compatibility validates explicit split ONNX graphs" {
     const model_bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
     defer allocator.free(model_bytes);
 
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "encoder_model.onnx",
         .data = model_bytes,
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "decoder_model.onnx",
         .data = model_bytes,
     });
@@ -11117,7 +11117,7 @@ test "component compatibility validates explicit split ONNX graphs" {
     );
     try std.testing.expectEqual(model_compatibility.Level.compatible, multistage_summary.level);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, platform.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{});
     _ = try manager.componentLoaderForPathsWithContract(
@@ -11148,7 +11148,7 @@ test "component compatibility validates explicit split ONNX graphs" {
     try std.testing.expectEqual(@as(usize, 1), required_loader.allowed_backend_count);
     try std.testing.expectEqual(backends.BackendType.cuda, required_loader.allowed_backends[0]);
 
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "encoder_model.onnx",
         .data = "invalidated",
     });
@@ -11173,14 +11173,14 @@ test "composite decoder selection qualifies optional merged artifacts and pins f
     try graph.markOutput(try builder.add(input, bias));
     const bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
     defer allocator.free(bytes);
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx", "decoder_model_merged.onnx" }) |name|
-        try dir.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = bytes });
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+        try dir.dir.writeFile(platform.testing.io, .{ .sub_path = name, .data = bytes });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "config.json", .data =
         \\{"model_type":"t5","vocab_size":4,"d_model":4,"decoder_start_token_id":0}
     });
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data =
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "tokenizer.json", .data =
         \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"}],"model":{"type":"BPE","vocab":{"<unk>":0},"merges":[]}}
     });
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
@@ -11188,7 +11188,7 @@ test "composite decoder selection qualifies optional merged artifacts and pins f
     const paths = try encoder_decoder.findEncoderDecoderPaths(allocator, root);
     defer allocator.free(paths.encoder);
     defer allocator.free(paths.decoder);
-    var sessions = backends.SessionManager.initWithIo(allocator, std.testing.io);
+    var sessions = backends.SessionManager.initWithIo(allocator, platform.testing.io);
     sessions.preferred_backends = &.{.native};
     var manager = ModelManager.init(allocator, sessions);
     defer manager.deinit();
@@ -11210,7 +11210,7 @@ test "composite decoder selection qualifies optional merged artifacts and pins f
     try std.testing.expect(first.get() == second.get());
     try manager.validateCompositeAssetsCurrent(&first, root, &.{ paths.encoder, paths.decoder });
     // Invalid optional publication cannot displace the working ordinary graph.
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "decoder_model_merged.onnx", .data = "invalid" });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "decoder_model_merged.onnx", .data = "invalid" });
     var fallback = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, null);
     defer fallback.release();
     try std.testing.expect(!fallback.get().considered_merged_decoder);
@@ -11220,28 +11220,28 @@ test "composite decoder selection qualifies optional merged artifacts and pins f
 
 test "split Whisper assets remain model-lifetime cached across request handles" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "tokenizer.json",
         .data =
         \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"},{"id":10,"content":"<|en|>"},{"id":11,"content":"<|es|>"},{"id":12,"content":"<|transcribe|>"},{"id":13,"content":"<|notimestamps|>"}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":10,"<|es|>":11,"<|transcribe|>":12,"<|notimestamps|>":13},"merges":[]}}
         ,
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"decoder_start_token_id":7,"eos_token_id":8,"max_length":99}
         ,
     });
-    try dir.dir.createDir(std.testing.io, "other", .default_dir);
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.createDir(platform.testing.io, "other", .default_dir);
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "other/tokenizer.json",
         .data =
         \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"},{"id":10,"content":"<|en|>"},{"id":11,"content":"<|es|>"},{"id":12,"content":"<|transcribe|>"},{"id":13,"content":"<|notimestamps|>"}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":10,"<|es|>":11,"<|transcribe|>":12,"<|notimestamps|>":13},"merges":[]}}
         ,
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "other/config.json",
         .data =
         \\{"decoder_start_token_id":9,"eos_token_id":8,"max_length":88}
@@ -11255,7 +11255,7 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
     const other_root = try std.fs.path.join(allocator, &.{ root, "other" });
     defer allocator.free(other_root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, platform.testing.io));
     defer manager.deinit();
     manager.configureModelCache(0, 2);
 
@@ -11268,13 +11268,13 @@ test "split Whisper assets remain model-lifetime cached across request handles" 
 
     // A republished directory gets a distinct immutable generation even while
     // requests still hold the previous tokenizer and prompt metadata.
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "tokenizer.json",
         .data =
         \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"},{"id":10,"content":"<|en|>"},{"id":11,"content":"<|es|>"},{"id":12,"content":"<|transcribe|>"},{"id":13,"content":"<|notimestamps|>"},{"id":14,"content":"new-generation"}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":10,"<|es|>":11,"<|transcribe|>":12,"<|notimestamps|>":13,"new-generation":14},"merges":[]}}
         ,
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"decoder_start_token_id":17,"eos_token_id":8,"max_length":77}
@@ -11358,7 +11358,7 @@ test "composite cold load cancellation abandons only the departing waiter" {
     defer manager.deinit();
     const flight = try std.testing.allocator.create(CompositeAssetsLoadFlight);
     const key = @as([32]u8, @splat(0));
-    flight.* = .{ .io = std.testing.io, .refs = 3, .load_state = .{ .io = std.testing.io } };
+    flight.* = .{ .io = platform.testing.io, .refs = 3, .load_state = .{ .io = platform.testing.io } };
     try std.testing.expect(flight.load_state.tryAddWaiter());
     try manager.in_flight_composite_assets.put(std.testing.allocator, key, flight);
     const Canceled = struct {
@@ -11382,7 +11382,7 @@ test "failed load flights allow immediate retry before the old task releases" {
     defer manager.deinit();
     const key = @as([32]u8, @splat(1));
     const old = try alloc.create(CompositeAssetsLoadFlight);
-    old.* = .{ .io = std.testing.io, .refs = 2, .load_state = .{ .io = std.testing.io } };
+    old.* = .{ .io = platform.testing.io, .refs = 2, .load_state = .{ .io = platform.testing.io } };
     try manager.in_flight_composite_assets.put(alloc, key, old);
     manager.finishCompositeAssetsLoadFlight(old, null, error.ResourceTemporarilyUnavailable);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.waitForCompositeAssetsLoadFlight(key, old, null));
@@ -11392,14 +11392,14 @@ test "failed load flights allow immediate retry before the old task releases" {
     try std.testing.expect(joinable == null);
     try std.testing.expect(!old.registered);
     const replacement = try alloc.create(CompositeAssetsLoadFlight);
-    replacement.* = .{ .io = std.testing.io, .load_state = .{ .io = std.testing.io } };
+    replacement.* = .{ .io = platform.testing.io, .load_state = .{ .io = platform.testing.io } };
     try manager.in_flight_composite_assets.put(alloc, key, replacement);
     manager.releaseCompositeAssetsLoadFlight(key, old);
     try std.testing.expect(manager.in_flight_composite_assets.get(key).? == replacement);
     manager.releaseCompositeAssetsLoadFlight(key, replacement);
 
     const old_model = try alloc.create(LoadFlight);
-    old_model.* = .{ .io = std.testing.io };
+    old_model.* = .{ .io = platform.testing.io };
     try manager.in_flight_loads.put(alloc, try alloc.dupe(u8, "retry"), old_model);
     manager.finishLoadFlight(old_model, null, error.ResourceTemporarilyUnavailable);
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.waitForLoadFlight("retry", old_model, null));
@@ -11409,7 +11409,7 @@ test "failed load flights allow immediate retry before the old task releases" {
     try std.testing.expect(model_joinable == null);
     try std.testing.expect(!old_model.registered);
     const new_model = try alloc.create(LoadFlight);
-    new_model.* = .{ .io = std.testing.io, .refs = 1 };
+    new_model.* = .{ .io = platform.testing.io, .refs = 1 };
     try manager.in_flight_loads.put(alloc, try alloc.dupe(u8, "retry"), new_model);
     manager.releaseLoadFlight("retry", old_model);
     try std.testing.expect(manager.in_flight_loads.get("retry").? == new_model);
@@ -11418,9 +11418,9 @@ test "failed load flights allow immediate retry before the old task releases" {
 
 test "component compatibility rejects malformed directory-backed native artifacts" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.safetensors",
         .data = "not a safetensors artifact",
     });
@@ -11445,7 +11445,7 @@ test "component compatibility rejects malformed directory-backed native artifact
     try std.testing.expectEqual(model_compatibility.Level.incompatible, summary.level);
     try std.testing.expectEqual(model_compatibility.Code.artifact_unreadable, summary.code);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, platform.testing.io));
     defer manager.deinit();
     // Structurally invalid artifacts remain incompatible even when unknown
     // model contracts are explicitly permitted.
@@ -11471,13 +11471,13 @@ test "component plan invalidates when a referenced safetensors shard changes" {
     @memcpy(shard_bytes[8..][0..shard_json.len], shard_json);
     @memset(shard_bytes[8 + shard_json.len ..], 0);
 
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model-00001-of-00001.safetensors",
         .data = &shard_bytes,
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.safetensors.index.json",
         .data =
         \\{"weight_map":{"weight":"model-00001-of-00001.safetensors"}}
@@ -11489,7 +11489,7 @@ test "component plan invalidates when a referenced safetensors shard changes" {
     );
     defer allocator.free(root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, platform.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
     _ = try manager.componentLoaderForPathsWithContract(
@@ -11500,7 +11500,7 @@ test "component plan invalidates when a referenced safetensors shard changes" {
     );
     try std.testing.expectEqual(@as(usize, 1), manager.component_plan_cache.count());
 
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model-00001-of-00001.safetensors",
         .data = "invalidated shard",
     });
@@ -11538,18 +11538,18 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
     );
     defer exported.deinit(allocator);
 
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     try writeTinyHeadSafetensorsForModelManagerTest(
         dir.dir,
         allocator,
         "model.safetensors",
     );
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "visual_model.onnx",
         .data = exported.model_bytes,
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "visual_model.data",
         .data = exported.external_data.?.bytes,
     });
@@ -11559,7 +11559,7 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
     );
     defer allocator.free(root);
 
-    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, std.testing.io));
+    var manager = ModelManager.init(allocator, backends.SessionManager.initWithIo(allocator, platform.testing.io));
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
     _ = try manager.componentLoaderForPathsWithContract(
@@ -11574,7 +11574,7 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
     // identity. The external-data file itself must invalidate the cached plan.
     const composite_generation = try manager.compositeAssetGenerationSignature(root, &.{root});
     try std.testing.expectEqualSlices(u8, &composite_generation, &(try manager.compositeAssetGenerationSignature(root, &.{root})));
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "visual_model.data",
         .data = "truncated",
     });
@@ -11589,7 +11589,7 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
         ),
     );
 
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "visual_model.data",
         .data = exported.external_data.?.bytes,
     });
@@ -11602,7 +11602,7 @@ test "component plan invalidates lazy ONNX graphs and their external data" {
 
     // The lazy graph itself is also a dependency, independently of its external
     // tensor storage.
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "visual_model.onnx",
         .data = "invalidated graph",
     });
@@ -11664,15 +11664,15 @@ test "gpu model admission classifies weights and persistent scratch" {
 
 test "projector residency follows its request-scoped lifecycle" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     const decoder_bytes: usize = 8192;
     const projector_bytes: usize = 4096;
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.gguf",
         .data = &(@as([decoder_bytes]u8, @splat(0x31))),
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "mmproj.gguf",
         .data = &(@as([projector_bytes]u8, @splat(0x32))),
     });
@@ -11740,10 +11740,10 @@ test "onnx admission separates encoded staging from completed residency" {
 
 test "directory-backed component admission charges native model artifacts" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     const weight_bytes = 8192;
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.gguf",
         .data = &(@as([weight_bytes]u8, @splat(0x5a))),
     });
@@ -11801,28 +11801,28 @@ test "ClipClap manifest selects CLIP image preprocessing profile" {
 
 test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "gliner_config.json",
         .data = "{\"model_type\":\"gliner2\",\"max_width\":4,\"capabilities\":[\"extraction\"]}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "model_manifest.json",
         .data = "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"]}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "antfly_inference_bundle.json",
         .data = "{\"family\":\"gliner2_split_bundle/v1\",\"wrapper\":\"gliner2\",\"encoder\":\"encoder.gguf\",\"head\":\"gliner_head.safetensors\"}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "tokenizer.json",
         .data =
         \\{
@@ -11880,13 +11880,13 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
     var threads: [workers.len]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
     defer {
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (threads[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (&workers, 0..) |*worker, i| {
-        threads[i] = try std.testing.io.concurrent(ColdLoadWorker.run, .{worker});
+        threads[i] = try platform.testing.io.concurrent(ColdLoadWorker.run, .{worker});
         started_tasks += 1;
     }
-    for (&threads) |*thread| thread.await(std.testing.io);
+    for (&threads) |*thread| thread.await(platform.testing.io);
     for (workers) |worker| {
         try std.testing.expect(worker.err == null);
         try std.testing.expect(worker.model == workers[0].model);
@@ -11904,14 +11904,14 @@ test "ModelManager loads split gliner bundle and exposes runtime pipeline" {
 
 test "ModelManager strict serving policy rejects unknown generator architectures" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "model_manifest.json",
         .data = "{\"type\":\"generator\"}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data = "{\"model_type\":\"brand_new_decoder\"}",
     });
@@ -11931,14 +11931,14 @@ test "ModelManager strict serving policy rejects unknown generator architectures
 
 test "ModelManager default serving policy still rejects a generator without a loadable artifact" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "model_manifest.json",
         .data = "{\"type\":\"generator\"}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data = "{\"model_type\":\"brand_new_decoder\"}",
     });
@@ -11958,14 +11958,14 @@ test "ModelManager default serving policy still rejects a generator without a lo
 
 test "ModelManager default serving policy does not enable a known incompatible generator" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "model_manifest.json",
         .data = "{\"type\":\"generator\"}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data = "{\"model_type\":\"deepseek4\"}",
     });
@@ -11985,28 +11985,28 @@ test "ModelManager default serving policy does not enable a known incompatible g
 
 test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipeline" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"model_type":"extractor","hidden_size":4,"num_hidden_layers":1,"num_attention_heads":2,"intermediate_size":8,"vocab_size":16,"max_position_embeddings":16,"position_buckets":16}
         ,
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "gliner_config.json",
         .data = "{\"model_type\":\"gliner2\",\"max_width\":4,\"capabilities\":[\"extraction\"]}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "model_manifest.json",
         .data = "{\"type\":\"extractor\",\"capabilities\":[\"extraction\"]}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "antfly_inference_bundle.json",
         .data = "{\"family\":\"gliner2_split_bundle/v1\",\"wrapper\":\"gliner2\",\"encoder\":\"encoder.gguf\",\"head\":\"gliner_head.gguf\"}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "tokenizer.json",
         .data =
         \\{
@@ -12054,15 +12054,15 @@ test "ModelManager loads split gliner gguf-head bundle and exposes runtime pipel
 
 test "shouldPreferSentencePieceOverride still prefers sentencepiece for multimodal gemma" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.model", .data = "fake-spm" });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "tokenizer.model", .data = "fake-spm" });
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "added_tokens.json",
         .data = "{\n  \"<image_soft_token>\": 262144\n}\n",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data = "{\n  \"model_type\": \"gemma3\"\n}\n",
     });
@@ -12078,7 +12078,7 @@ test "shouldPreferSentencePieceOverride still prefers sentencepiece for multimod
 
 test "shouldEnableGemmaSentencePieceCompat applies to gguf-only gemma dirs" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var man = manifest_mod.ModelManifest{ .allocator = allocator };
@@ -12094,9 +12094,9 @@ test "shouldEnableGemmaSentencePieceCompat applies to gguf-only gemma dirs" {
 
 test "sentencepiece tokenizer is owned before added-token failure" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "added_tokens.json",
         .data = "]",
     });
@@ -12271,7 +12271,7 @@ fn writeTinyDebertaEncoderGgufForModelManagerTest(
         written_offset += @intCast(byte_len);
     }
 
-    try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data.items });
+    try dir.writeFile(platform.testing.io, .{ .sub_path = sub_path, .data = data.items });
 }
 
 fn writeTinyHeadSafetensorsForModelManagerTest(
@@ -12287,7 +12287,7 @@ fn writeTinyHeadSafetensorsForModelManagerTest(
     try appendLeModelManagerTest(u64, allocator, &data, json.len);
     try data.appendSlice(allocator, json);
     try data.appendSlice(allocator, std.mem.asBytes(&[_]f32{ 0.0, 0.0 }));
-    try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data.items });
+    try dir.writeFile(platform.testing.io, .{ .sub_path = sub_path, .data = data.items });
 }
 
 fn writeTinyHeadGgufForModelManagerTest(
@@ -12395,7 +12395,7 @@ fn writeTinyProjectorGgufForModelManagerTest(
             try data.appendNTimes(allocator, 0, byte_len);
             written_offset += @intCast(byte_len);
         }
-        try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data.items });
+        try dir.writeFile(platform.testing.io, .{ .sub_path = sub_path, .data = data.items });
         return;
     }
     return writeTinyGgufForModelManagerTest(
@@ -12431,7 +12431,7 @@ fn writeTinyGgufForModelManagerTest(
         return error.UnsupportedTensorType;
     try data.appendNTimes(allocator, 0, tensor_byte_len);
 
-    try dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data.items });
+    try dir.writeFile(platform.testing.io, .{ .sub_path = sub_path, .data = data.items });
 }
 
 fn appendLeModelManagerTest(
@@ -12448,12 +12448,12 @@ fn appendLeModelManagerTest(
 test "load huggingface tokenizer from gguf gpt2 metadata" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithGpt2Tokenizer(allocator);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "ggml-model-i2_s.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "ggml-model-i2_s.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -12475,12 +12475,12 @@ test "load huggingface tokenizer from gguf gpt2 metadata" {
 test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithGemma4Tokenizer(allocator);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "gemma4-q4_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "gemma4-q4_0.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -12513,12 +12513,12 @@ test "load huggingface tokenizer from gguf gemma4 bpe metadata" {
 test "load huggingface tokenizer from gguf t5 unigram metadata" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithT5Tokenizer(allocator);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bge-m3-q4_k_m.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "bge-m3-q4_k_m.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -12591,12 +12591,12 @@ fn buildTestGgufWithQwen3EmbeddingTokenizer(allocator: std.mem.Allocator) ![]u8 
 test "load huggingface tokenizer from gguf qwen3 embedding metadata wraps eos only" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithQwen3EmbeddingTokenizer(allocator);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -12732,11 +12732,11 @@ test "offline load runtime supplies a real hard cancellation boundary only for d
     const alloc = std.testing.allocator;
     var manager = ModelManager.init(alloc, .{ .allocator = alloc, .preferred_backends = &.{.metal}, .process_isolation_available = false });
     defer manager.deinit();
-    try std.testing.expect(try manager.offlineLoadBoundaryLocked(std.testing.io) == null);
+    try std.testing.expect(try manager.offlineLoadBoundaryLocked(platform.testing.io) == null);
     try std.testing.expect(manager.owned_load_watchdog == null);
     manager.session_manager.process_isolation_available = true;
-    const boundary = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
-    const again = (try manager.offlineLoadBoundaryLocked(std.testing.io)).?;
+    const boundary = (try manager.offlineLoadBoundaryLocked(platform.testing.io)).?;
+    const again = (try manager.offlineLoadBoundaryLocked(platform.testing.io)).?;
     try std.testing.expectEqual(boundary.ptr, again.ptr);
     const control = InferenceExecutionControl{ .hard_cancellation = boundary };
     var guard = try control.enterUninterruptible(.process_required);
@@ -12817,7 +12817,7 @@ const TeardownTestProbe = struct {
             if (self.stderr_locked) {
                 // Separate bounded regular-file output supplied by the child
                 // runner; never reacquire the deliberately held stderr lock.
-                std.Io.File.stdout().writeStreamingAll(std.testing.io, marker) catch
+                std.Io.File.stdout().writeStreamingAll(platform.testing.io, marker) catch
                     @panic("teardown fixture marker write failed");
             } else std.debug.print("{s}", .{marker});
             if (self.block) while (true) std.atomic.spinLoopHint();
@@ -13090,7 +13090,7 @@ test "model manager teardown supervised child fixture" {
             probe.block = true;
             managed.deinit();
         }
-        try std.Io.File.stdout().writeStreamingAll(std.testing.io, "teardown-fixture lease-released\n");
+        try std.Io.File.stdout().writeStreamingAll(platform.testing.io, "teardown-fixture lease-released\n");
         return error.ExpectedTeardownWatchdogExit;
     } else if (std.mem.eql(u8, mode, "escaped")) {
         var managed = ManagedSession{ .session = try probe.session(&manager) };
@@ -13184,9 +13184,9 @@ test "GGUF Unigram tokenizer consumes its embedded normalization map" {
 
 test "ONNX WordPiece loading and admission use export artifacts with root fallback" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     for ([_]bool{ false, true }) |export_vocab| {
-        var dir = std.testing.tmpDir(.{});
+        var dir = platform.testing.tmpDir(.{});
         defer dir.cleanup();
         try dir.dir.createDirPath(io, "onnx");
         const paths = [_][]const u8{ "onnx/model.onnx", "onnx/config.json", if (export_vocab) "onnx/vocab.txt" else "vocab.txt", "tokenizer_config.json" };
@@ -13225,9 +13225,9 @@ test "ONNX WordPiece loading and admission use export artifacts with root fallba
 
 test "ONNX export tokenizer format takes precedence over root JSON" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     for ([_]bool{ false, true }) |export_json| {
-        var dir = std.testing.tmpDir(.{});
+        var dir = platform.testing.tmpDir(.{});
         defer dir.cleanup();
         try dir.dir.createDirPath(io, "onnx");
         const paths = [_][]const u8{ "onnx/model.onnx", "onnx/config.json", "onnx/vocab.txt", "tokenizer_config.json", "tokenizer.json" };

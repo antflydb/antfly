@@ -16,7 +16,9 @@
 //! Shared admission for native CPU/I/O tasks. Required work runs inline when
 //! saturated; speculative work yields. Result-owning leases last through joining;
 //! transient leases end at completion. Both release canceled-before-start slots.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const A = std.mem.Allocator;
 pub const LockedAllocator = struct {
     backing: A,
@@ -181,7 +183,7 @@ test "SQL shared scheduling bounds overlapping operators and releases canceled a
         }
     };
     var scheduler: Scheduler = .{ .max_workers = 2, .max_bytes = 100 };
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var first = scheduler.submit(io, 40, Worker.run, .{}) orelse return error.TestUnexpectedResult;
     var second = scheduler.submit(io, 60, Worker.run, .{}) orelse return error.TestUnexpectedResult;
     try std.testing.expect(scheduler.submit(io, 1, Worker.run, .{}) == null);
@@ -202,12 +204,12 @@ test "SQL completed speculative work releases admission before owner joins" {
     };
     var scheduler: Scheduler = .{ .max_workers = 1, .max_bytes = 4 };
     var gate: std.Io.Event = .unset;
-    var first = scheduler.submitTransient(std.testing.io, 4, Worker.run, .{ std.testing.io, &gate }).?;
+    var first = scheduler.submitTransient(platform.testing.io, 4, Worker.run, .{ platform.testing.io, &gate }).?;
     defer if (first.future != null) {
-        _ = first.cancel(std.testing.io) catch {};
+        _ = first.cancel(platform.testing.io) catch {};
     };
-    try std.testing.expect(scheduler.submit(std.testing.io, 1, Worker.run, .{ std.testing.io, &gate }) == null);
-    gate.set(std.testing.io);
+    try std.testing.expect(scheduler.submit(platform.testing.io, 1, Worker.run, .{ platform.testing.io, &gate }) == null);
+    gate.set(platform.testing.io);
     // The admission is distinct from the future/result owner. Wait on the
     // worker's released control instead of joining the owning task.
     while (!first.transient.?.released.load(.acquire)) std.atomic.spinLoopHint();
@@ -218,9 +220,9 @@ test "SQL completed speculative work releases admission before owner joins" {
         if (free) break;
         std.atomic.spinLoopHint();
     }
-    var second = scheduler.submitTransient(std.testing.io, 4, Worker.run, .{ std.testing.io, &gate }).?;
-    try second.await(std.testing.io);
-    try first.await(std.testing.io);
+    var second = scheduler.submitTransient(platform.testing.io, 4, Worker.run, .{ platform.testing.io, &gate }).?;
+    try second.await(platform.testing.io);
+    try first.await(platform.testing.io);
     try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
 }
 

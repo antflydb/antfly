@@ -591,7 +591,7 @@ fn nextRequired(args: *std.process.Args.Iterator) ![]const u8 {
 
 test "backup cli parser accepts help flag" {
     var argv = [_][*:0]const u8{"--help"};
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseBackupArgs(&iter);
     try std.testing.expect(opts.help);
 }
@@ -613,7 +613,7 @@ test "cluster backup CLI fails closed on incomplete and unknown results" {
 
 test "backup cli parser rejects unknown arguments" {
     var argv = [_][*:0]const u8{ "--backup-id", "daily", "--bogus" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expectError(error.UnknownArgument, parseBackupArgs(&iter));
 }
 
@@ -628,7 +628,7 @@ test "backup cli accepts native AFB2 output from a shared local repository" {
         "--out",
         "docs.afb",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseBackupArgs(&iter);
     try validateBackupArgs(opts);
     try std.testing.expectEqualStrings("docs.afb", opts.bundle_out.?);
@@ -636,28 +636,28 @@ test "backup cli accepts native AFB2 output from a shared local repository" {
 
 test "network backup requires explicit location" {
     var argv = [_][*:0]const u8{ "--backup-id", "daily", "--connection", "archive-writer" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseBackupArgs(&iter);
     try std.testing.expectError(error.BackupLocationRequired, validateBackupArgs(opts));
 }
 
 test "backup rejects conflicting table selectors" {
     var argv = [_][*:0]const u8{ "--table", "one", "--tables", "two,three", "--location", "s3://archive/backups" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseBackupArgs(&iter);
     try std.testing.expectError(error.ConflictingTableSelection, validateBackupArgs(opts));
 }
 
 test "backup list CLI exposes bounded cursor pagination" {
     var argv = [_][*:0]const u8{ "--list", "--location", "s3://archive/backups", "--limit", "250", "--cursor", "snap-024" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseBackupArgs(&iter);
     try validateBackupArgs(opts);
     try std.testing.expectEqual(@as(usize, 250), opts.list_limit);
     try std.testing.expectEqualStrings("snap-024", opts.list_cursor.?);
 
     var invalid_argv = [_][*:0]const u8{ "--location", "s3://archive/backups", "--limit", "10" };
-    var invalid_iter = std.process.Args.Iterator.init(.{ .vector = invalid_argv[0..] });
+    var invalid_iter = @import("antfly_platform").process.argsIterator(invalid_argv[0..]);
     try std.testing.expectError(error.BackupPaginationRequiresList, validateBackupArgs(try parseBackupArgs(&invalid_iter)));
 }
 
@@ -672,7 +672,7 @@ test "restore cli parser accepts aflite input shape" {
         "--backup-id",
         "lite-app",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectEqualStrings("app.aflite", opts.input_path.?);
     try std.testing.expectEqualStrings("docs", opts.table_name.?);
@@ -683,7 +683,7 @@ test "restore cli parser accepts aflite input shape" {
 
 test "restore CLI rejects ignored format selection" {
     var argv = [_][*:0]const u8{ "--table", "docs", "--format", "portable" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&iter));
 }
 
@@ -696,7 +696,7 @@ test "restore input location requires explicit shared staging" {
         "--table",
         "docs",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(!opts.location_explicit);
 
@@ -712,7 +712,7 @@ test "restore afb input also requires explicit shared staging" {
         "--table",
         "docs",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(!opts.location_explicit);
 
@@ -721,21 +721,21 @@ test "restore afb input also requires explicit shared staging" {
 
 test "restore cli parser accepts help flag" {
     var argv = [_][*:0]const u8{"help"};
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expect(opts.help);
 }
 
 test "network restore requires explicit location" {
     var argv = [_][*:0]const u8{ "--backup-id", "daily", "--connection", "archive-reader" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectError(error.RestoreLocationRequired, validateRestoreArgs(opts));
 }
 
 test "restore rejects conflicting table selectors" {
     var argv = [_][*:0]const u8{ "--table", "one", "--tables", "two,three", "--location", "s3://archive/backups" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectError(error.ConflictingTableSelection, validateRestoreArgs(opts));
 }
@@ -749,7 +749,7 @@ test "restore cli parser keeps mode visible for input validation" {
         "--mode",
         "replace",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectEqualStrings("app.aflite", opts.input_path.?);
     try std.testing.expectEqualStrings("replace", opts.restore_mode.?);
@@ -764,7 +764,7 @@ test "restore cli validation rejects mode with input restore" {
         "--mode",
         "replace",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectError(error.RestoreInputModeUnsupported, validateRestoreArgs(opts));
 }
@@ -776,7 +776,7 @@ test "restore cli validation rejects unsupported input extension" {
         "--table",
         "docs",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     const opts = try parseRestoreArgs(&iter);
     try std.testing.expectError(error.InvalidRestoreInputPath, validateRestoreArgs(opts));
 }
@@ -830,7 +830,7 @@ test "restore polling response classification resets ambiguity after recovery" {
 
 test "restore cli parser rejects unknown arguments" {
     var argv = [_][*:0]const u8{ "--input", "app.aflite", "--table", "docs", "--bogus" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = @import("antfly_platform").process.argsIterator(argv[0..]);
     try std.testing.expectError(error.UnknownArgument, parseRestoreArgs(&iter));
 }
 

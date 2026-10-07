@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -169,7 +170,7 @@ pub fn stageAfbRestoreBackup(
     location_uri: []const u8,
 ) !StagedRestore {
     if (!std.mem.endsWith(u8, path, ".afb")) return error.InvalidArguments;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var source = if (std.fs.path.isAbsolute(path))
@@ -610,7 +611,7 @@ fn appendJsonU64(
 }
 
 fn readFileAlloc(allocator: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     if (!std.fs.path.isAbsolute(path)) {
@@ -680,7 +681,7 @@ fn indexNamed(indexes: []const db_types.IndexConfig, name: []const u8) ?db_types
 test "lite restore staging writer close syncs unsynced batch before readonly reopen" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/restore-staging-close-sync.aflite", .{tmp.sub_path});
@@ -711,7 +712,7 @@ test "lite restore staging writer close syncs unsynced batch before readonly reo
 
 test "lite portable generation scavenging reaps stale data and lease-only crashes" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const parent = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(parent);
@@ -730,7 +731,7 @@ test "lite portable generation scavenging reaps stale data and lease-only crashe
     const active_lock = try std.fmt.allocPrint(allocator, "{s}.lock", .{active_data});
     defer allocator.free(active_lock);
 
-    const io = std.testing.io;
+    const io = platform.testing.io;
     {
         var data = try std.Io.Dir.cwd().createFile(io, stale_data, .{ .truncate = true });
         data.close(io);
@@ -761,7 +762,7 @@ test "lite portable generation scavenging reaps stale data and lease-only crashe
 
 test "lite portable restore enforces staging budget and preserves target" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/budget-source.aflite", .{tmp.sub_path});
     defer a.free(source_path);
@@ -804,7 +805,7 @@ test "lite portable restore enforces staging budget and preserves target" {
 test "lite portable publication never reports a retryable failure after adoption" {
     @import("antfly_test_error_logs").expectErrorLogs(1);
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/post-adopt-source.aflite", .{tmp.sub_path});
     defer allocator.free(source_path);
@@ -867,7 +868,7 @@ test "lite portable publication never reports a retryable failure after adoption
 test "lite portable publication reports durability unknown after adopting runtime state" {
     @import("antfly_test_error_logs").expectErrorLogs(1);
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/durability-source.aflite", .{tmp.sub_path});
     defer allocator.free(source_path);
@@ -923,7 +924,7 @@ test "lite portable publication reports durability unknown after adopting runtim
 
 test "lite portable import emptiness rejects tombstones and durable transactions" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const tombstone_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/import-tombstone.aflite", .{tmp.sub_path});
@@ -950,10 +951,10 @@ test "lite portable import emptiness rejects tombstones and durable transactions
 test "lite restore staging preserves portable afb schema index and enrichment metadata" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1034,10 +1035,10 @@ test "lite restore staging preserves portable afb schema index and enrichment me
 test "lite restore staging preflights afb before publishing staged files" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1083,9 +1084,9 @@ test "lite restore staging preflights afb before publishing staged files" {
 
 test "lite restore staging expands a self-contained native AFB2 bundle" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1177,13 +1178,13 @@ test "lite restore staging accepts aflite input for normal restore" {
     // Opt into tracing when diagnosing a failure.
     var no_stack_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(no_stack_allocator.deinit() == 0);
-    const allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else no_stack_allocator.allocator();
+    const allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else no_stack_allocator.allocator();
     var work_profile = RestoreWorkProfile.init();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1332,10 +1333,10 @@ test "lite restore staging accepts aflite input for normal restore" {
 test "lite restore staging exports stable aflite data while writer has open transaction" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1398,13 +1399,13 @@ test "lite portable backup roundtrips through normal table backup APIs" {
     // Opt into tracing when diagnosing a failure.
     var no_stack_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(no_stack_allocator.deinit() == 0);
-    const allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else no_stack_allocator.allocator();
+    const allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else no_stack_allocator.allocator();
     var work_profile = RestoreWorkProfile.init();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

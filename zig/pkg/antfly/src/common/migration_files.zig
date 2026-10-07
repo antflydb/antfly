@@ -13,6 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
 const fs = @import("antfly_runtime_fs").fs_paths;
 
@@ -60,7 +61,7 @@ pub fn requireJsonCatalogAuthority(alloc: std.mem.Allocator, io: std.Io, catalog
 
 test "offline migration rejects authoritative metadata before changing legacy catalog" {
     const alloc = std.testing.allocator;
-    const io = std.Options.debug_io;
+    const io = platform.debug_io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog.json", .{tmp.sub_path});

@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const readers = @import("antfly_readers");
 const asset_producer_runtime = @import("antfly_local_sources").asset_producer_runtime;
@@ -31,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer std.debug.assert(gpa.deinit() == 0);
     const alloc = gpa.allocator();
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();

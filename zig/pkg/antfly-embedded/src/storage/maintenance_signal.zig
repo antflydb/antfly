@@ -15,11 +15,12 @@
 
 //! Coalesced, allocation-free notification with one joined std.Io consumer.
 //! Producers retain the owning ResourceManager, never a DataServer callback.
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const Signal = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    epoch: platform.atomic.Value(u64) = .init(0),
     ready: std.Io.Event = .unset,
     io: ?std.Io = null,
 
@@ -76,7 +77,7 @@ test "maintenance completion survives an unbound consumer and coalesces notifica
     var signal: Signal = .{};
     signal.notify();
     signal.notify();
-    var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer runtime.deinit();
     const io = runtime.io();
     try signal.bind(io);
@@ -89,7 +90,7 @@ test "maintenance completion survives an unbound consumer and coalesces notifica
 test "maintenance completion wakes an Io consumer and detaches before runtime shutdown" {
     var signal: Signal = .{};
     {
-        var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+        var runtime = platform.Io.Threaded.init(std.testing.allocator, .{});
         defer runtime.deinit();
         const io = runtime.io();
         try signal.bind(io);

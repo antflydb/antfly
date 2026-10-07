@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("platform");
 const std = @import("std");
+
 const supervisor = @import("platform").one_shot_process;
 const inference_supervisor = @import("platform").inference_process_supervisor;
 extern "c" fn atexit(handler: *const fn () callconv(.c) void) c_int;
@@ -25,8 +27,8 @@ fn blockedAtExit() callconv(.c) void {
 fn fixtureSafetyLimit() void {
     // The intentionally pre-monitor stall has no production lifeline reader.
     // Bound this negative test even if the test parent itself is interrupted.
-    var delay = std.posix.timespec{ .sec = 6, .nsec = 0 };
-    while (std.posix.errno(std.posix.system.nanosleep(&delay, &delay)) == .INTR) {}
+    var delay = platform.c.timespec{ .sec = 6, .nsec = 0 };
+    while (std.posix.errno(platform.c.nanosleep(&delay, &delay)) == .INTR) {}
     @import("platform").process.exitImmediately(255);
 }
 

@@ -18,7 +18,9 @@
 //! read metadata only; point lookup reads one index entry and one payload.
 //! Producer authorization and semantic output validation belong to the ordered
 //! caller. This module alone is not permission to publish an extraction head.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const generations = @import("artifact_chunk_generation.zig");
 const scopes = @import("artifact_generation_scope.zig");
 const manifest = @import("artifact_chunk_manifest.zig");
@@ -459,7 +461,7 @@ test "ordered artifact inventory named extraction directory resumes lookup enume
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/named-extraction", .{tmp.sub_path});
     defer alloc.free(path);

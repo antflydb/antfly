@@ -31,7 +31,7 @@ const control_only_storage_sources = @import("antfly_local_sources").api_local_t
 
 const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
 const platform = @import("antfly_platform");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = platform.sync;
 const metadata_openapi = @import("antfly_metadata_openapi");
 const scraping = @import("antfly_scraping");
 const common_secrets = @import("antfly_local_sources").common_secrets;
@@ -485,7 +485,7 @@ const document_extraction_mod = @import("antfly_local_sources").storage_db_enric
 const distributed_txn = @import("distributed_txn.zig");
 const build_options = @import("build_options");
 const tracing = @import("../tracing/mod.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const Io = @import("antfly_local_sources").api_local_table_writes.Io;
 
 const txn_id_nonce = @import("antfly_local_sources").api_local_table_writes.txn_id_nonce;
@@ -1250,7 +1250,7 @@ const DroppedTableDeleteWork = struct {
     recovery_source: ?*ProvisionedTableWriteSource = null,
 
     fn deletePath(path: []const u8) !void {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         var attempt: u8 = 0;
         while (attempt < 6) : (attempt += 1) {
@@ -1334,7 +1334,7 @@ fn quarantineRecoveryIntent(
 fn countRecoveryQuarantineIntents(alloc: std.mem.Allocator, replica_root_dir: []const u8) !u64 {
     const quarantine_dir = try recoveryQuarantineDirPath(alloc, replica_root_dir);
     defer alloc.free(quarantine_dir);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var dir = std.Io.Dir.cwd().openDir(io, quarantine_dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -1811,7 +1811,7 @@ fn persistReplicaRetirementIntent(
     const dir_path = try replicaRetirementDirPath(alloc, replica_root_dir);
     defer alloc.free(dir_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, dir_path);
@@ -1949,7 +1949,7 @@ fn persistDroppedTableRepairIntent(
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
     defer alloc.free(tmp_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, repair_dir);
@@ -2093,7 +2093,7 @@ fn moveRetiredReplicaPathToTrash(
     const trash_path = try retiredReplicaTrashPath(alloc, replica_root_dir, group_id);
     errdefer alloc.free(trash_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, trash_dir_path);
@@ -2125,7 +2125,7 @@ fn moveDroppedGroupPathToTrash(
     const trash_path = try droppedTableTrashPath(alloc, replica_root_dir, table_name, group_id);
     errdefer alloc.free(trash_path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), trash_dir_path);
     std.Io.Dir.rename(std.Io.Dir.cwd(), path, std.Io.Dir.cwd(), trash_path, io_impl.io()) catch |err| switch (err) {
@@ -2149,7 +2149,7 @@ fn deleteGroupPathIfPresent(
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -4908,7 +4908,7 @@ pub const ProvisionedTableWriteCache = struct {
 
     fn openMutexIo(self: *ProvisionedTableWriteCache) Io {
         if (self.backend_runtime) |runtime| if (runtime.io()) |io| return io;
-        return Io.Threaded.global_single_threaded.io();
+        return platform.Io.Threaded.global_single_threaded.io();
     }
 
     fn lockOpenMutex(self: *ProvisionedTableWriteCache) void {
@@ -4937,7 +4937,7 @@ const HostedManagedDbCache = struct {
             .write_cache = ProvisionedTableWriteCache.init(alloc),
             .remote_capability_cache = remote_capabilities.Cache.init(
                 alloc,
-                std.Io.Threaded.global_single_threaded.io(),
+                platform.Io.Threaded.global_single_threaded.io(),
             ),
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
         };
@@ -6836,7 +6836,7 @@ pub const ProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     local_db_mutex: SourceStateMutex = .{},
-    table_activity_threaded: ?Io.Threaded,
+    table_activity_threaded: ?platform.Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
     // Protected by table_activity_mutex. Seed capture closes only new
@@ -8348,7 +8348,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn removeDroppedTableRepairIntent(path: []const u8) !void {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try removeDroppedTableRepairIntentWithIo(io_impl.io(), path);
     }
@@ -8365,7 +8365,7 @@ pub const ProvisionedTableWriteSource = struct {
         var retry_required = false;
         const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
         defer alloc.free(trash_dir_path);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, trash_dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -8394,7 +8394,7 @@ pub const ProvisionedTableWriteSource = struct {
         var retry_required = false;
         const repair_dir_path = try droppedTableRepairDirPath(alloc, self.replica_root_dir);
         defer alloc.free(repair_dir_path);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, repair_dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -8695,7 +8695,7 @@ pub const ProvisionedTableWriteSource = struct {
         const ownership = self.replicaRetirementOwnershipSnapshot() orelse return false;
         const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
         defer alloc.free(dir_path);
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -9142,7 +9142,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn requireAbsentRestoreOwnerRoot(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64) !void {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
@@ -9287,7 +9287,7 @@ pub const ProvisionedTableWriteSource = struct {
                 const failure = work.source.dropped_table_recovery_retry_failures.fetchAdd(1, .acq_rel);
                 const shift: u5 = @intCast(@min(failure, 4));
                 const delay_ms: u64 = @as(u64, 100) << shift;
-                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
                 defer io_impl.deinit();
                 io_impl.io().sleep(.fromNanoseconds(delay_ms * std.time.ns_per_ms), .awake) catch {};
                 work.source.dropped_table_recovery_retry_scheduled.store(false, .release);
@@ -13388,7 +13388,7 @@ pub const ProvisionedTableWriteSource = struct {
         const io = if (effective_backend_runtime) |runtime|
             runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
         else
-            self.restore_open_options.filesystem_io orelse std.Options.debug_io;
+            self.restore_open_options.filesystem_io orelse platform.debug_io;
         const cache = self.write_cache orelse return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             alloc,
             self.replica_root_dir,
@@ -13706,7 +13706,7 @@ pub const ProvisionedTableWriteSource = struct {
         const cache = self.write_cache orelse return error.RestoreStagingInProgress;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         try fs_paths.createDirPathPortable(io, path);
         var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, self.visibleRootGeneration(group_id), table.name, .restore_repair, null, null, .{
             .indexes_json = "{}",
@@ -15556,7 +15556,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         _ = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
         var locks = WriteCacheTransitionLocks.init(self, true, true);
         defer locks.deinit();
@@ -15600,7 +15600,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var io_impl = Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         _ = Io.Dir.cwd().statFile(io_impl.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return error.HASeedSnapshotReplicaMissing,
@@ -20914,7 +20914,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (moved_any_group) {
                 const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
                 defer alloc.free(trash_dir_path);
-                var io_impl = std.Io.Threaded.init(alloc, .{});
+                var io_impl = platform.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
                 try fs_paths.syncDirPortable(io_impl.io(), trash_dir_path);
             }
@@ -23091,7 +23091,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -31561,7 +31561,7 @@ fn shouldDrainCachedManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool
 }
 
 fn prepareLocalTablePathForRestore(alloc: std.mem.Allocator, path: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -31600,11 +31600,11 @@ fn moveRestorePathToTrashIfPresent(
 }
 
 fn sleepNs(duration_ns: u64) void {
-    var req = std.posix.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
         .nsec = @intCast(duration_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -31716,7 +31716,7 @@ const exportPortableBackupFileWithIo = physical_local_write.exportPortableBackup
 const exportPortableBackupFileWithSource = @import("antfly_local_sources").api_local_table_writes.exportPortableBackupFileWithSource;
 
 fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try std.Io.Dir.cwd().readFileAlloc(
         io_impl.io(),
@@ -31728,7 +31728,7 @@ fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn importPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, shared_io: ?std.Io) !void {
     if (shared_io) |io| return try importPortableBackupFileWithIo(alloc, store, path, io);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try importPortableBackupFileWithIo(alloc, store, path, io_impl.io());
 }
@@ -33093,7 +33093,7 @@ fn consumerTests() type {
 
         test "native restore admits selective repair only with authenticated generation manifest" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-selective", .{tmp.sub_path});
             defer alloc.free(root);
@@ -33101,15 +33101,15 @@ fn consumerTests() type {
             defer alloc.free(manifest_path);
             const projection_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{root});
             defer alloc.free(projection_path);
-            try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(projection_path).?);
-            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = "authenticated-generation" });
-            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = projection_path, .data = "projection" });
+            try fs_paths.createDirPathPortable(platform.testing.io, std.fs.path.dirname(projection_path).?);
+            try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = manifest_path, .data = "authenticated-generation" });
+            try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = projection_path, .data = "projection" });
 
-            var tree_integrity = try backups_api.artifactIntegrityAlloc(alloc, std.testing.io, .native, root);
+            var tree_integrity = try backups_api.artifactIntegrityAlloc(alloc, platform.testing.io, .native, root);
             defer tree_integrity.deinit(alloc);
             var manifest_integrity = try backups_api.nativeGenerationManifestIntegrityAllocWithCancellation(
                 alloc,
-                std.testing.io,
+                platform.testing.io,
                 root,
                 .none,
             );
@@ -33124,17 +33124,17 @@ fn consumerTests() type {
                 .native_manifest_sha256 = manifest_integrity.sha256,
             };
 
-            try std.Io.Dir.cwd().deleteFile(std.testing.io, projection_path);
+            try std.Io.Dir.cwd().deleteFile(platform.testing.io, projection_path);
             try std.testing.expectError(
                 error.BackupArtifactIntegrityMismatch,
-                backups_api.verifyShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none),
+                backups_api.verifyShardArtifactIntegrityWithCancellation(alloc, platform.testing.io, .native, root, &shard, .none),
             );
-            try backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none);
+            try backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(alloc, platform.testing.io, .native, root, &shard, .none);
 
-            try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = manifest_path, .data = "tampered-generation!!!!" });
+            try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = manifest_path, .data = "tampered-generation!!!!" });
             try std.testing.expectError(
                 error.BackupArtifactIntegrityMismatch,
-                backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(alloc, std.testing.io, .native, root, &shard, .none),
+                backups_api.verifyRestorableShardArtifactIntegrityWithCancellation(alloc, platform.testing.io, .native, root, &shard, .none),
             );
         }
 
@@ -33228,7 +33228,7 @@ fn consumerTests() type {
         test "provisioned table write source borrows runtime IO without native fallback" {
             var runtime = try db_mod.background_runtime.BackendRuntime.init(std.testing.allocator, .{
                 .backend = .manual,
-                .borrowed_io = .{ .general = std.testing.io },
+                .borrowed_io = .{ .general = platform.testing.io },
             });
             defer runtime.deinit();
             var source = ProvisionedTableWriteSource.initWithBackendRuntime(
@@ -33239,7 +33239,7 @@ fn consumerTests() type {
             defer source.deinit();
 
             try std.testing.expect(source.table_activity_threaded == null);
-            try std.testing.expectEqual(std.testing.io.userdata, source.tableActivityIo().userdata);
+            try std.testing.expectEqual(platform.testing.io.userdata, source.tableActivityIo().userdata);
         }
 
         test "provisioned owner clone snapshot preserves retired runtime counters" {
@@ -33594,11 +33594,11 @@ fn consumerTests() type {
             var clock: RetryClock = .{};
             RetryClock.active = &clock;
             defer RetryClock.active = null;
-            var io_vtable = std.testing.io.vtable.*;
+            var io_vtable = platform.testing.io.vtable.*;
             io_vtable.sleep = RetryClock.sleep;
             var runtime = try db_mod.background_runtime.BackendRuntime.init(std.testing.allocator, .{
                 .backend = .manual,
-                .borrowed_io = .{ .general = .{ .userdata = std.testing.io.userdata, .vtable = &io_vtable } },
+                .borrowed_io = .{ .general = .{ .userdata = platform.testing.io.userdata, .vtable = &io_vtable } },
             });
             defer runtime.deinit();
             const tables = [_]distributed_txn.TableCommitRequest{.{ .table_name = "docs", .writes = &.{.{ .key = "doc:a", .value = "{}" }} }};
@@ -35446,23 +35446,23 @@ fn consumerTests() type {
             errdefer if (restore_lifecycle_active) source.endRestoreLifecycleActivity("docs");
 
             var worker = RequestWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(RequestWorker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(RequestWorker.run, .{&worker});
             var read_worker = ReadWorker{ .source = &source };
-            var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
+            var read_thread = try platform.testing.io.concurrent(ReadWorker.run, .{&read_worker});
 
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!worker.entered.load(.acquire));
             try std.testing.expect(read_worker.entered.load(.acquire));
-            read_thread.await(std.testing.io);
+            read_thread.await(platform.testing.io);
 
             source.endRestoreLifecycleActivity("docs");
             restore_lifecycle_active = false;
             while (!worker.entered.load(.acquire)) {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
             }
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
         }
 
         test "HA seed request admission drains accepted writes and closes the preflight race" {
@@ -35510,34 +35510,34 @@ fn consumerTests() type {
 
             var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-ha-seed-request-admission", NoCatalog.iface());
             defer source.deinit();
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
 
             // A held capture reservation keeps a later public writer outside the
             // activity/cache lifecycle until preflight and snapshot finish.
             var capture_lease = try source.acquireHotStandbySeedTableRequestAdmissionLease();
             var request_worker = RequestWorker{ .source = &source };
-            var request_thread = try std.testing.io.concurrent(RequestWorker.run, .{&request_worker});
+            var request_thread = try platform.testing.io.concurrent(RequestWorker.run, .{&request_worker});
             defer {
                 capture_lease.release();
-                request_thread.await(std.testing.io);
+                request_thread.await(platform.testing.io);
             }
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!request_worker.entered.load(.acquire));
             capture_lease.release();
-            request_thread.await(std.testing.io);
+            request_thread.await(platform.testing.io);
             try std.testing.expect(request_worker.entered.load(.acquire));
 
             // Closing admission while a request is already active waits without
             // holding the mutex that request needs to publish its completion.
             source.beginTableRequest("docs");
             var capture_worker = CaptureWorker{ .source = &source };
-            var capture_thread = try std.testing.io.concurrent(CaptureWorker.run, .{&capture_worker});
+            var capture_thread = try platform.testing.io.concurrent(CaptureWorker.run, .{&capture_worker});
             var capture_thread_awaited = false;
             defer if (!capture_thread_awaited) {
                 source.endTableRequest("docs");
                 capture_worker.release.store(true, .release);
-                capture_thread.await(std.testing.io);
+                capture_thread.await(platform.testing.io);
             };
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!capture_worker.acquired.load(.acquire));
@@ -35546,7 +35546,7 @@ fn consumerTests() type {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
             }
             capture_worker.release.store(true, .release);
-            capture_thread.await(std.testing.io);
+            capture_thread.await(platform.testing.io);
             capture_thread_awaited = true;
         }
 
@@ -35777,17 +35777,17 @@ fn consumerTests() type {
             errdefer if (request_active) source.endTableRequest("docs");
 
             var worker = ReconcileWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(ReconcileWorker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(ReconcileWorker.run, .{&worker});
             defer {
                 if (request_active) {
                     source.endTableRequest("docs");
                     request_active = false;
                 }
                 worker.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             }
 
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             while (!source.hasGroupActivityBestEffort("docs", 7001)) {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -35795,14 +35795,14 @@ fn consumerTests() type {
             try std.testing.expect(!worker.entered.load(.acquire));
 
             var write_worker = WriteWorker{ .source = &source };
-            var write_thread = try std.testing.io.concurrent(WriteWorker.run, .{&write_worker});
+            var write_thread = try platform.testing.io.concurrent(WriteWorker.run, .{&write_worker});
             defer {
                 if (request_active) {
                     source.endTableRequest("docs");
                     request_active = false;
                 }
                 worker.release.store(true, .release);
-                write_thread.await(std.testing.io);
+                write_thread.await(platform.testing.io);
             }
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!write_worker.entered.load(.acquire));
@@ -35814,11 +35814,11 @@ fn consumerTests() type {
             }
             try std.testing.expect(!write_worker.entered.load(.acquire));
             worker.release.store(true, .release);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             while (!write_worker.entered.load(.acquire)) {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
             }
-            write_thread.await(std.testing.io);
+            write_thread.await(platform.testing.io);
         }
 
         test "resident activation journal rejects a delayed lower metadata epoch" {
@@ -36325,7 +36325,7 @@ fn consumerTests() type {
                 fn run(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.entered.store(true, .release);
-                    while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                    while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
             };
             const ActivationCall = struct {
@@ -36374,23 +36374,23 @@ fn consumerTests() type {
 
             var first = ActivationCall{ .source = &source, .target = target };
             var duplicate = ActivationCall{ .source = &source, .target = target };
-            var first_thread = try std.testing.io.concurrent(ActivationCall.run, .{&first});
+            var first_thread = try platform.testing.io.concurrent(ActivationCall.run, .{&first});
             defer {
                 barrier.release.store(true, .release);
-                first_thread.await(std.testing.io);
+                first_thread.await(platform.testing.io);
             }
-            while (!barrier.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-            var duplicate_thread = try std.testing.io.concurrent(ActivationCall.run, .{&duplicate});
+            while (!barrier.entered.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            var duplicate_thread = try platform.testing.io.concurrent(ActivationCall.run, .{&duplicate});
             defer {
                 barrier.release.store(true, .release);
-                duplicate_thread.await(std.testing.io);
+                duplicate_thread.await(platform.testing.io);
             }
-            while (test_index_activation_admission_waits.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (test_index_activation_admission_waits.load(.acquire) == 0) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             try std.testing.expect(!duplicate.returned.load(.acquire));
 
             barrier.release.store(true, .release);
-            first_thread.await(std.testing.io);
-            duplicate_thread.await(std.testing.io);
+            first_thread.await(platform.testing.io);
+            duplicate_thread.await(platform.testing.io);
             try std.testing.expectEqual(error.TestStructuralReconcileSubmitFailure, first.err.?);
             try std.testing.expect(duplicate.err == null);
         }
@@ -37284,22 +37284,22 @@ fn consumerTests() type {
             var request_active = true;
 
             var worker = ReconcileWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(ReconcileWorker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(ReconcileWorker.run, .{&worker});
             defer {
                 if (request_active) {
                     source.endTableRequest("docs");
                     request_active = false;
                 }
                 worker.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             }
             var thread_joined = false;
             defer {
                 if (request_active) source.endTableRequest("docs");
-                if (!thread_joined) thread.await(std.testing.io);
+                if (!thread_joined) thread.await(platform.testing.io);
             }
 
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             while (!source.hasGroupActivityBestEffort("docs", 7001)) {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -37310,7 +37310,7 @@ fn consumerTests() type {
 
             source.endTableRequest("docs");
             request_active = false;
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             thread_joined = true;
             try std.testing.expect(worker.entered.load(.acquire));
         }
@@ -37345,9 +37345,9 @@ fn consumerTests() type {
             errdefer if (reconcile_active) source.endStructuralReconcileActivity("docs");
 
             var worker = WriteWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(WriteWorker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(WriteWorker.run, .{&worker});
 
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!worker.entered.load(.acquire));
@@ -37357,7 +37357,7 @@ fn consumerTests() type {
             while (!worker.entered.load(.acquire)) {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
             }
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
         }
 
         test "provisioned table write source group operation blocks read admission" {
@@ -37399,9 +37399,9 @@ fn consumerTests() type {
             errdefer if (group_active) source.endGroupOperation("docs", 7001);
 
             var worker = ReadWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(ReadWorker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(ReadWorker.run, .{&worker});
 
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!worker.entered.load(.acquire));
@@ -37411,7 +37411,7 @@ fn consumerTests() type {
             while (!worker.entered.load(.acquire)) {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
             }
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
         }
 
         test "replica retirement fences only its owning table structural lane" {
@@ -38177,7 +38177,7 @@ fn consumerTests() type {
                 }
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-profiled-external-write-sync", .{tmp.sub_path});
@@ -38279,7 +38279,7 @@ fn consumerTests() type {
         test "startup catch-up stats for path include table and index-local wal retention" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/startup-path-retention/table-db", .{tmp.sub_path});
@@ -38489,7 +38489,7 @@ fn consumerTests() type {
         test "provisioned table write source drop table cancels index repair before structural admission" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-cancels-repair", .{tmp.sub_path});
@@ -38539,7 +38539,7 @@ fn consumerTests() type {
                 }
             };
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
 
@@ -38593,7 +38593,7 @@ fn consumerTests() type {
 
         test "malformed recovery intent is durably removed from the active queue and counted" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -38605,7 +38605,7 @@ fn consumerTests() type {
             defer alloc.free(repair_dir);
             const intent_path = try std.fmt.allocPrint(alloc, "{s}/invalid.bin", .{repair_dir});
             defer alloc.free(intent_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
             try fs_paths.createDirPathPortable(io, repair_dir);
@@ -38630,7 +38630,7 @@ fn consumerTests() type {
 
         test "transient recovery intent read failure retains active work and retries successfully" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -38645,7 +38645,7 @@ fn consumerTests() type {
                 .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{} },
             );
             defer alloc.free(intent_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
@@ -38673,7 +38673,7 @@ fn consumerTests() type {
                 }
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 std.testing.allocator,
@@ -38697,7 +38697,7 @@ fn consumerTests() type {
         }
 
         test "dropped table recovery watchdog repairs a failed durable enqueue" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 std.testing.allocator,
@@ -38794,7 +38794,7 @@ fn consumerTests() type {
                 fn run(ptr: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.entered.store(true, .release);
-                    while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                    while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
 
                 pub fn deinit(ptr: *anyopaque) void {
@@ -38828,19 +38828,19 @@ fn consumerTests() type {
                 .run = JobProbe.run,
                 .deinit = JobProbe.deinit,
             });
-            while (!probe.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!probe.entered.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
             var quiesce = Quiesce{ .source = &source };
-            var thread = try std.testing.io.concurrent(Quiesce.run, .{&quiesce});
+            var thread = try platform.testing.io.concurrent(Quiesce.run, .{&quiesce});
             var thread_joined = false;
             defer if (!thread_joined) {
                 probe.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             };
-            while (source.lifecycle.load(.acquire) == .open) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (source.lifecycle.load(.acquire) == .open) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             try std.testing.expect(!quiesce.complete.load(.acquire));
             probe.release.store(true, .release);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             thread_joined = true;
 
             try std.testing.expect(quiesce.complete.load(.acquire));
@@ -38856,7 +38856,7 @@ fn consumerTests() type {
 
         test "provisioned table drop retains repair intent until catalog ownership clears" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -38911,7 +38911,7 @@ fn consumerTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
 
@@ -38956,7 +38956,7 @@ fn consumerTests() type {
 
         test "replica retirement journal distinguishes active retained and committed removal" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -38968,7 +38968,7 @@ fn consumerTests() type {
             defer alloc.free(db_path);
             const raft_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/node-42/raft-log", .{replica_root_dir});
             defer alloc.free(raft_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), raft_path);
@@ -39059,7 +39059,7 @@ fn consumerTests() type {
 
         test "replica retirement journal batches preserve every group phase" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -39105,7 +39105,7 @@ fn consumerTests() type {
             var prepared = try source.prepareReplicaRetirements(alloc, &targets);
             defer prepared.deinit();
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.testing.expect(prepared.batch_created);
             var persisted_prepared = try loadReplicaRetirementBatch(alloc, io_impl.io(), prepared.batch_path.?);
@@ -39174,7 +39174,7 @@ fn consumerTests() type {
 
         test "replica retirement batch identity is canonical and rejects duplicate groups" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -39214,7 +39214,7 @@ fn consumerTests() type {
 
         test "replica retirement recovery discards a legacy orphan whose catalog removal aborted" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -39224,7 +39224,7 @@ fn consumerTests() type {
             defer alloc.free(replica_root_dir);
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
             defer alloc.free(db_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
             var persisted = try persistReplicaRetirementIntent(alloc, replica_root_dir, 7001);
@@ -39270,7 +39270,7 @@ fn consumerTests() type {
         test "provisioned table write source drop table retires old publication authority" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-publication-authority", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
@@ -39322,7 +39322,7 @@ fn consumerTests() type {
         test "provisioned table write source drop table does not hold local db mutex during background delete" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-mutex", .{tmp.sub_path});
@@ -39352,7 +39352,7 @@ fn consumerTests() type {
                 }
             };
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), path);
             const marker_path = try std.fmt.allocPrint(alloc, "{s}/marker.txt", .{path});
@@ -39375,12 +39375,12 @@ fn consumerTests() type {
             defer test_before_drop_table_delete_hook = null;
 
             var worker = DropWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(DropWorker.run, .{&worker});
-            thread.await(std.testing.io);
+            var thread = try platform.testing.io.concurrent(DropWorker.run, .{&worker});
+            thread.await(platform.testing.io);
 
             if (worker.err) |err| return err;
 
-            while (!probe.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!probe.entered.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             try std.testing.expect(source.local_db_mutex.tryLock());
             source.local_db_mutex.unlock();
 
@@ -39556,7 +39556,7 @@ fn consumerTests() type {
             var ctx = DrainCtx{};
             try source.restore_repair_work_group.concurrent(source.tableActivityIo(), DrainCtx.run, .{&ctx});
 
-            while (ctx.started.load(.acquire) == 0) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (ctx.started.load(.acquire) == 0) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             source.deinit();
 
             try std.testing.expectEqual(@as(u32, 1), ctx.started.load(.acquire));
@@ -39565,7 +39565,7 @@ fn consumerTests() type {
 
         test "provisioned Raft snapshot install rejects a changed catalog contract" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/raft-snapshot-catalog-fence", .{tmp.sub_path});
             defer alloc.free(replica_root);
@@ -39815,7 +39815,7 @@ fn consumerTests() type {
 
         test "hosted background writes carry the selected catalog fence through routed Raft admission" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -40091,7 +40091,7 @@ fn implementationTests() type {
 
         test "restore staging private provisioning primes hidden owner without public catalog admission" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hidden-owner", .{tmp.sub_path});
             defer alloc.free(root);
@@ -40150,7 +40150,7 @@ fn implementationTests() type {
 
         test "restore staging private provisioning rebuilds both migration read mappings after restart" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/migration-owner", .{tmp.sub_path});
             defer alloc.free(root);
@@ -40220,7 +40220,7 @@ fn implementationTests() type {
         }
         test "replicated merge retains its resident writer while graph ownership cleanup is pending" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-graph-owner", .{tmp.sub_path});
             defer alloc.free(root);
@@ -40283,7 +40283,7 @@ fn implementationTests() type {
 
         test "hosted index lifecycle owner retries transient activation failure" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -40333,7 +40333,7 @@ fn implementationTests() type {
 
         test "hosted index lifecycle backs off repeated stale resident observation" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -40374,7 +40374,7 @@ fn implementationTests() type {
 
         test "hosted activation revalidates topology after final resident RPC" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -40415,7 +40415,7 @@ fn implementationTests() type {
 
         test "hosted index lifecycle durable wake repairs worker admission failure" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -40454,7 +40454,7 @@ fn implementationTests() type {
                 structural_reconcile_test_index_json,
             );
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             for (0..2_000) |_| {
                 if (activation_capture.calls.load(.acquire) != 0) break;
@@ -40468,7 +40468,7 @@ fn implementationTests() type {
 
         test "hosted source publication recovers durable dropped-table intent" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -40480,7 +40480,7 @@ fn implementationTests() type {
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
             defer alloc.free(db_path);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
             const intent_path = try persistDroppedTableRepairIntent(
@@ -41094,7 +41094,7 @@ fn implementationTests() type {
 
         test "provisioned table drop persists cleanup intent before filesystem failure and recovers after restart" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -41104,7 +41104,7 @@ fn implementationTests() type {
             defer alloc.free(replica_root_dir);
             const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
             defer alloc.free(group_path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), group_path);
             const trash_dir_path = try droppedTableTrashDirPath(alloc, replica_root_dir);
@@ -41159,7 +41159,7 @@ fn implementationTests() type {
 
         test "managed structural catch-up does not delegate an empty producer handoff" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(
@@ -41193,12 +41193,12 @@ fn implementationTests() type {
         test "managed visibility publish hook updates runtime status cache from live writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-managed-visibility-publish-status", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -41239,12 +41239,12 @@ fn implementationTests() type {
         test "provisioned table write source runtime status repairs cold dense placeholder" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-provisioned-write-runtime-status-cold-reopen", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -41343,7 +41343,7 @@ fn implementationTests() type {
         test "provisioned table write source runtime status recovers empty cache from storage" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-uncached-fallback", .{tmp.sub_path});
@@ -41476,7 +41476,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-leased-snapshot", .{tmp.sub_path});
@@ -41558,7 +41558,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-leased-dirty", .{tmp.sub_path});
@@ -41641,7 +41641,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-visibility-hook", .{tmp.sub_path});
@@ -41722,7 +41722,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-consistent-hook-busy", .{tmp.sub_path});
@@ -41754,7 +41754,7 @@ fn implementationTests() type {
         test "provisioned table write source best effort publish does not advertise lock contention as an empty table" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-best-effort-busy", .{tmp.sub_path});
@@ -41818,7 +41818,7 @@ fn implementationTests() type {
         test "provisioned table write source consistent visibility refreshes stale dense status" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-consistent-dense-refresh", .{tmp.sub_path});
@@ -41885,7 +41885,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-promote-synthetic", .{tmp.sub_path});
@@ -41964,7 +41964,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-replay-debt-publish", .{tmp.sub_path});
@@ -42028,7 +42028,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-leased-request-busy", .{tmp.sub_path});
@@ -42394,7 +42394,7 @@ fn implementationTests() type {
         test "managed startup catch-up open constructs bounded enrichment runtime without workers" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up/table-db", .{tmp.sub_path});
@@ -42426,7 +42426,7 @@ fn implementationTests() type {
         test "managed startup catch-up reclaims due obsolete primary run files" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-obsolete-reclaim", .{tmp.sub_path});
@@ -42464,7 +42464,7 @@ fn implementationTests() type {
                 for (runs) |*run| run.* = cursor.next().?.*;
                 _ = try backend.manifest_journal.persist(&backend, primary_root, runs);
             }
-            try std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{});
+            try std.Io.Dir.cwd().access(platform.testing.io, obsolete_path, .{});
             {
                 var persisted = try lsm_backend.Backend.open(alloc, primary_root, .{ .backend = .{ .read_only = true } });
                 defer persisted.close();
@@ -42479,7 +42479,7 @@ fn implementationTests() type {
 
             const result = try source.catchUpTableGroupBestEffortWithIndexesJson(alloc, 7001, "docs", indexes_json);
             try std.testing.expect(!result.busy);
-            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, obsolete_path, .{}));
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, obsolete_path, .{}));
 
             var statuses = (try source.source().localRuntimeStatuses(alloc, "docs")).?;
             defer statuses.deinit(alloc);
@@ -42497,7 +42497,7 @@ fn implementationTests() type {
 
         test "provisioned Raft snapshot install publishes a fenced group generation" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/raft-snapshot-install", .{tmp.sub_path});
             defer alloc.free(replica_root);
@@ -42539,7 +42539,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42574,7 +42574,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42639,7 +42639,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42678,7 +42678,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42775,7 +42775,7 @@ fn implementationTests() type {
 
         test "managed structural catch-up delegates durable generation repair without rebuilding inline" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(
@@ -42818,7 +42818,7 @@ fn implementationTests() type {
 
         test "managed structural catch-up leaves pending enrichment with the asynchronous owner" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(
@@ -42928,7 +42928,7 @@ fn implementationTests() type {
 
         test "managed structural catch-up does not replay a completed dense generation" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(
@@ -42978,7 +42978,7 @@ fn implementationTests() type {
 
         test "standalone managed structural catch-up owns admitted enrichment progress" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(
@@ -43023,7 +43023,7 @@ fn implementationTests() type {
                 outcome = try catchUpManagedIndexCreate(alloc, &db, cfg.name, false);
                 if (outcome == .complete) break;
                 try std.testing.expectEqual(ManagedIndexCreateCatchUp.retry, outcome);
-                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
             }
             try std.testing.expectEqual(ManagedIndexCreateCatchUp.complete, outcome);
             try std.testing.expect(try db.completedManagedDenseGenerationIsServiceable(alloc, cfg.name));
@@ -43032,11 +43032,11 @@ fn implementationTests() type {
 
         test "managed native restore repair retains target backend admission for staged open" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-native-restore-plan", .{tmp.sub_path});
             defer alloc.free(path);
-            defer std.Io.Dir.cwd().deleteTree(std.testing.io, path) catch {};
+            defer std.Io.Dir.cwd().deleteTree(platform.testing.io, path) catch {};
 
             const ConfiguratorContext = struct {
                 expected_path: []const u8,
@@ -43092,7 +43092,7 @@ fn implementationTests() type {
 
         test "bound table write source locally deletes artifact enrichment" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-table-write-source-delete-artifact-enrichment", .{tmp.sub_path});
             defer alloc.free(path);
@@ -43123,7 +43123,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -43145,7 +43145,7 @@ fn implementationTests() type {
 
         test "bound native restore preserves the validated generated generation" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-native-generation-db", .{tmp.sub_path});
             defer alloc.free(path);
@@ -43184,7 +43184,7 @@ fn implementationTests() type {
             defer freeBackupShards(alloc, shards);
             const local_snapshot = try std.fmt.allocPrint(alloc, "{s}.snapshots/bound-native-local", .{path});
             defer alloc.free(local_snapshot);
-            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, local_snapshot, .{}));
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, local_snapshot, .{}));
             const manifest = backups_api.TableBackupManifest{
                 .format = .native,
                 .backup_id = "bound-native",
@@ -43212,7 +43212,7 @@ fn implementationTests() type {
 
         test "bound table sources inspect and reprocess document artifact manifests" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-table-document-artifact-manifest", .{tmp.sub_path});
@@ -43331,7 +43331,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -43365,7 +43365,7 @@ fn implementationTests() type {
 
         test "bound stable single-group transaction retry does not reapply transforms" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-stable-txn-retry", .{tmp.sub_path});
             defer alloc.free(path);
@@ -43410,7 +43410,7 @@ fn implementationTests() type {
 
         test "bound single-group batch reports prepared intent conflicts" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-batch-intent-conflict", .{tmp.sub_path});
             defer alloc.free(path);
@@ -43442,7 +43442,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -43464,7 +43464,7 @@ fn implementationTests() type {
         test "provisioned table write source create table clears stale local group state" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-create-table-clears-stale-root", .{tmp.sub_path});
@@ -43520,7 +43520,7 @@ fn implementationTests() type {
                 });
             }
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const stale_change_journal_dir = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{db_path});
             defer alloc.free(stale_change_journal_dir);
@@ -43542,7 +43542,7 @@ fn implementationTests() type {
         test "provisioned table write source seeds doc identity namespace from table range" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-identity-namespace-root", .{tmp.sub_path});
@@ -43613,7 +43613,7 @@ fn implementationTests() type {
 
         fn testReplicatedSplitDestinationAdmission(comptime indexes_json: []const u8) !void {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-destination-identity", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
@@ -43942,7 +43942,7 @@ fn implementationTests() type {
         test "provisioned table write source rejects stale doc identity namespace before write" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const Catalog = struct {
@@ -44047,7 +44047,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44077,7 +44077,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44119,7 +44119,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44160,7 +44160,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44207,7 +44207,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44247,7 +44247,7 @@ fn implementationTests() type {
 
         test "bound table write source backs up and restores a local table" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-backup-restore/table-db", .{tmp.sub_path});
@@ -44255,7 +44255,7 @@ fn implementationTests() type {
             const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-backup-restore/backup", .{tmp.sub_path});
             defer alloc.free(backup_root);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -44333,7 +44333,7 @@ fn implementationTests() type {
 
         test "bound table write source backs up and restores a portable local table" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-portable-backup-restore/table-db", .{tmp.sub_path});
@@ -44341,7 +44341,7 @@ fn implementationTests() type {
             const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-portable-backup-restore/backup", .{tmp.sub_path});
             defer alloc.free(backup_root);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -44450,7 +44450,7 @@ fn implementationTests() type {
             defer backup_root_tmp.cleanup();
             const backup_root = backup_root_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -44577,10 +44577,10 @@ fn implementationTests() type {
         test "provisioned table restore retry repairs exact incomplete restore state through active writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
 
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
@@ -44731,10 +44731,10 @@ fn implementationTests() type {
         test "provisioned restore repair source deinit cancels sleeping retry worker" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
 
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
@@ -44837,7 +44837,7 @@ fn implementationTests() type {
 
         test "restore asynchronous repair observes cancellation before staged work" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-repair-cancellation", .{tmp.sub_path});
             defer alloc.free(path);
@@ -44850,7 +44850,7 @@ fn implementationTests() type {
                 repairRestoredDbRuntimeStateUntilCompleteWithIo(
                     alloc,
                     &db,
-                    std.testing.io,
+                    platform.testing.io,
                     7001,
                     1,
                     db_mod.types.CancellationToken.fromAtomic(&cancelled),
@@ -44861,10 +44861,10 @@ fn implementationTests() type {
         test "provisioned restore repair worker retries transient step failures to completion" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
 
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
@@ -44974,7 +44974,7 @@ fn implementationTests() type {
             defer restore_path_tmp.cleanup();
             const restore_path = restore_path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -45070,7 +45070,7 @@ fn implementationTests() type {
             defer backup_root_tmp.cleanup();
             const backup_root = backup_root_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -45185,7 +45185,7 @@ fn implementationTests() type {
             defer backup_root_tmp.cleanup();
             const backup_root = backup_root_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -45367,10 +45367,10 @@ fn implementationTests() type {
         test "provisioned native backup restore repeats through shared read and write owners" {
             const alloc = platform.allocator.processAllocator(std.testing.allocator);
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
 
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
@@ -45680,7 +45680,7 @@ fn implementationTests() type {
 
         test "prepared writer open evicts an inactive sibling group before retrying descriptor pressure" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/descriptor-pressure-cache", .{tmp.sub_path});
@@ -45762,7 +45762,7 @@ fn implementationTests() type {
 
         test "prepared writer open reclaims descriptor capacity from startup cache" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cross-cache-descriptor-pressure", .{tmp.sub_path});
@@ -45966,15 +45966,15 @@ fn implementationTests() type {
             var worker = Worker{ .source = &source, .gate_state = &gate_state };
 
             lockAtomic(&source.local_db_mutex);
-            var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(Worker.run, .{&worker});
             while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
             var attempts: usize = 0;
-            while (attempts < 1_000) : (attempts += 1) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (attempts < 1_000) : (attempts += 1) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             const completed_while_locked = worker.completed.load(.acquire);
             const gate_changed_while_locked = source.replication_write_gate != null;
             const metadata_count_while_locked = write_cache.table_metadata.items.len;
             source.local_db_mutex.unlock();
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
 
             try std.testing.expect(!completed_while_locked);
             try std.testing.expect(!gate_changed_while_locked);
@@ -46032,7 +46032,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -46163,7 +46163,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -46297,12 +46297,12 @@ fn implementationTests() type {
         test "auto bulk background finish skips entries with active foreground leases" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-auto-bulk-active-lease-skip", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -46401,7 +46401,7 @@ fn implementationTests() type {
         test "auto bulk group writes release leases so idle finish can publish" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/auto-bulk-group-write-release", .{tmp.sub_path});
@@ -46520,7 +46520,7 @@ fn implementationTests() type {
         test "weak-sync group writes publish all docs after background dense catch-up" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/auto-bulk-threshold-visible", .{tmp.sub_path});
@@ -46635,12 +46635,12 @@ fn implementationTests() type {
         test "dirty auto bulk writer publishes runtime status without closing the cached writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-provisioned-write-cache-publish-before-invalidate", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -46775,7 +46775,7 @@ fn implementationTests() type {
             defer replica_root_dir_tmp.cleanup();
             const replica_root_dir = replica_root_dir_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
@@ -46872,7 +46872,7 @@ fn implementationTests() type {
             defer local_write_test_hooks.test_before_batch_execution_hook = null;
 
             var batch_worker = BatchWorker{ .source = &source, .alloc = alloc };
-            var batch_thread = try std.testing.io.concurrent(BatchWorker.run, .{&batch_worker});
+            var batch_thread = try platform.testing.io.concurrent(BatchWorker.run, .{&batch_worker});
 
             const ReadWorker = struct {
                 source: *ProvisionedTableWriteSource,
@@ -46889,9 +46889,9 @@ fn implementationTests() type {
             while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
 
             var read_worker = ReadWorker{ .source = &source };
-            var read_thread = std.testing.io.concurrent(ReadWorker.run, .{&read_worker}) catch |err| {
+            var read_thread = platform.testing.io.concurrent(ReadWorker.run, .{&read_worker}) catch |err| {
                 probe.release.store(true, .release);
-                batch_thread.await(std.testing.io);
+                batch_thread.await(platform.testing.io);
                 return err;
             };
             var threads_joined = false;
@@ -46899,8 +46899,8 @@ fn implementationTests() type {
                 // A failed assertion must release both workers before joining them;
                 // otherwise this regression masks the failure as a hung test shard.
                 probe.release.store(true, .release);
-                read_thread.await(std.testing.io);
-                batch_thread.await(std.testing.io);
+                read_thread.await(platform.testing.io);
+                batch_thread.await(platform.testing.io);
             };
 
             while (!read_worker.started.load(.acquire)) std.atomic.spinLoopHint();
@@ -46910,14 +46910,14 @@ fn implementationTests() type {
                     completed_before_batch_release = true;
                     break;
                 }
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             const cached_entries_before_batch_release = write_cache.entries.items.len;
             const dirty_before_batch_release = source.isWriteCacheDirtyForTable("docs");
 
             probe.release.store(true, .release);
-            read_thread.await(std.testing.io);
-            batch_thread.await(std.testing.io);
+            read_thread.await(platform.testing.io);
+            batch_thread.await(platform.testing.io);
             threads_joined = true;
 
             try std.testing.expect(completed_before_batch_release);
@@ -46935,7 +46935,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -47026,7 +47026,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47073,7 +47073,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47111,7 +47111,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47152,7 +47152,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47190,7 +47190,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47231,7 +47231,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47275,7 +47275,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47316,7 +47316,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47354,7 +47354,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47392,7 +47392,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47433,7 +47433,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47471,7 +47471,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47518,7 +47518,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47568,7 +47568,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47609,7 +47609,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47653,7 +47653,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47688,7 +47688,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47732,7 +47732,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47779,7 +47779,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47826,7 +47826,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47873,7 +47873,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47920,7 +47920,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47961,7 +47961,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47999,7 +47999,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48040,7 +48040,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48081,7 +48081,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48122,7 +48122,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48151,7 +48151,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48184,7 +48184,7 @@ fn implementationTests() type {
 
         test "bound table write source aborts graph transform transaction on validation failure" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-graph-transform-txn", .{tmp.sub_path});
             defer alloc.free(path);
@@ -48226,7 +48226,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48256,7 +48256,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48294,7 +48294,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48330,7 +48330,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48372,7 +48372,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48413,7 +48413,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48451,7 +48451,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48494,7 +48494,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48688,7 +48688,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48709,32 +48709,32 @@ fn implementationTests() type {
             defer local_write_test_hooks.test_before_batch_execution_hook = null;
 
             var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-            var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+            var first_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
             defer {
                 probe.release_first.store(true, .release);
-                first_thread.await(std.testing.io);
+                first_thread.await(platform.testing.io);
             }
             while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
             var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":\"beta\"}" };
             var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
-            var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+            var second_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
             defer {
                 probe.release_first.store(true, .release);
-                second_thread.await(std.testing.io);
+                second_thread.await(platform.testing.io);
             }
-            var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+            var third_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
             defer {
                 probe.release_first.store(true, .release);
-                third_thread.await(std.testing.io);
+                third_thread.await(platform.testing.io);
             }
 
             try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
             probe.release_first.store(true, .release);
 
-            first_thread.await(std.testing.io);
-            second_thread.await(std.testing.io);
-            third_thread.await(std.testing.io);
+            first_thread.await(platform.testing.io);
+            second_thread.await(platform.testing.io);
+            third_thread.await(platform.testing.io);
             if (first.err) |err| return err;
             if (second.err) |err| return err;
             if (third.err) |err| return err;
@@ -48758,7 +48758,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48775,25 +48775,25 @@ fn implementationTests() type {
             defer local_write_test_hooks.test_before_batch_execution_hook = null;
 
             var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{}" };
-            var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+            var first_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
             defer {
                 for (&probe.release) |*release| release.store(true, .release);
-                first_thread.await(std.testing.io);
+                first_thread.await(platform.testing.io);
             }
             while (!probe.entered[0].load(.acquire)) std.atomic.spinLoopHint();
 
             var owner_completed: std.atomic.Value(bool) = .init(false);
             var owner = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{}", .completed = &owner_completed };
             var peer = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{}" };
-            var owner_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&owner});
+            var owner_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&owner});
             defer {
                 for (&probe.release) |*release| release.store(true, .release);
-                owner_thread.await(std.testing.io);
+                owner_thread.await(platform.testing.io);
             }
-            var peer_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&peer});
+            var peer_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&peer});
             defer {
                 for (&probe.release) |*release| release.store(true, .release);
-                peer_thread.await(std.testing.io);
+                peer_thread.await(platform.testing.io);
             }
             try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
 
@@ -48801,10 +48801,10 @@ fn implementationTests() type {
             while (!probe.entered[1].load(.acquire)) std.atomic.spinLoopHint();
 
             var successor = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:d", .value = "{}" };
-            var successor_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&successor});
+            var successor_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&successor});
             defer {
                 for (&probe.release) |*release| release.store(true, .release);
-                successor_thread.await(std.testing.io);
+                successor_thread.await(platform.testing.io);
             }
             try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
             probe.release[1].store(true, .release);
@@ -48815,10 +48815,10 @@ fn implementationTests() type {
             const owner_returned_before_successor_finished = owner_completed.load(.acquire);
             probe.release[2].store(true, .release);
 
-            first_thread.await(std.testing.io);
-            owner_thread.await(std.testing.io);
-            peer_thread.await(std.testing.io);
-            successor_thread.await(std.testing.io);
+            first_thread.await(platform.testing.io);
+            owner_thread.await(platform.testing.io);
+            peer_thread.await(platform.testing.io);
+            successor_thread.await(platform.testing.io);
             if (first.err) |err| return err;
             if (owner.err) |err| return err;
             if (peer.err) |err| return err;
@@ -48832,7 +48832,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48853,33 +48853,33 @@ fn implementationTests() type {
             defer local_write_test_hooks.test_before_batch_execution_hook = null;
 
             var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-            var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+            var first_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
             defer {
                 probe.release_first.store(true, .release);
-                first_thread.await(std.testing.io);
+                first_thread.await(platform.testing.io);
             }
             while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
             var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
             var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{\"title\":\"beta\"}" };
-            var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+            var second_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
             defer {
                 probe.release_first.store(true, .release);
-                second_thread.await(std.testing.io);
+                second_thread.await(platform.testing.io);
             }
             try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
-            var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+            var third_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
             defer {
                 probe.release_first.store(true, .release);
-                third_thread.await(std.testing.io);
+                third_thread.await(platform.testing.io);
             }
 
             try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
             probe.release_first.store(true, .release);
 
-            first_thread.await(std.testing.io);
-            second_thread.await(std.testing.io);
-            third_thread.await(std.testing.io);
+            first_thread.await(platform.testing.io);
+            second_thread.await(platform.testing.io);
+            third_thread.await(platform.testing.io);
             if (first.err) |err| return err;
             if (second.err) |err| return err;
             if (third.err) |err| return err;
@@ -48898,7 +48898,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48919,10 +48919,10 @@ fn implementationTests() type {
             defer local_write_test_hooks.test_before_batch_execution_hook = null;
 
             var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-            var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+            var first_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
             defer {
                 probe.release_first.store(true, .release);
-                first_thread.await(std.testing.io);
+                first_thread.await(platform.testing.io);
             }
             while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
@@ -48932,24 +48932,24 @@ fn implementationTests() type {
             // delete succeeds independently.
             var second = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .value = "{not json" };
             var third = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:order", .delete = true };
-            var second_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
+            var second_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&second});
             defer {
                 probe.release_first.store(true, .release);
-                second_thread.await(std.testing.io);
+                second_thread.await(platform.testing.io);
             }
             try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 1);
-            var third_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
+            var third_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&third});
             defer {
                 probe.release_first.store(true, .release);
-                third_thread.await(std.testing.io);
+                third_thread.await(platform.testing.io);
             }
 
             try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
             probe.release_first.store(true, .release);
 
-            first_thread.await(std.testing.io);
-            second_thread.await(std.testing.io);
-            third_thread.await(std.testing.io);
+            first_thread.await(platform.testing.io);
+            second_thread.await(platform.testing.io);
+            third_thread.await(platform.testing.io);
             if (first.err) |err| return err;
             try std.testing.expect(second.err != null);
             if (third.err) |err| return err;
@@ -48966,7 +48966,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48987,32 +48987,32 @@ fn implementationTests() type {
             defer local_write_test_hooks.test_before_batch_execution_hook = null;
 
             var first = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:a", .value = "{\"title\":\"alpha\"}" };
-            var first_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
+            var first_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&first});
             defer {
                 probe.release_first.store(true, .release);
-                first_thread.await(std.testing.io);
+                first_thread.await(platform.testing.io);
             }
             while (!probe.first_entered.load(.acquire)) std.atomic.spinLoopHint();
 
             var invalid = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:b", .value = "{\"title\":" };
             var valid = ProvisionedWriteCoalesceBatchWorker{ .source = &source, .key = "doc:c", .value = "{\"title\":\"gamma\"}" };
-            var invalid_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&invalid});
+            var invalid_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&invalid});
             defer {
                 probe.release_first.store(true, .release);
-                invalid_thread.await(std.testing.io);
+                invalid_thread.await(platform.testing.io);
             }
-            var valid_thread = try std.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&valid});
+            var valid_thread = try platform.testing.io.concurrent(ProvisionedWriteCoalesceBatchWorker.run, .{&valid});
             defer {
                 probe.release_first.store(true, .release);
-                valid_thread.await(std.testing.io);
+                valid_thread.await(platform.testing.io);
             }
 
             try source.testingWaitForWriteCoalesceQueueEntries("docs", 7001, 2);
             probe.release_first.store(true, .release);
 
-            first_thread.await(std.testing.io);
-            invalid_thread.await(std.testing.io);
-            valid_thread.await(std.testing.io);
+            first_thread.await(platform.testing.io);
+            invalid_thread.await(platform.testing.io);
+            valid_thread.await(platform.testing.io);
             if (first.err) |err| return err;
             try std.testing.expect(invalid.err != null);
             if (valid.err) |err| return err;
@@ -49032,7 +49032,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -49171,7 +49171,7 @@ fn implementationTests() type {
                 }
             };
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -49308,7 +49308,7 @@ fn implementationTests() type {
                 }
             };
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -49418,7 +49418,7 @@ fn implementationTests() type {
         test "provisioned managed replay tails converge and publish without later traffic" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-managed-replay-tail", .{tmp.sub_path});
             defer alloc.free(path);
@@ -49899,7 +49899,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50070,8 +50070,8 @@ fn implementationTests() type {
                     defer parsed_req.deinit();
 
                     _ = self.request_count.fetchAdd(1, .monotonic);
-                    self.entered.set(std.testing.io);
-                    self.release.waitUncancelable(std.testing.io);
+                    self.entered.set(platform.testing.io);
+                    self.release.waitUncancelable(platform.testing.io);
 
                     const body = try successBody(arena, parsed_req.value.input);
                     return .{
@@ -50082,7 +50082,7 @@ fn implementationTests() type {
                 }
 
                 fn allowAll(self: *@This()) void {
-                    self.release.set(std.testing.io);
+                    self.release.set(platform.testing.io);
                 }
             };
 
@@ -50129,7 +50129,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50174,7 +50174,7 @@ fn implementationTests() type {
 
             // Hold the response until the stale reader exists. Returning 429
             // here couples cache invalidation to unrelated provider backoff.
-            try embedding_provider.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
+            try embedding_provider.entered.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(30), .clock = .awake } });
 
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, path, 7001);
             defer alloc.free(db_path);
@@ -50310,7 +50310,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50353,12 +50353,12 @@ fn implementationTests() type {
         test "provisioned table write source runtime statuses reconcile empty embeddings indexes" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-provisioned-write-runtime-status-managed", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50427,7 +50427,7 @@ fn implementationTests() type {
         test "provisioned table write source recovers durable status without shared snapshot" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -50436,7 +50436,7 @@ fn implementationTests() type {
             );
             defer alloc.free(path);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50501,7 +50501,7 @@ fn implementationTests() type {
         test "provisioned writer cache starts DB workers after stable entry installation" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const Catalog = struct {
                 var table_records = [_]metadata_table_manager.TableRecord{.{
@@ -50594,7 +50594,7 @@ fn implementationTests() type {
         test "provisioned table write cache retires stale db when index metadata changes" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-metadata-refresh", .{tmp.sub_path});
             defer alloc.free(path);
@@ -50674,7 +50674,7 @@ fn implementationTests() type {
 
         test "provider shutdown barrier closes cached dbs and remains idempotent" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -50707,7 +50707,7 @@ fn implementationTests() type {
 
         test "provider shutdown barrier joins an in-flight generated embedding call" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -50817,18 +50817,18 @@ fn implementationTests() type {
                 }
             };
             var close = Close{ .cache = &cache };
-            var thread = try std.testing.io.concurrent(Close.run, .{&close});
+            var thread = try platform.testing.io.concurrent(Close.run, .{&close});
             var thread_joined = false;
             defer if (!thread_joined) {
                 provider.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             };
             while (!close.started.load(.acquire)) std.atomic.spinLoopHint();
             sleepNs(10 * std.time.ns_per_ms);
             try std.testing.expect(!close.returned.load(.acquire));
 
             provider.release.store(true, .release);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             thread_joined = true;
             try std.testing.expect(!close.failed.load(.acquire));
             try std.testing.expect(close.returned.load(.acquire));
@@ -50840,7 +50840,7 @@ fn implementationTests() type {
         test "provisioned transition writer fences exact supplied table metadata" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -50938,7 +50938,7 @@ fn implementationTests() type {
         test "provisioned transition identity reassignment opens only the same table" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -51014,12 +51014,12 @@ fn implementationTests() type {
         test "provisioned create index enqueues target-fenced cached-writer activation" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-create-index-cached-writer", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
@@ -51287,7 +51287,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -51436,18 +51436,18 @@ fn implementationTests() type {
             defer if (operation_active) source.endGroupOperation("docs", 7001);
 
             var queued_writer = WriterWorker{ .source = &source };
-            var writer_thread = try std.testing.io.concurrent(WriterWorker.run, .{&queued_writer});
+            var writer_thread = try platform.testing.io.concurrent(WriterWorker.run, .{&queued_writer});
             defer {
                 queued_writer.release.store(true, .release);
-                writer_thread.await(std.testing.io);
+                writer_thread.await(platform.testing.io);
             }
             while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
             var worker = ReaderWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(ReaderWorker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(ReaderWorker.run, .{&worker});
             defer {
                 worker.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             }
 
             // The writer remains exclusive until it has leased the authoritative
@@ -51502,10 +51502,10 @@ fn implementationTests() type {
             defer if (operation_active) source.endGroupOperation("docs", 7001);
 
             var worker = Worker{ .source = &source };
-            var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(Worker.run, .{&worker});
             defer {
                 worker.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             }
             while (source.testingGroupTransitionWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
@@ -51556,18 +51556,18 @@ fn implementationTests() type {
             defer if (initial_read_active) initial_read.deinit();
 
             var transition_worker = TransitionWorker{ .source = &source };
-            var transition_thread = try std.testing.io.concurrent(TransitionWorker.run, .{&transition_worker});
+            var transition_thread = try platform.testing.io.concurrent(TransitionWorker.run, .{&transition_worker});
             defer {
                 transition_worker.release.store(true, .release);
-                transition_thread.await(std.testing.io);
+                transition_thread.await(platform.testing.io);
             }
             while (source.testingGroupTransitionWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
             var reader_worker = ReaderWorker{ .source = &source };
-            var reader_thread = try std.testing.io.concurrent(ReaderWorker.run, .{&reader_worker});
+            var reader_thread = try platform.testing.io.concurrent(ReaderWorker.run, .{&reader_worker});
             defer {
                 transition_worker.release.store(true, .release);
-                reader_thread.await(std.testing.io);
+                reader_thread.await(platform.testing.io);
             }
             for (0..10_000) |_| std.atomic.spinLoopHint();
             try std.testing.expect(!reader_worker.entered.load(.acquire));
@@ -51712,7 +51712,7 @@ fn implementationTests() type {
             };
 
             var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-repair-status-admission", NoCatalog.iface());
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
             const live_status = source.beginStatusRequest("docs");
@@ -51840,7 +51840,7 @@ fn implementationTests() type {
 
         test "managed index repair metadata mismatch hands off to structural reconciliation" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repair-metadata-handoff", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
@@ -51969,10 +51969,10 @@ fn implementationTests() type {
             defer if (initial_read_active) initial_read.deinit();
 
             var write_worker = WriteWorker{ .source = &source };
-            var write_thread = try std.testing.io.concurrent(WriteWorker.run, .{&write_worker});
+            var write_thread = try platform.testing.io.concurrent(WriteWorker.run, .{&write_worker});
             defer {
                 write_worker.release.store(true, .release);
-                write_thread.await(std.testing.io);
+                write_thread.await(platform.testing.io);
             }
             while (source.testingGroupOperationWaiterCount("docs", 7001) == 0) std.atomic.spinLoopHint();
 
@@ -51988,10 +51988,10 @@ fn implementationTests() type {
             )) == null);
 
             var read_worker = ReadWorker{ .source = &source };
-            var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
-            defer read_thread.await(std.testing.io);
+            var read_thread = try platform.testing.io.concurrent(ReadWorker.run, .{&read_worker});
+            defer read_thread.await(platform.testing.io);
 
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!read_worker.entered.load(.acquire));
@@ -52007,7 +52007,7 @@ fn implementationTests() type {
 
         test "hosted index lifecycle callback hands exact target to persistent control plane" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -52107,7 +52107,7 @@ fn implementationTests() type {
 
         test "repair handoff status settles after authoritative cached publication" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -52201,7 +52201,7 @@ fn implementationTests() type {
 
         test "live repair final audit excludes concurrent group mutation through publication" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -52340,7 +52340,7 @@ fn implementationTests() type {
 
         test "live repair validates resident writer against current catalog not queued metadata" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -52443,7 +52443,7 @@ fn implementationTests() type {
 
         test "terminal repair publication settles handoff or retains one fenced retry" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -52545,7 +52545,7 @@ fn implementationTests() type {
 
         test "managed create publication handoff releases on converged owner publication" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -52587,7 +52587,7 @@ fn implementationTests() type {
 
         test "structural reconcile publishes durable index repair debt once per group" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/structural-repair-handoff", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
@@ -52912,7 +52912,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-read-cache-hbc", .{tmp.sub_path});
@@ -53027,7 +53027,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-read-cache-preserve-replay", .{tmp.sub_path});
@@ -53168,7 +53168,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-repair-read-state", .{tmp.sub_path});
@@ -53441,7 +53441,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-path-cache-invalidation", .{tmp.sub_path});
@@ -53549,7 +53549,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-repair-stale-docid", .{tmp.sub_path});
@@ -53580,7 +53580,7 @@ fn implementationTests() type {
 
         test "fenced blocking status publication preserves accepted serving snapshot" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -53688,7 +53688,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-no-read-cache-invalidate", .{tmp.sub_path});
@@ -53770,7 +53770,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standby-ha-replay-index-reconcile", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
@@ -53894,7 +53894,7 @@ fn implementationTests() type {
                     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
                 };
 
-                var tmp = std.testing.tmpDir(.{});
+                var tmp = platform.testing.tmpDir(.{});
                 defer tmp.cleanup();
                 const replica_root_dir = try std.fmt.allocPrint(
                     alloc,
@@ -54015,7 +54015,7 @@ fn implementationTests() type {
                 }
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicated-sync-runtime-dirty", .{tmp.sub_path});
@@ -54081,7 +54081,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-retired-writer", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
@@ -54142,7 +54142,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-fail-closed-replacement", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
@@ -54260,7 +54260,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-live-target-overlay", .{tmp.sub_path});
@@ -54392,7 +54392,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-live-overlay-cold-visibility", .{tmp.sub_path});
@@ -54467,7 +54467,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-live-replay-clear-ambiguous-backfill", .{tmp.sub_path});
@@ -54579,7 +54579,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-live-replay-preserve-backfill", .{tmp.sub_path});
@@ -54695,7 +54695,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-warmed-read-cache-profiled-query", .{tmp.sub_path});
@@ -54742,7 +54742,7 @@ fn implementationTests() type {
         test "provisioned table read source survives many external write-sync batches before first profiled dense query" {
             var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             defer std.debug.assert(allocator_state.deinit() == 0);
-            const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+            const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
             const total_docs: usize = 50_000;
             const batch_size: usize = 250;
             const dims: usize = 384;
@@ -54811,7 +54811,7 @@ fn implementationTests() type {
                 }
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-profiled-external-write-sync-many", .{tmp.sub_path});
@@ -54988,7 +54988,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-bulk-ingest-active", .{tmp.sub_path});
@@ -55090,7 +55090,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-auto-bulk-active", .{tmp.sub_path});
@@ -55184,7 +55184,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-auto-bulk-active-lease", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
@@ -55275,7 +55275,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/read-prep-auto-bulk-dirty", .{tmp.sub_path});
@@ -55344,7 +55344,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-auto-bulk-expired", .{tmp.sub_path});
@@ -55395,7 +55395,7 @@ fn implementationTests() type {
 
         test "later startup activity cannot revoke authority for the same runtime root" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -55432,7 +55432,7 @@ fn implementationTests() type {
         test "runtime status snapshot with startup phase refreshes live table stats for active group" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-startup-phase-overlay/table-db", .{tmp.sub_path});
@@ -55528,7 +55528,7 @@ fn implementationTests() type {
         test "startup runtime status snapshot with live db refreshes table stats during active startup" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/startup-runtime-status-live-db/table-db", .{tmp.sub_path});
@@ -55615,7 +55615,7 @@ fn implementationTests() type {
         test "startup runtime status snapshot publishes live db when active cache is empty" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/startup-runtime-status-live-db-empty-cache/table-db", .{tmp.sub_path});
@@ -55673,7 +55673,7 @@ fn implementationTests() type {
         test "best effort startup runtime status publishes live db when cache is empty" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-startup-empty-cache/table-db", .{tmp.sub_path});
@@ -55728,7 +55728,7 @@ fn implementationTests() type {
         test "runtime status snapshot with idle phase refreshes live stats after startup catch-up" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-startup-phase-idle/table-db", .{tmp.sub_path});
@@ -55822,7 +55822,7 @@ fn implementationTests() type {
         test "idle startup runtime status publish is live when startup flag is still set" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-startup-idle-active-flag/table-db", .{tmp.sub_path});
@@ -55877,7 +55877,7 @@ fn implementationTests() type {
         test "idle startup runtime status preserves live empty cached status" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-startup-idle-live-empty/table-db", .{tmp.sub_path});
@@ -55937,7 +55937,7 @@ fn implementationTests() type {
         test "managed startup catch-up uses provided indexes json without catalog fetch" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-provided-indexes", .{tmp.sub_path});
@@ -56043,7 +56043,7 @@ fn implementationTests() type {
         test "clean generated startup inspection does not retain a resident writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -56144,7 +56144,7 @@ fn implementationTests() type {
         test "busy startup open preserves fresh writer runtime status" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-busy-status", .{tmp.sub_path});
@@ -56213,7 +56213,7 @@ fn implementationTests() type {
         test "managed startup catch-up marks FileNotFound index open terminal degraded" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-terminal-missing-index", .{tmp.sub_path});
@@ -56362,7 +56362,7 @@ fn implementationTests() type {
         test "managed startup catch-up preserves restore repair debt while index load is terminal" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-restore-before-terminal-load", .{tmp.sub_path});
@@ -56454,7 +56454,7 @@ fn implementationTests() type {
         test "managed startup catch-up bypasses shared write cache" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-cache", .{tmp.sub_path});
@@ -56522,7 +56522,7 @@ fn implementationTests() type {
         test "provisioned write cache close detaches promotion leadership callback before stats" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-close-detaches-promotion-owner", .{tmp.sub_path});
@@ -56602,7 +56602,7 @@ fn implementationTests() type {
         test "managed startup catch-up invalidates stale cached writer status after replay clears debt" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-invalidates-stale-cache", .{tmp.sub_path});
@@ -56698,7 +56698,7 @@ fn implementationTests() type {
         test "live managed repair leaves resident replay and status reads nonblocking" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-repeat-replay", .{tmp.sub_path});
@@ -56860,7 +56860,7 @@ fn implementationTests() type {
             try std.testing.expect(try cached.db.hasPendingIndexRepairIntents(alloc));
             cached.deinit(alloc);
 
-            var status_io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var status_io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer status_io_impl.deinit();
             const status_io = status_io_impl.io();
             var status_poller = StatusPoller{ .source = &source };
@@ -56946,7 +56946,7 @@ fn implementationTests() type {
 
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(
@@ -57038,7 +57038,7 @@ fn implementationTests() type {
 
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -57136,7 +57136,7 @@ fn implementationTests() type {
         test "managed startup catch-up defers while shared writer cache owns the table" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-defers-shared-writer", .{tmp.sub_path});
@@ -57205,7 +57205,7 @@ fn implementationTests() type {
         test "managed startup catch-up defers while foreground writer state is dirty" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-defers-dirty-writer", .{tmp.sub_path});
@@ -57252,7 +57252,7 @@ fn implementationTests() type {
         test "write cache invalidation retires leased entry until release" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-lease-retire", .{tmp.sub_path});
@@ -57317,7 +57317,7 @@ fn implementationTests() type {
         test "write cache blocks same-root generation replacement while stale lease stays live" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-retire-multiple-stale", .{tmp.sub_path});
@@ -57417,7 +57417,7 @@ fn implementationTests() type {
             var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
             const alloc = failing.allocator();
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-retire-oom", .{tmp.sub_path});
@@ -57533,7 +57533,7 @@ fn implementationTests() type {
         test "provisioned group apply releases source mutex and retires readers opened during apply" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-group-batch-mutex", .{tmp.sub_path});
@@ -57620,10 +57620,10 @@ fn implementationTests() type {
             defer local_write_test_hooks.test_before_batch_execution_hook = null;
 
             var worker = BatchWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(BatchWorker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(BatchWorker.run, .{&worker});
             defer {
                 probe.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             }
 
             while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -57635,7 +57635,7 @@ fn implementationTests() type {
             pre_commit.release();
 
             probe.release.store(true, .release);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
 
             if (worker.err) |err| return err;
 
@@ -57649,7 +57649,7 @@ fn implementationTests() type {
         test "provisioned table drop scopes cache-open fence after activity drain and before callbacks" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -57711,7 +57711,7 @@ fn implementationTests() type {
         test "provisioned table write source drop table waits for in-flight group batch on same table" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-waits-for-batch", .{tmp.sub_path});
@@ -57810,10 +57810,10 @@ fn implementationTests() type {
             defer test_before_drop_table_delete_hook = null;
 
             var batch_worker = BatchWorker{ .source = &source };
-            var batch_thread = try std.testing.io.concurrent(BatchWorker.run, .{&batch_worker});
+            var batch_thread = try platform.testing.io.concurrent(BatchWorker.run, .{&batch_worker});
             defer {
                 batch_probe.release.store(true, .release);
-                batch_thread.await(std.testing.io);
+                batch_thread.await(platform.testing.io);
             }
             while (!batch_probe.entered.load(.acquire)) std.atomic.spinLoopHint();
 
@@ -57821,23 +57821,23 @@ fn implementationTests() type {
             // batch already owns its writer, so it can finish after this transition.
             catalog.dropped.store(true, .release);
             var drop_worker = DropWorker{ .source = &source };
-            var drop_thread = try std.testing.io.concurrent(DropWorker.run, .{&drop_worker});
+            var drop_thread = try platform.testing.io.concurrent(DropWorker.run, .{&drop_worker});
             defer {
                 batch_probe.release.store(true, .release);
                 drop_probe.release.store(true, .release);
-                drop_thread.await(std.testing.io);
+                drop_thread.await(platform.testing.io);
             }
 
             sleepNs(10 * std.time.ns_per_ms);
             try std.testing.expect(!drop_probe.entered.load(.acquire));
 
             batch_probe.release.store(true, .release);
-            batch_thread.await(std.testing.io);
+            batch_thread.await(platform.testing.io);
             if (batch_worker.err) |err| return err;
 
             while (!drop_probe.entered.load(.acquire)) std.atomic.spinLoopHint();
             drop_probe.release.store(true, .release);
-            drop_thread.await(std.testing.io);
+            drop_thread.await(platform.testing.io);
             if (drop_worker.err) |err| return err;
         }
 
@@ -57864,10 +57864,10 @@ fn implementationTests() type {
             var clock: Clock = .{};
             Clock.active = &clock;
             defer Clock.active = null;
-            var vtable = std.testing.io.vtable.*;
+            var vtable = platform.testing.io.vtable.*;
             vtable.now = Clock.now;
             vtable.sleep = Clock.sleep;
-            const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+            const io: Io = .{ .userdata = platform.testing.io.userdata, .vtable = &vtable };
             var runtime = try db_mod.background_runtime.BackendRuntime.init(std.testing.allocator, .{
                 .backend = .manual,
                 .borrowed_io = .{ .general = io },
@@ -57906,7 +57906,7 @@ fn implementationTests() type {
         test "provisioned table write source drop table closes schema-bearing cached writer once" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-schema-cached-writer", .{tmp.sub_path});
@@ -58009,7 +58009,7 @@ fn implementationTests() type {
             try std.testing.expectError(error.TableWriteDrainTimeout, source.source().dropTable(alloc, "docs", contract));
             try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
             try std.testing.expectEqual(@as(usize, 1), write_cache.retired_entries.items.len);
-            try std.Io.Dir.cwd().access(std.testing.io, path, .{});
+            try std.Io.Dir.cwd().access(platform.testing.io, path, .{});
             var retained_doc = (try metric_pins.entries()[0].db.lookup(alloc, "doc:1", .{})) orelse return error.TestUnexpectedResult;
             defer retained_doc.deinit(alloc);
 
@@ -58022,8 +58022,8 @@ fn implementationTests() type {
 
                 fn beforeClose(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    self.entered.set(std.testing.io);
-                    self.release.waitUncancelable(std.testing.io);
+                    self.entered.set(platform.testing.io);
+                    self.release.waitUncancelable(platform.testing.io);
                 }
             };
             var close_probe: CloseProbe = .{};
@@ -58031,12 +58031,12 @@ fn implementationTests() type {
             defer test_before_write_cache_close_hook = null;
             metric_pins.deinit(alloc);
             metric_pins_active = false;
-            var closer = try std.testing.io.concurrent(ProvisionedTableWriteCache.drainPendingCloses, .{&write_cache});
+            var closer = try platform.testing.io.concurrent(ProvisionedTableWriteCache.drainPendingCloses, .{&write_cache});
             defer {
-                close_probe.release.set(std.testing.io);
-                closer.await(std.testing.io);
+                close_probe.release.set(platform.testing.io);
+                closer.await(platform.testing.io);
             }
-            try close_probe.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            try close_probe.entered.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
             try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
             try std.testing.expect(!write_cache.tryDrainRetiredGroupTable(7001, "docs", false));
@@ -58047,7 +58047,7 @@ fn implementationTests() type {
                 err: ?anyerror = null,
 
                 fn run(self: *@This()) void {
-                    defer self.done.set(std.testing.io);
+                    defer self.done.set(platform.testing.io);
                     self.source.executeDroppedTableCleanup(std.testing.allocator, "docs", self.contract, false) catch |err| {
                         self.err = err;
                     };
@@ -58059,31 +58059,31 @@ fn implementationTests() type {
                 source.dropped_table_cleanup_outer_mutex = fence;
                 defer source.dropped_table_cleanup_outer_mutex = null;
                 var attempt: DropAttempt = .{ .source = &source, .contract = contract };
-                var dropper = try std.testing.io.concurrent(DropAttempt.run, .{&attempt});
+                var dropper = try platform.testing.io.concurrent(DropAttempt.run, .{&attempt});
                 errdefer {
-                    close_probe.release.set(std.testing.io);
-                    dropper.await(std.testing.io);
+                    close_probe.release.set(platform.testing.io);
+                    dropper.await(platform.testing.io);
                 }
-                try attempt.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
-                dropper.await(std.testing.io);
+                try attempt.done.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+                dropper.await(platform.testing.io);
                 try std.testing.expectEqual(error.TableWriteDrainTimeout, attempt.err.?);
             }
-            try std.Io.Dir.cwd().access(std.testing.io, path, .{});
-            close_probe.release.set(std.testing.io);
-            closer.await(std.testing.io);
+            try std.Io.Dir.cwd().access(platform.testing.io, path, .{});
+            close_probe.release.set(platform.testing.io);
+            closer.await(platform.testing.io);
             // The durable cleanup intent must converge once the last lease releases.
             try std.testing.expect(!try source.recoverDroppedTableRepairIntents(alloc));
             try std.testing.expectEqual(@as(usize, 0), write_cache.retired_entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), write_cache.closing_entries.items.len);
-            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, path, .{}));
             write_cache.drainPendingCloses();
-            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, path, .{}));
         }
 
         test "provisioned table write source drop table waits for active read cache lease" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-table-waits-for-read-cache", .{tmp.sub_path});
@@ -58147,7 +58147,7 @@ fn implementationTests() type {
                 defer db.close();
             }
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
 
             var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
@@ -58194,9 +58194,9 @@ fn implementationTests() type {
             defer test_before_drop_table_delete_hook = null;
 
             var worker = DropWorker{ .source = &source };
-            var thread = try std.testing.io.concurrent(DropWorker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(DropWorker.run, .{&worker});
             var thread_joined = false;
-            defer if (!thread_joined) thread.await(std.testing.io);
+            defer if (!thread_joined) thread.await(platform.testing.io);
 
             // Observe the actual exclusive-cache barrier before checking deletion.
             // A fixed sleep can false-pass when the worker has not been scheduled.
@@ -58210,7 +58210,7 @@ fn implementationTests() type {
             if (!barrier_observed) {
                 read_lease.release();
                 read_lease_active = false;
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
                 thread_joined = true;
                 if (worker.err) |err| return err;
                 return error.TestUnexpectedResult;
@@ -58222,7 +58222,7 @@ fn implementationTests() type {
             // The production drain contract bounds this join even if lease retirement
             // regresses. The hook is observation-only, so the test itself cannot
             // manufacture an unbounded worker lifetime.
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             thread_joined = true;
             if (worker.err) |err| return err;
             try std.testing.expect(probe.entered.load(.acquire));
@@ -58231,7 +58231,7 @@ fn implementationTests() type {
         test "provisioned table write source backup releases read cache exclusive before native snapshot copy" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-backup-read-cache-copy", .{tmp.sub_path});
@@ -58285,7 +58285,7 @@ fn implementationTests() type {
                 defer db.close();
             }
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
 
             var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
@@ -58351,14 +58351,14 @@ fn implementationTests() type {
             defer local_write_test_hooks.test_before_native_backup_copy_hook = null;
 
             var backup_worker = BackupWorker{ .source = &source, .backup_root = backup_root };
-            var backup_thread = try std.testing.io.concurrent(BackupWorker.run, .{&backup_worker});
+            var backup_thread = try platform.testing.io.concurrent(BackupWorker.run, .{&backup_worker});
             defer {
                 if (read_lease_active) {
                     read_lease.release();
                     read_lease_active = false;
                 }
                 copy_probe.release.store(true, .release);
-                backup_thread.await(std.testing.io);
+                backup_thread.await(platform.testing.io);
             }
 
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
@@ -58371,10 +58371,10 @@ fn implementationTests() type {
             }
 
             var read_worker = ReadWorker{ .path = path, .cache = &read_cache };
-            var read_thread = try std.testing.io.concurrent(ReadWorker.run, .{&read_worker});
+            var read_thread = try platform.testing.io.concurrent(ReadWorker.run, .{&read_worker});
             defer {
                 copy_probe.release.store(true, .release);
-                read_thread.await(std.testing.io);
+                read_thread.await(platform.testing.io);
             }
             const read_deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s;
             while (!read_worker.entered.load(.acquire) and platform_time.monotonicNs() < read_deadline_ns) {
@@ -58383,8 +58383,8 @@ fn implementationTests() type {
             const read_entered_during_copy = read_worker.entered.load(.acquire);
 
             copy_probe.release.store(true, .release);
-            read_thread.await(std.testing.io);
-            backup_thread.await(std.testing.io);
+            read_thread.await(platform.testing.io);
+            backup_thread.await(platform.testing.io);
 
             if (read_worker.err) |err| return err;
             if (backup_worker.err) |err| return err;
@@ -58394,7 +58394,7 @@ fn implementationTests() type {
         test "provisioned table write source drop index does not hold local db mutex during index deletion work" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-drop-index-mutex", .{tmp.sub_path});
@@ -58476,10 +58476,10 @@ fn implementationTests() type {
             defer test_before_drop_index_work_hook = null;
 
             var worker = Worker{ .source = &source };
-            var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(Worker.run, .{&worker});
             defer {
                 probe.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             }
 
             while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -58487,7 +58487,7 @@ fn implementationTests() type {
             source.local_db_mutex.unlock();
 
             probe.release.store(true, .release);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
 
             if (worker.err) |err| return err;
 
@@ -58504,7 +58504,7 @@ fn implementationTests() type {
             const schema_json =
                 "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}";
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -58636,7 +58636,7 @@ fn implementationTests() type {
 
         test "provisioned create retries a retired cache lease before structural publication" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root_dir = try std.fmt.allocPrint(
                 alloc,
@@ -58747,7 +58747,7 @@ fn implementationTests() type {
 
         test "provisioned create succeeds when post-commit runtime status is fenced" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(
@@ -58833,7 +58833,7 @@ fn implementationTests() type {
 
         test "provisioned create reuses a generation opened by startup reconciliation" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
             defer backend_runtime.deinit();
@@ -58981,7 +58981,7 @@ fn implementationTests() type {
 
         test "provisioned create installs managed enrichment despite a matching stale fingerprint" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const FakeEmbeddingProvider = struct {
@@ -59176,7 +59176,7 @@ fn implementationTests() type {
             defer backup_root_tmp.cleanup();
             const backup_root = backup_root_tmp.path();
 
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -59301,10 +59301,10 @@ fn implementationTests() type {
                 .manifest = &manifest,
                 .backup_root = backup_root,
             };
-            var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+            var thread = try platform.testing.io.concurrent(Worker.run, .{&worker});
             defer {
                 probe.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             }
 
             while (!probe.entered.load(.acquire)) std.atomic.spinLoopHint();
@@ -59312,7 +59312,7 @@ fn implementationTests() type {
             source.local_db_mutex.unlock();
 
             probe.release.store(true, .release);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
 
             if (worker.err) |err| return err;
             try std.testing.expect(!(try db_mod.DB.restoreRuntimeRepairNeededForPath(alloc, db_path)));
@@ -59327,7 +59327,7 @@ fn implementationTests() type {
         test "managed startup catch-up repairs external dense doc gaps from stored artifacts without replay debt" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-dense-artifacts", .{tmp.sub_path});
@@ -59477,7 +59477,7 @@ fn implementationTests() type {
 
         test "managed startup catch-up advances counterless incomplete dense repair" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-counterless-incomplete-dense", .{tmp.sub_path});
@@ -59583,7 +59583,7 @@ fn implementationTests() type {
         test "managed startup catch-up defers while shared bulk ingest state is active" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-bulk", .{tmp.sub_path});
@@ -59675,7 +59675,7 @@ fn implementationTests() type {
         test "managed startup catch-up ignores stale dirty bit after writer cache entry is gone" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-startup-catch-up-stale-dirty", .{tmp.sub_path});
@@ -59746,7 +59746,7 @@ fn implementationTests() type {
         test "managed status-only cache open skips shared bulk ingest session state" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-status-only-bulk", .{tmp.sub_path});
@@ -59878,7 +59878,7 @@ fn implementationTests() type {
         test "managed source status-only open bypasses shared writer cache entry" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-source-status-only", .{tmp.sub_path});
@@ -59948,7 +59948,7 @@ fn implementationTests() type {
         test "managed source status-only open drains stale pending close before retry" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-source-status-only-pending-close", .{tmp.sub_path});
@@ -60015,7 +60015,7 @@ fn implementationTests() type {
         test "write cache HA gate clear drains inactive pending closes before returning" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-clear-drain", .{tmp.sub_path});
@@ -60093,7 +60093,7 @@ fn implementationTests() type {
         test "write cache retires shared HA generation stale entries before reuse" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-generation-stale", .{tmp.sub_path});
@@ -60192,7 +60192,7 @@ fn implementationTests() type {
         test "hosted status-only open drains stale pending close before retry" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-status-only-pending-close", .{tmp.sub_path});
@@ -60311,7 +60311,7 @@ fn implementationTests() type {
         test "write cache prunes stale visible root generations instead of clearing current entries" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-generations", .{tmp.sub_path});
@@ -60385,7 +60385,7 @@ fn implementationTests() type {
         test "hosted write cache opens current visible root generation" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-write-cache-generation", .{tmp.sub_path});
@@ -60508,7 +60508,7 @@ fn implementationTests() type {
         test "hosted runtime status reads owner snapshot without inspecting live writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-runtime-status-live-writer", .{tmp.sub_path});
@@ -60652,7 +60652,7 @@ fn implementationTests() type {
         test "write cache adopts just-created db across reconcile generation bump" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-created-generation", .{tmp.sub_path});
@@ -60728,7 +60728,7 @@ fn implementationTests() type {
         test "write cache local mutation reuses live stale-generation writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-structural-generation", .{tmp.sub_path});
@@ -60804,7 +60804,7 @@ fn implementationTests() type {
         test "write cache structural local mutation finishes auto bulk before reuse" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-structural-auto-bulk", .{tmp.sub_path});
@@ -60882,7 +60882,7 @@ fn implementationTests() type {
         test "write cache local mutation preempts stale startup writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-preempt-startup", .{tmp.sub_path});
@@ -60972,16 +60972,16 @@ fn implementationTests() type {
                 .write_cache = &write_cache,
                 .path = path,
             };
-            var thread = try std.testing.io.concurrent(Context.run, .{&context});
+            var thread = try platform.testing.io.concurrent(Context.run, .{&context});
             var joined = false;
-            defer if (!joined) thread.await(std.testing.io);
+            defer if (!joined) thread.await(platform.testing.io);
 
             while (!context.started.load(.acquire)) std.atomic.spinLoopHint();
             sleepNs(10 * std.time.ns_per_ms);
             try std.testing.expect(!context.completed.load(.acquire));
 
             startup.deinit(alloc);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             joined = true;
             if (context.err) |err| return err;
             try std.testing.expect(context.completed.load(.acquire));
@@ -60994,7 +60994,7 @@ fn implementationTests() type {
         test "write cache metadata refresh preserves inactive adoptable seed" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-created-metadata-refresh", .{tmp.sub_path});
@@ -61069,7 +61069,7 @@ fn implementationTests() type {
         test "write cache adopts active just-created db across generation bump" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-active-created-generation", .{tmp.sub_path});
@@ -61146,7 +61146,7 @@ fn implementationTests() type {
         test "HA seed preflight drains writer released after promotion cache clear before capture freeze" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(
@@ -61346,7 +61346,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), startup_write_cache.closing_entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
-            var io_impl = Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const store_path = try std.fs.path.join(alloc, &.{ destination_root, "store.bin" });
             defer alloc.free(store_path);
@@ -61359,7 +61359,7 @@ fn implementationTests() type {
         test "runtime status collection leaves active stale write lease live" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/runtime-status-active-stale-lease", .{tmp.sub_path});
@@ -61437,7 +61437,7 @@ fn implementationTests() type {
         test "resident DB lease adopts seeded write cache across visible generation bump" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/resident-db-write-cache-generation", .{tmp.sub_path});
@@ -61538,7 +61538,7 @@ fn implementationTests() type {
         test "resident DB retry preparation waits outside admission for writer publication" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/resident-db-startup-open", .{tmp.sub_path});
@@ -61586,9 +61586,9 @@ fn implementationTests() type {
             defer if (open_locked) startup_cache.unlockOpenMutex();
 
             var context = Context{ .source = &source };
-            var thread = try std.testing.io.concurrent(Context.run, .{&context});
+            var thread = try platform.testing.io.concurrent(Context.run, .{&context});
             var thread_joined = false;
-            defer if (!thread_joined) thread.await(std.testing.io);
+            defer if (!thread_joined) thread.await(platform.testing.io);
 
             while (!context.started.load(.acquire)) std.atomic.spinLoopHint();
             sleepNs(10 * std.time.ns_per_ms);
@@ -61610,7 +61610,7 @@ fn implementationTests() type {
             startup_cache.unlockOpenMutex();
             open_locked = false;
 
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             thread_joined = true;
             try std.testing.expect(context.completed.load(.acquire));
             try std.testing.expect(!context.failed.load(.acquire));
@@ -61630,7 +61630,7 @@ fn implementationTests() type {
         test "resident DB retry preparation does not block a borrowed std.Io scheduler" {
             const alloc = std.testing.allocator;
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
                 .backend = .manual,
@@ -61678,9 +61678,9 @@ fn implementationTests() type {
             var probe = Probe{ .cache = &cache };
             Probe.active = &probe;
             defer Probe.active = null;
-            var vtable = std.testing.io.vtable.*;
+            var vtable = platform.testing.io.vtable.*;
             vtable.futexWaitUncancelable = Probe.wait;
-            const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+            const io: Io = .{ .userdata = platform.testing.io.userdata, .vtable = &vtable };
             var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
                 .backend = .manual,
                 .borrowed_io = .{ .general = io },
@@ -61749,7 +61749,7 @@ fn implementationTests() type {
         test "replica root reconcile seeds write cache across generation bump" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-reconcile-generation", .{tmp.sub_path});
@@ -61857,7 +61857,7 @@ fn implementationTests() type {
         test "replica root reconcile enqueues newly admitted managed full text repair" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-reconcile-full-text-repair", .{tmp.sub_path});
@@ -61957,7 +61957,7 @@ fn implementationTests() type {
         test "write cache transfers adoptable provisioned db to raft apply source" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-transfer-generation", .{tmp.sub_path});
@@ -62038,7 +62038,7 @@ fn implementationTests() type {
         test "write cache retires adoptable seed when transfer allocators differ" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-transfer-allocator-mismatch", .{tmp.sub_path});
@@ -62113,7 +62113,7 @@ fn implementationTests() type {
         test "provisioned leader admission rejects uncommitted writes under dense repair pressure" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/dense-repair-leader-admission", .{tmp.sub_path});
@@ -62199,7 +62199,7 @@ fn implementationTests() type {
 
         test "median key lookup reuses startup writer instead of reopening its root" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/median-startup-owner", .{tmp.sub_path});
@@ -62287,7 +62287,7 @@ fn implementationTests() type {
 
         test "source vector status activity overlay never reenters the held DB apply lock" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-status-overlay", .{tmp.sub_path});
             defer alloc.free(db_path);
@@ -62318,7 +62318,7 @@ fn implementationTests() type {
 
         test "relational table API retries use the durable transaction epoch and decision" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relational-epoch-retries", .{tmp.sub_path});
             defer alloc.free(path);
@@ -62359,7 +62359,7 @@ fn implementationTests() type {
 
         test "portable file restore rejects documents without identity coverage" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-file-identity-source", .{tmp.sub_path});
             defer alloc.free(source_path);

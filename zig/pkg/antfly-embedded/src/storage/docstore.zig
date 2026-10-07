@@ -36,7 +36,7 @@ const retained_effects = @import("retained_effects.zig");
 const artifact_payload = @import("artifact_payload.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const writer_locked_retry_count: usize = 1000;
 const writer_locked_retry_sleep_ns: u64 = 100_000;
 
@@ -46,7 +46,7 @@ fn backoffWriterLockRetry(io: ?std.Io) void {
         return;
     }
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
+    platform.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
 }
 
 const replay_hints = [_]change_journal_mod.TargetHint{
@@ -460,7 +460,7 @@ pub const DocStore = struct {
     alloc: Allocator,
     /// Process-local wake hint, published only after successful row/schema
     /// commits. Durable mutation IDs and timers remain the restart authority.
-    columnar_revision: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    columnar_revision: platform.atomic.Value(u64) = .init(0),
     // 0 unknown, 1 no retention catalog, 2 catalog may exist. Admission marks
     // this before its commit; an aborted admission merely leaves a safe probe.
     retained_effects_cache: std.atomic.Value(u8) = .init(0),
@@ -1283,7 +1283,7 @@ pub const DocStore = struct {
     }
 
     fn payloadPolicyIo() std.Io {
-        return if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io();
+        return if (builtin.os.tag == .freestanding) .failing else platform.Io.Threaded.global_single_threaded.io();
     }
 
     fn unlockPayloadPolicy(self: *DocStore) void {
@@ -3583,14 +3583,14 @@ fn tmpPath(buf: []u8) [*:0]const u8 {
     const ts = platform_time.monotonicNs();
     const nonce = @atomicRmw(u64, &tmp_path_nonce, .Add, 1, .monotonic);
     const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch unreachable;
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
@@ -3765,9 +3765,9 @@ test "docstore range tracking native LSM common prefix batch benchmark" {
         var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
         defer store.close();
         if (active) try store.put(range_protection.activation_key, range_protection.activation_value);
-        const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        const started = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
         for (0..100) |_| try store.putBatch(&writes, &.{});
-        const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
+        const elapsed = std.Io.Clock.awake.now(platform.testing.io).nanoseconds - started;
         var read = try store.beginReadTxn();
         defer read.abort();
         try std.testing.expectEqual(@as(?u64, if (active) 100 else null), try range_protection.generation(&read, range_protection.bucket("doc:0")));
@@ -3779,7 +3779,7 @@ test "docstore range tracking survives native LSM reopen and rejects generation 
     const range_protection = @import("range_protection.zig");
     const index_records = @import("db/relational_index_records.zig");
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -3837,7 +3837,7 @@ test "docstore range tracking survives native LSM reopen and rejects generation 
 
 test "docstore retained row effects resume across LSM reopen and keep aborted GC history" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -3900,7 +3900,7 @@ test "docstore retained row effects resume across LSM reopen and keep aborted GC
 
 test "docstore retained REF5 keeps an oversized after-image across reopen and reclaims bounded chunks" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -3974,7 +3974,7 @@ test "docstore retained REF5 graph language persists exact value and tombstone a
     const retained = @import("retained_effects.zig");
     const frame = @import("retained_frame.zig");
     const codec = @import("db/enrichment/artifact_codec.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -4041,7 +4041,7 @@ test "docstore retained REF5 graph language persists exact value and tombstone a
 test "docstore retained integrity and row effects share an immutable atomic frame across reopen" {
     const alloc = std.testing.allocator;
     const integrity = @import("db/relational_integrity_contract.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/integrity-tail", .{tmp.sub_path});
     defer alloc.free(path);
@@ -4130,7 +4130,7 @@ test "docstore retained integrity and row effects share an immutable atomic fram
 
 test "docstore retained document timestamps remain paired with overwritten afterimages across reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -4195,7 +4195,7 @@ test "docstore retained document timestamps remain paired with overwritten after
 
 test "docstore retained row effects fence foreign native adoption without blocking target writes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -4814,7 +4814,7 @@ test "docstore releases payload policy before runtime writer admission" {
 
 test "docstore runtime lsm exposes large replaying graph artifact prefix batch immediately after commit" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -5397,7 +5397,7 @@ test "docstore consistent point batch owns values without cloning mutable state"
 
 test "docstore runtime lsm hint replay iteration avoids ordinary read snapshots" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -5463,7 +5463,7 @@ test "docstore runtime lsm hint replay iteration avoids ordinary read snapshots"
 
 test "docstore runtime lsm persists replay rows across namespace reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

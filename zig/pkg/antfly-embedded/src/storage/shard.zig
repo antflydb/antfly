@@ -21,9 +21,11 @@
 //!   - streamRange for copying data between DocStores
 //!   - validateKeyOwnership considering active split state
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const backend_erased = @import("backend_erased.zig");
 const backend_scan = @import("backend_scan.zig");
 const lsm_backend = @import("lsm_backend.zig");
@@ -960,7 +962,7 @@ fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
     const ts = monotonicNs();
     const nonce = @atomicRmw(u64, &tmp_path_nonce, .Add, 1, .monotonic);
     const slice = std.fmt.bufPrint(buf, "/tmp/antfly-shard-{s}-{d}-{d}\x00", .{ label, ts, nonce }) catch unreachable;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
     return @ptrCast(slice.ptr);
@@ -971,7 +973,7 @@ fn monotonicNs() u64 {
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

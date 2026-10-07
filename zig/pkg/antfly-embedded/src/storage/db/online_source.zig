@@ -17,8 +17,10 @@
 //! slots bound metadata growth; the retained journal's epoch high-watermark
 //! prevents old admissions from resurrecting after a terminal slot is reused.
 
+const platform = @import("antfly_platform");
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
+
 const retained = @import("../retained_effects.zig");
 const topology = @import("relational_integrity_topology.zig");
 const contract = @import("online_source_contract.zig");
@@ -424,7 +426,7 @@ pub fn stage(txn: anytype, command: Command, applied_index: u64) !void {
 test "relational index system online source controls survive LSM reopen with atomic abort and final fences" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-source", .{tmp.sub_path});
     defer alloc.free(path);
@@ -529,7 +531,7 @@ test "relational index system online source standby replay preserves admission c
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const effects = @import("replication_effects.zig");
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
     defer alloc.free(source_path);
@@ -608,7 +610,7 @@ test "relational index system native rewrite authority clocks survive pin crash 
     const effects = @import("replication_effects.zig");
     const pin = @import("source_pin.zig");
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -694,7 +696,7 @@ test "relational index system unknown identity summary never preserves false emp
     const identity = @import("doc_identity.zig");
     const internal = @import("../internal_keys.zig");
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_]bool{ false, true }, 0..) |delete_only, trial| {
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unknown-summary-{d}", .{ tmp.sub_path, trial });
@@ -730,7 +732,7 @@ test "relational index system native source authority preserves same namespace a
     const DB = @import("antfly_source_root").antfly_sources.physical_db;
     const clock = @import("../source_authority.zig");
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-adoption", .{tmp.sub_path});
     defer alloc.free(path);

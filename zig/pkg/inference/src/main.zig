@@ -1097,7 +1097,7 @@ test "process memory budget precedence ignores shadowed invalid sources" {
 test "inference run rejects unknown flags instead of silently disabling policy" {
     try std.testing.expectError(
         error.InvalidArguments,
-        runServer(std.heap.page_allocator, std.testing.io, &.{ "--kernel-jti-mode", "required" }),
+        runServer(std.heap.page_allocator, platform.testing.io, &.{ "--kernel-jti-mode", "required" }),
     );
 }
 

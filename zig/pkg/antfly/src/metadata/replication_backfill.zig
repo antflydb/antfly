@@ -13,12 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
 const table_catalog_api = @import("../api/table_catalog.zig");
 const table_router_api = @import("../api/table_router.zig");
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
+const platform_clock = platform.clock;
+const platform_time = platform.time;
 const foreign_mod = @import("../foreign/mod.zig");
 const table_writes_api = @import("antfly_source_root").antfly_sources.table_writes;
 const metadata_api = @import("api.zig");
@@ -145,7 +147,7 @@ pub const BackfillSummary = struct {
 
 pub const SnapshotBackfillRunner = struct {
     alloc: Allocator,
-    io: std.Io = std.Options.debug_io,
+    io: std.Io = platform.debug_io,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
     secret_store: ?*secrets.FileStore = null,
@@ -1361,7 +1363,7 @@ pub const SnapshotBackfillCoordinator = struct {
 
 pub const StreamingReplicationRunner = struct {
     alloc: Allocator,
-    io: std.Io = std.Options.debug_io,
+    io: std.Io = platform.debug_io,
     registry: *foreign_mod.Registry,
     write_source: table_writes_api.TableWriteSource,
     secret_store: ?*secrets.FileStore = null,
@@ -3694,8 +3696,8 @@ fn countReplicationSourcesJson(alloc: Allocator, replication_sources_json: []con
 threadlocal var checkpoint_buf: [64]u8 = undefined;
 
 fn hostNowMillis() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => {},
         else => return 0,
     }
@@ -3769,7 +3771,7 @@ test "metadata replication backfill applies postgres snapshot rows through bound
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-backfill";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -4000,7 +4002,7 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-prepared-snapshot";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -4199,7 +4201,7 @@ test "metadata replication backfill applies configured update transforms" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-backfill-transforms";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -4571,7 +4573,7 @@ test "metadata replication backfill coordinator resumes and then skips completed
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-backfill-coordinator";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -4791,7 +4793,7 @@ test "metadata replication backfill marks existing-slot fallback as slot_resumed
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-slot-resumed";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -4893,7 +4895,7 @@ test "metadata replication backfill rejects existing-slot fallback when exact cu
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-exact-cutover-required";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -5209,7 +5211,7 @@ test "metadata replication stream applies insert update and delete through bound
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-stream";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -5405,7 +5407,7 @@ test "metadata replication stream delete document op removes the full document" 
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-stream-delete-document";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -5702,7 +5704,7 @@ test "metadata replication stream applies configured update and derived delete t
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-metadata-replication-stream-transforms";
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -6538,7 +6540,7 @@ test "metadata replication live snapshot and later streaming insert through runn
     if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, wal_level, &std.ascii.whitespace), "logical")) return error.SkipZigTest;
 
     const path = "/tmp/antfly-metadata-replication-live-runner";
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -6787,7 +6789,7 @@ test "metadata http service live snapshot and later streaming insert through inj
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-cdc-hosted-root", .{tmp.sub_path});
     defer alloc.free(replica_root);
@@ -7079,7 +7081,7 @@ fn cleanupTestExactCutoverResources(
 
 fn execPsqlCommand(alloc: Allocator, dsn: []const u8, sql_text: []const u8) !void {
     const psql_bin = testPsqlBin() orelse return error.FileNotFound;
-    const result = try std.process.run(alloc, std.testing.io, .{
+    const result = try std.process.run(alloc, platform.testing.io, .{
         .argv = &.{ psql_bin, dsn, "-v", "ON_ERROR_STOP=1", "-c", sql_text },
     });
     defer alloc.free(result.stdout);
@@ -7092,7 +7094,7 @@ fn execPsqlCommand(alloc: Allocator, dsn: []const u8, sql_text: []const u8) !voi
 
 fn execPsqlScalarAlloc(alloc: Allocator, dsn: []const u8, sql_text: []const u8) ![]u8 {
     const psql_bin = testPsqlBin() orelse return error.FileNotFound;
-    const result = try std.process.run(alloc, std.testing.io, .{
+    const result = try std.process.run(alloc, platform.testing.io, .{
         .argv = &.{ psql_bin, dsn, "-tAc", sql_text },
     });
     defer alloc.free(result.stderr);

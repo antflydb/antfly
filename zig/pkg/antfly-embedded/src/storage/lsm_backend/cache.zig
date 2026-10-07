@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = platform.sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
@@ -1040,23 +1040,23 @@ const supports_waitable_pending = builtin.os.tag != .freestanding and
 
 const PendingSync = if (supports_waitable_pending)
     struct {
-        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+        mutex: platform.c.pthread_mutex_t = platform.c.PTHREAD_MUTEX_INITIALIZER,
+        cond: platform.c.pthread_cond_t = platform.c.PTHREAD_COND_INITIALIZER,
 
         fn lock(self: *@This()) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
         }
 
         fn unlock(self: *@This()) void {
-            if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
         }
 
         fn wait(self: *@This()) void {
-            if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
         }
 
         fn broadcast(self: *@This()) void {
-            if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
+            if (platform.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
         }
     }
 else
@@ -1233,7 +1233,7 @@ fn clampU64ToUsize(value: u64) usize {
 
 fn sleepNs(ns: u64) void {
     if (ns == 0) return;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Clock.Duration.sleep(.{
         .clock = .awake,
@@ -1371,8 +1371,8 @@ test "cache pending load waiter survives finish removal" {
 
     var waiter = Waiter{};
     {
-        var thread = try std.testing.io.concurrent(Waiter.run, .{ &waiter, &cache });
-        defer thread.await(std.testing.io);
+        var thread = try platform.testing.io.concurrent(Waiter.run, .{ &waiter, &cache });
+        defer thread.await(platform.testing.io);
         defer cache.finishLoad("run-1", 1, 1, .run_table_index);
         // beginLoad increments waits under pending_sync before releasing the
         // mutex in wait(). finishLoad takes that same mutex, so observing the

@@ -715,7 +715,7 @@ const FakeAntflyProvider = struct {
 };
 
 test "public api smoke integration creates table inserts and queries documents" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-full-e2e-root", .{tmp.sub_path});
@@ -946,7 +946,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     // has published its durable generation. Wait on that owner's activity
     // contract instead of assuming a fixed number of metadata rounds is
     // enough on a loaded CI runner.
-    var structural_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    var structural_wait_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer structural_wait_io.deinit();
     var structural_wait_attempts: usize = 0;
     while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (structural_wait_attempts += 1) {
@@ -1022,7 +1022,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     // data runtime's local-replica reconciliation hook does in production.
     // Without this step the lightweight fixture would retain the pre-cutover
     // cached writer even though metadata correctly moved reads to v1.
-    var owner_wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    var owner_wait_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer owner_wait_io.deinit();
     var owner_wait_attempts: usize = 0;
     while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
@@ -1115,7 +1115,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     // Batch acknowledgement precedes asynchronous full-text generation
     // publication. Wait on the observable query contract instead of assuming
     // an unloaded scheduler makes the first query see the new generation.
-    var query_visibility_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    var query_visibility_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer query_visibility_io.deinit();
     var query = try fetchQueryUntilTotal(
         &client,
@@ -1571,7 +1571,7 @@ test "public api smoke integration creates table inserts and queries documents" 
 }
 
 test "public api integration rebuilds schema-migration full-text index on exact backfill boundary" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-schema-boundary-root", .{tmp.sub_path});
@@ -1745,7 +1745,7 @@ test "public api integration rebuilds schema-migration full-text index on exact 
     // that owner's activity is both the production contract and substantially
     // cheaper than repeatedly cold-opening the standalone fixture through the
     // public status endpoint while the corpus-sized rebuild is in flight.
-    var wait_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    var wait_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer wait_io.deinit();
     try std.testing.expect(provisioned_write_source.hasGroupActivityBestEffort("docs", 0));
     var wait_attempts: usize = 0;
@@ -1860,7 +1860,7 @@ test "public api integration rebuilds schema-migration full-text index on exact 
 }
 
 test "public api integration rejects table backup during active schema migration" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-backup-migration-root", .{tmp.sub_path});
@@ -1968,7 +1968,7 @@ test "public api integration rejects table backup during active schema migration
 }
 
 test "public api integration rejects table restore for migration-state backup manifests" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-restore-migration-root", .{tmp.sub_path});
@@ -2085,7 +2085,7 @@ test "public api integration rejects table restore for migration-state backup ma
 }
 
 test "public api integration rejects table restore when target already exists" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-restore-exists-root", .{tmp.sub_path});
@@ -2192,7 +2192,7 @@ test "public api integration rejects table restore when target already exists" {
 }
 
 test "public api integration rejects table restore for mismatched backup manifests" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-restore-mismatch-root", .{tmp.sub_path});
@@ -2309,7 +2309,7 @@ test "public api integration rejects table restore for mismatched backup manifes
 }
 
 test "public api integration validates backup and restore request shapes and locations" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-backup-validate-root", .{tmp.sub_path});
@@ -2498,7 +2498,7 @@ test "public api integration validates backup and restore request shapes and loc
 }
 
 test "public api integration backs up drops and restores a table" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-backup-restore-root", .{tmp.sub_path});
@@ -2508,7 +2508,7 @@ test "public api integration backs up drops and restores a table" {
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -2634,7 +2634,7 @@ test "public api integration backs up drops and restores a table" {
 }
 
 test "public api split integration backs up drops and restores a table" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-split-backup-restore-root", .{tmp.sub_path});
@@ -2644,7 +2644,7 @@ test "public api split integration backs up drops and restores a table" {
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-split-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -2769,7 +2769,7 @@ test "public api standalone-like integration backs up drops and restores a table
     const internal_service_secret = "standalone-e2e-internal-service-secret-v1";
     const internal_service_issuer = "standalone-e2e";
     const process_alloc = platform.allocator.processAllocator(std.testing.allocator);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const metadata_replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-metadata-root", .{tmp.sub_path});
@@ -2785,7 +2785,7 @@ test "public api standalone-like integration backs up drops and restores a table
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
@@ -3152,7 +3152,7 @@ test "public api standalone-like integration backs up drops and restores a table
 }
 
 test "split data runtime registers a store with metadata" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const metadata_replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/split-metadata-root", .{tmp.sub_path});
@@ -3162,7 +3162,7 @@ test "split data runtime registers a store with metadata" {
     const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/split-metadata-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
@@ -3281,7 +3281,7 @@ test "hosted relational parent placement opens a real Raft owner" {
     const trusted_issuer = "hosted-fk-test";
     const internal_service_secret = "hosted-fk-internal-service-secret-v1";
     const internal_service_issuer = "hosted-fk-service";
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const metadata_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-parent-metadata", .{tmp.sub_path});
     defer alloc.free(metadata_root);
@@ -3289,7 +3289,7 @@ test "hosted relational parent placement opens a real Raft owner" {
     defer alloc.free(data_root);
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-parent-catalog", .{tmp.sub_path});
     defer alloc.free(catalog_path);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     defer std.Io.Dir.cwd().deleteTree(io, metadata_root) catch {};
@@ -3477,7 +3477,7 @@ test "hosted relational parent placement opens a real Raft owner" {
 }
 
 test "split data runtime serves retrieval agent pipeline queries" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const metadata_replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/split-retrieval-metadata-root", .{tmp.sub_path});
@@ -3487,7 +3487,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
     const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/split-retrieval-metadata-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
 
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
@@ -3585,7 +3585,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
 }
 
 test "public api integration supports managed semantic search and sparse embeddings" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-semantic-sparse-root", .{tmp.sub_path});
@@ -3715,7 +3715,7 @@ test "public api integration supports managed semantic search and sparse embeddi
 }
 
 test "public api integration adds managed embeddings indexes to existing tables" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-semantic-existing-root", .{tmp.sub_path});
@@ -3847,7 +3847,7 @@ test "public api integration adds managed embeddings indexes to existing tables"
 }
 
 test "public api integration recreates managed embeddings index after corrupt artifact" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-semantic-corrupt-recreate-root", .{tmp.sub_path});
@@ -4031,7 +4031,7 @@ test "public api integration recreates managed embeddings index after corrupt ar
 }
 
 test "public api integration restores managed embeddings from table backup" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-semantic-backup-root", .{tmp.sub_path});
@@ -4215,7 +4215,7 @@ test "public api integration restores managed embeddings from table backup" {
 }
 
 test "public api integration supports managed sparse embeddings generation" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-managed-sparse-root", .{tmp.sub_path});
@@ -4330,7 +4330,7 @@ test "public api integration supports managed sparse embeddings generation" {
 }
 
 test "public api integration supports hybrid query pruner and reranker" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-hybrid-rerank-root", .{tmp.sub_path});
@@ -4380,7 +4380,7 @@ test "public api integration supports hybrid query pruner and reranker" {
     // which needs I/O that can run concurrent work. Index validation uses the
     // network view and query embedding the API view; without a backend
     // runtime both otherwise fall back to single-threaded I/O.
-    var network_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    var network_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer network_io.deinit();
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4475,7 +4475,7 @@ test "public api integration supports hybrid query pruner and reranker" {
 }
 
 test "public api integration supports retrieval agent pipeline queries" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-agent-root", .{tmp.sub_path});
@@ -4571,7 +4571,7 @@ test "public api integration supports retrieval agent pipeline queries" {
 }
 
 test "public api integration supports retrieval agent generation step" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-generation-root", .{tmp.sub_path});
@@ -4676,7 +4676,7 @@ test "public api integration supports retrieval agent generation step" {
 }
 
 test "public api integration supports retrieval agent semantic and hybrid strategies" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-strategy-root", .{tmp.sub_path});
@@ -4801,7 +4801,7 @@ test "public api integration supports retrieval agent semantic and hybrid strate
 }
 
 test "public api integration supports retrieval agent tree search pipeline" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-tree-root", .{tmp.sub_path});
@@ -4907,7 +4907,7 @@ test "public api integration supports retrieval agent tree search pipeline" {
 }
 
 test "public api integration supports retrieval agent tree search from roots" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-tree-roots-root", .{tmp.sub_path});
@@ -5011,7 +5011,7 @@ test "public api integration supports retrieval agent tree search from roots" {
 }
 
 test "public api integration supports retrieval agent classification confidence and followup" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-classify-root", .{tmp.sub_path});
@@ -5122,7 +5122,7 @@ test "public api integration supports retrieval agent classification confidence 
 }
 
 test "public api integration supports retrieval agent fixed-body sse streaming" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-stream-root", .{tmp.sub_path});
@@ -5257,7 +5257,7 @@ test "public api integration supports retrieval agent fixed-body sse streaming" 
 }
 
 test "public api integration retrieval streaming emits clarification events" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-stream-clarify-root", .{tmp.sub_path});
@@ -5377,7 +5377,7 @@ test "public api integration retrieval streaming emits clarification events" {
 }
 
 test "public api integration supports bounded agentic retrieval mode" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-agentic-root", .{tmp.sub_path});
@@ -5472,7 +5472,7 @@ test "public api integration supports bounded agentic retrieval mode" {
 }
 
 test "public api integration agentic retrieval selects the best declared query" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-agentic-select-root", .{tmp.sub_path});
@@ -5565,7 +5565,7 @@ test "public api integration agentic retrieval selects the best declared query" 
 }
 
 test "public api integration agentic retrieval evaluates misses and falls back to the next query" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-agentic-fallback-root", .{tmp.sub_path});
@@ -5674,7 +5674,7 @@ test "public api integration agentic retrieval evaluates misses and falls back t
 }
 
 test "public api integration agentic retrieval can require clarification and continue from a decision" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-retrieval-agentic-decision-root", .{tmp.sub_path});
@@ -5780,7 +5780,7 @@ test "public api integration agentic retrieval can require clarification and con
 }
 
 test "public api integration restores managed sparse embeddings from table backup" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-managed-sparse-backup-root", .{tmp.sub_path});
@@ -5978,7 +5978,7 @@ test "public api integration supports embedding_template remote media helper" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-embedding-template-root", .{tmp.sub_path});
@@ -6028,7 +6028,7 @@ test "public api integration supports embedding_template remote media helper" {
     // which needs I/O that can run concurrent work. Index validation uses the
     // network view and query embedding the API view; without a backend
     // runtime both otherwise fall back to single-threaded I/O.
-    var network_io = std.Io.Threaded.init(std.testing.allocator, .{});
+    var network_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer network_io.deinit();
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6151,7 +6151,7 @@ test "public api integration supports template chunked remote text enrichment an
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-template-chunked-root", .{tmp.sub_path});
@@ -6400,7 +6400,7 @@ test "public api integration supports template chunked remote text enrichment an
 }
 
 test "public api integration restores chunked managed embeddings from table backup" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-chunked-backup-root", .{tmp.sub_path});
@@ -6619,7 +6619,7 @@ test "public api integration supports graph queries" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-graph-root", .{tmp.sub_path});
@@ -6840,7 +6840,7 @@ test "public api integration graph queries respect full_index sync level" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-graph-full-index-root", .{tmp.sub_path});
@@ -6975,7 +6975,7 @@ test "public api integration restores graph indexes from table backup" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-graph-backup-root", .{tmp.sub_path});
@@ -6985,7 +6985,7 @@ test "public api integration restores graph indexes from table backup" {
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-graph-backup-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
-    var backup_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var backup_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer backup_io.deinit();
     try std.Io.Dir.cwd().createDirPath(backup_io.io(), backup_root);
     const backup_root_absolute = try std.Io.Dir.cwd().realPathFileAlloc(backup_io.io(), backup_root, std.testing.allocator);
@@ -7256,7 +7256,7 @@ test "public api integration restores graph indexes from table backup" {
 }
 
 test "public api smoke integration queries across split ranges" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-split-e2e-root", .{tmp.sub_path});
@@ -7449,7 +7449,7 @@ test "public api smoke integration queries across split ranges" {
 }
 
 test "public api split integration uses distributed global text stats for bm25 and significant_terms" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-split-global-stats-root", .{tmp.sub_path});
@@ -7788,9 +7788,9 @@ test "public api split integration uses distributed global text stats for bm25 a
 }
 
 test "public api integration serves cluster backup list and restore routes" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-backup-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -7799,7 +7799,7 @@ test "public api integration serves cluster backup list and restore routes" {
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-backup-out", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
@@ -8043,9 +8043,9 @@ test "public api integration serves cluster backup list and restore routes" {
 }
 
 test "public api integration does not publish or restore a partial cluster backup" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-partial-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -8054,7 +8054,7 @@ test "public api integration does not publish or restore a partial cluster backu
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-partial-out", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
@@ -8170,9 +8170,9 @@ test "public api integration does not publish or restore a partial cluster backu
 }
 
 test "public api integration reports unsupported multi-range tables in cluster backup" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-multirange-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -8181,7 +8181,7 @@ test "public api integration reports unsupported multi-range tables in cluster b
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-multirange-out", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
@@ -8374,7 +8374,7 @@ test "public api integration reports unsupported multi-range tables in cluster b
 }
 
 test "public api smoke integration commits transaction across split ranges" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-split-txn-e2e-root", .{tmp.sub_path});
@@ -8554,7 +8554,7 @@ test "public api smoke integration commits transaction across split ranges" {
 }
 
 test "public api smoke integration commits transactions across two tables atomically" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-cross-table-txn-root", .{tmp.sub_path});
@@ -8748,7 +8748,7 @@ test "public api smoke integration commits transactions across two tables atomic
 }
 
 test "public api smoke integration queries after merge finalization" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-merge-e2e-root", .{tmp.sub_path});

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 //! Generation-owned ANN hints, never distance certificates or public scores.
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const View = struct {
@@ -178,7 +179,7 @@ test "compact subgroup cache releases partial allocations and retains immutable 
 
 test "compact subgroup cache concurrent first readers publish one immutable entry" {
     const alloc = std.testing.allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var cache = try Cache.init(alloc, 1);
     defer cache.deinit();

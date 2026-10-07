@@ -16,7 +16,9 @@
 //! Receiver-local acceptance for explicit vector ingress. Preparation borrows
 //! immutable postimages through commit; physical writes observe exact bytes.
 //! An origin flag, imported record, or old source position cannot grant it.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const publication = @import("artifact_publication.zig");
 const keys = @import("../internal_keys.zig");
 const codec = @import("enrichment/artifact_codec.zig");
@@ -379,7 +381,7 @@ pub fn prepareRetirementPage(alloc: std.mem.Allocator, store: anytype, root: u12
     var visits: usize = 0;
     var bytes: usize = 0;
     var after: [32]u8 = undefined;
-    const deadline = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms;
+    const deadline = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
     while (entry) |item| {
         if (!std.mem.startsWith(u8, item.key, scope)) {
             entry = null;
@@ -387,7 +389,7 @@ pub fn prepareRetirementPage(alloc: std.mem.Allocator, store: anytype, root: u12
         }
         if (item.key.len != @sizeOf(Key)) return error.ArtifactCatalogCorrupt;
         if (visits != 0 and (visits >= limits.visits or bytes +| @sizeOf(PreparedRetirement.Candidate) > limits.bytes or
-            @import("antfly_platform").time.monotonicNs() >= deadline)) break;
+            platform.time.monotonicNs() >= deadline)) break;
         const selected = item.key[0..@sizeOf(Key)].*;
         try validateRecord(&selected, item.value);
         if (!try outputIsCurrent(&read, authority, item.value))
@@ -431,10 +433,10 @@ test "ordered artifact inventory authored retirement resumes past live prefixes 
     const docstore = @import("../docstore.zig");
     const owner = @import("../source_authority.zig");
     const authority: publication.Authority = .{ .namespace = @splat(7), .epoch = 1, .catalog_digest = @splat(3) };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+    const path_len = try tmp.dir.realPath(platform.testing.io, &path_buffer);
     const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
     defer alloc.free(path);
     var store = try docstore.DocStore.open(alloc, path, .{});
@@ -583,10 +585,10 @@ test "ordered artifact inventory authored retirement cache binds owner clock epo
     const owner = @import("../source_authority.zig");
     const authority: publication.Authority = .{ .namespace = @splat(7), .epoch = 1, .catalog_digest = @splat(3) };
     for ([_]owner.Kind{ .native, .raft }) |kind| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+        const path_len = try tmp.dir.realPath(platform.testing.io, &path_buffer);
         const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
         defer alloc.free(path);
         var store = try docstore.DocStore.open(alloc, path, .{});
@@ -656,10 +658,10 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
     const namespace: publication.Namespace = @splat(7);
     const authority: publication.Authority = .{ .namespace = namespace, .epoch = 1, .catalog_digest = @splat(3) };
     for ([_]owner.Kind{ .native, .raft }) |kind| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-        const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
+        const path_len = try tmp.dir.realPath(platform.testing.io, &path_buffer);
         const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
         defer alloc.free(path);
         var store = try docstore.DocStore.open(alloc, path, .{});

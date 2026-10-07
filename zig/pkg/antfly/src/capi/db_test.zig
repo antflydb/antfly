@@ -658,19 +658,19 @@ fn unregisterTestHandle(ptr: *anyopaque) void {
 }
 
 fn cleanupTestDir(path: []const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = @import("antfly_platform").Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
 
 fn cleanupTestFile(path: []const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = @import("antfly_platform").Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteFile(io_impl.io(), path) catch {};
 }
 
 fn testPathExists(path: []const u8) bool {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = @import("antfly_platform").Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch return false;
     return true;
@@ -699,10 +699,10 @@ fn liteLocalEmbeddingModelAvailable(alloc: Allocator) bool {
     const home = std.mem.span(home_c);
     const owner_dir = std.fs.path.join(alloc, &.{ home, ".antfly", "inference", "models", "Qwen" }) catch return false;
     defer alloc.free(owner_dir);
-    var dir = std.Io.Dir.cwd().openDir(std.testing.io, owner_dir, .{ .iterate = true }) catch return false;
-    defer dir.close(std.testing.io);
+    var dir = std.Io.Dir.cwd().openDir(@import("antfly_platform").testing.io, owner_dir, .{ .iterate = true }) catch return false;
+    defer dir.close(@import("antfly_platform").testing.io);
     var it = dir.iterateAssumeFirstIteration();
-    while (it.next(std.testing.io) catch return false) |entry| {
+    while (it.next(@import("antfly_platform").testing.io) catch return false) |entry| {
         if (std.mem.startsWith(u8, entry.name, "Qwen3-Embedding-0.6B-GGUF")) return true;
     }
     return false;
@@ -2045,9 +2045,9 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer antfly_db_close(missing_status_handle);
 
     {
-        var short_file = try std.Io.Dir.cwd().createFile(std.testing.io, short_lite_path, .{});
-        defer short_file.close(std.testing.io);
-        try short_file.writePositionalAll(std.testing.io, "short native lite header", 0);
+        var short_file = try std.Io.Dir.cwd().createFile(@import("antfly_platform").testing.io, short_lite_path, .{});
+        defer short_file.close(@import("antfly_platform").testing.io);
+        try short_file.writePositionalAll(@import("antfly_platform").testing.io, "short native lite header", 0);
     }
     var short_lite_sentinel: u8 = 0;
     var short_lite_handle: ?*anyopaque = &short_lite_sentinel;
@@ -2114,8 +2114,8 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     const format_version = blk: {
         // Simulate the allocator's exclusive file lock. Handle status must
         // remain available without opening a competing external reader.
-        var held = try std.Io.Dir.cwd().openFile(std.testing.io, src_path, .{ .mode = .read_write, .lock = .exclusive });
-        defer held.close(std.testing.io);
+        var held = try std.Io.Dir.cwd().openFile(@import("antfly_platform").testing.io, src_path, .{ .mode = .read_write, .lock = .exclusive });
+        defer held.close(@import("antfly_platform").testing.io);
         const guard = public.enterHandle(src_handle, .read) orelse return error.InvalidHandle;
         defer guard.leave();
         break :blk guard.handle.owned_lite_backend.?.storageStatus().format_version.?;
@@ -2455,7 +2455,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, check_before.ptr.?[0..check_before.len], "\"valid\":true") != null);
 
     {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var file = try std.Io.Dir.cwd().openFile(io, src_path, .{ .mode = .read_write });
@@ -2722,7 +2722,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         try std.testing.expectEqual(@as(usize, 0), locked_restore_report.len);
     }
     {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         try std.testing.expect(!capiPathExists(io_impl.io(), locked_restore_path));
         try std.testing.expect(!capiPathExists(io_impl.io(), locked_restore_tmp_path));
@@ -2744,7 +2744,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(malformed_restore_report.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), malformed_restore_report.len);
     {
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         try std.testing.expect(!capiPathExists(io_impl.io(), restore_malformed_path));
     }
@@ -3092,7 +3092,7 @@ test "capi concurrent calls and closes on one handle never touch freed memory" {
     const spawn_config: std.Thread.SpawnConfig = .{ .stack_size = capi_min_thread_stack_size };
     var callers: [6]std.Thread = undefined;
     for (&callers) |*t| t.* = try std.Thread.spawn(spawn_config, Worker.call, .{ handle, &unexpected });
-    std.Io.sleep(std.testing.io, .fromMilliseconds(20), .awake) catch {};
+    std.Io.sleep(@import("antfly_platform").testing.io, .fromMilliseconds(20), .awake) catch {};
     const closer_a = try std.Thread.spawn(spawn_config, Worker.close, .{handle});
     const closer_b = try std.Thread.spawn(spawn_config, Worker.close, .{handle});
     closer_a.join();

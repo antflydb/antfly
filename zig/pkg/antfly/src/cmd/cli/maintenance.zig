@@ -15,7 +15,9 @@
 
 //! Resource-scoped operator commands. Execution and durable job ownership stay
 //! in the existing public repair and index APIs.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const client_mod = @import("antfly-client");
 const types = client_mod.types;
 const cli = @import("mod.zig");
@@ -257,8 +259,8 @@ const RecoveryLog = struct {
 
 test "maintenance recovery artifact preserves synced lines and restrictive permissions" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var dir = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
     var log = try RecoveryLog.init(alloc, io, dir.dir);
     defer log.deinit(io);
@@ -282,7 +284,7 @@ fn runRelational(allocator: std.mem.Allocator, io: std.Io, client: *client_mod.A
     }
     if (options.once or options.limit != null or options.cursor != null or options.repair_id != null) return error.UnsupportedMaintenanceAction;
     if (!std.mem.eql(u8, status.index_name, options.index.?)) return error.InvalidIndexStatus;
-    var test_directory = if (@import("builtin").is_test) std.testing.tmpDir(.{}) else {};
+    var test_directory = if (@import("builtin").is_test) platform.testing.tmpDir(.{}) else {};
     defer if (@import("builtin").is_test) test_directory.cleanup();
     var recovery: ?RecoveryLog = null;
     defer if (recovery) |*log| log.deinit(io);
@@ -356,7 +358,7 @@ test "maintenance recovery replay requires an explicit target and rejects mixed 
 test "maintenance recovery replay sends saved proofs directly and rejects foreign acknowledgements" {
     const httpx = @import("httpx");
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const request: types.IndexMaintenanceRequest = .{ .table_id = "7", .schema_version = 0, .owners = &.{.{ .group_id = "9", .generation = "1", .slot = 0, .owner = z17RepeatString("aa", 32), .comparison = z17RepeatString("bb", 32), .progress_digest = z17RepeatString("cc", 32), .maintenance_epoch = "0" }} };
     const Task = struct {
         fn check(info: httpx.testing_mod.RequestInfo) !void {
@@ -439,7 +441,7 @@ test "maintenance rejects ambiguous scopes invalid bounds and ignored options" {
 test "maintenance public routes send scoped API requests through the client" {
     const httpx = @import("httpx");
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const Case = struct {
         resource: Resource,
         argv: []const [*:0]const u8,
@@ -469,7 +471,7 @@ test "maintenance public routes send scoped API requests through the client" {
             }
         }
         fn client(test_io: std.Io, c: *client_mod.AntflyClient, case: Case, success: *bool) std.Io.Cancelable!void {
-            var args = std.process.Args.Iterator.init(.{ .vector = case.argv });
+            var args = platform.process.argsIterator(case.argv);
             switch (case.resource) {
                 .index => @import("index.zig").run(std.testing.allocator, test_io, c, &args) catch return,
                 .artifact => @import("artifact.zig").run(std.testing.allocator, test_io, c, &args) catch return,
@@ -501,7 +503,7 @@ test "maintenance public routes send scoped API requests through the client" {
 test "maintenance relational commands auto detect index type and submit exact proofs" {
     const httpx = @import("httpx");
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const status_json =
         \\{"shard_status":{},"config":{"name":"by_tenant","type":"relational","keys":[{"column":"tenant"}]},"status":{"index_type":"relational","milestones":{"queryable":{"reached":false,"blockers":[]},"complete":{"reached":false,"blockers":[]}},"relational_index":{"table_id":"71","schema_version":3,"index_name":"by_tenant","state":"failed","ranges":[{"group_id":"9","generation":"7","slot":2,"owner":"owner","comparison":"comparison","progress_digest":"progress","maintenance_epoch":"4","state":"failed","rows_scanned":"3"}]}}}
     ;
@@ -585,7 +587,7 @@ test "maintenance repair job responses retain handles and cursors and reject mal
     ;
     const httpx = @import("httpx");
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const Case = struct { status: u16, body: []const u8, invalid: bool = false, control: bool = false };
     const Task = struct {
         fn run(c: *client_mod.AntflyClient, case: Case, failure: *?anyerror) std.Io.Cancelable!void {

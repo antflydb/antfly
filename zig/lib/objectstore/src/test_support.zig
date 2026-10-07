@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 pub fn requireIntegrationEnabled(comptime env_name: []const u8) !void {
@@ -33,7 +34,7 @@ pub fn requiredOwned(alloc: std.mem.Allocator, env_name: []const u8) ![]u8 {
 }
 
 pub fn integrationNonce() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const now = std.Io.Timestamp.now(io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());

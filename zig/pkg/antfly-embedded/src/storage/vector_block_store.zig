@@ -20,7 +20,9 @@
 //! batches. A handle is poisoned after an ambiguous append failure and must be
 //! reopened, preventing duplicate commits after a failed fsync.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("lsm_backend/mod.zig");
@@ -61,19 +63,36 @@ const wal_checkpoint_bytes: usize = 64 * 1024 * 1024;
 // publication/collection performs the full streaming consolidation.
 const checkpoint_merge_input_bytes: u64 = 4 * wal_checkpoint_bytes;
 const max_block_bytes: usize = if (@sizeOf(usize) >= 8) 8 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
-var positional_read_test_nonce: @import("antfly_platform").atomic.Value(u64) = .init(0);
-var retained_block_identity: @import("antfly_platform").atomic.Value(u64) = .init(1);
+var positional_read_test_nonce: platform.atomic.Value(u64) = .init(0);
+var retained_block_identity: platform.atomic.Value(u64) = .init(1);
 
 pub fn checkpointBlockPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64, shard_id: u32) ![]u8 {
     const name = try std.fmt.allocPrint(alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
     defer alloc.free(name);
-    return try std.fs.path.join(alloc, &.{ root_dir, name });
+    return try joinStoragePath(alloc, &.{ root_dir, name });
 }
 
 pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64) ![]u8 {
     const name = try std.fmt.allocPrint(alloc, "wal-{d}.afvw", .{generation});
     defer alloc.free(name);
-    return try std.fs.path.join(alloc, &.{ root_dir, name });
+    return try joinStoragePath(alloc, &.{ root_dir, name });
+}
+
+test "checkpoint paths preserve empty and trailing-separator root joins" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "vectors/" }) |root| {
+        const block = try checkpointBlockPathAlloc(alloc, root, 1, 2);
+        defer alloc.free(block);
+        const wal = try checkpointWalPathAlloc(alloc, root, 1);
+        defer alloc.free(wal);
+        const prefix = if (root.len == 0) "" else "vectors/";
+        const expected_block = try std.fmt.allocPrint(alloc, "{s}block-1-2.afvb", .{prefix});
+        defer alloc.free(expected_block);
+        const expected_wal = try std.fmt.allocPrint(alloc, "{s}wal-1.afvw", .{prefix});
+        defer alloc.free(expected_wal);
+        try std.testing.expectEqualStrings(expected_block, block);
+        try std.testing.expectEqualStrings(expected_wal, wal);
+    }
 }
 
 pub const RetainedBlock = struct {
@@ -91,7 +110,7 @@ pub const RetainedBlock = struct {
 
     const Shared = struct {
         alloc: Allocator,
-        refs: @import("antfly_platform").atomic.Value(u64) = .init(1),
+        refs: platform.atomic.Value(u64) = .init(1),
         identity: u64,
         payload: Payload,
     };
@@ -128,7 +147,7 @@ pub const RetainedBlock = struct {
                 } else {
                     var read_len: usize = 0;
                     while (read_len < out.len) {
-                        const rc = std.posix.system.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
+                        const rc = platform.c.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
                         switch (std.posix.errno(rc)) {
                             .SUCCESS => {
                                 const n: usize = @intCast(rc);
@@ -151,7 +170,7 @@ pub const RetainedBlock = struct {
     fn discardResidentPages(self: RetainedBlock) void {
         if (comptime builtin.os.tag != .freestanding) {
             switch (self.shared.payload) {
-                .mapped => |mapped| std.posix.madvise(mapped.bytes.ptr, mapped.bytes.len, std.posix.MADV.DONTNEED) catch {},
+                .mapped => |mapped| platform.filesystem.adviseMemory(mapped.bytes.ptr, mapped.bytes.len, platform.c.MADV.DONTNEED) catch {},
                 .heap => {},
             }
         }
@@ -166,7 +185,7 @@ pub const RetainedBlock = struct {
                 if (comptime builtin.os.tag == .freestanding) {
                     unreachable;
                 } else {
-                    std.posix.munmap(mapped.bytes);
+                    platform.filesystem.unmapMemory(mapped.bytes);
                     _ = std.posix.system.close(mapped.fd);
                 }
             },
@@ -295,13 +314,7 @@ fn discardStagedBlocksAt(
     staged: []const StagedBlock,
 ) void {
     for (staged) |receipt| {
-        const separator = if (std.mem.endsWith(u8, root_dir, std.fs.path.sep_str)) "" else std.fs.path.sep_str;
-        const path = std.fmt.allocPrint(alloc, "{s}{s}block-{d}-{d}.afvb", .{
-            root_dir,
-            separator,
-            receipt.generation,
-            receipt.shard_id,
-        }) catch continue;
+        const path = checkpointBlockPathAlloc(alloc, root_dir, receipt.generation, receipt.shard_id) catch continue;
         defer alloc.free(path);
         storage.deleteFileAbsolute(path) catch {};
     }
@@ -1377,7 +1390,7 @@ pub const Store = struct {
         for (names) |name| {
             if (!isManagedArtifactName(name) or self.artifactNameIsLive(name)) continue;
             stats.observed_debt += 1;
-            const path = try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+            const path = try joinStoragePath(self.alloc, &.{ self.root_dir, name });
             defer self.alloc.free(path);
             self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
                 error.FileNotFound => {},
@@ -1517,7 +1530,7 @@ pub const Store = struct {
         for (0..options.shard_count) |shard| {
             const name = try std.fmt.allocPrint(self.alloc, "spool-{d}.tmp", .{shard});
             defer self.alloc.free(name);
-            spool_paths[shard] = try std.fs.path.join(self.alloc, &.{ self.root_dir, name });
+            spool_paths[shard] = try joinStoragePath(self.alloc, &.{ self.root_dir, name });
             path_count += 1;
         }
 
@@ -1738,7 +1751,7 @@ pub const Store = struct {
     }
 
     fn currentPathAlloc(self: *const Store) ![]u8 {
-        return try std.fs.path.join(self.alloc, &.{ self.root_dir, current_name });
+        return try joinStoragePath(self.alloc, &.{ self.root_dir, current_name });
     }
 
     fn walPathAlloc(self: *const Store, generation: u64) ![]u8 {
@@ -1873,10 +1886,10 @@ pub const ReferenceLocationCache = struct {
     stripes: [16]Stripe = @splat(.{}),
     manager: ?*resources.ResourceManager = null,
     reclaimer: u64 = 0,
-    resident_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    reclaimed_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    hits: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    misses: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    resident_bytes: platform.atomic.Value(u64) = .init(0),
+    reclaimed_bytes: platform.atomic.Value(u64) = .init(0),
+    hits: platform.atomic.Value(u64) = .init(0),
+    misses: platform.atomic.Value(u64) = .init(0),
 
     pub fn create(alloc: Allocator, count: usize) !*ReferenceLocationCache {
         return createWithPolicy(alloc, count, false);
@@ -2626,7 +2639,7 @@ pub const Opened = struct {
         for (0..destination_count) |shard| {
             const name = try std.fmt.allocPrint(self.store.alloc, "compact-{d}-{d}.tmp", .{ generation, shard });
             defer self.store.alloc.free(name);
-            spool_paths[shard] = try std.fs.path.join(self.store.alloc, &.{ self.store.root_dir, name });
+            spool_paths[shard] = try joinStoragePath(self.store.alloc, &.{ self.store.root_dir, name });
             path_count += 1;
         }
 
@@ -3946,7 +3959,7 @@ fn runPositionalReadBatchProfiled(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     stats: ?*ReadDispatchStats,
 ) !void {
-    const time = @import("antfly_platform").time;
+    const time = platform.time;
     if (stats) |p| {
         p.batches += @intFromBool(requests.len != 0);
         p.requests += requests.len;
@@ -4011,8 +4024,8 @@ fn runPositionalReadBatchProfiled(
         next: std.atomic.Value(usize) = .init(0),
         manager: ?*resource_manager_mod.ResourceManager,
         profiled: bool,
-        worker_wall_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        worker_start_delay_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        worker_wall_ns: platform.atomic.Value(u64) = .init(0),
+        worker_start_delay_ns: platform.atomic.Value(u64) = .init(0),
 
         fn worker(work: *@This(), submitted: u64) std.Io.Cancelable!void {
             defer if (work.manager) |manager| manager.releaseDenseReadTask();
@@ -4115,7 +4128,7 @@ test "storage.vector_block_store read dispatch profiling preserves request owner
             request.visits += 1;
         }
     };
-    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{ .dense_read_extra_task_limit = 4 });
     defer manager.deinit(std.testing.allocator);
@@ -4144,7 +4157,7 @@ test "storage.vector_block_store bounded read workers process every request once
         }
     };
     for ([_]usize{ 0, 1, 8 }) |limit| {
-        var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(limit) });
+        var runtime = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(limit) });
         defer runtime.deinit();
         var requests: [257]Request = @splat(.{});
         try runPositionalReadBatch(Request, {}, runtime.io(), &requests, Runner.run, null);
@@ -4156,7 +4169,7 @@ test "storage.vector_block_store bounded read workers process every request once
 }
 
 test "storage.vector_block_store governed read workers release permits on completion and cancellation" {
-    var runtime = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
     defer runtime.deinit();
     const Request = struct { visits: u32 = 0, cancel: bool = false };
     const Runner = struct {
@@ -4930,7 +4943,7 @@ fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) 
                         reader.covered_source_sequence == descriptor.covered_source_sequence and reader.admissionChecksum() == descriptor.admission_checksum)
                     {
                         const retained = RetainedBlock.init(store.alloc, .{ .mapped = mapped }) catch |err| {
-                            std.posix.munmap(mapped.bytes);
+                            platform.filesystem.unmapMemory(mapped.bytes);
                             _ = std.posix.system.close(mapped.fd);
                             return err;
                         };
@@ -4938,7 +4951,7 @@ fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) 
                     }
                 } else |_| {}
             }
-            std.posix.munmap(mapped.bytes);
+            platform.filesystem.unmapMemory(mapped.bytes);
             _ = std.posix.system.close(mapped.fd);
         } else |_| {}
     }
@@ -4970,7 +4983,7 @@ fn mapBlockFile(path: []const u8) !RetainedBlock.MappedPayload {
         // Vector point reads are physically sorted within a request but sparse
         // across the corpus. Disable broad kernel read-ahead so a recall-parity
         // workload does not pull the complete multi-GiB projection into RSS.
-        std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM) catch {};
+        platform.filesystem.adviseMemory(mapped.ptr, mapped.len, platform.c.MADV.RANDOM) catch {};
         return .{ .bytes = mapped, .fd = fd };
     }
 }
@@ -5127,7 +5140,7 @@ test "cold projection workers drain multiple shards under admission and reuse th
         };
     }
     for ([_]usize{ 0, 2, 8 }) |limit| {
-        var runtime = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(limit) });
+        var runtime = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(limit) });
         defer runtime.deinit();
         for (0..2) |_| {
             const stats = try session.readProjectionsIntoBatch(runtime.io(), &requests);
@@ -5175,7 +5188,7 @@ test "cold projection workers drain multiple shards under admission and reuse th
 test "grouped projection queue includes oversized fallbacks and unavailable helpers" {
     if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var native = try lsm_backend.NativeStorage.init(alloc, .threaded);
     defer native.deinit();
@@ -5291,7 +5304,7 @@ test "vector block positional lookup reads mmap payload through retained descrip
     var exact_decoded: [3]f32 = undefined;
     try std.testing.expectEqualSlices(f32, &.{ 1.25, -2.5, 3.75 }, try exact.decodeExactInto(&exact_decoded));
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const keys = [_][]const u8{ "artifact-a", "artifact-b", "artifact-c" };
     const revisions = [_]u64{ 7, 8, 9 };
@@ -6740,4 +6753,12 @@ test "storage.vector_block_store adaptive read cost and available work gate help
     try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(1, 100000));
     try std.testing.expectEqual(@as(usize, 1), adaptiveReadWorkers(2, 8000));
     try std.testing.expectEqual(@as(usize, 8), adaptiveReadWorkers(30, 50000));
+}
+
+/// Index storage paths are virtual inside Lite files and always use '/'.
+/// std.fs.path.join would use '\\' on Windows; '/' also works for real
+/// Windows filesystem paths. Other targets keep std.fs.path.join, which also
+/// skips empty components and collapses a separator shared by adjacent parts.
+fn joinStoragePath(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    return @import("antfly_runtime_fs").fs_paths.joinStoragePathAlloc(alloc, parts);
 }

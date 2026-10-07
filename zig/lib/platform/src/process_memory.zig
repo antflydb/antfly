@@ -630,7 +630,7 @@ fn readSmallLinuxFile(path: []const u8, buffer: []u8) ?[]const u8 {
 }
 
 fn readProcFile(path: []const u8, buf: []u8) ?[]const u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = @import("root.zig").Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var file = std.Io.Dir.openFileAbsolute(io_impl.io(), path, .{}) catch return null;
     defer file.close(io_impl.io());

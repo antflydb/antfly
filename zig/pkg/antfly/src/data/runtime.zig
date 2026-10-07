@@ -25,7 +25,7 @@ const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const runtime_io_abi = @import("antfly_runtime_abi").io_abi;
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = platform.sync;
 const build_options = @import("build_options");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
@@ -92,9 +92,9 @@ const change_journal_mod = @import("antfly_local_sources").storage_db_derived_ch
 const doc_identity = @import("antfly_local_sources").storage_db_doc_identity;
 const range_state_mod = @import("antfly_local_sources").storage_db_range_state;
 const data_raft_batch = @import("raft_batch.zig");
-const platform_clock = @import("antfly_platform").clock;
-const process_memory_mod = @import("antfly_platform").process_memory;
-const platform_time = @import("antfly_platform").time;
+const platform_clock = platform.clock;
+const process_memory_mod = platform.process_memory;
+const platform_time = platform.time;
 const platform = @import("antfly_platform");
 const raft_engine = @import("raft_engine");
 const thread_config = @import("antfly_local_sources").runtime_thread_config;
@@ -1491,7 +1491,7 @@ const RaftTableApplyStateMachine = struct {
     // Only live registrations and parked readers retain a signal. Heap-owned
     // addresses survive map growth and retirement while futex waits are parked.
     completion_groups: std.AutoHashMapUnmanaged(u64, *CompletionGroup) = .empty,
-    apply_outcome_io: std.Io = std.Options.debug_io,
+    apply_outcome_io: std.Io = platform.debug_io,
     // ReadIndex is asynchronous: enqueuing it is not a read barrier. This
     // shared tracker owns the request identity and waits until the matching
     // ReadState has crossed this exact replica's state-machine apply boundary.
@@ -1524,7 +1524,7 @@ const RaftTableApplyStateMachine = struct {
         catalog: antfly.public_api.table_catalog.CatalogSource,
         backend_runtime: ?*backend_runtime_mod.BackendRuntime,
     ) !RaftTableApplyStateMachine {
-        const io = if (backend_runtime) |runtime| runtime.io() orelse return error.ConcurrencyUnavailable else std.Options.debug_io;
+        const io = if (backend_runtime) |runtime| runtime.io() orelse return error.ConcurrencyUnavailable else platform.debug_io;
         var incarnation: u128 = undefined;
         try io.randomSecure(std.mem.asBytes(&incarnation));
         const write_source = antfly.public_api.ProvisionedTableWriteSource.initWithBackendRuntime(
@@ -1682,7 +1682,7 @@ const RaftTableApplyStateMachine = struct {
         const signal = self.completion_groups.get(group_id) orelse return;
         const epoch = if (writes) &signal.writes else &signal.reads;
         _ = epoch.fetchAdd(1, .release);
-        std.Io.futexWake(if (writes) self.apply_outcome_io else std.Options.debug_io, u32, &epoch.raw, std.math.maxInt(u32));
+        std.Io.futexWake(if (writes) self.apply_outcome_io else platform.debug_io, u32, &epoch.raw, std.math.maxInt(u32));
     }
 
     fn registerReadBarrier(self: *RaftTableApplyStateMachine, group_id: u64) !u64 {
@@ -1757,7 +1757,7 @@ const RaftTableApplyStateMachine = struct {
             const observed = signal.reads.load(.acquire);
             if (self.readBarrierState(request_id) != .pending) continue;
             std.Io.futexWaitTimeout(
-                std.Options.debug_io,
+                platform.debug_io,
                 u32,
                 &signal.reads.raw,
                 observed,
@@ -5807,7 +5807,7 @@ pub const DataServer = struct {
     owned_http_runtime: ?*httpx.HttpRuntime = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
-    query_io_impl: ?std.Io.Threaded = null,
+    query_io_impl: ?platform.Io.Threaded = null,
     distributed_read_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
     lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_future: ?std.Io.Future(void) = null,
@@ -6705,7 +6705,7 @@ pub const DataServer = struct {
             const io = runtime.apiIo() orelse return error.HttpRuntimeUnavailable;
             _ = self.read_source.withIoInterface(io, self.query_async_limit);
         } else {
-            self.query_io_impl = std.Io.Threaded.init(self.alloc, .{
+            self.query_io_impl = platform.Io.Threaded.init(self.alloc, .{
                 .async_limit = self.query_async_limit,
                 .concurrent_limit = .limited(backend_runtime_mod.default_io_concurrent_limit),
             });
@@ -7306,7 +7306,7 @@ pub const DataServer = struct {
         }, descriptor.byte_range, descriptor.scope);
         const registry_root = try self.hotStandbyRestoreOwnerMetadataRoot(self.alloc);
         defer self.alloc.free(registry_root);
-        const registry_io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const registry_io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         // Persist discovery before acknowledging this record. Otherwise a
         // post-seed hidden owner disappears from an offline subsequent seed.
         try @import("../storage/hot_standby/restore_owner_registry.zig").record(self.alloc, registry_io, registry_root, descriptor);
@@ -7342,7 +7342,7 @@ pub const DataServer = struct {
                 try source.completePreparedReplicaRetirements(&prepared);
             } else try source.requireAbsentRestoreOwnerRoot(self.alloc, group_id);
         } else try source.retireCanceledRestoreOwner(self.alloc, group_id, terminal.table_id, scope, self.replicaRetirementOwnership());
-        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         const root = try self.hotStandbyRestoreOwnerMetadataRoot(self.alloc);
         defer self.alloc.free(root);
         try @import("../storage/hot_standby/restore_owner_registry.zig").retireTerminal(self.alloc, io, root, group_id, scope);
@@ -7381,7 +7381,7 @@ pub const DataServer = struct {
 
     fn hotStandbyRestoreTerminalLedger(self: *DataServer) !*@import("../storage/hot_standby/restore_terminal_ledger.zig").Ledger {
         const source = self.liveRuntimeWriteSource();
-        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         self.restore_terminal_mutex.lockUncancelable(io);
         defer self.restore_terminal_mutex.unlock(io);
         if (self.restore_terminal_ledger == null) {
@@ -7414,7 +7414,7 @@ pub const DataServer = struct {
         if (applied_lsn == 0) return;
         const floor: @import("../storage/hot_standby/replay_floor.zig").Floor = .{ .cluster_id = identity.cluster_id, .timeline_id = identity.timeline_id, .epoch = identity.epoch, .lsn = applied_lsn };
         const source = self.liveRuntimeWriteSource();
-        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         const ledger = try self.hotStandbyRestoreTerminalLedger();
         var current = try ledger.snapshot();
         defer current.deinit();
@@ -8042,7 +8042,7 @@ pub const DataServer = struct {
         const published_root = try std.fs.path.join(alloc, &.{ snapshots_root, request.generation });
         errdefer alloc.free(published_root);
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         // Prepared roots are staging state only. A process stop can leave a
@@ -8339,7 +8339,7 @@ pub const DataServer = struct {
         const deadline_ns = now_ns +| hot_standby_seed_snapshot_preflight_timeout_ns;
         const registry_root = try self.hotStandbyRestoreOwnerMetadataRoot(self.alloc);
         defer self.alloc.free(registry_root);
-        const registry_io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const registry_io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         var terminal_snapshot = try (try self.hotStandbyRestoreTerminalLedger()).snapshot();
         defer terminal_snapshot.deinit();
         var native_inventory = try @import("../storage/hot_standby/restore_owner_registry.zig").loadWithTerminalSnapshot(self.alloc, registry_io, registry_root, metadata_snapshot.tables, &terminal_snapshot);
@@ -8409,7 +8409,7 @@ pub const DataServer = struct {
         defer alloc.free(metadata_root);
         const path = try std.fs.path.join(alloc, &.{ metadata_root, antfly.hot_standby.seed_materialization.private_provisioning_name });
         defer alloc.free(path);
-        const io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else std.Options.debug_io;
+        const io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes)) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -8593,7 +8593,7 @@ pub const DataServer = struct {
         defer alloc.free(allowed_root);
         if (!antfly.hot_standby.validation.isAbsoluteNormalizedPathWithinRoot(prepared_root, allowed_root) or
             std.mem.eql(u8, prepared_root, allowed_root)) return error.InvalidHASeedSnapshotRoot;
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         const topology_path = try std.fs.path.join(alloc, &.{ prepared_root, hot_standby_seed_snapshot_topology_name });
@@ -8710,7 +8710,7 @@ pub const DataServer = struct {
         defer alloc.free(allowed_root);
         if (!antfly.hot_standby.validation.isAbsoluteNormalizedPathWithinRoot(prepared_root, allowed_root) or
             std.mem.eql(u8, prepared_root, allowed_root)) return;
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), prepared_root) catch |err| {
             std.log.warn("failed to remove prepared HA seed snapshot root={s} err={s}", .{ prepared_root, @errorName(err) });
@@ -9428,7 +9428,7 @@ pub const DataServer = struct {
         self.provisioned_storage.detachWriteSourceRuntimeHooks();
         if (comptime linked_storage) {
             if (self.kernel_owner_source) |owner_source|
-                try owner_source.quiesce(self.dataRaftIo() orelse std.Io.Threaded.global_single_threaded.io());
+                try owner_source.quiesce(self.dataRaftIo() orelse platform.Io.Threaded.global_single_threaded.io());
         }
         // Native owner close joins transaction-recovery callbacks. They may
         // still need the Raft listener and progress driver to finish a local
@@ -25091,7 +25091,7 @@ const RemoteMetadataSource = struct {
     fn init(
         alloc: std.mem.Allocator,
         base_uris: []const []const u8,
-        io_impl: *std.Io.Threaded,
+        io_impl: *platform.Io.Threaded,
     ) !RemoteMetadataSource {
         if (base_uris.len == 0) return error.MissingMetadataApi;
         const http_executors = try alloc.alloc(
@@ -27736,7 +27736,7 @@ const RemoteMetadataSource = struct {
                     const now: u64 = if (ctx.request.deadline_io) |borrow| blk: {
                         var receiver = try borrow.receive();
                         break :blk @intCast(@max(0, std.Io.Clock.awake.now(receiver.io()).nanoseconds));
-                    } else @import("antfly_platform").time.monotonicNs();
+                    } else platform.time.monotonicNs();
                     if (now >= deadline) return error.DeadlineExceeded;
                     bounded.remaining_ms = @intCast(@min(bounded.remaining_ms, @max(1, (deadline - now) / std.time.ns_per_ms)));
                 }
@@ -29330,7 +29330,7 @@ fn collectLocalGroupStatuses(
         const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(db_path);
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         _ = statFilePath(io_impl.io(), db_path) catch |err| switch (err) {
             error.FileNotFound => continue,
@@ -30694,7 +30694,7 @@ pub fn runFromIterator(
     }
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
-    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
+    var setup_io = platform.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
@@ -31395,7 +31395,7 @@ fn resolveExtensionPackageStoreDirWithEnv(
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var probe = path;
@@ -31541,7 +31541,7 @@ fn printUsage(argv0: []const u8) void {
 fn exerciseLocalMergeFallback(comptime terminal: enum { finalized, rolled_back }) !void {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-merge-identity", .{tmp.sub_path});
@@ -31859,7 +31859,7 @@ const TestHotStandbySeedSnapshotProvider = struct {
         self.calls += 1;
         if (self.unsupported) return error.HASeedSnapshotUnsupportedBackend;
 
-        var io_impl = std.Io.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         const provider_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{request.capture_root});
@@ -32055,8 +32055,8 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     for (0..roots.len) |i| {
         var name_buf: [32]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "node-{d}", .{i + 1});
-        try tmp.dir.createDirPath(std.testing.io, name);
-        roots[i] = try tmp.dir.realPathFileAlloc(std.testing.io, name, alloc); // vopr-audit: allow(host_filesystem) explicit physical-backend differential
+        try tmp.dir.createDirPath(platform.testing.io, name);
+        roots[i] = try tmp.dir.realPathFileAlloc(platform.testing.io, name, alloc); // vopr-audit: allow(host_filesystem) explicit physical-backend differential
         root_count += 1;
     }
 
@@ -32121,7 +32121,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         };
     }
 
-    const profile_work = @import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE");
+    const profile_work = platform.env.getenvBool("ANTFLY_TEST_WORK_PROFILE");
     // Counts cover the borrowed runtime filesystem interface, not direct
     // adapter/OS calls. The wrappers preserve the original I/O and errors.
     const DiskWork = struct {
@@ -32129,19 +32129,19 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         var writes: std.atomic.Value(u64) = .init(0);
         pub fn sync(ptr: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
             _ = syncs.fetchAdd(1, .monotonic);
-            return std.testing.io.vtable.fileSync(ptr, file);
+            return platform.testing.io.vtable.fileSync(ptr, file);
         }
         fn write(ptr: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
             _ = writes.fetchAdd(1, .monotonic);
-            return std.testing.io.vtable.fileWritePositional(ptr, file, header, data, splat, offset);
+            return platform.testing.io.vtable.fileWritePositional(ptr, file, header, data, splat, offset);
         }
     };
     DiskWork.syncs.store(0, .monotonic);
     DiskWork.writes.store(0, .monotonic);
-    var filesystem_vtable = std.testing.io.vtable.*;
+    var filesystem_vtable = platform.testing.io.vtable.*;
     filesystem_vtable.fileSync = DiskWork.sync;
     filesystem_vtable.fileWritePositional = DiskWork.write;
-    const filesystem_io: std.Io = if (profile_work) .{ .userdata = std.testing.io.userdata, .vtable = &filesystem_vtable } else std.testing.io;
+    const filesystem_io: std.Io = if (profile_work) .{ .userdata = platform.testing.io.userdata, .vtable = &filesystem_vtable } else platform.testing.io;
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
         // Each production-shaped node keeps its LSM files on the host-backed
@@ -33945,7 +33945,7 @@ fn consumerTests() type {
                 }
             };
             var fake: Fake = .{};
-            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://collection.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://collection.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, platform.testing.io);
             defer source.deinit();
             source.cached_snapshot = try cloneAdminSnapshotOwned(a, .{
                 .status = .{ .metadata_group_id = 9, .metadata_incarnation = @as([32]u8, @splat('1')), .metrics = .{} },
@@ -34199,7 +34199,7 @@ fn consumerTests() type {
             };
             for ([_]bool{ false, true }) |heartbeat| {
                 var fake: Fake = .{};
-                var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://baseline.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+                var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://baseline.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, platform.testing.io);
                 defer source.deinit();
                 var server: DataServer = .{
                     .alloc = a,
@@ -34283,7 +34283,7 @@ fn consumerTests() type {
                 }
             };
             var fake = Fake{};
-            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://one.invalid", "http://two.invalid", "http://three.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://one.invalid", "http://two.invalid", "http://three.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, platform.testing.io);
             defer source.deinit();
             try std.testing.expectEqual(@as(u32, 17), try source.withMetadataApiClient(u32, Fake.call, &fake));
             try std.testing.expectEqual(@as(usize, 3), fake.calls);
@@ -34329,7 +34329,7 @@ fn consumerTests() type {
                 }
             };
             var fake: Fake = .{};
-            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, platform.testing.io);
             defer source.deinit();
             for (0..8) |_| {
                 const bytes = try source.readWriteValidation(alloc, .{}, "docs");
@@ -34385,7 +34385,7 @@ fn consumerTests() type {
                 }
             };
             var fake = Fake{};
-            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://one.invalid", "http://two.invalid", "http://three.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{ "http://one.invalid", "http://two.invalid", "http://three.invalid" }, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, platform.testing.io);
             defer source.deinit();
             fake.source = &source;
             const body = try source.readSystemCatalog(alloc, .{}, .{ .resolve = .{ .table = "docs" } });
@@ -34487,7 +34487,7 @@ fn consumerTests() type {
         test "data raft stable placement refreshes changed peer transport endpoints" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-peer-route-refresh", .{tmp.sub_path});
@@ -34742,15 +34742,15 @@ fn consumerTests() type {
                 raft_started += 1;
             }
 
-            var peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+            var peer = try httpx.TestServer.start(alloc, platform.testing.io, &.{.{
                 .method = .POST,
                 .path = "/internal/v1/groups/7/tables/docs/batch-routed-v1",
                 .respond = .{ .status = 201, .body = "{\"inserted\":1}" },
                 .max_uses = 1,
             }});
             defer peer.deinit();
-            var serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&peer});
-            defer serving.cancel(std.testing.io) catch {};
+            var serving = try platform.testing.io.concurrent(httpx.TestServer.handleOne, .{&peer});
+            defer serving.cancel(platform.testing.io) catch {};
             var forward_lane = try server.acquireDataRaftForwardLane();
             defer forward_lane.release();
             var executor = antfly.common.http.IoHttpExecutor.init(alloc, forward_lane.io(), .{});
@@ -34768,7 +34768,7 @@ fn consumerTests() type {
             );
             defer response.deinit(alloc);
             try std.testing.expectEqualStrings("{\"inserted\":1}", response.body);
-            try serving.await(std.testing.io);
+            try serving.await(platform.testing.io);
             try std.testing.expectEqual(@as(usize, 1), peer.route_hits[0]);
 
             // Strong reads (including FK preflight) await peer lookups from
@@ -34787,15 +34787,15 @@ fn consumerTests() type {
                 api_started += 1;
             }
             try std.testing.expectError(error.ConcurrencyUnavailable, api_io.concurrent(Worker.run, .{ api_io, &api_release }));
-            var read_peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+            var read_peer = try httpx.TestServer.start(alloc, platform.testing.io, &.{.{
                 .method = .GET,
                 .path = "/lookup",
                 .respond = .{ .status = 200, .body = "{\"id\":7}" },
                 .max_uses = 1,
             }});
             defer read_peer.deinit();
-            var read_serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&read_peer});
-            defer read_serving.cancel(std.testing.io) catch {};
+            var read_serving = try platform.testing.io.concurrent(httpx.TestServer.handleOne, .{&read_peer});
+            defer read_serving.cancel(platform.testing.io) catch {};
             const read_uri = try std.fmt.allocPrint(alloc, "{s}/lookup", .{read_peer.baseUrl()});
             defer alloc.free(read_uri);
             var unisolated = antfly.common.http.IoHttpExecutor.init(alloc, api_io, .{});
@@ -34813,7 +34813,7 @@ fn consumerTests() type {
             });
             defer read_response.deinit(alloc);
             try std.testing.expectEqualStrings("{\"id\":7}", read_response.body);
-            try read_serving.await(std.testing.io);
+            try read_serving.await(platform.testing.io);
             try std.testing.expectEqual(@as(usize, 1), read_peer.route_hits[0]);
 
             raft_release.set(raft_io);
@@ -34852,15 +34852,15 @@ fn consumerTests() type {
                 try std.testing.expectError(error.StorageReadTemporarilyUnavailable, server.distributedReadExecutor());
                 try std.testing.expect(server.distributed_read_http_executor == null);
             }
-            var consensus_peer = try httpx.TestServer.start(alloc, std.testing.io, &.{.{
+            var consensus_peer = try httpx.TestServer.start(alloc, platform.testing.io, &.{.{
                 .method = .POST,
                 .path = "/raft/v1/batch",
                 .respond = .{ .status = 200, .body = "{}" },
                 .max_uses = 1,
             }});
             defer consensus_peer.deinit();
-            var consensus_serving = try std.testing.io.concurrent(httpx.TestServer.handleOne, .{&consensus_peer});
-            defer consensus_serving.cancel(std.testing.io) catch {};
+            var consensus_serving = try platform.testing.io.concurrent(httpx.TestServer.handleOne, .{&consensus_peer});
+            defer consensus_serving.cancel(platform.testing.io) catch {};
             var consensus_executor: antfly.common.http.StdHttpExecutor = undefined;
             consensus_executor.initSharedInPlace(alloc, .{}, backend_runtime.ptr().raftOutboundIoImpl().?);
             defer consensus_executor.deinit();
@@ -34874,7 +34874,7 @@ fn consumerTests() type {
             });
             defer consensus_response.deinit(alloc);
             try std.testing.expectEqual(@as(u16, 200), consensus_response.status);
-            try consensus_serving.await(std.testing.io);
+            try consensus_serving.await(platform.testing.io);
             try std.testing.expectEqual(@as(usize, 1), consensus_peer.route_hits[0]);
         }
 
@@ -35368,7 +35368,7 @@ fn consumerTests() type {
                 fn run(ptr: *anyopaque) !void {
                     const data_server: *DataServer = @ptrCast(@alignCast(ptr));
                     while (!data_server.provisioned_index_repair_shutdown.load(.acquire)) {
-                        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                     }
                 }
 
@@ -35831,7 +35831,7 @@ fn consumerTests() type {
                     const call = self.calls.fetchAdd(1, .acq_rel);
                     if (call == 0) {
                         self.entered.store(true, .release);
-                        while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                        while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                         return 111;
                     }
                     return 222;
@@ -35879,14 +35879,14 @@ fn consumerTests() type {
 
             var controlled = ControlledScanner{};
             var scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
-            var thread = try std.testing.io.concurrent(ScanThread.run, .{&scan_thread});
-            while (!controlled.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            var thread = try platform.testing.io.concurrent(ScanThread.run, .{&scan_thread});
+            while (!controlled.entered.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
             // A request arriving during the scan fences its observation and
             // invalidates the entry. Only the retry may acknowledge the request.
             server.observeReallocationRequest(.{ .request_id = 44, .requested_at_ms = 55 });
             controlled.release.store(true, .release);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
 
             try std.testing.expectEqual(@as(u64, 222), scan_thread.result.?.disk_bytes);
             try std.testing.expect(
@@ -35919,11 +35919,11 @@ fn consumerTests() type {
             controlled.release.store(false, .release);
             controlled.calls.store(0, .release);
             var unrelated_scan_thread = ScanThread{ .server = &server, .scanner = controlled.interface() };
-            var unrelated_thread = try std.testing.io.concurrent(ScanThread.run, .{&unrelated_scan_thread});
-            while (!controlled.entered.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            var unrelated_thread = try platform.testing.io.concurrent(ScanThread.run, .{&unrelated_scan_thread});
+            while (!controlled.entered.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             server.invalidateRuntimeStatusDiskUsageCacheForGroup(8);
             controlled.release.store(true, .release);
-            unrelated_thread.await(std.testing.io);
+            unrelated_thread.await(platform.testing.io);
 
             try std.testing.expectEqual(@as(u64, 111), unrelated_scan_thread.result.?.disk_bytes);
             try std.testing.expectEqual(@as(u32, 1), controlled.calls.load(.acquire));
@@ -36415,7 +36415,7 @@ fn consumerTests() type {
 
         test "data raft read safety deadline and cancellation cover owner lock admission" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/read-owner-admission", .{tmp.sub_path});
             defer alloc.free(root);
@@ -36449,23 +36449,23 @@ fn consumerTests() type {
                 lockAtomic(&server.data_raft_mutex);
                 var locked = true;
                 defer if (locked) server.data_raft_mutex.unlock();
-                var task = try std.testing.io.concurrent(Reader.run, .{&reader});
+                var task = try platform.testing.io.concurrent(Reader.run, .{&reader});
                 // Always release the owner before joining, including on the old
                 // unbounded implementation, so this regression fails without hanging.
                 const watchdog = platform_time.monotonicNs() + std.time.ns_per_s;
                 while (server.data_raft_apply.?.read_barriers.pendingCount() == 0 and
                     !reader.done.load(.acquire) and platform_time.monotonicNs() < watchdog)
                 {
-                    std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                    platform.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
                 }
                 if (cancel) reader.cancelled.store(true, .release);
                 while (!reader.done.load(.acquire) and platform_time.monotonicNs() < watchdog) {
-                    std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                    platform.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
                 }
                 const completed_while_locked = reader.done.load(.acquire);
                 server.data_raft_mutex.unlock();
                 locked = false;
-                task.await(std.testing.io);
+                task.await(platform.testing.io);
                 try std.testing.expect(completed_while_locked);
                 try std.testing.expectEqual(@as(?anyerror, if (cancel) error.Cancelled else error.ReadIndexTimeout), reader.failure);
                 try std.testing.expectEqual(@as(usize, 0), server.data_raft_apply.?.read_barriers.pendingCount());
@@ -36630,7 +36630,7 @@ fn consumerTests() type {
 
         test "data raft read safety barrier excludes persisted but uninstalled snapshots" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pending-read-snapshot", .{tmp.sub_path});
             defer alloc.free(root);
@@ -37198,7 +37198,7 @@ fn consumerTests() type {
             const alloc = std.testing.allocator;
             const group_id: u64 = 77;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-raft-apply-conflict", .{tmp.sub_path});
             defer alloc.free(replica_root);
@@ -37588,7 +37588,7 @@ fn consumerTests() type {
         }
 
         test "data server can register a store without enabling data raft" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-no-raft-root", .{tmp.sub_path});
@@ -37614,7 +37614,7 @@ fn consumerTests() type {
         }
 
         test "data server registered data raft uses wal state backend by default" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-default-wal-root", .{tmp.sub_path});
@@ -37643,7 +37643,7 @@ fn consumerTests() type {
 
         test "unconfirmed hidden initial placement cannot retire admitted ordinary replica" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unconfirmed-hidden-placement", .{tmp.sub_path});
             defer alloc.free(replica_root);
@@ -37746,7 +37746,7 @@ fn consumerTests() type {
 
         test "cold omitted initial child quarantines only its own root" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cold-initial-child", .{tmp.sub_path});
             defer alloc.free(replica_root);
@@ -37754,7 +37754,7 @@ fn consumerTests() type {
             defer alloc.free(catalog_path);
             const hidden_root = try std.fmt.allocPrint(alloc, "{s}/group-77", .{replica_root});
             defer alloc.free(hidden_root);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try fs_paths.createDirPathPortable(io_impl.io(), hidden_root);
             {
@@ -37805,7 +37805,7 @@ fn consumerTests() type {
             if (comptime !linked_storage) return error.SkipZigTest;
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-cold-restore-admission", .{tmp.sub_path});
@@ -37961,7 +37961,7 @@ fn consumerTests() type {
         test "local raft admission leaves global metadata refresh to control" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-local-admission", .{tmp.sub_path});
@@ -38040,7 +38040,7 @@ fn consumerTests() type {
         test "data raft ticker advances consensus independently of control rounds" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-independent-raft-ticker", .{tmp.sub_path});
@@ -38209,7 +38209,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
 
             {
-                var io_impl = std.Io.Threaded.init(alloc, .{});
+                var io_impl = platform.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
                 var progress = antfly.raft.ManagedProgressDriver.init(
                     io_impl.io(),
@@ -38240,7 +38240,7 @@ fn consumerTests() type {
                 "--api-port",
                 "8080",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = platform.process.argsIterator(argv[0..]);
             var cfg = try parseCli(std.testing.allocator, &iter);
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("antfly.json", cfg.config_path.?);
@@ -38253,7 +38253,7 @@ fn consumerTests() type {
 
         test "data runtime cli accepts secret store path" {
             const argv = [_][*:0]const u8{ "--secret-store-path", "/run/antfly/secrets/secrets.json" };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = platform.process.argsIterator(argv[0..]);
             var cfg = try parseCli(std.testing.allocator, &iter);
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
@@ -38261,7 +38261,7 @@ fn consumerTests() type {
 
         test "data runtime cli accepts extension package store path" {
             const argv = [_][*:0]const u8{ "--extension-package-store", "/opt/antfly/extensions" };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = platform.process.argsIterator(argv[0..]);
             var cfg = try parseCli(std.testing.allocator, &iter);
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("/opt/antfly/extensions", cfg.extension_package_store_dir.?);
@@ -38277,7 +38277,7 @@ fn consumerTests() type {
                 "Tenant Antfly",
                 "--ard-public-catalog=true",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = platform.process.argsIterator(argv[0..]);
             var cfg = try parseCli(std.testing.allocator, &iter);
             defer cfg.deinit(std.testing.allocator);
             try std.testing.expectEqualStrings("https://tenant.example.com", cfg.ard_base_url.?);
@@ -38360,7 +38360,7 @@ fn consumerTests() type {
                 "--process-memory-budget-mb",
                 "0",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = platform.process.argsIterator(argv[0..]);
             var parsed = try parseCli(std.testing.allocator, &iter);
             defer parsed.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(usize, 1), parsed.metadata_apis.items.len);
@@ -38391,7 +38391,7 @@ fn consumerTests() type {
                 "--metadata-api",
                 "http://127.0.0.1:19002",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = platform.process.argsIterator(argv[0..]);
             var parsed = try parseCli(std.testing.allocator, &iter);
             defer parsed.deinit(std.testing.allocator);
             try std.testing.expectEqual(@as(usize, 2), parsed.metadata_apis.items.len);
@@ -38404,7 +38404,7 @@ fn consumerTests() type {
                 "--auth",
                 "true",
             };
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = platform.process.argsIterator(argv[0..]);
             var parsed = try parseCli(std.testing.allocator, &iter);
             defer parsed.deinit(std.testing.allocator);
             try std.testing.expectEqual(true, parsed.auth_enabled.?);
@@ -38412,7 +38412,7 @@ fn consumerTests() type {
 
         test "data runtime parses experimental flag" {
             const argv = [_][*:0]const u8{"--experimental"};
-            var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var iter = platform.process.argsIterator(argv[0..]);
             var parsed = try parseCli(std.testing.allocator, &iter);
             defer parsed.deinit(std.testing.allocator);
             try std.testing.expect(parsed.experimental);
@@ -38432,7 +38432,7 @@ fn consumerTests() type {
 
         test "data runtime resolves trusted principal secret from secret store" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/trusted-principal-secrets.json", .{tmp.sub_path});
@@ -38450,7 +38450,7 @@ fn consumerTests() type {
 
         test "data runtime resolves trusted principal issuer from secret store" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/trusted-principal-issuer.json", .{tmp.sub_path});
@@ -38615,7 +38615,7 @@ fn consumerTests() type {
 
         test "data runtime retries storage ownership invalidation before publishing fingerprint" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(
@@ -38849,7 +38849,7 @@ fn consumerTests() type {
         }
 
         test "data runtime raft status changes force immediate store status publication" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-raft-status-publication", .{tmp.sub_path});
@@ -38892,9 +38892,9 @@ fn consumerTests() type {
         }
 
         test "data runtime reallocation request refreshes group status once per request" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
 
             const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-reallocation-status-refresh", .{tmp.sub_path});
@@ -39177,7 +39177,7 @@ fn consumerTests() type {
         test "data runtime status refresh publishes synthetic missing status for absent local group db" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-missing-placeholder", .{tmp.sub_path});
@@ -39305,7 +39305,7 @@ fn consumerTests() type {
         test "data runtime status refresh budget preserves fresh cached group status for visible generation" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-budget-cached", .{tmp.sub_path});
@@ -39520,7 +39520,7 @@ fn consumerTests() type {
         test "data runtime startup catch-up stays dirty when metadata snapshot is unavailable" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-catch-up-no-snapshot", .{tmp.sub_path});
@@ -40186,13 +40186,13 @@ fn consumerTests() type {
 
         test "data runtime structural changes preserve physical root generations" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicas", .{tmp.sub_path});
             defer alloc.free(replica_root);
             const group_root = try std.fmt.allocPrint(alloc, "{s}/group-77", .{replica_root});
             defer alloc.free(group_root);
-            try std.Io.Dir.cwd().createDirPath(std.testing.io, group_root);
+            try std.Io.Dir.cwd().createDirPath(platform.testing.io, group_root);
 
             var server: DataServer = .{
                 .alloc = alloc,
@@ -40222,7 +40222,7 @@ fn consumerTests() type {
         test "data runtime startup catch-up prefers cached admin snapshot" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-cached-startup-snapshot", .{tmp.sub_path});
@@ -40326,7 +40326,7 @@ fn consumerTests() type {
         test "data runtime provisioned root refresh spawn failure preserves retry bookkeeping" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-spawn-failure", .{tmp.sub_path});
@@ -40376,7 +40376,7 @@ fn consumerTests() type {
         test "data runtime startup catch-up stays dirty when local groups are not visible yet" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-catch-up-no-local-groups", .{tmp.sub_path});
@@ -40504,7 +40504,7 @@ fn consumerTests() type {
         test "data runtime startup catch-up stays dirty when local leadership is unresolved" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-catch-up-leadership-unresolved", .{tmp.sub_path});
@@ -40659,7 +40659,7 @@ fn consumerTests() type {
         test "data runtime startup catch-up spawn failure preserves retry bookkeeping" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-spawn-failure", .{tmp.sub_path});
@@ -41532,7 +41532,7 @@ fn consumerTests() type {
 
         test "data raft raw topology rejection advances delegate with exact typed outcome" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-arbitration", .{tmp.sub_path});
             defer alloc.free(root);
@@ -41982,7 +41982,7 @@ fn consumerTests() type {
             const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -42111,7 +42111,7 @@ fn consumerTests() type {
             const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -42268,7 +42268,7 @@ fn consumerTests() type {
             const fence_path = try std.fmt.allocPrintSentinel(alloc, "{s}-primary-fence", .{fixture.path()}, 0);
             defer alloc.free(fence_path);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
@@ -42423,7 +42423,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -42634,7 +42634,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -42811,7 +42811,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     if (std.mem.endsWith(u8, req.uri, antfly.internal.routes.hot_standby_replication_start)) {
                         self.entered.store(true, .release);
-                        while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                        while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                     }
                     return try self.upstream.execute(alloc_arg, req);
                 }
@@ -42849,7 +42849,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -42896,16 +42896,16 @@ fn consumerTests() type {
             try server.initApiServer();
 
             var replication_thread = ReplicationThread{ .server = &server };
-            var thread = try std.testing.io.concurrent(ReplicationThread.run, .{&replication_thread});
+            var thread = try platform.testing.io.concurrent(ReplicationThread.run, .{&replication_thread});
             var joined = false;
             defer if (!joined) {
                 blocking_executor.release.store(true, .release);
-                thread.await(std.testing.io);
+                thread.await(platform.testing.io);
             };
 
             var spins: usize = 0;
             while (!blocking_executor.entered.load(.acquire) and spins < 1_000_000) : (spins += 1) {
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             try std.testing.expect(blocking_executor.entered.load(.acquire));
 
@@ -42922,7 +42922,7 @@ fn consumerTests() type {
                 server.hot_standby_state_mutex.unlock();
             }
             blocking_executor.release.store(true, .release);
-            thread.await(std.testing.io);
+            thread.await(platform.testing.io);
             joined = true;
 
             try std.testing.expect(mutex_available);
@@ -43013,7 +43013,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -43226,7 +43226,7 @@ fn consumerTests() type {
             const standby_progress_alias = try std.fmt.allocPrint(alloc, "./{s}", .{standby_progress});
             defer alloc.free(standby_progress_alias);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -43428,7 +43428,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -43629,7 +43629,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -43860,7 +43860,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -44041,7 +44041,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -44184,7 +44184,7 @@ fn consumerTests() type {
             const deadline = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
             while (server.dense_publication_rounds.load(.acquire) == 0) {
                 if (platform_time.monotonicNs() >= deadline) return error.TestUnexpectedResult;
-                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
             }
             server.stopLsmMaintenanceBackground();
             try std.testing.expect(server.lsm_maintenance_future == null);
@@ -44419,7 +44419,7 @@ fn consumerTests() type {
                 }
             };
             var fake = Fake{};
-            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, platform.testing.io);
             defer source.deinit();
             try std.testing.expectError(error.Cancelled, source.statusSource().acquireJoinPlanning(.{
                 .clock = .{ .deadline_ns = platform_time.monotonicNs() + 250 * std.time.ns_per_ms },
@@ -44437,7 +44437,7 @@ fn consumerTests() type {
                 }
             };
             var cookie: u8 = 0;
-            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &cookie, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &cookie, .vtable = &.{ .execute = Fake.execute } }}, platform.testing.io);
             defer source.deinit();
             const snapshot: antfly.metadata_api.AdminSnapshot = .{
                 .status = .{ .metadata_group_id = 9, .metadata_incarnation = "11111111111111111111111111111111".*, .metrics = .{} },
@@ -45232,7 +45232,7 @@ fn consumerTests() type {
                 const watchdog = platform_time.monotonicNs() +| 2 * std.time.ns_per_s;
                 while (!signal.load(.acquire)) {
                     if (platform_time.monotonicNs() >= watchdog) return error.SnapshotPublicationHandshakeTimeout;
-                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
                 }
             }
 
@@ -45267,13 +45267,13 @@ fn consumerTests() type {
                         .cancellation = .fromAtomic(&cancellation),
                     },
                 };
-                var task = try std.testing.io.concurrent(Worker.run, .{&worker});
+                var task = try platform.testing.io.concurrent(Worker.run, .{&worker});
                 var joined = false;
                 var cache_locked = false;
                 defer {
                     source_clock.release.store(true, .release);
                     if (cache_locked) source.cache_mutex.unlock();
-                    if (!joined) task.await(std.testing.io);
+                    if (!joined) task.await(platform.testing.io);
                     if (worker.result) |optional| {
                         if (optional) |value| {
                             var owned = value;
@@ -45289,7 +45289,7 @@ fn consumerTests() type {
                 if (cancel) cancellation.store(true, .release) else try caller_clock.advance(20 * std.time.ns_per_ms);
                 source.cache_mutex.unlock();
                 cache_locked = false;
-                task.await(std.testing.io);
+                task.await(platform.testing.io);
                 joined = true;
                 try std.testing.expect(!source_clock.wait_failed.load(.acquire));
                 try std.testing.expect(owner.mutation.fired);
@@ -45538,22 +45538,22 @@ fn consumerTests() type {
                 lockAtomic(&source.snapshot_refresh_mutex);
                 var locked = true;
                 defer if (locked) source.snapshot_refresh_mutex.unlock();
-                var task = try std.testing.io.concurrent(Worker.run, .{&worker});
+                var task = try platform.testing.io.concurrent(Worker.run, .{&worker});
                 // Complete a refresh while its follower is queued. The follower
                 // must use this publication, without touching the invalid URL.
                 if (mode == 0) {
-                    std.testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
+                    platform.testing.io.sleep(.fromMilliseconds(20), .awake) catch {};
                     var published = try source.acceptObservedSnapshot(try cloneAdminSnapshotOwned(std.testing.allocator, snapshot), worker.head, source.snapshot_fence_generation, source.awakeMs());
                     freeAdminSnapshotOwned(std.testing.allocator, &published);
                 } else {
                     if (mode == 2) cancellation.cancel();
                     const watchdog = source.awakeNs() + std.time.ns_per_s;
-                    while (!worker.done.load(.acquire) and source.awakeNs() < watchdog) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                    while (!worker.done.load(.acquire) and source.awakeNs() < watchdog) platform.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
                 }
                 const completed_while_locked = worker.done.load(.acquire);
                 source.snapshot_refresh_mutex.unlock();
                 locked = false;
-                task.await(std.testing.io);
+                task.await(platform.testing.io);
                 if (mode == 0) {
                     try std.testing.expect(worker.failure == null);
                 } else {
@@ -45819,7 +45819,7 @@ fn consumerTests() type {
                 }
             };
             var stub: Stub = .{};
-            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, std.testing.io);
+            var source = try RemoteMetadataSource.initWithRequestExecutors(alloc, &.{"http://metadata.invalid"}, &.{.{ .ptr = &stub, .vtable = &.{ .execute = Stub.execute } }}, platform.testing.io);
             defer source.deinit();
             source.local_node_id = 7;
             const api = source.statusSource();
@@ -45876,7 +45876,7 @@ fn consumerTests() type {
                 std.testing.allocator,
                 &.{"http://metadata.invalid"},
                 &executors,
-                std.Io.Threaded.global_single_threaded.io(),
+                platform.Io.Threaded.global_single_threaded.io(),
             );
             defer source.deinit();
 
@@ -46489,9 +46489,9 @@ fn implementationTests() type {
             const alloc = std.testing.allocator;
             const hidden = @import("antfly_local_sources").storage_db_relational_initial_child_publication;
             const table_catalog = @import("antfly_local_sources").storage_db_table_catalog;
-            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = platform.testing.io } });
             defer runtime.deinit();
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const group_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retired-exact-root", .{tmp.sub_path});
             defer alloc.free(group_path);
@@ -46642,7 +46642,7 @@ fn implementationTests() type {
         test "data runtime status refresh skips opening the active startup group when no cached snapshot exists yet" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-skip-active-startup-open", .{tmp.sub_path});
@@ -46878,7 +46878,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const fixture_root = try std.fmt.allocPrint(
@@ -46926,7 +46926,7 @@ fn implementationTests() type {
             });
             defer prepared.deinit(alloc);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const topology_path = try std.fs.path.join(alloc, &.{ prepared.root, hot_standby_seed_snapshot_topology_name });
             defer alloc.free(topology_path);
@@ -47544,7 +47544,7 @@ fn implementationTests() type {
 
         test "data runtime ordered artifact upload handoff retains cursor and admission under pressure" {
             const alloc = std.testing.allocator;
-            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = platform.testing.io } });
             defer runtime.deinit();
             const original_lane = runtime.durable_jobs;
             defer runtime.durable_jobs = original_lane;
@@ -47627,10 +47627,10 @@ fn implementationTests() type {
             completed.deinit(completed.ptr);
             var producers: [6]*artifact_publication_dispatch.Queue.Job = undefined;
             var producer_count: usize = 0;
-            defer for (producers[0..producer_count]) |producer| server.artifact_publication_queue.release(std.testing.io, producer);
+            defer for (producers[0..producer_count]) |producer| server.artifact_publication_queue.release(platform.testing.io, producer);
             for (&producers, 0..) |*producer, i| {
                 const bytes = [_]u8{@intCast(i)};
-                producer.* = (try server.artifact_publication_queue.reserve(std.testing.io, alloc, 17, recovery.namespace, &bytes)).?;
+                producer.* = (try server.artifact_publication_queue.reserve(platform.testing.io, alloc, 17, recovery.namespace, &bytes)).?;
                 producer_count += 1;
             }
             try DataServer.enqueueArtifactPublication(&server, 17, recovery.namespace, &hint);
@@ -47640,7 +47640,7 @@ fn implementationTests() type {
             server.stopDataServerBackgroundJobs();
             try std.testing.expectEqual(@as(usize, 1), lane.drained);
             try std.testing.expectEqual(@as(usize, 6), server.artifact_publication_queue.jobs);
-            for (producers) |producer| server.artifact_publication_queue.release(std.testing.io, producer);
+            for (producers) |producer| server.artifact_publication_queue.release(platform.testing.io, producer);
             producer_count = 0;
             try std.testing.expectEqual(@as(usize, 0), server.artifact_publication_queue.jobs);
             try std.testing.expectEqual(@as(usize, 0), server.artifact_publication_queue.bytes);
@@ -47648,7 +47648,7 @@ fn implementationTests() type {
 
         test "data runtime coordinated ttl admission never reenters cache and drains with its owner" {
             const alloc = std.testing.allocator;
-            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+            var runtime = try backend_runtime_mod.BackendRuntime.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = platform.testing.io } });
             defer runtime.deinit();
             const original_lane = runtime.durable_jobs;
             defer runtime.durable_jobs = original_lane;
@@ -47839,7 +47839,7 @@ fn implementationTests() type {
                     return DataServer.initFromLocalMetadataSources(allocator, .{ .replica_root_dir = root }, .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = freeAdmin } }, .{ .ptr = undefined, .vtable = &.{ .status = status } });
                 }
             };
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -47921,7 +47921,7 @@ fn implementationTests() type {
 
         test "data runtime terminal floor anchor failure never publishes a partial ledger" {
             const alloc = std.testing.allocator;
-            const io = std.testing.io;
+            const io = platform.testing.io;
             const floor_mod = @import("../storage/hot_standby/replay_floor.zig");
             const Probe = struct {
                 fn admin(_: *anyopaque) !antfly.metadata_api.AdminSnapshot {
@@ -47932,7 +47932,7 @@ fn implementationTests() type {
                     return error.UnexpectedCatalogLookup;
                 }
             };
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -48123,7 +48123,7 @@ fn implementationTests() type {
                 }
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-backoff", .{tmp.sub_path});
@@ -48426,7 +48426,7 @@ fn implementationTests() type {
             const alloc = std.testing.allocator;
             const group_id: u64 = 78;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-raft-refresh-retry", .{tmp.sub_path});
             defer alloc.free(replica_root);
@@ -48515,26 +48515,26 @@ fn implementationTests() type {
             for ([_]bool{ false, true }) |hold_mutex| {
                 var refresh: ?antfly.public_api.ProvisionedTableWriteSource.GroupRefreshActivity = null;
                 if (hold_mutex) {
-                    apply_sm.write_source.table_activity_mutex.lockUncancelable(std.testing.io);
+                    apply_sm.write_source.table_activity_mutex.lockUncancelable(platform.testing.io);
                 } else {
                     refresh = apply_sm.write_source.tryBeginGroupRefreshActivity("docs", group_id) orelse
                         return error.TestUnexpectedResult;
                 }
                 var locked = true;
                 defer if (locked) {
-                    if (refresh) |*activity| activity.deinit() else apply_sm.write_source.table_activity_mutex.unlock(std.testing.io);
+                    if (refresh) |*activity| activity.deinit() else apply_sm.write_source.table_activity_mutex.unlock(platform.testing.io);
                 };
                 var worker = ApplyWorker{ .sm = &apply_sm, .entries = &entries, .read_states = &read_states };
-                var task = try std.testing.io.concurrent(ApplyWorker.run, .{&worker});
+                var task = try platform.testing.io.concurrent(ApplyWorker.run, .{&worker});
                 const watchdog = platform_time.monotonicNs() + std.time.ns_per_s;
                 while (!worker.done.load(.acquire) and platform_time.monotonicNs() < watchdog) {
-                    std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+                    platform.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
                 }
                 const completed_while_locked = worker.done.load(.acquire);
                 // Release before joining even on the broken implementation.
-                if (refresh) |*activity| activity.deinit() else apply_sm.write_source.table_activity_mutex.unlock(std.testing.io);
+                if (refresh) |*activity| activity.deinit() else apply_sm.write_source.table_activity_mutex.unlock(platform.testing.io);
                 locked = false;
-                task.await(std.testing.io);
+                task.await(platform.testing.io);
                 try std.testing.expect(completed_while_locked);
                 try std.testing.expectEqual(@as(?anyerror, error.RaftApplyWriterUnavailable), worker.failure);
                 try std.testing.expectEqual(@as(u64, 0), apply_sm.appliedIndex(group_id));
@@ -48612,7 +48612,7 @@ fn implementationTests() type {
             const alloc = std.testing.allocator;
             const group_id: u64 = 78;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-raft-writer-retry", .{tmp.sub_path});
             defer alloc.free(replica_root);
@@ -49088,7 +49088,7 @@ fn implementationTests() type {
 
         test "data raft merge observation derives from replicated source and receiver markers" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-observation", .{tmp.sub_path});
             defer alloc.free(root);
@@ -49237,7 +49237,7 @@ fn implementationTests() type {
 
         test "data raft split finalization persists the receiver base before merge and survives restart replay" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/split-then-merge", .{tmp.sub_path});
             defer alloc.free(path);
@@ -49294,7 +49294,7 @@ fn implementationTests() type {
 
         test "data raft document apply identity prevents non-idempotent restart replay" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -49357,7 +49357,7 @@ fn implementationTests() type {
         }
 
         test "data runtime local group status uses injected leadership source" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-leadership-db", .{tmp.sub_path});
@@ -49389,7 +49389,7 @@ fn implementationTests() type {
         test "data runtime local group status status-only open preserves replay debt" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-local-group-status-replay-debt", .{tmp.sub_path});
@@ -49462,7 +49462,7 @@ fn implementationTests() type {
         test "data runtime local group status provider collects and caches group statuses" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provider-cache", .{tmp.sub_path});
@@ -49609,7 +49609,7 @@ fn implementationTests() type {
         test "data runtime local split fallback preserves source identity namespace" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-split-identity", .{tmp.sub_path});
@@ -49823,7 +49823,7 @@ fn implementationTests() type {
         test "data runtime split apply store seeding reuses cached source writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-split-seed-cached-writer", .{tmp.sub_path});
@@ -50083,7 +50083,7 @@ fn implementationTests() type {
         test "data runtime store status reuses stale cache while refreshing local group status" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-refresh", .{tmp.sub_path});
@@ -50186,7 +50186,7 @@ fn implementationTests() type {
         test "data runtime store status keeps stale cache and skips local group refresh while startup catch-up is active" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-startup-stale", .{tmp.sub_path});
@@ -50288,7 +50288,7 @@ fn implementationTests() type {
         test "data runtime live local group status skips the active startup group on a cold cache" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-live-group-status-skip-active-startup", .{tmp.sub_path});
@@ -50371,7 +50371,7 @@ fn implementationTests() type {
         test "data runtime local group status does not open roots owned by transitions" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-transition-owned-status", .{tmp.sub_path});
@@ -50495,7 +50495,7 @@ fn implementationTests() type {
         test "data runtime store status cold miss schedules a nonblocking refresh" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-store-status-cold", .{tmp.sub_path});
@@ -50574,7 +50574,7 @@ fn implementationTests() type {
         test "data runtime metadata local group status provider does not cold-open inline" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-metadata-provider-cold", .{tmp.sub_path});
@@ -50648,7 +50648,7 @@ fn implementationTests() type {
         test "data runtime local group refresh prefers runtime status snapshot over DB open" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-local-group-runtime-cache", .{tmp.sub_path});
@@ -50752,7 +50752,7 @@ fn implementationTests() type {
         test "data runtime background refresh publishes a cold placeholder without DB opens" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-runtime-snapshots", .{tmp.sub_path});
@@ -50904,7 +50904,7 @@ fn implementationTests() type {
         test "data runtime provisioned cache warmup populates runtime status without pinning db caches" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provisioned-warmup", .{tmp.sub_path});
@@ -51180,7 +51180,7 @@ fn implementationTests() type {
         test "data runtime provisioned cache warmup defers while startup catch-up is active" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-warmup-runs-during-startup-catch-up", .{tmp.sub_path});
@@ -51292,7 +51292,7 @@ fn implementationTests() type {
         test "data runtime status refresh preserves only the active catch-up group while refreshing unrelated tables" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-preserve-live-progress", .{tmp.sub_path});
@@ -51494,7 +51494,7 @@ fn implementationTests() type {
         test "data runtime status refresh publishes and retries an active startup group without opening it" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-skip-active-startup-open", .{tmp.sub_path});
@@ -51651,7 +51651,7 @@ fn implementationTests() type {
         test "data runtime status refresh reuses managed writer snapshot instead of reopening table db" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const fake_replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-fake-root", .{tmp.sub_path});
@@ -51801,7 +51801,7 @@ fn implementationTests() type {
         test "data runtime status refresh observes active startup owner before cached fallback" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-live-managed-writer-fallback", .{tmp.sub_path});
@@ -51945,7 +51945,7 @@ fn implementationTests() type {
         test "data runtime status refresh publishes placeholder when live managed writer is busy and cache entry is missing" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-live-managed-writer-busy-fallback", .{tmp.sub_path});
@@ -52088,7 +52088,7 @@ fn implementationTests() type {
         test "data local group status refresh skips active group when cache entry is missing" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-active-group-live-fallback", .{tmp.sub_path});
@@ -52158,7 +52158,7 @@ fn implementationTests() type {
         test "data runtime status refresh publishes sibling placeholder when only one group has managed writer" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-mixed-managed-writer", .{tmp.sub_path});
@@ -52337,7 +52337,7 @@ fn implementationTests() type {
         test "data runtime provisioned startup catch-up clears replay debt for local groups" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-catch-up", .{tmp.sub_path});
@@ -52573,7 +52573,7 @@ fn implementationTests() type {
         test "data runtime startup catch-up clears dirty bit for terminal degraded index load" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-terminal-startup-load", .{tmp.sub_path});
@@ -52756,7 +52756,7 @@ fn implementationTests() type {
             };
 
             for (cases) |tc| {
-                var tmp = std.testing.tmpDir(.{});
+                var tmp = platform.testing.tmpDir(.{});
                 defer tmp.cleanup();
 
                 const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-catch-up-busy-no-debt-{s}", .{ tmp.sub_path, tc.suffix });
@@ -52922,7 +52922,7 @@ fn implementationTests() type {
         test "data runtime startup catch-up retries unresolved leadership and observes leader open replay" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-startup-catch-up-retry-leadership", .{tmp.sub_path});
@@ -53189,7 +53189,7 @@ fn implementationTests() type {
         test "data runtime runRound does not refresh provisioned replica root inline while worker is active" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-active", .{tmp.sub_path});
@@ -53265,7 +53265,7 @@ fn implementationTests() type {
         test "data runtime runRound backs off retryable provision metadata failures" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-metadata-backoff", .{tmp.sub_path});
@@ -53358,7 +53358,7 @@ fn implementationTests() type {
         test "data runtime provisioned root refresh worker backs off retryable metadata failures" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-provision-worker-backoff", .{tmp.sub_path});
@@ -53443,7 +53443,7 @@ fn implementationTests() type {
         }
 
         test "data runtime local group status reflects active transition readiness" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-transition-db", .{tmp.sub_path});
@@ -53469,7 +53469,7 @@ fn implementationTests() type {
         }
 
         test "data runtime local group status uses metadata transition observation when local pair is absent" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-metadata-observation", .{tmp.sub_path});
@@ -53525,7 +53525,7 @@ fn implementationTests() type {
         }
 
         test "data runtime local group status uses injected membership source" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-membership-db", .{tmp.sub_path});
@@ -53560,7 +53560,7 @@ fn implementationTests() type {
         }
 
         test "data runtime local group status falls back to snapshot heartbeat readiness" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-snapshot-fallback", .{tmp.sub_path});
@@ -53621,7 +53621,7 @@ fn implementationTests() type {
         }
 
         test "data runtime local group status prefers merged snapshot readiness fallback" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-merged-fallback", .{tmp.sub_path});
@@ -54089,7 +54089,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const fixture_root = try std.fmt.allocPrint(
@@ -54137,7 +54137,7 @@ fn implementationTests() type {
             });
             defer prepared.deinit(alloc);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const topology_path = try std.fs.path.join(alloc, &.{ prepared.root, hot_standby_seed_snapshot_topology_name });
             defer alloc.free(topology_path);
@@ -54260,9 +54260,9 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *antfly.metadata_api.AdminSnapshot) void {}
             };
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
-            const cwd = try std.process.currentPathAlloc(std.testing.io, alloc);
+            const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
             defer alloc.free(cwd);
             const fixture_root_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-ha-executors", .{tmp.sub_path});
             defer alloc.free(fixture_root_rel);
@@ -54280,7 +54280,7 @@ fn implementationTests() type {
             const restore_jobs_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restore-jobs" });
             defer alloc.free(restore_jobs_path);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const replica_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "replicas" });
             defer alloc.free(replica_root);
@@ -54634,7 +54634,7 @@ fn implementationTests() type {
 
                 fn afterCopy(ptr: *anyopaque, hook_alloc: std.mem.Allocator) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    var hook_io_impl = std.Io.Threaded.init(hook_alloc, .{});
+                    var hook_io_impl = platform.Io.Threaded.init(hook_alloc, .{});
                     defer hook_io_impl.deinit();
                     var file = try std.Io.Dir.cwd().createFile(hook_io_impl.io(), self.runtime_path, .{ .truncate = true });
                     defer file.close(hook_io_impl.io());
@@ -55075,9 +55075,9 @@ fn implementationTests() type {
             var alloc_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             defer _ = alloc_state.deinit();
             const alloc = alloc_state.allocator();
-            var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM backend remains an explicit differential boundary
+            var tmp = platform.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM backend remains an explicit differential boundary
             defer tmp.cleanup();
-            const replica_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc); // vopr-audit: allow(host_filesystem) the LSM backend remains an explicit differential boundary
+            const replica_root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc); // vopr-audit: allow(host_filesystem) the LSM backend remains an explicit differential boundary
             defer alloc.free(replica_root);
 
             // DataServer, both Raft groups, their retry clocks, and both transition
@@ -55110,7 +55110,7 @@ fn implementationTests() type {
                 .backend = .manual,
                 // Each production-shaped node keeps its LSM files on the host-backed
                 // differential boundary while scheduling runtime work through VoprIo.
-                .filesystem_io = std.testing.io,
+                .filesystem_io = platform.testing.io,
                 .borrowed_io = .{
                     .general = io,
                     .raft_inbound = io,
@@ -55715,7 +55715,7 @@ fn implementationTests() type {
             const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -55842,7 +55842,7 @@ fn implementationTests() type {
             const standby_progress = try std.fmt.allocPrintSentinel(alloc, "{s}-standby-progress", .{fixture.path()}, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
@@ -56049,7 +56049,7 @@ fn implementationTests() type {
         test "data runtime status refresh retains serving facts when fallback lease races apply contention" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/data-runtime-refresh-fallback-apply-contention", .{tmp.sub_path});

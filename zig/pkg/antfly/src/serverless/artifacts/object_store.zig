@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const objectstore = @import("objectstore");
 const artifact_store = @import("store.zig");
 const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
@@ -1151,14 +1153,14 @@ test "serverless objectstore-backed artifact initialization cleans up every allo
             defer impl.deinit();
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.borrowed, .{});
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.owned, .{file_uri});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.borrowed, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.owned, .{file_uri});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

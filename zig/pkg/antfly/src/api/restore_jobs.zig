@@ -13,12 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const backend_erased = @import("antfly_local_sources").storage_backend_erased;
 const mem_backend = @import("antfly_local_sources").storage_mem_backend;
-const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
+const platform_sync = platform.sync;
+const platform_time = platform.time;
 const runtime_error_abi = @import("antfly_runtime_abi").error_abi;
 const runtime_memory_abi = @import("runtime_memory_abi");
 
@@ -2611,7 +2613,7 @@ test "restore staging incarnation survives retries and cancellation waits for ow
     for ([_]StagingResolution{ .canceled, .published }) |resolution| {
         var persistence = TestReplicatedPersistence.init(alloc);
         defer persistence.deinit();
-        var store = Store.initWithIo(alloc, std.testing.io);
+        var store = Store.initWithIo(alloc, platform.testing.io);
         defer store.deinit();
         try store.attachReplicated(persistence.persistence());
         const initial = try store.start(alloc, .{ .scope = .cluster, .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive-reader", .idempotency_namespace = "principal:admin:cluster" });
@@ -2905,7 +2907,7 @@ fn jobKey(alloc: std.mem.Allocator, job_id: u64) ![]u8 {
 
 test "restore admission gate rejects new jobs but retains exact idempotent outcomes" {
     const alloc = std.testing.allocator;
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     const request: StartRequest = .{
         .scope = .cluster,
@@ -3170,7 +3172,7 @@ test "restore jobs compound staging persistence schema rewrite admission survive
             .rewrite_plan_json = if (kind == .schema_rewrite) "separately-validated-staging-plan" else null,
             .generation_plan_json = if (kind == .empty_generation) "separately-validated-staging-plan" else null,
         };
-        var store = Store.initWithIo(alloc, std.testing.io);
+        var store = Store.initWithIo(alloc, platform.testing.io);
         defer store.deinit();
         try store.attachReplicated(adapter);
         persistence.timeout_after_new_create = true;
@@ -3181,7 +3183,7 @@ test "restore jobs compound staging persistence schema rewrite admission survive
 
         // A fresh coordinator can recover the durable first row before probing
         // sources whose already-admitted pins now reject fresh admission.
-        var reopened = Store.initWithIo(alloc, std.testing.io);
+        var reopened = Store.initWithIo(alloc, platform.testing.io);
         defer reopened.deinit();
         try reopened.attachReplicated(adapter);
         const recovered = (try reopened.existingRewriteAdmission(alloc, req)).?;
@@ -3204,7 +3206,7 @@ test "restore jobs compound staging persistence schema rewrite admission survive
 
         var ordinary = TestReplicatedPersistence.init(alloc);
         defer ordinary.deinit();
-        var unsupported = Store.initWithIo(alloc, std.testing.io);
+        var unsupported = Store.initWithIo(alloc, platform.testing.io);
         defer unsupported.deinit();
         try unsupported.attachReplicated(ordinary.persistence());
         const absent = try unsupported.startRecoverable(alloc, req);
@@ -3218,7 +3220,7 @@ test "failed destination authorization refresh reuses the idempotent restore job
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -3311,7 +3313,7 @@ test "restore admission recovers generated identity after polled expiry" {
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     const req: StartRequest = .{
@@ -3347,7 +3349,7 @@ test "restore expiry preserves durable ownership against an old poll after unkno
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     try store.prepareReplicatedLeadership(alloc, 7);
@@ -3388,11 +3390,11 @@ test "restore expiry preserves durable ownership against an old poll after unkno
     };
     persistence.get_gate.store(1, .release);
     var poll = Poll{ .store = &store, .job_id = parsed.value.job_id };
-    var thread = try std.testing.io.concurrent(Poll.run, .{&poll});
+    var thread = try platform.testing.io.concurrent(Poll.run, .{&poll});
     var joined = false;
     defer {
         persistence.get_gate.store(3, .release);
-        if (!joined) thread.await(std.testing.io);
+        if (!joined) thread.await(platform.testing.io);
         if (poll.result) |value| alloc.free(value);
     }
     while (persistence.get_gate.load(.acquire) != 2) std.atomic.spinLoopHint();
@@ -3405,7 +3407,7 @@ test "restore expiry preserves durable ownership against an old poll after unkno
     try std.testing.expect(persistence.rows.contains(key));
     try std.testing.expectEqual(@as(u32, 0), store.jobs.count());
     persistence.get_gate.store(3, .release);
-    thread.await(std.testing.io);
+    thread.await(platform.testing.io);
     joined = true;
     try std.testing.expect(poll.err == null);
     // The stale expiry observation must not erase the new durable job.
@@ -3417,7 +3419,7 @@ test "restore expiry preserves durable ownership when admission exceeds its byte
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     // Model an exhausted aggregate budget independently of record count.
@@ -3446,7 +3448,7 @@ test "restore expiry preserves durable ownership and accounts uncertain admissio
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     const req: StartRequest = .{
@@ -3518,7 +3520,7 @@ test "restore expiry preserves durable ownership through deletion faults and sta
             const alloc = std.testing.allocator;
             var persistence = TestReplicatedPersistence.init(alloc);
             defer persistence.deinit();
-            var store = Store.initWithIo(alloc, std.testing.io);
+            var store = Store.initWithIo(alloc, platform.testing.io);
             defer store.deinit();
             try store.attachReplicated(persistence.persistence());
             try store.prepareReplicatedLeadership(alloc, 7);
@@ -3599,10 +3601,10 @@ test "restore admission recovers generated identity after an unknown commit with
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
-    var successor = Store.initWithIo(alloc, std.testing.io);
+    var successor = Store.initWithIo(alloc, platform.testing.io);
     defer successor.deinit();
     try successor.attachReplicated(persistence.persistence());
     var req: StartRequest = .{
@@ -3648,7 +3650,7 @@ test "restore admission missing row stays recoverable and polling queues a late 
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     persistence.fail_put_private = true;
@@ -3683,7 +3685,7 @@ test "restore admission missing row stays recoverable and polling queues a late 
 test "delayed replicated restore refresh cannot regress a running job" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     var incompatible = persistence.persistence();
     incompatible.version += 1;
@@ -3720,18 +3722,18 @@ test "delayed replicated restore refresh cannot regress a running job" {
 
     persistence.get_gate.store(1, .release);
     var worker: LoadWorker = .{ .store = &store, .job_id = queued_parsed.value.job_id };
-    var thread = try std.testing.io.concurrent(LoadWorker.run, .{&worker});
+    var thread = try platform.testing.io.concurrent(LoadWorker.run, .{&worker});
     var joined = false;
     defer {
         persistence.get_gate.store(3, .release);
-        if (!joined) thread.await(std.testing.io);
+        if (!joined) thread.await(platform.testing.io);
     }
     while (persistence.get_gate.load(.acquire) != 2) std.atomic.spinLoopHint();
 
     const running = (try store.begin(std.testing.allocator, queued_parsed.value.job_id)).?;
     defer std.testing.allocator.free(running);
     persistence.get_gate.store(3, .release);
-    thread.await(std.testing.io);
+    thread.await(platform.testing.io);
     joined = true;
 
     try std.testing.expect(worker.err == null);
@@ -3766,7 +3768,7 @@ test "restore request fingerprints distinguish coordinated table sources" {
 test "restore job store is idempotent and fenced" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     const req: StartRequest = .{
@@ -3802,7 +3804,7 @@ test "restore job store is idempotent and fenced" {
 test "restore idempotency keys are scoped by principal and resource" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -3835,7 +3837,7 @@ test "restore idempotency keys are scoped by principal and resource" {
 test "successful restore completion wins a racing cancellation" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -3877,7 +3879,7 @@ test "restore cooperative continuations preserve checkpoints without replicated 
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     const started = try store.start(alloc, .{ .scope = .cluster, .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive-reader", .idempotency_namespace = "admin", .table_names = &.{"docs"} });
@@ -3960,7 +3962,7 @@ test "restore cooperative continuation allocation failure retains dispatcher own
     for ([_]bool{ false, true }) |fail_duplicate| {
         var persistence = TestReplicatedPersistence.init(alloc);
         defer persistence.deinit();
-        var store = Store.initWithIo(alloc, std.testing.io);
+        var store = Store.initWithIo(alloc, platform.testing.io);
         defer store.deinit();
         try store.attachReplicated(persistence.persistence());
         const created = try store.start(alloc, .{ .scope = .cluster, .backup_id = "daily", .location = "s3://archive/daily", .connection = "archive-reader", .idempotency_namespace = "admin" });
@@ -3998,7 +4000,7 @@ test "restore cooperative continuation shares fair FIFO and honors cancellation"
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     const started = try store.start(alloc, .{ .scope = .cluster, .backup_id = "one", .location = "s3://archive/daily", .connection = "archive-reader", .idempotency_namespace = "admin" });
@@ -4034,7 +4036,7 @@ test "restore cooperative continuation shares fair FIFO and honors cancellation"
 test "retryable restore contention durably requeues progress and honors cancellation" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -4169,7 +4171,7 @@ test "restore retry diagnostics survive recovery and clear on success" {
     const alloc = std.testing.allocator;
     var persistence = TestReplicatedPersistence.init(alloc);
     defer persistence.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     const created = try store.start(alloc, .{
@@ -4200,7 +4202,7 @@ test "restore retry diagnostics survive recovery and clear on success" {
 
     // Recovery must retain the actual cause instead of replacing it with a
     // generic restart marker. No extra diagnostic persistence is necessary.
-    var recovered = Store.initWithIo(alloc, std.testing.io);
+    var recovered = Store.initWithIo(alloc, platform.testing.io);
     defer recovered.deinit();
     try recovered.attachReplicated(persistence.persistence());
     try recovered.prepareReplicatedLeadership(alloc, 1);
@@ -4220,7 +4222,7 @@ test "restore retry diagnostics survive recovery and clear on success" {
 test "restore ownership loss requeues only the exact running attempt" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -4288,7 +4290,7 @@ test "replicated restore mutations are rejected after leadership term changes" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
     persistence.required_leadership_term = 7;
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     try store.prepareReplicatedLeadership(std.testing.allocator, 7);
@@ -4337,7 +4339,7 @@ test "replicated restore mutations are rejected after leadership term changes" {
 test "restore dispatch recovery retains worker ownership when begin fails" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -4419,7 +4421,7 @@ test "restore retry jitter is stable and honors production bounds" {
 test "delayed restore contention yields FIFO capacity to unrelated jobs" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -4498,7 +4500,7 @@ test "delayed restore contention yields FIFO capacity to unrelated jobs" {
 test "restore job runnable queue drains incrementally and preserves insertion order" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     var created: [3]u64 = undefined;
@@ -4558,7 +4560,7 @@ test "restore job runnable queue drains incrementally and preserves insertion or
 test "replicated restore leadership rebuild preserves FIFO and recovers running attempts" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -4638,7 +4640,7 @@ test "replicated restore leadership rebuild preserves FIFO and recovers running 
 test "replicated restore leadership terminalizes cancellation of a running attempt" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -4677,7 +4679,7 @@ test "replicated restore expiry deletion preserves foreign boundary failure" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
     persistence.fail_delete_many = true;
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
 
@@ -4713,7 +4715,7 @@ test "replicated restore expiry deletion preserves foreign boundary failure" {
 test "restore requests without idempotency keys create independent opaque jobs" {
     var persistence = TestReplicatedPersistence.init(std.testing.allocator);
     defer persistence.deinit();
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     try store.attachReplicated(persistence.persistence());
     const req: StartRequest = .{
@@ -4746,7 +4748,7 @@ test "restore runtime store persists checkpoints and requeues interrupted work" 
 
     var job_id: u64 = 0;
     {
-        var first_store = Store.initWithIo(alloc, std.testing.io);
+        var first_store = Store.initWithIo(alloc, platform.testing.io);
         defer first_store.deinit();
         try first_store.attachRuntime(&runtime);
         const started = try first_store.start(alloc, .{
@@ -4803,7 +4805,7 @@ test "restore progress ordinals remain bounded at maximum table count" {
     defer backend.close();
     var runtime = try backend.runtimeStore(alloc, .{ .name = "system/api-restore-jobs-ordinals" });
     defer runtime.deinit();
-    var store = Store.initWithIo(alloc, std.testing.io);
+    var store = Store.initWithIo(alloc, platform.testing.io);
     defer store.deinit();
     try store.attachRuntime(&runtime);
     const started = try store.start(alloc, .{
@@ -4930,7 +4932,7 @@ test "cluster restore summaries are truthful and bounded" {
 }
 
 test "restore job store rejects oversized request state" {
-    var store = Store.initWithIo(std.testing.allocator, std.testing.io);
+    var store = Store.initWithIo(std.testing.allocator, platform.testing.io);
     defer store.deinit();
     const oversized = try std.testing.allocator.alloc(u8, max_restore_string_bytes + 1);
     defer std.testing.allocator.free(oversized);

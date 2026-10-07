@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const embedded_db = @import("embedded_db_surface");
 const support = @import("embedded_support");
 const batch_api = support.batch;
@@ -457,7 +459,7 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     const lsm_backend = support.lsm_storage;
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -561,7 +563,7 @@ test "embedded api hosted profile drains derived indexing without native runtime
     const lsm_backend = support.lsm_storage;
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -634,7 +636,7 @@ test "embedded api hosted profile persists text index across reopen over storage
     const lsm_backend = support.lsm_storage;
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -701,7 +703,7 @@ test "embedded api hosted profile persists text index across reopen over storage
 test "embedded api createLite provisions default full text index" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-default-index.aflite", .{tmp.sub_path});
@@ -759,7 +761,7 @@ test "embedded api createLite provisions default full text index" {
 test "embedded api openLite round-trips batch lookup over aflite file" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite.aflite", .{tmp.sub_path});
@@ -805,7 +807,7 @@ test "embedded api openLite round-trips batch lookup over aflite file" {
 test "embedded api openLite manages index and enrichment definitions over aflite file" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-management.aflite", .{tmp.sub_path});
@@ -869,7 +871,7 @@ test "embedded api openLite manages index and enrichment definitions over aflite
 test "embedded api openLite resumes generated enrichment after hosted maintenance pause" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-enrichment-resume.aflite", .{tmp.sub_path});
@@ -946,7 +948,7 @@ test "embedded api openLite resumes generated enrichment after hosted maintenanc
 test "embedded api openLite keeps full text index inside native aflite file" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-native-index.aflite", .{tmp.sub_path});
@@ -1005,16 +1007,16 @@ test "embedded api openLite keeps full text index inside native aflite file" {
     }
 
     const sidecar_missing = blk: {
-        var dir = std.Io.Dir.cwd().openDir(std.testing.io, sidecar_path, .{}) catch |err| switch (err) {
+        var dir = std.Io.Dir.cwd().openDir(platform.testing.io, sidecar_path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => break :blk true,
             else => return err,
         };
-        dir.close(std.testing.io);
+        dir.close(platform.testing.io);
         break :blk false;
     };
     try std.testing.expect(sidecar_missing);
     const applied_sequence_checkpoint_missing = blk: {
-        std.Io.Dir.cwd().access(std.testing.io, applied_sequence_checkpoint_path, .{}) catch |err| switch (err) {
+        std.Io.Dir.cwd().access(platform.testing.io, applied_sequence_checkpoint_path, .{}) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => break :blk true,
             else => return err,
         };
@@ -1026,7 +1028,7 @@ test "embedded api openLite keeps full text index inside native aflite file" {
 test "embedded api openLite persists schema json over aflite file" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-schema.aflite", .{tmp.sub_path});
@@ -1068,7 +1070,7 @@ test "embedded api openLite persists schema json over aflite file" {
 test "embedded api openLite exports imports checks and vacuums portable backup" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/embedded-api-lite-portable-src.aflite", .{tmp.sub_path});
@@ -1090,9 +1092,9 @@ test "embedded api openLite exports imports checks and vacuums portable backup" 
     defer roundtrip_backup.deinit(alloc);
 
     {
-        var malformed_file = try std.Io.Dir.cwd().createFile(std.testing.io, malformed_file_path, .{});
-        defer malformed_file.close(std.testing.io);
-        try malformed_file.writePositionalAll(std.testing.io, "short embedded lite header", 0);
+        var malformed_file = try std.Io.Dir.cwd().createFile(platform.testing.io, malformed_file_path, .{});
+        defer malformed_file.close(platform.testing.io);
+        try malformed_file.writePositionalAll(platform.testing.io, "short embedded lite header", 0);
     }
     const malformed_check_json = try Api.checkLiteFileJson(alloc, malformed_file_path);
     defer alloc.free(malformed_check_json);

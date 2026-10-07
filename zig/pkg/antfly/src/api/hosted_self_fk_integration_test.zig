@@ -402,7 +402,7 @@ test "self-FK retries only a proven durable precommit abort" {
             return .{ .status = response.status, .body = try alloc.dupe(u8, response.body) };
         }
     };
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     inline for (std.meta.tags(Mode)) |mode| {
         var fake: Fake = .{ .mode = mode };
@@ -1173,9 +1173,9 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     const trusted_secret = "hosted-self-fk-trusted-v1";
     const internal_secret = "hosted-self-fk-internal-v1";
     const issuer = "hosted-self-fk";
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const meta_root = try std.fmt.allocPrint(alloc, "{s}/metadata", .{root});
     defer alloc.free(meta_root);
@@ -1189,7 +1189,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     defer alloc.free(session_path);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var metadata = try metadata_runtime.Server.init(process_alloc, .{

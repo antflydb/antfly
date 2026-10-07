@@ -28,7 +28,9 @@
 //! This replaces an earlier sorted-array store whose every transaction cloned
 //! the whole array (O(n) snapshots, O(n^2) ingest).
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Order = std.math.Order;
 
@@ -755,13 +757,13 @@ test "concurrent snapshot retain/release does not corrupt the refcount" {
     var threads: [8]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
     defer {
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (threads[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (&threads, &workers) |*t, *w| {
-        t.* = try std.testing.io.concurrent(Worker.run, .{w});
+        t.* = try platform.testing.io.concurrent(Worker.run, .{w});
         started_tasks += 1;
     }
-    for (&threads) |*t| t.await(std.testing.io);
+    for (&threads) |*t| t.await(platform.testing.io);
 
     for (&workers) |w| try testing.expect(w.ok);
     // The base must survive with exactly its original single reference: every

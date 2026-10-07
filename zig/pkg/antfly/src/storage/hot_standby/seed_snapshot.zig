@@ -14,7 +14,9 @@
 // limitations.
 
 //! Physical HA seed capture shared by inline and compiled storage owners.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Io = std.Io;
 const backups_api = @import("antfly_local_sources").api_local_backups;
 
@@ -25,7 +27,7 @@ pub fn capture(alloc: std.mem.Allocator, db: anytype, db_path: []const u8, snaps
     }
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/{s}", .{ db_path, snapshot_token });
     defer alloc.free(snapshot_root);
-    var io_impl = Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};
     defer Io.Dir.cwd().deleteTree(io_impl.io(), snapshot_root) catch {};

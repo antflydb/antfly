@@ -23,7 +23,7 @@ const platform = @import("antfly_platform");
 pub const Spool = struct {
     pub const Ref = struct { offset: u64, len: usize };
     alloc: std.mem.Allocator,
-    io_impl: ?*std.Io.Threaded = null,
+    io_impl: ?*platform.Io.Threaded = null,
     file: ?std.Io.File = null,
     path: ?[]u8 = null,
     size: u64 = 0,
@@ -45,17 +45,17 @@ pub const Spool = struct {
 
     fn ensureFile(self: *Spool) !void {
         if (self.file != null) return;
-        const impl = try self.alloc.create(std.Io.Threaded);
+        const impl = try self.alloc.create(platform.Io.Threaded);
         errdefer self.alloc.destroy(impl);
-        impl.* = std.Io.Threaded.init(self.alloc, .{});
+        impl.* = platform.Io.Threaded.init(self.alloc, .{});
         errdefer impl.deinit();
         const io = impl.io();
         var random: [16]u8 = undefined;
-        try @import("antfly_platform").entropy.fill(io, &random);
+        try platform.entropy.fill(io, &random);
         const directory = platform.env.getenv("TMPDIR") orelse platform.env.getenv("TEMP") orelse "/tmp";
         const path = try std.fmt.allocPrint(self.alloc, "{s}/antfly-schema-{x}.tmp", .{ directory, random });
         errdefer self.alloc.free(path);
-        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .exclusive = true, .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         self.io_impl = impl;
         self.path = path;
         self.file = file;

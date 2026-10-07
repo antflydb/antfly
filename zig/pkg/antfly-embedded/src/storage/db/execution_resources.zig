@@ -873,7 +873,7 @@ pub const RequestPreparationContext = struct {
             null;
         self.guard = .{
             .child = if (self.budget) |*tracked| tracked.allocator() else db.alloc,
-            .io = db.backend_runtime.io() orelse std.Options.debug_io,
+            .io = db.backend_runtime.io() orelse platform.debug_io,
         };
     }
 

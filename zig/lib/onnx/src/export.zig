@@ -21,7 +21,9 @@
 //
 // Uses the shared protobuf wire primitives.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const ml = @import("ml");
 const proto = @import("onnx_data").proto;
 
@@ -366,7 +368,7 @@ const ExternalDataBuilder = struct {
     offset: usize = 0,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
-        if (self.file) |*file| file.close(std.Io.Threaded.global_single_threaded.io());
+        if (self.file) |*file| file.close(platform.Io.Threaded.global_single_threaded.io());
         alloc.free(self.relative_path);
         self.bytes.deinit(alloc);
         self.* = undefined;
@@ -374,7 +376,7 @@ const ExternalDataBuilder = struct {
 };
 
 fn createExternalDataFile(path: []const u8) !std.Io.File {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = platform.Io.Threaded.global_single_threaded.io();
     if (std.fs.path.isAbsolute(path)) {
         return std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
     }
@@ -387,7 +389,7 @@ fn writeExternalBytes(
     bytes: []const u8,
 ) !void {
     if (ext.file) |*file| {
-        try file.writeStreamingAll(std.Io.Threaded.global_single_threaded.io(), bytes);
+        try file.writeStreamingAll(platform.Io.Threaded.global_single_threaded.io(), bytes);
         return;
     }
     try ext.bytes.appendSlice(alloc, bytes);

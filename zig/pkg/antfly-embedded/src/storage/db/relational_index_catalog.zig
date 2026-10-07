@@ -19,7 +19,9 @@
 //! metadata. This module never commits or publishes a query-ready generation.
 //! Only publish a prebuilt execution snapshot after the caller commits.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const schema = @import("../schema.zig");
 const native = @import("../relational_index.zig");
 const registry = @import("schema_registry.zig");
@@ -626,11 +628,11 @@ fn testSchemaParticipant(comptime Backend: type) !void {
     var store = try docstore.DocStore.openRuntime(alloc, &runtime);
     defer store.close();
     _ = try schema.saveSchema(&store, alloc, test_schema);
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
-    var controller = try Controller.init(alloc, std.testing.io, &store, view);
+    var controller = try Controller.init(alloc, platform.testing.io, &store, view);
     defer controller.deinit();
     var initial = try controller.prepare(view, test_definitions[0..1]);
     defer initial.deinit();
@@ -639,7 +641,7 @@ fn testSchemaParticipant(comptime Backend: type) !void {
     defer pinned.deinit();
     var next_schema = test_schema;
     next_schema.version += 1;
-    var next_schemas = try registry.Registry.initCloned(alloc, std.testing.io, next_schema);
+    var next_schemas = try registry.Registry.initCloned(alloc, platform.testing.io, next_schema);
     defer next_schemas.deinit();
     var next_view = next_schemas.acquire().?;
     defer next_view.release();
@@ -693,7 +695,7 @@ fn testSchemaParticipant(comptime Backend: type) !void {
     try std.testing.expectEqual(view.epoch, pinned.plan.schemaView().epoch);
     // A fresh registry with identical durable bytes still needs a new retained
     // runtime plan. Otherwise exact-epoch prepared rows would fail after restore.
-    var replacement = try registry.Registry.initCloned(alloc, std.testing.io, next_schema);
+    var replacement = try registry.Registry.initCloned(alloc, platform.testing.io, next_schema);
     defer replacement.deinit();
     var replacement_view = replacement.acquire().?;
     defer replacement_view.release();
@@ -734,7 +736,7 @@ const test_definitions = [_]native.RelationalIndexDefinition{
 };
 
 fn testCodecAllocations(alloc: Allocator) !void {
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
@@ -785,7 +787,7 @@ test "relational index catalog definitions exclude mutable generation progress" 
 
 test "relational index catalog rejects corruption noncanonical bytes and unbounded nesting" {
     const alloc = std.testing.allocator;
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
@@ -822,7 +824,7 @@ fn testCatalogTransaction(comptime Backend: type) !void {
     var store = try DocStore.openRuntime(alloc, &runtime);
     defer store.close();
     _ = try schema.saveSchema(&store, alloc, test_schema);
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
@@ -920,7 +922,7 @@ test "relational index catalog CAS and outbox staging are atomic on memory and L
 
 test "relational index catalog generation identity survives changes drop and reintroduction" {
     const alloc = std.testing.allocator;
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
@@ -950,7 +952,7 @@ test "relational index catalog generation identity survives changes drop and rei
 
 test "relational index catalog physical identities survive name ordering and reject aliases" {
     const alloc = std.testing.allocator;
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
@@ -982,7 +984,7 @@ test "relational index catalog physical identities survive name ordering and rej
 
 test "relational index catalog reuses only unchanged comparison dependencies across schema epochs" {
     const alloc = std.testing.allocator;
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
@@ -994,7 +996,7 @@ test "relational index catalog reuses only unchanged comparison dependencies acr
     var next_schema = test_schema;
     next_schema.version += 1;
     next_schema.relational_columns = &moved;
-    var next_registry = try registry.Registry.initCloned(alloc, std.testing.io, next_schema);
+    var next_registry = try registry.Registry.initCloned(alloc, platform.testing.io, next_schema);
     defer next_registry.deinit();
     var next_view = next_registry.acquire().?;
     defer next_view.release();
@@ -1010,7 +1012,7 @@ test "relational index catalog reuses only unchanged comparison dependencies acr
     changed_columns[1].column_type = .number;
     next_schema.version += 1;
     next_schema.relational_columns = &changed_columns;
-    var changed_registry = try registry.Registry.initCloned(alloc, std.testing.io, next_schema);
+    var changed_registry = try registry.Registry.initCloned(alloc, platform.testing.io, next_schema);
     defer changed_registry.deinit();
     var changed_view = changed_registry.acquire().?;
     defer changed_view.release();
@@ -1031,11 +1033,11 @@ fn testPublication(comptime Backend: type) !void {
     var store = try docstore.DocStore.openRuntime(alloc, &runtime);
     defer store.close();
     _ = try schema.saveSchema(&store, alloc, test_schema);
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
-    var controller = try Controller.init(alloc, std.testing.io, &store, view);
+    var controller = try Controller.init(alloc, platform.testing.io, &store, view);
     defer controller.deinit();
     try std.testing.expect(controller.acquire() == null);
     try std.testing.expectError(error.UnsupportedRelationalIndexExecution, controller.prepare(view, &test_definitions));
@@ -1080,7 +1082,7 @@ fn testPublication(comptime Backend: type) !void {
     // from committing by the current-plan identity above.
     _ = try batch.appendPrepared(&prepared_row);
     try std.testing.expectEqual(@as(usize, 9), (try batch.key(0, 0)).bytes.len);
-    var reopened = try Controller.init(alloc, std.testing.io, &store, view);
+    var reopened = try Controller.init(alloc, platform.testing.io, &store, view);
     defer reopened.deinit();
     var recovered = reopened.acquire().?;
     defer recovered.deinit();
@@ -1095,7 +1097,7 @@ test "relational index catalog publishes prepared snapshots only after atomic co
 }
 
 fn testPublicationAllocations(alloc: Allocator, store: *docstore.DocStore, view: registry.SchemaView) !void {
-    var controller = try Controller.init(alloc, std.testing.io, store, view);
+    var controller = try Controller.init(alloc, platform.testing.io, store, view);
     defer controller.deinit();
     var prepared = try controller.prepare(view, test_definitions[0..1]);
     defer prepared.deinit();
@@ -1111,7 +1113,7 @@ test "relational index catalog prepared publication cleans every allocation fail
     var store = try docstore.DocStore.openRuntime(alloc, &runtime);
     defer store.close();
     _ = try schema.saveSchema(&store, alloc, test_schema);
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();
@@ -1125,11 +1127,11 @@ test "relational index catalog survives LSM reopen and rejects incomplete durabl
     const alloc = std.testing.allocator;
     const Backend = @import("../lsm_backend.zig").Backend;
     const DocStore = @import("../docstore.zig").DocStore;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var schemas = try registry.Registry.initCloned(alloc, std.testing.io, test_schema);
+    var schemas = try registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer schemas.deinit();
     var view = schemas.acquire().?;
     defer view.release();

@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const inference_audio = @import("inference_audio");
 const mp3_synth = inference_audio.mp3.synthesis;
 const aac = inference_audio.aac;
@@ -62,7 +64,7 @@ const BenchResult = struct {
 pub fn main(init: std.process.Init) !void {
     const cfg = try parseArgs(init);
     const allocator = std.heap.page_allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     var results = std.ArrayList(BenchResult).empty;
@@ -281,8 +283,8 @@ fn elapsedNsSince(started_ns: u64) !u64 {
 }
 
 fn monotonicNowNs() !u64 {
-    var timespec: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec))) {
+    var timespec: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &timespec))) {
         .SUCCESS => return @intCast(@as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec),
         else => return error.ClockGetTimeFailed,
     }

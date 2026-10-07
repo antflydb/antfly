@@ -75,8 +75,8 @@ const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const ownership_mod = @import("../ownership.zig");
 const lease_mod = @import("../lease.zig");
 const types = @import("../types.zig");
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
+const platform_clock = platform.clock;
+const platform_time = platform.time;
 const background_runtime_mod = @import("../../background_runtime.zig");
 const template = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
@@ -93,7 +93,7 @@ else
 const mapper = @import("../document_mapper.zig");
 const relational_store = @import("../relational_store.zig");
 
-var activity_epoch_salt = @import("antfly_platform").atomic.Value(u64).init(1);
+var activity_epoch_salt = platform.atomic.Value(u64).init(1);
 
 fn newActivityEpoch(config: Config, clock: platform_clock.Clock) u64 {
     var hasher = std.hash.Wyhash.init(0x414e54464c594143);
@@ -904,7 +904,7 @@ fn requestGeneratedTextBatchPolicy(alloc: Allocator, request: enrichment_types.G
 
 fn backoffWriterLockRetry() void {
     if (comptime builtin.os.tag == .freestanding) return;
-    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
+    platform.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
 }
 
 fn sleepRetryBackoff(runtime: *EnrichmentRuntime, sleep_ns: u64) void {
@@ -934,7 +934,7 @@ fn sleepRetryBackoff(runtime: *EnrichmentRuntime, sleep_ns: u64) void {
         }
         return;
     }
-    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+    platform.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
 }
 
 fn transientEmbedRetrySleepNs(attempt: u32) u64 {
@@ -1795,7 +1795,7 @@ test "request embedding telemetry preserves an overlapping replay batch snapshot
 
 test "enrichment runtime status scopes embedding activity to exact consumer indexes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/activity-indexes", .{tmp.sub_path});
@@ -1881,7 +1881,7 @@ test "request embedding failure never claims a supervised retry" {
             return error.TestSparseRequestFailure;
         }
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/request-activity-indexes", .{tmp.sub_path});
@@ -4101,7 +4101,7 @@ test "empty chunk sources retain their own document revisions" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/empty-chunk-revisions", .{tmp.sub_path});
@@ -4167,7 +4167,7 @@ test "stale embedding cleanup guards each request in a shared window" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/cleanup-guards", .{tmp.sub_path});
@@ -4425,8 +4425,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     total_extract_ns: u64 = 0,
     inference_recovery_mutex: std.atomic.Mutex = .unlocked,
     inference_recovery: std.AutoHashMapUnmanaged(InferenceRecoveryKey, InferenceRecoveryState) = .empty,
-    inference_timeout_count: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    inference_cancel_count: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    inference_timeout_count: platform.atomic.Value(u64) = .init(0),
+    inference_cancel_count: platform.atomic.Value(u64) = .init(0),
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
@@ -4836,7 +4836,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     /// Backend-neutral executor retained from BackendRuntime. The small value
     /// wrapper preserves the existing `io()` call sites while removing the
-    /// production dependency on `std.Io.Threaded` and enabling VoprIo.
+    /// production dependency on `platform.Io.Threaded` and enabling VoprIo.
     io_impl: ?IoBackend,
     store: backend_erased.Store,
     owns_store: bool,
@@ -4943,8 +4943,8 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     total_extract_ns: u64 = 0,
     inference_recovery_mutex: std.atomic.Mutex = .unlocked,
     inference_recovery: std.AutoHashMapUnmanaged(InferenceRecoveryKey, InferenceRecoveryState) = .empty,
-    inference_timeout_count: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    inference_cancel_count: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    inference_timeout_count: platform.atomic.Value(u64) = .init(0),
+    inference_cancel_count: platform.atomic.Value(u64) = .init(0),
     dense_artifact_bytes_written: u64 = 0,
     sparse_artifact_bytes_written: u64 = 0,
     chunk_artifact_bytes_written: u64 = 0,
@@ -5773,7 +5773,7 @@ test "enrichment runtime status reports worker lifecycle diagnostics" {
 
 test "enrichment inline backoff wakes for teardown before and during wait admission" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const Waiter = struct {
@@ -5826,7 +5826,7 @@ test "enrichment inline backoff wakes for teardown before and during wait admiss
 test "enrichment visibility wait wakes immediately on applied state" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
@@ -5866,7 +5866,7 @@ test "enrichment visibility wait wakes immediately on applied state" {
 test "enrichment visibility wait has a hard liveness timeout" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
@@ -5891,7 +5891,7 @@ test "enrichment visibility wait has a hard liveness timeout" {
 test "enrichment visibility wait is cancelable" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
@@ -5926,7 +5926,7 @@ test "enrichment visibility wait is cancelable" {
 test "enrichment visibility wait observes borrowed request cancellation" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var signal = std.atomic.Value(bool).init(true);
     var runtime = EnrichmentRuntime{
@@ -5955,7 +5955,7 @@ test "enrichment visibility wait observes borrowed request cancellation" {
 test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var signal = std.atomic.Value(bool).init(true);
     var runtime = EnrichmentRuntime{
@@ -5989,7 +5989,7 @@ test "enrichment provider deadlines and progress cross native clock boundaries" 
     var clock: platform_clock.ManualClock = .{};
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
-        .io_impl = .{ .borrowed = std.testing.io },
+        .io_impl = .{ .borrowed = platform.testing.io },
         .store = undefined,
         .owns_store = false,
         .change_journal = undefined,
@@ -6619,7 +6619,7 @@ test "isolated enrichment request error does not mark worker failed" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/isolated-indexes", .{tmp.sub_path});
@@ -6714,7 +6714,7 @@ test "chunked dense terminal failure is recorded once per parent request" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/chunked-terminal-indexes", .{tmp.sub_path});
@@ -6801,7 +6801,7 @@ test "malformed chunked dense batch is isolated without failing the worker" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/malformed-chunked-indexes", .{tmp.sub_path});
@@ -6886,7 +6886,7 @@ test "rejected chunk embedding publication records its request for stale cleanup
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/rejected-chunk-indexes", .{tmp.sub_path});
@@ -7028,7 +7028,7 @@ fn endReplayPass(runtime: *EnrichmentRuntime, io: Io) void {
 test "enrichment replay passes are single flight" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
@@ -7420,7 +7420,7 @@ test "enrichment runtime graph stage recovery is bounded and fences superseded o
     defer manager.deinit();
     var runtime: EnrichmentRuntime = .{
         .alloc = alloc,
-        .io_impl = .{ .borrowed = std.testing.io },
+        .io_impl = .{ .borrowed = platform.testing.io },
         .store = erased,
         .owns_store = false,
         .change_journal = undefined,
@@ -8151,7 +8151,7 @@ const SharedPdfWindowScheduler = struct {
             while (true) {
                 if (!consumer.enabled) return error.DocumentExtractionWorkingSetTooLarge;
                 if (consumer.err) |err| return err;
-                return PdfWindowConsumerLease.initIndependent(@import("antfly_platform").allocator.concurrentFallback(), runtime.config.resource_manager orelse runtime.index_manager.resource_manager, required) catch |err| {
+                return PdfWindowConsumerLease.initIndependent(platform.allocator.concurrentFallback(), runtime.config.resource_manager orelse runtime.index_manager.resource_manager, required) catch |err| {
                     if (err != error.DocumentExtractionWorkingSetTooLarge or self.count == 0) return err;
                     try self.retireOne();
                     continue;
@@ -9110,7 +9110,7 @@ const RuntimePdfPageTextSpool = struct {
         };
         // An unrelated executor may reclaim this buffer. Neither its payloads
         // nor its control object may borrow a task-confined backing allocator.
-        if (self.segment == null) self.segment = try WriteBuffer.create(@import("antfly_platform").allocator.concurrentFallback(), self.manager());
+        if (self.segment == null) self.segment = try WriteBuffer.create(platform.allocator.concurrentFallback(), self.manager());
         const alloc = self.segment.?.allocator();
         {
             const key = try self.keyAlloc(alloc, page);
@@ -9391,7 +9391,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 while (!self.embedding_started.load(.acquire)) {
                     try context.check();
                     if (platform_time.monotonicNs() > deadline) return error.TextDidNotOverlapEmbedding;
-                    @import("antfly_platform").time.yieldNow();
+                    platform.time.yieldNow();
                 }
             }
             if (self.text_batch_failure) |err| return err;
@@ -9444,20 +9444,20 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 while (!self.text_started.load(.acquire) or !self.owner_released.load(.acquire)) {
                     try context.check();
                     if (platform_time.monotonicNs() > deadline) return error.OwnerDidNotOverlapPeers;
-                    @import("antfly_platform").time.yieldNow();
+                    platform.time.yieldNow();
                 }
             }
             if (self.worker_failure) |err| return err;
-            const deadline = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s;
+            const deadline = platform.time.monotonicNs() + std.time.ns_per_s;
             if (self.prefetch_started) |started| while (!started.load(.acquire)) {
                 try context.check();
                 if (platform_time.monotonicNs() > deadline) return error.PrefetchDidNotOverlapPeers;
-                @import("antfly_platform").time.yieldNow();
+                platform.time.yieldNow();
             };
             while (self.wait_for_cancel) {
                 try context.check();
-                if (@import("antfly_platform").time.monotonicNs() > deadline) return error.SharedConsumerWasNotCanceled;
-                @import("antfly_platform").time.yieldNow();
+                if (platform.time.monotonicNs() > deadline) return error.SharedConsumerWasNotCanceled;
+                platform.time.yieldNow();
             }
             if (self.single_slot) {
                 if (self.active.swap(true, .acq_rel)) {
@@ -9467,8 +9467,8 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 defer self.active.store(false, .release);
                 while (!self.admission_denied.load(.acquire)) {
                     try context.check();
-                    if (@import("antfly_platform").time.monotonicNs() > deadline) return error.MissingConcurrentAdmissionAttempt;
-                    @import("antfly_platform").time.yieldNow();
+                    if (platform.time.monotonicNs() > deadline) return error.MissingConcurrentAdmissionAttempt;
+                    platform.time.yieldNow();
                 }
                 return embed(ptr, a, name, parts, dims);
             }
@@ -9902,7 +9902,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                                 job.err = error.CompletedGrantWasRetained;
                                 return;
                             }
-                            @import("antfly_platform").time.yieldNow();
+                            platform.time.yieldNow();
                         }
                     }
                 };
@@ -10188,7 +10188,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
 
     if (text_session) |session| {
         {
-            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, @import("antfly_platform").allocator.concurrentFallback(), null, 30_000, config, session);
+            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, platform.allocator.concurrentFallback(), null, 30_000, config, session);
             defer coordinator.destroy();
             const single = try Harness.partMemory(&harness, "visual", .{ .item_count = 1 }, 2, null);
             const plans = [_]inference_work.InvocationMemoryPlan{ undefined, single, single };
@@ -10297,7 +10297,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             };
             var owner = PixelOwner{};
             const bounded_producer = asset_producer_mod.Producer{ .ptr = &owner, .vtable = &.{ .produce = PixelOwner.one, .produce_batch = PixelOwner.produceMany, .can_produce_batch = PixelOwner.can, .invocation_memory_for_requests = PixelOwner.memory } };
-            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, @import("antfly_platform").allocator.concurrentFallback(), null, 30_000, config, session);
+            const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(alloc, platform.allocator.concurrentFallback(), null, 30_000, config, session);
             defer coordinator.destroy();
             var pending = [_]document_extraction_mod.Unit{
                 try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }),
@@ -10504,7 +10504,7 @@ const PreparedDocumentSourceCache = struct {
             .io = runtime.config.io orelse if (comptime builtin.os.tag == .freestanding)
                 .failing
             else
-                Io.Threaded.global_single_threaded.io(),
+                platform.Io.Threaded.global_single_threaded.io(),
             .budgeted = if (manager) |value|
                 resource_manager_mod.BudgetedAllocator.init(
                     value,
@@ -10592,8 +10592,8 @@ const PreparedDocumentSourceCache = struct {
         std.debug.assert(self.pending_pdfs.items.len == 0);
         for (self.entries.items) |entry| self.destroyEntry(entry);
         self.entries.deinit(alloc);
-        self.pending_sources.deinit(@import("antfly_platform").allocator.concurrentFallback());
-        self.pending_pdfs.deinit(@import("antfly_platform").allocator.concurrentFallback());
+        self.pending_sources.deinit(platform.allocator.concurrentFallback());
+        self.pending_pdfs.deinit(platform.allocator.concurrentFallback());
         if (self.budgeted) |*budgeted| budgeted.deinit();
         self.mutex.unlock(self.io);
         self.* = undefined;
@@ -10702,23 +10702,23 @@ const PreparedDocumentSourceCache = struct {
                 continue;
             }
             const owned_credential = if (credential_name) |value|
-                @import("antfly_platform").allocator.concurrentFallback().dupe(u8, value) catch |err| {
+                platform.allocator.concurrentFallback().dupe(u8, value) catch |err| {
                     self.mutex.unlock(self.io);
                     return err;
                 }
             else
                 null;
-            self.pending_sources.append(@import("antfly_platform").allocator.concurrentFallback(), .{
+            self.pending_sources.append(platform.allocator.concurrentFallback(), .{
                 .source_identity = identity,
                 .credential_name = owned_credential,
             }) catch |err| {
-                if (owned_credential) |value| @import("antfly_platform").allocator.concurrentFallback().free(value);
+                if (owned_credential) |value| platform.allocator.concurrentFallback().free(value);
                 self.mutex.unlock(self.io);
                 return err;
             };
             self.active_preparations = std.math.add(usize, self.active_preparations, 1) catch {
                 const removed = self.pending_sources.pop().?;
-                if (removed.credential_name) |value| @import("antfly_platform").allocator.concurrentFallback().free(value);
+                if (removed.credential_name) |value| platform.allocator.concurrentFallback().free(value);
                 self.mutex.unlock(self.io);
                 return error.PreparedDocumentCacheReferenceOverflow;
             };
@@ -10805,7 +10805,7 @@ const PreparedDocumentSourceCache = struct {
             if (!std.mem.eql(u8, pending.source_identity[0..], identity[0..]) or
                 !optionalStringsEqual(pending.credential_name, credential_name)) continue;
             const removed = self.pending_sources.swapRemove(index);
-            if (removed.credential_name) |value| @import("antfly_platform").allocator.concurrentFallback().free(value);
+            if (removed.credential_name) |value| platform.allocator.concurrentFallback().free(value);
             std.debug.assert(self.active_preparations > 0);
             self.active_preparations -= 1;
             self.drained.broadcast(self.io);
@@ -10928,7 +10928,7 @@ const PreparedDocumentSourceCache = struct {
                 self.mutex.unlock(self.io);
                 continue;
             }
-            self.pending_pdfs.append(@import("antfly_platform").allocator.concurrentFallback(), .{
+            self.pending_pdfs.append(platform.allocator.concurrentFallback(), .{
                 .entry = entry,
                 .decode_limits = decode_limits,
             }) catch |err| {
@@ -11143,7 +11143,7 @@ test "shared PDF cache reclaims idle sources but never live source or parse leas
     budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
-    var cache = PreparedDocumentSourceCache{ .backing_alloc = alloc, .budgeted = resource_manager_mod.BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1), .io = std.testing.io };
+    var cache = PreparedDocumentSourceCache{ .backing_alloc = alloc, .budgeted = resource_manager_mod.BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1), .io = platform.testing.io };
     defer cache.deinit();
     const backing = cache.allocator();
     const bytes = try backing.alloc(u8, 24 * 1024);
@@ -11179,7 +11179,7 @@ test "shared PDF render admission reclaims idle sources without invalidating liv
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     {
-        var cache = PreparedDocumentSourceCache{ .backing_alloc = alloc, .budgeted = resource_manager_mod.BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1), .io = std.testing.io };
+        var cache = PreparedDocumentSourceCache{ .backing_alloc = alloc, .budgeted = resource_manager_mod.BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1), .io = platform.testing.io };
         defer cache.deinit();
         const backing = cache.allocator();
         const bytes = try backing.alloc(u8, 24 * 1024);
@@ -11223,7 +11223,7 @@ test "prepared document source cache isolates credentials and reuses bytes" {
     var cache = PreparedDocumentSourceCache{
         .backing_alloc = alloc,
         .budgeted = null,
-        .io = std.testing.io,
+        .io = platform.testing.io,
     };
     defer cache.deinit();
 
@@ -11309,7 +11309,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
             };
             defer source.deinit();
             _ = self.source_ready.fetchAdd(1, .release);
-            while (!self.start.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!self.start.load(.acquire)) platform.time.yieldNow();
             var prepared = self.cache.preparePdf(&source, .{
                 .max_decoded_stream_bytes = 1024,
                 .max_working_set_bytes = 2048,
@@ -11320,7 +11320,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
             defer prepared.deinit();
             self.sessions[index] = prepared.session();
             _ = self.lease_ready.fetchAdd(1, .release);
-            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!self.release.load(.acquire)) platform.time.yieldNow();
         }
     };
     const DeinitContext = struct {
@@ -11337,7 +11337,7 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
     var cache = PreparedDocumentSourceCache{
         .backing_alloc = std.testing.allocator,
         .budgeted = null,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .prepare_pdf_session_fn = FakePreparation.prepare,
     };
     var source = try cache.adoptOwned("https://example.test/concurrent.pdf", null, .{
@@ -11349,16 +11349,16 @@ test "prepared document cache single-flights concurrent PDF variants and drains 
     var workers = WorkerContext{ .cache = &cache };
     const first = try std.Thread.spawn(.{}, WorkerContext.run, .{ &workers, @as(usize, 0) });
     const second = try std.Thread.spawn(.{}, WorkerContext.run, .{ &workers, @as(usize, 1) });
-    while (workers.source_ready.load(.acquire) != 2) @import("antfly_platform").time.yieldNow();
+    while (workers.source_ready.load(.acquire) != 2) platform.time.yieldNow();
     workers.start.store(true, .release);
-    while (workers.lease_ready.load(.acquire) != 2) @import("antfly_platform").time.yieldNow();
+    while (workers.lease_ready.load(.acquire) != 2) platform.time.yieldNow();
 
     try std.testing.expectEqual(@as(usize, 1), FakePreparation.calls.load(.acquire));
     try std.testing.expectEqual(workers.sessions[0].?, workers.sessions[1].?);
 
     var deinit_context = DeinitContext{ .cache = &cache };
     const deinit_thread = try std.Thread.spawn(.{}, DeinitContext.run, .{&deinit_context});
-    while (!cache.isShuttingDown()) @import("antfly_platform").time.yieldNow();
+    while (!cache.isShuttingDown()) platform.time.yieldNow();
     try std.testing.expect(!deinit_context.done.load(.acquire));
     workers.release.store(true, .release);
     first.join();
@@ -11389,7 +11389,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
             while (now_active > observed) {
                 observed = peak.cmpxchgWeak(observed, now_active, .acq_rel, .acquire) orelse break;
             }
-            while (!release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!release.load(.acquire)) platform.time.yieldNow();
             _ = active.fetchSub(1, .acq_rel);
             return .{ .parsed = .{} };
         }
@@ -11426,7 +11426,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
     var cache = PreparedDocumentSourceCache{
         .backing_alloc = std.testing.allocator,
         .budgeted = null,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .prepare_pdf_session_fn = FakePreparation.prepare,
     };
     defer cache.deinit();
@@ -11444,7 +11444,7 @@ test "prepared document cache prepares unrelated PDF keys concurrently" {
     const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
     for (0..100_000) |_| {
         if (FakePreparation.calls.load(.acquire) == 2) break;
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     FakePreparation.release.store(true, .release);
     first_thread.join();
@@ -11730,7 +11730,7 @@ fn concurrencyIo(runtime: *EnrichmentRuntime) Io {
     if (comptime builtin.os.tag == .freestanding) {
         return .failing;
     } else {
-        return if (runtime.io_impl) |impl| impl.io() else std.Io.Threaded.global_single_threaded.io();
+        return if (runtime.io_impl) |impl| impl.io() else platform.Io.Threaded.global_single_threaded.io();
     }
 }
 
@@ -14044,8 +14044,8 @@ test "shared PDF precommit cache reclamation skips locked borrowers and preserve
         try std.testing.expectError(error.ResourceBudgetExceeded, manager.reserve(.document_extraction_working_set, 60 * 1024));
         try std.testing.expectEqual(@as(usize, 2), cache.rows.count());
         if (!builtin.single_threaded) {
-            var attempted = try std.testing.io.concurrent(PrecommitResultCache.reclaim, .{ &cache, 1 });
-            try std.testing.expectEqual(@as(u64, 0), attempted.await(std.testing.io));
+            var attempted = try platform.testing.io.concurrent(PrecommitResultCache.reclaim, .{ &cache, 1 });
+            try std.testing.expectEqual(@as(u64, 0), attempted.await(platform.testing.io));
         }
         try std.testing.expectEqualStrings(&text, cache.rows.get("reader/page1").?);
     }
@@ -15082,7 +15082,7 @@ const SharedPdfPngWindow = struct {
                 if (count > 0 and peak > available) break;
                 const grant = @min(peak, available);
                 if (grant == 0) return;
-                self.pages[i].lease = PdfWindowConsumerLease.init(@import("antfly_platform").allocator.concurrentFallback(), runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, grant) catch break;
+                self.pages[i].lease = PdfWindowConsumerLease.init(platform.allocator.concurrentFallback(), runtime.config.resource_manager orelse runtime.index_manager.resource_manager, parent, grant) catch break;
                 self.pages[i].attempted = true;
                 self.pages[i].deadline_ns = self.deadline_ns;
                 var singleton = raster;
@@ -16256,14 +16256,14 @@ test "PDF window output allocator enforces one ceiling across concurrent workers
         succeeded: bool = false,
 
         fn run(self: *@This()) void {
-            while (!self.start.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!self.start.load(.acquire)) platform.time.yieldNow();
             const memory = self.alloc.alloc(u8, allocation_bytes) catch {
                 _ = self.attempted.fetchAdd(1, .release);
                 return;
             };
             self.succeeded = true;
             _ = self.attempted.fetchAdd(1, .release);
-            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!self.release.load(.acquire)) platform.time.yieldNow();
             self.alloc.free(memory);
         }
     };
@@ -16286,7 +16286,7 @@ test "PDF window output allocator enforces one ceiling across concurrent workers
         spawned += 1;
     }
     start.store(true, .release);
-    while (attempted.load(.acquire) != worker_count) @import("antfly_platform").time.yieldNow();
+    while (attempted.load(.acquire) != worker_count) platform.time.yieldNow();
     const live_at_peak = output.liveBytes();
     release.store(true, .release);
     for (threads) |thread| thread.join();
@@ -17214,7 +17214,7 @@ const RuntimePdfRenderWindowPreparer = struct {
         policy.defer_render_pressure = speculative;
         var window = try renderRuntimePdfWindow(
             self.runtime,
-            @import("antfly_platform").allocator.concurrentFallback(),
+            platform.allocator.concurrentFallback(),
             self.producer,
             &self.coordinator.session,
             self.config,
@@ -24821,7 +24821,7 @@ const PdfEmbeddingWindowPreparer = struct {
         // allocations reachable from that task on a thread-safe allocator;
         // the composite lease and ResourceManager still enforce the large
         // scratch/output ceilings independently of the backing allocator.
-        const concurrent_alloc = @import("antfly_platform").allocator.concurrentFallback();
+        const concurrent_alloc = platform.allocator.concurrentFallback();
         self.coordinator.beginOperation(self.runtime.config.sync_wait_timeout_ms);
         self.coordinator.session.setCancellationProbe(self.cancellationProbe());
         if (first_item >= self.pending_pages.len) return error.InvalidPdfRenderWindow;
@@ -25386,8 +25386,8 @@ fn processPdfPageImageEmbeddingWithAllocator(
     // the current window, so the cloned render session must not share the
     // enrichment worker's task-confined allocator.
     const coordinator = try RuntimePdfOcrCoordinator.createFromPrepared(
-        @import("antfly_platform").allocator.concurrentFallback(),
-        @import("antfly_platform").allocator.concurrentFallback(),
+        platform.allocator.concurrentFallback(),
+        platform.allocator.concurrentFallback(),
         resource_tracker.manager,
         runtime.config.sync_wait_timeout_ms,
         render_config,
@@ -26262,7 +26262,7 @@ test "durable enrichment PDF page embedding queues complete staged generations w
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/pdf-stage-indexes", .{tmp.sub_path});
@@ -28956,7 +28956,7 @@ test "ordered artifact inventory embedding fallback reads selected chunk generat
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const chunks = @import("../artifact_chunk_manifest.zig");
     const generations = @import("../artifact_chunk_generation.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-consumer", .{tmp.sub_path});
     defer alloc.free(path);
@@ -30329,7 +30329,7 @@ test "enrichment applied checkpoint stays degraded until runtime status clears" 
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
@@ -30384,7 +30384,7 @@ test "durable enrichment retry progress preserves unrelated request debt across 
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
@@ -30506,9 +30506,9 @@ const RuntimeLeaseHeartbeatGuard = struct {
         // with the enrichment owner. Give its cloned lease and JSON scratch a
         // dedicated system allocator and snapshot immutable tenure identity
         // before starting the task.
-        self.owner_id = try @import("antfly_platform").allocator.concurrentFallback().dupe(u8, self.runtime.ownership.owner_id);
+        self.owner_id = try platform.allocator.concurrentFallback().dupe(u8, self.runtime.ownership.owner_id);
         errdefer {
-            @import("antfly_platform").allocator.concurrentFallback().free(self.owner_id);
+            platform.allocator.concurrentFallback().free(self.owner_id);
             self.owner_id = &.{};
         }
         self.epoch = self.runtime.ownership.lease_epoch;
@@ -30516,7 +30516,7 @@ const RuntimeLeaseHeartbeatGuard = struct {
         if (!self.runtime.ownership.has_lease or self.epoch == 0)
             return error.EnrichmentLeaseFenceLost;
         self.lease = try lease_mod.Lease.init(
-            @import("antfly_platform").allocator.concurrentFallback(),
+            platform.allocator.concurrentFallback(),
             self.runtime.store,
             enrichment_lease.default_lease_key,
         );
@@ -30537,7 +30537,7 @@ const RuntimeLeaseHeartbeatGuard = struct {
         }
         if (self.lease) |*lease| lease.deinit();
         self.lease = null;
-        if (self.owner_id.len > 0) @import("antfly_platform").allocator.concurrentFallback().free(self.owner_id);
+        if (self.owner_id.len > 0) platform.allocator.concurrentFallback().free(self.owner_id);
         self.owner_id = &.{};
     }
 
@@ -30901,7 +30901,7 @@ test "enrichment remote render config preserves runtime execution context" {
     const config = remoteRenderConfig(
         null,
         null,
-        std.Io.Threaded.global_single_threaded.io(),
+        platform.Io.Threaded.global_single_threaded.io(),
         CancellationToken.fromAtomic(&canceled),
         null,
     );
@@ -31900,7 +31900,7 @@ test "asset batch fallback isolates malformed envelope and preserves typed mixed
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
@@ -32043,7 +32043,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
     };
     var harness: Harness = .{};
     defer if (harness.encoded) |bytes| alloc.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unit-chunk-callback", .{tmp.sub_path});
     defer alloc.free(path);
@@ -32166,7 +32166,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
     };
     var harness: Harness = .{};
     defer if (harness.encoded) |bytes| alloc.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-callback", .{tmp.sub_path});
     defer alloc.free(path);
@@ -32349,7 +32349,7 @@ test "ordered artifact inventory authored document callbacks bypass providers an
     };
     for ([_]bool{ true, false }) |dense| {
         var harness: Harness = .{};
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authored-document-callback", .{tmp.sub_path});
         defer alloc.free(path);
@@ -32457,7 +32457,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
     };
     var harness: Harness = .{};
     defer if (harness.encoded) |bytes| alloc.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-vector-callback", .{tmp.sub_path});
     defer alloc.free(path);
@@ -32995,7 +32995,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
     };
     var harness: Harness = .{};
     defer if (harness.encoded) |bytes| alloc.free(bytes);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/asset-callback", .{tmp.sub_path});
     defer alloc.free(path);
@@ -33156,7 +33156,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
                     defer value.deinit();
                 }
             };
-            if (pass == 0 and !delete_live and !graph and !generated) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, selected, plan.plan() });
+            if (pass == 0 and !delete_live and !graph and !generated) try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, selected, plan.plan() });
         }
         if (previous_closure) |*value| value.deinit();
         previous_closure = null;
@@ -33215,7 +33215,7 @@ test "asset preparation is lazy and byte bounded across retryable provider batch
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/indexes", .{tmp.sub_path});
@@ -33370,7 +33370,7 @@ test "asset producer neighbor context samples local graph adjacency into the inp
         fn notify(_: *anyopaque, _: u64) void {}
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var db_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const db_path = try std.fmt.bufPrint(&db_path_buf, ".zig-cache/tmp/{s}/graph-db", .{tmp.sub_path});
@@ -33680,7 +33680,7 @@ test "asset batch fallback keeps the logical request retry budget" {
     defer store.deinit();
     var erased_store = try backend_erased.storeFrom(alloc, store);
     defer erased_store.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/asset-retry-indexes", .{tmp.sub_path});
@@ -34421,7 +34421,7 @@ test "graph projection preserves numeric literals in enrichment metadata and tem
 }
 
 test "enrichment terminal failure envelope is preserved by unbounded drains" {
-    var io_impl = Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,

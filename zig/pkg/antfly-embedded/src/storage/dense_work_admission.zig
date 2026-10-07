@@ -15,8 +15,10 @@
 
 //! FIFO admission for whole rerank callers. Optional read helpers have a
 //! separate, nonblocking node budget; a caller never waits for a helper.
+const platform = @import("antfly_platform");
 const std = @import("std");
-const time = @import("antfly_platform").time;
+
+const time = platform.time;
 const admission = @import("admission_waiter.zig");
 pub const Cancellation = admission.Cancellation;
 
@@ -161,7 +163,7 @@ test "dense rerank cancellation racing a grant returns the permit exactly once" 
 }
 
 test "dense rerank callers queue FIFO and cancel without retaining capacity" {
-    var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer runtime.deinit();
     const io = runtime.io();
     var queue = Queue{ .capacity = 1 };
@@ -232,7 +234,7 @@ test "dense rerank callers queue FIFO and cancel without retaining capacity" {
 }
 
 test "dense rerank Io cancellation retires a queued stack waiter" {
-    var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer runtime.deinit();
     const io = runtime.io();
     var queue = Queue{ .capacity = 1 };

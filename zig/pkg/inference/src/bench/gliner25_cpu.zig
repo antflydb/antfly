@@ -16,7 +16,9 @@
 //! Persistent, direct-core GLiNER2.5 CPU benchmark worker. The Python driver
 //! owns pairing, independent output/token validation, resource supervision,
 //! and the evidence report. This binary never claims serving qualification.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const linalg = @import("inference_linalg");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -61,8 +63,8 @@ const Extraction = struct {
 };
 
 fn nowNs() !u64 {
-    var ts: std.posix.timespec = undefined;
-    if (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return error.MonotonicClockUnavailable;
+    var ts: platform.c.timespec = undefined;
+    if (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return error.MonotonicClockUnavailable;
     return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
 }
 fn hash(bytes: []const u8) [64]u8 {
@@ -225,12 +227,12 @@ pub fn main(init: std.process.Init) !void {
     defer store.deinitOwned();
     // BLAS owns its math pool. Pure native math uses one bounded caller-owned
     // Io pool, shared by every projection and attention operation.
-    var math_io = std.Io.Threaded.init(a, .{
+    var math_io = platform.Io.Threaded.init(a, .{
         .async_limit = .limited(options.threads - 1),
         .concurrent_limit = .limited(options.threads - 1),
     });
     defer math_io.deinit();
-    var backend = if (on_cuda) try inference.native_compute.cuda.CudaCompute.init(a) else native.NativeCompute.initWithIo(a, &store, null, if (useCpuBlas() or options.threads == 1) std.Io.Threaded.global_single_threaded.io() else math_io.io());
+    var backend = if (on_cuda) try inference.native_compute.cuda.CudaCompute.init(a) else native.NativeCompute.initWithIo(a, &store, null, if (useCpuBlas() or options.threads == 1) platform.Io.Threaded.global_single_threaded.io() else math_io.io());
     defer backend.deinit();
     if (comptime on_cuda) {
         if (backend.kernels.gliner25_boundary_f32 == null) return error.CudaKernelUnavailable;

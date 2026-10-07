@@ -17,7 +17,9 @@
 //! Each call takes the same request JSON and returns the same response JSON
 //! as the matching `/ai/v1` route of the inference HTTP API, dispatched in
 //! memory to the same handlers.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const capi = @import("types.zig");
 const db = @import("db.zig");
 const inference_provider = db.inference_provider;
@@ -27,7 +29,7 @@ const alloc = std.heap.c_allocator;
 const known_flags: u32 = 0;
 
 const InferenceHandle = struct {
-    io: *std.Io.Threaded,
+    io: *platform.Io.Threaded,
     lifetime: inference_provider.EmbeddedInferenceProviderLifetime,
     /// The runtime borrows the models directory for its whole life.
     models_dir: ?[]u8,
@@ -103,9 +105,9 @@ fn openInference(options: ?*const capi.InferenceOptions) !*anyopaque {
     errdefer if (models_dir) |path| alloc.free(path);
     resolved.node.models_dir = models_dir;
 
-    const io_impl = try alloc.create(std.Io.Threaded);
+    const io_impl = try alloc.create(platform.Io.Threaded);
     errdefer alloc.destroy(io_impl);
-    io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    io_impl.* = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     errdefer io_impl.deinit();
     // The data directory is only a fallback anchor for the models directory,
     // which the runtime resolves on its own.
@@ -656,10 +658,10 @@ fn modelInstalled(owner: []const u8, prefix: []const u8) bool {
     const home = std.mem.span(std.c.getenv("HOME") orelse return false);
     const owner_dir = std.fs.path.join(std.testing.allocator, &.{ home, ".antfly", "inference", "models", owner }) catch return false;
     defer std.testing.allocator.free(owner_dir);
-    var dir = std.Io.Dir.cwd().openDir(std.testing.io, owner_dir, .{ .iterate = true }) catch return false;
-    defer dir.close(std.testing.io);
+    var dir = std.Io.Dir.cwd().openDir(platform.testing.io, owner_dir, .{ .iterate = true }) catch return false;
+    defer dir.close(platform.testing.io);
     var it = dir.iterateAssumeFirstIteration();
-    while (it.next(std.testing.io) catch return false) |entry| {
+    while (it.next(platform.testing.io) catch return false) |entry| {
         if (std.mem.startsWith(u8, entry.name, prefix)) return true;
     }
     return false;
@@ -764,8 +766,8 @@ test "capi inference lists models and reports route errors with the runtime JSON
     defer test_tmp.cleanup();
     const models_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}-models", .{test_tmp.path()});
     defer std.testing.allocator.free(models_dir);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, models_dir);
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, models_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, models_dir);
+    defer std.Io.Dir.cwd().deleteTree(platform.testing.io, models_dir) catch {};
     var options: capi.InferenceOptions = .{ .models_dir = testSlice(models_dir) };
     var handle: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(&options, &handle));
@@ -946,8 +948,8 @@ test "capi inference pulls a model with progress into the handle models director
     defer test_tmp.cleanup();
     const models_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}-models", .{test_tmp.path()});
     defer std.testing.allocator.free(models_dir);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, models_dir);
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, models_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, models_dir);
+    defer std.Io.Dir.cwd().deleteTree(platform.testing.io, models_dir) catch {};
 
     var options: capi.InferenceOptions = .{ .models_dir = testSlice(models_dir) };
     var handle: ?*anyopaque = null;
@@ -996,8 +998,8 @@ test "capi inference pulls a model with progress into the handle models director
     // each callback's answer before moving on.
     const fresh_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}-fresh", .{models_dir});
     defer std.testing.allocator.free(fresh_dir);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, fresh_dir);
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, fresh_dir) catch {};
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, fresh_dir);
+    defer std.Io.Dir.cwd().deleteTree(platform.testing.io, fresh_dir) catch {};
     var fresh_options: capi.InferenceOptions = .{ .models_dir = testSlice(fresh_dir) };
     var fresh: ?*anyopaque = null;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_inference_open(&fresh_options, &fresh));

@@ -25,11 +25,13 @@
 //! Callers typically wire this up once per binary, pointing at their
 //! server-specific metrics sources (raft metrics, serverless metrics, etc).
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = platform.sync;
 const Io = std.Io;
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const prometheus = @import("antfly_local_sources").common_prometheus;
 const runtime_lifecycle = @import("runtime_lifecycle.zig");
 const metrics_cache_ttl_ms: u64 = 5 * std.time.ms_per_s;
@@ -380,7 +382,7 @@ const FakeMetrics = struct {
 
 test "health server healthz returns ok" {
     const alloc = testing.allocator;
-    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, null);
+    const hs = try HealthServer.init(alloc, platform.testing.io, .{ .bind_port = 0 }, null, null);
     defer hs.deinit();
 
     var resp = try hs.executeForTest(.GET, "/healthz");
@@ -393,7 +395,7 @@ test "health server healthz returns ok" {
 test "health server readyz reports 200 when ready" {
     const alloc = testing.allocator;
     var fake = FakeReady{ .ready = true };
-    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, fake.iface(), null);
+    const hs = try HealthServer.init(alloc, platform.testing.io, .{ .bind_port = 0 }, fake.iface(), null);
     defer hs.deinit();
 
     var resp = try hs.executeForTest(.GET, "/readyz");
@@ -406,7 +408,7 @@ test "health server readyz reports 200 when ready" {
 test "health server readyz reports 503 when not ready" {
     const alloc = testing.allocator;
     var fake = FakeReady{ .ready = false };
-    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, fake.iface(), null);
+    const hs = try HealthServer.init(alloc, platform.testing.io, .{ .bind_port = 0 }, fake.iface(), null);
     defer hs.deinit();
 
     var resp = try hs.executeForTest(.GET, "/readyz");
@@ -419,7 +421,7 @@ test "health server readyz reports 503 when not ready" {
 test "health server metrics returns prometheus text" {
     const alloc = testing.allocator;
     var fake = FakeMetrics{};
-    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, fake.iface());
+    const hs = try HealthServer.init(alloc, platform.testing.io, .{ .bind_port = 0 }, null, fake.iface());
     defer hs.deinit();
 
     var resp = try hs.executeForTest(.GET, "/metrics");
@@ -435,7 +437,7 @@ test "health server metrics returns prometheus text" {
 test "health server metrics serves cached payload within ttl" {
     const alloc = testing.allocator;
     var fake = FakeMetrics{};
-    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, fake.iface());
+    const hs = try HealthServer.init(alloc, platform.testing.io, .{ .bind_port = 0 }, null, fake.iface());
     defer hs.deinit();
 
     var resp_a = try hs.executeForTest(.GET, "/metrics");
@@ -450,7 +452,7 @@ test "health server metrics serves cached payload within ttl" {
 test "health server metrics request path does not refresh stale cache" {
     const alloc = testing.allocator;
     var fake = FakeMetrics{};
-    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, fake.iface());
+    const hs = try HealthServer.init(alloc, platform.testing.io, .{ .bind_port = 0 }, null, fake.iface());
     defer hs.deinit();
 
     lockAtomic(&hs.metrics_cache_mutex);
@@ -466,7 +468,7 @@ test "health server metrics request path does not refresh stale cache" {
 
 test "health server startIfConfiguredOnHost uses provided bind host" {
     const alloc = testing.allocator;
-    const hs = (try HealthServer.startIfConfiguredOnHost(alloc, std.testing.io, "test", "127.0.0.1", 0, null, null)).?;
+    const hs = (try HealthServer.startIfConfiguredOnHost(alloc, platform.testing.io, "test", "127.0.0.1", 0, null, null)).?;
     defer hs.deinit();
 
     const uri = try hs.baseUri(alloc);
@@ -477,13 +479,13 @@ test "health server startIfConfiguredOnHost uses provided bind host" {
 test "health server startIfConfiguredOnHost propagates configured bind failures" {
     try testing.expectError(
         error.ParseFailed,
-        HealthServer.startIfConfiguredOnHost(testing.allocator, std.testing.io, "test", "not-an-ip", 4200, null, null),
+        HealthServer.startIfConfiguredOnHost(testing.allocator, platform.testing.io, "test", "not-an-ip", 4200, null, null),
     );
 }
 
 test "health server unknown path returns 404" {
     const alloc = testing.allocator;
-    const hs = try HealthServer.init(alloc, std.testing.io, .{ .bind_port = 0 }, null, null);
+    const hs = try HealthServer.init(alloc, platform.testing.io, .{ .bind_port = 0 }, null, null);
     defer hs.deinit();
 
     var resp = try hs.executeForTest(.GET, "/nope");

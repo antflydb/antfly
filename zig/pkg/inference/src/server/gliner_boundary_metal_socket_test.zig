@@ -80,7 +80,7 @@ fn requireMetal(node: *Node) void {
 fn inspectionControl(node: *Node) !Control {
     const watchdog = node.hard_cancellation_watchdog orelse return error.MissingHardCancellationWatchdog;
     return .{
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .deadline_ns = clock() + 5 * std.time.ns_per_s,
         .hard_cancellation = watchdog.boundary(),
     };
@@ -237,9 +237,9 @@ test "gliner boundary socket pinned small Metal managed HTTP success atomic reco
     const a = std.testing.allocator;
     var path: [Io.Dir.max_path_bytes]u8 = undefined;
     const length = if (std.fs.path.isAbsolute(requested))
-        try Io.Dir.realPathFileAbsolute(std.testing.io, requested, &path)
+        try Io.Dir.realPathFileAbsolute(platform.testing.io, requested, &path)
     else
-        try Io.Dir.cwd().realPathFile(std.testing.io, requested, &path);
+        try Io.Dir.cwd().realPathFile(platform.testing.io, requested, &path);
     const directory = path[0..length];
     const name = std.fs.path.basename(directory);
     const bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
@@ -257,7 +257,7 @@ test "gliner boundary socket pinned small Metal managed HTTP success atomic reco
         var node = try Node.init(a, try config(directory, 3 * GiB, 1));
         defer node.deinit();
         requireMetal(&node);
-        try node.attachIo(std.testing.io);
+        try node.attachIo(platform.testing.io);
         const transport = try socket.Loopback.init(a, &node);
         defer transport.deinit();
         // Loopback preserves Node.serve's resource-owner startup. A cold or
@@ -411,9 +411,9 @@ test "gliner boundary socket pinned small Metal admits concurrent extracts and s
     const a = std.testing.allocator;
     var path: [Io.Dir.max_path_bytes]u8 = undefined;
     const length = if (std.fs.path.isAbsolute(requested))
-        try Io.Dir.realPathFileAbsolute(std.testing.io, requested, &path)
+        try Io.Dir.realPathFileAbsolute(platform.testing.io, requested, &path)
     else
-        try Io.Dir.cwd().realPathFile(std.testing.io, requested, &path);
+        try Io.Dir.cwd().realPathFile(platform.testing.io, requested, &path);
     const directory = path[0..length];
     const name = std.fs.path.basename(directory);
     const bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
@@ -433,7 +433,7 @@ test "gliner boundary socket pinned small Metal admits concurrent extracts and s
     var node = try Node.init(a, try config(directory, 3 * GiB, 2));
     defer node.deinit();
     requireMetal(&node);
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
     node.test_allow_unqualified_gliner_boundary = true;
     const transport = try socket.Loopback.init(a, &node);
     defer transport.deinit();
@@ -452,9 +452,9 @@ test "gliner boundary socket pinned small Metal admits concurrent extracts and s
     defer a.free(url);
     var second_budget = BoundedAlloc{ .backing = a, .limit = 4 * 1024 * 1024 };
     defer std.debug.assert(second_budget.live == 0);
-    var driver = Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
+    var driver = platform.Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
     defer driver.deinit();
-    var second_io = Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
+    var second_io = platform.Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
     defer second_io.deinit();
     var second = httpx.Client.initWithConfig(second_budget.allocator(), second_io.io(), .{
         .timeouts = .{ .connect_ms = 5_000, .read_ms = 180_000, .write_ms = 5_000, .request_ms = 180_000 },
@@ -480,7 +480,7 @@ test "gliner boundary socket pinned small Metal admits concurrent extracts and s
         while (node.inference_admission.stats().in_flight_requests == 0) {
             if (first.completed.load(.acquire)) break;
             if (clock() >= until) return error.RaceAdmissionTimeout;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
     {

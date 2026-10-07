@@ -14,6 +14,7 @@
 // limitations under the License.
 
 //! Statement-owned blocking results shared by nested relations and public streams.
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const Cursor = struct {
@@ -248,7 +249,7 @@ test "SQL blocking result blocks preserve exact values and avoid row directories
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
     defer manager.deinit();
     {
         const cursor = try Cursor.create(a, &manager, 3);

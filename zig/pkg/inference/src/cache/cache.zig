@@ -16,11 +16,12 @@
 // Result cache with TTL expiration and singleflight deduplication.
 // Mirrors the legacy Go inference caching strategy.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 fn nowNs() i64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
+    var ts: platform.c.timespec = undefined;
+    if (platform.c.clock_gettime(.MONOTONIC, &ts) != 0) return 0;
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 

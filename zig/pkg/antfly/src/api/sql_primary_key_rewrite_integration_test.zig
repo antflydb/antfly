@@ -190,9 +190,9 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
     const reader_authorization = try basicAuthorization(alloc, "pk-reader", "pk-reader-durable-password");
     defer alloc.free(reader_authorization);
     const reader_headers = [_]http.RequestHeader{.{ .name = "authorization", .value = reader_authorization }};
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const meta_root = try std.fmt.allocPrint(alloc, "{s}/metadata", .{root});
     defer alloc.free(meta_root);
@@ -204,7 +204,7 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
     defer alloc.free(data_catalog);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var metadata = try metadata_runtime.Server.init(process_alloc, .{
         .local_node_id = 1,

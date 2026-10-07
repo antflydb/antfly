@@ -1003,9 +1003,9 @@ test "laya training rejects malformed encoder metadata instead of defaulting" {
 
 test "laya admission snapshots frozen export tensors and rejects nonfinite values" {
     const a = std.testing.allocator;
-    var temp = std.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
-    const directory = try temp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const directory = try temp.dir.realPathFileAlloc(platform.testing.io, ".", a);
     defer a.free(directory);
     const file = try path(a, directory, "frozen.safetensors");
     defer a.free(file);
@@ -1017,7 +1017,7 @@ test "laya admission snapshots frozen export tensors and rejects nonfinite value
         defer source.deinit();
         break :blk try exportInputs(arena.allocator(), &source, &.{});
     };
-    try temp.dir.deleteFile(std.testing.io, "frozen.safetensors");
+    try temp.dir.deleteFile(platform.testing.io, "frozen.safetensors");
     try checkpoint.saveControlled(a, file, &.{.{ .name = "act_head.0.weight", .shape = &.{1}, .data = &.{std.math.nan(f32)} }}, null, true);
     try std.testing.expectEqualStrings("act_head.0.weight", admitted[0].name);
     try std.testing.expectEqualSlices(usize, &.{1}, admitted[0].shape);

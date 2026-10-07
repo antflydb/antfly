@@ -13,10 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
-const platform_time = @import("antfly_platform").time;
-const shared_platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
+const shared_platform_time = platform.time;
 const cache_budget = @import("antfly_cache_budget");
 pub const DenseWorkAdmission = @import("dense_work_admission.zig");
 const admission = @import("admission_waiter.zig");
@@ -107,32 +109,32 @@ const supports_pressure_wait = builtin.os.tag != .freestanding and
 
 const PressureChange = if (supports_pressure_wait)
     struct {
-        mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-        cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
-        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        mutex: platform.c.pthread_mutex_t = platform.c.PTHREAD_MUTEX_INITIALIZER,
+        cond: platform.c.pthread_cond_t = platform.c.PTHREAD_COND_INITIALIZER,
+        epoch: platform.atomic.Value(u64) = .init(0),
 
         fn snapshot(self: *@This()) u64 {
             return self.epoch.load(.acquire);
         }
 
         fn waitForChange(self: *@This(), observed: u64) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
-            defer if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+            defer if (platform.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
             while (self.epoch.load(.acquire) == observed) {
-                if (std.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
+                if (platform.c.pthread_cond_wait(&self.cond, &self.mutex) != .SUCCESS) unreachable;
             }
         }
 
         fn advance(self: *@This()) void {
-            if (std.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_mutex_lock(&self.mutex) != .SUCCESS) unreachable;
             _ = self.epoch.fetchAdd(1, .release);
-            if (std.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
-            if (std.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
+            if (platform.c.pthread_cond_broadcast(&self.cond) != .SUCCESS) unreachable;
+            if (platform.c.pthread_mutex_unlock(&self.mutex) != .SUCCESS) unreachable;
         }
     }
 else
     struct {
-        epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        epoch: platform.atomic.Value(u64) = .init(0),
 
         fn snapshot(self: *@This()) u64 {
             return self.epoch.load(.acquire);
@@ -716,12 +718,12 @@ pub const DerivedRecoverableRetryStats = struct {
 };
 
 const DerivedRecoverableRetryCounters = struct {
-    total: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    writer_locked: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    resource_budget: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    replay_document_not_visible: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    artifact_repair_required: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    not_found: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    total: platform.atomic.Value(u64) = .init(0),
+    writer_locked: platform.atomic.Value(u64) = .init(0),
+    resource_budget: platform.atomic.Value(u64) = .init(0),
+    replay_document_not_visible: platform.atomic.Value(u64) = .init(0),
+    artifact_repair_required: platform.atomic.Value(u64) = .init(0),
+    not_found: platform.atomic.Value(u64) = .init(0),
 
     fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
@@ -1075,18 +1077,18 @@ pub const ResourceManager = struct {
     reclaimers: std.ArrayListUnmanaged(ReclaimerSlot) = .empty,
     next_reclaimer_identity: u64 = 1,
     reclaimer_cursor: usize = 0,
-    reclaim_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    reclaimed_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    hbc_benefit_sample_counter: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    reclaim_requests: platform.atomic.Value(u64) = .init(0),
+    reclaimed_bytes: platform.atomic.Value(u64) = .init(0),
+    hbc_benefit_sample_counter: platform.atomic.Value(u64) = .init(0),
     hbc_cache_benefit: [@typeInfo(HbcCacheClass).@"enum".field_names.len]HbcCacheBenefitState = @splat(HbcCacheBenefitState{}),
     pressure_change: PressureChange = .{},
     memory: MutableMemory,
-    latency_sensitive_derived_replay_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    latency_sensitive_derived_replay_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    foreground_query_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    foreground_query_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    foreground_write_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    foreground_write_quiet_until_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    latency_sensitive_derived_replay_sessions: platform.atomic.Value(u64) = .init(0),
+    latency_sensitive_derived_replay_quiet_until_ns: platform.atomic.Value(u64) = .init(0),
+    foreground_query_sessions: platform.atomic.Value(u64) = .init(0),
+    foreground_query_quiet_until_ns: platform.atomic.Value(u64) = .init(0),
+    foreground_write_sessions: platform.atomic.Value(u64) = .init(0),
+    foreground_write_quiet_until_ns: platform.atomic.Value(u64) = .init(0),
     dense_search_admission_mutex: std.atomic.Mutex = .unlocked,
     dense_search_bandwidth_capacity_bytes: u64 = 0,
     dense_search_active_bytes: u64 = 0,
@@ -1139,9 +1141,9 @@ pub const ResourceManager = struct {
     dense_projection_pages_mutex: std.atomic.Mutex = .unlocked,
     dense_read_extra_tasks: std.atomic.Value(u32) = .init(0),
     dense_read_peak_extra_tasks: std.atomic.Value(u32) = .init(0),
-    dense_read_denied_tasks: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    dense_physically_ordered_batches: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    dense_physically_ordered_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    dense_read_denied_tasks: platform.atomic.Value(u64) = .init(0),
+    dense_physically_ordered_batches: platform.atomic.Value(u64) = .init(0),
+    dense_physically_ordered_requests: platform.atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
     /// Adaptive window size in original work units, independent of storage estimates.
     dense_replay_window_budget_bytes: u64 = 0,
@@ -1363,7 +1365,7 @@ pub const ResourceManager = struct {
             if (comptime builtin.os.tag == .freestanding) {
                 std.atomic.spinLoopHint();
             } else {
-                @import("antfly_platform").time.yieldNow();
+                platform.time.yieldNow();
             }
         }
     }
@@ -4271,7 +4273,7 @@ fn cacheBenefitPerByte(sample: HbcCacheBenefitSample, miss_service_ns_per_miss: 
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    @import("antfly_platform").sync.lockYielding(mutex);
+    platform.sync.lockYielding(mutex);
 }
 
 test "resource manager tracks reservations and releases" {
@@ -4601,7 +4603,7 @@ test "dense search bandwidth admission removes cancelled waiters" {
             var lease = self.manager.acquireDenseSearchBandwidth(1, .{
                 .ptr = &self.cancelled,
                 .is_cancelled = isCancelled,
-            }, std.Io.Threaded.global_single_threaded.io()) catch |err| {
+            }, platform.Io.Threaded.global_single_threaded.io()) catch |err| {
                 std.debug.assert(err == error.Cancelled);
                 self.saw_cancelled.store(true, .release);
                 return;

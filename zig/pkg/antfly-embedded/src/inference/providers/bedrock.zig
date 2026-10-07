@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const httpx = @import("httpx");
 const inference = @import("antfly_inference_types");
@@ -659,7 +661,7 @@ fn endpointHostAlloc(alloc: std.mem.Allocator, endpoint: []const u8) ![]u8 {
 const endpointBaseAlloc = aws.endpointBaseAlloc;
 
 pub fn testBedrockSigningClockUsesUnixWallTime() !void {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const before = try unixSecondsFromTimestamp(std.Io.Timestamp.now(io_impl.io(), .real));
     const actual = try currentUnixSeconds();

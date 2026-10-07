@@ -20,7 +20,9 @@
 //! caller action: acknowledge, wait, reject, or acknowledge while explicitly
 //! degraded to async.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const primary_mod = @import("primary.zig");
 
 var test_path_counter: u64 = 0;
@@ -111,7 +113,7 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     );
     defer alloc.free(slots_raw);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), log_raw) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), slots_raw) catch {};

@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const audio = @import("antfly_audio_openapi");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
@@ -564,7 +566,7 @@ test "Apple transcription recognizes a recording with phrase and word timestamps
     _ = std.base64.standard.Encoder.encode(encoded, fixture);
     const uri = try std.fmt.allocPrint(alloc, "data:audio/wav;base64,{s}", .{encoded});
     defer alloc.free(uri);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{});
     defer client.deinit();
@@ -1436,7 +1438,7 @@ test "vertex segments keep the transcript's punctuation" {
 
 test "vertex applies request, then provider config, then default" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1757,7 +1759,7 @@ test "transcribing registry duplicate provider error does not double free config
 
 test "transcribing runtime rejects an Antfly provider without a routing model" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -1775,7 +1777,7 @@ test "transcribing runtime rejects an Antfly provider without a routing model" {
 
 test "transcribing runtime loads antfly provider and transcribes data uri input" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1843,7 +1845,7 @@ test "transcribing runtime loads antfly provider and transcribes data uri input"
 
 test "Antfly transcriber sends negotiated framed audio attachments" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var server = try httpx.TestServer.start(allocator, io, &.{.{
@@ -1885,7 +1887,7 @@ test "Antfly transcriber sends negotiated framed audio attachments" {
 
 test "transcribing runtime loads openai provider and transcribes data uri input" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1950,7 +1952,7 @@ test "transcribing runtime loads openai provider and transcribes data uri input"
 
 test "vertex transcriber exchanges service account credentials and sends bearer auth" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1969,9 +1971,9 @@ test "vertex transcriber exchanges service account credentials and sends bearer 
     const credentials_json = try fakeVertexCredentialsJsonAlloc(alloc, token_uri);
     defer alloc.free(credentials_json);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
     const credentials_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "credentials.json" });
     defer alloc.free(credentials_path);
 
@@ -2106,7 +2108,7 @@ test "a json-only openai response still yields its transcript" {
 
 test "remote antfly transcription asks for diarization and keeps the labels" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var server = try httpx.TestServer.start(allocator, io, &.{.{

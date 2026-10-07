@@ -17,6 +17,34 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
+/// Join native or virtual storage paths with std's empty-component and
+/// separator-boundary rules. Windows also accepts '/', which Lite requires.
+pub fn joinStoragePathAlloc(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    const path = try std.fs.path.join(alloc, parts);
+    if (comptime builtin.os.tag == .windows) std.mem.replaceScalar(u8, path, '\\', '/');
+    return path;
+}
+
+test "storage path joins preserve boundaries and virtual separators" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { parts: []const []const u8, expected: []const u8 }{
+        .{ .parts = &.{ "", "CURRENT" }, .expected = "CURRENT" },
+        .{ .parts = &.{ "vectors/", "CURRENT" }, .expected = "vectors/CURRENT" },
+        .{ .parts = &.{ "", "vectors/", "/CURRENT", "" }, .expected = "vectors/CURRENT" },
+        .{ .parts = &.{ "vectors", "CURRENT" }, .expected = "vectors/CURRENT" },
+    };
+    for (cases) |case| {
+        const path = try joinStoragePathAlloc(alloc, case.parts);
+        defer alloc.free(path);
+        try std.testing.expectEqualStrings(case.expected, path);
+    }
+    if (comptime builtin.os.tag == .windows) {
+        const path = try joinStoragePathAlloc(alloc, &.{ "C:\\data\\", "vector-blocks", "CURRENT" });
+        defer alloc.free(path);
+        try std.testing.expectEqualStrings("C:/data/vector-blocks/CURRENT", path);
+    }
+}
+
 fn fsPathDebugEnabled() bool {
     if (builtin.os.tag == .freestanding) return false;
     return platform.env.getenv("ANTFLY_FS_PATH_DEBUG") != null;
@@ -80,7 +108,11 @@ pub fn createFilePortable(io: anytype, path: []const u8, flags: std.Io.Dir.Creat
 /// prove that it will not be produced. Callers must be able to handle artifacts
 /// created for a different deployment target without target-specific catches.
 pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    // Experimental Windows support: Win32 cannot flush a directory handle.
+    // This is a best-effort experimental path. Flushing file contents does
+    // not establish namespace durability; power-loss recovery is unverified.
+    if (builtin.os.tag == .windows) return;
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
     var dir = if (std.fs.path.isAbsolute(path))
@@ -92,7 +124,11 @@ pub fn syncDirPortable(io: anytype, path: []const u8) anyerror!void {
 }
 
 pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    if (builtin.os.tag == .windows) {
+        const file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
+        return file.sync(platform.Io.Threaded.global_single_threaded.io());
+    }
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableFileSyncUnsupported;
     while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
         .SUCCESS => return,
@@ -107,7 +143,9 @@ pub fn syncFileFdPortable(fd: std.posix.fd_t) !void {
 }
 
 pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    // Experimental Windows support: see syncDirPortable.
+    if (builtin.os.tag == .windows) return;
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
     while (true) switch (std.posix.errno(std.posix.system.fsync(fd))) {
         .SUCCESS => return,
@@ -127,7 +165,9 @@ pub fn syncDirectoryFdPortable(fd: std.posix.fd_t) !void {
 /// to `fsync`. Reopening `.` through the held directory keeps resolution bound
 /// to the same directory while obtaining a sync-capable descriptor.
 pub fn syncDirectoryHandlePortable(io: anytype, dir: std.Io.Dir) anyerror!void {
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
+    // Experimental Windows support: see syncDirPortable.
+    if (builtin.os.tag == .windows) return;
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
         return error.DurableDirectorySyncUnsupported;
 
     var sync_dir = try dir.openDir(io, ".", .{
@@ -150,10 +190,12 @@ fn syncDirectoryWithIo(io: anytype, dir: std.Io.Dir) !void {
 }
 
 pub fn syncFilePortable(io: anytype, path: []const u8) !void {
+    // Windows file flushes (NtFlushBuffersFile) require write access.
+    const options: std.Io.Dir.OpenFileOptions = if (builtin.os.tag == .windows) .{ .mode = .read_write } else .{};
     const file = if (std.fs.path.isAbsolute(path))
-        try std.Io.Dir.openFileAbsolute(io, path, .{})
+        try std.Io.Dir.openFileAbsolute(io, path, options)
     else
-        try std.Io.Dir.cwd().openFile(io, path, .{});
+        try std.Io.Dir.cwd().openFile(io, path, options);
     defer file.close(io);
     try file.sync(io);
 }
@@ -258,10 +300,10 @@ fn realPathAlloc(allocator: std.mem.Allocator, io: anytype, path: []const u8) ![
 }
 
 test "syncDirPortable opens a real directory fd" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -271,10 +313,10 @@ test "syncDirPortable opens a real directory fd" {
 }
 
 test "syncDirectoryHandlePortable supports cwd and traversal-only handles" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -290,10 +332,10 @@ test "syncDirectoryHandlePortable supports cwd and traversal-only handles" {
 }
 
 test "createDirPathPortable creates absolute nested directories" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
 
     const cwd_path = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".zig-cache/tmp", std.testing.allocator);
@@ -308,10 +350,10 @@ test "createDirPathPortable creates absolute nested directories" {
 }
 
 test "pathsReferToSameExistingFile resolves aliases" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
 
     const relative = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -327,7 +369,7 @@ test "pathsReferToSameExistingFile resolves aliases" {
 
 fn createDirAbsolutePortable(path: []const u8) !void {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.createDirAbsolute(io_impl.io(), path, .default_dir) catch |err| switch (err) {
             error.PathAlreadyExists => return,

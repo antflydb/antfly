@@ -62,6 +62,12 @@ fn filesystemCapacitySupported(target: std.Build.ResolvedTarget) bool {
 }
 
 fn configureModule(module: *std.Build.Module, options: ModuleOptions) *std.Build.Module {
+    if (options.target.result.os.tag == .windows) {
+        // Independent runtime archives cannot propagate inferred extern-library
+        // dependencies to their final executable. Bind platform imports here.
+        module.linkSystemLibrary("bcrypt", .{});
+        module.linkSystemLibrary("ws2_32", .{});
+    }
     if (options.link_libc) {
         addFilesystemCapacitySource(module, options.filesystem_capacity_source_file, options.target);
     }
@@ -102,7 +108,63 @@ pub fn addTests(b: *std.Build, options: struct {
         .optimize = optimize,
     }) });
     const run_entropy_tests = b.addRunArtifact(entropy_tests);
+    const clock_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/time.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    }) });
+    const run_clocks = b.addRunArtifact(clock_tests);
+    // Always compile the Linux syscall variant, including on macOS hosts.
+    // This catches an accidental libc dependency without a cross-runner.
+    const syscall_clocks = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "src/time.zig"),
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu }),
+        .optimize = optimize,
+        .link_libc = false,
+    }) });
+    const io_platform = createModule(b, .{
+        .root_source_file = options.root.path(b, "src/root.zig"),
+        .filesystem_capacity_source_file = options.root.path(b, "src/filesystem_capacity.c"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    const io_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "tests/io_namespace_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+        .imports = &.{.{ .name = "antfly_platform", .module = io_platform }},
+    }) });
+    const duplicate_platform = createModule(b, .{
+        .root_source_file = options.root.path(b, "src/root.zig"),
+        .filesystem_capacity_source_file = options.root.path(b, "src/filesystem_capacity.c"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    // Exercise equivalent roots represented by a build path and absolute path.
+    const absolute_platform_path = std.Io.Dir.cwd().realPathFileAlloc(
+        b.graph.io,
+        authoredModulePath(io_platform, b.allocator).?,
+        b.allocator,
+    ) catch @panic("cannot resolve platform test source");
+    duplicate_platform.root_source_file = b.graph.cwdRelativePath(absolute_platform_path);
+    const standalone_dependency = b.createModule(.{
+        .root_source_file = options.root.path(b, "tests/platform_dependency_fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "antfly_platform", .module = duplicate_platform }},
+    });
+    io_tests.root_module.addImport("platform_dependency", standalone_dependency);
+    bindPlatform(io_tests.root_module, io_platform);
+    std.debug.assert(standalone_dependency.import_table.get("antfly_platform").? == io_platform);
+    const run_io_tests = b.addRunArtifact(io_tests);
     const run_unit = b.addRunArtifact(unit);
+    run_unit.step.dependOn(&run_io_tests.step);
+    run_unit.step.dependOn(&run_clocks.step);
+    run_unit.step.dependOn(&syscall_clocks.step);
     run_unit.step.dependOn(&run_atomic_tests.step);
     run_unit.step.dependOn(&run_entropy_tests.step);
     const one_shot = b.createModule(.{
@@ -263,4 +325,86 @@ fn visitSdkModule(b: *std.Build, module: *std.Build.Module, steps: *std.AutoHash
         else => {},
     };
     for (module.import_table.values()) |dependency| visitSdkModule(b, dependency, steps, modules);
+}
+
+/// Bind native platform APIs throughout a composed product graph. Borrowed Io
+/// types remain std.Io; only executor construction and native primitives use
+/// this dependency. Host-tool graphs keep their own target and platform.
+pub fn bindPlatform(value: anytype, platform: *std.Build.Module) void {
+    const T = @TypeOf(value);
+    if (T == *std.Build.Module) {
+        bindPlatformModule(value, platform);
+    } else switch (@typeInfo(T)) {
+        .@"struct" => |info| inline for (info.field_names) |name| {
+            bindPlatform(@field(value, name), platform);
+        },
+        .optional => if (value) |present| bindPlatform(present, platform),
+        else => {},
+    }
+}
+
+fn bindPlatformModule(root: *std.Build.Module, platform: *std.Build.Module) void {
+    if (root == platform) return;
+    if (root.resolved_target) |target| {
+        const expected = platform.resolved_target.?.result;
+        if (target.result.os.tag != expected.os.tag or
+            target.result.cpu.arch != expected.cpu.arch or target.result.abi != expected.abi) return;
+    }
+    const arena = root.owner.graph.arena;
+    var seen: std.AutoHashMap(*std.Build.Module, void) = .init(arena);
+    var pending: std.ArrayList(*std.Build.Module) = .empty;
+    pending.append(arena, root) catch @panic("OOM");
+    var index: usize = 0;
+    while (index < pending.items.len) : (index += 1) {
+        const module = pending.items[index];
+        if (module == platform) continue;
+        if (module.resolved_target) |target| {
+            const expected = platform.resolved_target.?.result;
+            if (target.result.os.tag != expected.os.tag or
+                target.result.cpu.arch != expected.cpu.arch or target.result.abi != expected.abi) continue;
+        }
+        const entry = seen.getOrPut(module) catch @panic("OOM");
+        if (entry.found_existing) continue;
+        // Standalone dependencies can configure a second instance of this
+        // same platform source. A composed compilation needs one module identity
+        // for its executor types and TLS. Preserve genuinely different adapters.
+        const existing = module.import_table.get("antfly_platform");
+        if (existing == null or samePlatformSource(existing.?, platform)) {
+            module.addImport("antfly_platform", platform);
+        }
+        module.cached_graph = .{ .modules = &.{}, .names = &.{} };
+        for (module.import_table.values()) |dependency| {
+            if (dependency != platform) pending.append(arena, dependency) catch @panic("OOM");
+        }
+    }
+}
+
+fn samePlatformSource(left: *std.Build.Module, right: *std.Build.Module) bool {
+    if (left == right) return true;
+    const left_target = left.resolved_target orelse return false;
+    const right_target = right.resolved_target orelse return false;
+    if (left_target.result.os.tag != right_target.result.os.tag or
+        left_target.result.cpu.arch != right_target.result.cpu.arch or
+        left_target.result.abi != right_target.result.abi) return false;
+    const arena = right.owner.graph.arena;
+    const left_path = authoredModulePath(left, arena) orelse return false;
+    const right_path = authoredModulePath(right, arena) orelse return false;
+    // Dependency roots can be relative while the composition root is absolute,
+    // or reach the same checkout through a symlink. Compare physical files.
+    right.owner.dependOnFileMetadata(left.root_source_file.?);
+    right.owner.dependOnFileMetadata(right.root_source_file.?);
+    const io = right.owner.graph.io;
+    const left_real = std.Io.Dir.cwd().realPathFileAlloc(io, left_path, arena) catch return false;
+    const right_real = std.Io.Dir.cwd().realPathFileAlloc(io, right_path, arena) catch return false;
+    return std.mem.eql(u8, left_real, right_real);
+}
+
+fn authoredModulePath(module: *std.Build.Module, arena: std.mem.Allocator) ?[]const u8 {
+    return switch (module.root_source_file orelse return null) {
+        .src_path => |source| source.owner.root.joinString(arena, source.sub_path) catch @panic("OOM"),
+        .dependency => |source| source.dependency.builder.root.joinString(arena, source.sub_path) catch @panic("OOM"),
+        .cwd_relative => |source| source,
+        .relative => |source| if (source.base == .cwd) source.sub_path else null,
+        else => null,
+    };
 }

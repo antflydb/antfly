@@ -31,7 +31,9 @@
 //! the Antfly runtime offline until activation succeeds and then open the
 //! returned generation path as its data root.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -188,7 +190,7 @@ pub fn pruneActivatedGenerations(
     if (!validation.isAbsoluteNormalizedPath(request.slot_activation_receipt_path))
         return error.InvalidSeedActivationCheckpointPath;
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     // Kubernetes projected ConfigMap volumes expose keys through a symlink to
@@ -360,7 +362,7 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
     // Raw transport validation is always complete before either raw or live
     // generation roots are created on the target PVC.
     try seed_artifact.verifyStaged(alloc, request.staging_root, request.expected, request.limits);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -572,7 +574,7 @@ fn activateMaterializedWithOptions(alloc: Allocator, request: ActivateRequest, o
 
 fn validatePublishedRawGeneration(alloc: Allocator, raw_root: []const u8, request: ActivateRequest, raw_marker_json: []const u8) !void {
     seed_artifact.verifyStaged(alloc, raw_root, request.expected, request.limits) catch return error.SeedGenerationConflict;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const marker_path = try std.fs.path.join(alloc, &.{ raw_root, generation_receipt_name });
     defer alloc.free(marker_path);
@@ -682,7 +684,7 @@ fn activateWithOptions(alloc: Allocator, request: ActivateRequest, options: Acti
     // content digests, it binds generation, slot, identity and LSN boundary.
     try seed_artifact.verifyStaged(alloc, request.staging_root, request.expected, request.limits);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -953,7 +955,7 @@ fn validateActiveReceipt(
 
 fn validatePublishedGeneration(alloc: Allocator, generation_path: []const u8, request: ActivateRequest, activation_json: []const u8) !void {
     seed_artifact.verifyStaged(alloc, generation_path, request.expected, request.limits) catch return error.SeedGenerationConflict;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const marker_path = try std.fs.path.join(alloc, &.{ generation_path, generation_receipt_name });
     defer alloc.free(marker_path);
@@ -991,7 +993,7 @@ pub fn validateActivatedGeneration(alloc: Allocator, expectation: StartupExpecta
     if (!validation.isIdentifier(expectation.expected.slot_name)) return error.InvalidSlotName;
     try validateBinding(expectation.binding);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const active_path = try std.fs.path.join(alloc, &.{ expectation.target_root, active_receipt_name });
@@ -1265,7 +1267,7 @@ fn prepareTestStagingWithBinding(
     defer alloc.free(source_root);
     const source_path = try std.fs.path.join(alloc, &.{ source_root, "data/catalog.txt" });
     defer alloc.free(source_path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), std.fs.path.dirname(source_path).?);
     {
@@ -1381,7 +1383,7 @@ fn prepareMaterializedTestStaging(
     defer alloc.free(source_snapshot_root);
     const live_db_path = try std.fs.path.join(alloc, &.{ root, "materialized-primary", generation, "table-db" });
     defer alloc.free(live_db_path);
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, source_snapshot_root);
@@ -1556,9 +1558,9 @@ fn expectPathMissing(io: std.Io, path: []const u8) !void {
 
 test "storage.hot_standby seed activation publishes a verified immutable generation idempotently" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const staging_root = try prepareTestStaging(alloc, root, "gen-0001", testIdentity(), "catalog-v1");
     defer alloc.free(staging_root);
@@ -1580,7 +1582,7 @@ test "storage.hot_standby seed activation publishes a verified immutable generat
     try std.testing.expect(!activated.already_active);
     const installed_file = try std.fs.path.join(alloc, &.{ activated.generation_path, "data/catalog.txt" });
     defer alloc.free(installed_file);
-    const installed = try readFileAlloc(std.testing.io, alloc, installed_file, 128);
+    const installed = try readFileAlloc(platform.testing.io, alloc, installed_file, 128);
     defer alloc.free(installed);
     try std.testing.expectEqualStrings("catalog-v1", installed);
 
@@ -1593,9 +1595,9 @@ test "storage.hot_standby seed activation publishes a verified immutable generat
 
 test "storage.hot_standby seed activation rejects checkpoint below durable replay floor before publication" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const target = try std.fs.path.join(alloc, &.{ root, "floor-target" });
     defer alloc.free(target);
@@ -1603,7 +1605,7 @@ test "storage.hot_standby seed activation rejects checkpoint below durable repla
     const prepared = try prepareMaterializedTestStaging(alloc, root, "old-seed", testIdentity(), binding);
     defer alloc.free(prepared.root);
     const identity = testIdentity();
-    try @import("replay_floor.zig").advance(alloc, std.testing.io, target, .{ .cluster_id = identity.cluster_id, .timeline_id = identity.timeline_id, .epoch = identity.epoch, .lsn = 100 });
+    try @import("replay_floor.zig").advance(alloc, platform.testing.io, target, .{ .cluster_id = identity.cluster_id, .timeline_id = identity.timeline_id, .epoch = identity.epoch, .lsn = 100 });
     try std.testing.expectError(error.SeedBelowHAReplayFloor, activate(alloc, .{
         .staging_root = prepared.root,
         .target_root = target,
@@ -1613,17 +1615,17 @@ test "storage.hot_standby seed activation rejects checkpoint below durable repla
     }));
     const active = try std.fs.path.join(alloc, &.{ target, active_receipt_name });
     defer alloc.free(active);
-    try expectPathMissing(std.testing.io, active);
+    try expectPathMissing(platform.testing.io, active);
     const generations = try std.fs.path.join(alloc, &.{ target, generations_dir_name });
     defer alloc.free(generations);
-    try expectPathMissing(std.testing.io, generations);
+    try expectPathMissing(platform.testing.io, generations);
 }
 
 test "storage.hot_standby seed activation gc requires the durable seeded-slot activation checkpoint" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const binding = ActivationBinding{
         .topology_id = "topology-a",
@@ -1661,7 +1663,7 @@ test "storage.hot_standby seed activation gc requires the durable seeded-slot ac
     }));
     const marker_path = try std.fs.path.join(alloc, &.{ activated.generation_path, local_generation_gc.marker_name });
     defer alloc.free(marker_path);
-    try expectPathMissing(std.testing.io, marker_path);
+    try expectPathMissing(platform.testing.io, marker_path);
 
     const checkpoint_json = try std.json.Stringify.valueAlloc(alloc, .{
         .schema_version = @as(i64, 1),
@@ -1684,12 +1686,12 @@ test "storage.hot_standby seed activation gc requires the durable seeded-slot ac
     }, .{});
     defer alloc.free(checkpoint_json);
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, checkpoint_path, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, checkpoint_json);
-        try file.sync(std.testing.io);
+        var file = try std.Io.Dir.cwd().createFile(platform.testing.io, checkpoint_path, .{ .truncate = true });
+        defer file.close(platform.testing.io);
+        try file.writeStreamingAll(platform.testing.io, checkpoint_json);
+        try file.sync(platform.testing.io);
     }
-    try fs_paths.syncDirPortable(std.testing.io, root);
+    try fs_paths.syncDirPortable(platform.testing.io, root);
 
     var pruned = try pruneActivatedGenerations(alloc, .{
         .target_root = target_root,
@@ -1698,22 +1700,22 @@ test "storage.hot_standby seed activation gc requires the durable seeded-slot ac
     });
     defer pruned.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), pruned.deleted_generations);
-    try std.Io.Dir.cwd().access(std.testing.io, marker_path, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, marker_path, .{});
 
     // Match Kubernetes' projected ConfigMap layout: the mounted key points at
     // ..data, which points at one immutable generation directory.
     if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
         const projected_dir = try std.fs.path.join(alloc, &.{ root, "..2026_01" });
         defer alloc.free(projected_dir);
-        try fs_paths.createDirPathPortable(std.testing.io, projected_dir);
+        try fs_paths.createDirPathPortable(platform.testing.io, projected_dir);
         const projected_checkpoint_path = try std.fs.path.join(alloc, &.{ projected_dir, "seeded-slot-activation.json" });
         defer alloc.free(projected_checkpoint_path);
-        try std.Io.Dir.rename(std.Io.Dir.cwd(), checkpoint_path, std.Io.Dir.cwd(), projected_checkpoint_path, std.testing.io);
+        try std.Io.Dir.rename(std.Io.Dir.cwd(), checkpoint_path, std.Io.Dir.cwd(), projected_checkpoint_path, platform.testing.io);
         const data_link = try std.fs.path.join(alloc, &.{ root, "..data" });
         defer alloc.free(data_link);
-        try std.Io.Dir.cwd().symLink(std.testing.io, "..2026_01", data_link, .{ .is_directory = true });
-        try std.Io.Dir.cwd().symLink(std.testing.io, "..data/seeded-slot-activation.json", checkpoint_path, .{});
-        const projected_stat = try std.Io.Dir.cwd().statFile(std.testing.io, checkpoint_path, .{ .follow_symlinks = false });
+        try std.Io.Dir.cwd().symLink(platform.testing.io, "..2026_01", data_link, .{ .is_directory = true });
+        try std.Io.Dir.cwd().symLink(platform.testing.io, "..data/seeded-slot-activation.json", checkpoint_path, .{});
+        const projected_stat = try std.Io.Dir.cwd().statFile(platform.testing.io, checkpoint_path, .{ .follow_symlinks = false });
         try std.testing.expectEqual(std.Io.File.Kind.sym_link, projected_stat.kind);
 
         var projected_pruned = try pruneActivatedGenerations(alloc, .{
@@ -1728,9 +1730,9 @@ test "storage.hot_standby seed activation gc requires the durable seeded-slot ac
 
 test "storage.hot_standby materialized activation gc deletes raw and live generations as one lifecycle pair" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const binding = ActivationBinding{
         .topology_id = "topology-a",
@@ -1784,18 +1786,18 @@ test "storage.hot_standby materialized activation gc deletes raw and live genera
     }, .{});
     defer alloc.free(checkpoint_json);
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, checkpoint_path, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, checkpoint_json);
-        try file.sync(std.testing.io);
+        var file = try std.Io.Dir.cwd().createFile(platform.testing.io, checkpoint_path, .{ .truncate = true });
+        defer file.close(platform.testing.io);
+        try file.writeStreamingAll(platform.testing.io, checkpoint_json);
+        try file.sync(platform.testing.io);
     }
 
     const old_raw = try std.fs.path.join(alloc, &.{ target_root, generations_dir_name, "gen-a-old" });
     defer alloc.free(old_raw);
     const old_live = try std.fs.path.join(alloc, &.{ target_root, live_generations_dir_name, "gen-a-old" });
     defer alloc.free(old_live);
-    try fs_paths.createDirPathPortable(std.testing.io, old_raw);
-    try fs_paths.createDirPathPortable(std.testing.io, old_live);
+    try fs_paths.createDirPathPortable(platform.testing.io, old_raw);
+    try fs_paths.createDirPathPortable(platform.testing.io, old_live);
     const old_raw_file = try std.fs.path.join(alloc, &.{ old_raw, "raw" });
     defer alloc.free(old_raw_file);
     const old_live_file = try std.fs.path.join(alloc, &.{ old_live, "live" });
@@ -1804,10 +1806,10 @@ test "storage.hot_standby materialized activation gc deletes raw and live genera
         .{ .path = old_raw_file, .body = "immutable-transport" },
         .{ .path = old_live_file, .body = "mutable-runtime" },
     }) |entry| {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, entry.path, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, entry.body);
-        try file.sync(std.testing.io);
+        var file = try std.Io.Dir.cwd().createFile(platform.testing.io, entry.path, .{ .truncate = true });
+        defer file.close(platform.testing.io);
+        try file.writeStreamingAll(platform.testing.io, entry.body);
+        try file.sync(platform.testing.io);
     }
     try local_generation_gc.markEligible(alloc, .{
         .root = target_root,
@@ -1825,21 +1827,21 @@ test "storage.hot_standby materialized activation gc deletes raw and live genera
     });
     defer pruned.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), pruned.deleted_generations);
-    try expectPathMissing(std.testing.io, old_raw);
-    try expectPathMissing(std.testing.io, old_live);
+    try expectPathMissing(platform.testing.io, old_raw);
+    try expectPathMissing(platform.testing.io, old_live);
     const current_raw = try std.fs.path.join(alloc, &.{ target_root, generations_dir_name, "gen-z-current" });
     defer alloc.free(current_raw);
     const current_live = try std.fs.path.join(alloc, &.{ target_root, live_generations_dir_name, "gen-z-current" });
     defer alloc.free(current_live);
-    try std.Io.Dir.cwd().access(std.testing.io, current_raw, .{});
-    try std.Io.Dir.cwd().access(std.testing.io, current_live, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, current_raw, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, current_live, .{});
 }
 
 test "storage.hot_standby seed activation binds startup evidence and revalidates installed bytes on restart" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const binding = ActivationBinding{
         .topology_id = "topology-a",
@@ -1870,7 +1872,7 @@ test "storage.hot_standby seed activation binds startup evidence and revalidates
         .binding = binding,
         .pod_uid = "pod-activation-wrong-capture",
     }));
-    try expectPathMissing(std.testing.io, target_root);
+    try expectPathMissing(platform.testing.io, target_root);
 
     var activated = try activate(alloc, .{
         .staging_root = prepared.root,
@@ -1933,18 +1935,18 @@ test "storage.hot_standby seed activation binds startup evidence and revalidates
     const installed_file = try std.fs.path.join(alloc, &.{ activated.generation_path, "data/catalog.txt" });
     defer alloc.free(installed_file);
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, installed_file, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "tampered");
+        var file = try std.Io.Dir.cwd().createFile(platform.testing.io, installed_file, .{ .truncate = true });
+        defer file.close(platform.testing.io);
+        try file.writeStreamingAll(platform.testing.io, "tampered");
     }
     try std.testing.expectError(error.SeedGenerationConflict, validateActivatedGeneration(alloc, expectation));
 }
 
 test "storage.hot_standby bound activation keeps immutable transport separate from mutable live runtime" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const binding = ActivationBinding{
         .topology_id = "topology-a",
@@ -1990,7 +1992,7 @@ test "storage.hot_standby bound activation keeps immutable transport separate fr
 
     const logical_catalog_path = try std.fs.path.join(alloc, &.{ activated.generation_path, "metadata/local-metadata.json" });
     defer alloc.free(logical_catalog_path);
-    const logical_json = try readFileAlloc(std.testing.io, alloc, logical_catalog_path, 64 * 1024);
+    const logical_json = try readFileAlloc(platform.testing.io, alloc, logical_catalog_path, 64 * 1024);
     defer alloc.free(logical_json);
     var logical = try std.json.parseFromSlice(seed_materialization.LogicalCatalog, alloc, logical_json, .{});
     defer logical.deinit();
@@ -2005,7 +2007,7 @@ test "storage.hot_standby bound activation keeps immutable transport separate fr
     defer alloc.free(raw_catalog_path);
     // The checksummed catalog envelope can exceed the legacy 1 KiB fixture
     // bound even for this single materialized generation.
-    const raw_before = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 64 * 1024);
+    const raw_before = try readFileAlloc(platform.testing.io, alloc, raw_catalog_path, 64 * 1024);
     defer alloc.free(raw_before);
     try std.testing.expect(std.mem.indexOf(u8, raw_before, "\"generation\":\"gen-materialized\"") != null);
 
@@ -2028,16 +2030,16 @@ test "storage.hot_standby bound activation keeps immutable transport separate fr
         .expected = expected,
         .binding = binding,
     }));
-    const raw_after = try readFileAlloc(std.testing.io, alloc, raw_catalog_path, 64 * 1024);
+    const raw_after = try readFileAlloc(platform.testing.io, alloc, raw_catalog_path, 64 * 1024);
     defer alloc.free(raw_after);
     try std.testing.expectEqualSlices(u8, raw_before, raw_after);
 }
 
 test "storage.hot_standby materialized activation recovers every raw live and ACTIVE publication crash" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const binding = ActivationBinding{
         .topology_id = "topology-a",
@@ -2088,9 +2090,9 @@ test "storage.hot_standby materialized activation recovers every raw live and AC
         const active_path = try std.fs.path.join(alloc, &.{ target_root, active_receipt_name });
         defer alloc.free(active_path);
         if (boundary == .active_published) {
-            try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
+            try std.Io.Dir.cwd().access(platform.testing.io, active_path, .{});
         } else {
-            try expectPathMissing(std.testing.io, active_path);
+            try expectPathMissing(platform.testing.io, active_path);
         }
 
         var recovered = try activate(alloc, request);
@@ -2108,9 +2110,9 @@ test "storage.hot_standby materialized activation recovers every raw live and AC
 
 test "storage.hot_standby seed activation rejects unrelated nonempty targets without mutation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const staging_root = try prepareTestStaging(alloc, root, "gen-safe", testIdentity(), "seed-data");
     defer alloc.free(staging_root);
@@ -2118,11 +2120,11 @@ test "storage.hot_standby seed activation rejects unrelated nonempty targets wit
     defer alloc.free(target_root);
     const unrelated = try std.fs.path.join(alloc, &.{ target_root, "primary.db" });
     defer alloc.free(unrelated);
-    try fs_paths.createDirPathPortable(std.testing.io, target_root);
+    try fs_paths.createDirPathPortable(platform.testing.io, target_root);
     {
-        var file = try std.Io.Dir.cwd().createFile(std.testing.io, unrelated, .{ .truncate = true });
-        defer file.close(std.testing.io);
-        try file.writeStreamingAll(std.testing.io, "do-not-overwrite");
+        var file = try std.Io.Dir.cwd().createFile(platform.testing.io, unrelated, .{ .truncate = true });
+        defer file.close(platform.testing.io);
+        try file.writeStreamingAll(platform.testing.io, "do-not-overwrite");
     }
 
     try std.testing.expectError(error.UnsafeActivationTarget, activate(alloc, .{
@@ -2134,16 +2136,16 @@ test "storage.hot_standby seed activation rejects unrelated nonempty targets wit
             .identity = testIdentity(),
         },
     }));
-    const preserved = try readFileAlloc(std.testing.io, alloc, unrelated, 128);
+    const preserved = try readFileAlloc(platform.testing.io, alloc, unrelated, 128);
     defer alloc.free(preserved);
     try std.testing.expectEqualStrings("do-not-overwrite", preserved);
 }
 
 test "storage.hot_standby seed activation rejects cross-identity and conflicting generations" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const staging_a = try prepareTestStaging(alloc, root, "gen-a", testIdentity(), "generation-a");
     defer alloc.free(staging_a);
@@ -2161,7 +2163,7 @@ test "storage.hot_standby seed activation rejects cross-identity and conflicting
             .identity = wrong_identity,
         },
     }));
-    try expectPathMissing(std.testing.io, target_root);
+    try expectPathMissing(platform.testing.io, target_root);
 
     var first = try activate(alloc, .{
         .staging_root = staging_a,
@@ -2189,9 +2191,9 @@ test "storage.hot_standby seed activation rejects cross-identity and conflicting
 
 test "storage.hot_standby materialized activation advances the same target authority monotonically" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const target_root = try std.fs.path.join(alloc, &.{ root, "target-handoff" });
     defer alloc.free(target_root);
@@ -2261,9 +2263,9 @@ test "storage.hot_standby materialized activation advances the same target autho
 
 test "storage.hot_standby seed activation recovers each publication crash boundary" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const staging_root = try prepareTestStaging(alloc, root, "gen-crash", testIdentity(), "crash-safe");
     defer alloc.free(staging_root);
@@ -2291,9 +2293,9 @@ test "storage.hot_standby seed activation recovers each publication crash bounda
         const active_path = try std.fs.path.join(alloc, &.{ target_root, active_receipt_name });
         defer alloc.free(active_path);
         if (boundary == .active_published) {
-            try std.Io.Dir.cwd().access(std.testing.io, active_path, .{});
+            try std.Io.Dir.cwd().access(platform.testing.io, active_path, .{});
         } else {
-            try expectPathMissing(std.testing.io, active_path);
+            try expectPathMissing(platform.testing.io, active_path);
         }
 
         var recovered = try activate(alloc, request);

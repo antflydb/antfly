@@ -1,8 +1,8 @@
 # Zig 0.17 Evented qualification
 
-`antfly_platform.Evented` selects the local io_uring compatibility backend on
+`platform.Io.Evented` selects the local io_uring compatibility backend on
 Linux and the local Dispatch compatibility backend on macOS. Production storage
-and network defaults remain `std.Io.Threaded`. LMDB's existing
+and network defaults remain `platform.Io.Threaded`. LMDB's existing
 `-Dlmdb_evented_async_io=true` option selects Dispatch on macOS; Linux LMDB still
 uses Threaded. The optional enrichment executor supports both tested platforms.
 

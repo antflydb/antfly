@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const testing = @import("testing.zig");
@@ -213,7 +214,7 @@ pub const InMemoryTaskStore = struct {
     pub fn init(alloc: std.mem.Allocator) InMemoryTaskStore {
         return .{
             .alloc = alloc,
-            .io = std.Io.Threaded.global_single_threaded.io(),
+            .io = platform.Io.Threaded.global_single_threaded.io(),
         };
     }
 
@@ -223,7 +224,7 @@ pub const InMemoryTaskStore = struct {
 
     pub fn deinit(self: *InMemoryTaskStore, fallback_alloc: std.mem.Allocator) void {
         const alloc = self.alloc orelse fallback_alloc;
-        const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
+        const io = self.io orelse platform.Io.Threaded.global_single_threaded.io();
         self.mutex.lockUncancelable(io);
         var it = self.authorities.iterator();
         while (it.next()) |entry| {
@@ -378,7 +379,7 @@ pub const InMemoryTaskStore = struct {
     fn release(ptr: *anyopaque, authority: []const u8, task_id: []const u8, expected_generation: u64) void {
         const self: *InMemoryTaskStore = @ptrCast(@alignCast(ptr));
         const store_alloc = self.alloc orelse return;
-        const io = self.io orelse std.Io.Threaded.global_single_threaded.io();
+        const io = self.io orelse platform.Io.Threaded.global_single_threaded.io();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const state = self.authorities.getPtr(authority) orelse return;
@@ -1102,7 +1103,7 @@ test "a2a dispatches message by metadata skill" {
 
     var ctx: u8 = 0;
     var dispatcher = Dispatcher{
-        .io = std.Io.Threaded.global_single_threaded.io(),
+        .io = platform.Io.Threaded.global_single_threaded.io(),
         .base_url = "http://127.0.0.1/a2a",
     };
     defer dispatcher.deinit(alloc);
@@ -1160,7 +1161,7 @@ test "a2a message stream emits queue events through sink" {
 
     var ctx: u8 = 0;
     var dispatcher = Dispatcher{
-        .io = std.Io.Threaded.global_single_threaded.io(),
+        .io = platform.Io.Threaded.global_single_threaded.io(),
         .task_store = store.iface(),
     };
     defer dispatcher.deinit(alloc);
@@ -1203,7 +1204,7 @@ test "a2a agent card lists skills" {
 
     var ctx: u8 = 0;
     var dispatcher = Dispatcher{
-        .io = std.Io.Threaded.global_single_threaded.io(),
+        .io = platform.Io.Threaded.global_single_threaded.io(),
         .base_url = "http://example/a2a",
     };
     defer dispatcher.deinit(alloc);
@@ -1250,7 +1251,7 @@ test "a2a maps malformed requests, unknown skills, and missing tasks to JSON-RPC
     defer store.deinit(alloc);
     var ctx: u8 = 0;
     var dispatcher = Dispatcher{
-        .io = std.Io.Threaded.global_single_threaded.io(),
+        .io = platform.Io.Threaded.global_single_threaded.io(),
         .task_store = store.iface(),
     };
     defer dispatcher.deinit(alloc);
@@ -1310,7 +1311,7 @@ test "a2a task store supports get and cancel" {
 
     var ctx: u8 = 0;
     var dispatcher = Dispatcher{
-        .io = std.Io.Threaded.global_single_threaded.io(),
+        .io = platform.Io.Threaded.global_single_threaded.io(),
         .base_url = "http://127.0.0.1/a2a",
         .task_store = store.iface(),
     };
@@ -1359,7 +1360,7 @@ test "a2a generates unique task and context identities when omitted" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{});
     defer store.deinit(alloc);
@@ -1419,7 +1420,7 @@ test "a2a task store bounds memory and reclaims expired tasks" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{
         .max_tasks = 1,
@@ -1465,7 +1466,7 @@ test "a2a task store reclaims expired tasks under byte pressure" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{
         .max_tasks = 8,
@@ -1494,7 +1495,7 @@ test "a2a task store reclaims expired tasks under byte pressure" {
 
 test "a2a task store scopes identities and reservations to authority" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{});
     defer store.deinit(alloc);
@@ -1533,7 +1534,7 @@ test "a2a task store reuses expired ids and preserves per-authority capacity" {
             return now_ns.load(.acquire);
         }
     };
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{
         .max_tasks = 8,
@@ -1577,7 +1578,7 @@ test "a2a task store reuses expired ids and preserves per-authority capacity" {
 
 test "a2a task store rejects oversized records and identifiers" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var store = InMemoryTaskStore.initWithOptions(alloc, io_impl.io(), .{
         .max_task_id_bytes = 8,

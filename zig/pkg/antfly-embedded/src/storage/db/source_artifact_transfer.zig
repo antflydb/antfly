@@ -353,7 +353,7 @@ pub fn finish(db: *DB, descriptor: Descriptor, cancellation: Cancellation) !Stat
     var receipt: [body_size + 32]u8 = undefined;
     receipt[0..certificate_size].* = try descriptor.certificate.encode();
     receipt[certificate_size..][0..32].* = descriptor.scope.pin();
-    std.mem.writeInt(u64, receipt[certificate_size + 32 ..][0..8], stat.inode, .little);
+    std.mem.writeInt(u64, receipt[certificate_size + 32 ..][0..8], @bitCast(stat.inode), .little);
     std.mem.writeInt(u64, receipt[certificate_size + 40 ..][0..8], stat.size, .little);
     std.mem.writeInt(i128, receipt[certificate_size + 48 ..][0..16], stat.mtime.toNanoseconds(), .little);
     receipt[body_size..].* = checksum(receipt[0..body_size]);

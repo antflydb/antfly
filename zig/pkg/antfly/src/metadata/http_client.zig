@@ -13,12 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const snapshot_transfer = @import("snapshot_transfer.zig");
 const store_report_update = @import("store_report_update.zig");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const ant_json = @import("antfly-json");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const tables_api = @import("../api/tables.zig");
 const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const internal_service_auth = @import("../api/internal_service_auth.zig");
@@ -1140,7 +1142,7 @@ pub const MetadataHttpClient = struct {
         // Publication status is a principal-independent stamp. The internal
         // service credential authenticates this read; it must not require the
         // separate setting administrator/read grant used for policy contents.
-        const grant = if (input.requiresAdministrativeGrant() or input.requiresSettingAuthorityReadGrant()) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, if (input.requiresAdministrativeGrant()) .admin else .read, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        const grant = if (input.requiresAdministrativeGrant() or input.requiresSettingAuthorityReadGrant()) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, if (input.requiresAdministrativeGrant()) .admin else .read, body, @intCast(@divFloor(platform.time.realtimeNs(), std.time.ns_per_s))) else null;
         defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{remaining_ms}) },
@@ -1203,7 +1205,7 @@ pub const MetadataHttpClient = struct {
         var remaining_buf: [10]u8 = undefined;
         var forwards_buf: [3]u8 = undefined;
         const authority = @import("../system_catalog/setting_authority.zig");
-        const grant = if (setting_admin) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s))) else null;
+        const grant = if (setting_admin) try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, body, @intCast(@divFloor(platform.time.realtimeNs(), std.time.ns_per_s))) else null;
         defer if (grant) |value| self.alloc.free(value);
         const headers = [_]http_common.RequestHeader{
             .{ .name = routes.Routes.raft_mutation_remaining_ms_header, .value = try std.fmt.bufPrint(&remaining_buf, "{d}", .{forwarding.remaining_ms}) },
@@ -4259,7 +4261,7 @@ fn consumerTests() type {
 
             var source = FakeSource{};
             var server = metadata_http_server.MetadataHttpServer.init(std.heap.page_allocator, .{}, source.iface());
-            var server_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var server_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer server_io.deinit();
             var listener = httpx.Server.initWithConfig(std.heap.page_allocator, server_io.io(), .{
                 .host = "127.0.0.1",
@@ -4268,14 +4270,14 @@ fn consumerTests() type {
             defer listener.deinit();
             try server.registerRoutes(&listener);
             try listener.bind();
-            var listener_thread = try std.testing.io.concurrent(struct {
+            var listener_thread = try platform.testing.io.concurrent(struct {
                 fn listen(http_server: *httpx.Server) void {
                     http_server.listen() catch |err| std.debug.panic("metadata httpx test listener failed: {s}", .{@errorName(err)});
                 }
             }.listen, .{&listener});
             defer {
                 listener.stop();
-                listener_thread.await(std.testing.io);
+                listener_thread.await(platform.testing.io);
             }
 
             const address = listener.boundAddress() orelse return error.AddressNotAvailable;
@@ -4497,7 +4499,7 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
     const Executor = struct {
         fn execute(_: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
-            try authority.verify("enrollment-admin-secret", "enrollment-admin-issuer", .admin, request.body, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
+            try authority.verify("enrollment-admin-secret", "enrollment-admin-issuer", .admin, request.body, @intCast(@divFloor(platform.time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name) orelse return error.TestUnexpectedResult);
             return .{ .status = 409, .body = try a.dupe(u8, "StoreRootEnrollmentChanged") };
         }
     };

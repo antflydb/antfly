@@ -13,8 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const builtin = @import("builtin");
 const std = @import("std");
+
 const antjson = @import("antfly-json");
 
 const Allocator = std.mem.Allocator;
@@ -42,12 +44,12 @@ const ParseMode = enum {
 };
 
 fn nowNs() u64 {
-    const clock_id: std.posix.clockid_t = switch (builtin.os.tag) {
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => std.posix.CLOCK.UPTIME_RAW,
-        else => std.posix.CLOCK.MONOTONIC,
+    const clock_id: platform.c.clockid_t = switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => platform.c.CLOCK.UPTIME_RAW,
+        else => platform.c.CLOCK.MONOTONIC,
     };
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(clock_id, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(clock_id, &ts))) {
         .SUCCESS => return @intCast(@as(u128, @intCast(ts.sec)) * std.time.ns_per_s + @as(u128, @intCast(ts.nsec))),
         else => return 0,
     }

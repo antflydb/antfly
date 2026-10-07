@@ -2685,7 +2685,7 @@ test "GLiNER mixed GGUF encoder matrices retain Metal mirrors" {
 }
 
 test "GLiNER Decide Q8 bundle can use quantized encoder path" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_Q8_BUNDLE_DIR") orelse return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const path = try std.fs.path.join(allocator, &.{ directory, "gliner2-encoder.Q8_0.gguf" });
     defer allocator.free(path);
@@ -6078,10 +6078,10 @@ test "DeBERTa fast-path admission covers direct classifiers and reranker mirrors
 
 test "detectArchitecture recognizes generic deberta classifier configs" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"model_type":"deberta-v3","hidden_size":768,"num_hidden_layers":12,"num_attention_heads":12,"intermediate_size":3072,"num_labels":3}
@@ -6106,8 +6106,8 @@ test "detectArchitecture recognizes generic deberta classifier configs" {
 
 test "legacy GLiNER architecture reads local encoder sidecar and preserves label overrides" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\",\"encoder_name\":\"ignored/remote-model\"}" });
     try tmp.dir.createDir(io, "encoder_config", .default_dir);
@@ -6141,8 +6141,8 @@ test "legacy GLiNER architecture reads local encoder sidecar and preserves label
 
 test "legacy GLiNER absent encoder sidecar keeps defaults while malformed present config rejects" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
     const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -6164,8 +6164,8 @@ test "legacy GLiNER absent encoder sidecar keeps defaults while malformed presen
 
 test "legacy GLiNER encoder sidecar bounds regular input and recovers after allocation failure" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(io, "encoder_config", .default_dir);
     const model_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -6188,15 +6188,15 @@ test "legacy GLiNER encoder sidecar bounds regular input and recovers after allo
             try std.testing.expect(cfg.use_exact_gelu);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
+    try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
     try Check.run(allocator, model_dir);
 }
 
 test "legacy GLiNER encoder sidecar obeys managed inventory and root containment" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const managed_receipt = @import("../registry/managed_receipt.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "model/encoder_config");
     try tmp.dir.writeFile(io, .{ .sub_path = "outside.json", .data = "{\"hidden_act\":\"gelu\"}" });
@@ -6227,10 +6227,10 @@ test "legacy GLiNER encoder sidecar obeys managed inventory and root containment
 
 test "detectArchitecture preserves exact GELU for BGE-M3 XLM-R config" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"model_type":"xlm-roberta","vocab_size":250002,"hidden_size":1024,"num_hidden_layers":24,"num_attention_heads":16,"intermediate_size":4096,"max_position_embeddings":8194,"type_vocab_size":1,"pad_token_id":1,"layer_norm_eps":1e-5,"hidden_act":"gelu"}
@@ -6254,10 +6254,10 @@ test "detectArchitecture preserves exact GELU for BGE-M3 XLM-R config" {
 
 test "detectArchitecture and weight normalization recognize HuggingFace ModernBERT embeddings" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"architectures":["ModernBertModel"],"model_type":"modernbert","hidden_size":768,"num_hidden_layers":22,"num_attention_heads":12,"intermediate_size":1152,"vocab_size":50368,"max_position_embeddings":8192,"local_attention":128,"global_attn_every_n_layers":3}
@@ -6291,10 +6291,10 @@ test "detectArchitecture and weight normalization recognize HuggingFace ModernBE
 
 test "detectArchitecture recognizes Nomic Embed Text NomicBERT config" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"architectures":["NomicBertModel"],"model_type":"nomic_bert","n_embd":768,"n_layer":12,"n_head":12,"n_inner":3072,"n_positions":8192,"vocab_size":30528,"type_vocab_size":2,"layer_norm_eps":1e-12,"rotary_emb_base":1000}
@@ -6318,16 +6318,16 @@ test "detectArchitecture recognizes Nomic Embed Text NomicBERT config" {
 
 test "detectArchitecture treats split gliner bundle encoder config as gliner" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data =
         \\{"model_type":"deberta-v2","hidden_size":768,"num_hidden_layers":12,"num_attention_heads":12,"intermediate_size":3072,"vocab_size":128011,"position_buckets":256}
         ,
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "added_tokens.json",
         .data = "{\"[C]\":51,\"[E]\":52,\"[R]\":53}",
     });
@@ -6371,9 +6371,9 @@ test "detectArchitectureFromGguf recognizes deberta metadata" {
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &tensors);
     defer layout.deinit(allocator);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model.gguf", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -6405,9 +6405,9 @@ test "detectArchitectureFromGguf recognizes bert metadata" {
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model.gguf", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -6445,9 +6445,9 @@ test "detectArchitectureFromGguf recognizes t5 metadata" {
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model.gguf", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -6487,9 +6487,9 @@ test "detectArchitectureFromGguf recognizes whisper metadata" {
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model.gguf", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -6535,9 +6535,9 @@ test "detectArchitectureFromGguf recognizes layoutlmv3 metadata" {
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
     const gguf_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model.gguf", .{tmp.sub_path});
     defer allocator.free(gguf_path);
 
@@ -6576,9 +6576,9 @@ test "detectArchitectureFromGguf recognizes clip metadata" {
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model.gguf", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -6634,9 +6634,9 @@ test "detectArchitectureFromGguf recognizes clap metadata" {
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model.gguf", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -6698,9 +6698,9 @@ test "detectArchitectureFromGguf recognizes florence metadata" {
     var layout = try gguf_mod.writer.buildLayout(allocator, &metadata, &.{});
     defer layout.deinit(allocator);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.gguf", .data = layout.header_bytes });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model.gguf", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -6972,7 +6972,7 @@ test "attachIo reaches native compute backend" {
         .vtable = &arch_vtable,
     };
 
-    attachIo(session, std.testing.io);
+    attachIo(session, platform.testing.io);
     var cb = try makeComputeBackend(&arch_session, allocator, null);
     defer cb.deinit();
     try std.testing.expect(cb.getIo() != null);
@@ -8303,7 +8303,7 @@ test "gliner boundary persistent Metal owner observation rejects foreign cold an
     try std.testing.expectError(error.NotArchSession, TestGlinerBoundaryMetalOwner.snapshot(.{
         .ptr = &unrelated,
         .vtable = &other_vtable,
-    }, std.testing.io));
+    }, platform.testing.io));
     var self = ArchSession{
         .allocator = std.testing.allocator,
         // Only the discriminator is observed; this is not a loaded model.
@@ -8316,7 +8316,7 @@ test "gliner boundary persistent Metal owner observation rejects foreign cold an
         } },
     };
     const session = Session{ .ptr = &self, .vtable = &arch_vtable };
-    try std.testing.expectError(error.NotMetalSession, TestGlinerBoundaryMetalOwner.snapshot(session, std.testing.io));
+    try std.testing.expectError(error.NotMetalSession, TestGlinerBoundaryMetalOwner.snapshot(session, platform.testing.io));
     self.arch_config = .{ .gpt = .{
         .hidden_size = 4,
         .num_hidden_layers = 1,
@@ -8324,17 +8324,17 @@ test "gliner boundary persistent Metal owner observation rejects foreign cold an
         .intermediate_size = 8,
         .vocab_size = 16,
     } };
-    try std.testing.expectError(error.NotGlinerBoundarySession, TestGlinerBoundaryMetalOwner.snapshot(session, std.testing.io));
+    try std.testing.expectError(error.NotGlinerBoundarySession, TestGlinerBoundaryMetalOwner.snapshot(session, platform.testing.io));
     if (comptime build_options.enable_metal) {
         self.arch_config = .{ .gliner_boundary = std.mem.zeroes(gliner_boundary_model.Config) };
         self.backend_type = .metal;
         self.backend_data = .{ .metal = .{ .allocator = std.testing.allocator, .prefix = "", .lazy_weights = .empty } };
         const data = gpuBackendData(&self);
-        try std.testing.expectError(error.MissingMetalNativeProvider, TestGlinerBoundaryMetalOwner.snapshot(session, std.testing.io));
+        try std.testing.expectError(error.MissingMetalNativeProvider, TestGlinerBoundaryMetalOwner.snapshot(session, platform.testing.io));
         try std.testing.expect(data.shared_metal_native_provider == null);
         try std.testing.expect(data.shared_metal_native_provider_lock.tryLock());
-        defer data.shared_metal_native_provider_lock.unlock(std.testing.io);
-        try std.testing.expectError(error.QueueFull, TestGlinerBoundaryMetalOwner.snapshot(session, std.testing.io));
+        defer data.shared_metal_native_provider_lock.unlock(platform.testing.io);
+        try std.testing.expectError(error.QueueFull, TestGlinerBoundaryMetalOwner.snapshot(session, platform.testing.io));
         try std.testing.expect(data.shared_metal_native_provider == null);
     }
 }

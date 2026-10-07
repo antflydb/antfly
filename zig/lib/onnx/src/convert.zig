@@ -20,7 +20,9 @@
 // and memoizing results to avoid duplicate work. The recursive walk
 // naturally produces topological order (dependencies before dependents).
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const log = std.log.scoped(.onnx_convert);
 const ml = @import("ml");
 const proto = @import("onnx_data").proto;
@@ -919,12 +921,12 @@ test "Model.loadInitializerData loads external small constants" {
     const file_name = "termite_onnx_model_ext.bin";
     const full_path = "/tmp/termite_onnx_model_ext.bin";
     {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = full_path, .data = raw });
     }
     defer {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteFile(io_impl.io(), full_path) catch {};
     }
@@ -970,12 +972,12 @@ test "Model.convertToGraph inlines external small constants when base_dir is set
     const file_name = "termite_onnx_convert_ext.bin";
     const full_path = "/tmp/termite_onnx_convert_ext.bin";
     {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = full_path, .data = bias_raw });
     }
     defer {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteFile(io_impl.io(), full_path) catch {};
     }
@@ -1681,7 +1683,7 @@ test "Model.initFromLazy: lazy parsing skips untouched initializers" {
 // ── Integration tests with real ONNX models ─────────────────────────
 
 fn readModelFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, allocator, .limited(1024 * 1024 * 1024)) catch |e| switch (e) {
         error.FileNotFound => return error.SkipZigTest,

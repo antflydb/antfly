@@ -15,7 +15,9 @@
 
 //! Repeatable native microbenchmarks. Fixtures live outside measured budgets;
 //! both paths produce and validate the same outputs. No timing assertions.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
 const operators = @import("operators.zig");
@@ -54,7 +56,7 @@ const CountingAllocator = struct {
     }
 };
 fn now() i96 {
-    return std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    return std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
 }
 fn expression(vector: bool, program: *const scalar.Program, rows: []const []const Datum, count: usize) !struct { ns: i96, peak: usize, checksum: f64 } {
     var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
@@ -96,7 +98,7 @@ fn windows(overlay: bool, count: usize) !struct { ns: i96, bytes: u64 } {
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var rows = try disk.Rows.init(a, &manager, 3);
     defer rows.deinit();
@@ -124,7 +126,7 @@ fn sorting(buffer_bytes: usize, count: usize) !struct { ns: i96, first_ns: i96, 
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .buffer_bytes = buffer_bytes };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .buffer_bytes = buffer_bytes };
     defer manager.deinit();
     var sort = spill.Sort.init(a, &manager, &.{.{}}, 32768);
     defer sort.deinit();
@@ -153,7 +155,7 @@ fn joining(partitioned: bool, count: usize) !struct { ns: i96, first_ns: i96, pe
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const bytes = 256 * 1024;
     const grace = if (partitioned) try @import("partition_join.zig").Join.create(a, &manager, bytes, count * 2, count * 256, false, false) else null;
@@ -450,7 +452,7 @@ fn resultDelivery(blocks: bool, count: usize) !struct { ns: i96, peak: usize, wr
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var rows: ?disk.Rows = if (!blocks) try disk.Rows.init(a, &manager, 4) else null;
     defer if (rows) |*owner| owner.deinit();
@@ -529,7 +531,7 @@ fn windowLayouts(shared: bool, count: usize, bytes: usize) !struct { ns: i96, wr
     };
     const a = std.testing.allocator;
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
     defer manager.deinit();
     const payload = try a.alloc(u8, bytes);
     defer a.free(payload);
@@ -587,7 +589,7 @@ fn windowColumnReads(columnar: bool, count: usize) !struct { ns: i96, read_bytes
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var rows = try disk.Rows.init(a, &manager, 2);
     defer rows.deinit();
@@ -621,7 +623,7 @@ fn wideColumnCache(full: bool) !struct { ns: i96, decodes: usize, checksum: i64 
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var rows = try disk.Rows.init(a, &manager, 8);
     defer rows.deinit();
@@ -716,7 +718,7 @@ fn leasedResultDelivery(leased: bool, sorted: bool) !struct { ns: i96, peak: usi
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const Cursor = @import("result_cursor.zig").Cursor;
     const cursor = try Cursor.create(a, &manager, 3);
@@ -765,7 +767,7 @@ fn compactTypedDecode(compact: bool, dictionary: bool) !struct { ns: i96, peak: 
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var file = try spill.Sequential.init(&manager, 1024 * 1024);
     defer file.close();

@@ -21,7 +21,9 @@
 //! recreating dispatch, handle checks, status/metrics selection, or result
 //! cleanup.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const admin_api = @import("../../admin/mod.zig");
 const admin = @import("admin.zig");
@@ -1371,7 +1373,7 @@ fn checkedManifestFileReadLimit(size_bytes: u64) !usize {
 }
 
 fn readFileAlloc(alloc: Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
 }
@@ -2015,7 +2017,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     const backup_root = try allocPrintPath(alloc, name, "backup-root", nonce);
     defer alloc.free(backup_root);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
@@ -2075,7 +2077,7 @@ fn seedFiles() [2]backup_manifest.FileEntry {
 }
 
 fn writeTestFile(path: []const u8, bytes: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{

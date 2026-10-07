@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const db_mod = @import("mod.zig");
 const rows = @import("relational_rows.zig");
 const mapper = @import("document_mapper.zig");
@@ -57,7 +59,7 @@ test "relational index system expression CHECK activation records arithmetic fai
             try std.testing.expect(activation.hasActive(catalog));
             try std.testing.expectEqual(activation.State.validating, (try activation.status(&read, catalog)).state);
         }
-        var page = try activation.Page.prepare(alloc, std.testing.io, owner.core, .{ .time_ns = std.time.ns_per_s }) orelse return error.ActivationPageUnavailable;
+        var page = try activation.Page.prepare(alloc, platform.testing.io, owner.core, .{ .time_ns = std.time.ns_per_s }) orelse return error.ActivationPageUnavailable;
         defer page.deinit();
         try std.testing.expectEqual(.check, page.phase);
         try std.testing.expectEqual(@as(usize, 2), page.rows.rows.len);
@@ -146,7 +148,7 @@ test "relational index system portable restore preserves generated historical ro
         {
             var covered_reader = try restored.beginRelationalRows(alloc, .{ .index = "by_total", .fields = &.{ "total", "doubled" }, .conditions = &.{.{ .column = "total", .op = .gt, .value = .{ .integer = 7 } }} });
             defer covered_reader.deinit();
-            var covered = try covered_reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+            var covered = try covered_reader.nextPage(alloc, platform.testing.io, .{ .time_ns = std.time.ns_per_s });
             defer covered.deinit();
             try std.testing.expectEqual(@as(usize, 1), covered.rows.len);
             try std.testing.expectEqual(@as(usize, 0), covered.primary_lookups);
@@ -286,7 +288,7 @@ test "relational index system fallback consumer failure releases transferred com
 fn scan(db: *db_mod.DB, indexed: bool) !rows.Page {
     var reader = try db.beginRelationalRows(alloc, .{ .index = if (indexed) "by_total" else null, .fields = &.{ "total", "doubled" } });
     defer reader.deinit();
-    return reader.nextPage(alloc, std.testing.io, .{ .rows = 32, .records = 256, .time_ns = std.time.ns_per_s });
+    return reader.nextPage(alloc, platform.testing.io, .{ .rows = 32, .records = 256, .time_ns = std.time.ns_per_s });
 }
 
 test "relational index system generated rows share defaults checks covering hash and durable replay" {

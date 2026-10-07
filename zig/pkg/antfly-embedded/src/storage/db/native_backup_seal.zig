@@ -16,7 +16,9 @@
 //! Restart-stable, owner/attempt-bound backup pin inventories. Seals contain
 //! hardlinks to immutable files and bounded copied committed WAL prefixes;
 //! they never retain pointers, live paths or process-local descriptor leases.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const backup = @import("native_backup.zig");
 const topology = @import("relational_integrity_topology.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
@@ -180,15 +182,17 @@ pub fn finish(alloc: Allocator, io: std.Io, root: []const u8, fence: topology.Fe
         try cancellation.check();
         // Temporary process-local pin trees are not part of the durable seal.
         if (std.mem.startsWith(u8, entry.path, ".generated-")) continue;
-        const absolute = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, entry.path });
+        // Walker paths are native; the durable inventory uses '/' on every host.
+        const relative = try fs_paths.joinStoragePathAlloc(a, &.{entry.path});
+        const absolute = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, relative });
         if (entry.kind == .directory) {
             try fs_paths.syncDirPortable(io, absolute);
             continue;
         }
         if (entry.kind != .file or files.items.len == max_files) return error.BackupSealInventoryTooLarge;
-        try checkRelative(entry.path);
+        try checkRelative(relative);
         const stat = try backup.statRegularFile(io, absolute);
-        try files.append(a, .{ .path = try a.dupe(u8, entry.path), .size = stat.size, .inode = stat.inode, .mtime_ns = stat.mtime.toNanoseconds() });
+        try files.append(a, .{ .path = relative, .size = stat.size, .inode = @bitCast(stat.inode), .mtime_ns = stat.mtime.toNanoseconds() });
     }
     std.mem.sort(File, files.items, {}, struct {
         fn less(_: void, x: File, y: File) bool {
@@ -208,6 +212,40 @@ pub fn finish(alloc: Allocator, io: std.Io, root: []const u8, fence: topology.Fe
     _ = try backup.writeFileDurable(io, digest_path, &digest);
     try fs_paths.syncDirPortable(io, root);
     return .{ .fence = fence, .digest = digest };
+}
+
+test "backup seal inventories nested files with portable relative paths" {
+    const alloc = std.testing.allocator;
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "primary-lsm/nested");
+    {
+        const file = try tmp.dir.createFile(io, "primary-lsm/nested/segment.afps", .{});
+        defer file.close(io);
+        try file.writeStreamingAll(io, "immutable");
+    }
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    const fence: topology.Fence = .{
+        .transition_id = 1,
+        .attempt = 1,
+        .peer_group_id = 1,
+        .owner_group_id = 1,
+        .role = .backup_snapshot,
+        .namespace = .{ .table_id = 1 },
+        .catalog_digest = @splat(1),
+    };
+    const handle = try finish(alloc, io, root, fence, 1, .{
+        .artifact_format = "test",
+        .artifact_version = 1,
+        .source_backend = "test",
+    }, &.{}, .none);
+    var opened = try open(alloc, io, root, handle);
+    defer opened.deinit();
+    try std.testing.expectEqual(@as(usize, 1), opened.parsed.value.files.len);
+    try std.testing.expectEqualStrings("primary-lsm/nested/segment.afps", opened.parsed.value.files[0].path);
+    try std.testing.expectEqual(@as(u64, 9), opened.parsed.value.files[0].size);
 }
 
 pub const Opened = struct {

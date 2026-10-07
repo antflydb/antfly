@@ -21,7 +21,9 @@
 //! routing bounds, vector revisions and source coverage. It must fsync chunks
 //! before publishing a manifest that references them. This module performs no
 //! I/O and never publishes implicitly; preparation and rebasing are off-lane.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Crc32 = @import("antfly_hash").Crc32;
 const directory = @import("quantized_directory.zig");
@@ -1443,7 +1445,7 @@ test "posting row manifest visibility follows the enclosing WAL commit" {
 test "posting row repack worker permits mutations while the old query stays leased" {
     const a = std.testing.allocator;
     // The I/O runtime outlives all chunk/query/worker cleanup.
-    var runtime_io = std.Io.Threaded.init(a, .{});
+    var runtime_io = platform.Io.Threaded.init(a, .{});
     defer runtime_io.deinit();
     const io = runtime_io.io();
     const chunk = try testChunk(a, 1, 1, &.{ 10, 20, 30, 40 }, .cosine);
@@ -1574,7 +1576,7 @@ test "posting row shared query preparation microbenchmark" {
         for (0..4) |round| for (0..2) |arm| {
             const shared = (round + arm) % 2 == 1;
             var sink = Sink{};
-            const started = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            const started = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
             for (0..iterations) |_| {
                 if (shared) {
                     try snapshot.scoreTo(&quantizer, &query, &scratch, null, &sink);
@@ -1583,7 +1585,7 @@ test "posting row shared query preparation microbenchmark" {
                     try quantizer.estimateDistancesInRangesTo(&set, &query, &scratch, null, &.{.{ .start = run.start, .end = run.start + run.len }}, Output{ .sink = &sink, .ids = run.chunk.view.member_ids });
                 }
             }
-            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - started;
+            const elapsed = std.Io.Clock.awake.now(platform.testing.io).nanoseconds - started;
             if (expected_sum) |expected| try std.testing.expectEqual(expected, sink.sum) else expected_sum = sink.sum;
             std.mem.doNotOptimizeAway(sink.sum);
             std.debug.print("posting-rows query-preparation chunks={} round={} shared={} ns_per_query={d:.3}\n", .{ chunk_count, round, shared, @as(f64, @floatFromInt(elapsed)) / iterations });
@@ -1638,7 +1640,7 @@ test "posting row representation microbenchmark" {
             var source_with_allocator = source;
             source_with_allocator.alloc = measured; // borrowed; never deinit this copy
             var encoded_bytes: u64 = 0;
-            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            const start = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
             for (0..visits) |_| {
                 if (delta) {
                     var append: ?*Chunk = null;
@@ -1676,7 +1678,7 @@ test "posting row representation microbenchmark" {
                     std.mem.doNotOptimizeAway(encoded.ptr);
                 }
             }
-            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
+            const elapsed = std.Io.Clock.awake.now(platform.testing.io).nanoseconds - start;
             try std.testing.expectEqual(counting.allocated_bytes, counting.freed_bytes);
             std.debug.print("posting-rows mutation replace={} work_rows={} leaf_visits={} round={} delta={} ns_per_leaf={d:.1} requested_bytes={} encoded_bytes={} allocations={}\n", .{
                 replace, work_rows, visits, round, delta, @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(visits)), counting.allocated_bytes, encoded_bytes, counting.allocations,
@@ -1709,9 +1711,9 @@ test "posting row representation microbenchmark" {
             const fragmented = (round + arm) % 2 == 1;
             const view = if (fragmented) &dirty else &compact;
             var sink = Sink{};
-            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+            const start = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
             for (0..1000) |_| try view.scoreTo(&quantizer, &query, &scratch, null, &sink);
-            const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
+            const elapsed = std.Io.Clock.awake.now(platform.testing.io).nanoseconds - start;
             std.mem.doNotOptimizeAway(sink.sum);
             std.debug.print("posting-rows query replace={} round={} fragmented={} ns_per_live_row={d:.3} runs={} chunks={} retained_bytes={}\n", .{
                 replace, round, fragmented, @as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(1000 * view.row_count)), view.runs.len, view.chunk_count, view.physical_bytes,

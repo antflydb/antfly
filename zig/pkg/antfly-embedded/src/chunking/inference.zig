@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
@@ -28,7 +30,7 @@ const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const inference_work = @import("antfly_inference_work");
 const execution_context = @import("antfly_inference_execution_context");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 
 const Allocator = std.mem.Allocator;
 const remote_chunk_max_response_bytes: usize = 16 << 20;
@@ -139,7 +141,7 @@ pub fn chunkInputWithProvider(
     if (resolved_endpoint == null and linked_callback_available) if (antfly_provider) |provider| {
         const ptr = provider.ptr orelse return error.InvalidChunkProvider;
         const dispatch = provider.boundary_dispatch orelse return error.InvalidChunkProvider;
-        const io = execution.io orelse std.Io.Threaded.global_single_threaded.io();
+        const io = execution.io orelse platform.Io.Threaded.global_single_threaded.io();
         const request_context = execution.requestContext(io);
         try request_context.check();
         const chunks = if (provider.chunk_input_with_context_callback) |callback| blk: {
@@ -165,12 +167,12 @@ pub fn chunkInputWithProvider(
     const endpoint = try normalizedAntflyChunkEndpointAlloc(alloc, endpoint_raw);
     defer alloc.free(endpoint);
 
-    var fallback_io: ?std.Io.Threaded = null;
+    var fallback_io: ?platform.Io.Threaded = null;
     defer if (fallback_io) |*io_impl| io_impl.deinit();
     const io = if (execution.io) |io|
         io
     else blk: {
-        fallback_io = std.Io.Threaded.init(alloc, .{});
+        fallback_io = platform.Io.Threaded.init(alloc, .{});
         break :blk fallback_io.?.io();
     };
 
@@ -865,7 +867,7 @@ test "antfly chunker execution-only provider preserves local fallback and cancel
         .max_chunks = 2,
         .text = .{ .target_tokens = 3, .overlap_tokens = 0, .separator = " " },
     };
-    var provider: chunk_provider.Provider = .{ .execution = .{ .io = std.testing.io } };
+    var provider: chunk_provider.Provider = .{ .execution = .{ .io = platform.testing.io } };
     const chunks = try chunkTextWithProvider(alloc, cfg, "alpha beta gamma delta epsilon", provider);
     defer {
         for (chunks) |*chunk| chunk.deinit(alloc);

@@ -176,7 +176,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     const link_libc = b.option(bool, "link-libc", "Link Antfly runtime modules against libc") orelse true;
     const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer for the Antfly runtime") orelse false;
     const runtime_artifact_role = b.option(RuntimeArtifactRole, "runtime-artifact-role", "Build one focused runtime artifact: cli, data, inference, metadata, or standalone");
-    const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse "antfly";
+    const antfly_bin_name = b.option([]const u8, "antfly-bin-name", "Installed filename for the top-level Antfly CLI") orelse
+        (if (target.result.os.tag == .windows) "antfly.exe" else "antfly");
     if (antfly_bin_name.len == 0 or std.mem.indexOfAny(u8, antfly_bin_name, "/\\") != null) {
         @panic("-Dantfly-bin-name must be a non-empty filename, not a path");
     }
@@ -1274,7 +1275,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
 
-    return .{
+    const shared: Shared = .{
         .api_bench_standalone = api_bench_standalone,
         .conformance_fetch = conformance_fetch,
         .conformance_fixtures = conformance_fixtures,
@@ -1350,6 +1351,8 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .antfly_imports = antfly_imports,
         .production_antfly_imports = production_antfly_imports,
     };
+    platform_build.bindPlatform(shared, platform_mod);
+    return shared;
 }
 
 fn buildArguments(b: *std.Build) ?[]const []const u8 {

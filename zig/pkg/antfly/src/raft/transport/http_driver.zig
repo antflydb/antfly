@@ -13,11 +13,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const raft_engine = @import("raft_engine");
 const common = @import("http_common.zig");
 const common_http = @import("../../common/http/mod.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const routes = @import("routes.zig");
 
 pub const HttpDriverConfig = struct {
@@ -102,7 +104,7 @@ pub const HttpFrameDriver = struct {
     executor: common.RequestExecutor,
     io: std.Io,
     // Dedicated capacity keeps Raft senders independent of request/artifact fan-out.
-    sender_io: ?std.Io.Threaded = null,
+    sender_io: ?platform.Io.Threaded = null,
     workers: []std.Io.Future(void) = &.{},
     isolated_executors: []common_http.StdHttpExecutor = &.{},
     mutex: std.Io.Mutex = .init,
@@ -232,7 +234,7 @@ pub const HttpFrameDriver = struct {
         }
         errdefer self.deinitIsolatedExecutors();
         self.workers = try self.alloc.alloc(std.Io.Future(void), self.cfg.async_send_worker_count);
-        if (self.cfg.sender_io == null) self.sender_io = std.Io.Threaded.init(self.alloc, .{
+        if (self.cfg.sender_io == null) self.sender_io = platform.Io.Threaded.init(self.alloc, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(self.cfg.async_send_worker_count),
         });
@@ -617,7 +619,7 @@ test "http frame driver posts batch frames to raft batch route" {
 
     var executor = RecordingExecutor{ .alloc = std.testing.allocator };
     defer executor.deinit();
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var driver = HttpFrameDriver.init(std.testing.allocator, .{}, executor.iface(), io_impl.io());
     try driver.sendBatch(.{
@@ -681,7 +683,7 @@ test "http frame driver isolates blocked peers without reordering a peer lane" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
@@ -744,7 +746,7 @@ test "http frame driver propagates isolated worker executor configuration" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var unused = UnusedExecutor{};
     const executor_config: common_http.StdHttpExecutorConfig = .{
@@ -784,7 +786,7 @@ test "http frame driver split shutdown wakes idle senders before deinit" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var unused = UnusedExecutor{};
     var driver: HttpFrameDriver = undefined;
@@ -807,7 +809,7 @@ test "http frame sender drains partial startup and releases private capacity" {
         .ptr = undefined,
         .vtable = &.{ .execute = UnusedExecutor.execute },
     };
-    var shared = std.Io.Threaded.init(std.testing.allocator, .{
+    var shared = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
@@ -858,7 +860,7 @@ test "http frame sender borrows capacity and drains a refused partial startup" {
             var driver = HttpFrameDriver.init(std.testing.allocator, .{ .sender_io = io, .async_send_worker_count = 4 }, .{
                 .ptr = undefined,
                 .vtable = &.{ .execute = Unused.execute },
-            }, std.testing.io);
+            }, platform.testing.io);
             defer driver.deinit();
             try std.testing.expectError(error.ConcurrencyUnavailable, driver.startAsyncSender());
             try std.testing.expectEqual(refuse_after, lane.admitted);
@@ -900,7 +902,7 @@ test "http frame driver budgets in flight and failed frames and invalidates queu
         }
     };
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var executor = BlockingFailure{ .io = io };
     var driver: HttpFrameDriver = undefined;
     try driver.initAsyncInPlace(alloc, .{ .async_send_worker_count = 1, .async_send_retained_bytes_max = 256, .async_send_retained_bytes_max_per_peer = 100 }, .{ .ptr = &executor, .vtable = &.{ .execute = BlockingFailure.execute } }, io);
@@ -967,7 +969,7 @@ test "queued context-free heartbeats coalesce behind a slow peer without droppin
             return error.ConnectionRefused;
         }
     };
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var executor = Blocking{ .io = io };
     var driver: HttpFrameDriver = undefined;
     try driver.initAsyncInPlace(std.testing.allocator, .{ .async_send_worker_count = 1, .async_send_queue_max_per_peer = 3 }, .{ .ptr = &executor, .vtable = &.{ .execute = Blocking.execute } }, io);
@@ -1030,7 +1032,7 @@ test "http frame driver ready peers drain fairly and retain FIFO across backlog"
         }
     };
     var context: u8 = 0;
-    var driver = HttpFrameDriver.init(std.testing.allocator, .{}, .{ .ptr = &context, .vtable = &.{ .execute = Fake.execute } }, std.testing.io);
+    var driver = HttpFrameDriver.init(std.testing.allocator, .{}, .{ .ptr = &context, .vtable = &.{ .execute = Fake.execute } }, platform.testing.io);
     defer driver.deinit();
     var workers: [1]std.Io.Future(void) = undefined;
     driver.workers = &workers; // Exercise queue ownership without starting I/O.
@@ -1064,7 +1066,7 @@ test "http frame driver scheduler workload benchmark" {
             var samples: [9]u64 = undefined;
             for (&samples) |*sample| {
                 var context: u8 = 0;
-                var driver = HttpFrameDriver.init(alloc, .{}, .{ .ptr = &context, .vtable = &.{ .execute = Fake.execute } }, std.testing.io);
+                var driver = HttpFrameDriver.init(alloc, .{}, .{ .ptr = &context, .vtable = &.{ .execute = Fake.execute } }, platform.testing.io);
                 defer driver.deinit();
                 var workers: [1]std.Io.Future(void) = undefined;
                 driver.workers = &workers;

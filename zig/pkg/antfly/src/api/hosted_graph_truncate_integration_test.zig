@@ -464,9 +464,9 @@ fn mountedGraphTruncate(faults: bool) !void {
     const admin_authorization = try basicAuthorization(alloc, admin_username, admin_password);
     defer alloc.free(admin_authorization);
     const admin_headers = [_]http.RequestHeader{.{ .name = "authorization", .value = admin_authorization }};
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const meta_root = try std.fmt.allocPrint(alloc, "{s}/metadata", .{root});
     defer alloc.free(meta_root);
@@ -478,7 +478,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     defer alloc.free(data_catalog);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var metadata = try metadata_runtime.Server.init(process_alloc, .{

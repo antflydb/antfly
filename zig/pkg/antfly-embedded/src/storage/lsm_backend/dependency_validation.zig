@@ -16,7 +16,9 @@
 //! An owned dependency certificate. Callers own its selected handles until
 //! cleanup completes; this object pins every epoch used by its cursors.
 //! advanceLocked performs ONE bounded off-lock slice, including scratch GC.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const work_budget = @import("work_budget.zig");
 const Directory = @import("run_directory.zig").Directory;
 const Job = @import("dependency_job.zig").Job;
@@ -158,9 +160,9 @@ test "dependency validation uses the borrowed clock for every phase" {
         }
     };
     Clock.epoch = 0;
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.now = Clock.now;
-    var io = std.testing.io;
+    var io = platform.testing.io;
     io.vtable = &vtable;
     const allocator = std.testing.allocator;
     var backend = Backend.init(allocator, .{ .wal_enabled = false, .read_runtime = .{ .io = io } });

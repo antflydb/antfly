@@ -438,7 +438,7 @@ pub fn materialize(a: A, io: std.Io, root: Root, store: stores.ArtifactStore, ta
         const destination = try std.fmt.allocPrint(a, "{s}/{s}", .{ target, file.path });
         defer a.free(destination);
         if (std.fs.path.dirname(destination)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
-        const output = try std.Io.Dir.cwd().createFile(io, destination, .{ .permissions = .fromMode(0o600) });
+        const output = try std.Io.Dir.cwd().createFile(io, destination, .{ .permissions = if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file });
         defer output.close(io);
         const input = try std.fmt.allocPrint(a, "{s}/{s}", .{ reader.prefix, file.path });
         defer a.free(input);

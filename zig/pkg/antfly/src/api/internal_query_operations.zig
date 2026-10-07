@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -22,7 +24,7 @@ const managed_embedder = @import("antfly_local_sources").inference_managed_embed
 const query_embedding_cache = @import("antfly_inference_query_embedding_cache");
 const cache_budget = @import("antfly_cache_budget");
 const common_secrets = @import("antfly_local_sources").common_secrets;
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const scraping = @import("antfly_scraping");
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 
@@ -347,7 +349,7 @@ test "semantic query planning reuses equivalent embeddings across tables and iso
     };
 
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, std.Io.Threaded.global_single_threaded.io(), .{});
+    var cache = query_embedding_cache.QueryEmbeddingCache.init(alloc, platform.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
     var provider = FakeProvider{};
     const base: QueryPlanningContext = .{

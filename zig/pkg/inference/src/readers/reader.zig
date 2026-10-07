@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const build_options = @import("build_options");
 const backends = @import("../backends/backends.zig");
 const donut_mod = @import("donut.zig");
@@ -1252,17 +1254,17 @@ test "moondream parser extracts description and fields from json" {
 
 test "reader capability probe distinguishes unsupported metadata and preserves allocation failures" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
     const man = manifest_mod.ModelManifest{ .allocator = allocator };
     try std.testing.expect(!(try probeManifest(allocator, model_dir, man)).isSupported());
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "antfly_metadata.json", .data = "[]" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "antfly_metadata.json", .data = "[]" });
     try std.testing.expectEqual(UnsupportedReason.invalid_metadata, (try probeManifest(allocator, model_dir, man)).unsupported);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "antfly_metadata.json", .data = "{}" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "encoder_model.onnx", .data = "encoder" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "decoder_model.onnx", .data = "decoder" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "antfly_metadata.json", .data = "{}" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "encoder_model.onnx", .data = "encoder" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "decoder_model.onnx", .data = "decoder" });
     const Check = struct {
         fn run(a: std.mem.Allocator, path: []const u8) !void {
             const manifest = manifest_mod.ModelManifest{ .allocator = a };
@@ -1271,5 +1273,5 @@ test "reader capability probe distinguishes unsupported metadata and preserves a
             try std.testing.expectEqual(ReaderKind.encoder_decoder, support.supported);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
+    try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{model_dir});
 }

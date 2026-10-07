@@ -23,7 +23,9 @@
 //! layout, including adapters unused by the last batch. All files and training
 //! provenance are verified and synced before an atomic, no-overwrite rename.
 //! Receipts record integrity and provenance, never model quality qualification.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const source_mod = @import("boundary_training_source.zig");
 const run = @import("boundary_run.zig");
@@ -722,11 +724,11 @@ test "boundary training export full and head snapshots preserve canonical invent
 
 test "boundary training export global LoRA and DoRA files preserve provenance and no overwrite" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     for ([_]run.Mode{ .lora, .dora }) |mode| {
         var test_adapter = try TestAdapter.init(a, mode);
         defer test_adapter.deinit();
-        var temporary = std.testing.tmpDir(.{});
+        var temporary = platform.testing.tmpDir(.{});
         defer temporary.cleanup();
         const parent = try temporary.dir.realPathFileAlloc(io, ".", a);
         defer a.free(parent);
@@ -797,23 +799,23 @@ test "boundary training export rejects partial extra invalid nonfinite and unflu
     test_adapter.layout.fingerprint[0] ^= 1;
     try std.testing.expectError(error.BoundaryTrainingExportLimitExceeded, estimateView(a, test_adapter.source, original, .{ .max_output_bytes = 1 }, null));
     try std.testing.expectError(error.BoundaryTrainingExportLimitExceeded, estimateView(a, test_adapter.source, original, .{ .max_header_bytes = 4 }, null));
-    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    var temporary = platform.testing.tmpDir(.{ .iterate = true });
     defer temporary.cleanup();
-    const parent = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const parent = try temporary.dir.realPathFileAlloc(platform.testing.io, ".", a);
     defer a.free(parent);
     const output = try std.fs.path.join(a, &.{ parent, "bad" });
     defer a.free(output);
     @constCast(test_adapter.slots[0].values)[0] = std.math.nan(f32);
     _ = try estimateView(a, test_adapter.source, original, .{}, null); // metadata only
-    try std.testing.expectError(error.NonFiniteBoundaryTrainingSnapshot, exportView(a, std.testing.io, test_adapter.source, output, original, .{}, null));
+    try std.testing.expectError(error.NonFiniteBoundaryTrainingSnapshot, exportView(a, platform.testing.io, test_adapter.source, output, original, .{}, null));
     var iterator = temporary.dir.iterate();
-    try std.testing.expect((try iterator.next(std.testing.io)) == null);
+    try std.testing.expect((try iterator.next(platform.testing.io)) == null);
 }
 
 test "boundary training export written tensors reject same-size mutation shape aliases and trailing bytes" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const parent = try temporary.dir.realPathFileAlloc(io, ".", a);
     defer a.free(parent);
@@ -841,8 +843,8 @@ test "boundary training export written tensors reject same-size mutation shape a
 }
 
 fn exportAllocationFailures(a: Allocator, source: View, snapshot: Snapshot, output: []const u8) !void {
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, output) catch {};
-    _ = try exportView(a, std.testing.io, source, output, snapshot, .{}, null);
+    defer std.Io.Dir.cwd().deleteTree(platform.testing.io, output) catch {};
+    _ = try exportView(a, platform.testing.io, source, output, snapshot, .{}, null);
 }
 fn estimateAllocationFailures(a: Allocator, source: View, snapshot: Snapshot) !void {
     _ = try estimateView(a, source, snapshot, .{}, null);
@@ -850,11 +852,11 @@ fn estimateAllocationFailures(a: Allocator, source: View, snapshot: Snapshot) !v
 
 test "boundary training export bounds cancellation and all allocation failures reclaim private staging" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var test_adapter = try TestAdapter.init(a, .dora);
     defer test_adapter.deinit();
     const snapshot = test_adapter.snapshot();
-    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    var temporary = platform.testing.tmpDir(.{ .iterate = true });
     defer temporary.cleanup();
     const parent = try temporary.dir.realPathFileAlloc(io, ".", a);
     defer a.free(parent);
@@ -875,7 +877,7 @@ test "boundary training export bounds cancellation and all allocation failures r
         fn call(raw: ?*anyopaque) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             var iterator = self.directory.iterate();
-            if (try iterator.next(std.testing.io)) |_| {
+            if (try iterator.next(platform.testing.io)) |_| {
                 self.saw_stage = true;
                 return error.Cancelled;
             }
@@ -884,16 +886,16 @@ test "boundary training export bounds cancellation and all allocation failures r
     var cancel = CancelStaged{ .directory = temporary.dir };
     try std.testing.expectError(error.Cancelled, exportView(a, io, test_adapter.source, output, snapshot, .{}, .{ .ptr = &cancel, .check_fn = CancelStaged.call }));
     try std.testing.expect(cancel.saw_stage);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, estimateAllocationFailures, .{ test_adapter.source, snapshot });
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exportAllocationFailures, .{ test_adapter.source, snapshot, output });
+    try platform.allocator.checkAllAllocationFailures(a, estimateAllocationFailures, .{ test_adapter.source, snapshot });
+    try platform.allocator.checkAllAllocationFailures(a, exportAllocationFailures, .{ test_adapter.source, snapshot, output });
     var iterator = temporary.dir.iterate();
     try std.testing.expect((try iterator.next(io)) == null);
 }
 
 test "boundary training export published small full and head complete FP32 snapshots" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_TRAINING_EXPORT_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_TRAINING_EXPORT_MODEL_DIR") orelse return error.SkipZigTest;
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const source = try source_mod.Source.open(a, io, directory, .{}, null);
     defer source.deinit();
     if (source.config.backbone != .small) return error.InvalidBoundaryTrainingSource;
@@ -912,7 +914,7 @@ test "boundary training export published small full and head complete FP32 snaps
             }
             try slots.append(scratch, .{ .name = parameter.name, .dimensions = parameter.dimensions, .values = values });
         }
-        var temporary = std.testing.tmpDir(.{});
+        var temporary = platform.testing.tmpDir(.{});
         defer temporary.cleanup();
         const parent = try temporary.dir.realPathFileAlloc(io, ".", scratch);
         const output = try std.fs.path.join(scratch, &.{ parent, "model" });

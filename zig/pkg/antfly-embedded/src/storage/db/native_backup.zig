@@ -21,7 +21,9 @@
 //! generation. Legacy snapshots have no manifest and intentionally retain the
 //! deferred runtime-repair restore path.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const native_artifact_sink = @import("../native_artifact_sink.zig");
@@ -370,7 +372,7 @@ pub const PinnedGeneratedArtifacts = struct {
     }
 
     pub fn deinit(self: *PinnedGeneratedArtifacts) void {
-        if (self.pin_present) std.Io.Dir.cwd().deleteTree(self.io, self.pin_root) catch {};
+        if (self.pin_present) cleanupPinTree(self.io, self.pin_root);
         for (self.files) |*file| file.deinit(self.alloc);
         self.alloc.free(self.files);
         self.alloc.free(self.pin_root);
@@ -417,6 +419,14 @@ pub const PinnedGeneratedArtifacts = struct {
     }
 };
 
+// Pin cleanup must finish even when cancellation arrives just before unwind.
+// Restore protection before closing leases which may release their I/O runtime.
+fn cleanupPinTree(io: Io, pin_root: []const u8) void {
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+}
+
 pub fn pinGeneratedArtifacts(
     alloc: Allocator,
     io: Io,
@@ -446,7 +456,7 @@ pub fn pinGeneratedCheckpointMetadata(
 ) !PinnedGeneratedArtifacts {
     try ensureActive(cancellation);
     try fs_paths.createDirPathPortable(io, pin_root);
-    errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+    errdefer cleanupPinTree(io, pin_root);
     var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
     errdefer {
         for (files.items) |*file| file.deinit(alloc);
@@ -517,7 +527,7 @@ pub fn pinExplicitArtifacts(
 ) !PinnedGeneratedArtifacts {
     try ensureActive(cancellation);
     try fs_paths.createDirPathPortable(io, pin_root);
-    errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+    errdefer cleanupPinTree(io, pin_root);
     var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
     errdefer {
         for (files.items) |*file| file.deinit(alloc);
@@ -586,7 +596,7 @@ pub fn pinGeneratedArtifactsForProjections(
         }
     }
     try fs_paths.createDirPathPortable(io, pin_root);
-    errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+    errdefer cleanupPinTree(io, pin_root);
     var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
     errdefer {
         for (files.items) |*file| file.deinit(alloc);
@@ -1155,10 +1165,12 @@ fn collectArtifacts(
             .file => {
                 if (std.mem.eql(u8, entry.path, manifest_file_name)) continue;
                 if (result.items.len == max_artifacts) return error.NativeBackupManifestTooLarge;
-                try validateRelativePath(entry.path);
-                const path = try alloc.dupe(u8, entry.path);
+                // Normalize trusted walker output before recording portable
+                // inventory paths; external manifest validation stays strict.
+                const path = try fs_paths.joinStoragePathAlloc(alloc, &.{entry.path});
                 errdefer alloc.free(path);
-                const absolute = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, entry.path });
+                try validateRelativePath(path);
+                const absolute = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, path });
                 defer alloc.free(absolute);
                 const stat = try statRegularFile(io, absolute);
                 var digest: [Sha256.digest_length]u8 = undefined;
@@ -1166,8 +1178,8 @@ fn collectArtifacts(
                 const hex = std.fmt.bytesToHex(digest, .lower);
                 const sha256 = try alloc.dupe(u8, &hex);
                 errdefer alloc.free(sha256);
-                const ownership = try artifactOwnership(entry.path, projections);
-                const install_path = try artifactInstallPathAlloc(alloc, entry.path, ownership.role);
+                const ownership = try artifactOwnership(path, projections);
+                const install_path = try artifactInstallPathAlloc(alloc, path, ownership.role);
                 errdefer alloc.free(install_path);
                 try result.append(alloc, .{
                     .path = path,
@@ -1278,7 +1290,12 @@ fn validateCompleteInventory(
             .directory => {},
             .file => {
                 if (std.mem.eql(u8, entry.path, manifest_file_name)) continue;
-                if (!manifestContainsArtifact(manifest, entry.path))
+                const path = if (comptime @import("builtin").os.tag == .windows)
+                    try fs_paths.joinStoragePathAlloc(alloc, &.{entry.path})
+                else
+                    entry.path;
+                defer if (comptime @import("builtin").os.tag == .windows) alloc.free(path);
+                if (!manifestContainsArtifact(manifest, path))
                     return error.InvalidNativeBackupManifest;
             },
             else => return error.UnsupportedFileType,
@@ -1539,7 +1556,7 @@ test "explicit native generation pin keeps immutable files and exact WAL prefix"
     const alloc = std.testing.allocator;
     var native_storage = try lsm_backend.NativeStorage.init(alloc, .threaded);
     defer native_storage.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -1551,11 +1568,11 @@ test "explicit native generation pin keeps immutable files and exact WAL prefix"
     defer alloc.free(pin_root);
     const snapshot = try std.fmt.allocPrint(alloc, "{s}/snapshot", .{root});
     defer alloc.free(snapshot);
-    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(segment).?);
-    _ = try writeFileDurable(std.testing.io, segment, "immutable-generation");
-    _ = try writeFileDurable(std.testing.io, wal, "committed-uncommitted-tail");
+    try fs_paths.createDirPathPortable(platform.testing.io, std.fs.path.dirname(segment).?);
+    _ = try writeFileDurable(platform.testing.io, segment, "immutable-generation");
+    _ = try writeFileDurable(platform.testing.io, wal, "committed-uncommitted-tail");
 
-    var pinned = try pinExplicitArtifacts(alloc, std.testing.io, pin_root, &.{
+    var pinned = try pinExplicitArtifacts(alloc, platform.testing.io, pin_root, &.{
         .{
             .relative_path = "indexes/dense/posting-segments/CURRENT",
             .source = .{ .bytes = "manifest" },
@@ -1583,38 +1600,38 @@ test "explicit native generation pin keeps immutable files and exact WAL prefix"
     // Atomic generation replacement may unlink and recreate the live path;
     // both the hardlinked immutable pin and leased WAL descriptor must retain
     // the selected inode while corpus copying runs outside admission.
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, segment);
-    _ = try writeFileDurable(std.testing.io, segment, "replacement");
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, wal);
-    _ = try writeFileDurable(std.testing.io, wal, "replacement-wal");
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, segment);
+    _ = try writeFileDurable(platform.testing.io, segment, "replacement");
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, wal);
+    _ = try writeFileDurable(platform.testing.io, wal, "replacement-wal");
     _ = try pinned.materialize(snapshot, .none);
 
     const restored_segment = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/posting-segments/segment-1.afps", .{snapshot});
     defer alloc.free(restored_segment);
     const restored_wal = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/posting-segments/wal-1.afpw", .{snapshot});
     defer alloc.free(restored_wal);
-    const segment_bytes = try readFileAlloc(alloc, std.testing.io, restored_segment, 64);
+    const segment_bytes = try readFileAlloc(alloc, platform.testing.io, restored_segment, 64);
     defer alloc.free(segment_bytes);
-    const wal_bytes = try readFileAlloc(alloc, std.testing.io, restored_wal, 64);
+    const wal_bytes = try readFileAlloc(alloc, platform.testing.io, restored_wal, 64);
     defer alloc.free(wal_bytes);
     try std.testing.expectEqualStrings("immutable-generation", segment_bytes);
     try std.testing.expectEqualStrings("committed", wal_bytes);
     const durable_wal = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/posting-segments/wal-1.afpw", .{sealed});
     defer alloc.free(durable_wal);
-    const durable_wal_bytes = try readFileAlloc(alloc, std.testing.io, durable_wal, 64);
+    const durable_wal_bytes = try readFileAlloc(alloc, platform.testing.io, durable_wal, 64);
     defer alloc.free(durable_wal_bytes);
     try std.testing.expectEqualStrings("committed", durable_wal_bytes);
 }
 
 test "shared vector acceleration corruption preserves native posting authority" {
     const alloc = std.testing.allocator;
-    var source_tmp = std.testing.tmpDir(.{});
+    var source_tmp = platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
-    var snapshot_tmp = std.testing.tmpDir(.{});
+    var snapshot_tmp = platform.testing.tmpDir(.{});
     defer snapshot_tmp.cleanup();
-    var destination_tmp = std.testing.tmpDir(.{});
+    var destination_tmp = platform.testing.tmpDir(.{});
     defer destination_tmp.cleanup();
-    var valid_destination_tmp = std.testing.tmpDir(.{});
+    var valid_destination_tmp = platform.testing.tmpDir(.{});
     defer valid_destination_tmp.cleanup();
     const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{source_tmp.sub_path});
     defer alloc.free(source);
@@ -1628,14 +1645,14 @@ test "shared vector acceleration corruption preserves native posting authority" 
     defer alloc.free(posting);
     const vector_block = try std.fmt.allocPrint(alloc, "{s}/indexes/vector-blocks/block-1-0.afvb", .{source});
     defer alloc.free(vector_block);
-    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(posting).?);
-    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(vector_block).?);
-    _ = try writeFileDurable(std.testing.io, posting, "posting-generation");
-    _ = try writeFileDurable(std.testing.io, vector_block, "vector-acceleration");
+    try fs_paths.createDirPathPortable(platform.testing.io, std.fs.path.dirname(posting).?);
+    try fs_paths.createDirPathPortable(platform.testing.io, std.fs.path.dirname(vector_block).?);
+    _ = try writeFileDurable(platform.testing.io, posting, "posting-generation");
+    _ = try writeFileDurable(platform.testing.io, vector_block, "vector-acceleration");
     const store_file = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot});
     defer alloc.free(store_file);
-    _ = try writeFileDurable(std.testing.io, store_file, "primary");
-    _ = try capture(alloc, std.testing.io, source, snapshot, 9, &.{.{
+    _ = try writeFileDurable(platform.testing.io, store_file, "primary");
+    _ = try capture(alloc, platform.testing.io, source, snapshot, 9, &.{.{
         .name = "dense",
         .kind = "dense_vector",
         .config_hash = 1,
@@ -1650,19 +1667,19 @@ test "shared vector acceleration corruption preserves native posting authority" 
         .artifact_state = .complete,
         .repair_reason = "",
     }});
-    var valid_loaded = (try validateAndMaterialize(alloc, std.testing.io, snapshot, valid_destination)).?;
+    var valid_loaded = (try validateAndMaterialize(alloc, platform.testing.io, snapshot, valid_destination)).?;
     defer valid_loaded.deinit();
     const installed_vector = try std.fmt.allocPrint(alloc, "{s}/vector-blocks/block-1-0.afvb", .{valid_destination});
     defer alloc.free(installed_vector);
-    try std.testing.expect(try pathExists(std.testing.io, installed_vector));
+    try std.testing.expect(try pathExists(platform.testing.io, installed_vector));
     const wrongly_nested_vector = try std.fmt.allocPrint(alloc, "{s}/indexes/vector-blocks/block-1-0.afvb", .{valid_destination});
     defer alloc.free(wrongly_nested_vector);
-    try std.testing.expect(!try pathExists(std.testing.io, wrongly_nested_vector));
+    try std.testing.expect(!try pathExists(platform.testing.io, wrongly_nested_vector));
     const snapshot_vector = try std.fmt.allocPrint(alloc, "{s}/indexes/vector-blocks/block-1-0.afvb", .{snapshot});
     defer alloc.free(snapshot_vector);
-    _ = try writeFileDurable(std.testing.io, snapshot_vector, "corrupt");
+    _ = try writeFileDurable(platform.testing.io, snapshot_vector, "corrupt");
 
-    var loaded = (try validateAndMaterialize(alloc, std.testing.io, snapshot, destination)).?;
+    var loaded = (try validateAndMaterialize(alloc, platform.testing.io, snapshot, destination)).?;
     defer loaded.deinit();
     try std.testing.expect(loaded.shared_acceleration_invalid);
     try std.testing.expect(!loaded.projectionInvalid("dense"));
@@ -1670,17 +1687,55 @@ test "shared vector acceleration corruption preserves native posting authority" 
     defer alloc.free(restored_posting);
     const restored_vector = try std.fmt.allocPrint(alloc, "{s}/vector-blocks/block-1-0.afvb", .{destination});
     defer alloc.free(restored_vector);
-    try std.testing.expect(try pathExists(std.testing.io, restored_posting));
-    try std.testing.expect(!try pathExists(std.testing.io, restored_vector));
+    try std.testing.expect(try pathExists(platform.testing.io, restored_posting));
+    try std.testing.expect(!try pathExists(platform.testing.io, restored_vector));
+}
+
+test "native generation inventory restores nested portable paths and rejects extra files" {
+    const alloc = std.testing.allocator;
+    const io = platform.testing.io;
+    var snapshot_tmp = platform.testing.tmpDir(.{});
+    defer snapshot_tmp.cleanup();
+    var destination_tmp = platform.testing.tmpDir(.{});
+    defer destination_tmp.cleanup();
+    const snapshot = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{snapshot_tmp.sub_path});
+    defer alloc.free(snapshot);
+    const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{destination_tmp.sub_path});
+    defer alloc.free(destination);
+    try snapshot_tmp.dir.createDirPath(io, "primary-lsm/runs");
+    for ([_][]const u8{ "primary-lsm/manifest.bin", "primary-lsm/runs/1.tbl" }) |relative| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot, relative });
+        defer alloc.free(path);
+        _ = try writeFileDurable(io, path, "immutable");
+    }
+    _ = try finalizeCaptureGenerationWithCancellation(alloc, io, snapshot, 1, &.{}, .{
+        .artifact_format = "antfly-lsm-checkpoint",
+        .artifact_version = 1,
+        .source_backend = "lsm",
+    }, .none);
+    var loaded = (try validateAndMaterialize(alloc, io, snapshot, destination)).?;
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.value().artifacts.len);
+    try std.testing.expectEqualStrings("primary-lsm/runs/1.tbl", loaded.value().artifacts[1].path);
+    const restored = try std.fmt.allocPrint(alloc, "{s}/runs/1.tbl", .{destination});
+    defer alloc.free(restored);
+    const body = try readFileAlloc(alloc, io, restored, 64);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("immutable", body);
+    const extra = try std.fmt.allocPrint(alloc, "{s}/primary-lsm/runs/2.tbl", .{snapshot});
+    defer alloc.free(extra);
+    _ = try writeFileDurable(io, extra, "extra");
+    try std.testing.expectError(error.InvalidNativeBackupManifest, validateAndMaterialize(alloc, io, snapshot, destination));
+    try std.testing.expectError(error.InvalidNativeBackupArtifactPath, validateRelativePath("primary-lsm\\runs\\1.tbl"));
 }
 
 test "native generation manifest captures validates and materializes generated artifacts" {
     const alloc = std.testing.allocator;
-    var source_tmp = std.testing.tmpDir(.{});
+    var source_tmp = platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
-    var snapshot_tmp = std.testing.tmpDir(.{});
+    var snapshot_tmp = platform.testing.tmpDir(.{});
     defer snapshot_tmp.cleanup();
-    var destination_tmp = std.testing.tmpDir(.{});
+    var destination_tmp = platform.testing.tmpDir(.{});
     defer destination_tmp.cleanup();
 
     const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{source_tmp.sub_path});
@@ -1691,13 +1746,13 @@ test "native generation manifest captures validates and materializes generated a
     defer alloc.free(destination);
     const index_file = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{source});
     defer alloc.free(index_file);
-    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(index_file).?);
-    _ = try writeFileDurable(std.testing.io, index_file, "dense-index");
+    try fs_paths.createDirPathPortable(platform.testing.io, std.fs.path.dirname(index_file).?);
+    _ = try writeFileDurable(platform.testing.io, index_file, "dense-index");
     const store_file = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot});
     defer alloc.free(store_file);
-    _ = try writeFileDurable(std.testing.io, store_file, "primary");
+    _ = try writeFileDurable(platform.testing.io, store_file, "primary");
 
-    _ = try capture(alloc, std.testing.io, source, snapshot, 12, &.{.{
+    _ = try capture(alloc, platform.testing.io, source, snapshot, 12, &.{.{
         .name = "dense",
         .kind = "dense_vector",
         .config_hash = 7,
@@ -1714,7 +1769,7 @@ test "native generation manifest captures validates and materializes generated a
     }});
     const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot, manifest_file_name });
     defer alloc.free(manifest_path);
-    const manifest_raw = try readFileAlloc(alloc, std.testing.io, manifest_path, max_manifest_bytes);
+    const manifest_raw = try readFileAlloc(alloc, platform.testing.io, manifest_path, max_manifest_bytes);
     defer alloc.free(manifest_raw);
     var parsed_current = try parseManifestBytes(alloc, manifest_raw);
     parsed_current.deinit();
@@ -1724,31 +1779,31 @@ test "native generation manifest captures validates and materializes generated a
         return error.TestUnexpectedResult;
     unreleased[version_offset + "\"format_version\":".len] = '3';
     try std.testing.expectError(error.InvalidNativeBackupManifest, parseManifestBytes(alloc, unreleased));
-    var loaded = (try validateAndMaterialize(alloc, std.testing.io, snapshot, destination)).?;
+    var loaded = (try validateAndMaterialize(alloc, platform.testing.io, snapshot, destination)).?;
     defer loaded.deinit();
     try std.testing.expectEqual(@as(u64, 12), loaded.value().capture_target_sequence);
     try std.testing.expectEqual(@as(usize, 1), loaded.value().projections.len);
     const restored = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{destination});
     defer alloc.free(restored);
-    const restored_body = try readFileAlloc(alloc, std.testing.io, restored, 64);
+    const restored_body = try readFileAlloc(alloc, platform.testing.io, restored, 64);
     defer alloc.free(restored_body);
     try std.testing.expectEqualStrings("dense-index", restored_body);
 
     const snapshot_index = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{snapshot});
     defer alloc.free(snapshot_index);
-    _ = try writeFileDurable(std.testing.io, snapshot_index, "corrupt");
-    var corrupted = (try validateAndMaterialize(alloc, std.testing.io, snapshot, destination)).?;
+    _ = try writeFileDurable(platform.testing.io, snapshot_index, "corrupt");
+    var corrupted = (try validateAndMaterialize(alloc, platform.testing.io, snapshot, destination)).?;
     defer corrupted.deinit();
     try std.testing.expect(corrupted.projectionInvalid("dense"));
-    try corrupted.discardInvalidProjectionArtifacts(std.testing.io, destination);
-    try std.testing.expect(!try pathExists(std.testing.io, restored));
+    try corrupted.discardInvalidProjectionArtifacts(platform.testing.io, destination);
+    try std.testing.expect(!try pathExists(platform.testing.io, restored));
 }
 
 test "native materialization receipts construct the manifest in one corpus pass" {
     const alloc = std.testing.allocator;
-    var source_tmp = std.testing.tmpDir(.{});
+    var source_tmp = platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
-    var snapshot_tmp = std.testing.tmpDir(.{});
+    var snapshot_tmp = platform.testing.tmpDir(.{});
     defer snapshot_tmp.cleanup();
     const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{source_tmp.sub_path});
     defer alloc.free(source);
@@ -1756,11 +1811,11 @@ test "native materialization receipts construct the manifest in one corpus pass"
     defer alloc.free(snapshot);
     const index_source = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{source});
     defer alloc.free(index_source);
-    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(index_source).?);
-    _ = try writeFileDurable(std.testing.io, index_source, "dense-receipt");
+    try fs_paths.createDirPathPortable(platform.testing.io, std.fs.path.dirname(index_source).?);
+    _ = try writeFileDurable(platform.testing.io, index_source, "dense-receipt");
     const primary_source = try std.fmt.allocPrint(alloc, "{s}/primary.bin", .{source});
     defer alloc.free(primary_source);
-    _ = try writeFileDurable(std.testing.io, primary_source, "primary-receipt");
+    _ = try writeFileDurable(platform.testing.io, primary_source, "primary-receipt");
     const projection = Projection{
         .name = "dense",
         .kind = "dense_vector",
@@ -1781,7 +1836,7 @@ test "native materialization receipts construct the manifest in one corpus pass"
     defer alloc.free(pin_root);
     var pinned = try pinGeneratedArtifactsForProjections(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         source,
         pin_root,
         &projections,
@@ -1795,7 +1850,7 @@ test "native materialization receipts construct the manifest in one corpus pass"
     const primary_destination = try std.fmt.allocPrint(alloc, "{s}/store.bin", .{snapshot});
     defer alloc.free(primary_destination);
     _ = try copyFileDurableCancellableWithSink(
-        std.testing.io,
+        platform.testing.io,
         primary_source,
         primary_destination,
         .none,
@@ -1803,7 +1858,7 @@ test "native materialization receipts construct the manifest in one corpus pass"
     );
     _ = try finalizeCaptureGenerationFromReceiptsWithCancellation(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         &receipts,
         12,
         .{
@@ -1816,7 +1871,7 @@ test "native materialization receipts construct the manifest in one corpus pass"
 
     const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot, manifest_file_name });
     defer alloc.free(manifest_path);
-    const raw = try readFileAlloc(alloc, std.testing.io, manifest_path, max_manifest_bytes);
+    const raw = try readFileAlloc(alloc, platform.testing.io, manifest_path, max_manifest_bytes);
     defer alloc.free(raw);
     var loaded = try parseManifestBytes(alloc, raw);
     defer loaded.deinit();
@@ -1876,9 +1931,9 @@ test "native generation projection inventory is complete and revision exact" {
 
 test "native generation validator leaves legacy snapshot on repair path" {
     const alloc = std.testing.allocator;
-    var snapshot_tmp = std.testing.tmpDir(.{});
+    var snapshot_tmp = platform.testing.tmpDir(.{});
     defer snapshot_tmp.cleanup();
-    var destination_tmp = std.testing.tmpDir(.{});
+    var destination_tmp = platform.testing.tmpDir(.{});
     defer destination_tmp.cleanup();
     const snapshot = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{snapshot_tmp.sub_path});
     defer alloc.free(snapshot);
@@ -1886,7 +1941,7 @@ test "native generation validator leaves legacy snapshot on repair path" {
     defer alloc.free(destination);
     try std.testing.expect((try validateAndMaterialize(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         snapshot,
         destination,
     )) == null);
@@ -1894,9 +1949,9 @@ test "native generation validator leaves legacy snapshot on repair path" {
 
 test "native generation validation honors restore cancellation before materialization" {
     const alloc = std.testing.allocator;
-    var snapshot_tmp = std.testing.tmpDir(.{});
+    var snapshot_tmp = platform.testing.tmpDir(.{});
     defer snapshot_tmp.cleanup();
-    var destination_tmp = std.testing.tmpDir(.{});
+    var destination_tmp = platform.testing.tmpDir(.{});
     defer destination_tmp.cleanup();
     const snapshot = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{snapshot_tmp.sub_path});
     defer alloc.free(snapshot);
@@ -1907,7 +1962,7 @@ test "native generation validation honors restore cancellation before materializ
         error.Canceled,
         validateAndMaterializeWithCancellation(
             alloc,
-            std.testing.io,
+            platform.testing.io,
             snapshot,
             destination,
             CancellationToken.fromAtomic(&canceled),
@@ -1919,9 +1974,9 @@ test "native generated pin rejects in-place artifact mutation" {
     @import("antfly_test_error_logs").expectErrorLogs(1);
 
     const alloc = std.testing.allocator;
-    var source_tmp = std.testing.tmpDir(.{});
+    var source_tmp = platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
-    var snapshot_tmp = std.testing.tmpDir(.{});
+    var snapshot_tmp = platform.testing.tmpDir(.{});
     defer snapshot_tmp.cleanup();
     const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{source_tmp.sub_path});
     defer alloc.free(source);
@@ -1929,16 +1984,56 @@ test "native generated pin rejects in-place artifact mutation" {
     defer alloc.free(snapshot);
     const source_file = try std.fmt.allocPrint(alloc, "{s}/indexes/dense/data.bin", .{source});
     defer alloc.free(source_file);
-    try fs_paths.createDirPathPortable(std.testing.io, std.fs.path.dirname(source_file).?);
-    _ = try writeFileDurable(std.testing.io, source_file, "stable");
+    try fs_paths.createDirPathPortable(platform.testing.io, std.fs.path.dirname(source_file).?);
+    _ = try writeFileDurable(platform.testing.io, source_file, "stable");
     const pin_root = try std.fmt.allocPrint(alloc, "{s}/.generated-pin", .{snapshot});
     defer alloc.free(pin_root);
-    var pinned = try pinGeneratedArtifacts(alloc, std.testing.io, source, pin_root, .none);
+    var pinned = try pinGeneratedArtifacts(alloc, platform.testing.io, source, pin_root, .none);
     defer pinned.deinit();
 
-    _ = try writeFileDurable(std.testing.io, source_file, "mutated-in-place");
+    _ = try writeFileDurable(platform.testing.io, source_file, "mutated-in-place");
     try std.testing.expectError(
         error.SourceFileChanged,
         pinned.materialize(snapshot, .none),
     );
+}
+
+test "native generated pin cleanup removes hardlinks despite pending cancellation" {
+    const alloc = std.testing.allocator;
+    var pool = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
+    defer pool.deinit();
+    const io = pool.io();
+    var tmp = platform.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "immutable" });
+    const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+    defer alloc.free(source);
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pins", .{tmp.sub_path});
+    defer alloc.free(root);
+    var pins = try pinExplicitArtifacts(alloc, io, root, &.{.{ .relative_path = "artifact", .source = .{ .immutable_file = source } }}, .{});
+    var active = true;
+    defer if (active) pins.deinit();
+    const State = struct {
+        started: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        cancellation_restored: bool = false,
+        fn run(i: std.Io, self: *@This(), owned: *PinnedGeneratedArtifacts) void {
+            self.started.set(i);
+            self.gate.wait(i) catch i.recancel();
+            owned.deinit();
+            i.checkCancel() catch |err| {
+                self.cancellation_restored = err == error.Canceled;
+            };
+        }
+    };
+    var state: State = .{};
+    var task = try io.concurrent(State.run, .{ io, &state, &pins });
+    active = false;
+    state.started.waitUncancelable(io);
+    task.cancel(io);
+    try std.testing.expect(state.cancellation_restored);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "pins", .{}));
+    const original = try readFileAlloc(alloc, io, source, 64);
+    defer alloc.free(original);
+    try std.testing.expectEqualStrings("immutable", original);
 }

@@ -19,6 +19,7 @@ pub const support = @import("build_support.zig");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    defer @import("antfly_platform").bindBuild(b);
 
     const protobuf_dep = b.dependency("protobuf", .{
         .target = target,

@@ -1704,7 +1704,7 @@ test "awaitTurn propagates cancellation without stealing the active turn" {
             try target.awaitTurn(lease, .decode, io);
         }
     };
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var future = try io.concurrent(Waiter.run, .{ &coordinator, &second, io });
@@ -1735,7 +1735,7 @@ test "deferred turn cleanup releases ownership after post-acquire failure" {
             return error.InjectedFailure;
         }
     };
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     try std.testing.expectError(error.InjectedFailure, FailingStep.run(&coordinator, &first, io_impl.io()));
     try std.testing.expectEqual(@as(?RequestId, null), coordinator.in_turn);
@@ -2824,13 +2824,13 @@ test "coordinator serializes concurrent acquire and release" {
     var threads: [4]std.Io.Future(void) = undefined;
     var started_tasks: usize = 0;
     defer {
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (threads[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (&threads) |*thread| {
-        thread.* = try std.testing.io.concurrent(Worker.run, .{&coordinator});
+        thread.* = try platform.testing.io.concurrent(Worker.run, .{&coordinator});
         started_tasks += 1;
     }
-    for (&threads) |*thread| thread.await(std.testing.io);
+    for (&threads) |*thread| thread.await(platform.testing.io);
 
     const state = coordinator.snapshot();
     try std.testing.expectEqual(@as(usize, 0), state.active_units);

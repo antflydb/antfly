@@ -36,7 +36,7 @@ const backend_types = @import("backend_types.zig");
 const lsm_backend = @import("lsm_backend/mod.zig");
 const lsm_storage = @import("lsm_backend/storage_io.zig");
 const platform = @import("antfly_platform");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const storage_sim = @import("sim_runtime.zig");
 const sim_fixture = @import("sim_fixture.zig");
 const wal_sim_fixture = @import("wal_sim_fixture.zig");
@@ -274,7 +274,7 @@ pub const WAL = struct {
     sync_io: std.Io = if (@import("builtin").os.tag == .freestanding)
         .failing
     else
-        std.Io.Threaded.global_single_threaded.io(),
+        platform.Io.Threaded.global_single_threaded.io(),
     mutex: std.Io.Mutex = .init,
     completed: std.Io.Condition = .init,
     coordinator_active: bool = false,
@@ -1119,7 +1119,7 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
                 );
             }
             if (opts.storage == null and !opts.read_only) {
-                var io_impl = std.Io.Threaded.init(alloc, .{});
+                var io_impl = platform.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
                 try fs_paths.createDirPathPortable(io_impl.io(), path_owned);
                 if (debug_open) std.log.info("wal lsm open ensured dir path={s}", .{path_owned});
@@ -1193,7 +1193,7 @@ fn elapsedSince(started: u64) u64 {
 
 fn sleepNs(ns: u64) void {
     if (ns == 0) return;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Clock.Duration.sleep(.{
         .clock = .awake,
@@ -1213,7 +1213,7 @@ fn initialCommitWindowNs(configured_window_ns: u64) u64 {
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    @import("antfly_platform").sync.lockYielding(mutex);
+    platform.sync.lockYielding(mutex);
 }
 
 fn putWalValue(txn: anytype, key: []const u8, value: []const u8) !void {
@@ -1525,7 +1525,7 @@ fn runConcurrentAppends(io: std.Io, workers: []ConcurrentAppendWorker) !void {
 
 test "wal concurrent append startup failure drains workers without writing" {
     for (0..3) |capacity| {
-        var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
+        var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(capacity),
         });
@@ -1547,7 +1547,7 @@ test "wal concurrent append startup failure drains workers without writing" {
             try std.testing.expect(worker.err == null);
         }
         // Reuse the same WAL and payloads after every partial startup point.
-        try runConcurrentAppends(std.testing.io, &workers);
+        try runConcurrentAppends(platform.testing.io, &workers);
         try std.testing.expectEqual(@as(u64, 3), wal.lastLsn());
         for (workers) |worker| {
             try std.testing.expect(worker.err == null);
@@ -1612,7 +1612,7 @@ fn applyWalSimAction(
                 .{ .wal = wal, .payload = left_payload },
                 .{ .wal = wal, .payload = right_payload },
             };
-            try runConcurrentAppends(std.testing.io, &workers);
+            try runConcurrentAppends(platform.testing.io, &workers);
             const left = workers[0];
             const right = workers[1];
 
@@ -1968,11 +1968,11 @@ fn writeWalReplayFixtureArtifact(
     );
     defer allocator.free(normalized);
 
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
+    var file = try std.Io.Dir.createFileAbsolute(platform.testing.io, path, .{});
+    defer file.close(platform.testing.io);
 
     var file_buf: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &file_buf);
+    var writer = file.writer(platform.testing.io, &file_buf);
     try writer.interface.writeAll(normalized);
     try writer.end();
 
@@ -2105,7 +2105,7 @@ fn replayWalFixtureFile(allocator: Allocator, name: []const u8) !void {
     const path = try std.fmt.allocPrint(allocator, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/{s}", .{name});
     defer allocator.free(path);
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, path, allocator, .limited(64 * 1024));
     defer allocator.free(contents);
 
     var fixture = try wal_sim_fixture.parseFixture(allocator, contents);
@@ -2129,7 +2129,7 @@ fn replayModeledWalFixtureFile(allocator: Allocator, name: []const u8) !void {
     const path = try std.fmt.allocPrint(allocator, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/{s}", .{name});
     defer allocator.free(path);
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, path, allocator, .limited(64 * 1024));
     defer allocator.free(contents);
 
     var fixture = try wal_sim_fixture.parseFixture(allocator, contents);
@@ -2161,11 +2161,11 @@ fn replayModeledWalFixtureFile(allocator: Allocator, name: []const u8) !void {
 }
 
 fn runWalReplayFixtures(allocator: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(platform.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer fixtures_dir.close(std.testing.io);
+    defer fixtures_dir.close(platform.testing.io);
 
     var fixture_names: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -2176,7 +2176,7 @@ fn runWalReplayFixtures(allocator: Allocator) !void {
     var walker = try fixtures_dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_names.append(allocator, try allocator.dupe(u8, entry.path));
@@ -2194,11 +2194,11 @@ fn runWalReplayFixtures(allocator: Allocator) !void {
 }
 
 fn runModeledWalReplayFixtures(allocator: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/replay", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(platform.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/replay", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer fixtures_dir.close(std.testing.io);
+    defer fixtures_dir.close(platform.testing.io);
 
     var fixture_names: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -2209,7 +2209,7 @@ fn runModeledWalReplayFixtures(allocator: Allocator) !void {
     var walker = try fixtures_dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_names.append(allocator, try std.fmt.allocPrint(allocator, "replay/{s}", .{entry.path}));
@@ -2227,11 +2227,11 @@ fn runModeledWalReplayFixtures(allocator: Allocator) !void {
 }
 
 fn runModeledWalCrashFixtures(allocator: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/crash", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(platform.testing.io, "pkg/antfly-embedded/src/storage/wal_sim_fixtures/crash", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer fixtures_dir.close(std.testing.io);
+    defer fixtures_dir.close(platform.testing.io);
 
     var fixture_names: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -2242,7 +2242,7 @@ fn runModeledWalCrashFixtures(allocator: Allocator) !void {
     var walker = try fixtures_dir.walk(allocator);
     defer walker.deinit();
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_names.append(allocator, try std.fmt.allocPrint(allocator, "crash/{s}", .{entry.path}));
@@ -3035,7 +3035,7 @@ test "wal async-io group commit coalesces concurrent appends" {
             .{ .wal = &wal, .payload = "alpha" },
             .{ .wal = &wal, .payload = "beta" },
         };
-        try runConcurrentAppends(std.testing.io, &workers);
+        try runConcurrentAppends(platform.testing.io, &workers);
         const worker_a = workers[0];
         const worker_b = workers[1];
 
@@ -3108,7 +3108,7 @@ test "wal async-io survives concurrent append burst" {
         .{ .wal = &wal, .payload = payload, .appends = 64 },
     };
 
-    try runConcurrentAppends(std.testing.io, &workers);
+    try runConcurrentAppends(platform.testing.io, &workers);
     for (workers) |worker| {
         if (worker.err) |err| return err;
     }
@@ -3141,7 +3141,7 @@ test "wal async-io survives grouped concurrent append burst" {
         .{ .wal = &wal, .payload = payload, .appends = 64 },
     };
 
-    try runConcurrentAppends(std.testing.io, &workers);
+    try runConcurrentAppends(platform.testing.io, &workers);
     for (workers) |worker| {
         if (worker.err) |err| return err;
     }
@@ -3174,7 +3174,7 @@ test "wal async-io survives plain then grouped concurrent runs in one process" {
                 .{ .wal = &wal, .payload = payload, .appends = 64 },
             };
 
-            try runConcurrentAppends(std.testing.io, &workers);
+            try runConcurrentAppends(platform.testing.io, &workers);
             for (workers) |worker| {
                 if (worker.err) |err| return err;
             }
@@ -3620,7 +3620,7 @@ test "wal retains post commit sync when lsm commit is not durable" {
 }
 
 test "wal read-only lsm backend does not create missing root" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path_raw = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/wal-readonly-lsm-missing", .{tmp.sub_path});
@@ -3628,7 +3628,7 @@ test "wal read-only lsm backend does not create missing root" {
     const path = try std.testing.allocator.dupeSentinel(u8, path_raw, 0);
     defer std.testing.allocator.free(path);
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path_raw, .{}));
     var wal = try WAL.open(path, .{
@@ -3662,7 +3662,7 @@ test "wal can use in-memory lsm backend without creating durable state" {
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 
     try std.testing.expectEqual(StorageBackend.lsm, (WalOptions{}).resolvedBackend());
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, std.mem.span(path), .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(platform.testing.io, std.mem.span(path), .{}));
 }
 
 test "wal routes lsm profile options" {
@@ -3681,7 +3681,7 @@ test "wal routes lsm profile options" {
 }
 
 fn cleanupWalDir(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

@@ -642,8 +642,8 @@ fn visionTraceEnabled() bool {
 }
 
 fn nowNs() !u64 {
-    var ts: posix.timespec = undefined;
-    switch (posix.errno(posix.system.clock_gettime(.REALTIME, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (posix.errno(platform.c.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => {},
         else => return error.ClockGetTimeFailed,
     }

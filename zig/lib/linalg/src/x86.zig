@@ -15,7 +15,9 @@
 
 //! Linux x86 kernel selection. No optional instruction executes until both
 //! CPU support and OS preservation of XMM/YMM state have been established.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 pub const enabled = builtin.os.tag == .linux and builtin.cpu.arch == .x86_64;
 pub const Kernel = enum(u8) { portable = 1, avx2 = 2 };
@@ -96,7 +98,7 @@ test "AVX2 requires all CPU features and OS vector state" {
 test "x86 kernel selection is stable during concurrent first use" {
     if (comptime !enabled or builtin.single_threaded) return error.SkipZigTest;
     cached.store(0, .release);
-    var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer runtime.deinit();
     var group: std.Io.Group = .init;
     defer group.cancel(runtime.io());

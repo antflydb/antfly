@@ -19,7 +19,9 @@
 //! binds that transport-agnostic contract to the `/internal/v1/ha/replication`
 //! routes used for primary-to-standby traffic inside a trusted deployment.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const http_common = @import("antfly_local_sources").common_http_http_common;
 const http_operation = @import("http_operation.zig");
@@ -431,7 +433,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     const primary_slots = try allocPrintPath(alloc, name, "primary-slots", nonce);
     defer alloc.free(primary_slots);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};

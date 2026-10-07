@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const vopr = @import("vopr");
 const metadata_api = @import("api.zig");
 const metadata_control_loop = @import("control_loop.zig");
@@ -70,8 +72,8 @@ const internal_keys = @import("antfly_local_sources").storage_internal_keys;
 const storage_sim = @import("antfly_local_sources").storage_sim_runtime;
 const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const raft_trace_logger = @import("../tracing/raft_trace_logger.zig");
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
+const platform_clock = platform.clock;
+const platform_time = platform.time;
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
@@ -491,7 +493,7 @@ fn backendRuntimeForReplicaRoot(
 
 test "metadata VOPR source seeding preserves arbitrary keys and open range bounds" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/vopr-source-seed", .{tmp.sub_path});
     defer alloc.free(root);
@@ -531,7 +533,7 @@ test "metadata VOPR source seeding preserves arbitrary keys and open range bound
 
 test "metadata VOPR split runtime preserves source identity namespace" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-split-identity", .{tmp.sub_path});
@@ -571,9 +573,9 @@ test "metadata VOPR split runtime preserves source identity namespace" {
     defer alloc.free(source_identity_path);
     const retained_identity_path = try std.fmt.allocPrint(alloc, "{s}.retained", .{source_identity_path});
     defer alloc.free(retained_identity_path);
-    try std.Io.Dir.rename(std.Io.Dir.cwd(), source_identity_path, std.Io.Dir.cwd(), retained_identity_path, std.testing.io);
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), source_identity_path, std.Io.Dir.cwd(), retained_identity_path, platform.testing.io);
     try std.testing.expectError(error.FileNotFound, split.observeStatus(7001, 1, 701, 702));
-    try std.Io.Dir.rename(std.Io.Dir.cwd(), retained_identity_path, std.Io.Dir.cwd(), source_identity_path, std.testing.io);
+    try std.Io.Dir.rename(std.Io.Dir.cwd(), retained_identity_path, std.Io.Dir.cwd(), source_identity_path, platform.testing.io);
     // A failed initialization leaves a retryable entry, not a terminal one.
     const initial = try split.observeStatus(7001, 1, 701, 702);
     try std.testing.expect(!initial.bootstrapped);
@@ -600,7 +602,7 @@ test "metadata VOPR split runtime preserves source identity namespace" {
     // Terminal progress belongs to the apply/progress stores, not to the
     // former source primary's identity checkpoint. Observation must not
     // reopen or reseed that primary after the coordinator releases it.
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, source_identity_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, source_identity_path);
     const finalized = try split.observeStatus(7001, 1, 701, 702);
     try std.testing.expectEqual(.finalized, finalized.phase);
     var reconstructed = VoprSplitRuntime{ .replica_root_dir = replica_root_dir };
@@ -2008,7 +2010,7 @@ fn verifyComposedMergePublicTraffic(
 }
 
 fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenario) !void {
-    var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) modeled distributed-data scheduling retains a native storage differential root
+    var tmp = platform.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) modeled distributed-data scheduling retains a native storage differential root
     defer tmp.cleanup();
 
     const initial_group_id = cfg.table_id * 10 + 1;
@@ -2397,7 +2399,7 @@ pub fn reduceDistributedDataVoprCampaign(
 }
 
 fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenario) !void {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const left_group_id = cfg.table_id * 10 + 1;
@@ -4507,7 +4509,7 @@ const VoprSchedulerGate = struct {
             _ = self.contentions.fetchAdd(1, .monotonic);
         }
 
-        self.mutex.lockUncancelable(std.Options.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
         std.debug.assert(!self.owner_valid.load(.acquire));
         self.owner_thread_id.store(thread_id, .monotonic);
         self.depth = 1;
@@ -4523,7 +4525,7 @@ const VoprSchedulerGate = struct {
         if (self.depth != 0) return;
 
         self.owner_valid.store(false, .release);
-        self.mutex.unlock(std.Options.debug_io);
+        self.mutex.unlock(platform.debug_io);
     }
 };
 
@@ -4577,7 +4579,7 @@ pub const MetadataHttpClusterVopr = struct {
         configs: []const raft_vopr.ManagedHttpHostSimulationConfig,
         deps: []const raft_vopr.ManagedHttpHostSimulationDeps,
     ) !MetadataHttpClusterVopr {
-        return initWithFilesystemIo(alloc, metadata_group_id, configs, deps, std.testing.io);
+        return initWithFilesystemIo(alloc, metadata_group_id, configs, deps, platform.testing.io);
     }
 
     pub fn initWithFilesystemIo(
@@ -5469,9 +5471,9 @@ pub const MetadataHttpClusterVopr = struct {
 };
 
 test "failed node replacement leaves a drainable empty slot" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{.{
         .host = .{ .http = .{
@@ -5497,9 +5499,9 @@ test "failed node replacement leaves a drainable empty slot" {
 }
 
 test "metadata wrapper rejects empty node startup and restores external ownership after retry" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     const configs = [_]raft_vopr.ManagedHttpHostSimulationConfig{.{
         .host = .{ .http = .{
@@ -6513,8 +6515,8 @@ const PublicApiLinearizableReadDriver = struct {
     completed_read_index: u64 = 0,
 
     fn io(self: *const @This()) std.Io {
-        const cluster = self.cluster orelse return std.Options.debug_io;
-        return cluster.backendRuntime(self.node_index).io() orelse std.Options.debug_io;
+        const cluster = self.cluster orelse return platform.debug_io;
+        return cluster.backendRuntime(self.node_index).io() orelse platform.debug_io;
     }
 
     fn requestContext(self: *const @This(), buf: []u8, sequence: u64) ![]u8 {
@@ -7220,7 +7222,7 @@ const PublicApiCatalogSource = struct {
     fn iface(self: *@This()) api_table_catalog.CatalogSource {
         return .{
             .ptr = self,
-            .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse std.Options.debug_io)),
+            .io = @import("antfly_runtime_abi").io_abi.Borrow.init(&(self.node.cluster.backendRuntime(self.node.index).io() orelse platform.debug_io)),
             .vtable = &.{
                 .admin_snapshot = adminSnapshot,
                 .free_admin_snapshot = freeAdminSnapshot,
@@ -7471,7 +7473,7 @@ fn deinitPublicApiStack(
 fn PublicApiTestRig(comptime N: usize) type {
     return struct {
         alloc: std.mem.Allocator,
-        http_io: std.Io.Threaded,
+        http_io: platform.Io.Threaded,
         listeners: [N]api_http_test_runtime.Runtime = undefined,
         servers: [N]api_http_server.ApiHttpServer = undefined,
         status_sources: [N]PublicApiStatusSource = undefined,
@@ -7533,7 +7535,7 @@ fn PublicApiTestRig(comptime N: usize) type {
         ) !void {
             self.* = .{
                 .alloc = alloc,
-                .http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size }),
+                .http_io = platform.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size }),
             };
             self.forward_executor.initSharedInPlace(std.heap.page_allocator, .{}, &self.http_io);
             errdefer self.forward_executor.deinit();
@@ -7623,7 +7625,7 @@ pub const VoprPublicClusterFixture = struct {
 
     alloc: std.mem.Allocator,
     sim: *vopr.vopr_io.VoprIo,
-    tmp: std.testing.TmpDir,
+    tmp: platform.testing.TmpDir,
     roots: [node_count][]u8 = undefined,
     root_count: usize = 0,
     catalogs: [node_count][]u8 = undefined,
@@ -7742,7 +7744,7 @@ pub const VoprPublicClusterFixture = struct {
         self.* = .{
             .alloc = alloc,
             .sim = sim,
-            .tmp = std.testing.tmpDir(.{}), // vopr-audit: allow(host_filesystem) unique process-local namespace; all modeled I/O still uses VoprIo
+            .tmp = platform.testing.tmpDir(.{}), // vopr-audit: allow(host_filesystem) unique process-local namespace; all modeled I/O still uses VoprIo
         };
         return self;
     }
@@ -10873,13 +10875,13 @@ fn metadataVoprRunExpandedLivenessWorkload(
 
 const MetadataVoprScratch = struct {
     alloc: std.mem.Allocator,
-    io_impl: *std.Io.Threaded, // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
+    io_impl: *platform.Io.Threaded, // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
     sub_path: []u8,
 
     fn init(alloc: std.mem.Allocator) !MetadataVoprScratch {
-        const io_impl = try alloc.create(std.Io.Threaded); // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
+        const io_impl = try alloc.create(platform.Io.Threaded); // vopr-audit: allow(native_thread_or_io) metadata VOPR retains native storage as an explicit differential backend
         errdefer alloc.destroy(io_impl);
-        io_impl.* = std.Io.Threaded.init(alloc, .{}); // vopr-audit: allow(native_thread_or_io) differential scratch backend only
+        io_impl.* = platform.Io.Threaded.init(alloc, .{}); // vopr-audit: allow(native_thread_or_io) differential scratch backend only
         errdefer io_impl.deinit();
         var random_bytes: [12]u8 = undefined;
         io_impl.io().random(&random_bytes); // vopr-audit: allow(host_entropy) random bytes isolate a normalized scratch path and never enter choices observations or events
@@ -11272,7 +11274,7 @@ fn startMetadataAdminServers(
     comptime N: usize,
     alloc: std.mem.Allocator,
     cluster: *MetadataHttpClusterVopr,
-    shared_io: *std.Io.Threaded,
+    shared_io: *platform.Io.Threaded,
     listeners: *[N]metadata_http_test_runtime.Runtime,
     servers: *[N]metadata_http_server.MetadataHttpServer,
     sources: *[N]MetadataAdminVoprSource,
@@ -11323,7 +11325,7 @@ fn requestNodeShutdownViaVoprAdmin(
 }
 
 test "metadata VOPR http cluster drives table placement convergence" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -11398,7 +11400,7 @@ test "metadata VOPR http cluster drives table placement convergence" {
 }
 
 test "metadata-only cluster preserves external data placements without shadow replicas" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -11478,7 +11480,7 @@ test "metadata VOPR http cluster serves public lifecycle from a non-host node af
     defer _ = vopr_alloc_state.deinit();
     const vopr_alloc = vopr_alloc_state.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(vopr_alloc);
@@ -11669,7 +11671,7 @@ test "metadata VOPR http cluster seeds default admin for auth-enabled public api
     defer _ = vopr_alloc_state.deinit();
     const vopr_alloc = vopr_alloc_state.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(vopr_alloc);
@@ -11763,7 +11765,7 @@ test "metadata VOPR http cluster forwards public split flow from a non-host node
     defer _ = vopr_alloc_state.deinit();
     const vopr_alloc = vopr_alloc_state.allocator();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(vopr_alloc);
@@ -11821,7 +11823,7 @@ test "metadata VOPR http cluster forwards public split flow from a non-host node
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
+    var http_io = platform.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
@@ -11961,7 +11963,7 @@ test "metadata VOPR http cluster forwards public split flow from a non-host node
 }
 
 test "metadata VOPR http cluster forwards public merge flow from a non-host node after public create" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var vopr_alloc_state: LeanVoprAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
@@ -12023,7 +12025,7 @@ test "metadata VOPR http cluster forwards public merge flow from a non-host node
     try cluster.publishClusterNodes(leader_index);
     try cluster.publishClusterStores(leader_index);
 
-    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
+    var http_io = platform.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var metadata_admin_listeners: [4]metadata_http_test_runtime.Runtime = undefined;
@@ -12197,7 +12199,7 @@ test "metadata VOPR http cluster forwards public merge flow from a non-host node
 }
 
 test "metadata VOPR http cluster survives metadata leader restart during placement reconcile" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -12270,7 +12272,7 @@ test "metadata VOPR http cluster survives metadata leader restart during placeme
 }
 
 test "metadata VOPR http cluster drops table topology across leader restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -12357,7 +12359,7 @@ test "metadata VOPR http cluster drops table topology across leader restart" {
 }
 
 test "metadata VOPR recovery skips an isolated candidate" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var stores = [_]raft_engine.core.MemoryStorage{
@@ -12411,7 +12413,7 @@ test "metadata VOPR recovery skips an isolated candidate" {
 }
 
 test "metadata VOPR http cluster converges placement after candidate churn" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -12511,7 +12513,7 @@ test "metadata VOPR http cluster converges placement after candidate churn" {
 }
 
 test "metadata VOPR http cluster drives split intent through the control loop" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -12599,7 +12601,7 @@ test "metadata VOPR http cluster drives split intent through the control loop" {
 }
 
 test "metadata VOPR http cluster drives merge intent through the control loop" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -12694,7 +12696,7 @@ test "metadata VOPR http cluster drives merge intent through the control loop" {
 }
 
 test "metadata VOPR http cluster drives automatic split through the control loop" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -12795,7 +12797,7 @@ test "metadata VOPR http cluster drives automatic split through the control loop
 }
 
 test "metadata VOPR http cluster uses live median key for automatic split planning" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -12896,7 +12898,7 @@ test "metadata VOPR http cluster uses live median key for automatic split planni
 }
 
 test "metadata VOPR http cluster uses remote live median key when metadata leader is not a shard replica" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -13020,7 +13022,7 @@ test "metadata VOPR http cluster uses remote live median key when metadata leade
 }
 
 test "metadata VOPR http cluster completes automatic split after metadata leader restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -13121,7 +13123,7 @@ test "metadata VOPR http cluster completes automatic split after metadata leader
 }
 
 test "metadata VOPR http cluster completes automatic split after metadata leader partition" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -13221,7 +13223,7 @@ test "metadata VOPR http cluster completes automatic split after metadata leader
 }
 
 test "metadata VOPR http cluster completes automatic split under delayed raft transport" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -13326,7 +13328,7 @@ test "metadata VOPR http cluster completes automatic split under delayed raft tr
 }
 
 test "metadata VOPR http cluster completes automatic split after leader restart under delayed raft transport" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -13434,7 +13436,7 @@ test "metadata VOPR http cluster completes automatic split after leader restart 
 }
 
 test "metadata VOPR http cluster completes automatic split after source group leader restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -13536,7 +13538,7 @@ test "metadata VOPR http cluster completes automatic split after source group le
 }
 
 test "metadata VOPR http cluster completes automatic split after destination group leader restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -13663,7 +13665,7 @@ test "metadata VOPR http cluster completes automatic split after destination gro
 }
 
 test "metadata VOPR http cluster completes automatic split after leader partition under delayed raft transport" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -13906,7 +13908,7 @@ test "metadata VOPR distributed data survives split partition node restart and m
 }
 
 test "metadata VOPR http cluster drives automatic merge through the control loop" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14013,7 +14015,7 @@ test "metadata VOPR http cluster drives automatic merge through the control loop
 }
 
 test "metadata VOPR http cluster completes automatic merge after metadata leader restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14119,7 +14121,7 @@ test "metadata VOPR http cluster completes automatic merge after metadata leader
 }
 
 test "metadata VOPR http cluster completes automatic merge after donor group leader restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14226,7 +14228,7 @@ test "metadata VOPR http cluster completes automatic merge after donor group lea
 }
 
 test "metadata VOPR http cluster completes automatic merge after receiver group leader restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14333,7 +14335,7 @@ test "metadata VOPR http cluster completes automatic merge after receiver group 
 }
 
 test "metadata VOPR http cluster completes automatic merge after metadata leader partition" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14438,7 +14440,7 @@ test "metadata VOPR http cluster completes automatic merge after metadata leader
 }
 
 test "metadata VOPR http cluster completes automatic merge under delayed raft transport" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14548,7 +14550,7 @@ test "metadata VOPR http cluster completes automatic merge under delayed raft tr
 }
 
 test "metadata VOPR http cluster completes automatic merge after leader restart under delayed raft transport" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14661,7 +14663,7 @@ test "metadata VOPR http cluster completes automatic merge after leader restart 
 }
 
 test "metadata VOPR http cluster completes automatic merge after leader partition under delayed raft transport" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14887,7 +14889,7 @@ test "metadata VOPR http cluster serves public traffic across automatic merge af
 }
 
 test "metadata VOPR http cluster survives leader restart before forced automatic split reconcile" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -14994,7 +14996,7 @@ test "metadata VOPR http cluster survives leader restart before forced automatic
 }
 
 test "metadata VOPR http cluster publishes split topology after finalize" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -15083,7 +15085,7 @@ test "metadata VOPR http cluster publishes split topology after finalize" {
 }
 
 test "metadata VOPR http cluster publishes merge topology after finalize" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -15181,7 +15183,7 @@ test "metadata VOPR http cluster publishes merge topology after finalize" {
 }
 
 test "metadata VOPR http cluster provisions split destination replicas across nodes" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -15266,7 +15268,7 @@ test "metadata VOPR http cluster provisions split destination replicas across no
 }
 
 test "metadata VOPR http cluster retires merge donor replicas across nodes" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -15442,7 +15444,7 @@ test "metadata VOPR http cluster forwards public table io from a non-host node" 
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -15513,7 +15515,7 @@ test "metadata VOPR http cluster forwards public table io from a non-host node" 
     const client_index: usize = if (actual_host_index == 0) 1 else 0;
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4831));
 
-    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
+    var http_io = platform.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]api_http_test_runtime.Runtime = undefined;
@@ -15693,7 +15695,7 @@ test "metadata VOPR http cluster forwards public table io across split ranges fr
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -15787,7 +15789,7 @@ test "metadata VOPR http cluster forwards public table io across split ranges fr
         if (i != left and i != right) break i;
     } else return error.TestExpectedEqual;
 
-    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
+    var http_io = platform.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]api_http_test_runtime.Runtime = undefined;
@@ -15961,7 +15963,7 @@ test "metadata VOPR http cluster forwards public table io after merge finalizati
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -16060,7 +16062,7 @@ test "metadata VOPR http cluster forwards public table io after merge finalizati
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4851));
     try std.testing.expectEqual(raft_host.HostedReplicaStatus.absent, cluster.node(client_index).status(4852));
 
-    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
+    var http_io = platform.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
 
     var listeners: [3]api_http_test_runtime.Runtime = undefined;
@@ -16141,7 +16143,7 @@ test "metadata VOPR http cluster forwards public table io after merge finalizati
 }
 
 test "metadata VOPR http cluster reconverges placement from committed node membership" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -16251,7 +16253,7 @@ test "metadata VOPR http cluster reconverges placement from committed node membe
 }
 
 test "metadata VOPR http cluster reconverges placement from committed live stores" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -16353,7 +16355,7 @@ test "metadata VOPR http cluster reconverges placement from committed live store
 }
 
 test "metadata VOPR http cluster drains node through shutdown API" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -16445,7 +16447,7 @@ test "metadata VOPR http cluster drains node through shutdown API" {
 }
 
 test "metadata VOPR http cluster ignores live stores without available capacity" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -16551,7 +16553,7 @@ test "metadata VOPR http cluster ignores live stores without available capacity"
 }
 
 test "metadata VOPR http cluster rebalances after store capacity churn" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -16648,7 +16650,7 @@ test "metadata VOPR http cluster rebalances after store capacity churn" {
 }
 
 test "metadata VOPR http cluster survives leader restart after reported store status churn" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -16745,7 +16747,7 @@ test "metadata VOPR http cluster survives leader restart after reported store st
 }
 
 test "metadata VOPR http cluster transfers reconcile lease on leader restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -16914,7 +16916,7 @@ test "metadata VOPR http cluster recovers from a ready persistence stall without
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -17049,14 +17051,14 @@ test "metadata VOPR http cluster recovers from a ready persistence stall without
 }
 
 test "metadata VOPR http cluster load balanced backup retries a real election" {
-    var barrier_io = std.Io.Threaded.init(std.testing.allocator, .{
+    var barrier_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .stack_size = lean_vopr_thread_stack_size,
         .async_limit = .nothing,
         .concurrent_limit = .limited(2),
     });
     defer barrier_io.deinit();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -17134,7 +17136,7 @@ test "metadata VOPR http cluster load balanced backup retries a real election" {
         failure: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.start.waitUncancelable(std.Options.debug_io);
+            self.start.waitUncancelable(platform.debug_io);
             _ = self.entered.fetchAdd(1, .acq_rel);
             self.proof = self.driver.ensure() catch |err| {
                 self.failure = err;
@@ -17175,13 +17177,13 @@ test "metadata VOPR http cluster load balanced backup retries a real election" {
         ConcurrentBarrierWorker.run,
         .{&internal_barrier},
     ) catch |err| {
-        start.set(std.Options.debug_io);
+        start.set(platform.debug_io);
         cluster.scheduler_gate.unlock();
         scheduler_locked = false;
         external_thread.await(barrier_io.io());
         return err;
     };
-    start.set(std.Options.debug_io);
+    start.set(platform.debug_io);
     const concurrent_barrier_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
     while ((entered.load(.acquire) != 2 or
         cluster.scheduler_gate.contentions.load(.acquire) < baseline_contentions + 2) and
@@ -17247,7 +17249,7 @@ test "metadata VOPR http cluster load balanced backup retries a real election" {
         writes[index] = api_table_writes.BoundTableWriteSource.init("docs", &dbs[index]);
     }
 
-    var http_io = std.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
+    var http_io = platform.Io.Threaded.init(leanVoprHttpAllocator(), .{ .stack_size = lean_vopr_thread_stack_size });
     defer http_io.deinit();
     var status_sources: [3]PublicApiStatusSource = undefined;
     var servers: [3]api_http_server.ApiHttpServer = undefined;
@@ -17305,7 +17307,7 @@ test "metadata VOPR http cluster load balanced backup retries a real election" {
 
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/backup-election-output", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
     defer std.testing.allocator.free(backup_root_abs);
@@ -17353,7 +17355,7 @@ test "metadata VOPR http cluster load balanced backup retries a real election" {
 }
 
 test "metadata VOPR http cluster skips reconcile work without lease ownership" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -17418,7 +17420,7 @@ test "metadata VOPR http cluster skips reconcile work without lease ownership" {
 }
 
 test "metadata VOPR http cluster rebalances away from high lease pressure" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -17547,7 +17549,7 @@ test "metadata VOPR http cluster rebalances away from high lease pressure" {
 }
 
 test "metadata VOPR http cluster repairs replica count after store recovery" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -17641,7 +17643,7 @@ test "metadata VOPR http cluster repairs replica count after store recovery" {
 }
 
 test "metadata VOPR http cluster spreads multi-range placement across stores" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -17740,7 +17742,7 @@ test "metadata VOPR http cluster spreads multi-range placement across stores" {
 }
 
 test "metadata VOPR http cluster preserves valid placement when a better store appears" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -17819,7 +17821,7 @@ test "metadata VOPR http cluster preserves valid placement when a better store a
 }
 
 test "metadata VOPR http cluster rotates replica pairs across tables and ranges" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -17941,7 +17943,7 @@ test "metadata VOPR http cluster rotates replica pairs across tables and ranges"
 }
 
 test "metadata VOPR http cluster rebalances one table while preserving another valid placement" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -18081,7 +18083,7 @@ test "metadata VOPR http cluster rebalances one table while preserving another v
 }
 
 test "metadata VOPR http cluster prefers healthy stores before degraded ones" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -18177,7 +18179,7 @@ test "metadata VOPR http cluster prefers healthy stores before degraded ones" {
 }
 
 test "metadata VOPR http cluster prefers cross-domain placement for a range" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -18261,7 +18263,7 @@ test "metadata VOPR http cluster prefers cross-domain placement for a range" {
 }
 
 test "metadata VOPR http cluster mixes health domain and minimal-movement policy" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -18378,7 +18380,7 @@ test "metadata VOPR http cluster mixes health domain and minimal-movement policy
 }
 
 test "metadata VOPR http cluster respects table placement roles under churn" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -18548,7 +18550,7 @@ test "metadata VOPR http cluster respects table placement roles under churn" {
 }
 
 test "metadata VOPR http cluster repairs only when a matching placement role appears" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -18639,7 +18641,7 @@ test "metadata VOPR http cluster repairs only when a matching placement role app
 }
 
 test "metadata VOPR http cluster rebalances after store class promotion and demotion" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);

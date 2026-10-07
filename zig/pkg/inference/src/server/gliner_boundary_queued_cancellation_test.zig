@@ -72,7 +72,7 @@ fn requireMetal(node: *Node) void {
 
 fn controlUntil(node: *Node, deadline_ns: u64) !Control {
     const watchdog = node.hard_cancellation_watchdog orelse return error.MissingHardCancellationWatchdog;
-    return .{ .io = std.testing.io, .deadline_ns = deadline_ns, .hard_cancellation = watchdog.boundary() };
+    return .{ .io = platform.testing.io, .deadline_ns = deadline_ns, .hard_cancellation = watchdog.boundary() };
 }
 
 fn shortControl(node: *Node) !Control {
@@ -291,7 +291,7 @@ const HeldRequest = struct {
                 try std.testing.expect(self.mutex_held);
                 return;
             }
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
 
@@ -338,9 +338,9 @@ test "gliner boundary socket pinned small Metal queued cancellation releases adm
     const a = std.testing.allocator;
     var path: [Io.Dir.max_path_bytes]u8 = undefined;
     const length = if (std.fs.path.isAbsolute(requested))
-        try Io.Dir.realPathFileAbsolute(std.testing.io, requested, &path)
+        try Io.Dir.realPathFileAbsolute(platform.testing.io, requested, &path)
     else
-        try Io.Dir.cwd().realPathFile(std.testing.io, requested, &path);
+        try Io.Dir.cwd().realPathFile(platform.testing.io, requested, &path);
     const directory = path[0..length];
     const name = std.fs.path.basename(directory);
     const bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
@@ -359,7 +359,7 @@ test "gliner boundary socket pinned small Metal queued cancellation releases adm
         var node = try Node.init(a, try config(directory));
         defer node.deinit();
         requireMetal(&node);
-        try node.attachIo(std.testing.io);
+        try node.attachIo(platform.testing.io);
         const transport = try sockets.Loopback.init(a, &node);
         defer transport.deinit();
         // The shared helper establishes Node.serve's authoritative resource

@@ -95,7 +95,7 @@ pub const RaftApplyStoreConfig = struct {
 pub const RaftApplyStore = struct {
     alloc: std.mem.Allocator,
     borrowed_io: ?std.Io,
-    owned_io_impl: ?std.Io.Threaded,
+    owned_io_impl: ?platform.Io.Threaded,
     root_dir: []u8,
     path: []u8,
     groups_root: []u8,
@@ -190,7 +190,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn init(alloc: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
-        var owned_io_impl: ?std.Io.Threaded = if (cfg.io == null)
+        var owned_io_impl: ?platform.Io.Threaded = if (cfg.io == null)
             threaded_io_limits.initService(alloc)
         else
             null;
@@ -2609,7 +2609,7 @@ test "data raft integrity transfer refuses projection only owners and retains na
 
 test "data raft online topology arbitration persists exact rejection and scopes release across reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/arbitration", .{tmp.sub_path});
     defer alloc.free(root);
@@ -2745,7 +2745,7 @@ test "data raft online topology arbitration persists exact rejection and scopes 
 }
 
 test "data raft apply store persists batches across reopen" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-store", .{tmp.sub_path});
@@ -2801,7 +2801,7 @@ test "data raft apply store persists batches across reopen" {
 }
 
 test "data raft protocol barrier persists and transfers in snapshots" {
-    var source_tmp = std.testing.tmpDir(.{});
+    var source_tmp = platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/protocol-source", .{source_tmp.sub_path});
     defer std.testing.allocator.free(source_root);
@@ -2833,7 +2833,7 @@ test "data raft protocol barrier persists and transfers in snapshots" {
 
     const snapshot = try source.snapshotBuilder().buildSnapshot(std.testing.allocator, 45);
     defer std.testing.allocator.free(snapshot);
-    var target_tmp = std.testing.tmpDir(.{});
+    var target_tmp = platform.testing.tmpDir(.{});
     defer target_tmp.cleanup();
     const target_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/protocol-target", .{target_tmp.sub_path});
     defer std.testing.allocator.free(target_root);
@@ -2852,7 +2852,7 @@ test "data raft protocol barrier persists and transfers in snapshots" {
 }
 
 test "data raft protocol request observation never waits for generation preparation" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/protocol-busy", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -2875,7 +2875,7 @@ test "data raft protocol request observation never waits for generation preparat
 }
 
 test "data raft apply store accepts equivalent restart replay with different batch boundaries" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-replay", .{tmp.sub_path});
@@ -3000,7 +3000,7 @@ test "data raft apply store accepts equivalent restart replay with different bat
 }
 
 test "data raft apply store rejects conflicting and malformed advancing overlap" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-forward-overlap", .{tmp.sub_path});
@@ -3082,7 +3082,7 @@ test "data raft apply store rejects conflicting and malformed advancing overlap"
 }
 
 test "data raft apply store accepts restart replay split below the durable watermark" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-replay-split", .{tmp.sub_path});
@@ -3218,7 +3218,7 @@ test "data raft apply store accepts restart replay split below the durable water
 }
 
 test "data raft apply store accepts restart replay split below the durable watermark during identity upgrade" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-replay-upgrade", .{tmp.sub_path});
@@ -3318,7 +3318,7 @@ test "data raft apply store accepts restart replay split below the durable water
 }
 
 test "data raft apply store accepts restart replay split below the durable watermark after identity pruning" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-replay-prune", .{tmp.sub_path});
@@ -3456,7 +3456,7 @@ test "data raft apply store accepts equivalent restart replay with different bat
 }
 
 test "data raft apply store admits one writable owner per root" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-single-writer", .{tmp.sub_path});
@@ -3471,7 +3471,7 @@ test "data raft apply store admits one writable owner per root" {
 }
 
 test "data raft apply store separates normal and admin entries" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-mixed", .{tmp.sub_path});
@@ -3528,7 +3528,7 @@ test "data raft apply store separates normal and admin entries" {
 }
 
 test "data raft apply store applies delete operations into group state" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-delete", .{tmp.sub_path});
@@ -3595,7 +3595,7 @@ test "data raft apply store applies delete operations into group state" {
 }
 
 test "data raft apply store prepared snapshot retains its MVCC view across later writes" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-prepared-snapshot", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -3633,8 +3633,8 @@ test "data raft apply store prepared snapshot retains its MVCC view across later
         }
     };
     var worker = Worker{ .source = source };
-    var thread = try std.testing.io.concurrent(Worker.run, .{&worker});
-    thread.await(std.testing.io);
+    var thread = try platform.testing.io.concurrent(Worker.run, .{&worker});
+    thread.await(platform.testing.io);
     if (worker.failure) |err| return err;
     var materialized = worker.snapshot orelse return error.MissingDataSnapshot;
     defer materialized.deinit(std.heap.page_allocator);
@@ -3655,7 +3655,7 @@ test "data raft apply store prepared snapshot retains its MVCC view across later
 }
 
 test "data raft apply store orders independent groups through separate shards" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-concurrent-groups", .{tmp.sub_path});
@@ -3694,11 +3694,11 @@ test "data raft apply store orders independent groups through separate shards" {
 
     var first = Worker{ .store = &store, .group_id = 1 };
     var second = Worker{ .store = &store, .group_id = 2 };
-    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
-    defer first_thread.await(std.testing.io);
-    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
-    first_thread.await(std.testing.io);
-    second_thread.await(std.testing.io);
+    var first_thread = try platform.testing.io.concurrent(Worker.run, .{&first});
+    defer first_thread.await(platform.testing.io);
+    var second_thread = try platform.testing.io.concurrent(Worker.run, .{&second});
+    first_thread.await(platform.testing.io);
+    second_thread.await(platform.testing.io);
     if (first.result) |err| return err;
     if (second.result) |err| return err;
     try std.testing.expectEqual(@as(u64, 1), (try store.latestBatch(1)).?.commit_index);
@@ -3706,7 +3706,7 @@ test "data raft apply store orders independent groups through separate shards" {
 }
 
 test "data raft apply store persists and enforces group range" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-range", .{tmp.sub_path});
@@ -3773,7 +3773,7 @@ test "data raft apply store persists and enforces group range" {
 }
 
 test "data raft apply store parses empty-start colon range" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-empty-start-range", .{tmp.sub_path});
@@ -3803,7 +3803,7 @@ test "data raft apply store parses empty-start colon range" {
 
 test "data raft apply store captures split handoff and replays destination deltas" {
     const setup_commit_index: u64 = 6;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-src", .{tmp.sub_path});
@@ -3876,7 +3876,7 @@ test "data raft apply store captures split handoff and replays destination delta
 }
 
 test "data raft apply store parses colon-delimited range keys correctly" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-range-colons", .{tmp.sub_path});
@@ -3912,7 +3912,7 @@ test "data raft apply store parses colon-delimited range keys correctly" {
 }
 
 test "data raft apply store persists split destination acknowledgements" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-ack", .{tmp.sub_path});
@@ -3975,7 +3975,7 @@ test "data raft apply store persists split destination acknowledgements" {
 }
 
 test "data raft apply store projects split destination checkpoint range" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-destination-range", .{tmp.sub_path});
@@ -4053,7 +4053,7 @@ test "data raft apply store projects split destination checkpoint range" {
 test "data raft merge source fence persists and transfers in snapshots" {
     const alloc = std.testing.allocator;
     const group_id: u64 = 401;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-source", .{tmp.sub_path});
     defer alloc.free(source_root);
@@ -4220,7 +4220,7 @@ test "data raft merge source fence persists and transfers in snapshots" {
 test "data raft merge receiver checkpoint expands monotonically and snapshots" {
     const alloc = std.testing.allocator;
     const group_id: u64 = 502;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-receiver", .{tmp.sub_path});
     defer alloc.free(source_root);
@@ -4472,7 +4472,7 @@ test "data raft merge receiver checkpoint expands monotonically and snapshots" {
 test "data raft merge accept initializes a pristine replica projection" {
     const alloc = std.testing.allocator;
     const group_id: u64 = 503;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-pristine-receiver", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4521,7 +4521,7 @@ test "data raft merge controls converge across three replicas" {
     const alloc = std.testing.allocator;
     const donor_group_id: u64 = 601;
     const receiver_group_id: u64 = 602;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var roots: [3][]u8 = undefined;
     var roots_initialized: usize = 0;
@@ -4670,7 +4670,7 @@ test "data raft merge controls converge across three replicas" {
 }
 
 test "data raft apply store skips persisted split commands in overlapping replay" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-overlap", .{tmp.sub_path});
@@ -4730,7 +4730,7 @@ test "data raft apply store skips persisted split commands in overlapping replay
 }
 
 test "data raft apply store recovers committed split start after projection generation gap" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-generation-gap", .{tmp.sub_path});
@@ -4789,9 +4789,9 @@ test "data raft apply store recovers committed split start after projection gene
 }
 
 test "data raft split cursors are stable across apply batching and acknowledge same-batch writes" {
-    var combined_tmp = std.testing.tmpDir(.{});
+    var combined_tmp = platform.testing.tmpDir(.{});
     defer combined_tmp.cleanup();
-    var partitioned_tmp = std.testing.tmpDir(.{});
+    var partitioned_tmp = platform.testing.tmpDir(.{});
     defer partitioned_tmp.cleanup();
     const combined_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/combined", .{combined_tmp.sub_path});
     defer std.testing.allocator.free(combined_root);
@@ -4869,7 +4869,7 @@ test "data raft split cursors are stable across apply batching and acknowledge s
 }
 
 test "data raft apply store recovers exact split replay after injected projection corruption" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-split-watermark-lag", .{tmp.sub_path});
@@ -4950,7 +4950,7 @@ test "data raft apply store recovers exact split replay after injected projectio
 }
 
 test "data raft apply store rejects mismatched terminal split identity" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-terminal-identity", .{tmp.sub_path});
@@ -5021,7 +5021,7 @@ test "data raft apply store rejects mismatched terminal split identity" {
 }
 
 test "data raft apply store seeds pre-raft snapshots once at reserved index zero" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-seed", .{tmp.sub_path});
@@ -5077,7 +5077,7 @@ test "data raft apply store seeds pre-raft snapshots once at reserved index zero
 }
 
 test "data raft apply store reconciles an inherited document root at an exact watermark" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-reconcile", .{tmp.sub_path});
@@ -5151,7 +5151,7 @@ test "data raft apply store reconciles an inherited document root at an exact wa
 }
 
 test "data raft apply store reconciles inherited documents while preserving active split control" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-active-split-reconcile", .{tmp.sub_path});
@@ -5218,7 +5218,7 @@ test "data raft apply store reconciles inherited documents while preserving acti
 }
 
 test "data raft apply store rejects a regressing source generation during active split" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-active-split-regression", .{tmp.sub_path});
@@ -5258,7 +5258,7 @@ test "data raft apply store rejects a regressing source generation during active
 }
 
 test "data raft apply store transition reads fail fast during generation staging" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-transition-ready", .{tmp.sub_path});
@@ -5303,7 +5303,7 @@ test "data raft apply store transition reads fail fast during generation staging
 }
 
 test "data raft apply store installs snapshot watermark atomically" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-watermark-source", .{tmp.sub_path});
     defer std.testing.allocator.free(source_root);
@@ -5399,9 +5399,9 @@ test "data raft apply store installs snapshot watermark atomically" {
 }
 
 test "data raft apply store refuses stale snapshot projection regression" {
-    var source_tmp = std.testing.tmpDir(.{});
+    var source_tmp = platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
-    var target_tmp = std.testing.tmpDir(.{});
+    var target_tmp = platform.testing.tmpDir(.{});
     defer target_tmp.cleanup();
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/stale-snapshot-source", .{source_tmp.sub_path});
     defer std.testing.allocator.free(source_root);
@@ -5453,7 +5453,7 @@ test "data raft apply store refuses stale snapshot projection regression" {
 }
 
 test "data raft snapshot staging blocks only the target group" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-concurrency-source", .{tmp.sub_path});
     defer std.testing.allocator.free(source_root);
@@ -5513,11 +5513,11 @@ test "data raft snapshot staging blocks only the target group" {
     test_block_snapshot_staging.store(true, .release);
     defer test_block_snapshot_staging.store(false, .release);
     var install_ctx = InstallContext{ .store = &target, .snapshot = snapshot };
-    var install_thread = try std.testing.io.concurrent(InstallContext.run, .{&install_ctx});
+    var install_thread = try platform.testing.io.concurrent(InstallContext.run, .{&install_ctx});
     var install_joined = false;
     defer if (!install_joined) {
         test_block_snapshot_staging.store(false, .release);
-        install_thread.await(std.testing.io);
+        install_thread.await(platform.testing.io);
     };
 
     var attempts: usize = 0;
@@ -5538,17 +5538,17 @@ test "data raft snapshot staging blocks only the target group" {
     }
 
     var read_ctx = ReadContext{ .store = &target };
-    var read_thread = try std.testing.io.concurrent(ReadContext.run, .{&read_ctx});
+    var read_thread = try platform.testing.io.concurrent(ReadContext.run, .{&read_ctx});
     var read_joined = false;
-    defer if (!read_joined) read_thread.await(std.testing.io);
+    defer if (!read_joined) read_thread.await(platform.testing.io);
     attempts = 0;
     while (!read_ctx.completed.load(.acquire) and attempts < 100_000) : (attempts += 1) platform.time.yieldBriefly();
     const colliding_group_completed_during_staging = read_ctx.completed.load(.acquire);
 
     test_block_snapshot_staging.store(false, .release);
-    read_thread.await(std.testing.io);
+    read_thread.await(platform.testing.io);
     read_joined = true;
-    install_thread.await(std.testing.io);
+    install_thread.await(platform.testing.io);
     install_joined = true;
     if (read_ctx.failure) |err| return err;
     if (install_ctx.failure) |err| return err;
@@ -5556,7 +5556,7 @@ test "data raft snapshot staging blocks only the target group" {
 }
 
 test "data raft apply store bounds and retires resource-managed group owners" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/bounded-group-owners", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -5607,7 +5607,7 @@ test "data raft apply store bounds and retires resource-managed group owners" {
 }
 
 test "data raft apply placement transition retains union on abort and retires without allocation" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/placement-transition", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -5647,7 +5647,7 @@ test "data raft apply placement transition retains union on abort and retires wi
 }
 
 test "data raft apply placement transition retires high cardinality summaries in one pass" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/placement-transition-scale", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -5696,7 +5696,7 @@ test "data raft apply placement transition retires high cardinality summaries in
 }
 
 test "data apply store replay is idempotent when applied watermark lags WAL state" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-apply-replay-idempotent", .{tmp.sub_path});

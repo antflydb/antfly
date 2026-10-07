@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const artifact_store = @import("store.zig");
@@ -788,8 +790,8 @@ fn verifyOpenFileContent(file: std.Io.File, io: std.Io, expected_byte_len: u64, 
     try cancellation.check();
 }
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {

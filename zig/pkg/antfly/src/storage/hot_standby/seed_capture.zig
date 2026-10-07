@@ -34,7 +34,9 @@
 //! generation is durably marked aborted and its seeding slot is dropped. A new
 //! generation must be requested. No partial directory is ever published.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Crc32 = @import("antfly_hash").Crc32;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -258,7 +260,7 @@ pub fn prunePublishedGenerations(
     if (!validation.isIdentifier(request.generation)) return error.InvalidCaptureGeneration;
     if (!validation.isIdentifier(request.slot_name)) return error.InvalidSlotName;
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const generation_root = try std.fs.path.join(alloc, &.{ request.capture_root, generations_dir_name, request.generation });
@@ -431,7 +433,7 @@ fn captureHeld(alloc: Allocator, request: CaptureRequest, options: CaptureOption
     var plan_hex: [Sha256.digest_length * 2]u8 = undefined;
     encodeHex(&plan_hex, &plan_digest);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1301,11 +1303,11 @@ fn testPrimaryPaths(alloc: Allocator, root: []const u8, label: []const u8) !Test
 }
 
 fn writeTestFile(path: []const u8, body: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(std.testing.io, parent);
-    var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
-    defer file.close(std.testing.io);
-    try file.writeStreamingAll(std.testing.io, body);
-    try file.sync(std.testing.io);
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(platform.testing.io, parent);
+    var file = try std.Io.Dir.cwd().createFile(platform.testing.io, path, .{ .truncate = true });
+    defer file.close(platform.testing.io);
+    try file.writeStreamingAll(platform.testing.io, body);
+    try file.sync(platform.testing.io);
 }
 
 const BarrierProbe = struct {
@@ -1321,7 +1323,7 @@ const BarrierProbe = struct {
     fn afterHook(raw: ?*anyopaque) void {
         const self: *BarrierProbe = @ptrCast(@alignCast(raw.?));
         self.exclusive.store(true, .release);
-        while (!self.allow_copy.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        while (!self.allow_copy.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 };
 
@@ -1344,15 +1346,15 @@ fn waitFor(flag: *const std.atomic.Value(bool)) !void {
     var attempts: usize = 0;
     while (!flag.load(.acquire)) : (attempts += 1) {
         if (attempts > 1_000_000) return error.TestTimedOut;
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 }
 
 test "storage.hot_standby seed capture waits for in-flight mutation and excludes post-checkpoint state" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const paths = try testPrimaryPaths(alloc, root, "capture-barrier");
     defer paths.deinit(alloc);
@@ -1397,14 +1399,14 @@ test "storage.hot_standby seed capture waits for in-flight mutation and excludes
         } },
     };
     defer if (worker.result) |*result| result.deinit(alloc);
-    var thread = try std.testing.io.concurrent(CaptureWorker.run, .{&worker});
+    var thread = try platform.testing.io.concurrent(CaptureWorker.run, .{&worker});
     defer {
         if (mutation_active) {
             mutation.release();
             mutation_active = false;
         }
         probe.allow_copy.store(true, .release);
-        thread.await(std.testing.io);
+        thread.await(platform.testing.io);
     }
     try waitFor(&probe.before);
     try std.testing.expect(!probe.exclusive.load(.acquire));
@@ -1414,7 +1416,7 @@ test "storage.hot_standby seed capture waits for in-flight mutation and excludes
     try waitFor(&probe.exclusive);
     try std.testing.expect(barrier.tryAcquireShared() == null);
     probe.allow_copy.store(true, .release);
-    thread.await(std.testing.io);
+    thread.await(platform.testing.io);
     if (worker.capture_error) |err| return err;
     var result = worker.result orelse return error.TestExpectedEqual;
     worker.result = null;
@@ -1427,7 +1429,7 @@ test "storage.hot_standby seed capture waits for in-flight mutation and excludes
 
     const captured_path = try std.fs.path.join(alloc, &.{ result.content_root, "database/catalog/state" });
     defer alloc.free(captured_path);
-    const captured = try readFileAlloc(std.testing.io, alloc, captured_path, 128);
+    const captured = try readFileAlloc(platform.testing.io, alloc, captured_path, 128);
     defer alloc.free(captured);
     try std.testing.expectEqualStrings("committed", captured);
     const manifest = try backup_manifest.decodeAlloc(alloc, result.manifest_bytes);
@@ -1439,9 +1441,9 @@ test "storage.hot_standby seed capture waits for in-flight mutation and excludes
 
 test "storage.hot_standby prepared seed capture releases mutation barrier after checkpoint before copying" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const primary_paths = try testPrimaryPaths(alloc, root, "prepared-release");
     defer primary_paths.deinit(alloc);
@@ -1494,9 +1496,9 @@ test "storage.hot_standby prepared seed capture releases mutation barrier after 
 
 test "storage.hot_standby seed capture resumes every durable local crash boundary without duplicate backup end" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const source_path = try std.fs.path.join(alloc, &.{ root, "live/catalog" });
     defer alloc.free(source_path);
@@ -1551,9 +1553,9 @@ test "storage.hot_standby seed capture resumes every durable local crash boundar
 
 test "storage.hot_standby seed capture burns a generation whose local snapshot was incomplete" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const paths = try testPrimaryPaths(alloc, root, "capture-abort");
     defer paths.deinit(alloc);
@@ -1583,9 +1585,9 @@ test "storage.hot_standby seed capture burns a generation whose local snapshot w
 
 test "storage.hot_standby seed capture gc requires a remotely verified v2 COMPLETE checkpoint" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const paths = try testPrimaryPaths(alloc, root, "capture-publish-gc");
     defer paths.deinit(alloc);
@@ -1626,7 +1628,7 @@ test "storage.hot_standby seed capture gc requires a remotely verified v2 COMPLE
     }));
     const marker_path = try std.fs.path.join(alloc, &.{ captured.generation_root, local_generation_gc.marker_name });
     defer alloc.free(marker_path);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, marker_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, marker_path, .{}));
 
     var published = try seed_artifact.publish(alloc, store, .{
         .generation = "gen-published",
@@ -1646,14 +1648,14 @@ test "storage.hot_standby seed capture gc requires a remotely verified v2 COMPLE
     });
     defer pruned.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), pruned.deleted_generations);
-    try std.Io.Dir.cwd().access(std.testing.io, marker_path, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, marker_path, .{});
 }
 
 test "storage.hot_standby seed capture v2 binds COMPLETE and journals publication before success" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const paths = try testPrimaryPaths(alloc, root, "capture-bound");
     defer paths.deinit(alloc);

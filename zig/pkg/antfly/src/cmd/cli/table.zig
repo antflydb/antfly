@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const ant_json = @import("antfly-json");
 const antfly_client = @import("antfly-client");
 const httpx = antfly_client.httpx;
@@ -367,7 +369,7 @@ test "table create inline configs reject malformed unknown and duplicate definit
 
 test "table create sends the exact quickstart inline index through the HTTP client" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
 
     const Assert = struct {
         fn request(info: httpx.testing_mod.RequestInfo) !void {
@@ -410,7 +412,7 @@ test "table create sends the exact quickstart inline index through the HTTP clie
                 \\{"name":"title_body","type":"embeddings","template":"{{title}} {{body}}","embedder":{"provider":"antfly","model":"antflydb/clipclap"},"chunker":{"provider":"antfly","text":{"target_tokens":200,"overlap_tokens":25}}}
                 ,
             };
-            var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+            var args = platform.process.argsIterator(argv[0..]);
             createTable(std.testing.allocator, test_io, c, &args) catch return;
             success.store(true, .release);
         }

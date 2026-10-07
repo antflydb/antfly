@@ -189,7 +189,7 @@ test "db transaction recovery enabled requires backend runtime io" {
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = @import("antfly_platform").testing.io,
     });
     defer runtime.deinit();
 
@@ -2347,7 +2347,7 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
     const baseline = @import("antfly_local_sources").storage_db_artifact_producer_baseline;
     const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
     const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/producer-baseline", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2562,7 +2562,7 @@ test "db ordered artifact inventory producer baseline resumes and includes behin
 test "db ordered artifact inventory upload backpressure advances apply without false completion" {
     const alloc = std.testing.allocator;
     const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/publication-upload-admission", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2616,7 +2616,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
     const generations = @import("antfly_local_sources").storage_db_artifact_chunk_generation;
     const chunks = @import("antfly_local_sources").storage_db_artifact_chunk_manifest;
     const planning = @import("antfly_local_sources").storage_db_artifact_graph_planning;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-head-fence", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2711,7 +2711,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
     const generations = @import("antfly_local_sources").storage_db_artifact_chunk_generation;
     const chunks = @import("antfly_local_sources").storage_db_artifact_chunk_manifest;
     const planning = @import("antfly_local_sources").storage_db_artifact_graph_planning;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-extraction-head", .{tmp.sub_path});
     defer alloc.free(path);
@@ -2871,7 +2871,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
     const publication = @import("antfly_local_sources").storage_db_artifact_publication;
     const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
     const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/accepted-publication-upload", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3132,7 +3132,7 @@ test "db ordered artifact inventory upload resumes across restart and atomically
     const publication = @import("antfly_local_sources").storage_db_artifact_publication;
     const transport = @import("antfly_local_sources").storage_db_artifact_publication_transport;
     const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/publication-upload", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3204,7 +3204,7 @@ test "db ordered artifact inventory idle upload retirement replays across owners
     const publication = @import("antfly_local_sources").storage_db_artifact_publication;
     const codec = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
     const obligations = @import("antfly_local_sources").storage_db_artifact_producer_obligations;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     const payload = try alloc.alloc(u8, codec.chunk_bytes);
@@ -3345,7 +3345,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
             defer result.deinit();
         }
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ordered-chunk-publication", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3506,7 +3506,7 @@ test "db ordered artifact inventory asset publication authenticates output and p
             defer prepared.deinit();
         }
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/asset-ordered-output", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3590,7 +3590,7 @@ test "db ordered artifact inventory full text replay publishes physical coverage
     const alloc = std.testing.allocator;
     const publication = @import("antfly_local_sources").storage_db_artifact_publication;
     const certificates = @import("antfly_local_sources").storage_db_artifact_projection_certificate;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/physical-projection-seal", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3776,7 +3776,7 @@ test "db ordered artifact inventory materialization replay cut is owner local at
     const publication = @import("antfly_local_sources").storage_db_artifact_publication;
     const source_gap = @import("antfly_local_sources").storage_db_artifact_source_gap;
     var source_guard: source_gap.Guard = undefined;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/materialization-replay-cut", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3863,7 +3863,7 @@ test "db ordered artifact inventory materialization replay cut is owner local at
 test "db ordered artifact inventory stale publications commit rejection without artifact or replay progress" {
     const alloc = std.testing.allocator;
     const publication = @import("antfly_local_sources").storage_db_artifact_publication;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/publication-rejection", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3938,7 +3938,7 @@ test "db ordered artifact inventory commits receipt and detects catalog drift ac
     try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("antfly_local_sources").storage_db_artifact_inventory.ordered_key));
     try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("antfly_local_sources").storage_db_artifact_inventory.local_key));
     try std.testing.expect(!portable_backup.isPortableMetadataKey(@import("antfly_local_sources").storage_db_artifact_reconcile_intent.key));
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ordered-artifacts", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3983,7 +3983,7 @@ test "db ordered artifact inventory commits receipt and detects catalog drift ac
 
 test "relational index system online admission defers during index structural mutation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source-admission-index-guard", .{tmp.sub_path});
     defer alloc.free(path);
@@ -4108,7 +4108,7 @@ test "db transaction recovery observes admission replacement after execution bin
 
 test "db ordered artifact inventory follower completes initial build under durable admission across reopen" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = @import("antfly_platform").testing.tmpDir(.{});
     defer tmp.cleanup();
     const leader_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/admission-leader", .{tmp.sub_path});
     defer alloc.free(leader_path);

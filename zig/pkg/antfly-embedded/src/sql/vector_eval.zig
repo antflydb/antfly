@@ -15,7 +15,9 @@
 
 //! Bounded instruction-major expression kernels. Lazy or unsupported programs
 //! fall back intact to scalar evaluation; unreachable errors stay unreachable.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
 const Binary = @import("ast.zig").Scalar.Binary;
@@ -699,9 +701,9 @@ test "SQL shared scheduled column kernels match scalar values over permuted null
     const refs = try a.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
     defer a.free(refs);
     complete.batch.row_refs = refs;
-    const scheduled = (try evaluateColumnsScheduled(a, &program, complete, &definitions, &.{}, std.testing.io)).?;
+    const scheduled = (try evaluateColumnsScheduled(a, &program, complete, &definitions, &.{}, platform.testing.io)).?;
     defer a.free(scheduled);
-    const fused = try evaluateColumnsManyScheduled(a, &.{ &program, &program }, complete, &definitions, &.{}, std.testing.io);
+    const fused = try evaluateColumnsManyScheduled(a, &.{ &program, &program }, complete, &definitions, &.{}, platform.testing.io);
     defer {
         for (fused) |result| if (result) |vector| a.free(vector);
         a.free(fused);

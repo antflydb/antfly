@@ -23,7 +23,9 @@
 // The JSON header maps tensor names to metadata:
 //   { "tensor_name": { "dtype": "F32", "shape": [768, 512], "data_offsets": [0, 1572864] } }
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const DType = @import("../backends/tensor.zig").DType;
 
@@ -688,7 +690,7 @@ fn exerciseOwnedTensor(a: std.mem.Allocator) !void {
 
 test "safetensors tensor bounds and owned shape allocation failures are safe" {
     try exerciseOwnedTensor(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseOwnedTensor, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseOwnedTensor, .{});
 }
 
 fn exerciseBorrowedSnapshot(a: std.mem.Allocator) !void {
@@ -711,7 +713,7 @@ fn exerciseBorrowedSnapshot(a: std.mem.Allocator) !void {
 
 test "safetensors borrowed immutable snapshot keeps caller bytes and zero-copy aligned tensors through allocation failures" {
     try exerciseBorrowedSnapshot(std.testing.allocator);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseBorrowedSnapshot, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseBorrowedSnapshot, .{});
 }
 
 test "safetensors unaligned mapped payload becomes an aligned owned tensor" {
@@ -726,7 +728,7 @@ test "safetensors unaligned mapped payload becomes an aligned owned tensor" {
     @memset(bytes[8 + json.len ..][0..padding], ' ');
     const values = [_]f32{ 1.25, -2.5 };
     @memcpy(bytes[8 + header_len ..], std.mem.asBytes(&values));
-    var temporary = std.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/unaligned.safetensors", .{temporary.sub_path});
     defer a.free(path);
@@ -772,13 +774,13 @@ test "artifact validation checks shard headers and index membership" {
     @memcpy(shard_bytes[8..][0..shard_json.len], shard_json);
     @memset(shard_bytes[8 + shard_json.len ..], 0);
 
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model-00001-of-00001.safetensors",
         .data = &shard_bytes,
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.safetensors.index.json",
         .data =
         \\{"weight_map":{"weight":"model-00001-of-00001.safetensors"}}
@@ -805,7 +807,7 @@ test "artifact validation checks shard headers and index membership" {
         "model-00001-of-00001.safetensors",
     ));
 
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.safetensors.index.json",
         .data =
         \\{"weight_map":{"other":"model-00001-of-00001.safetensors"}}
@@ -819,9 +821,9 @@ test "artifact validation checks shard headers and index membership" {
 
 test "artifact validation rejects shard path traversal" {
     const allocator = std.testing.allocator;
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.safetensors.index.json",
         .data =
         \\{"weight_map":{"weight":"../outside.safetensors"}}

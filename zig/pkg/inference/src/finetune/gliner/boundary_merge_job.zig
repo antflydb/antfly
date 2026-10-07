@@ -360,13 +360,13 @@ fn parseAllocationFailures(a: Allocator, bytes: []const u8) !void {
 
 test "boundary merge job strict versioned config and exact snapshot ownership" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const json = try std.json.Stringify.valueAlloc(a, testConfig(), .{});
     defer a.free(json);
     var parsed = try parse(a, json);
     defer parsed.deinit();
     try std.testing.expectEqual(testConfig().expected_source, parsed.value.expected_source);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, parseAllocationFailures, .{json});
+    try platform.allocator.checkAllAllocationFailures(a, parseAllocationFailures, .{json});
     const invalid_numbers = [_][]const u8{ "-1", "1.5", "\"2\"", "true", "18446744073709551616" };
     for (invalid_numbers) |number| {
         const invalid = try std.fmt.allocPrint(a, "{{\"version\":{s}{s}", .{ number, json["{\"version\":1".len..] });
@@ -379,7 +379,7 @@ test "boundary merge job strict versioned config and exact snapshot ownership" {
     const duplicate = try std.fmt.allocPrint(a, "{{\"version\":1,{s}", .{json[1..]});
     defer a.free(duplicate);
     try std.testing.expectError(error.DuplicateField, parse(a, duplicate));
-    var temporary = std.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const directory = try temporary.dir.realPathFileAlloc(io, ".", a);
     defer a.free(directory);
@@ -427,8 +427,8 @@ test "boundary merge job admission charges source adapter import peak scratch an
 
 test "boundary merge job adapter descriptors reject receipt presence and changed snapshots" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var temporary = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try temporary.dir.realPathFileAlloc(io, ".", a);
     defer a.free(path);
@@ -470,7 +470,7 @@ test "boundary merge job bounded setup owner recovers declared and backing OOM w
     const a = std.testing.allocator;
     const bytes = try std.json.Stringify.valueAlloc(a, testConfig(), .{});
     defer a.free(bytes);
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, snapshotAllocationFailures, .{bytes});
+    try platform.allocator.checkAllAllocationFailures(a, snapshotAllocationFailures, .{bytes});
     try std.testing.expectError(error.BoundaryMergeJobConfigLimitExceeded, parseSnapshotBounded(a, bytes, @sizeOf(ConfigOwner) + 128));
     var snapshot = try parseSnapshot(a, bytes);
     defer snapshot.deinit();

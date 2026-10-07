@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const relationship_filter = @import("antfly_local_sources").graph_relationship_filter;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const raft_mod = struct {
@@ -49,8 +51,8 @@ const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
-const platform_time = @import("antfly_platform").time;
-const platform_sync = @import("antfly_platform").sync;
+const platform_time = platform.time;
+const platform_sync = platform.sync;
 const indexes_api = @import("indexes.zig");
 const query_contract = @import("antfly_local_sources").api_query_contract;
 const graph_query_diagnostic = @import("graph_query_diagnostic.zig");
@@ -15412,7 +15414,7 @@ test "distributed graph stops after single retry on repeated topology churn" {
 
 test "distributed graph fans out per-group expand and hydrate with worker io" {
     const TestState = struct {
-        io_impl: *std.Io.Threaded,
+        io_impl: *platform.Io.Threaded,
         expand_calls: std.atomic.Value(u32) = .init(0),
         hydrate_calls: std.atomic.Value(u32) = .init(0),
         expand_active: std.atomic.Value(u32) = .init(0),
@@ -15573,7 +15575,7 @@ test "distributed graph fans out per-group expand and hydrate with worker io" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var state = TestState{ .io_impl = &io_impl };
     var cancellation = std.atomic.Value(bool).init(false);

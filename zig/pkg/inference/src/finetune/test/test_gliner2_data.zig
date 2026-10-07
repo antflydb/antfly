@@ -336,9 +336,9 @@ test "legacy entity rows reject Unicode annotations instead of using ASCII match
         \\{"text":"ÉCOLE","entities":[{"text":"école","label":"place","start":0,"end":6}]}
         \\
     ;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "legacy-unicode.jsonl", .data = data });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "legacy-unicode.jsonl", .data = data });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/legacy-unicode.jsonl", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -412,9 +412,9 @@ test "upstream schema conditioning metadata is parsed and encoded" {
         \\{"input":"Alice built Acme.","output":{"entities":{"person":["Alice"]},"entity_descriptions":{"person":"a human"},"json_structures":[{"product":{"name":"Acme"}}],"json_descriptions":{"product":{"name":"a company"}},"classifications":[{"task":"sentiment","labels":["positive","negative"],"true_label":["positive"],"multi_label":true,"prompt":"Choose a sentiment.","examples":[["Great.","positive"],["Bad.","negative"]],"label_descriptions":{"positive":"favorable","negative":"unfavorable"}}]}}
         \\
     ;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "conditioned.jsonl", .data = data });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "conditioned.jsonl", .data = data });
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/conditioned.jsonl", .{tmp.sub_path});
     defer allocator.free(path);
 
@@ -525,12 +525,12 @@ test "malformed upstream schema conditioning metadata fails closed in both loade
         },
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/invalid-conditioning.jsonl", .{tmp.sub_path});
     defer allocator.free(path);
     for (cases) |case| {
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "invalid-conditioning.jsonl", .data = case.data });
+        try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "invalid-conditioning.jsonl", .data = case.data });
         try std.testing.expectError(case.expected, gliner2_data.loadExamples(allocator, path, null));
         try std.testing.expectError(case.expected, gliner2_data.loadTrainingRecords(allocator, path, null));
     }
@@ -590,12 +590,12 @@ test "schema identifiers reject surrounding ASCII whitespace before target const
         },
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/whitespace.jsonl", .{tmp.sub_path});
     defer allocator.free(path);
     for (cases) |case| {
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "whitespace.jsonl", .data = case.data });
+        try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "whitespace.jsonl", .data = case.data });
         try std.testing.expectError(case.expected, gliner2_data.loadExamples(allocator, path, null));
         try std.testing.expectError(case.expected, gliner2_data.loadTrainingRecords(allocator, path, null));
     }
@@ -980,9 +980,9 @@ test "GLiNER2 negative fixture is explicit and unresolved annotations fail" {
     try std.testing.expectEqual(@as(usize, 0), stats.classification_true_label_count);
     try std.testing.expectEqual(@as(usize, 0), stats.span_field_annotations);
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "invalid.jsonl",
         .data =
         \\{"input":"Mary visited London.","output":{"entities":{"person":["John"]}}}
@@ -999,9 +999,9 @@ test "GLiNER2 negative fixture is explicit and unresolved annotations fail" {
 
 test "GLiNER2 upstream data labels every mention and appends terminal punctuation" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "repeated.jsonl",
         .data =
         \\{"input":"Café met café","output":{"entities":{"place":["café"]}}}
@@ -1186,9 +1186,9 @@ test "GLiNER2 upstream Unicode splitter preserves byte boundaries and special br
 
 test "GLiNER2 upstream annotations use Unicode lowercase matching" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "unicode.jsonl",
         .data =
         \\{"input":"ÉCOLE met Москва","output":{"entities":{"place":["école"],"city":["москва"]}}}

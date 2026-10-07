@@ -19,7 +19,9 @@
 //! the borrowed I/O lane; its remaining capacity stays available to durable
 //! commits and nested storage operations. A handle must be joined before its
 //! context is destroyed, and all handles before the scheduler is destroyed.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Io = std.Io;
 
 pub const Scheduler = struct {
@@ -267,7 +269,7 @@ pub const Scheduler = struct {
 };
 
 test "maintenance scheduler cancellation closes admission before owner destruction" {
-    var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+    var threaded = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
     defer threaded.deinit();
     const io = threaded.io();
     const scheduler = try Scheduler.create(std.testing.allocator, io, 2);
@@ -284,7 +286,7 @@ test "maintenance scheduler cancellation closes admission before owner destructi
 
 test "maintenance scheduler handles hundreds of parked owners with bounded runnable capacity" {
     inline for (.{ 1, 2 }) |capacity| {
-        var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+        var threaded = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
         defer threaded.deinit();
         const io = threaded.io();
         const scheduler = try Scheduler.create(std.testing.allocator, io, capacity);
@@ -324,7 +326,7 @@ test "maintenance scheduler handles hundreds of parked owners with bounded runna
 }
 
 test "maintenance wake during active pass is retained and cancel joins its invocation" {
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const scheduler = try Scheduler.create(std.testing.allocator, io, 1);
     defer scheduler.destroy();
     const Probe = struct {
@@ -356,7 +358,7 @@ test "maintenance wake during active pass is retained and cancel joins its invoc
 }
 
 test "maintenance producer waiters cannot consume derived publication capacity" {
-    var threaded = Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(5) });
+    var threaded = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(5) });
     defer threaded.deinit();
     const io = threaded.io();
     const scheduler = try Scheduler.create(std.testing.allocator, io, Scheduler.cpuLimitedCapacity(1, 4));
@@ -393,7 +395,7 @@ test "maintenance producer waiters cannot consume derived publication capacity" 
 }
 
 test "maintenance scheduler shutdown fences registration and drains owner handles" {
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const scheduler = try Scheduler.create(std.testing.allocator, io, 4);
     const Probe = struct {
         fn step(_: *@This()) ?u64 {

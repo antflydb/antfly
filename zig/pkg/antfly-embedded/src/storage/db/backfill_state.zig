@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Crc32 = @import("antfly_hash").Crc32;
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
@@ -112,7 +114,7 @@ pub const RebuildState = struct {
             if (self.storage == null) return null;
             return try self.checkWithIo(alloc, undefined);
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.checkWithIo(alloc, io_impl.io());
     }
@@ -205,7 +207,7 @@ pub const RebuildState = struct {
             if (self.storage == null) return;
             return try self.updateWithIo(undefined, key);
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try self.updateWithIo(io_impl.io(), key);
     }
@@ -235,7 +237,7 @@ pub const RebuildState = struct {
             if (self.storage == null) return;
             return try self.clearWithIo(undefined);
         }
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try self.clearWithIo(io_impl.io());
     }
@@ -562,11 +564,11 @@ fn keyToU64(key: []const u8) u64 {
 }
 
 fn createTestStateRoot(path: []const u8) !void {
-    try fs_paths.createDirPathPortable(std.testing.io, path);
+    try fs_paths.createDirPathPortable(platform.testing.io, path);
 }
 
 test "rebuild state round trips and clears" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -587,7 +589,7 @@ test "rebuild state round trips and clears" {
 }
 
 test "rebuild state rejects key corruption" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-corrupt", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -598,14 +600,14 @@ test "rebuild state rejects key corruption" {
     const state_path = try state.pathAlloc(std.testing.allocator);
     defer std.testing.allocator.free(state_path);
     const encoded = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        platform.testing.io,
         state_path,
         std.testing.allocator,
         .limited(rebuild_state_max_encoded_bytes),
     );
     defer std.testing.allocator.free(encoded);
     encoded[rebuild_state_v1_header_bytes + 4] = 'z';
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = encoded });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = state_path, .data = encoded });
 
     try std.testing.expectError(error.InvalidRebuildState, state.check(std.testing.allocator));
     // Validation quarantines the cursor; it must not silently clear it.
@@ -613,7 +615,7 @@ test "rebuild state rejects key corruption" {
 }
 
 test "rebuild state rejects truncation" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-truncated", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -624,19 +626,19 @@ test "rebuild state rejects truncation" {
     const state_path = try state.pathAlloc(std.testing.allocator);
     defer std.testing.allocator.free(state_path);
     const encoded = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        platform.testing.io,
         state_path,
         std.testing.allocator,
         .limited(rebuild_state_max_encoded_bytes),
     );
     defer std.testing.allocator.free(encoded);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = encoded[0 .. encoded.len - 1] });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = state_path, .data = encoded[0 .. encoded.len - 1] });
 
     try std.testing.expectError(error.InvalidRebuildState, state.check(std.testing.allocator));
 }
 
 test "rebuild state upgrades legacy cursor by restarting from scratch" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-legacy", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -645,17 +647,17 @@ test "rebuild state upgrades legacy cursor by restarting from scratch" {
     const state = RebuildState.init(path);
     const state_path = try state.pathAlloc(std.testing.allocator);
     defer std.testing.allocator.free(state_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = "doc:m" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = state_path, .data = "doc:m" });
 
-    var legacy = try state.loadWithIo(std.testing.allocator, std.testing.io);
+    var legacy = try state.loadWithIo(std.testing.allocator, platform.testing.io);
     defer legacy.deinit(std.testing.allocator);
     try std.testing.expect(legacy == .legacy);
 
-    const restart_key = (try state.checkWithIo(std.testing.allocator, std.testing.io)) orelse return error.TestExpectedEqual;
+    const restart_key = (try state.checkWithIo(std.testing.allocator, platform.testing.io)) orelse return error.TestExpectedEqual;
     defer std.testing.allocator.free(restart_key);
     try std.testing.expectEqualStrings("", restart_key);
 
-    var migrated = try state.loadWithIo(std.testing.allocator, std.testing.io);
+    var migrated = try state.loadWithIo(std.testing.allocator, platform.testing.io);
     defer migrated.deinit(std.testing.allocator);
     switch (migrated) {
         .valid => |key| try std.testing.expectEqualStrings("", key),
@@ -664,16 +666,16 @@ test "rebuild state upgrades legacy cursor by restarting from scratch" {
 }
 
 test "rebuild state update does not recreate vanished owner directory" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-stale-owner", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
     try createTestStateRoot(path);
-    try std.Io.Dir.cwd().deleteTree(std.testing.io, path);
+    try std.Io.Dir.cwd().deleteTree(platform.testing.io, path);
 
     const state = RebuildState.init(path);
-    try std.testing.expectError(error.RebuildStateOwnerStale, state.updateWithIo(std.testing.io, "doc:m"));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+    try std.testing.expectError(error.RebuildStateOwnerStale, state.updateWithIo(platform.testing.io, "doc:m"));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, path, .{}));
 }
 
 test "rebuild state uses injected durable storage" {
@@ -683,9 +685,9 @@ test "rebuild state uses injected durable storage" {
     const storage = memory.storage();
     const state = RebuildState.initWithStorage("__test/indexes/search", storage);
 
-    try std.testing.expect((try state.checkWithIo(alloc, std.testing.io)) == null);
-    try state.updateWithIo(std.testing.io, "doc:m");
-    const loaded = (try state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+    try std.testing.expect((try state.checkWithIo(alloc, platform.testing.io)) == null);
+    try state.updateWithIo(platform.testing.io, "doc:m");
+    const loaded = (try state.checkWithIo(alloc, platform.testing.io)) orelse return error.TestExpectedEqual;
     defer alloc.free(loaded);
     try std.testing.expectEqualStrings("doc:m", loaded);
 
@@ -695,12 +697,12 @@ test "rebuild state uses injected durable storage" {
     defer alloc.free(encoded);
     try std.testing.expectEqualStrings(rebuild_state_magic, encoded[0..rebuild_state_magic.len]);
 
-    try state.clearWithIo(std.testing.io);
-    try std.testing.expect((try state.checkWithIo(alloc, std.testing.io)) == null);
+    try state.clearWithIo(platform.testing.io);
+    try std.testing.expect((try state.checkWithIo(alloc, platform.testing.io)) == null);
 }
 
 test "rebuild state generation owner fences same-name replacement ABA" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-aba", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -708,27 +710,27 @@ test "rebuild state generation owner fences same-name replacement ABA" {
 
     const old_generation = RebuildState.initOwned(path, null, 41);
     const replacement = RebuildState.initOwned(path, null, 42);
-    try old_generation.updateWithIo(std.testing.io, "doc:m");
+    try old_generation.updateWithIo(platform.testing.io, "doc:m");
 
     // The replacement cannot even observe the old generation's plausible
     // cursor. Its normal empty-index path starts a new rebuild.
-    try std.testing.expect((try replacement.checkWithIo(std.testing.allocator, std.testing.io)) == null);
-    try replacement.updateWithIo(std.testing.io, "");
-    try replacement.updateWithIo(std.testing.io, "doc:f");
+    try std.testing.expect((try replacement.checkWithIo(std.testing.allocator, platform.testing.io)) == null);
+    try replacement.updateWithIo(platform.testing.io, "");
+    try replacement.updateWithIo(platform.testing.io, "doc:f");
 
     // A stale worker may keep running, but it can only mutate its own
     // generation namespace. No timing interleaving can clobber generation 42.
-    try old_generation.updateWithIo(std.testing.io, "doc:z");
-    try old_generation.clearWithIo(std.testing.io);
+    try old_generation.updateWithIo(platform.testing.io, "doc:z");
+    try old_generation.clearWithIo(platform.testing.io);
 
-    const current = (try replacement.checkWithIo(std.testing.allocator, std.testing.io)) orelse
+    const current = (try replacement.checkWithIo(std.testing.allocator, platform.testing.io)) orelse
         return error.TestExpectedEqual;
     defer std.testing.allocator.free(current);
     try std.testing.expectEqualStrings("doc:f", current);
 }
 
 test "rebuild state owned completion cannot erase replacement cursor" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-owned-clear", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -736,31 +738,31 @@ test "rebuild state owned completion cannot erase replacement cursor" {
 
     const old_generation = RebuildState.initOwned(path, null, 71);
     const replacement = RebuildState.initOwned(path, null, 72);
-    try old_generation.updateWithIo(std.testing.io, "doc:b");
-    try old_generation.clearWithIo(std.testing.io);
-    try std.testing.expect((try old_generation.checkWithIo(std.testing.allocator, std.testing.io)) == null);
+    try old_generation.updateWithIo(platform.testing.io, "doc:b");
+    try old_generation.clearWithIo(platform.testing.io);
+    try std.testing.expect((try old_generation.checkWithIo(std.testing.allocator, platform.testing.io)) == null);
 
-    try replacement.updateWithIo(std.testing.io, "");
-    try replacement.updateWithIo(std.testing.io, "doc:q");
-    try old_generation.clearWithIo(std.testing.io);
-    const current = (try replacement.checkWithIo(std.testing.allocator, std.testing.io)) orelse
+    try replacement.updateWithIo(platform.testing.io, "");
+    try replacement.updateWithIo(platform.testing.io, "doc:q");
+    try old_generation.clearWithIo(platform.testing.io);
+    const current = (try replacement.checkWithIo(std.testing.allocator, platform.testing.io)) orelse
         return error.TestExpectedEqual;
     defer std.testing.allocator.free(current);
     try std.testing.expectEqualStrings("doc:q", current);
 }
 
 test "rebuild state owned migration safely restarts an in-flight legacy cursor" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-owner-migration", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
     try createTestStateRoot(path);
 
     const legacy = RebuildState.init(path);
-    try legacy.updateWithIo(std.testing.io, "doc:m");
+    try legacy.updateWithIo(platform.testing.io, "doc:m");
 
     const owned = RebuildState.initOwned(path, null, 91);
-    const restart = (try owned.checkWithIo(std.testing.allocator, std.testing.io)) orelse
+    const restart = (try owned.checkWithIo(std.testing.allocator, platform.testing.io)) orelse
         return error.TestExpectedEqual;
     defer std.testing.allocator.free(restart);
     try std.testing.expectEqualStrings("", restart);
@@ -772,55 +774,55 @@ test "rebuild state owned migration safely restarts an in-flight legacy cursor" 
     // Migration retires the unowned marker only after the owned restart is
     // durable. Completion therefore cannot rediscover the legacy cursor and
     // spuriously restart the same generation forever.
-    try owned.clearWithIo(std.testing.io);
-    try std.testing.expect((try owned.checkWithIo(std.testing.allocator, std.testing.io)) == null);
+    try owned.clearWithIo(platform.testing.io);
+    try std.testing.expect((try owned.checkWithIo(std.testing.allocator, platform.testing.io)) == null);
 }
 
 test "rebuild state nonmutating load reports owned legacy without migration" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rebuild-state-owner-inspect", .{tmp.sub_path});
     defer alloc.free(path);
     try createTestStateRoot(path);
 
     const legacy = RebuildState.init(path);
-    try legacy.updateWithIo(std.testing.io, "doc:m");
+    try legacy.updateWithIo(platform.testing.io, "doc:m");
     const legacy_path = try legacy.pathAlloc(alloc);
     defer alloc.free(legacy_path);
-    const before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, legacy_path, alloc, .limited(rebuild_state_max_encoded_bytes));
+    const before = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, legacy_path, alloc, .limited(rebuild_state_max_encoded_bytes));
     defer alloc.free(before);
 
     const owned = RebuildState.initOwned(path, null, 91);
-    var loaded = try owned.loadWithIo(alloc, std.testing.io);
+    var loaded = try owned.loadWithIo(alloc, platform.testing.io);
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded == .legacy);
 
     const owned_path = try owned.pathAlloc(alloc);
     defer alloc.free(owned_path);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, owned_path, .{}));
-    const after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, legacy_path, alloc, .limited(rebuild_state_max_encoded_bytes));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, owned_path, .{}));
+    const after = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, legacy_path, alloc, .limited(rebuild_state_max_encoded_bytes));
     defer alloc.free(after);
     try std.testing.expectEqualStrings(before, after);
 }
 
 test "rebuild state publication crash boundaries preserve a valid state" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/rebuild-state-publication-crash", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
     try createTestStateRoot(path);
 
     const state = RebuildState.initOwned(path, null, 101);
-    try state.updateWithIo(std.testing.io, "doc:a");
+    try state.updateWithIo(platform.testing.io, "doc:a");
 
     test_publish_fault = .after_temp_sync;
     defer test_publish_fault = null;
     try std.testing.expectError(
         error.TestRebuildStateCrash,
-        state.updateWithIo(std.testing.io, "doc:b"),
+        state.updateWithIo(platform.testing.io, "doc:b"),
     );
-    var loaded = (try state.checkWithIo(std.testing.allocator, std.testing.io)) orelse
+    var loaded = (try state.checkWithIo(std.testing.allocator, platform.testing.io)) orelse
         return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("doc:a", loaded);
     std.testing.allocator.free(loaded);
@@ -830,9 +832,9 @@ test "rebuild state publication crash boundaries preserve a valid state" {
     test_publish_fault = .after_rename;
     try std.testing.expectError(
         error.TestRebuildStateCrash,
-        state.updateWithIo(std.testing.io, "doc:c"),
+        state.updateWithIo(platform.testing.io, "doc:c"),
     );
-    loaded = (try state.checkWithIo(std.testing.allocator, std.testing.io)) orelse
+    loaded = (try state.checkWithIo(std.testing.allocator, platform.testing.io)) orelse
         return error.TestExpectedEqual;
     defer std.testing.allocator.free(loaded);
     try std.testing.expectEqualStrings("doc:c", loaded);

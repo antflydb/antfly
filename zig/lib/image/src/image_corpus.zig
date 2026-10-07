@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const build_options = @import("build_options");
 const bmp = @import("bmp.zig");
 const gif = @import("gif.zig");
@@ -76,7 +78,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn cmdList(alloc: std.mem.Allocator) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -103,7 +105,7 @@ fn cmdList(alloc: std.mem.Allocator) !void {
 }
 
 fn cmdDescribe(alloc: std.mem.Allocator, fixture_path: []const u8) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -229,7 +231,7 @@ fn inferFormat(fixture_path: []const u8) ?[]const u8 {
 }
 
 fn cmdVerifyJpeg(alloc: std.mem.Allocator) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -409,7 +411,7 @@ fn isArithmeticFrameKind(kind: jpeg.FrameKind) bool {
 }
 
 fn cmdVerifyPng(alloc: std.mem.Allocator) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -551,7 +553,7 @@ fn cmdVerifyPngSpng(alloc: std.mem.Allocator) !void {
         return;
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -613,7 +615,7 @@ fn cmdVerifyPngSpng(alloc: std.mem.Allocator) !void {
 }
 
 fn cmdVerifyGif(alloc: std.mem.Allocator) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -702,7 +704,7 @@ fn cmdVerifyGif(alloc: std.mem.Allocator) !void {
 }
 
 fn cmdVerifyBmp(alloc: std.mem.Allocator) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -788,7 +790,7 @@ fn cmdVerifyBmp(alloc: std.mem.Allocator) !void {
 }
 
 fn cmdVerifyWebp(alloc: std.mem.Allocator) !void {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());

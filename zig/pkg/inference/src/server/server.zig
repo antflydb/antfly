@@ -550,7 +550,7 @@ test "transcription response survives an allocation failure at any step" {
             transcribing_api.deinitResponse(allocator, &response);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "transcription response carries every speaker it labelled" {
@@ -1701,8 +1701,8 @@ fn embedTimingEnabled() bool {
 }
 
 fn embedTimingNowNs() u128 {
-    var ts: std.posix.timespec = undefined;
-    return switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    return switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => 0,
     };
@@ -2008,7 +2008,7 @@ test "inference download context carries request cancellation" {
     };
     var state = State{ .cancelled = true };
     const request_context = InferenceDownloadRequestContext{
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .control = .{
             .cancellation = .{ .ptr = &state, .is_cancelled_fn = State.isCancelled },
         },
@@ -2026,7 +2026,7 @@ test "dense embed parser contexts reject expired image fetches" {
         .visual_model_path = "visual.onnx",
     };
     const context = InferenceDownloadRequestContext{
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .control = .{ .deadline_ns = 0 },
     };
 
@@ -2168,8 +2168,8 @@ fn fillRandomBytes(buffer: []u8) !void {
 }
 
 fn completionCreatedTimestamp() i64 {
-    var ts: std.posix.timespec = undefined;
-    return switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    return switch (std.posix.errno(platform.c.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => @intCast(ts.sec),
         else => 0,
     };
@@ -2330,7 +2330,7 @@ test "token counting uses the attached std.Io tokenizer path" {
         @as(usize, 2),
         try countTokenizerTokens(
             std.testing.allocator,
-            std.testing.io,
+            platform.testing.io,
             tokenizer,
             "parallel",
         ),
@@ -2755,7 +2755,7 @@ fn computeCompatibilitySignature(
 
 test "compatibility signature tracks implicit GLiNER classification sidecar" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const model_dir = try std.fs.path.join(
         allocator,
@@ -2766,20 +2766,20 @@ test "compatibility signature tracks implicit GLiNER classification sidecar" {
     var missing = std.crypto.hash.sha2.Sha256.init(.{});
     try addModelSidecarToSignature(
         allocator,
-        std.testing.io,
+        platform.testing.io,
         &missing,
         model_dir,
         "special_tokens_map.json",
     );
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "special_tokens_map.json",
         .data = "{\"additional_special_tokens\":[\"[P]\",\"[C]\",\"[E]\",\"[R]\",\"[SEP_TEXT]\"]}",
     });
     var present = std.crypto.hash.sha2.Sha256.init(.{});
     try addModelSidecarToSignature(
         allocator,
-        std.testing.io,
+        platform.testing.io,
         &present,
         model_dir,
         "special_tokens_map.json",
@@ -2797,7 +2797,7 @@ test "compatibility signature tracks implicit GLiNER classification sidecar" {
 
 test "compatibility signature hashes same-size sidecar replacements" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const model_dir = try std.fs.path.join(
         allocator,
@@ -2805,14 +2805,14 @@ test "compatibility signature hashes same-size sidecar replacements" {
     );
     defer allocator.free(model_dir);
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data = "{\"model_type\":\"bert\"}",
     });
     var first = std.crypto.hash.sha2.Sha256.init(.{});
     try addModelSidecarToSignature(
         allocator,
-        std.testing.io,
+        platform.testing.io,
         &first,
         model_dir,
         "config.json",
@@ -2820,14 +2820,14 @@ test "compatibility signature hashes same-size sidecar replacements" {
     var first_digest: CompatibilitySignature = undefined;
     first.final(&first_digest);
 
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data = "{\"model_type\":\"bart\"}",
     });
     var second = std.crypto.hash.sha2.Sha256.init(.{});
     try addModelSidecarToSignature(
         allocator,
-        std.testing.io,
+        platform.testing.io,
         &second,
         model_dir,
         "config.json",
@@ -2843,7 +2843,7 @@ test "compatibility signature hashes same-size sidecar replacements" {
 
 test "cached compatibility signature tracks known ONNX external dependencies without reparsing" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const model_dir = try std.fs.path.join(
         allocator,
@@ -2855,7 +2855,7 @@ test "cached compatibility signature tracks known ONNX external dependencies wit
         &.{ model_dir, "weights.bin" },
     );
     defer allocator.free(external_path);
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "weights.bin",
         .data = "first-external-generation",
     });
@@ -2864,19 +2864,19 @@ test "cached compatibility signature tracks known ONNX external dependencies wit
     defer man.deinit();
     const first = try computeCompatibilitySignatureWithDependencies(
         allocator,
-        std.testing.io,
+        platform.testing.io,
         model_dir,
         &man,
         &.{external_path},
         true,
     );
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "weights.bin",
         .data = "second-external-generat",
     });
     const second = try computeCompatibilitySignatureWithDependencies(
         allocator,
-        std.testing.io,
+        platform.testing.io,
         model_dir,
         &man,
         &.{external_path},
@@ -3444,8 +3444,8 @@ test "loaded model listing uses model directories and safe relative identifiers"
 
 test "loaded model listing preserves managed variant identity without exposing cache leaves" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/owner/model--antfly-0123456789abcdef");
@@ -3959,7 +3959,7 @@ pub const Node = struct {
     fn runTensorBatch(raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends_mod.Tensor, supplied: ?InferenceExecutionControl) anyerror![]backends_mod.Tensor {
         const self: *Node = @ptrCast(@alignCast(raw));
         const control = self.bindExecutionControl(null, supplied orelse .{});
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const io = self.inferenceIo(allocator, control.io, &owned_io);
         const selected_gate = gate orelse session.execution_gate orelse return error.MissingExecutionGate;
@@ -3985,7 +3985,7 @@ pub const Node = struct {
             &self.session_manager,
             &required_backend_scratch,
         );
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*threaded| threaded.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -4117,11 +4117,11 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         caller_io: ?std.Io,
-        owned: *?std.Io.Threaded,
+        owned: *?platform.Io.Threaded,
     ) std.Io {
         if (caller_io) |io| return io;
         if (self.session_manager.io) |io| return io;
-        owned.* = std.Io.Threaded.init(allocator, .{});
+        owned.* = platform.Io.Threaded.init(allocator, .{});
         return owned.*.?.io();
     }
 
@@ -4209,7 +4209,7 @@ pub const Node = struct {
         model_name: []const u8,
         texts: []const []const u8,
     ) ![][]f32 {
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         return try self.embedDenseTextsDirectWithContext(allocator, io, null, model_name, texts);
@@ -4341,7 +4341,7 @@ pub const Node = struct {
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, 0, 0, 0);
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const request_io = self.inferenceIo(allocator, control.io, &owned_io);
         if (trace) |*value| value.resolve_manifest_ns = embedding_trace.now() -| resolve_started;
@@ -4475,7 +4475,7 @@ pub const Node = struct {
         self.metrics.incRequest("embed_sparse.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -4567,7 +4567,7 @@ pub const Node = struct {
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const request_io = self.inferenceIo(allocator, io, &owned_io);
 
@@ -4663,7 +4663,7 @@ pub const Node = struct {
         self.metrics.incRequest("rewrite.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "rewriters");
@@ -4746,7 +4746,7 @@ pub const Node = struct {
         self.metrics.incRequest("classify.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const requested = if (model_name.len > 0) model_name else null;
@@ -5280,7 +5280,7 @@ pub const Node = struct {
         try execution_control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -5724,7 +5724,7 @@ pub const Node = struct {
         if (model.kind != .generator) return error.A4bPrefetchRequiresGenerator;
         if (model.backend != null and model.backend.? != .cuda)
             return error.A4bPrefetchRequiresCuda;
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
@@ -5753,7 +5753,7 @@ pub const Node = struct {
     }
 
     fn materializeWarmModelOptionalSessions(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
@@ -5842,7 +5842,7 @@ pub const Node = struct {
         std.log.info("warming inference embedder model={s}", .{model_name});
         const texts = [_][]const u8{"ping"};
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model_name, "embedders");
@@ -5906,7 +5906,7 @@ pub const Node = struct {
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference reranker model={s}", .{model_name});
         const documents = [_][]const u8{"pong"};
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model_name, "rerankers");
@@ -5928,7 +5928,7 @@ pub const Node = struct {
         const task_dir = warmModelTaskDir(model.kind);
         const started_at_ns = embedTimingNowNs();
         std.log.info("loading inference {s} model={s}", .{ @tagName(model.kind), model.name });
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, task_dir);
@@ -5947,7 +5947,7 @@ pub const Node = struct {
         model_name: []const u8,
         input: std.json.Value,
     ) ![][]f32 {
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         return try self.embedDenseJsonInputDirectWithContext(allocator, io, null, model_name, input);
@@ -6009,7 +6009,7 @@ pub const Node = struct {
         model_name: []const u8,
         parts: []const DirectDenseEmbedPart,
     ) ![][]f32 {
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         return try self.embedDensePartsDirectWithContext(allocator, io, null, model_name, parts);
@@ -6349,7 +6349,7 @@ pub const Node = struct {
         // Official ONNX GLiNER contracts are singleton executors. They retain
         // their existing path and never pay a native batch-fill delay.
         if (pipeline.session.backend() == .onnx or contract.batch.max_items <= 1) return if (scoring) direct.scoreLabelsBatch(texts, labels) else direct.recognizeWithLabelTokenBatch(texts, labels, label_token, threshold, flat_ner);
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const control = self.bindExecutionControl(null, pipeline.execution_control orelse .{});
         const io = self.inferenceIo(allocator, control.io, &owned_io);
@@ -7162,7 +7162,7 @@ pub const Node = struct {
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -7356,7 +7356,7 @@ pub const Node = struct {
         for (request.images) |image| try decoded_budget.addImage(image.bytes);
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
@@ -7648,7 +7648,7 @@ pub const Node = struct {
             return error.ReadBatchTooLarge;
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
@@ -8429,7 +8429,7 @@ pub const Node = struct {
         self.metrics.incRequest("transcribe.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -8869,7 +8869,7 @@ pub const Node = struct {
         if (parsed.value != .object) return null;
         const name = parsed.value.object.get("model") orelse return null;
         if (name != .string or name.string.len == 0) return null;
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(scratch, null, &owned_io);
         const path = self.resolveRequestModelPath(scratch, io, name.string, "extractors") catch |err| switch (err) {
@@ -8946,7 +8946,7 @@ pub const Node = struct {
             .pipeline = .{ .regex_context = &validators, .validate_value_fn = regex.Context.validateValue },
             .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
         };
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(scratch, null, &owned_io);
         failure.* = .{ .stage = "model" };
@@ -9290,7 +9290,7 @@ pub const Node = struct {
             .include_spans = options.include_spans orelse false,
         };
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -9419,7 +9419,7 @@ pub const Node = struct {
             .input_ids = input_ids,
         };
 
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveRequestModelPath(allocator, io, model_name, "extractors");
@@ -9571,7 +9571,7 @@ pub const Node = struct {
         texts: []const []const u8,
         execution_control: ?InferenceExecutionControl,
     ) ![]u8 {
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveClassificationRequestModelPath(allocator, io, model_name);
@@ -9929,10 +9929,10 @@ pub const Node = struct {
 
     fn findFirstModelInDir(self: *Node, dir_path: []const u8) ?[]const u8 {
         if (!build_options.link_libc) {
-            var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dir_path, .{ .iterate = true }) catch return null;
-            defer dir.close(std.Options.debug_io);
+            var dir = std.Io.Dir.cwd().openDir(platform.debug_io, dir_path, .{ .iterate = true }) catch return null;
+            defer dir.close(platform.debug_io);
             var iter = dir.iterate();
-            while (iter.next(std.Options.debug_io) catch null) |entry| {
+            while (iter.next(platform.debug_io) catch null) |entry| {
                 const ename_slice = entry.name;
                 if (ename_slice.len == 0 or ename_slice[0] == '.') continue;
 
@@ -9978,10 +9978,10 @@ pub const Node = struct {
 
     fn findFirstModelDir(self: *Node) ?[]const u8 {
         if (!build_options.link_libc) {
-            var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, self.config.models_dir, .{ .iterate = true }) catch return null;
-            defer dir.close(std.Options.debug_io);
+            var dir = std.Io.Dir.cwd().openDir(platform.debug_io, self.config.models_dir, .{ .iterate = true }) catch return null;
+            defer dir.close(platform.debug_io);
             var iter = dir.iterate();
-            while (iter.next(std.Options.debug_io) catch null) |entry| {
+            while (iter.next(platform.debug_io) catch null) |entry| {
                 const name_slice = entry.name;
                 if (name_slice.len == 0 or name_slice[0] == '.') continue;
 
@@ -16685,7 +16685,7 @@ pub const Node = struct {
         }
 
         var completion_tokens: usize = 0;
-        var rewrite_owned_io: ?std.Io.Threaded = null;
+        var rewrite_owned_io: ?platform.Io.Threaded = null;
         defer if (rewrite_owned_io) |*owned| owned.deinit();
         const rewrite_io = self.inferenceIo(ctx.allocator, execution_control.io, &rewrite_owned_io);
         const rewritten = pipeline.rewritePrepared(rewrite_io, &prepared) catch |err|
@@ -19181,7 +19181,7 @@ pub const Node = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const request = try decide_mod.parse(a, request_json);
-        var owned_io: ?std.Io.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
         const path = try self.resolveRequestModelPath(a, io, request.model, "extractors");
@@ -20695,7 +20695,7 @@ test "gliner boundary v2 allocation attribution distinguishes recovery and model
     {
         var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
         defer request.deinit();
-        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        var ctx = httpx.Context.init(a, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try extractionV2FailureResponse(&ctx, genuine_oom, .{ .stage = "model" });
         defer response.deinit();
@@ -20741,7 +20741,7 @@ test "gliner boundary v2 HTTP dispatch rejects advanced legacy fields and recove
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
         defer request.deinit();
         request.body = case.json;
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.extractJSON(&ctx);
         defer response.deinit();
@@ -20781,7 +20781,7 @@ test "gliner boundary v2 direct cancellation and HTTP capacity use existing admi
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
     defer request.deinit();
     request.body = json;
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.extractJSON(&ctx);
     defer response.deinit();
@@ -20798,12 +20798,12 @@ test "gliner boundary v2 direct cancellation and HTTP capacity use existing admi
 }
 
 test "node attachment propagates model eviction scheduling failure" {
-    var unavailable_io = std.Io.Threaded.init(std.testing.allocator, .{
+    var unavailable_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
     defer unavailable_io.deinit();
-    var available_io = std.Io.Threaded.init(std.testing.allocator, .{
+    var available_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .limited(1),
     });
@@ -20838,7 +20838,7 @@ test "gliner boundary v2 direct control binds cold and cached Metal process guar
     }
     var supervised = try Node.init(std.testing.allocator, .{ .process_termination_available = true });
     defer supervised.deinit();
-    try supervised.attachIo(std.testing.io);
+    try supervised.attachIo(platform.testing.io);
     for (supplied_controls) |supplied| {
         const control = supervised.extractionExecutionControl(supplied);
         try std.testing.expect(control.io != null);
@@ -20879,7 +20879,7 @@ test "gliner boundary v2 version probe shares memory admission and recovers decl
     var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
     defer request.deinit();
     request.body = shallow;
-    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    var ctx = httpx.Context.init(a, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.extractJSON(&ctx);
     defer response.deinit();
@@ -20895,7 +20895,7 @@ test "gliner boundary v2 declared budget failures preserve input provenance and 
     for ([_]anyerror{ error.MemoryBudgetExceeded, error.OutOfMemory }) |err| {
         var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
         defer request.deinit();
-        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        var ctx = httpx.Context.init(a, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try extractionV2FailureResponse(&ctx, err, .{ .input_index = 3, .stage = "windowing" });
         defer response.deinit();
@@ -21005,7 +21005,7 @@ test "gliner boundary v2 enum work exhaustion returns atomic 413 and retries" {
     {
         var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
         defer request.deinit();
-        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        var ctx = httpx.Context.init(a, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try extractionV2FailureResponse(&ctx, failed, .{ .input_index = fixture.last_sample, .stage = "execution" });
         defer response.deinit();
@@ -21059,7 +21059,7 @@ test "gliner boundary v2 enum work retry releases every failed allocation" {
             defer a.free(bytes);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&fixture});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&fixture});
 }
 
 fn rebelSchemaFailureResponse(ctx: *httpx.Context, err: anyerror) !httpx.Response {
@@ -23783,7 +23783,7 @@ test "generate executor contract error maps unqualified GLiNER boundary runtime 
 
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/extract");
     defer request.deinit();
-    var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try inferenceExecutorContractFailureResponse(&ctx, error.UnsupportedGlinerBoundaryRuntime);
     defer response.deinit();
@@ -24743,20 +24743,20 @@ test "generate batch media planner bounds inline and unknown remote windows" {
 
 test "generate batch releases materialized media between executor windows" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/model");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/generators/owner/model");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/model/config.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/model/model_manifest.json",
         .data =
         \\{"type":"generator","inputs":["text","image"],"capabilities":["inference.batch.max_items=1"]}
         ,
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{
@@ -24774,7 +24774,7 @@ test "generate batch releases materialized media between executor windows" {
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/batch");
     defer request.deinit();
     try request.setJson(batch_body);
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.generateBatchContent(&ctx);
     defer response.deinit();
@@ -25014,7 +25014,7 @@ test "generate batch admission units sum pending generation work" {
 }
 
 test "generate batch shared backends own the outer model lock" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var mutex: std.atomic.Mutex = .unlocked;
 
@@ -25626,18 +25626,18 @@ test "direct dense embed rejects media and reserves audio before model work" {
 
 test "direct dense embed rejects borrowed image expansion before model loading" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/embedders/owner/embed");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/embedders/owner/embed");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/embedders/owner/embed/config.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/embedders/owner/embed/model_manifest.json",
         .data = "{\"type\":\"embedder\",\"inputs\":[\"image\"]}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var png = @as([24]u8, @splat(0));
@@ -25706,7 +25706,7 @@ test "read decoded image budget rejects aggregate expansion and overflow" {
 
 test "accepted multimodal routes reject tiny high-pixel batches before model loading" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const model_dirs = [_][]const u8{
@@ -25715,24 +25715,24 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         "models/rerankers/owner/rerank",
     };
     for (model_dirs) |dir| {
-        try tmp.dir.createDirPath(std.testing.io, dir);
+        try tmp.dir.createDirPath(platform.testing.io, dir);
         const config_path = try std.fs.path.join(allocator, &.{ dir, "config.json" });
         defer allocator.free(config_path);
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = config_path, .data = "{}" });
+        try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = config_path, .data = "{}" });
     }
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/embedders/owner/embed/model_manifest.json",
         .data = "{\"type\":\"embedder\",\"inputs\":[\"image\"]}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/generate/model_manifest.json",
         .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/rerankers/owner/rerank/model_manifest.json",
         .data = "{\"type\":\"reranker\",\"capabilities\":[\"colqwen\"],\"inputs\":[\"text\",\"image\"]}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     // Two 24-byte PNG headers each declare a modest 800x800 canvas. They fit
@@ -25761,7 +25761,7 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
         defer request.deinit();
         try request.setJson(body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.generateContent(&ctx);
         defer response.deinit();
@@ -25775,7 +25775,7 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
         defer request.deinit();
         try request.setJson(embed_body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.createEmbedding(&ctx);
         defer response.deinit();
@@ -25789,7 +25789,7 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
         defer request.deinit();
         try request.setJson(per_item_body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.createEmbedding(&ctx);
         defer response.deinit();
@@ -25803,7 +25803,7 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank");
         defer request.deinit();
         try request.setJson(body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.rerankDocuments(&ctx);
         defer response.deinit();
@@ -25822,31 +25822,31 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
 
 test "generate HTTP enforces resolved manifest media limits before model loading" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/model");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/generators/owner/model");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/model/config.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/model/model_manifest.json",
         .data =
         \\{"type":"generator","inputs":["text","image"],"capabilities":["inference.batch.max_decoded_pixels=5"]}
         ,
     });
-    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/tiny-bytes");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/generators/owner/tiny-bytes");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/tiny-bytes/config.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/tiny-bytes/model_manifest.json",
         .data =
         \\{"type":"generator","inputs":["text","image"],"capabilities":["inference.batch.max_encoded_media_bytes=8"]}
         ,
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{ .models_dir = models_root });
@@ -25857,7 +25857,7 @@ test "generate HTTP enforces resolved manifest media limits before model loading
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
     defer request.deinit();
     try request.setJson(body);
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.generateContent(&ctx);
     defer response.deinit();
@@ -25870,7 +25870,7 @@ test "generate HTTP enforces resolved manifest media limits before model loading
     var batch_request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/batch");
     defer batch_request.deinit();
     try batch_request.setJson(batch_body);
-    var batch_ctx = httpx.Context.init(allocator, std.testing.io, &batch_request);
+    var batch_ctx = httpx.Context.init(allocator, platform.testing.io, &batch_request);
     defer batch_ctx.deinit();
     var batch_response = try node.generateBatchContent(&batch_ctx);
     defer batch_response.deinit();
@@ -25886,7 +25886,7 @@ test "generate HTTP enforces resolved manifest media limits before model loading
     var bytes_batch_request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/batch");
     defer bytes_batch_request.deinit();
     try bytes_batch_request.setJson(bytes_batch_body);
-    var bytes_batch_ctx = httpx.Context.init(allocator, std.testing.io, &bytes_batch_request);
+    var bytes_batch_ctx = httpx.Context.init(allocator, platform.testing.io, &bytes_batch_request);
     defer bytes_batch_ctx.deinit();
     var bytes_batch_response = try node.generateBatchContent(&bytes_batch_ctx);
     defer bytes_batch_response.deinit();
@@ -25897,20 +25897,20 @@ test "generate HTTP enforces resolved manifest media limits before model loading
 
 test "internal classification executor uses extraction candidate limits before model loading" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/classifiers/owner/model");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/classifiers/owner/model");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/classifiers/owner/model/config.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/classifiers/owner/model/model_manifest.json",
         .data =
         \\{"type":"classifier","inputs":["text"],"capabilities":["inference.limits.max_candidates_per_request=1"]}
         ,
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{ .models_dir = models_root });
@@ -25932,20 +25932,20 @@ test "internal classification executor uses extraction candidate limits before m
 
 test "sparse embed validates text-only input before model loading" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/embedders/owner/sparse");
+    try tmp.dir.createDirPath(platform.testing.io, "models/embedders/owner/sparse");
     // The lightweight manifest is sufficient for request validation. A full
     // load from this deliberately incomplete model directory would return 500.
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/embedders/owner/sparse/config.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/embedders/owner/sparse/model_manifest.json",
         .data = "{\"type\":\"embedder\",\"capabilities\":[\"sparse\"],\"inputs\":[\"text\"]}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
@@ -25956,7 +25956,7 @@ test "sparse embed validates text-only input before model loading" {
     try request.setJson(
         "{\"model\":\"owner/sparse\",\"input\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,AA==\"}}]}",
     );
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try node.createEmbedding(&ctx);
@@ -25970,18 +25970,18 @@ test "sparse embed validates text-only input before model loading" {
 
 test "multimodal rerank rejects incompatible manifest before media or model loading" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/rerankers/owner/text-only");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/rerankers/owner/text-only");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/rerankers/owner/text-only/config.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/rerankers/owner/text-only/model_manifest.json",
         .data = "{\"type\":\"reranker\",\"inputs\":[\"text\"]}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
@@ -25995,7 +25995,7 @@ test "multimodal rerank rejects incompatible manifest before media or model load
     try request.setJson(
         "{\"model\":\"owner/text-only\",\"query\":\"q\",\"documents\":[[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.invalid/x\"}}]]}",
     );
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try node.rerankDocuments(&ctx);
@@ -26026,7 +26026,7 @@ test "read weighted admission rejects before model resolution or download" {
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
     defer request.deinit();
     try request.setJson(body.items);
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try node.readImages(&ctx);
@@ -26047,7 +26047,7 @@ test "transcribe validates encoded audio before model resolution and releases ad
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
     defer request.deinit();
     try request.setJson("{\"model\":\"missing\",\"audio\":\"YQ==\"}");
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try node.transcribeAudio(&ctx);
@@ -26068,7 +26068,7 @@ test "transcribe requires an explicit model before admission or media work" {
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
     defer request.deinit();
     try request.setJson("{\"model\":\" \\t\",\"audio\":\"%%%\"}");
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try node.transcribeAudio(&ctx);
@@ -26120,7 +26120,7 @@ test "transcribe bounded-decodes corrupt and metadata-amplified audio before mod
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
         defer request.deinit();
         try request.setJson(body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
 
         var response = try node.transcribeAudio(&ctx);
@@ -26160,7 +26160,7 @@ fn voiceTestPost(allocator: std.mem.Allocator, node: *Node, path: []const u8, bo
     var request = try httpx.Request.init(allocator, .POST, path);
     defer request.deinit();
     try request.setJson(body);
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
     if (std.mem.eql(u8, path, "/ai/v1/dictate")) return node.dictate(&ctx);
     if (std.mem.eql(u8, path, "/ai/v1/transcription/sessions")) return node.createTranscriptionSession(&ctx);
@@ -26269,7 +26269,7 @@ test "transcription session lookups reject unknown ids without media work" {
     {
         var request = try httpx.Request.init(allocator, .GET, "/ai/v1/transcription/sessions/" ++ unknown_id);
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.getTranscriptionSession(&ctx, unknown_id);
         defer response.deinit();
@@ -26278,7 +26278,7 @@ test "transcription session lookups reject unknown ids without media work" {
     {
         var request = try httpx.Request.init(allocator, .DELETE, "/ai/v1/transcription/sessions/not-an-id");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.deleteTranscriptionSession(&ctx, "not-an-id");
         defer response.deinit();
@@ -26289,7 +26289,7 @@ test "transcription session lookups reject unknown ids without media work" {
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/" ++ unknown_id ++ "/audio");
         defer request.deinit();
         try request.setJson("{\"audio\":\"YQ==\"}");
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.appendTranscriptionAudio(&ctx, unknown_id);
         defer response.deinit();
@@ -26311,7 +26311,7 @@ test "transcription session append buffers raw pcm before the transcriber loads 
         .model = "missing",
         .now_wall_s = 0,
         .now_mono_ns = platform.time.monotonicNs(),
-        .io = std.testing.io,
+        .io = platform.testing.io,
     });
     defer created.deinit(allocator);
     const session_id: []const u8 = &created.id;
@@ -26331,7 +26331,7 @@ test "transcription session append buffers raw pcm before the transcriber loads 
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/audio");
         defer request.deinit();
         try request.setJson(body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.appendTranscriptionAudio(&ctx, session_id);
         defer response.deinit();
@@ -26343,7 +26343,7 @@ test "transcription session append buffers raw pcm before the transcriber loads 
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/audio");
         defer request.deinit();
         try request.setJson("{\"audio\":\"YQ==\",\"format\":\"pcm16\"}");
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.appendTranscriptionAudio(&ctx, session_id);
         defer response.deinit();
@@ -26354,7 +26354,7 @@ test "transcription session append buffers raw pcm before the transcriber loads 
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/audio");
         defer request.deinit();
         try request.setJson("{}");
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.appendTranscriptionAudio(&ctx, session_id);
         defer response.deinit();
@@ -26369,7 +26369,7 @@ test "transcription session append buffers raw pcm before the transcriber loads 
     {
         var request = try httpx.Request.init(allocator, .GET, "/ai/v1/transcription/sessions/x");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.getTranscriptionSession(&ctx, session_id);
         defer response.deinit();
@@ -26379,7 +26379,7 @@ test "transcription session append buffers raw pcm before the transcriber loads 
     {
         var request = try httpx.Request.init(allocator, .DELETE, "/ai/v1/transcription/sessions/x");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.deleteTranscriptionSession(&ctx, session_id);
         defer response.deinit();
@@ -26414,7 +26414,7 @@ test "dictate accepts the framed attachment transport and resolves the model aft
     defer request.deinit();
     try request.setBody(envelope);
     try request.setHeader("Content-Type", httpx.attachment_envelope.content_type);
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.dictate(&ctx);
     defer response.deinit();
@@ -26430,7 +26430,7 @@ test "dictate accepts the framed attachment transport and resolves the model aft
     defer request2.deinit();
     try request2.setBody(unreferenced);
     try request2.setHeader("Content-Type", httpx.attachment_envelope.content_type);
-    var ctx2 = httpx.Context.init(allocator, std.testing.io, &request2);
+    var ctx2 = httpx.Context.init(allocator, platform.testing.io, &request2);
     defer ctx2.deinit();
     var response2 = try node.dictate(&ctx2);
     defer response2.deinit();
@@ -26448,7 +26448,7 @@ test "transcription session append accepts framed raw pcm and the events stream 
         .model = "missing",
         .now_wall_s = 0,
         .now_mono_ns = platform.time.monotonicNs(),
-        .io = std.testing.io,
+        .io = platform.testing.io,
     });
     defer created.deinit(allocator);
     const session_id: []const u8 = &created.id;
@@ -26464,7 +26464,7 @@ test "transcription session append accepts framed raw pcm and the events stream 
         defer request.deinit();
         try request.setBody(envelope);
         try request.setHeader("Content-Type", httpx.attachment_envelope.content_type);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.appendTranscriptionAudio(&ctx, session_id);
         defer response.deinit();
@@ -26487,13 +26487,13 @@ test "transcription session append accepts framed raw pcm and the events stream 
         .end_ms = 900,
         .language = null,
     }};
-    try node.transcription_sessions.publish(entry, &events, std.testing.io);
+    try node.transcription_sessions.publish(entry, &events, platform.testing.io);
     node.transcription_sessions.unwatch(entry);
-    try node.transcription_sessions.remove(session_id, std.testing.io);
+    try node.transcription_sessions.remove(session_id, platform.testing.io);
     {
         var request = try httpx.Request.init(allocator, .GET, "/ai/v1/transcription/sessions/x/events");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.streamTranscriptionSessionEvents(&ctx, session_id);
         defer response.deinit();
@@ -26503,7 +26503,7 @@ test "transcription session append accepts framed raw pcm and the events stream 
     {
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcription/sessions/x/stream");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.streamTranscriptionAudio(&ctx, "0123456789abcdef0123456789abcdef", .{ .format = "pcm16" });
         defer response.deinit();
@@ -26579,16 +26579,16 @@ test "extraction framed attachments preserve input identity and borrowed bytes" 
 
 test "read image preflight maps malformed dimension and aggregate errors before model load" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
+    try tmp.dir.createDirPath(platform.testing.io, "models/owner/model");
     // Enough for path resolution; reaching model load would fail this test with 500.
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/owner/model/model_manifest.json",
         .data = "{\"type\":\"reader\",\"inputs\":[\"image\"]}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 1 });
@@ -26598,7 +26598,7 @@ test "read image preflight maps malformed dimension and aggregate errors before 
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
         defer request.deinit();
         try request.setJson("{\"model\":\"owner/model\",\"images\":[{\"url\":\"data:image/png;base64,bm90LWFuLWltYWdl\"}]}");
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.readImages(&ctx);
         defer response.deinit();
@@ -26621,7 +26621,7 @@ test "read image preflight maps malformed dimension and aggregate errors before 
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
         defer request.deinit();
         try request.setJson(body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.readImages(&ctx);
         defer response.deinit();
@@ -26638,7 +26638,7 @@ test "read image preflight maps malformed dimension and aggregate errors before 
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/read");
         defer request.deinit();
         try request.setJson(aggregate_body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.readImages(&ctx);
         defer response.deinit();
@@ -26653,7 +26653,7 @@ test "extraction image downloads transfer ownership and clean up aggregate failu
     node.config = .{};
     var request = try httpx.Request.init(allocator, .GET, "/");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
     const images = [_]api.ImageURL{
         .{ .url = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==" },
@@ -26773,50 +26773,50 @@ test "Qwen3-VL read routing admits only generation bundles" {
 
 test "read model resolution falls back to generators and keeps reader precedence" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/qwen");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/generators/owner/qwen");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/qwen/config.json",
         .data = "{}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{ .models_dir = models_root });
     defer node.deinit();
-    const generator_path = try node.resolveReadRequestModelPath(allocator, std.testing.io, "owner/qwen");
+    const generator_path = try node.resolveReadRequestModelPath(allocator, platform.testing.io, "owner/qwen");
     defer allocator.free(generator_path);
     try std.testing.expect(std.mem.endsWith(u8, generator_path, "generators/owner/qwen"));
 
-    try tmp.dir.createDirPath(std.testing.io, "models/readers/owner/qwen");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/readers/owner/qwen");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/readers/owner/qwen/config.json",
         .data = "{}",
     });
-    const reader_path = try node.resolveReadRequestModelPath(allocator, std.testing.io, "owner/qwen");
+    const reader_path = try node.resolveReadRequestModelPath(allocator, platform.testing.io, "owner/qwen");
     defer allocator.free(reader_path);
     try std.testing.expect(std.mem.endsWith(u8, reader_path, "readers/owner/qwen"));
 }
 
 test "/read recognizes a Qwen3-VL generator bundle before reader model loading" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/qwen");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/generators/owner/qwen");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/qwen/config.json",
         .data = "{\"model_type\":\"qwen3_vl\"}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/qwen/model_manifest.json",
         .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/qwen/antfly_inference_bundle.json",
         .data = "{\"family\":\"qwen3_vl_gguf_bundle/v1\",\"decoder\":\"config.json\",\"projector\":\"model_manifest.json\"}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{ .models_dir = models_root, .max_concurrent_requests = 8 });
@@ -26827,7 +26827,7 @@ test "/read recognizes a Qwen3-VL generator bundle before reader model loading" 
     try request.setJson(
         "{\"model\":\"owner/qwen\",\"images\":[{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC\"}]}",
     );
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try node.readImages(&ctx);
@@ -26882,7 +26882,7 @@ test "Qwen3-VL encoded read results own page identities and report serial execut
             try std.testing.expectEqual(@as(usize, 0), batch.execution.fallback_items);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "read admission units scale with image batch and decode length" {
@@ -26904,24 +26904,24 @@ test "Qwen3-VL read admission includes one serial multimodal generation" {
 
 test "Qwen3-VL direct read rejects insufficient generation capacity before fetching media" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/generators/owner/qwen");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/generators/owner/qwen");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/qwen/config.json",
         .data = "{\"model_type\":\"qwen3_vl\"}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/qwen/model_manifest.json",
         .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/generators/owner/qwen/antfly_inference_bundle.json",
         .data = "{\"family\":\"qwen3_vl_gguf_bundle/v1\",\"decoder\":\"config.json\",\"projector\":\"model_manifest.json\"}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
-    const model_path = try tmp.dir.realPathFileAlloc(std.testing.io, "models/generators/owner/qwen", allocator);
+    const model_path = try tmp.dir.realPathFileAlloc(platform.testing.io, "models/generators/owner/qwen", allocator);
     defer allocator.free(model_path);
     var manifest = try manifest_mod.loadFromDir(allocator, model_path);
     defer manifest.deinit();
@@ -26990,7 +26990,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
         &out,
         "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,YWJj\"}}]",
         &media_budget,
-        .{ .io = std.testing.io },
+        .{ .io = platform.testing.io },
         false,
     );
     try std.testing.expectEqual(first_uri.len, media_budget.used_bytes);
@@ -27002,7 +27002,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
             &out,
             "[{\"type\":\"media\",\"data\":\"ZGVm\"}]",
             &media_budget,
-            .{ .io = std.testing.io },
+            .{ .io = platform.testing.io },
             false,
         ),
     );
@@ -27019,17 +27019,17 @@ test "direct extraction content releases temporary ownership on every allocation
             var out = DirectExtractionInputs{ .allocator = allocator };
             defer out.deinit();
             var budget = RequestMediaBudget.init(32);
-            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget, .{ .io = std.testing.io }, false);
+            try appendDirectExtractionContent(target, allocator, &out, "\"plain\"", &budget, .{ .io = platform.testing.io }, false);
             try appendDirectExtractionContent(
                 target,
                 allocator,
                 &out,
                 "[{\"type\":\"text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]",
                 &budget,
-                .{ .io = std.testing.io },
+                .{ .io = platform.testing.io },
                 false,
             );
-            try appendDirectExtractionContent(target, allocator, &out, "42", &budget, .{ .io = std.testing.io }, false);
+            try appendDirectExtractionContent(target, allocator, &out, "42", &budget, .{ .io = platform.testing.io }, false);
             try std.testing.expectEqual(@as(usize, 3), out.texts.items.len);
         }
     };
@@ -27066,7 +27066,7 @@ test "direct extraction borrows indexed media and treats text as its prompt" {
         .mime_type = "image/png",
     }};
     try validateDirectExtractionRequest(.{ .inputs = &inputs, .attachments = &attachments });
-    var parsed = try parseDirectExtractionInputs(&node, allocator, &inputs, &attachments, null, null, 16, .{ .io = std.testing.io });
+    var parsed = try parseDirectExtractionInputs(&node, allocator, &inputs, &attachments, null, null, 16, .{ .io = platform.testing.io });
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.images.items.len);
     try std.testing.expectEqual(@intFromPtr(image[0..].ptr), @intFromPtr(parsed.images.items[0].ptr));
@@ -27089,7 +27089,7 @@ test "direct extraction rejects conflicting per-image prompts" {
     };
     try std.testing.expectError(
         error.UnsupportedInput,
-        parseDirectExtractionInputs(&node, allocator, &inputs, &attachments, null, null, 16, .{ .io = std.testing.io }),
+        parseDirectExtractionInputs(&node, allocator, &inputs, &attachments, null, null, 16, .{ .io = platform.testing.io }),
     );
 }
 
@@ -27106,7 +27106,7 @@ test "fail-fast embedding capacity response exposes retry contract" {
     var request = try httpx.Request.init(allocator, .GET, "/ai/v1/embeddings");
     defer request.deinit();
 
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try embedDenseInputFailureResponse(
@@ -27161,7 +27161,7 @@ test "cold model load executor saturation exposes retry contract" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .GET, "/ai/v1/embeddings");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try modelLoadFailureResponse(&ctx, error.ConcurrencyUnavailable);
@@ -27176,7 +27176,7 @@ test "changing model publication returns an explicit retry contract" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try modelLoadFailureResponse(&ctx, error.ModelArtifactsChanging);
@@ -27194,7 +27194,7 @@ test "managed download markers return the model publication retry contract" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/transcribe");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try modelLoadFailureResponse(&ctx, error.IncompleteManagedDownload);
@@ -27213,7 +27213,7 @@ test "inference lifetime errors preserve timeout and cancellation semantics" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var timeout_response = try inferenceFailureResponse(&ctx, error.Timeout);
@@ -27263,12 +27263,12 @@ test "node attachIo wires model session manager" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
 
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);
 
-    var owned_io: ?std.Io.Threaded = null;
+    var owned_io: ?platform.Io.Threaded = null;
     defer if (owned_io) |*io_impl| io_impl.deinit();
     _ = node.inferenceIo(std.testing.allocator, null, &owned_io);
     try std.testing.expect(owned_io == null);
@@ -27278,7 +27278,7 @@ test "unattached direct inference owns its executor fallback" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
 
-    var owned_io: ?std.Io.Threaded = null;
+    var owned_io: ?platform.Io.Threaded = null;
     defer if (owned_io) |*io_impl| io_impl.deinit();
     _ = node.inferenceIo(std.testing.allocator, null, &owned_io);
     try std.testing.expect(owned_io != null);
@@ -27295,7 +27295,7 @@ test "supervised node owns and joins the hard cancellation watchdog" {
             .hard_cancellation = node.hard_cancellation_watchdog.?.boundary(),
         }).enterUninterruptible(.process_required),
     );
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     const control = node.bindExecutionControl(null, .{});
     try std.testing.expect(control.io != null);
@@ -27308,7 +27308,7 @@ test "direct generation admission binds preload control without granting embedde
     const alloc = std.testing.allocator;
     var supervised = try Node.init(alloc, .{ .process_termination_available = true });
     defer supervised.deinit();
-    try supervised.attachIo(std.testing.io);
+    try supervised.attachIo(platform.testing.io);
     var admission = try supervised.beginDirectGenerateAdmission(.{}, 1);
     defer admission.deinit();
     try std.testing.expect(admission.execution_control == null);
@@ -27333,7 +27333,7 @@ test "direct generation admission binds preload control without granting embedde
 
     var embedded = try Node.init(alloc, .{});
     defer embedded.deinit();
-    try embedded.attachIo(std.testing.io);
+    try embedded.attachIo(platform.testing.io);
     var embedded_admission = try embedded.beginDirectGenerateAdmission(.{}, 1);
     defer embedded_admission.deinit();
     const embedded_control = try embedded_admission.boundExecutionControl();
@@ -27368,7 +27368,7 @@ test "supervised node drains load task guards before destroying watchdog" {
             .process_termination_available = true,
         });
         defer node.deinit();
-        const io = std.testing.io;
+        const io = platform.testing.io;
         try node.attachIo(io);
         node.model_manager.load_io = io;
         try node.model_manager.load_group.concurrent(io, Probe.run, .{
@@ -27634,18 +27634,18 @@ test "structured extraction validates generation options before resolver and med
 
 test "valid direct entity failures release admission and partial model state" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/owner/broken-gliner");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/owner/broken-gliner");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/owner/broken-gliner/config.json",
         .data = "{\"model_type\":\"gliner2\"}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/owner/broken-gliner/gliner_config.json",
         .data = "{\"model_type\":\"gliner2\",\"default_labels\":[\"person\"]}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{
@@ -27881,18 +27881,18 @@ test "learned entity cleanup releases partial batches on every allocation failur
 
 test "REBEL rejects unsupported typed schemas before model loading" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "models/owner/rebel");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "models/owner/rebel");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/owner/rebel/config.json",
         .data = "{}",
     });
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models/owner/rebel/rebel_config.json",
         .data = "{}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
     var node = try Node.init(allocator, .{
@@ -27941,7 +27941,7 @@ test "REBEL rejects unsupported typed schemas before model loading" {
         resetRequestWorkTestCounters();
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/extract");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
 
         var response = try node.extractEntitiesAndRelations(
@@ -28099,7 +28099,7 @@ test "readyz serves only the published inventory snapshot" {
     {
         var request = try httpx.Request.init(allocator, .GET, "/readyz");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
 
         var response = try node.readyzHandler(&ctx);
@@ -28112,7 +28112,7 @@ test "readyz serves only the published inventory snapshot" {
     {
         var request = try httpx.Request.init(allocator, .GET, "/readyz");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
 
         var response = try node.readyzHandler(&ctx);
@@ -28127,7 +28127,7 @@ test "readyz serves only the published inventory snapshot" {
     {
         var request = try httpx.Request.init(allocator, .GET, "/readyz");
         defer request.deinit();
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
 
         var response = try node.readyzHandler(&ctx);
@@ -28139,9 +28139,9 @@ test "readyz serves only the published inventory snapshot" {
 
 test "failed readiness refresh preserves the last known good inventory" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models-is-a-file",
         .data = "not a directory",
     });
@@ -28159,7 +28159,7 @@ test "failed readiness refresh preserves the last known good inventory" {
 
     try std.testing.expectError(
         error.NotDir,
-        node.refreshReadinessInventory(std.testing.io),
+        node.refreshReadinessInventory(platform.testing.io),
     );
     const snapshot = node.readiness_inventory.load();
     try std.testing.expect(snapshot.initialized);
@@ -28168,9 +28168,9 @@ test "failed readiness refresh preserves the last known good inventory" {
 
 test "model listing reports registry discovery failures" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "models-is-a-file",
         .data = "not a directory",
     });
@@ -28187,16 +28187,16 @@ test "model listing reports registry discovery failures" {
 
     try std.testing.expectError(
         error.NotDir,
-        node.listModelsJsonAlloc(allocator, std.testing.io),
+        node.listModelsJsonAlloc(allocator, platform.testing.io),
     );
 }
 
 test "model listing does not parse GGUF payloads during discovery" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(std.testing.io, "generators/acme/demo");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "generators/acme/demo");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "generators/acme/demo/model.gguf",
         // Listing metadata only needs the artifact's presence. This is
         // intentionally not a parseable GGUF payload.
@@ -28212,14 +28212,14 @@ test "model listing does not parse GGUF payloads during discovery" {
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
 
-    const body = try node.listModelsJsonAlloc(allocator, std.testing.io);
+    const body = try node.listModelsJsonAlloc(allocator, platform.testing.io);
     defer allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"acme/demo\":") != null);
 }
 
 test "readiness refresh observes an externally published model" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const models_path = try std.fs.path.join(allocator, &.{
         ".zig-cache",
@@ -28230,18 +28230,18 @@ test "readiness refresh observes an externally published model" {
 
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
-    try node.refreshReadinessInventory(std.testing.io);
+    try node.refreshReadinessInventory(platform.testing.io);
     try std.testing.expectEqual(@as(usize, 0), node.readiness_inventory.load().counts.total());
 
     // Model pulls happen in another process and atomically publish directories
     // into this cache. A tiny GGUF marker is enough for listing discovery; no
     // model is loaded or parsed by this test.
-    try tmp.dir.createDirPath(std.testing.io, "generators/acme/demo");
-    try tmp.dir.writeFile(std.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "generators/acme/demo");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "generators/acme/demo/model.gguf",
         .data = "listing-only fixture",
     });
-    try node.refreshReadinessInventory(std.testing.io);
+    try node.refreshReadinessInventory(platform.testing.io);
 
     const refreshed = node.readiness_inventory.load();
     try std.testing.expect(refreshed.initialized);
@@ -28250,7 +28250,7 @@ test "readiness refresh observes an externally published model" {
 
 test "readiness inventory initializes once and owns its refresh task" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const models_path = try std.fs.path.join(allocator, &.{
         ".zig-cache",
@@ -28261,8 +28261,8 @@ test "readiness inventory initializes once and owns its refresh task" {
 
     var node = try Node.init(allocator, .{ .models_dir = models_path });
     defer node.deinit();
-    try node.startReadinessInventory(std.testing.io);
-    try node.startReadinessInventory(std.testing.io);
+    try node.startReadinessInventory(platform.testing.io);
+    try node.startReadinessInventory(platform.testing.io);
 
     const snapshot = node.readiness_inventory.load();
     try std.testing.expect(snapshot.initialized);
@@ -28273,9 +28273,9 @@ test "readiness inventory initializes once and owns its refresh task" {
 
 test "readiness inventory starts with no async worker capacity" {
     const allocator = std.testing.allocator;
-    var threaded = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    var threaded = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
     defer threaded.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(path);
@@ -28290,7 +28290,7 @@ test "internal error response hides implementation error names" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try internalErrorResponse(&ctx, "MODEL_LOAD_FAILED", error.SecretModelFilesystemFailure);
@@ -28306,7 +28306,7 @@ test "post-preprocessing prompt overflow remains a client generation error" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try generationErrorResponse(&ctx, error.PromptTooLong);
@@ -28325,7 +28325,7 @@ test "generation memory exhaustion is an actionable non-retryable capacity error
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try generationErrorResponse(&ctx, error.MemoryBudgetExceeded);
@@ -28354,7 +28354,7 @@ test "generation live pressure is an actionable retryable capacity error" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try generationErrorResponse(&ctx, error.ResourceTemporarilyUnavailable);
@@ -28657,7 +28657,7 @@ test "ambiguous model resolution returns an actionable conflict response" {
     const allocator = std.testing.allocator;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/embeddings");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try Node.requestModelResolutionError(&ctx, error.AmbiguousModelIdentifier);
@@ -28681,7 +28681,7 @@ test "decide maps model resolution errors to client responses" {
     for (cases) |case| {
         var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/decide");
         defer request.deinit();
-        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try Node.decideFailureResponse(&ctx, case[0]);
         defer response.deinit();
@@ -28692,29 +28692,29 @@ test "decide maps model resolution errors to client responses" {
 
 test "HTTP model resolution is canonical and contained while trusted resolution accepts absolute paths" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", alloc);
+    try tmp.dir.createDirPath(platform.testing.io, "models/owner/model");
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", alloc);
     defer alloc.free(models_root);
-    const model_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models/owner/model", alloc);
+    const model_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models/owner/model", alloc);
     defer alloc.free(model_root);
     const explicit_ref = try registry_mod.ModelRef.parse("owner/model:gguf:Q4_K_M");
     const explicit_variant_root = try registry_mod.modelInstallDirAlloc(alloc, models_root, explicit_ref);
     defer alloc.free(explicit_variant_root);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, explicit_variant_root);
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, explicit_variant_root);
     const explicit_variant_config = try std.fs.path.join(alloc, &.{ explicit_variant_root, "config.json" });
     defer alloc.free(explicit_variant_config);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_variant_config, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = explicit_variant_config, .data = "{}" });
     const bge_ref = try registry_mod.ModelRef.parse("BAAI/bge-m3");
     const bge_variant_root = try registry_mod.modelInstallDirAlloc(alloc, models_root, bge_ref);
     defer alloc.free(bge_variant_root);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, bge_variant_root);
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, bge_variant_root);
     const bge_variant_config = try std.fs.path.join(alloc, &.{ bge_variant_root, "config.json" });
     defer alloc.free(bge_variant_config);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = bge_variant_config, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = bge_variant_config, .data = "{}" });
 
     var node: Node = undefined;
     node.config = .{ .models_dir = models_root };
@@ -28723,32 +28723,32 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     defer request_arena.deinit();
     const request_allocator = request_arena.allocator();
 
-    const resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "hf:owner/model:q4_0", "generators");
+    const resolved = try node.resolveRequestModelPath(request_allocator, platform.testing.io, "hf:owner/model:q4_0", "generators");
     defer request_allocator.free(resolved);
     try std.testing.expectEqualStrings(model_root, resolved);
-    const explicit_resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "owner/model:gguf:Q4_K_M", "generators");
+    const explicit_resolved = try node.resolveRequestModelPath(request_allocator, platform.testing.io, "owner/model:gguf:Q4_K_M", "generators");
     defer request_allocator.free(explicit_resolved);
     try std.testing.expectEqualStrings(explicit_variant_root, explicit_resolved);
-    const bge_resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "BAAI/bge-m3", "embedders");
+    const bge_resolved = try node.resolveRequestModelPath(request_allocator, platform.testing.io, "BAAI/bge-m3", "embedders");
     defer request_allocator.free(bge_resolved);
     try std.testing.expectEqualStrings(bge_variant_root, bge_resolved);
-    const trusted_resolved = try node.resolveModelPath(std.testing.io, model_root, "generators");
+    const trusted_resolved = try node.resolveModelPath(platform.testing.io, model_root, "generators");
     defer alloc.free(trusted_resolved);
     try std.testing.expectEqualStrings(model_root, trusted_resolved);
 
     const builtin_os = @import("builtin").os.tag;
     if (builtin_os != .windows and builtin_os != .wasi and builtin_os != .freestanding) {
-        try tmp.dir.createDirPath(std.testing.io, "outside");
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "outside/config.json", .data = "{}" });
-        try tmp.dir.symLink(std.testing.io, "../outside", "models/link", .{});
-        try std.testing.expectError(error.ModelOutsideModelsDir, node.resolveRequestModelPath(request_allocator, std.testing.io, "link", "generators"));
+        try tmp.dir.createDirPath(platform.testing.io, "outside");
+        try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "outside/config.json", .data = "{}" });
+        try tmp.dir.symLink(platform.testing.io, "../outside", "models/link", .{});
+        try std.testing.expectError(error.ModelOutsideModelsDir, node.resolveRequestModelPath(request_allocator, platform.testing.io, "link", "generators"));
     }
 }
 
 test "trusted model resolution prefers an exact legacy path before receipt discovery" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/owner/model");
@@ -28781,8 +28781,8 @@ test "trusted model resolution prefers an exact legacy path before receipt disco
 
 test "HTTP model resolution accepts the managed identity advertised by discovery" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "models/provisioned/arbitrary-leaf");
@@ -28827,8 +28827,8 @@ test "HTTP model resolution accepts the managed identity advertised by discovery
 
 test "managed model resolution fails closed when explicit variants coexist" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     inline for (.{
@@ -28887,14 +28887,14 @@ test "HTTP model resolution caller ownership stays flat across repeated requests
     var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
     defer std.debug.assert(gpa.deinit() == 0);
     const allocator = gpa.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    try tmp.dir.createDirPath(platform.testing.io, "models/owner/model");
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
-    const model_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models/owner/model", allocator);
+    const model_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models/owner/model", allocator);
     defer allocator.free(model_root);
 
     var node: Node = undefined;
@@ -28902,7 +28902,7 @@ test "HTTP model resolution caller ownership stays flat across repeated requests
     node.allocator = allocator;
 
     for (0..64) |_| {
-        const resolved = try node.resolveRequestModelPath(allocator, std.testing.io, "hf:owner/model:q4_0", "generators");
+        const resolved = try node.resolveRequestModelPath(allocator, platform.testing.io, "hf:owner/model:q4_0", "generators");
         try std.testing.expectEqualStrings(model_root, resolved);
         allocator.free(resolved);
     }
@@ -28912,15 +28912,15 @@ test "trusted model resolution caller ownership stays flat across every return s
     var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
     defer std.debug.assert(gpa.deinit() == 0);
     const allocator = gpa.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(std.testing.io, "models/owner/model");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/config.json", .data = "{}" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
-    const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
+    try tmp.dir.createDirPath(platform.testing.io, "models/owner/model");
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "models/config.json", .data = "{}" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "models/owner/model/config.json", .data = "{}" });
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models", allocator);
     defer allocator.free(models_root);
-    const model_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models/owner/model", allocator);
+    const model_root = try tmp.dir.realPathFileAlloc(platform.testing.io, "models/owner/model", allocator);
     defer allocator.free(model_root);
 
     var node: Node = undefined;
@@ -28928,15 +28928,15 @@ test "trusted model resolution caller ownership stays flat across every return s
     node.allocator = allocator;
 
     for (0..64) |_| {
-        const named = try node.resolveModelPath(std.testing.io, "hf:owner/model:q4_0", "generators");
+        const named = try node.resolveModelPath(platform.testing.io, "hf:owner/model:q4_0", "generators");
         try std.testing.expectEqualStrings(model_root, named);
         allocator.free(named);
 
-        const absolute = try node.resolveModelPath(std.testing.io, model_root, "generators");
+        const absolute = try node.resolveModelPath(platform.testing.io, model_root, "generators");
         try std.testing.expectEqualStrings(model_root, absolute);
         allocator.free(absolute);
 
-        const configured_root = try node.resolveModelPath(std.testing.io, null, null);
+        const configured_root = try node.resolveModelPath(platform.testing.io, null, null);
         try std.testing.expectEqualStrings(models_root, configured_root);
         allocator.free(configured_root);
     }
@@ -29105,10 +29105,10 @@ test "inline media budgets charge encoded sources before decoding" {
 
 test "download helpers fail closed for null and explicit empty policies" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image.png", .data = "png" });
-    const file_path = try tmp.dir.realPathFileAlloc(std.testing.io, "image.png", alloc);
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "image.png", .data = "png" });
+    const file_path = try tmp.dir.realPathFileAlloc(platform.testing.io, "image.png", alloc);
     defer alloc.free(file_path);
     const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{file_path});
     defer alloc.free(file_uri);
@@ -29161,12 +29161,12 @@ test "explicit private IP override does not implicitly allow hosts or files" {
 
 test "download remote content honors an explicit file allowlist" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image.png", .data = "png" });
-    const allowed_root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "image.png", .data = "png" });
+    const allowed_root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(allowed_root);
-    const file_path = try tmp.dir.realPathFileAlloc(std.testing.io, "image.png", alloc);
+    const file_path = try tmp.dir.realPathFileAlloc(platform.testing.io, "image.png", alloc);
     defer alloc.free(file_path);
     const file_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{file_path});
     defer alloc.free(file_uri);
@@ -29369,10 +29369,10 @@ fn dirContainsModel(path: []const u8) bool {
     }
 
     if (!build_options.link_libc) {
-        var dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, path, .{ .iterate = true }) catch return false;
-        defer dir.close(std.Options.debug_io);
+        var dir = std.Io.Dir.cwd().openDir(platform.debug_io, path, .{ .iterate = true }) catch return false;
+        defer dir.close(platform.debug_io);
         var iter = dir.iterate();
-        while (iter.next(std.Options.debug_io) catch null) |entry| {
+        while (iter.next(platform.debug_io) catch null) |entry| {
             const name = entry.name;
             if (name.len > 5 and std.mem.endsWith(u8, name, ".gguf")) return true;
             if (name.len > 5 and std.mem.endsWith(u8, name, ".onnx")) return true;
@@ -31407,7 +31407,7 @@ test "Antfly inference numeric HTTP response ownership is allocation failure saf
             var request = try httpx.Request.init(alloc, .POST, "/ai/v1/rerank");
             defer request.deinit();
             try request.headers.set("Accept", httpx.numeric_response.accept);
-            var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             try ctx.setHeader("Vary", "Origin");
             var response = try Node.writeRerankScoresResponse(&ctx, "reranker", &.{ 0.25, 0.75 }, 2);
@@ -31424,7 +31424,7 @@ test "Antfly inference numeric HTTP response ownership is allocation failure saf
             try std.testing.expectEqual(@as(f32, 0.75), view.value(1));
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn buildEmbedDenseResponse(
@@ -32528,7 +32528,7 @@ test "rerank rejects ambiguous or empty document lists before loading a model" {
         var request = try httpx.Request.init(allocator, .POST, "/ai/v1/rerank");
         defer request.deinit();
         try request.setJson(body);
-        var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+        var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try node.rerankDocuments(&ctx);
         defer response.deinit();
@@ -34085,7 +34085,7 @@ test "admission rejection includes Retry-After" {
 
     var request = try httpx.Request.init(allocator, .GET, "/ai/v1/models");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = (try node.acquireSlot(&ctx)) orelse return error.TestExpectedAdmissionRejection;
@@ -34122,7 +34122,7 @@ test "route-owned request admission rejects before endpoint work" {
     );
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/test");
     defer request.deinit();
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try handler.invoke(&ctx);
@@ -34161,7 +34161,7 @@ test "structured extract rejects mixed inputs before resolving a missing model" 
     request.body =
         \\{"model":"missing-model","inputs":[{"content":"hello"},{"content":[{"type":"image_url","image_url":{"url":"https://invalid.example/image.png"}}]}],"schema":{"structures":{"answer":{"fields":{"value":"string"}}}}}
     ;
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.extract(&ctx);
     defer response.deinit();
@@ -34183,7 +34183,7 @@ test "structured extract maps weighted admission exhaustion to retryable capacit
     request.body =
         \\{"model":"demo","inputs":[{"content":"hello"}],"schema":{"structures":{"answer":{"fields":{"value":"string"}}}}}
     ;
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try node.extract(&ctx);
@@ -34204,7 +34204,7 @@ test "predict endpoint shares inference request admission" {
     var request = try httpx.Request.init(allocator, .POST, "/ml/v1/predict");
     defer request.deinit();
     request.body = "{\"model\":\"demo\",\"input\":[[1.0]]}";
-    var ctx = httpx.Context.init(allocator, std.testing.io, &request);
+    var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try node.predict(&ctx);
@@ -34327,7 +34327,7 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     const gib: usize = 1024 * 1024 * 1024;
     var node = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true, .generation_budget_overrides = .{ .host_limit_bytes = 6 * gib, .backend_limit_bytes = 12 * gib, .combined_limit_bytes = 18 * gib, .scratch_limit_bytes = 8 * gib } });
     defer node.deinit();
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
     const backend = try @import("../util/laya_test_support.zig").selectedBackend();
     node.session_manager.required_backend = backend;
     node.model_manager.session_manager.required_backend = backend;
@@ -34354,7 +34354,7 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     if (backend == .metal and @import("../ops/laya_metal.zig").enabled()) {
         var denied = try Node.init(a, .{ .models_dir = root, .allow_unknown_models = true, .max_concurrent_requests = 1, .process_termination_available = true, .generation_budget_overrides = .{ .backend_limit_bytes = 1 } });
         defer denied.deinit();
-        try denied.attachIo(std.testing.io);
+        try denied.attachIo(platform.testing.io);
         // A CPU candidate exists; strict residency must still reject the
         // Metal admission failure rather than select that fallback.
         denied.session_manager.preferred_backends = &.{ .metal, .native };
@@ -34376,7 +34376,7 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
     defer request.deinit();
     request.body = body;
-    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    var ctx = httpx.Context.init(a, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.extractJSON(&ctx);
     defer response.deinit();
@@ -34462,7 +34462,7 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
         },
     });
     defer node.deinit();
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
     const backend_name = platform.env.getenv("ANTFLY_GLINER_DECIDE_BACKEND") orelse "native";
     const backend: backends_mod.BackendType = if (std.mem.eql(u8, backend_name, "cuda")) .cuda else if (std.mem.eql(u8, backend_name, "native")) .native else return error.InvalidDecisionTestBackend;
     node.session_manager.required_backend = backend;
@@ -34476,7 +34476,7 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
     var request = try httpx.Request.init(a, .POST, "/ai/v1/extract");
     defer request.deinit();
     request.body = body;
-    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    var ctx = httpx.Context.init(a, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.extractJSON(&ctx);
     defer response.deinit();

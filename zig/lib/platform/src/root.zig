@@ -26,9 +26,13 @@ pub const process_memory = @import("process_memory.zig");
 pub const sync = @import("sync.zig");
 pub const time = @import("time.zig");
 
-/// Fiber backends adapted to the pinned Zig release Io interface.
-pub const Evented = if (@import("std").Io.fiber.supported) switch (@import("builtin").os.tag) {
-    .linux => @import("io_uring_compat.zig"),
-    .macos => @import("dispatch_compat.zig"),
-    else => @import("std").Io.Evented,
-} else void;
+/// Platform I/O contexts and owning backends.
+pub const Io = @import("io.zig");
+pub const c = @import("native_c.zig");
+pub const DynLib = if (@import("builtin").os.tag == .windows) @import("windows_native.zig").WindowsDynLib else @import("std").DynLib;
+pub const testing = @import("testing.zig");
+
+/// Process-lifetime fallback for diagnostics and legacy optional I/O.
+/// Runtime APIs should continue to use their caller-supplied executor.
+var debug_threaded: Io.Threaded = .init_single_threaded;
+pub const debug_io: Io.Context = if (@import("builtin").os.tag == .windows) debug_threaded.io() else @import("std").Options.debug_io;

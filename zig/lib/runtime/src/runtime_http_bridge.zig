@@ -17,6 +17,7 @@
 //! compiled independently on each side of a linked archive boundary; only the
 //! extern values and callbacks in runtime_http_abi cross that boundary.
 
+const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const abi = @import("runtime_http_abi.zig");
 
@@ -198,6 +199,7 @@ fn callbackResult(status: abi.CallbackStatus) !void {
 
 test "runtime HTTP streaming carries policy headers before commitment across both adapters" {
     const std = @import("std");
+
     const Capture = struct {
         started: bool = false,
         fn start(raw: ?*anyopaque, status: u16, content_type: []const u8, headers: *const httpx.Headers) !void {
@@ -259,7 +261,7 @@ test "runtime HTTP streaming carries policy headers before commitment across bot
 
 test "missing linked callbacks leave a normal buffered context" {
     const std = @import("std");
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var request = try httpx.Request.init(std.testing.allocator, .GET, "/");
     defer request.deinit();
@@ -288,7 +290,7 @@ test "linked request bodies remain lazy and transport neutral" {
 
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/query");
     defer request.deinit();
-    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var context = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer context.deinit();
     var state = State{};
     const cancellation: abi.CancellationView = .{};
@@ -347,7 +349,7 @@ test "linked callbacks preserve streaming and cancellation semantics" {
         }
     };
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/stream");
     defer request.deinit();
@@ -401,7 +403,7 @@ test "outbound stream callbacks preserve terminal status classes" {
 
     var request = try httpx.Request.init(std.testing.allocator, .GET, "/");
     defer request.deinit();
-    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var context = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer context.deinit();
     var cancellation = std.atomic.Value(bool).init(false);
     context.cancellation = &cancellation;
@@ -468,7 +470,7 @@ test "outbound callbacks prefer cancellation that arrives during transport IO" {
 
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/stream");
     defer request.deinit();
-    var context = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+    var context = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer context.deinit();
     var cancellation = std.atomic.Value(bool).init(false);
     context.cancellation = &cancellation;

@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const common = @import("antfly_local_sources").common_http_http_common;
 const std_http_listener = @import("antfly_local_sources").common_http_std_http_listener;
@@ -70,7 +72,7 @@ pub const StdHttpExecutor = struct {
 
     alloc: std.mem.Allocator,
     cfg: StdHttpExecutorConfig,
-    io_impl: *std.Io.Threaded,
+    io_impl: *platform.Io.Threaded,
     io_vtable: *std.Io.VTable,
     io_owner: IoOwner,
     client: std.http.Client,
@@ -85,8 +87,8 @@ pub const StdHttpExecutor = struct {
     requests_on_current_connection: u32,
 
     pub fn initInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig) void {
-        const io_impl = alloc.create(std.Io.Threaded) catch @panic("OOM");
-        io_impl.* = std.Io.Threaded.init(alloc, .{
+        const io_impl = alloc.create(platform.Io.Threaded) catch @panic("OOM");
+        io_impl.* = platform.Io.Threaded.init(alloc, .{
             .stack_size = cfg.thread_stack_size,
             .concurrent_limit = .limited(cfg.io_concurrent_limit),
         });
@@ -118,7 +120,7 @@ pub const StdHttpExecutor = struct {
         self.resolved_client = httpx.Client.initWithConfig(alloc, safe_io, resolvedClientConfig(cfg));
     }
 
-    pub fn initSharedInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig, io_impl: *std.Io.Threaded) void {
+    pub fn initSharedInPlace(self: *StdHttpExecutor, alloc: std.mem.Allocator, cfg: StdHttpExecutorConfig, io_impl: *platform.Io.Threaded) void {
         const io_vtable = threaded_connect_io.createVTable(alloc, io_impl) catch @panic("OOM");
         self.* = .{
             .alloc = alloc,
@@ -967,8 +969,8 @@ test "std http executor retains socket write failures and uncertain delivery" {
         }
     };
     const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
-    var server = try address.listen(std.testing.io, .{});
-    defer server.deinit(std.testing.io);
+    var server = try address.listen(platform.testing.io, .{});
+    defer server.deinit(platform.testing.io);
     const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(uri);
     for ([_]common.Method{ .GET, .POST }) |method| {
@@ -1020,8 +1022,8 @@ test "std http executor rejects truncated response without replaying a delivered
             self.flushed = true;
         }
     };
-    var server = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(std.testing.io, .{});
-    defer server.deinit(std.testing.io);
+    var server = try (std.Io.net.IpAddress{ .ip4 = .loopback(0) }).listen(platform.testing.io, .{});
+    defer server.deinit(platform.testing.io);
     const uri = try std.fmt.allocPrint(std.testing.allocator, "http://127.0.0.1:{d}/", .{server.socket.address.getPort()});
     defer std.testing.allocator.free(uri);
     for ([_][]const u8{
@@ -1122,7 +1124,7 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
         ) std.Io.Cancelable!void {
             state.completed_at = std.Io.Clock.Timestamp.now(task_io, .awake);
             published.store(true, .release);
-            while (!release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             state.done.set(task_io);
         }
     };
@@ -1131,12 +1133,12 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
         release: *std.atomic.Value(bool),
 
         fn run(self: *@This()) void {
-            sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 25);
+            sleepTestMs(platform.Io.Threaded.global_single_threaded.io(), 25);
             self.release.store(true, .release);
         }
     };
 
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const completed_before_deadline = std.Io.Clock.Timestamp.now(io, .awake);
     const future_deadline = std.Io.Clock.Timestamp.fromNow(io, .{
         .raw = std.Io.Duration.fromMilliseconds(1_000),
@@ -1213,7 +1215,7 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
         release.store(true, .release);
         group.cancel(task_io);
     };
-    while (!published.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!published.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
 
     const race_deadline = std.Io.Clock.Timestamp.fromNow(task_io, .{
         .raw = std.Io.Duration.fromMilliseconds(25),
@@ -1224,9 +1226,9 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
     try std.testing.expect(!raced.done.isSet());
 
     var release_task = ReleaseTask{ .release = &release };
-    var release_thread = try std.testing.io.concurrent(ReleaseTask.run, .{&release_task});
+    var release_thread = try platform.testing.io.concurrent(ReleaseTask.run, .{&release_task});
     var release_thread_joined = false;
-    defer if (!release_thread_joined) release_thread.await(std.testing.io);
+    defer if (!release_thread_joined) release_thread.await(platform.testing.io);
     const raced_result = StdHttpExecutor.cancelAndFinishControlledRequest(
         &group,
         &raced,
@@ -1237,7 +1239,7 @@ test "controlled HTTP completion time arbitrates the absolute deadline" {
     );
     raced_owned = false;
     group_active = false;
-    release_thread.await(std.testing.io);
+    release_thread.await(platform.testing.io);
     release_thread_joined = true;
     var raced_response = try raced_result;
     defer raced_response.deinit(std.testing.allocator);
@@ -1447,7 +1449,7 @@ test "resolved std http executor bounds queued requests before delivery" {
         cancellation: *common.RequestCancellation,
 
         fn run(self: *@This()) void {
-            sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 25);
+            sleepTestMs(platform.Io.Threaded.global_single_threaded.io(), 25);
             self.cancellation.cancel();
         }
     };
@@ -1482,9 +1484,9 @@ test "resolved std http executor bounds queued requests before delivery" {
 
     var cancellation: common.RequestCancellation = .{};
     var cancel_task = CancelTask{ .cancellation = &cancellation };
-    var cancel_thread = try std.testing.io.concurrent(CancelTask.run, .{&cancel_task});
+    var cancel_thread = try platform.testing.io.concurrent(CancelTask.run, .{&cancel_task});
     var cancel_thread_joined = false;
-    defer if (!cancel_thread_joined) cancel_thread.await(std.testing.io);
+    defer if (!cancel_thread_joined) cancel_thread.await(platform.testing.io);
 
     var cancelled_delivery: common.RequestDeliveryTracker = .{};
     try std.testing.expectError(error.Cancelled, executor.executor().execute(std.testing.allocator, .{
@@ -1494,7 +1496,7 @@ test "resolved std http executor bounds queued requests before delivery" {
         .cancellation = &cancellation,
         .delivery_tracker = &cancelled_delivery,
     }));
-    cancel_thread.await(std.testing.io);
+    cancel_thread.await(platform.testing.io);
     cancel_thread_joined = true;
     try std.testing.expectEqual(common.RequestDeliveryTracker.State.not_sent, cancelled_delivery.load());
     try std.testing.expectEqual(@as(usize, 0), app.calls.load(.acquire));
@@ -1574,14 +1576,14 @@ test "std http executor cancellation interrupts a request queued for the pooled 
         .executor = executor.executor(),
         .cancellation = &cancellation,
     };
-    var request_thread = try std.testing.io.concurrent(RequestThread.run, .{&request_state});
+    var request_thread = try platform.testing.io.concurrent(RequestThread.run, .{&request_state});
     var request_joined = false;
     defer if (!request_joined) {
         if (client_locked) {
             executor.client_mutex.unlock(io);
             client_locked = false;
         }
-        request_thread.await(std.testing.io);
+        request_thread.await(platform.testing.io);
     };
 
     var admitted = false;
@@ -1605,7 +1607,7 @@ test "std http executor cancellation interrupts a request queued for the pooled 
 
     executor.client_mutex.unlock(io);
     client_locked = false;
-    request_thread.await(std.testing.io);
+    request_thread.await(platform.testing.io);
     request_joined = true;
     try std.testing.expect(cancelled_while_queued);
     try std.testing.expectEqual(@as(u8, 1), request_state.outcome.load(.acquire));
@@ -1626,7 +1628,7 @@ test "std http executor cancellation interrupts an active response wait" {
             const cancellation = req.cancellation orelse return error.TestExpectedCancellation;
             self.entered.store(true, .release);
             while (!cancellation.isCancelled()) {
-                sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
+                sleepTestMs(platform.Io.Threaded.global_single_threaded.io(), 1);
             }
             self.exited.store(true, .release);
             return .{ .status = 200, .body = try alloc.dupe(u8, "cancelled") };
@@ -1672,7 +1674,7 @@ test "std http executor cancellation interrupts an active response wait" {
         .uri = uri,
         .cancellation = &cancellation,
     };
-    var task_io = std.Io.Threaded.init(std.testing.allocator, .{
+    var task_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .concurrent_limit = .limited(1),
     });
     defer task_io.deinit();
@@ -1683,13 +1685,13 @@ test "std http executor cancellation interrupts an active response wait" {
 
     for (0..2_000) |_| {
         if (app.entered.load(.acquire)) break;
-        sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
+        sleepTestMs(platform.Io.Threaded.global_single_threaded.io(), 1);
     }
     try std.testing.expect(app.entered.load(.acquire));
     cancellation.cancel();
     for (0..2_000) |_| {
         if (task.outcome.load(.acquire) != 0 and app.exited.load(.acquire)) break;
-        sleepTestMs(std.Io.Threaded.global_single_threaded.io(), 1);
+        sleepTestMs(platform.Io.Threaded.global_single_threaded.io(), 1);
     }
     try std.testing.expectEqual(@as(u8, 1), task.outcome.load(.acquire));
     try std.testing.expectEqual(.may_have_been_sent, task.delivery_tracker.load());

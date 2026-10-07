@@ -109,8 +109,8 @@ pub const ForwardProfile = struct {
 fn monotonicNowNs() u64 {
     // wasm-freestanding has no posix clock; profiling is best-effort there.
     if (@import("builtin").target.cpu.arch.isWasm()) return 0;
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -1362,7 +1362,7 @@ fn exerciseContextualLabelGather(a: std.mem.Allocator) !void {
 }
 
 test "GLiNER contextual batch label gather allocation failure releases ownership" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseContextualLabelGather, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseContextualLabelGather, .{});
 }
 
 // Small analytic head: the span MLP returns its first word vector, the zero
@@ -1516,7 +1516,7 @@ test "GLiNER complete batched head releases host allocations on failure and retr
     // Fail every architecture-owned allocation, including the second word
     // gather and span-index allocations. The backend uses its own allocator,
     // so an error must unwind CT ownership as well as these host buffers.
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseHeadAllocationFailures, .{&cb});
+    try platform.allocator.checkAllAllocationFailures(a, exerciseHeadAllocationFailures, .{&cb});
     try exerciseHeadAllocationFailures(a, &cb);
 }
 

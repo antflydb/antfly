@@ -16,6 +16,21 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Open a read-only file whose handle is retained by its caller. Windows uses
+/// overlapped I/O from the first open, so repeated c.pread calls do not reopen
+/// the file. Close with File.close using the same owning executor.
+pub fn openPositionalReadOnly(io: std.Io, dir: std.Io.Dir, path: []const u8) std.Io.File.OpenError!std.Io.File {
+    if (builtin.os.tag == .windows) return @import("threaded_windows.zig").openPositionalReadOnly(dir, path);
+    return dir.openFile(io, path, .{});
+}
+
+/// Temporary file root selected from the native host environment.
+pub fn temporaryDirectory() []const u8 {
+    const env = @import("env.zig");
+    if (builtin.os.tag == .windows) return env.getenv("TEMP") orelse env.getenv("TMP") orelse ".";
+    return env.getenv("TMPDIR") orelse "/tmp";
+}
+
 pub const capacity_supported = builtin.link_libc and switch (builtin.os.tag) {
     .linux, .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .illumos => true,
     else => false,
@@ -65,4 +80,22 @@ test "filesystem capacity reports the test volume" {
     const observation = try capacity(".");
     try std.testing.expect(observation.total_bytes > 0);
     try std.testing.expect(observation.available_bytes <= observation.total_bytes);
+}
+
+/// Mapping hints remain optional on Windows; callers retain ownership of the
+/// mapping and should use their owning Io for actual reads and publication.
+pub fn adviseMemory(ptr: [*]align(std.heap.page_size_min) u8, length: usize, advice: u32) std.posix.MadviseError!void {
+    if (builtin.os.tag == .windows) {
+        if (@import("windows_native.zig").madvise(ptr, length, advice) != 0) return error.Unexpected;
+        return;
+    }
+    return std.posix.madvise(ptr, length, advice);
+}
+
+pub fn unmapMemory(memory: []align(std.heap.page_size_min) const u8) void {
+    if (builtin.os.tag == .windows) {
+        if (@import("windows_native.zig").munmap(memory.ptr, memory.len) != 0) @panic("cannot unmap Windows file view");
+        return;
+    }
+    std.posix.munmap(memory);
 }

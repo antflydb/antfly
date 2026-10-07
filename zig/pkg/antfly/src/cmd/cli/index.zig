@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const antfly = @import("../../cli_root.zig");
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
@@ -151,79 +153,79 @@ fn parseRoute(iterator: std.process.Args.Iterator) Route {
 
 test "index route accepts flags before and after the action" {
     var documented_argv = [_][*:0]const u8{ "list", "--table", "wikipedia" };
-    const documented = parseRoute(std.process.Args.Iterator.init(.{ .vector = documented_argv[0..] }));
+    const documented = parseRoute(platform.process.argsIterator(documented_argv[0..]));
     try std.testing.expectEqualStrings("list", documented.subcommand.?);
     try std.testing.expectEqualStrings("wikipedia", documented.table_name.?);
 
     var legacy_argv = [_][*:0]const u8{ "--table", "wikipedia", "list" };
-    const legacy = parseRoute(std.process.Args.Iterator.init(.{ .vector = legacy_argv[0..] }));
+    const legacy = parseRoute(platform.process.argsIterator(legacy_argv[0..]));
     try std.testing.expectEqualStrings("list", legacy.subcommand.?);
     try std.testing.expectEqualStrings("wikipedia", legacy.table_name.?);
 
     var value_argv = [_][*:0]const u8{ "create", "--table", "docs", "--type", "list" };
-    const value = parseRoute(std.process.Args.Iterator.init(.{ .vector = value_argv[0..] }));
+    const value = parseRoute(platform.process.argsIterator(value_argv[0..]));
     try std.testing.expectEqualStrings("create", value.subcommand.?);
 
     var flags_first_argv = [_][*:0]const u8{ "--table", "docs", "--type", "list", "create" };
-    const flags_first = parseRoute(std.process.Args.Iterator.init(.{ .vector = flags_first_argv[0..] }));
+    const flags_first = parseRoute(platform.process.argsIterator(flags_first_argv[0..]));
     try std.testing.expectEqualStrings("create", flags_first.subcommand.?);
 
     var policy_argv = [_][*:0]const u8{ "create", "--table", "docs", "--coverage-policy", "partial" };
-    const policy = parseRoute(std.process.Args.Iterator.init(.{ .vector = policy_argv[0..] }));
+    const policy = parseRoute(platform.process.argsIterator(policy_argv[0..]));
     try std.testing.expectEqualStrings("create", policy.subcommand.?);
     try std.testing.expect(policy.unknown_arg == null);
 
     var vector_options_argv = [_][*:0]const u8{ "create", "--table", "docs", "--external", "--distance-metric", "cosine" };
-    const vector_options = parseRoute(std.process.Args.Iterator.init(.{ .vector = vector_options_argv[0..] }));
+    const vector_options = parseRoute(platform.process.argsIterator(vector_options_argv[0..]));
     try std.testing.expectEqualStrings("create", vector_options.subcommand.?);
     try std.testing.expect(vector_options.unknown_arg == null);
 
     var wait_argv = [_][*:0]const u8{ "wait", "--table", "docs", "--index", "dense", "--until", "searchable-artifacts=1" };
-    const wait = parseRoute(std.process.Args.Iterator.init(.{ .vector = wait_argv[0..] }));
+    const wait = parseRoute(platform.process.argsIterator(wait_argv[0..]));
     try std.testing.expectEqualStrings("wait", wait.subcommand.?);
     try std.testing.expect(wait.unknown_arg == null);
 
     var wait_prefix_argv = [_][*:0]const u8{ "--until", "complete", "--index", "dense", "wait", "--table", "docs" };
-    const wait_prefix = parseRoute(std.process.Args.Iterator.init(.{ .vector = wait_prefix_argv[0..] }));
+    const wait_prefix = parseRoute(platform.process.argsIterator(wait_prefix_argv[0..]));
     try std.testing.expectEqualStrings("wait", wait_prefix.subcommand.?);
     try std.testing.expect(wait_prefix.unknown_arg == null);
 
     var missing_until_argv = [_][*:0]const u8{ "wait", "--table", "docs", "--index", "dense", "--until" };
-    const missing_until = parseRoute(std.process.Args.Iterator.init(.{ .vector = missing_until_argv[0..] }));
+    const missing_until = parseRoute(platform.process.argsIterator(missing_until_argv[0..]));
     try std.testing.expectEqualStrings("--until", missing_until.missing_value_arg.?);
 
     var legacy_wait_argv = [_][*:0]const u8{ "wait", "--table", "docs", "--index", "dense", "--queryable" };
-    const legacy_wait = parseRoute(std.process.Args.Iterator.init(.{ .vector = legacy_wait_argv[0..] }));
+    const legacy_wait = parseRoute(platform.process.argsIterator(legacy_wait_argv[0..]));
     try std.testing.expectEqualStrings("--queryable", legacy_wait.unknown_arg.?);
 
     var legacy_complete_argv = [_][*:0]const u8{ "wait", "--table", "docs", "--index", "dense", "--complete" };
-    const legacy_complete = parseRoute(std.process.Args.Iterator.init(.{ .vector = legacy_complete_argv[0..] }));
+    const legacy_complete = parseRoute(platform.process.argsIterator(legacy_complete_argv[0..]));
     try std.testing.expectEqualStrings("--complete", legacy_complete.unknown_arg.?);
 
     var shorthand_json_argv = [_][*:0]const u8{ "--table", "docs", "--output", "json" };
-    const shorthand_json = parseRoute(std.process.Args.Iterator.init(.{ .vector = shorthand_json_argv[0..] }));
+    const shorthand_json = parseRoute(platform.process.argsIterator(shorthand_json_argv[0..]));
     try std.testing.expect(shorthand_json.subcommand == null);
     try std.testing.expect(shorthand_json.index_name == null);
     try std.testing.expect(shorthand_json.unknown_arg == null);
 
     var shorthand_invalid_argv = [_][*:0]const u8{ "--table", "docs", "--dimension", "3" };
-    const shorthand_invalid = parseRoute(std.process.Args.Iterator.init(.{ .vector = shorthand_invalid_argv[0..] }));
+    const shorthand_invalid = parseRoute(platform.process.argsIterator(shorthand_invalid_argv[0..]));
     try std.testing.expectEqualStrings("--dimension", shorthand_invalid.unknown_arg.?);
 
     var duplicate_table_argv = [_][*:0]const u8{ "list", "--table", "docs", "-t", "other" };
-    const duplicate_table = parseRoute(std.process.Args.Iterator.init(.{ .vector = duplicate_table_argv[0..] }));
+    const duplicate_table = parseRoute(platform.process.argsIterator(duplicate_table_argv[0..]));
     try std.testing.expectEqualStrings("-t", duplicate_table.duplicate_arg.?);
 
     var missing_index_argv = [_][*:0]const u8{ "--table", "docs", "--index" };
-    const missing_index = parseRoute(std.process.Args.Iterator.init(.{ .vector = missing_index_argv[0..] }));
+    const missing_index = parseRoute(platform.process.argsIterator(missing_index_argv[0..]));
     try std.testing.expectEqualStrings("--index", missing_index.missing_value_arg.?);
 
     var swallowed_dimension_argv = [_][*:0]const u8{ "create", "--table", "docs", "--coverage-policy", "--dimension", "3" };
-    const swallowed_dimension = parseRoute(std.process.Args.Iterator.init(.{ .vector = swallowed_dimension_argv[0..] }));
+    const swallowed_dimension = parseRoute(platform.process.argsIterator(swallowed_dimension_argv[0..]));
     try std.testing.expectEqualStrings("--coverage-policy", swallowed_dimension.missing_value_arg.?);
 
     var typo_argv = [_][*:0]const u8{ "create", "--table", "docs", "--dimensoin", "512" };
-    const typo = parseRoute(std.process.Args.Iterator.init(.{ .vector = typo_argv[0..] }));
+    const typo = parseRoute(platform.process.argsIterator(typo_argv[0..]));
     try std.testing.expectEqualStrings("--dimensoin", typo.unknown_arg.?);
 }
 
@@ -2225,7 +2227,7 @@ test "index wait retries bounded HTTP and transport failures" {
     var fake = Fake{ .allocator = std.testing.allocator };
     const outcome = try waitForIndexWithFetcher(
         std.testing.allocator,
-        std.testing.io,
+        platform.testing.io,
         .{ .ptr = &fake, .fetch_fn = Fake.fetch },
         .system(),
         "docs",
@@ -2263,7 +2265,7 @@ test "index wait rejects a transient ready snapshot" {
     var fake = Fake{ .allocator = std.testing.allocator };
     const outcome = try waitForIndexWithFetcher(
         std.testing.allocator,
-        std.testing.io,
+        platform.testing.io,
         .{ .ptr = &fake, .fetch_fn = Fake.fetch },
         .system(),
         "docs",
@@ -2303,7 +2305,7 @@ test "index wait deadline rejects a response that arrives late" {
     var fake = Fake{ .allocator = std.testing.allocator };
     const outcome = try waitForIndexWithFetcher(
         std.testing.allocator,
-        std.testing.io,
+        platform.testing.io,
         .{ .ptr = &fake, .fetch_fn = Fake.fetch },
         .{ .ptr = &fake, .now_fn = Fake.now },
         "docs",
@@ -2351,7 +2353,7 @@ test "index wait does not fetch after its deadline" {
     var fake = Fake{ .allocator = std.testing.allocator };
     const outcome = try waitForIndexWithFetcher(
         std.testing.allocator,
-        std.testing.io,
+        platform.testing.io,
         .{ .ptr = &fake, .fetch_fn = Fake.fetch },
         .{ .ptr = &fake, .now_fn = Fake.now },
         "docs",

@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const audio = @import("antfly_audio_openapi");
 const httpx = @import("httpx");
 
@@ -344,7 +346,7 @@ test "synthesizing registry preserves named providers and default" {
 
 test "synthesizing runtime loads openai provider and returns inline audio" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

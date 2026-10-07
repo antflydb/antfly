@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Crc32 = @import("antfly_hash").Crc32;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
@@ -44,7 +46,7 @@ fn metadataOnlySnapshot(snapshot: raft_engine.core.types.Snapshot) raft_engine.c
 
 pub const PersistentReplicaState = struct {
     alloc: std.mem.Allocator,
-    io_impl: std.Io.Threaded,
+    io_impl: platform.Io.Threaded,
     layout: storage_mod.ReplicaPathLayout,
     store: raft_engine.core.MemoryStorage,
     applied_index: raft_engine.core.types.Index = 0,
@@ -621,7 +623,7 @@ test "persistent replica state decoder frees partially decoded ownership" {
 }
 
 test "persistent replica state rejects corrupt unchecked and structurally invalid files" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checksummed-state", .{tmp.sub_path});
@@ -649,7 +651,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
     }
 
     const valid = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        platform.testing.io,
         state_path,
         alloc,
         .limited(max_state_bytes),
@@ -660,7 +662,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
     const corrupt = try alloc.dupe(u8, valid);
     defer alloc.free(corrupt);
     corrupt[8] ^= 0x40;
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = corrupt });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = state_path, .data = corrupt });
     try std.testing.expectError(
         error.InvalidReplicaState,
         PersistentReplicaState.init(alloc, layout),
@@ -675,7 +677,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
         Crc32.hash(unchecked[0 .. unchecked.len - state_checksum_len]),
         .little,
     );
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = unchecked });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = state_path, .data = unchecked });
     try std.testing.expectError(
         error.UnsupportedReplicaStateVersion,
         PersistentReplicaState.init(alloc, layout),
@@ -696,7 +698,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
     try PersistentReplicaState.appendInt(u64, alloc, &invalid, 0);
     try PersistentReplicaState.appendInt(u32, alloc, &invalid, std.math.maxInt(u32));
     try PersistentReplicaState.appendInt(u32, alloc, &invalid, Crc32.hash(invalid.items));
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = state_path, .data = invalid.items });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = state_path, .data = invalid.items });
     try std.testing.expectError(
         error.InvalidReplicaState,
         PersistentReplicaState.init(alloc, layout),
@@ -704,7 +706,7 @@ test "persistent replica state rejects corrupt unchecked and structurally invali
 }
 
 test "persistent replica state persists ready updates across reopen" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -750,7 +752,7 @@ test "persistent replica state persists ready updates across reopen" {
 }
 
 test "persistent replica state replays committed entries when append persisted before applied watermark" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/append-before-apply", .{tmp.sub_path});
@@ -801,7 +803,7 @@ test "persistent replica state replays committed entries when append persisted b
 }
 
 test "persistent replica state persists applied watermark and replays only unapplied suffix after snapshot" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/applied-replay", .{tmp.sub_path});
@@ -867,7 +869,7 @@ test "persistent replica state persists applied watermark and replays only unapp
 
 test "persistent replica completion excludes pending snapshots and legacy inference" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completed", .{tmp.sub_path});
     defer alloc.free(root);
@@ -903,7 +905,7 @@ test "persistent replica completion excludes pending snapshots and legacy infere
     }
     const path = try std.fmt.allocPrint(alloc, "{s}/state.bin", .{layout.log_dir});
     defer alloc.free(path);
-    const encoded = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(max_state_bytes));
+    const encoded = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, path, alloc, .limited(max_state_bytes));
     defer alloc.free(encoded);
     // The preexisting checksummed v5 layout had no completion proof. Preserve
     // its ordinary cursor, but do not invent completed native installation.
@@ -913,7 +915,7 @@ test "persistent replica completion excludes pending snapshots and legacy infere
     @memcpy(legacy[33..], encoded[41..]);
     std.mem.writeInt(u32, legacy[4..8], 5, .little);
     std.mem.writeInt(u32, legacy[legacy.len - 4 ..][0..4], Crc32.hash(legacy[0 .. legacy.len - 4]), .little);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = legacy });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = path, .data = legacy });
     var legacy_state = try PersistentReplicaState.init(alloc, layout);
     defer legacy_state.deinit();
     try std.testing.expectEqual(@as(u64, 10), legacy_state.appliedIndex());
@@ -921,7 +923,7 @@ test "persistent replica completion excludes pending snapshots and legacy infere
 }
 
 test "persistent replica state persists snapshots across reopen" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -966,7 +968,7 @@ test "persistent replica state persists snapshots across reopen" {
 }
 
 test "persistent replica state refuses a corrupt durable snapshot payload on reopen" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/corrupt-persistent-snapshot", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -986,7 +988,7 @@ test "persistent replica state refuses a corrupt durable snapshot payload on reo
 
     const path = try snapshot_payload_store.pathAlloc(std.testing.allocator, layout.snapshot_dir, 7, 3);
     defer std.testing.allocator.free(path);
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var file = try std.Io.Dir.cwd().openFile(io_impl.io(), path, .{ .mode = .read_write });
     try file.writePositionalAll(io_impl.io(), "X", 72);
@@ -999,7 +1001,7 @@ test "persistent replica state refuses a corrupt durable snapshot payload on reo
 }
 
 test "persistent replica state publishes an artifact snapshot and reopens it" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/persistent-artifact-snapshot", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -1021,10 +1023,10 @@ test "persistent replica state publishes an artifact snapshot and reopens it" {
 
         const spool_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/snapshot-spool", .{layout.root_dir});
         defer std.testing.allocator.free(spool_path);
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = spool_path, .data = "artifact-state" });
+        try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = spool_path, .data = "artifact-state" });
         const artifact = try file_snapshot_artifact.FileSnapshotArtifact.create(
             std.testing.allocator,
-            std.testing.io,
+            platform.testing.io,
             spool_path,
             "artifact-state".len,
         );
@@ -1047,7 +1049,7 @@ test "persistent replica state publishes an artifact snapshot and reopens it" {
 }
 
 test "persistent replica state recovers both snapshot publication crash windows" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/persistent-snapshot-crash-windows", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -1065,7 +1067,7 @@ test "persistent replica state recovers both snapshot publication crash windows"
         });
     }
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

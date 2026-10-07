@@ -3270,8 +3270,8 @@ fn shapeToDims(allocator: std.mem.Allocator, shape: Shape) ![]i32 {
 var device_grad_norm_debug_done: bool = false;
 
 fn monotonicNowNs() u64 {
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -3817,7 +3817,7 @@ test "RealAutodiffTrainer: training state round-trips weights moments and counte
     trainer.step_count = 5;
     trainer.optimizer_step_count = 3;
 
-    var tmp = testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/training_state.safetensors", .{tmp.sub_path});
     defer allocator.free(path);
@@ -3887,7 +3887,7 @@ test "RealAutodiffTrainer: checkpoint persists zero Adam state for a never-stepp
     // lazily-created ParamState for this slot.
     try testing.expect(trainer.optimizer_state.param_states.get(name) == null);
 
-    var tmp = testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/never_stepped.safetensors", .{tmp.sub_path});
     defer allocator.free(path);
@@ -3912,7 +3912,7 @@ test "RealAutodiffTrainer: training state without per-slot adam steps falls back
     // Host-only restore path: the slot has no device counterpart.
     trainer.lora_params.items[0].device = null;
 
-    var tmp = testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/legacy_state.safetensors", .{tmp.sub_path});
     defer allocator.free(path);

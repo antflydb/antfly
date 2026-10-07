@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const client_mod = @import("client.zig");
 const s3_compat = @import("s3_compat.zig");
@@ -170,7 +172,7 @@ pub const HttpContext = struct {
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: ?*std.Io.Threaded,
+    io_impl: ?*platform.Io.Threaded,
     client: httpx.Client,
 
     fn init(
@@ -179,9 +181,9 @@ const HttpxTransport = struct {
         shared_io: ?std.Io,
         address_filter: ?httpx.AddressFilter,
     ) !HttpxTransport {
-        const io_impl: ?*std.Io.Threaded = if (shared_io == null) blk: {
-            const owned = try alloc.create(std.Io.Threaded);
-            owned.* = std.Io.Threaded.init(alloc, .{});
+        const io_impl: ?*platform.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(platform.Io.Threaded);
+            owned.* = platform.Io.Threaded.init(alloc, .{});
             break :blk owned;
         } else null;
         errdefer if (io_impl) |owned| {
@@ -499,7 +501,7 @@ fn remainingRequestTimeoutMs(timeout_ms: u64, elapsed_ns: i96) !u64 {
 
 test "s3 http transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
-    var shared = std.Io.Threaded.init(alloc, .{});
+    var shared = platform.Io.Threaded.init(alloc, .{});
     defer shared.deinit();
     var transport = try HttpxTransport.init(alloc, null, shared.io(), null);
     defer transport.deinit();
@@ -515,7 +517,7 @@ test "s3 http transport borrows a shared io runtime" {
 
 test "request-scoped S3 transport preserves caller IO and client config" {
     var transport = ContextHttpxTransport.init(std.testing.allocator, .{
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .timeout_ms = 250,
         .client_config = .{
             .keep_alive = false,
@@ -524,7 +526,7 @@ test "request-scoped S3 transport preserves caller IO and client config" {
     });
     defer transport.deinit();
 
-    try std.testing.expectEqual(std.testing.io.userdata, transport.client.io.userdata);
+    try std.testing.expectEqual(platform.testing.io.userdata, transport.client.io.userdata);
     try std.testing.expect(!transport.client.config.keep_alive);
     try std.testing.expectEqual(@as(u64, 123), transport.client.config.timeouts.read_ms);
     const remaining = (try transport.remainingTimeoutMs()).?;
@@ -1984,7 +1986,7 @@ fn byteRangeHeaderAlloc(alloc: Allocator, range: types.ByteRange) ![]u8 {
 }
 
 fn currentUnixSeconds() !u64 {
-    return currentUnixSecondsWithIo(std.Io.Threaded.global_single_threaded.io());
+    return currentUnixSecondsWithIo(platform.Io.Threaded.global_single_threaded.io());
 }
 
 fn currentUnixSecondsWithIo(io: std.Io) !u64 {
@@ -2038,7 +2040,7 @@ fn asciiLowerAlloc(alloc: Allocator, input: []const u8) ![]u8 {
 }
 
 test "s3 signing timestamp uses Unix wall clock" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
 
     const before: u64 = @intCast(std.Io.Timestamp.now(io_impl.io(), .real).toSeconds());
@@ -2423,7 +2425,7 @@ test "s3 signing timestamp is Unix wall-clock time" {
 
     // This bound catches accidental use of an uptime/monotonic clock while
     // leaving decades of headroom for reproducible builds and long-lived CI.
-    const now = try currentUnixSecondsWithIo(std.testing.io);
+    const now = try currentUnixSecondsWithIo(platform.testing.io);
     try std.testing.expect(now >= 1_577_836_800); // 2020-01-01 UTC
     try std.testing.expect(now < 4_102_444_800); // 2100-01-01 UTC
 }
@@ -2641,7 +2643,7 @@ test "s3 query and signing builders clean up every allocation failure" {
 
 test "s3 file upload completes a multipart lifecycle with bounded parts" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const source_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-s3-multipart-{d}", .{test_support.integrationNonce()});
     defer alloc.free(source_path);
     defer std.Io.Dir.deleteFileAbsolute(io, source_path) catch {};
@@ -3317,7 +3319,7 @@ test "s3 client round-trips against env-configured endpoint" {
 
 test "s3 error envelope caps preserve owned and context transport settings" {
     const allocator = std.testing.allocator;
-    var owned = try HttpxTransport.init(allocator, 1234, std.testing.io, null);
+    var owned = try HttpxTransport.init(allocator, 1234, platform.testing.io, null);
     defer owned.deinit();
     try std.testing.expectEqual(@as(?usize, 4096), owned.client.config.max_error_response_size);
     try std.testing.expectEqual(@as(u64, 1234), owned.client.config.timeouts.request_ms);
@@ -3325,7 +3327,7 @@ test "s3 error envelope caps preserve owned and context transport settings" {
 
     for ([_]?usize{ null, 0, 128, 4096, 8192 }) |requested| {
         var context = ContextHttpxTransport.init(allocator, .{
-            .io = std.testing.io,
+            .io = platform.testing.io,
             .timeout_ms = 4567,
             .client_config = .{
                 .max_error_response_size = requested,

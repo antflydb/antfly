@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const types = @import("../storage/db/types.zig");
 const expr = @import("expressions.zig");
@@ -52,10 +54,10 @@ fn applyBounded(a: std.mem.Allocator, req: types.SearchRequest, result: *types.S
     const source_relation = result.total_hits_relation;
     if (plan.scope == .matches and (source_relation != .exact or result.hits.len != source_total)) return error.DecisionLimitExceeded;
     const count = @min(result.hits.len, plan.candidate_count);
-    var fallback_io: ?std.Io.Threaded = null;
+    var fallback_io: ?platform.Io.Threaded = null;
     defer if (fallback_io) |*io| io.deinit();
     const io = if (options.reranker_runtime) |service| service.io else if (options.backend_runtime) |backend| backend.io() orelse return error.QueryRuntimeUnavailable else blk: {
-        fallback_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        fallback_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         break :blk fallback_io.?.io();
     };
     var fallback_http: ?httpx.Client = null;

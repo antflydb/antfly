@@ -120,9 +120,9 @@ pub fn startLiteEmbeddedInference(
     path: []const u8,
     budget_options: inference_provider.EmbeddedInferenceNodeOptions,
 ) !void {
-    const io_impl = try alloc.create(std.Io.Threaded);
+    const io_impl = try alloc.create(@import("antfly_platform").Io.Threaded);
     errdefer alloc.destroy(io_impl);
-    io_impl.* = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    io_impl.* = @import("antfly_platform").Io.Threaded.init(std.heap.page_allocator, .{});
     errdefer io_impl.deinit();
     const data_dir = std.fs.path.dirname(path) orelse ".";
     const created = try inference_provider.createEmbeddedInferenceNode(data_dir, io_impl.io(), budget_options);
@@ -2757,7 +2757,7 @@ pub export fn antfly_restore_backup_json(
 
     const alloc = std.heap.c_allocator;
     var encoded_report = stringifyJson(RestoreReport{ .format = restoreFormatName(resolved.storage_kind), .path = path }) catch return .internal;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const restored = switch (resolved.storage_kind) {
@@ -2786,7 +2786,7 @@ pub export fn antfly_restore_backup_file_json(
 
     const alloc = std.heap.c_allocator;
     var encoded_report = stringifyJson(RestoreReport{ .format = restoreFormatName(resolved.storage_kind), .path = destination }) catch return .internal;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const restored = switch (resolved.storage_kind) {
@@ -3096,7 +3096,7 @@ pub fn restorePortableSourceToLiteFile(
             .backend_runtime = backend_runtime,
         };
         // A caller-supplied std.Io runtime may be cooperative (VoprIo) rather
-        // than backed by std.Io.Threaded. Restore is synchronous, so it must
+        // than backed by @import("antfly_platform").Io.Threaded. Restore is synchronous, so it must
         // not select the executor variant that requires an owned Threaded
         // implementation merely because the runtime exposes an Io interface.
         if (backend_runtime != null) opts.executor = .{ .backend = .manual };

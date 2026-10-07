@@ -36,8 +36,10 @@
 //!   4. IndexWriter.addSegmentWithId(segment) → new in-memory snapshot
 //!   4. WAL.truncate(LSN)
 
+const platform = @import("antfly_platform");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+
+const platform_sync = platform.sync;
 const projection_seal = @import("projection_seal.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
@@ -51,7 +53,7 @@ const lsm_backend = @import("lsm_backend/mod.zig");
 const storage_io = lsm_backend.storage_io;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const wal_mod = if (builtin.os.tag == .freestanding) @import("portable_wal.zig") else @import("wal.zig");
 const CommitBackend = wal_mod.CommitBackend;
 const CommitStats = wal_mod.CommitStats;
@@ -891,7 +893,7 @@ fn persistentStorageIo(runtime_io: ?std.Io) std.Io {
     return runtime_io orelse if (comptime @import("builtin").os.tag == .freestanding)
         .failing
     else
-        std.Io.Threaded.global_single_threaded.io();
+        platform.Io.Threaded.global_single_threaded.io();
 }
 
 test "persistent storage contention yields through borrowed IO during cancellation cleanup" {
@@ -1441,7 +1443,7 @@ pub const PersistentIndex = struct {
         defer alloc.free(index_path);
         const index_path_span = index_path[0..index_path.len];
         if (builtin.os.tag != .freestanding and needs_host_dirs) {
-            var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             try storage_io.createDirPathPortable(io_impl.io(), path_span);
             try storage_io.createDirPathPortable(io_impl.io(), index_path_span);
@@ -4025,7 +4027,7 @@ fn persistTmpPath(buf: []u8) [*:0]const u8 {
 }
 
 fn cleanupPersistDir(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
@@ -4150,7 +4152,7 @@ test "persistent independent indexes publish while another owner is locked" {
         fn wake(_: ?*anyopaque, _: *const u32, _: u32) void {}
     };
     var probe = Probe{ .first = &first };
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.futexWaitUncancelable = Probe.wait;
     vtable.futexWake = Probe.wake;
     const io: std.Io = .{ .userdata = &probe, .vtable = &vtable };
@@ -5595,11 +5597,11 @@ fn persistentReplayArtifactPath(buf: []u8, suffix: []const u8) []const u8 {
 }
 
 fn writePersistentReplayArtifactFile(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
+    var file = try std.Io.Dir.createFileAbsolute(platform.testing.io, path, .{});
+    defer file.close(platform.testing.io);
 
     var file_buf: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &file_buf);
+    var writer = file.writer(platform.testing.io, &file_buf);
     try writer.interface.writeAll(contents);
     try writer.end();
 }
@@ -5734,7 +5736,7 @@ fn replayPersistentFixtureFile(alloc: Allocator, name: []const u8) !void {
     const path = try std.fmt.allocPrint(alloc, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures/{s}", .{name});
     defer alloc.free(path);
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(64 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, path, alloc, .limited(64 * 1024));
     defer alloc.free(contents);
 
     var fixture = try persistent_sim_fixture.parseFixture(alloc, contents);
@@ -5758,7 +5760,7 @@ fn replayModeledPersistentFixtureFile(alloc: Allocator, name: []const u8) !void 
     const path = try std.fmt.allocPrint(alloc, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures/{s}", .{name});
     defer alloc.free(path);
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(64 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, path, alloc, .limited(64 * 1024));
     defer alloc.free(contents);
 
     var fixture = try persistent_sim_fixture.parseFixture(alloc, contents);
@@ -5814,11 +5816,11 @@ fn replayModeledPersistentCrashFixture(
 }
 
 fn runPersistentReplayFixtures(alloc: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(platform.testing.io, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer fixtures_dir.close(std.testing.io);
+    defer fixtures_dir.close(platform.testing.io);
 
     var fixture_names: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -5829,7 +5831,7 @@ fn runPersistentReplayFixtures(alloc: Allocator) !void {
     var walker = try fixtures_dir.walk(alloc);
     defer walker.deinit();
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_names.append(alloc, try alloc.dupe(u8, entry.path));
@@ -5845,11 +5847,11 @@ fn runPersistentReplayFixtures(alloc: Allocator) !void {
 }
 
 fn runModeledPersistentFixtures(alloc: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(platform.testing.io, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
-    defer fixtures_dir.close(std.testing.io);
+    defer fixtures_dir.close(platform.testing.io);
 
     var fixture_names: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -5860,7 +5862,7 @@ fn runModeledPersistentFixtures(alloc: Allocator) !void {
     var walker = try fixtures_dir.walk(alloc);
     defer walker.deinit();
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_names.append(alloc, try alloc.dupe(u8, entry.path));

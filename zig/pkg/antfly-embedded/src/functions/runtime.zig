@@ -14,7 +14,9 @@
 // limitations under the License.
 
 //! Request-owned provider execution and budgets; no retries or fallback.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const decisions = @import("decisions.zig");
 const openai = @import("openai.zig");
@@ -252,7 +254,7 @@ pub const Runtime = struct {
 
 test "decision functions Antfly and Jev HTTP adapters preserve payload credentials and usage" {
     const a = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const Check = struct {
@@ -333,7 +335,7 @@ test "decision functions Antfly and Jev HTTP adapters preserve payload credentia
 
 test "decision functions HTTP ceiling rejects oversized advertised bodies before downloading" {
     const a = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const oversized = try a.alloc(u8, max_response_bytes + 1);

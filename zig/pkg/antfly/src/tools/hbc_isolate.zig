@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 
 const antfly = @import("antfly_hbc_isolate_root");
@@ -472,14 +474,14 @@ const TestPath = struct {
     fn init(self: *TestPath) [*:0]const u8 {
         const ts = nowNs();
         const slice = std.fmt.bufPrint(&self.buf, "/tmp/antfly-hbc-isolate-{d}\x00", .{ts}) catch unreachable;
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch unreachable;
         return @ptrCast(slice.ptr);
     }
 
     fn cleanup(self: *TestPath) void {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(&self.buf)))) catch {};
     }
@@ -487,8 +489,8 @@ const TestPath = struct {
 
 fn nowNs() u64 {
     if (builtin.os.tag == .freestanding) return 0;
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => {},
         else => unreachable,
     }

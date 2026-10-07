@@ -15,7 +15,9 @@
 
 //! Partition exact typed states before reducing; use ordered merging for
 //! order-sensitive aggregates and partitions that exceed bounded admission.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const operators = @import("operators.zig");
 const scalar = @import("scalar.zig");
 const spill = @import("spill.zig");
@@ -478,7 +480,7 @@ test "SQL partitioned typed aggregation reduces repeated updates and preserves o
         var budget: @import("memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
         const a = budget.allocator();
         {
-            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false, .compression = .none };
+            var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false, .compression = .none };
             defer manager.deinit();
             var group = try Grouped.init(a, &manager, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, 1, 128 * 1024);
             group.partitioned = partitioned;
@@ -517,7 +519,7 @@ test "SQL partitioned integer aggregation preserves invalid input errors" {
     };
     var dummy: u8 = 0;
     const a = std.testing.allocator;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false };
     defer manager.deinit();
     var group = try Grouped.init(a, &manager, &.{.{ .kind = .sum, .input_type = .integer }}, 1, 128 * 1024);
     defer group.deinit();
@@ -536,7 +538,7 @@ test "SQL full parallel partition reductions preserve exact states and close ear
     };
     for ([_]bool{ false, true }) |exact| {
         var dummy: u8 = 0;
-        var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
         defer manager.deinit();
         {
             var grouped = try Grouped.init(a, &manager, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, 1, 512 * 1024);
@@ -590,7 +592,7 @@ test "SQL parallel aggregate keys remain owned after output blocks and workers c
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var output = std.heap.ArenaAllocator.init(a);
     defer output.deinit();

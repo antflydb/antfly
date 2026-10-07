@@ -19,6 +19,7 @@
 //! so a cache cannot invalidate a borrowed slice underneath a decoder.
 //! A contiguous source borrows its buffer. Range-source storage owners must
 //! outlive the source unless that backend explicitly transfers an owner lease.
+const platform = @import("antfly_platform");
 const std = @import("std");
 const resources = @import("storage/resource_manager.zig");
 const Crc32 = @import("antfly_hash").Crc32;
@@ -31,7 +32,7 @@ pub const MappedArtifact = struct {
     release: ?*const fn (*anyopaque) void = null,
 
     pub fn deinit(self: *MappedArtifact) void {
-        if (@import("builtin").os.tag != .freestanding) std.posix.munmap(self.bytes);
+        if (@import("builtin").os.tag != .freestanding) platform.filesystem.unmapMemory(self.bytes);
         if (self.release) |release| release(self.context.?);
         self.* = undefined;
     }

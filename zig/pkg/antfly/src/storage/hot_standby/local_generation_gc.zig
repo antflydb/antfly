@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
@@ -149,7 +151,7 @@ pub fn markEligible(alloc: Allocator, request: MarkRequest) !void {
     if (request.checkpoint_bytes.len == 0 or request.checkpoint_bytes.len > request.max_checkpoint_bytes)
         return error.InvalidLocalGCCheckpoint;
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -199,7 +201,7 @@ fn pruneWithOptions(alloc: Allocator, request: PruneRequest, options: PruneOptio
         }
     }
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const generations_root = try std.fs.path.join(alloc, &.{ request.root, generations_dir_name });
@@ -482,19 +484,19 @@ fn encodeHex(out: []u8, bytes: []const u8) void {
 }
 
 fn writeTestFile(path: []const u8, body: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(std.testing.io, parent);
-    var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .truncate = true });
-    defer file.close(std.testing.io);
-    try file.writeStreamingAll(std.testing.io, body);
-    try file.sync(std.testing.io);
+    if (std.fs.path.dirname(path)) |parent| try fs_paths.createDirPathPortable(platform.testing.io, parent);
+    var file = try std.Io.Dir.cwd().createFile(platform.testing.io, path, .{ .truncate = true });
+    defer file.close(platform.testing.io);
+    try file.writeStreamingAll(platform.testing.io, body);
+    try file.sync(platform.testing.io);
 }
 
 fn expectPathExists(path: []const u8) !void {
-    try std.Io.Dir.cwd().access(std.testing.io, path, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, path, .{});
 }
 
 fn expectPathMissing(path: []const u8) !void {
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, path, .{}));
 }
 
 fn generationPath(alloc: std.mem.Allocator, root: []const u8, generation: []const u8) ![]u8 {
@@ -516,9 +518,9 @@ fn prepareGeneration(alloc: std.mem.Allocator, root: []const u8, generation: []c
 
 test "storage.hot_standby local generation gc retains newest and protected eligible generations only" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
 
     const ineligible = try prepareGeneration(alloc, root, "gen-incomplete");
@@ -588,9 +590,9 @@ test "storage.hot_standby local generation gc retains newest and protected eligi
 
 test "storage.hot_standby local generation gc resumes an interrupted tombstone deletion" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
 
     for (1..3) |index| {
@@ -636,9 +638,9 @@ test "storage.hot_standby local generation gc resumes an interrupted tombstone d
 
 test "storage.hot_standby local generation gc crash between paired and raw deletion resumes without live orphan" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
 
     for (1..3) |index| {
@@ -699,9 +701,9 @@ test "storage.hot_standby local generation gc crash between paired and raw delet
 
 test "storage.hot_standby local generation gc fails closed without current durable eligibility" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try prepareGeneration(alloc, root, "gen-unpublished");
     defer alloc.free(path);

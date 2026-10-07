@@ -17,7 +17,9 @@
 //! Sync API keeps a process-lifetime owner on Linux; other platforms retain
 //! their sequential fallback. Io-aware callers use their own scheduling owner.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 
 pub const max_workers: usize = 8;
@@ -28,7 +30,7 @@ pub const Job = struct {
 };
 
 const SyncPool = struct {
-    io_impl: if (supports_sync_parallelism) std.Io.Threaded else void,
+    io_impl: if (supports_sync_parallelism) platform.Io.Threaded else void,
     submit_mutex: std.Io.Mutex = .init,
     capacity: usize,
 
@@ -37,7 +39,7 @@ const SyncPool = struct {
             const bounded = @min(capacity, max_workers - 1);
             return .{
                 .capacity = bounded,
-                .io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{
+                .io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{
                     .async_limit = .limited(bounded),
                     .concurrent_limit = .limited(bounded),
                 }),
@@ -96,7 +98,7 @@ pub fn ensurePool(worker_count: usize) usize {
     if (comptime !supports_sync_parallelism) return 0;
     if (worker_count == 0) return 0;
     if (!pool_initialized.load(.acquire)) {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = platform.Io.Threaded.global_single_threaded.io();
         pool_init_mutex.lockUncancelable(io);
         defer pool_init_mutex.unlock(io);
         if (!pool_initialized.load(.monotonic)) {
@@ -116,7 +118,7 @@ fn jobRunner(fn_ptr: *const fn (*anyopaque) void, ctx: *anyopaque) std.Io.Cancel
 
 /// Io-aware dispatch.  Submits jobs via `io.Group.async` so the work
 /// schedules on the caller's runtime thread pool (typically a long-lived
-/// `std.Io.Threaded`).  This composes with the runtime's cancellation
+/// `platform.Io.Threaded`).  This composes with the runtime's cancellation
 /// semantics: when one task fails or the group is cancelled, in-flight
 /// work surfaces `error.Canceled` from `g.await`.  Use this when the
 /// caller has an `Io` available (server requests, plumbed CLI calls);
@@ -222,13 +224,13 @@ test "Sync pool drains concurrent callers with bounded and unavailable capacity"
         var callers: [4]Caller = undefined;
         var futures: [4]std.Io.Future(void) = undefined;
         var started: usize = 0;
-        defer for (futures[0..started]) |*future| future.await(std.testing.io);
+        defer for (futures[0..started]) |*future| future.await(platform.testing.io);
         for (&callers, &futures) |*caller, *future| {
             caller.* = .{ .owner = &owner };
-            future.* = try std.testing.io.concurrent(Caller.run, .{caller});
+            future.* = try platform.testing.io.concurrent(Caller.run, .{caller});
             started += 1;
         }
-        for (futures[0..started]) |*future| future.await(std.testing.io);
+        for (futures[0..started]) |*future| future.await(platform.testing.io);
         started = 0;
         for (&callers) |*caller| try std.testing.expectEqual(@as(u32, 96), caller.total.load(.acquire));
     }

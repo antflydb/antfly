@@ -850,10 +850,10 @@ fn dirExists(path: []const u8) bool {
 }
 
 fn writeTestManifest(dir: std.Io.Dir, sub_path: []const u8, manifest_json: []const u8) !void {
-    try dir.createDirPath(std.testing.io, sub_path);
+    try dir.createDirPath(platform.testing.io, sub_path);
     const file_path = try std.fs.path.join(std.testing.allocator, &.{ sub_path, "model_manifest.json" });
     defer std.testing.allocator.free(file_path);
-    try dir.writeFile(std.testing.io, .{
+    try dir.writeFile(platform.testing.io, .{
         .sub_path = file_path,
         .data = manifest_json,
     });
@@ -863,13 +863,13 @@ fn writeTestFlorenceReader(dir: std.Io.Dir, sub_path: []const u8) !void {
     try writeTestManifest(dir, sub_path, "{\"type\":\"reader\",\"inputs\":[\"image\"]}");
     const config_path = try std.fs.path.join(std.testing.allocator, &.{ sub_path, "config.json" });
     defer std.testing.allocator.free(config_path);
-    try dir.writeFile(std.testing.io, .{
+    try dir.writeFile(platform.testing.io, .{
         .sub_path = config_path,
         .data = "{\"model_type\":\"florence2\",\"architectures\":[\"Florence2ForConditionalGeneration\"]}",
     });
     const model_path = try std.fs.path.join(std.testing.allocator, &.{ sub_path, "model.gguf" });
     defer std.testing.allocator.free(model_path);
-    try dir.writeFile(std.testing.io, .{ .sub_path = model_path, .data = "GGUFstub" });
+    try dir.writeFile(platform.testing.io, .{ .sub_path = model_path, .data = "GGUFstub" });
 }
 
 test "extractor prefers same-name reader first" {
@@ -881,7 +881,7 @@ test "extractor prefers same-name reader first" {
 
 test "resolve prefers reader for image extraction when both exist" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(tmp.dir, "readers/acme/doc-extract", "{\"type\":\"reader\",\"capabilities\":[\"extraction\"],\"inputs\":[\"image\"]}");
@@ -904,7 +904,7 @@ test "resolve prefers reader for image extraction when both exist" {
 
 test "resolve rejects extraction extractor without text input before inference" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(
@@ -918,7 +918,7 @@ test "resolve rejects extraction extractor without text input before inference" 
 
     try std.testing.expectError(error.ModelNotFound, resolve(.{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -927,7 +927,7 @@ test "resolve rejects extraction extractor without text input before inference" 
 
 test "resolveNamedReaderPath supports flat default model layout" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(tmp.dir, "Xenova/trocr-base-printed", "{\"type\":\"reader\",\"inputs\":[\"image\"]}");
@@ -949,7 +949,7 @@ test "resolveNamedReaderPath supports flat default model layout" {
 
 test "image extraction fallback ignores manifest-only unsupported readers" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(
@@ -963,7 +963,7 @@ test "image extraction fallback ignores manifest-only unsupported readers" {
 
     try std.testing.expectError(error.NoReaderModelAvailable, resolveReaderModelPathForExtraction(.{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -972,7 +972,7 @@ test "image extraction fallback ignores manifest-only unsupported readers" {
 
 test "image extraction does not reinterpret the extractor root as a reader" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(
@@ -986,7 +986,7 @@ test "image extraction does not reinterpret the extractor root as a reader" {
 
     try std.testing.expectError(error.NoReaderModelAvailable, resolveReaderModelPathForExtraction(.{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -995,7 +995,7 @@ test "image extraction does not reinterpret the extractor root as a reader" {
 
 test "image extraction caches a supported fallback reader selection" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestFlorenceReader(tmp.dir, "readers/antflydb/florence-2-base");
@@ -1006,7 +1006,7 @@ test "image extraction caches a supported fallback reader selection" {
     defer resolver.deinit();
     const ctx = Context{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1024,7 +1024,7 @@ test "image extraction caches a supported fallback reader selection" {
     try std.testing.expectEqual(@as(usize, 1), resolver.entries.count());
 
     try std.testing.expect(resolver.entries.contains("fastino/gliner2-base-v1"));
-    try resolver.markCandidateFailure(std.testing.io, first);
+    try resolver.markCandidateFailure(platform.testing.io, first);
     const failed_entry = resolver.entries.get("fastino/gliner2-base-v1").?;
     try std.testing.expectEqual(@as(?[]u8, null), failed_entry.path);
     try std.testing.expectEqual(@as(usize, 1), resolver.failed_candidates.count());
@@ -1033,7 +1033,7 @@ test "image extraction caches a supported fallback reader selection" {
 
 test "image extraction reader discovery skips invalid unrelated models" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(
@@ -1048,7 +1048,7 @@ test "image extraction reader discovery skips invalid unrelated models" {
 
     const selected = try discoverReaderModelPathFromRegistry(.{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1081,7 +1081,7 @@ test "image extraction caches unavailable reader discovery for a bounded ttl" {
     var discovery = Discovery{};
     const ctx = Context{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = "/models",
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1101,7 +1101,7 @@ test "image extraction caches unavailable reader discovery for a bounded ttl" {
 
 test "image extraction fallback cache is isolated by extractor" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(tmp.dir, "acme/extractor-a", "{\"type\":\"extractor\",\"inputs\":[\"text\"]}");
@@ -1116,7 +1116,7 @@ test "image extraction fallback cache is isolated by extractor" {
     defer resolver.deinit();
     const ctx = Context{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1137,7 +1137,7 @@ test "image extraction fallback cache is isolated by extractor" {
 
 test "expired fallback cache discovers a newly preferred reader" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestFlorenceReader(tmp.dir, "readers/antflydb/florence-2-base");
@@ -1148,7 +1148,7 @@ test "expired fallback cache discovers a newly preferred reader" {
     defer resolver.deinit();
     const ctx = Context{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1170,7 +1170,7 @@ test "expired fallback cache discovers a newly preferred reader" {
 
 test "same-name reader variant outranks a generic OCR reader" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestFlorenceReader(tmp.dir, "readers/acme/extractor-Q8_0");
@@ -1180,7 +1180,7 @@ test "same-name reader variant outranks a generic OCR reader" {
 
     const path = try resolveReaderModelPathForExtraction(.{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1240,7 +1240,7 @@ test "one extraction request falls back after a structural reader failure" {
     var fake = FakeReaders{};
     const ctx = Context{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = "/models",
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1296,7 +1296,7 @@ test "reader selection does not recache a candidate quarantined during discovery
     var discovery = Discovery{ .resolver = &resolver };
     const path = try resolveReaderModelPathForExtraction(.{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = "/models",
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1313,7 +1313,7 @@ test "reader selection does not recache a candidate quarantined during discovery
 
 test "structurally broken preferred reader falls back within its cooldown" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestFlorenceReader(tmp.dir, "readers/Xenova/trocr-base-printed");
@@ -1325,7 +1325,7 @@ test "structurally broken preferred reader falls back within its cooldown" {
     defer resolver.deinit();
     const ctx = Context{
         .allocator = allocator,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1336,7 +1336,7 @@ test "structurally broken preferred reader falls back within its cooldown" {
     defer allocator.free(preferred);
     try std.testing.expect(std.mem.endsWith(u8, preferred, "readers/Xenova/trocr-base-printed"));
 
-    try resolver.markCandidateFailure(std.testing.io, preferred);
+    try resolver.markCandidateFailure(platform.testing.io, preferred);
     const fallback = try resolveReaderModelPathForExtraction(ctx, "fastino/gliner2-base-v1");
     defer allocator.free(fallback);
     try std.testing.expect(std.mem.endsWith(u8, fallback, "readers/antflydb/florence-2-base"));
@@ -1393,7 +1393,7 @@ test "reader selection bounds global structural failure history" {
     for (0..max_failed_reader_candidates + 4) |i| {
         var path_buf: [64]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "/models/readers/broken-{d}", .{i});
-        try resolver.markCandidateFailure(std.testing.io, path);
+        try resolver.markCandidateFailure(platform.testing.io, path);
     }
 
     try std.testing.expectEqual(max_failed_reader_candidates, resolver.failed_candidates.count());
@@ -1404,11 +1404,11 @@ test "structural reader failure invalidates every extractor selection" {
     const allocator = std.testing.allocator;
     var resolver = ReaderResolver.init(allocator);
     defer resolver.deinit();
-    const now = std.Io.Timestamp.now(std.testing.io, .awake);
+    const now = std.Io.Timestamp.now(platform.testing.io, .awake);
     try resolver.cacheLocked("acme/extractor-a", "/models/readers/broken", now);
     try resolver.cacheLocked("acme/extractor-b", "/models/readers/broken", now);
 
-    try resolver.markCandidateFailure(std.testing.io, "/models/readers/broken");
+    try resolver.markCandidateFailure(platform.testing.io, "/models/readers/broken");
 
     try std.testing.expect(resolver.entries.get("acme/extractor-a").?.path == null);
     try std.testing.expect(resolver.entries.get("acme/extractor-b").?.path == null);
@@ -1421,16 +1421,16 @@ test "reader selection state cleans up every allocation failure" {
             var resolver = ReaderResolver.init(allocator);
             defer resolver.deinit();
 
-            const now = std.Io.Timestamp.now(std.testing.io, .awake);
+            const now = std.Io.Timestamp.now(platform.testing.io, .awake);
             try resolver.cacheLocked("acme/extractor", "/models/readers/preferred", now);
             try resolver.cacheUnavailableLocked("acme/missing", now);
-            try resolver.markCandidateFailure(std.testing.io, "/models/readers/preferred");
-            try resolver.markCandidateFailure(std.testing.io, "/models/readers/fallback");
+            try resolver.markCandidateFailure(platform.testing.io, "/models/readers/preferred");
+            try resolver.markCandidateFailure(platform.testing.io, "/models/readers/fallback");
             var snapshot = try resolver.snapshotLocked("acme/extractor", now);
             defer snapshot.deinit();
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "reader path resolution cleans up every allocation failure" {
@@ -1452,7 +1452,7 @@ test "reader path resolution cleans up every allocation failure" {
             var discovery_context: u8 = 0;
             const path = try resolveReaderModelPathForExtraction(.{
                 .allocator = allocator,
-                .io = std.testing.io,
+                .io = platform.testing.io,
                 .models_dir = "/models",
                 .session_manager = undefined,
                 .model_manager = undefined,
@@ -1465,7 +1465,7 @@ test "reader path resolution cleans up every allocation failure" {
             defer allocator.free(path);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "reader selection singleflights same keys while independent stripes discover concurrently" {
@@ -1555,7 +1555,7 @@ test "reader selection singleflights same keys while independent stripes discove
     };
 
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var discovery = Discovery{};
@@ -1614,7 +1614,7 @@ test "reader selection singleflights same keys while independent stripes discove
 
 test "reader discovery preserves allocation failure" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestFlorenceReader(tmp.dir, "readers/antflydb/florence-2-base");
@@ -1624,7 +1624,7 @@ test "reader discovery preserves allocation failure" {
     var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, resolveReaderModelPathForExtraction(.{
         .allocator = failing.allocator(),
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .models_dir = models_dir,
         .session_manager = undefined,
         .model_manager = undefined,
@@ -1635,7 +1635,7 @@ test "extractor resolution cleans up and preserves every allocation failure" {
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
     const allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeTestManifest(
         tmp.dir,
@@ -1649,7 +1649,7 @@ test "extractor resolution cleans up and preserves every allocation failure" {
         fn run(alloc: std.mem.Allocator, root: []const u8) !void {
             var extractor = try resolve(.{
                 .allocator = alloc,
-                .io = std.testing.io,
+                .io = platform.testing.io,
                 .models_dir = root,
                 .session_manager = undefined,
                 .model_manager = undefined,
@@ -1657,7 +1657,7 @@ test "extractor resolution cleans up and preserves every allocation failure" {
             defer extractor.deinit(alloc);
         }
     };
-    @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{models_dir}) catch |err| switch (err) {
+    platform.allocator.checkAllAllocationFailures(allocator, Runner.run, .{models_dir}) catch |err| switch (err) {
         // Zig 0.17's threaded filesystem I/O can change the number of allocator
         // calls between retries even though every induced OOM remains clean.
         error.NondeterministicMemoryUsage => {},
@@ -1673,7 +1673,7 @@ test "canonical model names coalesce prefixes and variants" {
 
 test "resolve prefers extractor for text extraction when both exist" {
     const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try writeTestManifest(tmp.dir, "readers/acme/doc-extract", "{\"type\":\"reader\",\"capabilities\":[\"extraction\"],\"inputs\":[\"image\"]}");

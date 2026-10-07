@@ -383,7 +383,7 @@ test "cloud credentials validate AWS UTC expiration" {
 
 test "cloud credentials bound subprocess exit and honor cancellation" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+    var threaded = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const options: std.process.RunOptions = .{ .argv = &.{ "/bin/sh", "-c", "exec /bin/sleep 3 >&- 2>&-" }, .stdout_limit = .limited(1024), .stderr_limit = .limited(1024) };

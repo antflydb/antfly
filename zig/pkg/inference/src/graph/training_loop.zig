@@ -20,7 +20,9 @@
 // TrainingLoop: forward → loss → gradient → clip → optimize → upload.
 // Checkpoint: binary save/load of parameters + optimizer state.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const ml = @import("ml");
 const Graph = ml.graph.Graph;
 const NodeId = ml.graph.NodeId;
@@ -648,8 +650,8 @@ fn elapsedNs(start_ns: u64) u64 {
 }
 
 fn nowNs() u64 {
-    var timespec: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &timespec))) {
+    var timespec: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &timespec))) {
         .SUCCESS => return @intCast(@as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec),
         else => return 0,
     }

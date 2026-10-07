@@ -13,8 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+
+const platform_sync = platform.sync;
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const catalog_service = @import("../catalog/service.zig");
@@ -482,7 +484,7 @@ test "serverless publication coalescing keeps bounded deadlines and reclaims del
 
 test "serverless background publisher drains small WAL and enrichment batches after bounded coalescing" {
     const a = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/coalescing", .{tmp.sub_path});
     defer a.free(path);
@@ -510,7 +512,7 @@ test "serverless background publisher drains small WAL and enrichment batches af
     var store = fs_catalog.catalogStore();
     defer store.deinit();
     var builder = @import("builder.zig").Builder.init(a, &artifacts, &manifests, &progress, &wal);
-    builder.setIo(std.testing.io);
+    builder.setIo(platform.testing.io);
     var catalog = catalog_service.CatalogService.init(a, &artifacts, &manifests, &progress, &wal, &builder, &store);
     defer catalog.deinit();
     _ = try catalog.ensureNamespace("docs", 1);
@@ -532,7 +534,7 @@ test "serverless background publisher drains small WAL and enrichment batches af
         }
     };
     var clock = Clock{};
-    var publisher = BackgroundPublisher.init(a, std.testing.io, &catalog, 60_000);
+    var publisher = BackgroundPublisher.init(a, platform.testing.io, &catalog, 60_000);
     defer publisher.deinit();
     publisher.scheduling_clock = .{ .ptr = &clock, .now_fn = Clock.read };
     var before = try catalog.buildStatus("docs");
@@ -552,7 +554,7 @@ test "serverless background publisher drains small WAL and enrichment batches af
     try std.testing.expectEqual(@as(usize, 1), (try enricher.runNamespaceWithConfig("docs", .{ .batch_size = 1 })).idle_namespaces);
     try std.testing.expectEqual(@as(usize, 0), (try publisher.runOnce()).published_namespaces);
     // Deadline expiry never overrides an independent admission rejection.
-    try publisher.budget_backoff.reject(a, "docs", std.Io.Timestamp.now(std.testing.io, .awake).toNanoseconds());
+    try publisher.budget_backoff.reject(a, "docs", std.Io.Timestamp.now(platform.testing.io, .awake).toNanoseconds());
     clock.ns = 2 * std.time.ns_per_s;
     try std.testing.expectEqual(@as(usize, 1), (try publisher.runOnce()).budget_rejected_namespaces);
     publisher.budget_backoff.clear("docs");
@@ -763,25 +765,25 @@ test "serverless background publisher loop publishes asynchronously and latest r
         fn reach(ptr: *anyopaque, event: @import("builder.zig").PublicationLifecycleEvent) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (event.candidate_version != 2) return;
-            self.ready.set(std.testing.io);
-            self.release.waitUncancelable(std.testing.io);
+            self.ready.set(platform.testing.io);
+            self.release.waitUncancelable(platform.testing.io);
         }
     };
     var barrier: PublicationBarrier = .{};
     builder.setPublicationLifecycleHook(.{ .ptr = &barrier, .reach_fn = PublicationBarrier.reach });
     defer builder.setPublicationLifecycleHook(null);
 
-    var publisher = BackgroundPublisher.init(alloc, std.testing.io, &catalog, 1);
+    var publisher = BackgroundPublisher.init(alloc, platform.testing.io, &catalog, 1);
     defer publisher.deinit();
     // Release a parked worker before deinit joins it, including assertion failures.
-    defer barrier.release.set(std.testing.io);
+    defer barrier.release.set(platform.testing.io);
     {
-        var unavailable = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
+        var unavailable = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .nothing });
         defer unavailable.deinit();
         publisher.io = unavailable.io();
         defer {
             publisher.stop();
-            publisher.io = std.testing.io;
+            publisher.io = platform.testing.io;
         }
         try std.testing.expectError(error.ConcurrencyUnavailable, publisher.start());
         try std.testing.expect(publisher.future == null);
@@ -794,7 +796,7 @@ test "serverless background publisher loop publishes asynchronously and latest r
     defer query.deinit();
     // Park the worker immediately before HEAD CAS. Read the old manifest and
     // its WAL tail at a known publication boundary, regardless of disk speed.
-    try barrier.ready.waitTimeout(std.testing.io, .{ .duration = .{
+    try barrier.ready.waitTimeout(platform.testing.io, .{ .duration = .{
         .raw = .fromSeconds(10),
         .clock = .awake,
     } });
@@ -807,7 +809,7 @@ test "serverless background publisher loop publishes asynchronously and latest r
         try std.testing.expect(session.manifest.wal_end_lsn <= try wal_store.latestLsn("docs"));
         try std.testing.expect(tail.len > 0);
     }
-    barrier.release.set(std.testing.io);
+    barrier.release.set(platform.testing.io);
     // The parked worker already owns run_mutex. Acquiring it after release
     // joins that publication pass without a scheduler-speed polling window.
     publisher.run_mutex.lockUncancelable(publisher.io);
@@ -900,16 +902,16 @@ test "serverless concurrent background publishers yield a single publish winner"
     };
 
     var state = RaceState{
-        .pub_a = BackgroundPublisher.init(alloc, std.testing.io, &catalog_a, 1),
-        .pub_b = BackgroundPublisher.init(alloc, std.testing.io, &catalog_b, 1),
+        .pub_a = BackgroundPublisher.init(alloc, platform.testing.io, &catalog_a, 1),
+        .pub_b = BackgroundPublisher.init(alloc, platform.testing.io, &catalog_b, 1),
     };
     defer state.pub_a.deinit();
     defer state.pub_b.deinit();
-    var thread_a = try std.testing.io.concurrent(RaceState.runA, .{&state});
-    defer thread_a.await(std.testing.io);
-    var thread_b = try std.testing.io.concurrent(RaceState.runB, .{&state});
-    thread_a.await(std.testing.io);
-    thread_b.await(std.testing.io);
+    var thread_a = try platform.testing.io.concurrent(RaceState.runA, .{&state});
+    defer thread_a.await(platform.testing.io);
+    var thread_b = try platform.testing.io.concurrent(RaceState.runB, .{&state});
+    thread_a.await(platform.testing.io);
+    thread_b.await(platform.testing.io);
 
     try std.testing.expectEqual(@as(?anyerror, null), state.error_a);
     try std.testing.expectEqual(@as(?anyerror, null), state.error_b);
@@ -920,8 +922,8 @@ test "serverless concurrent background publishers yield a single publish winner"
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

@@ -15,7 +15,9 @@
 
 //! Optional Linux x86 GNU acceleration. Keep the library resident for the
 //! process lifetime: published function pointers must never outlive it.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const options = @import("build_options");
 const linalg = @import("inference_linalg");
@@ -25,7 +27,7 @@ pub const enabled = builtin.os.tag == .linux and builtin.cpu.arch == .x86_64 and
     @hasDecl(options, "enable_runtime_openblas") and options.enable_runtime_openblas;
 
 pub const Sgemm = *const fn (c_int, c_int, c_int, c_int, c_int, c_int, f32, [*]const f32, c_int, [*]const f32, c_int, f32, [*]f32, c_int) callconv(.c) void;
-const Api = struct { lib: std.DynLib, sgemm: Sgemm, threads: usize };
+const Api = struct { lib: platform.DynLib, sgemm: Sgemm, threads: usize };
 var api: ?Api = null;
 var initialized: std.atomic.Value(bool) = .init(false);
 var mutex: std.Io.Mutex = .init;
@@ -41,7 +43,7 @@ fn threadCount(budget: usize, requested: ?[]const u8) !usize {
 }
 
 fn load() !Api {
-    var lib = std.DynLib.open(env("ANTFLY_OPENBLAS_LIBRARY") orelse "libopenblas.so.0") catch return error.OpenBlasNotFound;
+    var lib = platform.DynLib.open(env("ANTFLY_OPENBLAS_LIBRARY") orelse "libopenblas.so.0") catch return error.OpenBlasNotFound;
     errdefer lib.close();
     const get_config = lib.lookup(*const fn () callconv(.c) [*:0]const u8, "openblas_get_config") orelse return error.InvalidOpenBlasLibrary;
     // CBLAS uses c_int dimensions here. An ILP64 library has a different ABI.
@@ -63,7 +65,7 @@ fn load() !Api {
 pub fn available() bool {
     if (comptime !enabled) return false;
     if (!initialized.load(.acquire)) {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = platform.Io.Threaded.global_single_threaded.io();
         mutex.lockUncancelable(io);
         defer mutex.unlock(io);
         if (!initialized.load(.monotonic)) {

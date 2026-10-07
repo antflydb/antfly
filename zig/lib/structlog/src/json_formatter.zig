@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Field = @import("fields.zig").Field;
 
 /// Formats log entries as NDJSON (one JSON object per line).
@@ -48,8 +50,8 @@ pub fn format(
 }
 
 fn writeTimestamp(writer: *std.Io.Writer) !void {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
+    var ts: platform.c.timespec = undefined;
+    _ = platform.c.clock_gettime(.REALTIME, &ts);
     const epoch_secs: i64 = ts.sec;
     const epoch_day: i32 = @intCast(@divFloor(epoch_secs, 86400));
     const day_secs: u32 = @intCast(@mod(epoch_secs, 86400));

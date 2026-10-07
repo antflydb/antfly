@@ -83,8 +83,8 @@ test "lockYielding acquires a mutex released by another thread" {
             m.unlock();
         }
     };
-    var thread = try std.testing.io.concurrent(Holder.release, .{&mutex});
+    var thread = try @import("root.zig").testing.io.concurrent(Holder.release, .{&mutex});
     lockYielding(&mutex);
-    thread.await(std.testing.io);
+    thread.await(@import("root.zig").testing.io);
     mutex.unlock();
 }

@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const compiler = @import("antfly_local_sources").sql_compiler;
 const runtime = @import("antfly_local_sources").sql_runtime;
 const catalog = @import("antfly_local_sources").sql_catalog;
@@ -170,7 +172,7 @@ test "SQL EXISTS validates discarded expressions without evaluating them" {
             try std.testing.expect(result.output.rows[0][0].bool);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     for ([_]struct { query: []const u8, err: anyerror }{
         .{ .query = "SELECT EXISTS (SELECT missing + 1 FROM (SELECT 1 AS x) i)", .err = error.UndefinedColumn },
@@ -229,7 +231,7 @@ test "SQL membership unwinds allocations admits parameters and fails closed outs
             try std.testing.expect(result.output.rows[0][0].bool);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT 1 IN (SELECT x FROM (SELECT 1 AS x) i)", .{});
     defer compiled.deinit();
@@ -313,10 +315,10 @@ test "SQL membership bounded hash projections share one capture instead of per r
         try std.testing.expectEqual(@as(usize, 1), join.left_keys.len);
         try std.testing.expectEqual(@as(usize, 1), join.right_keys.len);
     }
-    const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    const start = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
     var result = try runtime.execute(execution_alloc, fixture.backend(), &compiled, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 });
     defer result.deinit();
-    const elapsed = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
+    const elapsed = std.Io.Clock.awake.now(platform.testing.io).nanoseconds - start;
     try std.testing.expectEqual(fixture.count, try std.fmt.parseInt(usize, result.output.rows[0][0].string, 10));
     try std.testing.expectEqual(fixture.count * 3, fixture.rows);
     try std.testing.expectEqual(@as(usize, 1), fixture.captures);
@@ -336,14 +338,14 @@ test "SQL membership bounded hash projections share one capture instead of per r
         fixture.expected_scans = 2;
         var ordered = try compiler.compile(std.testing.allocator, sql, .{});
         defer ordered.deinit();
-        const ordered_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+        const ordered_start = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
         var output = try runtime.execute(execution_alloc, fixture.backend(), &ordered, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 });
         defer output.deinit();
         try std.testing.expectEqual(fixture.count, try std.fmt.parseInt(usize, output.output.rows[0][0].string, 10));
         try std.testing.expectEqual(fixture.count + (if (case_index == 2) @min(fixture.count, 256) else fixture.count), fixture.rows);
         try std.testing.expectEqual(@as(usize, 1), fixture.captures);
         try std.testing.expectEqual(@as(usize, 1), fixture.closes);
-        std.debug.print("SQL subquery: shape={s} rows={d} native_rows={d} native_scans=2 captures=1 peak_bytes={d} elapsed_ns={d}\n", .{ if (case_index == 2) "uncorrelated-exists" else "ordered", fixture.count, fixture.rows, output.peakMemoryBytes(), std.Io.Clock.awake.now(std.testing.io).nanoseconds - ordered_start });
+        std.debug.print("SQL subquery: shape={s} rows={d} native_rows={d} native_scans=2 captures=1 peak_bytes={d} elapsed_ns={d}\n", .{ if (case_index == 2) "uncorrelated-exists" else "ordered", fixture.count, fixture.rows, output.peakMemoryBytes(), std.Io.Clock.awake.now(platform.testing.io).nanoseconds - ordered_start });
     }
     fixture.rows = 0;
     fixture.captures = 0;
@@ -351,14 +353,14 @@ test "SQL membership bounded hash projections share one capture instead of per r
     fixture.expected_scans = 3;
     var disjunctive = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM outer_rows o WHERE EXISTS (SELECT 1 FROM inner_rows i WHERE i.x > o.x OR i.x = 0)", .{});
     defer disjunctive.deinit();
-    const disjunctive_start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
+    const disjunctive_start = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
     var disjunctive_result = try runtime.execute(execution_alloc, fixture.backend(), &disjunctive, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 });
     defer disjunctive_result.deinit();
     try std.testing.expectEqual(fixture.count, try std.fmt.parseInt(usize, disjunctive_result.output.rows[0][0].string, 10));
     try std.testing.expectEqual(@as(usize, 1), fixture.captures);
     try std.testing.expectEqual(@as(usize, 1), fixture.closes);
     try std.testing.expect(fixture.rows >= fixture.count * 2 and fixture.rows <= fixture.count * 3);
-    std.debug.print("SQL subquery: shape=disjunctive outer_rows={d} native_rows={d} native_scans=3 captures=1 peak_bytes={d} elapsed_ns={d}\n", .{ fixture.count, fixture.rows, disjunctive_result.peakMemoryBytes(), std.Io.Clock.awake.now(std.testing.io).nanoseconds - disjunctive_start });
+    std.debug.print("SQL subquery: shape=disjunctive outer_rows={d} native_rows={d} native_scans=3 captures=1 peak_bytes={d} elapsed_ns={d}\n", .{ fixture.count, fixture.rows, disjunctive_result.peakMemoryBytes(), std.Io.Clock.awake.now(platform.testing.io).nanoseconds - disjunctive_start });
 }
 
 test "SQL complete uncorrelated value relations preserve grouped set window and topK semantics" {
@@ -519,7 +521,7 @@ test "SQL composed correlated aggregates retain empty group defaults and compute
             try std.testing.expectEqualStrings("10", result.output.rows[1][1].string);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT i.y + SUM(i.y) FROM (SELECT 1 AS y) i)", .{});
     defer compiled.deinit();
@@ -587,7 +589,7 @@ test "SQL decorrelation unwinds every allocation and enforces shared memory admi
             defer result.deinit();
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT EXISTS (SELECT 1)", .{});
     defer compiled.deinit();

@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const routing = @import("api/table_catalog.zig");
 const metadata = @import("metadata/api.zig");
 const records = @import("metadata/table_manager.zig");
@@ -33,7 +35,7 @@ fn query(generation: *routing.RoutingGeneration, alloc: std.mem.Allocator, name:
 }
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
     for ([_]usize{ 10, 1000, 10000 }) |n| {

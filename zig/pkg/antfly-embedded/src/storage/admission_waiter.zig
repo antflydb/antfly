@@ -18,8 +18,10 @@
 //! Admission publication transfers lifetime back to the waiting caller: no
 //! publisher may access the waiter after publish returns (or after its final
 //! release store). Cancellation must rejoin that same lock before retirement.
+const platform = @import("antfly_platform");
 const std = @import("std");
-const time = @import("antfly_platform").time;
+
+const time = platform.time;
 
 pub const Cancellation = struct {
     ptr: *const anyopaque,
@@ -116,7 +118,7 @@ pub fn Fifo(comptime Payload: type) type {
 }
 
 test "admission handoff signals before transfer and never touches a retired waiter" {
-    var runtime = std.Io.Threaded.init(std.testing.allocator, .{});
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer runtime.deinit();
     const io = runtime.io();
     const Probe = struct {

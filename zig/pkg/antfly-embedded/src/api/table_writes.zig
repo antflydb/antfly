@@ -13,8 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 pub const physical_local_write = if (@import("storage_source_options").control_only) struct {} else @import("antfly_source_root").antfly_sources.local_write;
 pub const std = @import("std");
+
 pub const storage_source_options = @import("storage_source_options");
 pub const control_only_storage_sources = storage_source_options.control_only;
 pub const backups_api = @import("backups.zig");
@@ -40,10 +42,10 @@ pub const applyGraphMetricActionToDb = physical_local_write.applyGraphMetricActi
 pub const runGraphMetricMaintenanceOrActionJsonAlloc = physical_local_write.runGraphMetricMaintenanceOrActionJsonAlloc;
 
 pub const distributed_txn = @import("transaction_contract.zig");
-pub const platform_time = @import("antfly_platform").time;
+pub const platform_time = platform.time;
 pub const Io = std.Io;
 
-pub var txn_id_nonce: @import("antfly_platform").atomic.Value(u64) = .init(0);
+pub var txn_id_nonce: platform.atomic.Value(u64) = .init(0);
 pub fn repairNativeRestoreProjectionsUntilCompleteWithIo(
     alloc: std.mem.Allocator,
     db: *db_mod.DB,
@@ -1357,7 +1359,7 @@ pub fn exportPortableBackupShardWithSeal(
     var source_summary: ?[]@import("../storage/portable_backup.zig").SourceGenerationAdmissionSummaryEntry = null;
     errdefer if (source_summary) |entries| @import("../storage/portable_backup.zig").freeSourceGenerationAdmissionSummary(alloc, entries);
     if (sealed) |proof| {
-        var fallback: ?std.Io.Threaded = if (shared_io == null) std.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
+        var fallback: ?platform.Io.Threaded = if (shared_io == null) platform.Io.Threaded.init(std.heap.page_allocator, .{}) else null;
         defer if (fallback) |*owned| owned.deinit();
         try exportPortableBackupFileWithSource(alloc, db.core.store, dest_path, shared_io orelse fallback.?.io(), .{ .db = db, .handle = proof.handle, .cancellation = cancellation, .source_generation_summary_output = &source_summary });
     } else try exportPortableBackupFile(alloc, db.core.store, dest_path, shared_io);

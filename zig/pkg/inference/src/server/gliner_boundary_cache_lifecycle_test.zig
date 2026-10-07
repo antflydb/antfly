@@ -83,7 +83,7 @@ fn requireMetal(node: *Node) void {
 fn control(node: *Node) !Control {
     const watchdog = node.hard_cancellation_watchdog orelse return error.MissingHardCancellationWatchdog;
     return .{
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .deadline_ns = platform.time.monotonicNs() + 5 * std.time.ns_per_s,
         .hard_cancellation = watchdog.boundary(),
     };
@@ -164,7 +164,7 @@ fn inspect(node: *Node, directory: []const u8, pins: pipeline.PublishedModelFile
             // The cache load lock protects the owner even without an external
             // handle; its execution mutex is held above. The final provider
             // lock is acquired by the allocation-free factory observation.
-            const storage = try factory.TestGlinerBoundaryMetalOwner.snapshot(loaded.session, std.testing.io);
+            const storage = try factory.TestGlinerBoundaryMetalOwner.snapshot(loaded.session, platform.testing.io);
             try expectPersistentOwner(storage, pins);
             const resident = try factory.glinerBoundaryResidentStats(loaded.session);
             const workspace_lease = factory.glinerBoundaryWorkspaceAdmissionAmounts(loaded.session);
@@ -317,9 +317,9 @@ pub fn exercise(maintenance: Maintenance) !void {
     const a = std.testing.allocator;
     var path: [Io.Dir.max_path_bytes]u8 = undefined;
     const length = if (std.fs.path.isAbsolute(requested))
-        try Io.Dir.realPathFileAbsolute(std.testing.io, requested, &path)
+        try Io.Dir.realPathFileAbsolute(platform.testing.io, requested, &path)
     else
-        try Io.Dir.cwd().realPathFile(std.testing.io, requested, &path);
+        try Io.Dir.cwd().realPathFile(platform.testing.io, requested, &path);
     const directory = path[0..length];
     const name = std.fs.path.basename(directory);
     const raw_fixture = try fixtures.fixtureBytes(a, "pipeline_cases.json");
@@ -337,7 +337,7 @@ pub fn exercise(maintenance: Maintenance) !void {
         var node = try Node.init(a, try config(directory));
         defer node.deinit();
         requireMetal(&node);
-        try node.attachIo(std.testing.io);
+        try node.attachIo(platform.testing.io);
         const transport = try sockets.Loopback.init(a, &node);
         defer transport.deinit();
         try transport.start();

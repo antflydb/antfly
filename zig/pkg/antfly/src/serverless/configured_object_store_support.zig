@@ -19,7 +19,9 @@
 //! scanner and scaffold tests do not inherit the full node-config dependency
 //! graph. API query routing and serverless publication both use this policy.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const common_config = @import("antfly_local_sources").common_config;
 const common_secrets = @import("antfly_local_sources").common_secrets;
 const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
@@ -261,7 +263,7 @@ fn resolveFilesystemSourcePathAlloc(
     const relative = std.mem.trimStart(u8, uri_path, "/");
     if (relative.len > 0) try validateFilesystemSourceRelativePath(relative);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const canonical_root = std.Io.Dir.realPathFileAbsoluteAlloc(io, configured_root, alloc) catch |err| switch (err) {
@@ -323,13 +325,13 @@ fn hasConnectionCapability(connection: common_config.Config.ConnectionConfig, ca
 
 test "credentialed binding object store opens scoped filesystem source" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", alloc);
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(cwd);
     const allowed_root = try std.fs.path.resolve(alloc, &.{ cwd, ".zig-cache", "tmp", tmp.sub_path[0..], "allowed" });
     defer alloc.free(allowed_root);
-    try std.Io.Dir.createDirAbsolute(std.testing.io, allowed_root, .default_dir);
+    try std.Io.Dir.createDirAbsolute(platform.testing.io, allowed_root, .default_dir);
     const allowed_root_json = try std.json.Stringify.valueAlloc(alloc, allowed_root, .{});
     defer alloc.free(allowed_root_json);
     const allowed_path = try std.fs.path.resolve(alloc, &.{ allowed_root, "events" });
@@ -532,7 +534,7 @@ test "serverless external source credentialed binding opens scoped s3 source wit
 
 test "serverless external source resolves s3 credential secrets" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const secret_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/s3-secrets.json", .{tmp.sub_path});
     defer alloc.free(secret_path);
@@ -594,7 +596,7 @@ test "serverless external source resolves s3 credential secrets" {
 
 test "serverless external source resolves gcs bearer token secret" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const secret_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/gcs-secrets.json", .{tmp.sub_path});
     defer alloc.free(secret_path);
@@ -646,7 +648,7 @@ test "serverless external source resolves gcs bearer token secret" {
 
 test "credential-free binding object store opens read-only without creating file bucket" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const lake_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/credential-free", .{tmp.sub_path});
     defer alloc.free(lake_path);

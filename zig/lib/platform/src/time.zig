@@ -15,12 +15,14 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const windows = @import("windows.zig");
 
 var freestanding_counter: u64 = 0;
 const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 
 pub fn sleepNs(ns: u64) void {
     if (comptime is_hostless) return;
+    if (comptime builtin.os.tag == .windows) return windows.sleepNs(ns);
 
     var req = std.posix.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
@@ -35,7 +37,7 @@ pub fn sleepNs(ns: u64) void {
 
 pub fn yieldBriefly() void {
     if (comptime builtin.os.tag != .freestanding) {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = @import("root.zig").Io.Threaded.global_single_threaded.io();
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
         io.sleep(.fromMicroseconds(100), .awake) catch unreachable;
@@ -49,7 +51,7 @@ pub fn yieldNow() void {
     if (comptime builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        const io = std.Io.Threaded.global_single_threaded.io();
+        const io = @import("root.zig").Io.Threaded.global_single_threaded.io();
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
         io.sleep(.zero, .awake) catch unreachable;
@@ -68,6 +70,7 @@ pub fn monotonicNs() u64 {
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
+    if (comptime builtin.os.tag == .windows) return windows.monotonicNs();
 
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
@@ -97,6 +100,7 @@ pub fn realtimeNs() u64 {
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
+    if (comptime builtin.os.tag == .windows) return windows.realtimeNs();
 
     var ts: std.posix.timespec = undefined;
     switch (std.posix.errno(std.posix.system.clock_gettime(.REALTIME, &ts))) {
@@ -128,7 +132,7 @@ test "thread CPU clock is monotonic where supported" {
 }
 
 pub fn residentBytes() usize {
-    if (comptime is_hostless) return 0;
+    if (comptime is_hostless or builtin.os.tag == .windows) return 0;
 
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     if (usage.maxrss <= 0) return 0;
@@ -138,4 +142,15 @@ pub fn residentBytes() usize {
         .linux => std.math.mul(usize, maxrss, 1024) catch std.math.maxInt(usize),
         else => maxrss,
     };
+}
+
+test "platform clocks and sleep work without requiring libc on Linux" {
+    if (comptime is_hostless) return error.SkipZigTest;
+    const before = monotonicNs();
+    try std.testing.expect(before > 0);
+    sleepNs(std.time.ns_per_ms);
+    try std.testing.expect(monotonicNs() >= before);
+    try std.testing.expect(realtimeNs() > 0);
+    try std.testing.expect(authorityNs() >= before);
+    if (threadCpuNs()) |cpu| try std.testing.expect(cpu > 0);
 }

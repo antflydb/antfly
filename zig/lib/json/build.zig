@@ -18,6 +18,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    defer @import("antfly_platform").bindBuild(b);
 
     _ = b.addModule("antfly-json", .{
         .root_source_file = b.path("src/mod.zig"),

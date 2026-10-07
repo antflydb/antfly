@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 pub const x86 = @import("x86.zig");
 pub const primitives = @import("primitives.zig");
@@ -55,7 +57,7 @@ const sgemmTransBF16AddSlice = gemm.sgemmTransBF16AddSlice;
 //   - The canonical functions (sgemm, sgemmTransB, ...) take an Io
 //     parameter, dispatch via std.Io.Group, and return Cancelable!void.
 //     Callers that already have an Io (servers, CLIs, anything plumbing
-//     std.Io.Threaded) should use these so matmul work composes with the
+//     platform.Io.Threaded) should use these so matmul work composes with the
 //     caller's thread pool and inherits cancellation semantics.
 //   - The `*Sync` escape hatches (sgemmSync, sgemmTransBSync, ...) keep
 //     the no-Io signature.  They use a process-wide raw-futex worker pool
@@ -364,7 +366,7 @@ pub const axpy = primitives.axpy;
 //
 // Same kernels, but parallel dispatch goes through `std.Io.Group.async` so
 // the work is scheduled on the caller's runtime thread pool (typically a
-// long-lived `std.Io.Threaded` instance owned by the application).  This
+// long-lived `platform.Io.Threaded` instance owned by the application).  This
 // avoids hand-rolling a process-wide thread pool inside lib/linalg and
 // gives us a future hook for cancellation and async runtimes.
 //
@@ -378,7 +380,7 @@ pub const axpy = primitives.axpy;
 
 /// SGEMM: C = alpha * A @ B + beta * C.  Parallel work is dispatched via
 /// `io.Group.async`; pass any `std.Io` implementation (typically from
-/// `std.Io.Threaded`).  Use `sgemmSync` if you don't have an Io.
+/// `platform.Io.Threaded`).  Use `sgemmSync` if you don't have an Io.
 pub fn sgemm(
     io: Io,
     m: usize,
@@ -568,11 +570,11 @@ test "sgemmTransB threaded path matches reference" {
 // The canonical sgemmTransB takes an Io and dispatches via io.Group.async;
 // this test validates that path against sgemmTransBSync (which uses the
 // process-wide futex pool).  Both should produce identical results.
-test "sgemmTransB Io path matches sync via std.Io.Threaded" {
+test "sgemmTransB Io path matches sync via platform.Io.Threaded" {
     const allocator = std.testing.allocator;
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var threaded = Io.Threaded.init(allocator, .{});
+    var threaded = platform.Io.Threaded.init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
@@ -652,13 +654,13 @@ test "sgemmTransBSync is safe under concurrent callers" {
 
     var started_tasks: usize = 0;
     defer {
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+        for (threads[0..started_tasks]) |*task| task.await(platform.testing.io);
     }
     for (0..num_threads) |i| {
-        threads[i] = try std.testing.io.concurrent(Worker.run, .{ a, b, per_thread_outputs[i], m, n, k, calls_per_thread });
+        threads[i] = try platform.testing.io.concurrent(Worker.run, .{ a, b, per_thread_outputs[i], m, n, k, calls_per_thread });
         started_tasks += 1;
     }
-    for (&threads) |*t| t.await(std.testing.io);
+    for (&threads) |*t| t.await(platform.testing.io);
 
     for (per_thread_outputs) |buf| {
         for (c_ref, buf) |x, y| try std.testing.expect(@abs(x - y) < 1e-3);

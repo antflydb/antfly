@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
 const stored_destination_authorization = @import("antfly_local_sources").api_stored_destination_authorization;
@@ -46,7 +48,7 @@ pub const ProvisionSummary = @import("antfly_provision_contract").ProvisionSumma
 
 pub const ReconcileReplicaRootOptions = struct {
     drain_resolver_backfill: bool = true,
-    io: std.Io = std.Options.debug_io,
+    io: std.Io = platform.debug_io,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     shard_db_adapter: ?shard_db_adapter_mod.ShardDbAdapter = null,
     restore_open_options: backups_api.OpenOptions = .{},
@@ -611,7 +613,7 @@ pub fn collectLocalRestoreProgressWithOptions(
             options,
         );
     }
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var threaded_options = options;
     threaded_options.shared_io = io_impl.io();
@@ -1159,7 +1161,6 @@ fn testProvisionedFullTextBackfill(inject_activation_deferral: bool) !void {
     var path_tmp = try @import("antfly_local_sources").common_test_directory.TestDirectory.initFast("backfill");
     defer path_tmp.cleanup();
     const path = path_tmp.path();
-    const platform = @import("antfly_platform");
     var clock = platform.clock.ManualClock{ .now_realtime_ns = 10 * std.time.ns_per_s };
 
     var db = try db_mod.DB.open(std.testing.allocator, path, .{
@@ -1374,13 +1375,13 @@ fn implementationTests() type {
             var reference_ns: [5]u64 = undefined;
             var indexed_ns: [5]u64 = undefined;
             for (0..if (benchmark) @as(usize, 6) else 1) |sample| {
-                const start = @import("antfly_platform").time.monotonicNs();
+                const start = platform.time.monotonicNs();
                 const reference = try collectLocalSchemaProgressReference(a, 3, hosted, tables, ranges, &stores);
                 defer a.free(reference);
-                const middle = @import("antfly_platform").time.monotonicNs();
+                const middle = platform.time.monotonicNs();
                 const ready = try collectLocalSchemaProgressFromRuntime(a, 3, hosted, tables, ranges, &stores);
                 defer a.free(ready);
-                const end = @import("antfly_platform").time.monotonicNs();
+                const end = platform.time.monotonicNs();
                 try std.testing.expectEqualDeep(reference, ready);
                 try std.testing.expectEqual(table_count, ready.len);
                 const quiet = try schemaProgressDelta(a, ready, ready);
@@ -1641,7 +1642,7 @@ fn implementationTests() type {
         }
 
         test "table provisioner materializes metadata indexes into hosted group dbs" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner", .{tmp.sub_path});
             defer std.testing.allocator.free(path);
@@ -1681,7 +1682,7 @@ fn implementationTests() type {
 
         test "table provisioner materializes array-form metadata indexes" {
             const path = "/tmp/antfly-metadata-table-provisioner-array-indexes";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1712,7 +1713,7 @@ fn implementationTests() type {
 
         test "target index reconciliation never mutates sibling indexes" {
             const path = "/tmp/antfly-metadata-table-provisioner-target-index";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1750,7 +1751,7 @@ fn implementationTests() type {
         test "target index reconciliation retires orphaned inline enrichments after deletion retry" {
             const alloc = std.testing.allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-target-enrichment-delete";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1808,7 +1809,7 @@ fn implementationTests() type {
 
         test "table provisioner replaces embedding index when metadata incarnation changes" {
             const path = "/tmp/antfly-metadata-table-provisioner-coverage-incarnation";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1836,7 +1837,7 @@ fn implementationTests() type {
             // Replacement is intentionally a multi-pass desired-state transition:
             // the durable owner retires the old artifact namespace before a later
             // reconcile admits the new coverage incarnation.
-            var cleanup_io = std.Io.Threaded.init(std.testing.allocator, .{});
+            var cleanup_io = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer cleanup_io.deinit();
             var cleanup_pages: usize = 0;
             var cleanup_attempts: usize = 0;
@@ -1865,7 +1866,7 @@ fn implementationTests() type {
         test "table provisioner reconciliation is non-mutating for query read-only dbs" {
             const path = "/tmp/antfly-metadata-table-provisioner-readonly-reconcile";
             const indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1909,7 +1910,7 @@ fn implementationTests() type {
 
         test "table provisioner reconciles stored algebraic metadata without public type" {
             const path = "/tmp/antfly-metadata-table-provisioner-algebraic-existing";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1942,7 +1943,7 @@ fn implementationTests() type {
 
         test "table provisioner admits algebraic index on a non-empty table through generation repair" {
             const path = "/tmp/antfly-metadata-table-provisioner-algebraic-non-empty";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2007,7 +2008,7 @@ fn implementationTests() type {
 
         test "table provisioner registers top-level enrichments without creating enrichment index" {
             const path = "/tmp/antfly-metadata-table-provisioner-enrichments";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2058,7 +2059,7 @@ fn implementationTests() type {
 
         test "table provisioner registers a resolver declared in the table index config" {
             const path = "/tmp/antfly-metadata-table-provisioner-resolver";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2213,7 +2214,7 @@ fn implementationTests() type {
         test "table provisioner can admit resolver backfill without draining corpus work" {
             const alloc = std.testing.allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-async-resolver";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2271,7 +2272,7 @@ fn implementationTests() type {
         test "table provisioner registers explicit document enrichments from index config" {
             const alloc = std.heap.c_allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-enrichments";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2322,7 +2323,7 @@ fn implementationTests() type {
         test "table provisioner rejects conflicting inline enrichment definitions" {
             const alloc = std.heap.c_allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-conflicting-enrichments";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2358,7 +2359,7 @@ fn implementationTests() type {
         test "table provisioner rejects conflicting enrichment kinds under the same artifact name" {
             const alloc = std.heap.c_allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-conflicting-enrichment-kinds";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2393,7 +2394,7 @@ fn implementationTests() type {
         test "table provisioner updates changed enrichment config under the same name" {
             const alloc = std.heap.c_allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-changed-enrichment";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2466,7 +2467,7 @@ fn implementationTests() type {
         test "table provisioner replaces enrichment kind under the same artifact name" {
             const alloc = std.heap.c_allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-replace-enrichment-kind";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2540,7 +2541,7 @@ fn implementationTests() type {
         test "table provisioner applies artifact enrichments in dependency order" {
             const alloc = std.heap.c_allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-enrichment-dependency-order";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2600,7 +2601,7 @@ fn implementationTests() type {
         test "table provisioner treats duplicate identical inline enrichments as one desired artifact" {
             const alloc = std.heap.c_allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-shared-enrichment";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2650,7 +2651,7 @@ fn implementationTests() type {
         test "table provisioner updates full text artifact mapping and cleans removed enrichments" {
             const alloc = std.heap.c_allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-enrichment-remap";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2793,7 +2794,7 @@ fn implementationTests() type {
         }
 
         test "table provisioner restores local shard data from metadata restore intent" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner-restore-root", .{tmp.sub_path});
@@ -2803,7 +2804,7 @@ fn implementationTests() type {
             const source_db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner-restore-source", .{tmp.sub_path});
             defer std.testing.allocator.free(source_db_path);
 
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -2835,7 +2836,7 @@ fn implementationTests() type {
             const dest_root = try backups_api.shardSnapshotPath(std.testing.allocator, backup_root, "snap1", 2001);
             defer std.testing.allocator.free(dest_root);
             try backups_api.copyDirectoryRecursive(std.testing.allocator, snapshot_root, dest_root);
-            const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+            const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
             defer std.testing.allocator.free(cwd);
             const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
             defer std.testing.allocator.free(backup_root_abs);
@@ -2843,7 +2844,7 @@ fn implementationTests() type {
             defer std.testing.allocator.free(restore_location);
             var artifact_integrity = try backups_api.artifactIntegrityAlloc(
                 std.testing.allocator,
-                std.testing.io,
+                platform.testing.io,
                 .native,
                 dest_root,
             );
@@ -2987,7 +2988,7 @@ fn implementationTests() type {
         }
 
         test "table provisioner restore rejects mismatched doc identity namespace" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner-restore-docid-root", .{tmp.sub_path});
@@ -2997,7 +2998,7 @@ fn implementationTests() type {
             const source_db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/table-provisioner-restore-docid-source", .{tmp.sub_path});
             defer std.testing.allocator.free(source_db_path);
 
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -3027,7 +3028,7 @@ fn implementationTests() type {
             const dest_root = try backups_api.shardSnapshotPath(std.testing.allocator, backup_root, "snap1", 2001);
             defer std.testing.allocator.free(dest_root);
             try backups_api.copyDirectoryRecursive(std.testing.allocator, snapshot_root, dest_root);
-            const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+            const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
             defer std.testing.allocator.free(cwd);
             const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
             defer std.testing.allocator.free(backup_root_abs);
@@ -3035,7 +3036,7 @@ fn implementationTests() type {
             defer std.testing.allocator.free(restore_location);
             var artifact_integrity = try backups_api.artifactIntegrityAlloc(
                 std.testing.allocator,
-                std.testing.io,
+                platform.testing.io,
                 .native,
                 dest_root,
             );
@@ -3106,12 +3107,12 @@ fn implementationTests() type {
         }
 
         test "table provisioner removes indexes missing from metadata" {
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
             const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-provisioner-drop", .{tmp.sub_path});
             defer std.testing.allocator.free(path);
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -3156,7 +3157,7 @@ fn implementationTests() type {
 
         test "table provisioner reconcile does not replay pending derived batches" {
             const path = "/tmp/antfly-metadata-table-provisioner-no-replay";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -3297,7 +3298,7 @@ fn implementationTests() type {
 
         test "table provisioner reports local schema progress once all local shards have the target full-text index" {
             const path = "/tmp/antfly-metadata-table-provisioner-progress";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -3406,7 +3407,7 @@ fn implementationTests() type {
 
         test "table provisioner schema progress probes do not take a writer lease" {
             const path = "/tmp/antfly-metadata-table-provisioner-progress-live-writer";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -3452,7 +3453,7 @@ fn implementationTests() type {
         test "table provisioner schema progress reads generation-owned rebuild state from status-only catalog" {
             const alloc = std.testing.allocator;
             const path = "/tmp/antfly-metadata-table-provisioner-progress-rebuild-marker";
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -3499,7 +3500,7 @@ fn implementationTests() type {
 
         test "table provisioner schema progress quarantines a corrupt rebuild marker" {
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(
                 alloc,
@@ -3507,7 +3508,7 @@ fn implementationTests() type {
                 .{tmp.sub_path},
             );
             defer alloc.free(path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
 
             const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2008);
@@ -3554,7 +3555,7 @@ fn implementationTests() type {
 
         test "table provisioner withholds schema progress when any local shard is missing the target full-text index" {
             const path = "/tmp/antfly-metadata-table-provisioner-progress-incomplete";
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -3772,11 +3773,11 @@ fn implementationTests() type {
         test "target index reconciliation does not wait for sibling storage maintenance" {
             if (@import("builtin").single_threaded) return error.SkipZigTest;
             const alloc = std.testing.allocator;
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/target-maintenance", .{tmp.sub_path});
             defer alloc.free(path);
-            var io_impl = std.Io.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
             var db = try db_mod.DB.open(alloc, path, .{

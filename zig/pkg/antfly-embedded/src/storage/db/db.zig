@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const snapshot_staging = @import("snapshot_staging.zig");
 const execution_resources = @import("execution_resources.zig");
 const read_projection = @import("read_projection.zig");
 // Canonical execution types come from execution_resources. This compile-time
@@ -107,7 +108,7 @@ const replication_commit = @import("commit_integration.zig");
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const ant_json = @import("antfly-json");
 const vector_mod = @import("antfly_vector").vector;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = platform.sync;
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const antfly_image = @import("antfly_image");
@@ -225,7 +226,7 @@ const enrichment_artifact_codec = @import("enrichment/artifact_codec.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const lsm_backend_mod = @import("../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
-const process_memory_mod = @import("antfly_platform").process_memory;
+const process_memory_mod = platform.process_memory;
 
 fn quarantineClaimMismatchReason(
     mismatch: index_manager_mod.IndexManager.FailedIndexLoadMismatch,
@@ -404,8 +405,8 @@ const db_split_sim_fixture = @import("db_split_sim_fixture.zig");
 const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
     pub const sim = struct {};
 };
-const platform_clock = @import("antfly_platform").clock;
-const platform_time = @import("antfly_platform").time;
+const platform_clock = platform.clock;
+const platform_time = platform.time;
 
 /// A backup can be admitted before a policy barrier and continue streaming
 /// after the barrier closes. Compose the caller's cancellation with the
@@ -901,9 +902,9 @@ var test_fail_portable_activation_retry_fallback_submit: std.atomic.Value(bool) 
 var test_pause_portable_activation_retry_probe_before_lifecycle_lock: std.atomic.Value(bool) = .init(false);
 var test_portable_activation_retry_probe_paused: std.atomic.Value(bool) = .init(false);
 var test_release_portable_activation_retry_probe: std.atomic.Value(bool) = .init(false);
-var test_graph_repair_stream_flushes: @import("antfly_platform").atomic.Value(u64) = .init(0);
-var test_graph_repair_stream_scans: @import("antfly_platform").atomic.Value(u64) = .init(0);
-var test_graph_split_retire_flushes: @import("antfly_platform").atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_flushes: platform.atomic.Value(u64) = .init(0);
+var test_graph_repair_stream_scans: platform.atomic.Value(u64) = .init(0);
+var test_graph_split_retire_flushes: platform.atomic.Value(u64) = .init(0);
 var test_graph_split_retire_abort_after_flush: std.atomic.Value(bool) = .init(false);
 var test_graph_split_retire_abort_before_cursor: std.atomic.Value(bool) = .init(false);
 var test_graph_merge_import_abort_after_primary: std.atomic.Value(bool) = .init(false);
@@ -1907,9 +1908,9 @@ fn recoverIncompletePortableImport(alloc: Allocator, store: *docstore_mod.DocSto
     try store.sync(true);
 }
 
-fn threadedIo() if (builtin.os.tag == .freestanding) void else std.Io.Threaded {
+fn threadedIo() if (builtin.os.tag == .freestanding) void else platform.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 /// Generic directory-store imports are decoded into a bounded, durable scratch
@@ -2340,7 +2341,7 @@ fn writeRestoreMarkerAtomicWithIo(
 ) !void {
     if (raw.len > max_restore_marker_bytes) return error.RestoreMarkerTooLarge;
     var entropy: [8]u8 = undefined;
-    try @import("antfly_platform").entropy.fill(io, &entropy);
+    try platform.entropy.fill(io, &entropy);
     const nonce = std.fmt.bytesToHex(entropy, .lower);
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{s}", .{ path, &nonce });
     defer alloc.free(tmp_path);
@@ -2509,7 +2510,7 @@ fn spinOrYield() void {
     if (builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
 }
 
@@ -2572,7 +2573,7 @@ fn lockAtomicWithCancellation(mutex: *std.atomic.Mutex, cancellation: types.Canc
         if (builtin.os.tag == .freestanding or builtin.single_threaded or attempts < 64) {
             std.atomic.spinLoopHint();
         } else if (attempts < 128) {
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
         } else {
             const backoff_step = @min(attempts - 128, 5);
             sleepNs(@min(@as(u64, 50_000) << @intCast(backoff_step), @as(u64, 1_000_000)));
@@ -2634,7 +2635,7 @@ fn lockApplyWithBackoffProfiled(rw_lock: *apply_rw_lock_mod.ApplyRwLock, stats: 
             continue;
         }
         if (attempts < 128) {
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
             yield_loops += 1;
             continue;
         }
@@ -3792,7 +3793,7 @@ pub const DB = struct {
 
             core_owner.* = try db_core.DBCore.fromOpened(
                 alloc,
-                backend_runtime.io() orelse backend_runtime.filesystemIo() orelse std.Options.debug_io,
+                backend_runtime.io() orelse backend_runtime.filesystemIo() orelse platform.debug_io,
                 core,
             );
             core_owned = false;
@@ -4456,7 +4457,7 @@ pub const DB = struct {
         const identity = try std.json.Stringify.valueAlloc(self.alloc, self.core.identity_namespace, .{});
         defer self.alloc.free(identity);
         const configuration_hash = try self.vectorMigrationConfigurationHash();
-        const disk = try @import("antfly_platform").filesystem.capacity(self.core.path);
+        const disk = try platform.filesystem.capacity(self.core.path);
         if (disk.available_bytes < request.budget.disk_reserve_bytes +| request.budget.batch_bytes * 8)
             return error.VectorMigrationDiskReserve;
         // The source manifest is durable before the primary job admits any
@@ -4915,9 +4916,9 @@ pub const DB = struct {
     pub fn close(self: *DB) void {
         if (self.closed) return;
         self.closed = true;
-        self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse std.Options.debug_io);
-        self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
-        self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse std.Options.debug_io);
+        self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse platform.debug_io);
+        self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse platform.debug_io);
+        self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse platform.debug_io);
         self.deinitWrapperState(true);
     }
 
@@ -5549,7 +5550,7 @@ pub const DB = struct {
     /// teardown drains TTL workers before releasing the owning service.
     pub fn setCoordinatedTtl(self: *DB, port: ?coordinated_ttl.Port) void {
         const context = self.ttl_cleanup_context orelse return;
-        const io = self.backend_runtime.io() orelse std.Options.debug_io;
+        const io = self.backend_runtime.io() orelse platform.debug_io;
         context.hook_mutex.lockUncancelable(io);
         defer context.hook_mutex.unlock(io);
         context.coordinated_port = port;
@@ -5580,7 +5581,7 @@ pub const DB = struct {
         };
         errdefer contexts.release();
         contexts.identity.resource_manager = self.core.index_manager.resource_manager;
-        contexts.identity.io = self.backend_runtime.io() orelse std.Options.debug_io;
+        contexts.identity.io = self.backend_runtime.io() orelse platform.debug_io;
         self.transaction_owner = try @TypeOf(self.transaction_owner).create(self.runtime_alloc, contexts, .{ self, cfg }, constructTransactionRuntime);
         self.transaction_recovery_identity_context = &self.transaction_owner.context.?.identity;
         self.transaction_recovery_local_context = &self.transaction_owner.context.?.local;
@@ -5780,9 +5781,9 @@ pub const DB = struct {
         self.stopGraphEndpointCleanupWorker();
         self.transaction_owner.deinitRuntime(self.runtime_alloc);
         self.transaction_runtime = null;
-        self.local_execution.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
+        self.local_execution.source_publication.stop(self.backend_runtime.io() orelse platform.debug_io);
         self.local_execution.merge_artifact_layout.clear();
-        self.local_execution.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
+        self.local_execution.online_merge_reader.retire(self.backend_runtime.io() orelse platform.debug_io, null);
         self.transaction_owner.deinitContext(self.runtime_alloc);
         self.transaction_recovery_local_context = null;
         self.transaction_recovery_identity_context = null;
@@ -6685,7 +6686,7 @@ pub const DB = struct {
             if (attempts >= 2000) {
                 return std.testing.expectEqual(expected, backend.snapshotMaintenanceStats().obsolete_paths_reclaimable);
             }
-            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     }
 
@@ -8726,7 +8727,7 @@ pub const DB = struct {
         if (builtin.is_test and test_block_generated_artifact_finalization.load(.acquire)) {
             test_generated_artifact_finalization_entered.store(true, .release);
             while (!test_release_generated_artifact_finalization.load(.acquire)) {
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
         try finalizeRetiredIndexCleanupContext(ctx, index_name, cleanup_key);
@@ -19190,7 +19191,7 @@ pub const DB = struct {
         const staging = try createSnapshotStagingRoot(self.alloc, io, parent, id);
         defer self.alloc.free(staging);
         var published = false;
-        defer if (!published) std.Io.Dir.cwd().deleteTree(io, staging) catch {};
+        defer if (!published) snapshot_staging.cleanup(io, staging);
         const total = try seal.exportTo(self.alloc, io, root, handle, staging, output_cancellation);
         try seal.recordExport(self.alloc, io, staging, handle, total);
         try output_cancellation.check();
@@ -19253,7 +19254,7 @@ pub const DB = struct {
             const parent = std.fs.path.dirname(root) orelse return error.InvalidBackupSeal;
             const temporary = try createSnapshotStagingRoot(self.alloc, io, parent, "portable-decoder");
             defer self.alloc.free(temporary);
-            defer std.Io.Dir.cwd().deleteTree(io, temporary) catch {};
+            defer snapshot_staging.cleanup(io, temporary);
             var backend = try @import("../lsm_backend.zig").Backend.open(self.alloc, temporary, .{ .read_runtime = @import("../lsm_backend/storage_io.zig").ReadRuntime.init(io) });
             defer backend.close();
             var store = try docstore_mod.DocStore.openRuntime(self.alloc, try backend.runtimeStore(self.alloc, .{ .name = "docs" }));
@@ -19383,7 +19384,7 @@ pub const DB = struct {
         } else try createSnapshotStagingRoot(self.alloc, io, snapshot_parent, id);
         defer self.alloc.free(staging_root);
         var published = false;
-        defer if (!published) std.Io.Dir.cwd().deleteTree(io, staging_root) catch {};
+        defer if (!published) snapshot_staging.cleanup(io, staging_root);
 
         if (!include_generated) {
             // Portable snapshots omit generated files, but their replay log and
@@ -23649,7 +23650,7 @@ pub const DB = struct {
             }
         };
         const io = self.backend_runtime.io();
-        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .io = io orelse std.Options.debug_io };
+        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .io = io orelse platform.debug_io };
         var input_bytes: usize = 0;
         for (intents) |intent| input_bytes +|= if (intent.value) |value| value.len else 0;
         const workers = @min(@as(usize, 8), @min(intents.len, @max(@as(usize, 1), input_bytes / (256 * 1024))));
@@ -24310,7 +24311,7 @@ pub const DB = struct {
             }
         }
         if (command == .release) {
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
+            const io = self.backend_runtime.io() orelse platform.debug_io;
             self.local_execution.source_publication.cancelScope(io, command.scope());
             self.local_execution.online_merge_reader.retire(io, command.scope());
         }
@@ -28973,7 +28974,7 @@ pub const DB = struct {
     const TargetAdvanceStallGuard = struct {
         db: *DB,
         timeout_ns: u64,
-        last_check_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        last_check_ns: platform.atomic.Value(u64) = .init(0),
 
         const recheck_interval_ns: u64 = 250 * std.time.ns_per_ms;
 
@@ -30222,7 +30223,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         if (test_pause_portable_activation_retry_probe_before_lifecycle_lock.load(.acquire)) {
             test_portable_activation_retry_probe_paused.store(true, .release);
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
+            const io = self.backend_runtime.io() orelse platform.debug_io;
             while (!test_release_portable_activation_retry_probe.load(.acquire))
                 io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
@@ -35578,7 +35579,7 @@ pub const DB = struct {
         defer if (apply_locked) self.core.unlockApply();
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
         try self.core.store.beginPortableImportPublication(
-            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io,
+            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse platform.debug_io,
         );
         var publication_fenced = true;
         defer if (publication_fenced) self.core.store.finishPortableImportPublication();
@@ -35628,7 +35629,7 @@ pub const DB = struct {
         defer if (apply_locked) self.core.unlockApply();
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
         try self.core.store.beginPortableImportPublication(
-            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io,
+            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse platform.debug_io,
         );
         var publication_fenced = true;
         defer if (publication_fenced) self.core.store.finishPortableImportPublication();
@@ -41159,7 +41160,7 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                @import("antfly_platform").time.yieldNow();
+                platform.time.yieldNow();
             }
         }
         return true;
@@ -41221,7 +41222,7 @@ pub const DB = struct {
             if (spins < 64) {
                 std.atomic.spinLoopHint();
             } else {
-                @import("antfly_platform").time.yieldNow();
+                platform.time.yieldNow();
             }
         }
         return true;
@@ -41401,7 +41402,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (builtin.is_test and test_block_match_all_ordinal_lookup.load(.acquire)) {
             test_match_all_ordinal_lookup_entered.store(true, .release);
-            while (!test_release_match_all_ordinal_lookup.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!test_release_match_all_ordinal_lookup.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
         return try self.lookupLiveDocOrdinalNoLock(alloc, doc_id, generation);
     }
@@ -43210,7 +43211,7 @@ fn resolvedDocSetFromSearchHitOrdinalsAlloc(alloc: Allocator, hits: []const type
 
 test "owned DB open starts self-retaining workers at the stable allocation" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owned-db-worker", .{tmp.sub_path});
     defer alloc.free(path);
@@ -47134,7 +47135,7 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
     var view = if (ctx.schema_registry) |registry| registry.acquire() else null;
     defer if (view) |*pinned| pinned.release();
     if (view) |pinned| if (pinned.hasCoordinatedConstraints()) {
-        const io = ctx.batch.io orelse std.Options.debug_io;
+        const io = ctx.batch.io orelse platform.debug_io;
         ctx.hook_mutex.lockUncancelable(io);
         const port = ctx.coordinated_port;
         ctx.hook_mutex.unlock(io);
@@ -48850,7 +48851,7 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
 
 test "native publication reports contention separately from an empty pass" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-publication-contention", .{tmp.sub_path});
     defer alloc.free(path);
@@ -48868,7 +48869,7 @@ test "native publication reports contention separately from an empty pass" {
 
 test "native publication finalization forwards raced source completion" {
     const alloc = std.testing.allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
@@ -48925,8 +48926,8 @@ test "external dense bulk waiter owns admission across catch-up handoff" {
         }
     };
     var waiter = Waiter{ .ctx = &ctx };
-    var waiter_thread = try std.testing.io.concurrent(Waiter.run, .{&waiter});
-    defer waiter_thread.await(std.testing.io);
+    var waiter_thread = try platform.testing.io.concurrent(Waiter.run, .{&waiter});
+    defer waiter_thread.await(platform.testing.io);
 
     const wait_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (ctx.dense_admission.waiters.load(.acquire) == 0) {
@@ -50944,21 +50945,21 @@ test "db derived coverage snapshot stays coherent across atomic creation and tra
         if (builtin.mode == .fast) {
             const iterations = 10_000;
             var independent_sum: u64 = 0;
-            const independent_start = std.Io.Clock.awake.now(std.testing.io);
+            const independent_start = std.Io.Clock.awake.now(platform.testing.io);
             for (0..iterations) |_| {
                 for (names) |name| independent_sum += (try loadDerivedCoverageOutcomeCounterFromStore(alloc, &store, "dense", 7, name)).?;
                 independent_sum += (try range_cardinality.load(alloc, &store)).?;
             }
-            const independent_ns = independent_start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+            const independent_ns = independent_start.durationTo(std.Io.Clock.awake.now(platform.testing.io)).toNanoseconds();
             var snapshot_sum: u64 = 0;
-            const snapshot_start = std.Io.Clock.awake.now(std.testing.io);
+            const snapshot_start = std.Io.Clock.awake.now(platform.testing.io);
             for (0..iterations) |_| {
                 var txn = try store.beginReadTxn();
                 defer txn.abort();
                 const counters = try DerivedCoverageCounters.load(alloc, &txn, "dense", 7);
                 snapshot_sum += counters.produced.? + counters.skipped.? + counters.terminal_failed.? + (try range_cardinality.loadFromTxn(&txn)).?;
             }
-            const snapshot_ns = snapshot_start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+            const snapshot_ns = snapshot_start.durationTo(std.Io.Clock.awake.now(platform.testing.io)).toNanoseconds();
             try std.testing.expectEqual(@as(u64, iterations * 4), independent_sum);
             try std.testing.expectEqual(independent_sum, snapshot_sum);
             std.debug.print("coverage read benchmark backend={s} iterations={d} independent_ns={d} snapshot_ns={d}\n", .{ @typeName(Backend), iterations, independent_ns, snapshot_ns });
@@ -52295,7 +52296,7 @@ const applyCommittedBatchToShadow = local_mutation.applyCommittedBatchToShadow;
 /// can therefore drain without a lock cycle.
 fn waitForSplitShadowDrainLocked(self: *DB, require_clean: bool) !void {
     const shadow = activeSplitShadow(self) orelse return;
-    const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse std.Options.debug_io;
+    const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse platform.debug_io;
     shadow.apply_mutex.lockUncancelable(io);
     while (shadow.applied_ticket != shadow.next_ticket) {
         shadow.apply_advanced.waitUncancelable(io, &shadow.apply_mutex);
@@ -54251,24 +54252,7 @@ fn snapshotPathExists(io: Io, path: []const u8) !bool {
 }
 
 fn createSnapshotStagingRoot(alloc: Allocator, io: Io, parent: []const u8, id: []const u8) ![]u8 {
-    for (0..64) |_| {
-        var entropy: [8]u8 = undefined;
-        try @import("antfly_platform").entropy.fill(io, &entropy);
-        const nonce = std.fmt.bytesToHex(entropy, .lower);
-        const candidate = try std.fmt.allocPrint(alloc, "{s}/.{s}.staging-{s}", .{ parent, id, &nonce });
-        errdefer alloc.free(candidate);
-        std.Io.Dir.cwd().createDir(io, candidate, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                alloc.free(candidate);
-                continue;
-            },
-            else => return err,
-        };
-        errdefer std.Io.Dir.cwd().deleteTree(io, candidate) catch {};
-        try fs_paths.syncDirPortable(io, parent);
-        return candidate;
-    }
-    return error.SnapshotStagingCollision;
+    return snapshot_staging.createRoot(alloc, io, parent, id);
 }
 
 fn publishSnapshotStaging(io: Io, parent: []const u8, staging: []const u8, destination: []const u8) !void {
@@ -57416,7 +57400,7 @@ const GateDenseEmbedder = struct {
         if (previous_successes >= self.allowed_successes.load(.acquire)) {
             _ = self.successful_requests.fetchSub(1, .acq_rel);
             _ = self.blocked_requests.fetchAdd(1, .monotonic);
-            if (self.blocked_event) |event| event.set(std.testing.io);
+            if (self.blocked_event) |event| event.set(platform.testing.io);
             return self.blocked_error;
         }
         if (dims != 3) return error.InvalidVectorDimensions;
@@ -58038,11 +58022,11 @@ fn ensureDbSplitSimIndexDir(alloc: Allocator, db_path: []const u8) !void {
 }
 
 fn writeDbSplitReplayArtifactFile(path: []const u8, contents: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{});
-    defer file.close(std.testing.io);
+    var file = try std.Io.Dir.createFileAbsolute(platform.testing.io, path, .{});
+    defer file.close(platform.testing.io);
 
     var file_buf: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &file_buf);
+    var writer = file.writer(platform.testing.io, &file_buf);
     try writer.interface.writeAll(contents);
     try writer.end();
 }
@@ -58324,8 +58308,8 @@ fn runModeledDbSplitReplayCase(
 
 fn runDbSplitReplayFixtures(alloc: Allocator) !void {
     const root_dir = "pkg/antfly-embedded/src/storage/db/db_sim_fixtures";
-    var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
-    defer fixture_dir.close(std.testing.io);
+    var fixture_dir = try std.Io.Dir.cwd().openDir(platform.testing.io, root_dir, .{ .iterate = true });
+    defer fixture_dir.close(platform.testing.io);
 
     var walker = try fixture_dir.walk(alloc);
     defer walker.deinit();
@@ -58336,7 +58320,7 @@ fn runDbSplitReplayFixtures(alloc: Allocator) !void {
         fixture_paths.deinit(alloc);
     }
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_paths.append(alloc, try alloc.dupe(u8, entry.path));
@@ -58352,7 +58336,7 @@ fn runDbSplitReplayFixtures(alloc: Allocator) !void {
         const fixture_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_dir, fixture_rel_path });
         defer alloc.free(fixture_path);
 
-        const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_path, alloc, .limited(64 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, fixture_path, alloc, .limited(64 * 1024));
         defer alloc.free(raw);
 
         var fixture = try db_split_sim_fixture.parseFixture(alloc, raw);
@@ -58375,8 +58359,8 @@ fn runDbSplitReplayFixtures(alloc: Allocator) !void {
 
 fn runModeledDbSplitReplayFixtures(alloc: Allocator) !void {
     const root_dir = "pkg/antfly-embedded/src/storage/db/db_sim_fixtures/replay";
-    var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
-    defer fixture_dir.close(std.testing.io);
+    var fixture_dir = try std.Io.Dir.cwd().openDir(platform.testing.io, root_dir, .{ .iterate = true });
+    defer fixture_dir.close(platform.testing.io);
 
     var walker = try fixture_dir.walk(alloc);
     defer walker.deinit();
@@ -58387,7 +58371,7 @@ fn runModeledDbSplitReplayFixtures(alloc: Allocator) !void {
         fixture_paths.deinit(alloc);
     }
 
-    while (try walker.next(std.testing.io)) |entry| {
+    while (try walker.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
         try fixture_paths.append(alloc, try alloc.dupe(u8, entry.path));
@@ -58403,7 +58387,7 @@ fn runModeledDbSplitReplayFixtures(alloc: Allocator) !void {
         const fixture_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root_dir, fixture_rel_path });
         defer alloc.free(fixture_path);
 
-        const raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_path, alloc, .limited(64 * 1024));
+        const raw = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, fixture_path, alloc, .limited(64 * 1024));
         defer alloc.free(raw);
 
         var fixture = try db_split_sim_fixture.parseFixture(alloc, raw);
@@ -59059,7 +59043,7 @@ test "db open borrows shared backend runtime" {
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer runtime.deinit();
 
@@ -59105,7 +59089,7 @@ test "db close retires runtime owners for memory primary backend" {
     const alloc = std.testing.allocator;
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer runtime.deinit();
 
@@ -59521,7 +59505,7 @@ test "db open downgrades borrowed manual backend runtime to manual executor" {
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer runtime.deinit();
 
@@ -59588,7 +59572,7 @@ test "db text merge enabled requires backend runtime io" {
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer runtime.deinit();
 
@@ -59609,7 +59593,7 @@ test "db enrichment enabled requires backend runtime io" {
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer runtime.deinit();
 
@@ -59977,7 +59961,7 @@ test "db ttl cleanup enabled requires backend runtime io" {
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer runtime.deinit();
 
@@ -61379,7 +61363,7 @@ test "prepared relational batch uses bounded parallel workers safely" {
         std.testing.expectEqual(@as(u64, 0), budget.live_bytes) catch @panic("prepared row budget leak");
         budget.deinit();
     }
-    var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+    var io_impl = platform.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
     defer io_impl.deinit();
     var allocator_guard = PreparedRowAllocator{ .child = budget.allocator(), .io = io_impl.io() };
     var rows: [writes.len]?mapper.PreparedRelationalWrite = @splat(null);
@@ -62194,7 +62178,7 @@ test "relational columnar scheduler batches deferred discovery before ready work
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -62742,7 +62726,7 @@ fn testColumnarSelection(comptime physical_plan: bool) !void {
     // retains boundary keys on a smaller fixture without asserting that plan.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
@@ -62863,7 +62847,7 @@ test "relational columnar sequential selection preserves dirty owners bounds and
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
@@ -62978,7 +62962,7 @@ test "relational columnar bound scan benchmark" {
 fn testRelationalBoundScan(benchmark: bool) !void {
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     const row_count: usize = if (benchmark) 768 else 2 * @import("column_read_cache.zig").max_rows;
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -63145,7 +63129,7 @@ fn productionLsmPhysicalChurnBenchmark(gc_min_percent: u8) !void {
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
     var path_tmp = try TestDirectory.init("db");
@@ -63736,7 +63720,7 @@ test "relational columnar clean coalescing preserves typed cells without primary
     // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     for ([_]PrimaryBackend{.{ .lsm = .{ .flush_threshold = 1 } }}) |backend| {
         var path_tmp = try TestDirectory.initFast("db");
         defer path_tmp.cleanup();
@@ -64373,7 +64357,7 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     // The explicit block limit below, not elapsed wall time, defines quanta.
     relational_columns.test_disable_deadline = true;
     defer relational_columns.test_disable_deadline = false;
@@ -65027,7 +65011,7 @@ test "db portable publication fence blocks lock-free point reads" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.core.store.beginPortableImportPublication(std.Options.debug_io);
+    try db.core.store.beginPortableImportPublication(platform.debug_io);
     var fenced = true;
     defer if (fenced) db.core.store.finishPortableImportPublication();
 
@@ -65101,11 +65085,11 @@ test "db portable publication waits for admitted readers and rejects new ones" {
                 return;
             };
             self.returned.store(true, .release);
-            while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!self.release.load(.acquire)) platform.time.yieldNow();
             self.store.finishPortableImportPublication();
         }
     };
-    var publisher = Publisher{ .store = db.core.store, .io = std.Options.debug_io };
+    var publisher = Publisher{ .store = db.core.store, .io = platform.debug_io };
     const thread = try std.Thread.spawn(.{}, Publisher.run, .{&publisher});
     var joined = false;
     defer if (!joined) {
@@ -65119,7 +65103,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
 
     const close_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!db.core.store.portableImportPublicationInProgress() and monotonicTimeNs() < close_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(db.core.store.portableImportPublicationInProgress());
     try std.testing.expect(!publisher.returned.load(.acquire));
@@ -65129,7 +65113,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
     admitted_open = false;
     const drain_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!publisher.returned.load(.acquire) and monotonicTimeNs() < drain_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(publisher.returned.load(.acquire));
     publisher.release.store(true, .release);
@@ -65179,7 +65163,7 @@ test "db portable activation gate revalidates queued and replicated writes" {
 
     const prelock_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
@@ -65245,7 +65229,7 @@ test "db portable activation gate revalidates queued graph reads" {
 
     const entered_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!reader.entered.load(.acquire) and monotonicTimeNs() < entered_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(reader.entered.load(.acquire));
     db.async_context.portable_runtime_activation_pending.store(true, .release);
@@ -65262,7 +65246,7 @@ test "db portable activation gate revalidates profiled dense search after catalo
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var path_tmp = try TestDirectory.init("db");
@@ -65383,7 +65367,7 @@ test "portable activation retry runtime job can be restarted" {
 
         const exit_deadline = monotonicTimeNs() + std.time.ns_per_s;
         while (db.portable_activation_recovery.worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
         }
         try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
     }
@@ -65412,11 +65396,11 @@ test "portable activation retry stop joins the runtime worker final handshake" {
         release_final_lock: *std.atomic.Value(bool),
 
         fn run(ctx: @This()) void {
-            while (!ctx.db.portable_activation_recovery.stopping.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!ctx.db.portable_activation_recovery.stopping.load(.acquire)) platform.time.yieldNow();
             _ = lockAtomic(&ctx.db.portable_activation_recovery.lifecycle_mutex);
             ctx.db.portable_activation_recovery.worker_running.store(false, .release);
             ctx.holding_final_lock.store(true, .release);
-            while (!ctx.release_final_lock.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!ctx.release_final_lock.load(.acquire)) platform.time.yieldNow();
             ctx.db.portable_activation_recovery.lifecycle_mutex.unlock();
         }
     };
@@ -65455,7 +65439,7 @@ test "portable activation retry stop joins the runtime worker final handshake" {
 
     const hold_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!holding_final_lock.load(.acquire) and monotonicTimeNs() < hold_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(holding_final_lock.load(.acquire));
     // Give the stopper ample time to observe the published false state. It
@@ -65541,7 +65525,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     const pause_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!test_portable_activation_retry_probe_paused.load(.acquire) and monotonicTimeNs() < pause_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(test_portable_activation_retry_probe_paused.load(.acquire));
 
@@ -65557,7 +65541,7 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     const stop_deadline = monotonicTimeNs() + std.time.ns_per_s;
     while (!db.portable_activation_recovery.stopping.load(.acquire) and monotonicTimeNs() < stop_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(db.portable_activation_recovery.stopping.load(.acquire));
     try std.testing.expect(!close_returned.load(.acquire));
@@ -65607,7 +65591,7 @@ test "portable activation retry uses owner scoped runtime" {
         db.portable_activation_recovery.worker_running.load(.acquire)) and
         monotonicTimeNs() < recovery_deadline)
     {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
     try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
@@ -65658,7 +65642,7 @@ test "db searches fail fast without joining portable activation recovery" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var path_tmp = try TestDirectory.init("db");
@@ -65942,7 +65926,7 @@ test "portable import scratch scavenging removes abandoned stages and preserves 
     if (comptime builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const parent = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(parent);
@@ -65966,37 +65950,37 @@ test "portable import scratch scavenging removes abandoned stages and preserves 
         error.InjectedPortableImportStageDirectoryCreationFailure,
         createUniquePortableImportStageBase(alloc, target),
     );
-    var parent_dir = try std.Io.Dir.cwd().openDir(std.testing.io, parent, .{ .iterate = true });
-    defer parent_dir.close(std.testing.io);
+    var parent_dir = try std.Io.Dir.cwd().openDir(platform.testing.io, parent, .{ .iterate = true });
+    defer parent_dir.close(platform.testing.io);
     var entries = parent_dir.iterate();
-    while (try entries.next(std.testing.io)) |entry| {
+    while (try entries.next(platform.testing.io)) |entry| {
         try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".target.portable-import-"));
     }
 
     var abandoned_lease = try acquirePortableImportStageLease(alloc, abandoned);
-    try std.Io.Dir.cwd().createDir(std.testing.io, abandoned, .default_dir);
-    abandoned_lease.close(std.testing.io);
+    try std.Io.Dir.cwd().createDir(platform.testing.io, abandoned, .default_dir);
+    abandoned_lease.close(platform.testing.io);
 
     var active_lease = try acquirePortableImportStageLease(alloc, active);
-    defer active_lease.close(std.testing.io);
-    try std.Io.Dir.cwd().createDir(std.testing.io, active, .default_dir);
+    defer active_lease.close(platform.testing.io);
+    try std.Io.Dir.cwd().createDir(platform.testing.io, active, .default_dir);
 
     var orphaned_lease = try acquirePortableImportStageLease(alloc, lease_only);
-    orphaned_lease.close(std.testing.io);
+    orphaned_lease.close(platform.testing.io);
 
     const created = try createUniquePortableImportStageBase(alloc, target);
     defer {
-        created.lease_file.close(std.testing.io);
-        std.Io.Dir.cwd().deleteTree(std.testing.io, created.path) catch {};
-        deletePortableImportStageLease(alloc, std.testing.io, created.path) catch {};
+        created.lease_file.close(platform.testing.io);
+        std.Io.Dir.cwd().deleteTree(platform.testing.io, created.path) catch {};
+        deletePortableImportStageLease(alloc, platform.testing.io, created.path) catch {};
         alloc.free(created.path);
     }
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned, .{}));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned_lease_path, .{}));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, lease_only_path, .{}));
-    try std.Io.Dir.cwd().access(std.testing.io, active, .{});
-    try std.Io.Dir.cwd().access(std.testing.io, active_lease_path, .{});
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, abandoned, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, abandoned_lease_path, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, lease_only_path, .{}));
+    try std.Io.Dir.cwd().access(platform.testing.io, active, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, active_lease_path, .{});
 }
 
 test "db rejects relational storage mode transitions and physical row reinterpretation" {
@@ -66985,7 +66969,7 @@ test "db embeddings index remoteMedia accepts webp via shared image decode" {
     });
 
     const webp_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        platform.testing.io,
         "testdata/image/webp/lossy/minimal-vp8-1x1.webp",
         alloc,
         .limited(64 * 1024),
@@ -67686,7 +67670,7 @@ test "db published dense admission cannot overflow into catalog closure" {
 test "db dense fast path registers before catalog lookup during index deletion" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const wait_timeout_ns = 5 * std.time.ns_per_s;
@@ -68872,11 +68856,11 @@ test "db status_only open reads index catalog without loading index state" {
     // only a startup/publication owner is allowed to reclaim it.
     const vector_root = try std.fmt.allocPrint(alloc, "{s}/vector-blocks", .{std.mem.span(path)});
     defer alloc.free(vector_root);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, vector_root);
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, vector_root);
     const orphan_vector_block = try std.fmt.allocPrint(alloc, "{s}/block-999999-0.afvb", .{vector_root});
     defer alloc.free(orphan_vector_block);
-    var orphan_file = try std.Io.Dir.cwd().createFile(std.testing.io, orphan_vector_block, .{ .truncate = true });
-    orphan_file.close(std.testing.io);
+    var orphan_file = try std.Io.Dir.cwd().createFile(platform.testing.io, orphan_vector_block, .{ .truncate = true });
+    orphan_file.close(platform.testing.io);
 
     {
         var status_db = try DB.open(alloc, std.mem.span(path), .{
@@ -68954,7 +68938,7 @@ test "db status_only open reads index catalog without loading index state" {
         const legacy_state = backfill_state_mod.RebuildState.init(rebuild_root);
         const legacy_state_path = try legacy_state.pathAlloc(alloc);
         defer alloc.free(legacy_state_path);
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
             .sub_path = legacy_state_path,
             .data = "doc:legacy",
         });
@@ -68968,9 +68952,9 @@ test "db status_only open reads index catalog without loading index state" {
             return error.TestUnexpectedResult;
         };
         try std.testing.expect(legacy_ft.backfill_active);
-        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, current_state_path, .{}));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, current_state_path, .{}));
         const preserved_legacy = try std.Io.Dir.cwd().readFileAlloc(
-            std.testing.io,
+            platform.testing.io,
             legacy_state_path,
             alloc,
             .limited(1024),
@@ -68978,7 +68962,7 @@ test "db status_only open reads index catalog without loading index state" {
         defer alloc.free(preserved_legacy);
         try std.testing.expectEqualStrings("doc:legacy", preserved_legacy);
     }
-    try std.Io.Dir.cwd().access(std.testing.io, orphan_vector_block, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, orphan_vector_block, .{});
 }
 
 test "db dense and sparse vector searches apply stored symbolic filters before final paging" {
@@ -69049,7 +69033,7 @@ test "db dense stored symbolic filter candidate window covers offset pagination"
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
@@ -69971,7 +69955,7 @@ test "db in-memory primary backends keep derived log off disk" {
 
         const derived_log_path = try std.fmt.allocPrint(alloc, "{s}/derived_log", .{std.mem.span(path)});
         defer alloc.free(derived_log_path);
-        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, derived_log_path, .{}));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(platform.testing.io, derived_log_path, .{}));
     }
 }
 
@@ -77986,7 +77970,7 @@ test "db document extraction attempts forced OCR for a scanned PDF" {
     });
 
     const pdf_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        platform.testing.io,
         "lib/pdf/testdata/scanned_table_fixture.pdf",
         alloc,
         .limited(4 * 1024 * 1024),
@@ -81072,7 +81056,7 @@ test "index repair advance lease covers cancellation and deletion" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn run(self: *@This()) void {
@@ -81089,11 +81073,11 @@ test "index repair advance lease covers cancellation and deletion" {
     };
     defer DB.test_index_repair_advance_lease_hook = null;
 
-    var advance_thread = try std.testing.io.concurrent(Race.run, .{&race});
+    var advance_thread = try platform.testing.io.concurrent(Race.run, .{&race});
     var joined = false;
     defer if (!joined) {
         race.release.store(true, .release);
-        advance_thread.await(std.testing.io);
+        advance_thread.await(platform.testing.io);
     };
     var entered = false;
     for (0..100_000) |_| {
@@ -81101,7 +81085,7 @@ test "index repair advance lease covers cancellation and deletion" {
             entered = true;
             break;
         }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!entered) return error.TestTimeout;
 
@@ -81115,7 +81099,7 @@ test "index repair advance lease covers cancellation and deletion" {
     );
 
     race.release.store(true, .release);
-    advance_thread.await(std.testing.io);
+    advance_thread.await(platform.testing.io);
     joined = true;
     DB.test_index_repair_advance_lease_hook = null;
     try std.testing.expect(race.err == null);
@@ -81465,7 +81449,7 @@ test "db index repair shadow swap survives reopen" {
 
         const stale_canonical_file = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/stale-before-repair", .{std.mem.span(path)});
         defer alloc.free(stale_canonical_file);
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
             .sub_path = stale_canonical_file,
             .data = "stale",
         });
@@ -81508,11 +81492,11 @@ test "db index repair shadow swap survives reopen" {
         try std.testing.expectEqual(@as(u32, 1), after.total_hits);
         try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
         reopened.backend_runtime.durable_jobs.drainOwner(reopened.repair_cleanup_owner_id);
-        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, abandoned_shadow, .{}));
-        try std.Io.Dir.cwd().access(std.testing.io, in_progress_shadow, .{});
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, abandoned_shadow, .{}));
+        try std.Io.Dir.cwd().access(platform.testing.io, in_progress_shadow, .{});
         const stale_canonical_file = try std.fmt.allocPrint(alloc, "{s}/indexes/ft_v1/stale-before-repair", .{std.mem.span(path)});
         defer alloc.free(stale_canonical_file);
-        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, stale_canonical_file, .{}));
+        try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, stale_canonical_file, .{}));
     }
 }
 
@@ -81538,9 +81522,9 @@ test "db index repair shadow roots are allocated uniquely" {
     try std.testing.expect(std.mem.indexOf(u8, second, "/.repair-shadow-") != null);
     try std.testing.expect(std.mem.indexOf(u8, third, "/.repair-shadow-") != null);
 
-    try std.Io.Dir.cwd().access(std.testing.io, first, .{});
-    try std.Io.Dir.cwd().access(std.testing.io, second, .{});
-    try std.Io.Dir.cwd().access(std.testing.io, third, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, first, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, second, .{});
+    try std.Io.Dir.cwd().access(platform.testing.io, third, .{});
 }
 
 test "db index repair shadow swap preserves post snapshot mutations" {
@@ -83592,7 +83576,7 @@ test "db document extraction concurrent same-key writes converge without stale p
 
     const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
@@ -83722,7 +83706,7 @@ test "db document extraction pre-lock precompute survives a concurrent catalog m
 
     const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 
@@ -86010,14 +85994,14 @@ test "db dense checkpoint persistence serializes with index apply" {
         }
     };
     var persist = Persist{ .db = &db };
-    var thread = try std.testing.io.concurrent(Persist.run, .{&persist});
+    var thread = try platform.testing.io.concurrent(Persist.run, .{&persist});
     while (!persist.started.load(.acquire)) std.atomic.spinLoopHint();
     sleepNs(25 * std.time.ns_per_ms);
     const completed_while_apply_active = persist.done.load(.acquire);
 
     apply_guard.unlock();
     apply_locked = false;
-    thread.await(std.testing.io);
+    thread.await(platform.testing.io);
 
     try std.testing.expect(!completed_while_apply_active);
     if (persist.err) |err| return err;
@@ -86324,11 +86308,11 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     lockApplyShared(&db);
     var apply_shared_held = true;
     var retry_state = RetryState{ .db = &db };
-    var retry_thread = try std.testing.io.concurrent(RetryState.run, .{&retry_state});
+    var retry_thread = try platform.testing.io.concurrent(RetryState.run, .{&retry_state});
     var retry_thread_joined = false;
     defer {
         if (apply_shared_held) db.core.unlockApplyShared();
-        if (!retry_thread_joined) retry_thread.await(std.testing.io);
+        if (!retry_thread_joined) retry_thread.await(platform.testing.io);
     }
 
     const publication_deadline = monotonicTimeNs() +| 30 * std.time.ns_per_s;
@@ -86339,7 +86323,7 @@ test "db quarantined index self-heals via retryQuarantinedIndexLoads" {
     const publication_waited_for_reader = publication_fence_entered and !retry_state.completed.load(.acquire);
     db.core.unlockApplyShared();
     apply_shared_held = false;
-    retry_thread.await(std.testing.io);
+    retry_thread.await(platform.testing.io);
     retry_thread_joined = true;
 
     try std.testing.expect(publication_fence_entered);
@@ -87046,19 +87030,19 @@ test "db artifact dense reset waits for catalog readers before closing storage" 
         }
     };
     var reset = Reset{ .db = &db };
-    var future = try std.testing.io.concurrent(Reset.run, .{&reset});
+    var future = try platform.testing.io.concurrent(Reset.run, .{&reset});
     var joined = false;
     defer if (!joined) {
         if (reader_held) {
             reader.release();
             reader_held = false;
         }
-        future.await(std.testing.io) catch {};
+        future.await(platform.testing.io) catch {};
     };
     const deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (!db.indexCatalogBarrierActive() and !reset.done.load(.acquire)) {
         if (monotonicTimeNs() >= deadline) return error.TestTimeout;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expect(db.indexCatalogBarrierActive());
     try std.testing.expect(!reset.done.load(.acquire));
@@ -87071,7 +87055,7 @@ test "db artifact dense reset waits for catalog readers before closing storage" 
     try std.testing.expect(db.core.index_manager.denseIndex("dense_idx").?.index.experimentalPostingDurableAppliedSequence() != null);
     reader.release();
     reader_held = false;
-    const result = future.await(std.testing.io);
+    const result = future.await(platform.testing.io);
     joined = true;
     try result;
     try std.testing.expect(!db.indexCatalogBarrierActive());
@@ -92879,14 +92863,14 @@ test "db async replay truncation retains journal behind generated enrichment" {
 
     const target_sequence = db.core.nextDerivedSequence();
     try std.testing.expect(target_sequence > 0);
-    const deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+    const deadline = std.Io.Clock.Timestamp.fromNow(platform.testing.io, .{
         .raw = .fromSeconds(5),
         .clock = .awake,
     });
     while (!provider_failed.isSet()) {
-        provider_failed.waitTimeout(std.testing.io, .{ .deadline = deadline }) catch |err| switch (err) {
+        provider_failed.waitTimeout(platform.testing.io, .{ .deadline = deadline }) catch |err| switch (err) {
             error.Timeout => {
-                if (std.Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline))
+                if (std.Io.Clock.Timestamp.now(platform.testing.io, .awake).compare(.gte, deadline))
                     return error.ProviderFailureNotObserved;
             },
             error.Canceled => return err,
@@ -94570,7 +94554,7 @@ test "enrichment worker bounds retries against a durable foreign lease" {
     const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
     runtime.notifySequence(1);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     io_impl.io().sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
 
@@ -96494,7 +96478,7 @@ test "db full-text backfill resumes after interrupted reopen" {
         state_path = try rebuild_state.pathAlloc(alloc);
     }
 
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024));
+    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, state_path.?, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
 
@@ -96503,7 +96487,7 @@ test "db full-text backfill resumes after interrupted reopen" {
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(platform.testing.io, state_path.?, alloc, .limited(1024)));
 
     var result = try reopened.search(alloc, .{
         .index_name = "ft_v1",
@@ -96631,26 +96615,26 @@ test "db sparse backfill restarts safely from a legacy cursor after interrupted 
         const cfg = interrupted.core.index_manager.get("sp_v1") orelse return error.IndexNotFound;
         const rebuild_state = interrupted.core.index_manager.rebuildState(cfg.kind, rebuild_root, cfg.*);
         owned_state_path = try rebuild_state.pathAlloc(alloc);
-        resume_key = (try rebuild_state.checkWithIo(alloc, std.testing.io)) orelse return error.TestExpectedEqual;
+        resume_key = (try rebuild_state.checkWithIo(alloc, platform.testing.io)) orelse return error.TestExpectedEqual;
         try std.testing.expect(resume_key.?.len > 0);
     }
 
     // Simulate an upgrade from the legacy raw-cursor format. It cannot be
     // trusted, so reopen must restart from the beginning without inflating the
     // persisted sparse document count for rows already indexed above.
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, owned_state_path.?);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, owned_state_path.?);
     const legacy_rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root);
     const legacy_state_path = try legacy_rebuild_state.pathAlloc(alloc);
     defer alloc.free(legacy_state_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = legacy_state_path, .data = resume_key.? });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = legacy_state_path, .data = resume_key.? });
 
     index_manager_mod.test_abort_sparse_backfill_after_batches = null;
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, owned_state_path.?, alloc, .limited(1024)));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, legacy_state_path, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(platform.testing.io, owned_state_path.?, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(platform.testing.io, legacy_state_path, alloc, .limited(1024)));
 
     var result = try reopened.search(alloc, .{
         .index_name = "sp_v1",
@@ -96680,7 +96664,7 @@ fn waitForAtomicFlag(flag: *const std.atomic.Value(u8), expected: u8, max_attemp
     var attempts: usize = 0;
     while (attempts < max_attempts) : (attempts += 1) {
         if (flag.load(.monotonic) == expected) return true;
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     return flag.load(.monotonic) == expected;
 }
@@ -96694,7 +96678,7 @@ const SharedReadLockHold = struct {
         self.db.core.lockApplyShared();
         self.acquired.store(1, .monotonic);
         while (self.release.load(.monotonic) == 0) {
-            std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
         self.db.core.unlockApplyShared();
     }
@@ -99779,7 +99763,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
         terminal_error: ?anyerror = null,
 
         fn terminal(ptr: *@This()) void {
-            while (!ptr.observed.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!ptr.observed.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             ptr.terminal_attempted.store(true, .release);
             ptr.db.recordIndexRepairAttemptFailure(
                 ptr.db.alloc,
@@ -99795,18 +99779,18 @@ test "quarantine binding reconciliation serializes with terminal transition" {
             const ptr: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(ptr.repair_id, observed_repair_id);
             ptr.observed.store(true, .release);
-            while (!ptr.terminal_attempted.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!ptr.terminal_attempted.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             // The terminal thread is now waiting on repair-control ownership.
             // Returning lets discovery finish its pending binding transaction;
             // terminalization must then release that exact binding.
         }
     };
     var context = Context{ .db = &reopened, .repair_id = repair_id };
-    var terminal_thread = try std.testing.io.concurrent(Context.terminal, .{&context});
+    var terminal_thread = try platform.testing.io.concurrent(Context.terminal, .{&context});
     var terminal_thread_joined = false;
     defer if (!terminal_thread_joined) {
         context.observed.store(true, .release);
-        terminal_thread.await(std.testing.io);
+        terminal_thread.await(platform.testing.io);
     };
     DB.test_index_repair_discovery_observation_hook = .{
         .ptr = &context,
@@ -99814,7 +99798,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
     };
     defer DB.test_index_repair_discovery_observation_hook = null;
     const discovery = try reopened.discoverRecoverableStartupIndexFailures(alloc, 1);
-    terminal_thread.await(std.testing.io);
+    terminal_thread.await(platform.testing.io);
     terminal_thread_joined = true;
     try std.testing.expect(context.terminal_error == null);
     try std.testing.expectEqual(@as(usize, 1), discovery.already_pending);
@@ -99932,7 +99916,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try std.testing.expectEqual(self.repair_id, observed_repair_id);
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn reconcile(self: *@This()) void {
@@ -99956,11 +99940,11 @@ test "db restart reconciles activated dense repair without rebuilding" {
     };
     defer DB.test_index_repair_reconcile_fence_hook = null;
 
-    var reconcile_thread = try std.testing.io.concurrent(ReconcileRace.reconcile, .{&race});
+    var reconcile_thread = try platform.testing.io.concurrent(ReconcileRace.reconcile, .{&race});
     var reconcile_joined = false;
     defer if (!reconcile_joined) {
         race.release.store(true, .release);
-        reconcile_thread.await(std.testing.io);
+        reconcile_thread.await(platform.testing.io);
     };
     var reconcile_entered = false;
     for (0..100_000) |_| {
@@ -99968,15 +99952,15 @@ test "db restart reconciles activated dense repair without rebuilding" {
             reconcile_entered = true;
             break;
         }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!reconcile_entered) return error.TestTimeout;
 
-    var structural_thread = try std.testing.io.concurrent(ReconcileRace.structural, .{&race});
+    var structural_thread = try platform.testing.io.concurrent(ReconcileRace.structural, .{&race});
     var structural_joined = false;
     defer if (!structural_joined) {
         race.release.store(true, .release);
-        structural_thread.await(std.testing.io);
+        structural_thread.await(platform.testing.io);
     };
     var structural_started = false;
     for (0..100_000) |_| {
@@ -99984,16 +99968,16 @@ test "db restart reconciles activated dense repair without rebuilding" {
             structural_started = true;
             break;
         }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!structural_started) return error.TestTimeout;
-    for (0..256) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    for (0..256) |_| platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!race.structural_acquired.load(.acquire));
 
     race.release.store(true, .release);
-    reconcile_thread.await(std.testing.io);
+    reconcile_thread.await(platform.testing.io);
     reconcile_joined = true;
-    structural_thread.await(std.testing.io);
+    structural_thread.await(platform.testing.io);
     structural_joined = true;
     DB.test_index_repair_reconcile_fence_hook = null;
     try std.testing.expect(race.err == null);
@@ -100156,7 +100140,7 @@ test "db durable root incarnation follows the physical root rather than visibili
     }
     const repair_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/index_repair.checkpoint", .{std.mem.span(path)});
     defer alloc.free(repair_checkpoint_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = repair_checkpoint_path, .data = "corrupt-derived-state" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = repair_checkpoint_path, .data = "corrupt-derived-state" });
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
             .lsm_root_generation = 1,
@@ -102504,7 +102488,7 @@ test "db completed partial managed admission serves and retires redundant repair
     while (!try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent)) {
         if (monotonicTimeNs() >= publication_deadline) return error.TestUnexpectedResult;
         _ = try db.finalizeDenseProjectionLifecycleForIdle();
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(try db.managedAdmissionGenerationIsServiceable(alloc, repair.intent));
     const runtime_stats = try db.stats(alloc);
@@ -102562,7 +102546,7 @@ test "db completed generated recovery retires an inactive candidate without an a
     while (!try db.managedAdmissionGenerationIsServiceable(alloc, admitted.intent)) {
         if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
         _ = try db.finalizeDenseProjectionLifecycleForIdle();
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     _ = try db.advanceIndexRepairIntent(alloc, admission, .{});
     const marker_key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, cfg.name);
@@ -103151,7 +103135,7 @@ test "db managed full text admission survives restart without in-place backfill"
     // Model a crash after the atomic catalog/outbox commit but before the
     // repair checkpoint becomes durable. Reopen must reconstruct the intent
     // from the primary-store marker without running an in-place backfill.
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), repair_checkpoint_path.?);
 
@@ -103695,7 +103679,7 @@ test "db generated artifact finalization releases page arbitration and preserves
     var wait_attempts: usize = 0;
     while (!DB.test_generated_artifact_finalization_entered.load(.acquire)) : (wait_attempts += 1) {
         try std.testing.expect(wait_attempts < 100_000);
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     try std.testing.expect(db.async_context.index_artifact_cleanup_mutex.tryLock());
@@ -103719,7 +103703,7 @@ test "db generated artifact finalization releases page arbitration and preserves
                 break;
             },
             .progressed => {},
-            .busy => std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {},
+            .busy => platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {},
         }
     }
     try std.testing.expect(second_drained);
@@ -103801,7 +103785,7 @@ test "db managed admission materialization serializes with index deletion" {
         fn afterConfigLookup(ptr: *anyopaque, _: *DB, _: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn materialize(self: *@This()) void {
@@ -103829,24 +103813,24 @@ test "db managed admission materialization serializes with index deletion" {
     };
     defer DB.test_managed_admission_materialization_hook = null;
 
-    var materialize_thread = try std.testing.io.concurrent(Race.materialize, .{&race});
+    var materialize_thread = try platform.testing.io.concurrent(Race.materialize, .{&race});
     var entered = false;
     for (0..100_000) |_| {
         if (race.entered.load(.acquire)) {
             entered = true;
             break;
         }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!entered) {
         race.release.store(true, .release);
-        materialize_thread.await(std.testing.io);
+        materialize_thread.await(platform.testing.io);
         return error.TestTimeout;
     }
 
-    var delete_thread = std.testing.io.concurrent(Race.delete, .{&race}) catch |err| {
+    var delete_thread = platform.testing.io.concurrent(Race.delete, .{&race}) catch |err| {
         race.release.store(true, .release);
-        materialize_thread.await(std.testing.io);
+        materialize_thread.await(platform.testing.io);
         return err;
     };
     var delete_started = false;
@@ -103855,19 +103839,19 @@ test "db managed admission materialization serializes with index deletion" {
             delete_started = true;
             break;
         }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!delete_started) {
         race.release.store(true, .release);
-        materialize_thread.await(std.testing.io);
-        delete_thread.await(std.testing.io);
+        materialize_thread.await(platform.testing.io);
+        delete_thread.await(platform.testing.io);
         return error.TestTimeout;
     }
-    for (0..256) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    for (0..256) |_| platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     const deletion_crossed_materialization = race.delete_completed.load(.acquire);
     race.release.store(true, .release);
-    materialize_thread.await(std.testing.io);
-    delete_thread.await(std.testing.io);
+    materialize_thread.await(platform.testing.io);
+    delete_thread.await(platform.testing.io);
 
     try std.testing.expect(!deletion_crossed_materialization);
     try std.testing.expect(race.materialize_err == null);
@@ -104709,7 +104693,7 @@ test "db repair capacity converts materialized shadow bytes into consumed reserv
 
     const file_path = try std.fmt.allocPrint(alloc, "{s}/materialized", .{std.mem.span(candidate_path)});
     defer alloc.free(file_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = file_path,
         .data = "0123456789012345678901234567890123456789",
     });
@@ -105456,7 +105440,7 @@ test "db missing activation certification rolls back to serviceable dense predec
         .{ std.mem.span(path), interrupted.candidate_relative_path },
     );
     defer alloc.free(manifest_path);
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, manifest_path);
 
     const resumed = try db.advanceIndexRepairIntent(alloc, interrupted.repair_id, .{});
     try std.testing.expect(resumed.attempted);
@@ -105509,7 +105493,7 @@ test "db missing activation certification exposes predecessor action required" {
         .{ std.mem.span(path), interrupted.candidate_relative_path },
     );
     defer alloc.free(manifest_path);
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, manifest_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, manifest_path);
 
     const CrashAfterRollback = struct {
         fn beforeRetry(_: *anyopaque, _: *DB, _: u128) !void {
@@ -106753,7 +106737,7 @@ test "db dense target coverage reads one immutable primary commit epoch" {
 
 test "db inline dense generation remains rebuilding until outcomes cover the live corpus" {
     const alloc = std.testing.allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
 
@@ -106969,7 +106953,7 @@ fn waitForNativeDenseReadyForTest(db: *DB, index_name: []const u8) !void {
                 std.mem.eql(u8, item.projection_checkpoint_status, "clean")) return;
         }
         if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
-        try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
 }
 
@@ -107990,13 +107974,13 @@ test "db dense artifact rebuild resumes from persisted state" {
 test "db dense artifact rebuild persists state through external index storage" {
     const alloc = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table.aflite", .{tmp.sub_path});
     defer alloc.free(path);
     const index_base_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/index-namespace", .{tmp.sub_path});
     defer alloc.free(index_base_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = path,
         .data = "single-file-container",
     });
@@ -108653,21 +108637,21 @@ test "db dense artifact rebuild clears stale persisted state when no valid artif
         const rebuild_root_path = try reopened.denseIndexRebuildStatePathAlloc(alloc, "dense_idx");
         defer alloc.free(rebuild_root_path);
         const legacy_rebuild_state = backfill_state_mod.RebuildState.init(rebuild_root_path);
-        var before_probe = try legacy_rebuild_state.loadWithIo(alloc, std.testing.io);
+        var before_probe = try legacy_rebuild_state.loadWithIo(alloc, platform.testing.io);
         defer before_probe.deinit(alloc);
         try std.testing.expectEqualStrings("doc:z", before_probe.valid);
 
         try std.testing.expect(!(try reopened.hasPendingDenseArtifactRebuild(alloc)));
         // Logical readiness is read-only and does not surface internal cursor
         // cleanup as user-visible rebuild debt.
-        var after_probe = try legacy_rebuild_state.loadWithIo(alloc, std.testing.io);
+        var after_probe = try legacy_rebuild_state.loadWithIo(alloc, platform.testing.io);
         defer after_probe.deinit(alloc);
         try std.testing.expectEqualStrings("doc:z", after_probe.valid);
 
         try std.testing.expect(try reopened.denseArtifactRebuildMaintenanceNeeded(alloc));
         try std.testing.expect(try reopened.runDenseArtifactRebuildMaintenanceWithProgress(alloc, null, null));
         try std.testing.expect(!(try reopened.denseArtifactRebuildMaintenanceNeeded(alloc)));
-        var cleared = try legacy_rebuild_state.loadWithIo(alloc, std.testing.io);
+        var cleared = try legacy_rebuild_state.loadWithIo(alloc, platform.testing.io);
         defer cleared.deinit(alloc);
         try std.testing.expect(cleared == .absent);
     }
@@ -111580,7 +111564,7 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
         state_path = try rebuild_state.pathAlloc(alloc);
     }
 
-    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024));
+    const interrupted_state = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, state_path.?, alloc, .limited(1024));
     defer alloc.free(interrupted_state);
     try std.testing.expect(interrupted_state.len > 0);
 
@@ -111589,7 +111573,7 @@ test "db graph reverse rebuild resumes after interrupted reopen" {
     var reopened = try DB.open(alloc, std.mem.span(path), .{});
     defer reopened.close();
 
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(std.testing.io, state_path.?, alloc, .limited(1024)));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().readFileAlloc(platform.testing.io, state_path.?, alloc, .limited(1024)));
 
     const incoming = try reopened.getEdges(alloc, "gr_v1", "doc:target", "links", .in);
     defer graph_mod.GraphIndex.freeEdges(alloc, incoming);
@@ -111772,11 +111756,11 @@ test "db delete full text index drains active merge before closing generation" {
         }
     };
     var deletion = Delete{ .db = &db };
-    var delete_thread = try std.testing.io.concurrent(Delete.run, .{&deletion});
+    var delete_thread = try platform.testing.io.concurrent(Delete.run, .{&deletion});
     var joined = false;
     defer if (!joined) {
         text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
-        delete_thread.await(std.testing.io);
+        delete_thread.await(platform.testing.io);
     };
 
     var stop_entered = false;
@@ -111795,7 +111779,7 @@ test "db delete full text index drains active merge before closing generation" {
     try std.testing.expect(!deletion.completed.load(.acquire));
 
     text_merge_runtime_mod.test_release_after_task_begin.store(true, .release);
-    delete_thread.await(std.testing.io);
+    delete_thread.await(platform.testing.io);
     joined = true;
     try std.testing.expect(deletion.err == null);
     try std.testing.expect(deletion.removed);
@@ -111921,11 +111905,11 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
         }
     };
     var reader = Reader{ .db = &db };
-    var reader_thread = try std.testing.io.concurrent(Reader.run, .{&reader});
+    var reader_thread = try platform.testing.io.concurrent(Reader.run, .{&reader});
     var reader_joined = false;
     defer if (!reader_joined) {
         test_release_match_all_ordinal_lookup.store(true, .release);
-        reader_thread.await(std.testing.io);
+        reader_thread.await(platform.testing.io);
     };
     var lookup_entered = false;
     for (0..200_000) |_| {
@@ -111933,7 +111917,7 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
             lookup_entered = true;
             break;
         }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!lookup_entered) return error.TestTimeout;
 
@@ -111948,11 +111932,11 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
         }
     };
     var writer = Writer{ .db = &db };
-    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
+    var writer_thread = try platform.testing.io.concurrent(Writer.run, .{&writer});
     var writer_joined = false;
     defer if (!writer_joined) {
         test_release_match_all_ordinal_lookup.store(true, .release);
-        writer_thread.await(std.testing.io);
+        writer_thread.await(platform.testing.io);
     };
 
     // Wait until a cleanup-style writer owns the reader gate and is blocked on
@@ -111966,16 +111950,16 @@ test "db post-delete filter reader does not deadlock behind queued cleanup write
             break;
         }
         db.core.unlockApplyShared();
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     if (!writer_queued) return error.TestTimeout;
     try std.testing.expect(!reader.completed.load(.acquire));
     try std.testing.expect(!writer.completed.load(.acquire));
 
     test_release_match_all_ordinal_lookup.store(true, .release);
-    reader_thread.await(std.testing.io);
+    reader_thread.await(platform.testing.io);
     reader_joined = true;
-    writer_thread.await(std.testing.io);
+    writer_thread.await(platform.testing.io);
     writer_joined = true;
     if (reader.err) |err| return err;
     try std.testing.expectEqual(doc_count, reader.total_hits);
@@ -112502,14 +112486,14 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
         }
     };
     var stop = Stop{ .runtime = &runtime };
-    var stop_thread = try std.testing.io.concurrent(Stop.run, .{&stop});
+    var stop_thread = try platform.testing.io.concurrent(Stop.run, .{&stop});
     var stop_joined = false;
     defer if (!stop_joined) {
         if (held_descriptors) {
             pool.releaseDescriptorsForTest(io, 2);
             held_descriptors = false;
         }
-        stop_thread.await(std.testing.io);
+        stop_thread.await(platform.testing.io);
     };
 
     for (0..1_000) |_| {
@@ -112517,7 +112501,7 @@ test "db text merge shutdown cancels a worker blocked on descriptor admission" {
         try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     if (!stop.completed.load(.acquire)) return error.TestTimeout;
-    stop_thread.await(std.testing.io);
+    stop_thread.await(platform.testing.io);
     stop_joined = true;
 
     try std.testing.expect(stop.stopped);
@@ -112763,19 +112747,19 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     };
     var waiter = Waiter{ .runtime = &admission_runtime };
     const events_before = admission_runtime.stats().backpressure_events;
-    var waiter_thread = try std.testing.io.concurrent(Waiter.run, .{&waiter});
+    var waiter_thread = try platform.testing.io.concurrent(Waiter.run, .{&waiter});
     var waiter_joined = false;
     defer if (!waiter_joined) {
         held_permit.release();
-        waiter_thread.await(std.testing.io);
+        waiter_thread.await(platform.testing.io);
     };
     const waiter_deadline = monotonicTimeNs() +| std.time.ns_per_s;
     while (admission_runtime.stats().backpressure_events == events_before and monotonicTimeNs() < waiter_deadline) {
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(admission_runtime.stats().backpressure_events > events_before);
     held_permit.release();
-    waiter_thread.await(std.testing.io);
+    waiter_thread.await(platform.testing.io);
     waiter_joined = true;
     try std.testing.expect(waiter.acquired.load(.acquire));
     try std.testing.expect(!waiter.failed.load(.acquire));
@@ -112814,20 +112798,20 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     };
     var cross_index_waiter = CrossIndexWaiter{ .runtime = &fair_runtime, .acquired = &cross_index_acquired };
     const cross_events_before = fair_runtime.stats().backpressure_events;
-    var cross_index_thread = try std.testing.io.concurrent(CrossIndexWaiter.run, .{&cross_index_waiter});
+    var cross_index_thread = try platform.testing.io.concurrent(CrossIndexWaiter.run, .{&cross_index_waiter});
     var cross_index_joined = false;
     defer if (!cross_index_joined) {
         cross_index_blocker.release();
-        cross_index_thread.await(std.testing.io);
+        cross_index_thread.await(platform.testing.io);
     };
     const cross_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (fair_runtime.stats().backpressure_events == cross_events_before and monotonicTimeNs() < cross_wait_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events > cross_events_before);
     var independent_index_permit = try fair_runtime.acquireProducerPermit("admission-b", 100, 0);
     independent_index_permit.release();
     try std.testing.expect(!cross_index_acquired.load(.acquire));
     cross_index_blocker.release();
-    cross_index_thread.await(std.testing.io);
+    cross_index_thread.await(platform.testing.io);
     cross_index_joined = true;
     try std.testing.expect(cross_index_acquired.load(.acquire));
 
@@ -112873,7 +112857,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
                 return;
             };
             self.acquisition_order.store(self.acquisition_counter.fetchAdd(1, .acq_rel) + 1, .release);
-            while (!self.release_gate.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release_gate.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             permit.release();
         }
     };
@@ -112894,7 +112878,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .failed = &mixed_older_failed,
     };
     const mixed_events_before = mixed_runtime.stats().backpressure_events;
-    var mixed_older_thread = try std.testing.io.concurrent(MixedWaiter.run, .{&mixed_older});
+    var mixed_older_thread = try platform.testing.io.concurrent(MixedWaiter.run, .{&mixed_older});
     var mixed_older_joined = false;
     defer if (!mixed_older_joined) {
         if (mixed_segment_blocker_active) {
@@ -112906,10 +112890,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             mixed_byte_blocker_active = false;
         }
         mixed_release.store(true, .release);
-        mixed_older_thread.await(std.testing.io);
+        mixed_older_thread.await(platform.testing.io);
     };
     const mixed_older_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (mixed_runtime.stats().backpressure_events == mixed_events_before and monotonicTimeNs() < mixed_older_wait_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(mixed_runtime.stats().backpressure_events > mixed_events_before);
 
     var mixed_younger = MixedWaiter{
@@ -112922,7 +112906,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .release_gate = &mixed_release,
         .failed = &mixed_younger_failed,
     };
-    var mixed_younger_thread = try std.testing.io.concurrent(MixedWaiter.run, .{&mixed_younger});
+    var mixed_younger_thread = try platform.testing.io.concurrent(MixedWaiter.run, .{&mixed_younger});
     var mixed_younger_joined = false;
     defer if (!mixed_younger_joined) {
         if (mixed_segment_blocker_active) {
@@ -112934,10 +112918,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             mixed_byte_blocker_active = false;
         }
         mixed_release.store(true, .release);
-        mixed_younger_thread.await(std.testing.io);
+        mixed_younger_thread.await(platform.testing.io);
     };
     const mixed_younger_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (mixed_runtime.stats().backpressure_events < mixed_events_before + 2 and monotonicTimeNs() < mixed_younger_wait_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(mixed_runtime.stats().backpressure_events >= mixed_events_before + 2);
     try std.testing.expectEqual(@as(u32, 0), mixed_older_order.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
@@ -112947,18 +112931,18 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     mixed_byte_blocker.release();
     mixed_byte_blocker_active = false;
     const mixed_older_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (mixed_older_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_older_acquired_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(u32, 1), mixed_older_order.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), mixed_younger_order.load(.acquire));
     try std.testing.expect(!mixed_older_failed.load(.acquire));
     try std.testing.expect(!mixed_younger_failed.load(.acquire));
     mixed_release.store(true, .release);
-    mixed_older_thread.await(std.testing.io);
+    mixed_older_thread.await(platform.testing.io);
     mixed_older_joined = true;
     const mixed_younger_acquired_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (mixed_younger_order.load(.acquire) == 0 and monotonicTimeNs() < mixed_younger_acquired_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(u32, 2), mixed_younger_order.load(.acquire));
-    mixed_younger_thread.await(std.testing.io);
+    mixed_younger_thread.await(platform.testing.io);
     mixed_younger_joined = true;
 
     var blocking_permit = try fair_runtime.acquireProducerPermit("admission-test", 80, 0);
@@ -112975,7 +112959,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             var permit = self.runtime.acquireProducerPermit("admission-test", self.segment_count, 0) catch return;
             self.acquired.store(true, .release);
             if (self.release_gate) |gate| {
-                while (!gate.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                while (!gate.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
             permit.release();
         }
@@ -112990,7 +112974,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .acquired = &large_acquired,
         .release_gate = &release_large,
     };
-    var large_thread = try std.testing.io.concurrent(FairWaiter.run, .{&large_waiter});
+    var large_thread = try platform.testing.io.concurrent(FairWaiter.run, .{&large_waiter});
     var large_joined = false;
     defer if (!large_joined) {
         if (blocking_active) {
@@ -112998,10 +112982,10 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             blocking_active = false;
         }
         release_large.store(true, .release);
-        large_thread.await(std.testing.io);
+        large_thread.await(platform.testing.io);
     };
     const large_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 1 and monotonicTimeNs() < large_wait_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 1);
 
     var small_waiter = FairWaiter{
@@ -113010,7 +112994,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
         .acquired = &small_acquired,
         .release_gate = null,
     };
-    var small_thread = try std.testing.io.concurrent(FairWaiter.run, .{&small_waiter});
+    var small_thread = try platform.testing.io.concurrent(FairWaiter.run, .{&small_waiter});
     var small_joined = false;
     defer if (!small_joined) {
         if (blocking_active) {
@@ -113018,23 +113002,23 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
             blocking_active = false;
         }
         release_large.store(true, .release);
-        small_thread.await(std.testing.io);
+        small_thread.await(platform.testing.io);
     };
     const small_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (fair_runtime.stats().backpressure_events < fair_events_before + 2 and monotonicTimeNs() < small_wait_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events >= fair_events_before + 2);
     try std.testing.expect(!small_acquired.load(.acquire));
 
     blocking_permit.release();
     blocking_active = false;
     const fair_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!large_acquired.load(.acquire) and monotonicTimeNs() < fair_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(large_acquired.load(.acquire));
     try std.testing.expect(!small_acquired.load(.acquire));
     release_large.store(true, .release);
-    large_thread.await(std.testing.io);
+    large_thread.await(platform.testing.io);
     large_joined = true;
-    small_thread.await(std.testing.io);
+    small_thread.await(platform.testing.io);
     small_joined = true;
     try std.testing.expect(small_acquired.load(.acquire));
 
@@ -113066,7 +113050,7 @@ test "db text merge backpressure drains sustained segment debt to low watermark"
     var cancel_group_active = true;
     defer if (cancel_group_active) cancel_group.cancel(fair_io);
     const cancel_wait_deadline = monotonicTimeNs() +| std.time.ns_per_s;
-    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (fair_runtime.stats().backpressure_events == cancel_events_before and monotonicTimeNs() < cancel_wait_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(fair_runtime.stats().backpressure_events > cancel_events_before);
     cancel_group.cancel(fair_io);
     cancel_group_active = false;
@@ -116263,7 +116247,7 @@ test "db search projects stored fields for hydrated hits" {
 
 test "db ordered artifact inventory chunk projection streams pinned snapshots and releases allocation faults" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-projection", .{tmp.sub_path});
     defer alloc.free(path);
@@ -118939,8 +118923,8 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
         fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.mutex.lockUncancelable(std.testing.io);
-            defer self.mutex.unlock(std.testing.io);
+            self.mutex.lockUncancelable(platform.testing.io);
+            defer self.mutex.unlock(platform.testing.io);
             switch (event.change) {
                 .status => {
                     self.publish_calls += 1;
@@ -119011,9 +118995,9 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     // Finish the implicit bulk publish, but hold the deferred executor wake so
     // the test can prove the replay catch-up itself publishes fresh visibility.
     try db.finishDenseAutoBulkIngestSessionWithOptionsInternal(.{ .compact = false }, false);
-    hook_mutex.lockUncancelable(std.testing.io);
+    hook_mutex.lockUncancelable(platform.testing.io);
     hook_ctx = .{ .mutex = &hook_mutex, .changed_db = &db };
-    hook_mutex.unlock(std.testing.io);
+    hook_mutex.unlock(platform.testing.io);
 
     flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
     try db.executor.waitForAll(4);
@@ -119022,12 +119006,12 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     const deadline = monotonicTimeNs() +| 10 * std.time.ns_per_s;
     var observed: HookCtx = undefined;
     while (true) {
-        hook_mutex.lockUncancelable(std.testing.io);
+        hook_mutex.lockUncancelable(platform.testing.io);
         observed = hook_ctx;
-        hook_mutex.unlock(std.testing.io);
+        hook_mutex.unlock(platform.testing.io);
         if (observed.publish_blocking_with_clean_checkpoint > 0) break;
         if (monotonicTimeNs() >= deadline) return error.TestUnexpectedResult;
-        try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
 
     try std.testing.expect(observed.publish_calls > 0);
@@ -120555,9 +120539,9 @@ test "db reopens persisted index status with the borrowed clock" {
     const alloc = std.testing.allocator;
     var tmp = try TestDirectory.init("db");
     defer tmp.cleanup();
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.now = Clock.now;
-    const io: std.Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const io: std.Io = .{ .userdata = platform.testing.io.userdata, .vtable = &vtable };
     {
         var db = try DB.open(alloc, tmp.path(), .{});
         defer db.close();
@@ -122061,7 +122045,7 @@ test "db direct merge import supersedes queued graph replay across publication a
                 fn pause(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.entered.store(true, .release);
-                    while (!self.release.load(.acquire)) @import("antfly_platform").time.yieldNow();
+                    while (!self.release.load(.acquire)) platform.time.yieldNow();
                 }
                 fn run(self: *@This()) void {
                     _ = applyDerivedBatchToIndexAsync(self.ctx, self.batch, .{ .name = "g", .kind = .graph }, .{}) catch |err| {
@@ -122078,7 +122062,7 @@ test "db direct merge import supersedes queued graph replay across publication a
                 pending.release.store(true, .release);
                 thread.join();
             };
-            while (!pending.entered.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!pending.entered.load(.acquire)) platform.time.yieldNow();
             try receiver.importMergeRangeFromTransitionDonor(&donor, .{ .start = "doc:a", .end = "doc:z" });
             pending.release.store(true, .release);
             thread.join();
@@ -123803,7 +123787,7 @@ test "db native snapshot exports self-contained generation" {
 
     var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer runtime.deinit();
     var db = try DB.open(alloc, std.mem.span(path), .{
@@ -123908,7 +123892,7 @@ test "db native snapshot rejects an external physical root before creating artif
     );
     const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
     defer alloc.free(snapshot_parent);
-    try std.testing.expect(!try snapshotPathExists(std.testing.io, snapshot_parent));
+    try std.testing.expect(!try snapshotPathExists(platform.testing.io, snapshot_parent));
 }
 
 test "native restore backend configuration is resolved exactly once" {
@@ -124064,7 +124048,7 @@ test "db native snapshot admission bounds capture under concurrent writes" {
         fn afterCaptureAdmission(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn afterApplyRelease(ptr: *anyopaque) void {
@@ -124074,13 +124058,13 @@ test "db native snapshot admission bounds capture under concurrent writes" {
                 self.apply_released.store(true, .release);
             }
             self.copy_entered.store(true, .release);
-            while (!self.release_copy.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release_copy.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         fn beforeArtifactMaterialize(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.materialize_entered.store(true, .release);
-            while (!self.release_materialize.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!self.release_materialize.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
     };
     const SnapshotWorker = struct {
@@ -124145,23 +124129,23 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     };
     defer DB.test_snapshot_fence_hook = null;
     var worker = SnapshotWorker{ .db = &db };
-    var snapshot_thread = try std.testing.io.concurrent(SnapshotWorker.run, .{&worker});
+    var snapshot_thread = try platform.testing.io.concurrent(SnapshotWorker.run, .{&worker});
     defer {
         fence.release.store(true, .release);
         fence.release_copy.store(true, .release);
         fence.release_materialize.store(true, .release);
-        snapshot_thread.await(std.testing.io);
+        snapshot_thread.await(platform.testing.io);
     }
     const capture_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (!fence.entered.load(.acquire) and
         !worker.done.load(.acquire) and
-        monotonicTimeNs() < capture_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        monotonicTimeNs() < capture_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     if (!fence.entered.load(.acquire)) {
         worker.canceled.store(true, .release);
         fence.release.store(true, .release);
         fence.release_copy.store(true, .release);
         fence.release_materialize.store(true, .release);
-        snapshot_thread.await(std.testing.io);
+        snapshot_thread.await(platform.testing.io);
         if (worker.err) |err| return err;
         return error.SnapshotCaptureFenceTimeout;
     }
@@ -124176,30 +124160,30 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // selected revision. It resumes immediately after staging, before manifest
     // hashing and publication complete.
     var writer = Writer{ .db = &db };
-    var writer_thread = try std.testing.io.concurrent(Writer.run, .{&writer});
+    var writer_thread = try platform.testing.io.concurrent(Writer.run, .{&writer});
     defer {
         fence.release.store(true, .release);
         fence.release_copy.store(true, .release);
         fence.release_materialize.store(true, .release);
-        writer_thread.await(std.testing.io);
+        writer_thread.await(platform.testing.io);
     }
     const writer_start_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (!writer.started.load(.acquire) and monotonicTimeNs() < writer_start_deadline)
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(writer.started.load(.acquire));
-    for (0..1024) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    for (0..1024) |_| platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!writer.done.load(.acquire));
     fence.release.store(true, .release);
     const copy_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (!fence.copy_entered.load(.acquire) and
         !worker.done.load(.acquire) and
-        monotonicTimeNs() < copy_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        monotonicTimeNs() < copy_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     if (!fence.copy_entered.load(.acquire)) {
         worker.canceled.store(true, .release);
         fence.release_copy.store(true, .release);
         fence.release_materialize.store(true, .release);
-        snapshot_thread.await(std.testing.io);
-        writer_thread.await(std.testing.io);
+        snapshot_thread.await(platform.testing.io);
+        writer_thread.await(platform.testing.io);
         if (worker.err) |err| return err;
         if (writer.err) |err| return err;
         return error.SnapshotCopyFenceTimeout;
@@ -124208,30 +124192,30 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     // Apply release alone is not the publication boundary: the short metadata
     // pin still excludes physical index maintenance.
     var maintenance = Maintenance{ .db = &db };
-    var maintenance_thread = try std.testing.io.concurrent(Maintenance.run, .{&maintenance});
+    var maintenance_thread = try platform.testing.io.concurrent(Maintenance.run, .{&maintenance});
     defer {
         fence.release.store(true, .release);
         fence.release_copy.store(true, .release);
         fence.release_materialize.store(true, .release);
-        maintenance_thread.await(std.testing.io);
+        maintenance_thread.await(platform.testing.io);
     }
     const maintenance_start_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (!maintenance.started.load(.acquire) and monotonicTimeNs() < maintenance_start_deadline)
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(maintenance.started.load(.acquire));
-    for (0..1024) |_| std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    for (0..1024) |_| platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!maintenance.done.load(.acquire));
     fence.release_copy.store(true, .release);
     const materialize_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (!fence.materialize_entered.load(.acquire) and
         !worker.done.load(.acquire) and
-        monotonicTimeNs() < materialize_deadline) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        monotonicTimeNs() < materialize_deadline) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     if (!fence.materialize_entered.load(.acquire)) {
         worker.canceled.store(true, .release);
         fence.release_materialize.store(true, .release);
-        snapshot_thread.await(std.testing.io);
-        maintenance_thread.await(std.testing.io);
-        writer_thread.await(std.testing.io);
+        snapshot_thread.await(platform.testing.io);
+        maintenance_thread.await(platform.testing.io);
+        writer_thread.await(platform.testing.io);
         if (worker.err) |err| return err;
         if (maintenance.err) |err| return err;
         if (writer.err) |err| return err;
@@ -124243,14 +124227,14 @@ test "db native snapshot admission bounds capture under concurrent writes" {
     const outside_fence_deadline = monotonicTimeNs() +| 5 * std.time.ns_per_s;
     while (monotonicTimeNs() < outside_fence_deadline) {
         if (writer.done.load(.acquire) and maintenance.done.load(.acquire)) break;
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     const writer_finished_outside_fence = writer.done.load(.acquire);
     const maintenance_finished_outside_fence = maintenance.done.load(.acquire);
     fence.release_materialize.store(true, .release);
-    snapshot_thread.await(std.testing.io);
-    maintenance_thread.await(std.testing.io);
-    writer_thread.await(std.testing.io);
+    snapshot_thread.await(platform.testing.io);
+    maintenance_thread.await(platform.testing.io);
+    writer_thread.await(platform.testing.io);
     if (worker.err) |err| return err;
     if (maintenance.err) |err| return err;
     if (writer.err) |err| return err;
@@ -124261,13 +124245,13 @@ test "db native snapshot admission bounds capture under concurrent writes" {
 
     const snapshot_root = try std.fmt.allocPrint(alloc, "{s}.snapshots/fenced-native", .{std.mem.span(path)});
     defer alloc.free(snapshot_root);
-    var destination_tmp = std.testing.tmpDir(.{});
+    var destination_tmp = platform.testing.tmpDir(.{});
     defer destination_tmp.cleanup();
     const destination = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{destination_tmp.sub_path});
     defer alloc.free(destination);
     var loaded = (try native_backup.validateAndMaterialize(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         snapshot_root,
         destination,
     )).?;
@@ -124395,7 +124379,7 @@ test "db native deferred restore preserves generated dense generation without em
             defer alloc.free(legacy_path);
             try std.testing.expectError(
                 error.FileNotFound,
-                std.Io.Dir.cwd().access(std.testing.io, legacy_path, .{}),
+                std.Io.Dir.cwd().access(platform.testing.io, legacy_path, .{}),
             );
         }
         _ = try source.snapshotNative("native-fast");
@@ -124414,7 +124398,7 @@ test "db native deferred restore preserves generated dense generation without em
     const native_manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, native_backup.manifest_file_name });
     defer alloc.free(native_manifest_path);
     const native_manifest_raw = try std.Io.Dir.cwd().readFileAlloc(
-        std.testing.io,
+        platform.testing.io,
         native_manifest_path,
         alloc,
         .limited(native_backup.max_manifest_bytes),
@@ -124438,7 +124422,7 @@ test "db native deferred restore preserves generated dense generation without em
         .{snapshot_root},
     );
     defer alloc.free(native_posting_current);
-    try std.Io.Dir.accessAbsolute(std.testing.io, native_posting_current, .{});
+    try std.Io.Dir.accessAbsolute(platform.testing.io, native_posting_current, .{});
 
     // Exact-vector blocks are shared acceleration rather than posting
     // authority. Simulate losing one after capture: restore must retain the
@@ -124449,7 +124433,7 @@ test "db native deferred restore preserves generated dense generation without em
         if (artifact.role != .shared_acceleration or !std.mem.endsWith(u8, artifact.path, ".afvb")) continue;
         const artifact_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, artifact.path });
         defer alloc.free(artifact_path);
-        try std.Io.Dir.cwd().deleteFile(std.testing.io, artifact_path);
+        try std.Io.Dir.cwd().deleteFile(platform.testing.io, artifact_path);
         removed_shared_acceleration = true;
         break;
     }
@@ -124461,7 +124445,7 @@ test "db native deferred restore preserves generated dense generation without em
     defer staged.deinit();
     var restore_runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer restore_runtime.deinit();
     try DB.restoreSnapshotToDeferredRuntimeRepair(
@@ -124481,7 +124465,7 @@ test "db native deferred restore preserves generated dense generation without em
             .group_id = 7001,
         },
     );
-    try std.testing.expect(!(try DB.restoreRuntimeRepairNeededForPathWithIo(alloc, std.testing.io, staged.path())));
+    try std.testing.expect(!(try DB.restoreRuntimeRepairNeededForPathWithIo(alloc, platform.testing.io, staged.path())));
     _ = try staged.publish();
     staged.deinit();
     transition.deinit();
@@ -124551,19 +124535,19 @@ test "db native restore rejects a primary revision outside the manifest generati
     defer {
         var snapshots_buf: [512]u8 = undefined;
         if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(source_path)})) |snapshots| {
-            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+            std.Io.Dir.cwd().deleteTree(platform.testing.io, snapshots) catch {};
         } else |_| {}
     }
     const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, native_backup.manifest_file_name });
     defer alloc.free(manifest_path);
-    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, alloc, .limited(8 * 1024 * 1024));
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, manifest_path, alloc, .limited(8 * 1024 * 1024));
     defer alloc.free(manifest_raw);
     var parsed = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
     defer parsed.deinit();
     parsed.value.capture_target_sequence += 1;
     const mismatched_manifest = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     defer alloc.free(mismatched_manifest);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = manifest_path,
         .data = mismatched_manifest,
     });
@@ -124577,7 +124561,7 @@ test "db native restore rejects a primary revision outside the manifest generati
         DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
             &staged,
             alloc,
-            std.testing.io,
+            platform.testing.io,
             snapshot_root,
             staged.path(),
             .{ .primary_backend = primary_backend },
@@ -124629,22 +124613,22 @@ test "db native restore preserves primary generation and repairs only a missing 
     defer {
         var snapshots_buf: [512]u8 = undefined;
         if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(source_path)})) |snapshots| {
-            std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+            std.Io.Dir.cwd().deleteTree(platform.testing.io, snapshots) catch {};
         } else |_| {}
     }
     const manifest_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, native_backup.manifest_file_name });
     defer alloc.free(manifest_path);
-    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, alloc, .limited(8 * 1024 * 1024));
+    const manifest_raw = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, manifest_path, alloc, .limited(8 * 1024 * 1024));
     defer alloc.free(manifest_raw);
     var parsed = try std.json.parseFromSlice(native_backup.Manifest, alloc, manifest_raw, .{});
     defer parsed.deinit();
-    var compatibility_tmp = std.testing.tmpDir(.{});
+    var compatibility_tmp = platform.testing.tmpDir(.{});
     defer compatibility_tmp.cleanup();
     const compatibility_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{compatibility_tmp.sub_path});
     defer alloc.free(compatibility_path);
     var compatibility = (try native_backup.validateAndMaterialize(
         alloc,
-        std.testing.io,
+        platform.testing.io,
         snapshot_root,
         compatibility_path,
     )).?;
@@ -124655,7 +124639,7 @@ test "db native restore preserves primary generation and repairs only a missing 
     } else return error.TestUnexpectedResult;
     const damaged_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ snapshot_root, damaged });
     defer alloc.free(damaged_path);
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, damaged_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, damaged_path);
 
     var transition = try generation_lifecycle.beginProcessExclusive(std.mem.span(restore_path));
     defer transition.deinit();
@@ -124664,7 +124648,7 @@ test "db native restore preserves primary generation and repairs only a missing 
     try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
         &staged,
         alloc,
-        std.testing.io,
+        platform.testing.io,
         snapshot_root,
         staged.path(),
         .{ .primary_backend = primary_backend },
@@ -124676,8 +124660,8 @@ test "db native restore preserves primary generation and repairs only a missing 
             .group_id = 7002,
         },
     );
-    try std.testing.expect(try DB.restoreRuntimeRepairNeededForPathWithIo(alloc, std.testing.io, staged.path()));
-    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, staged.path())).?;
+    try std.testing.expect(try DB.restoreRuntimeRepairNeededForPathWithIo(alloc, platform.testing.io, staged.path()));
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, platform.testing.io, staged.path())).?;
     defer restore_state.deinit(alloc);
     try std.testing.expectEqualStrings("repair_indexes", restore_state.phase);
     const repair_path = try index_repair_state.checkpointPathAlloc(alloc, staged.path());
@@ -124717,7 +124701,7 @@ test "db native restore preserves primary generation and repairs only a missing 
         error.RestoreRuntimeRepairIncomplete,
         repair_db.repairRestoreRuntimeStateStepIfNeededWithIoAndRepairOptions(
             alloc,
-            std.testing.io,
+            platform.testing.io,
             .{ .cancel_check = .{
                 .ptr = &cancellation_probe,
                 .is_requested = CancellationProbe.requested,
@@ -124826,7 +124810,7 @@ test "logical snapshot descriptor is strict while descriptorless compatibility r
     }
     const descriptor_path = try std.fs.path.join(alloc, &.{ snapshot_root, db_core.logical_snapshot_manifest_file_name });
     defer alloc.free(descriptor_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = descriptor_path,
         .data = "{\"format_version\":2,\"primary_artifact_format\":\"antfly-kv-stream\",\"primary_artifact_version\":2,\"replay_embedded\":true}",
     });
@@ -124837,7 +124821,7 @@ test "logical snapshot descriptor is strict while descriptorless compatibility r
         }),
     );
 
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, descriptor_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, descriptor_path);
     try DB.restoreSnapshotTo(alloc, snapshot_root, std.mem.span(restore_path), .{
         .primary_backend = primary_backend,
         .start_index_workers = false,
@@ -124914,7 +124898,7 @@ test "db restore snapshot repeatedly validates run-backed doc identity metadata"
         try DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
             &staged_generation,
             alloc,
-            std.testing.io,
+            platform.testing.io,
             snapshot_root,
             staged_generation.path(),
             .{
@@ -125057,7 +125041,7 @@ test "db deferred restore rejects strict doc identity namespace mismatch" {
     try std.testing.expectError(error.IdentityNamespaceMismatch, DB.restoreSnapshotToDeferredRuntimeRepairWithIo(
         &staged_generation,
         alloc,
-        std.testing.io,
+        platform.testing.io,
         snapshot_root,
         staged_generation.path(),
         .{
@@ -125457,7 +125441,7 @@ test "db restore dense artifact completion retires an obsolete invalid-generatio
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, cfg.name)) == null);
     const completed_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, completed_checkpoint.status);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, shadow_base, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, shadow_base, .{}));
 }
 
 test "db restore final artifact recount preserves an exact native generation" {
@@ -125613,7 +125597,7 @@ test "db restore durability proof retries reopen-only dense debt" {
             "snapshots/snap1",
             7001,
         );
-        try DB.markRestoreRuntimeRepairCompleteWithIo(alloc, std.testing.io, std.mem.span(path));
+        try DB.markRestoreRuntimeRepairCompleteWithIo(alloc, platform.testing.io, std.mem.span(path));
         // Leave valid native authority with a stale completion watermark.
         // Resetting its selected directory would manufacture a corrupt root,
         // which restore must reject rather than treat as recoverable debt.
@@ -125710,10 +125694,10 @@ test "db restore owner converges rediscovered dense projection intent" {
         "snapshots/snap1",
         7001,
     );
-    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "sync_indexes", false);
+    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, platform.testing.io, "sync_indexes", false);
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_idx")) == null);
-    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, platform.testing.io, std.mem.span(path))).?;
     defer restore_state.deinit(alloc);
     try std.testing.expect(restore_state.runtime_repair_complete);
     try std.testing.expectEqualStrings("complete", restore_state.phase);
@@ -125758,7 +125742,7 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
         "snapshots/snap1",
         7001,
     );
-    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "rebuild_replayed_artifacts", false);
+    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, platform.testing.io, "rebuild_replayed_artifacts", false);
 
     // Simulate a resident managed writer without racing a real worker against
     // this deterministic step test.
@@ -125770,13 +125754,13 @@ test "db restore dense rebuild publishes mixed progress before worker wait" {
     );
     try std.testing.expect((try db.indexRepairIdForIndex(alloc, "dense_b")) != null);
 
-    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, platform.testing.io, std.mem.span(path))).?;
     defer restore_state.deinit(alloc);
     try std.testing.expectEqualStrings("rebuild_replayed_artifacts", restore_state.phase);
     // Watermark repair can publish one more bounded progress quantum after
     // rebuilding. Once drained, the pending owner must yield, not spin.
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
-    var waiting = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(path))).?;
+    var waiting = (try DB.readRestoreStateForPathWithIo(alloc, platform.testing.io, std.mem.span(path))).?;
     defer waiting.deinit(alloc);
     try std.testing.expectEqualStrings("rebuild_replayed_artifacts", waiting.phase);
     try std.testing.expectError(error.RestoreRuntimeRepairIncomplete, db.repairRestoreRuntimeStateStepIfNeeded(alloc));
@@ -125949,7 +125933,7 @@ test "db explicit restore runtime repair repairs managed chunked dense embedding
         try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
     }
 
-    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(restore_path))).?;
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, platform.testing.io, std.mem.span(restore_path))).?;
     defer restore_state.deinit(alloc);
     try std.testing.expect(restore_state.runtime_repair_complete);
     try std.testing.expectEqualStrings("complete", restore_state.phase);
@@ -126089,7 +126073,7 @@ test "db restore repair does not complete before regenerated chunk embeddings ar
         try std.testing.expectEqualStrings("doc:a", after.hits[0].id);
     }
 
-    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, std.testing.io, std.mem.span(restore_path))).?;
+    var restore_state = (try DB.readRestoreStateForPathWithIo(alloc, platform.testing.io, std.mem.span(restore_path))).?;
     defer restore_state.deinit(alloc);
     try std.testing.expect(restore_state.runtime_repair_complete);
     try std.testing.expectEqualStrings("complete", restore_state.phase);
@@ -126240,7 +126224,7 @@ test "db graph ownership restore materializes large artifacts in published segme
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const alloc = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var path_tmp = try TestDirectory.init("db");
     defer path_tmp.cleanup();
     const path = path_tmp.path().ptr;
@@ -126408,7 +126392,7 @@ test "db restore graph ownership replay persists a bounded page cursor" {
         "snapshots/snap1",
         7001,
     );
-    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, std.testing.io, "rebuild_graph", false);
+    try db.updateRestoreRuntimeRepairPhaseWithIo(alloc, platform.testing.io, "rebuild_graph", false);
 
     try std.testing.expect(try db.repairRestoreRuntimeStateStepIfNeeded(alloc));
     {
@@ -126510,38 +126494,38 @@ test "db rw lock allows search and scan while shared read lock is held" {
     });
 
     var held = SharedReadLockHold{ .db = &db };
-    var held_thread = try std.testing.io.concurrent(SharedReadLockHold.run, .{&held});
+    var held_thread = try platform.testing.io.concurrent(SharedReadLockHold.run, .{&held});
     defer {
         held.release.store(1, .release);
-        held_thread.await(std.testing.io);
+        held_thread.await(platform.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
 
     var search_probe = ConcurrentReadProbe{ .db = &db };
-    var search_thread = try std.testing.io.concurrent(ConcurrentReadProbe.runSearch, .{&search_probe});
+    var search_thread = try platform.testing.io.concurrent(ConcurrentReadProbe.runSearch, .{&search_probe});
     defer {
         held.release.store(1, .release);
-        search_thread.await(std.testing.io);
+        search_thread.await(platform.testing.io);
     }
 
     try std.testing.expect(waitForAtomicFlag(&search_probe.started, 1, 10_000));
     try std.testing.expect(waitForAtomicFlag(&search_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), search_probe.failed.load(.monotonic));
-    search_thread.await(std.testing.io);
+    search_thread.await(platform.testing.io);
 
     var scan_probe = ConcurrentReadProbe{ .db = &db };
-    var scan_thread = try std.testing.io.concurrent(ConcurrentReadProbe.runScan, .{&scan_probe});
+    var scan_thread = try platform.testing.io.concurrent(ConcurrentReadProbe.runScan, .{&scan_probe});
     defer {
         held.release.store(1, .release);
-        scan_thread.await(std.testing.io);
+        scan_thread.await(platform.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&scan_probe.started, 1, 10_000));
     try std.testing.expect(waitForAtomicFlag(&scan_probe.done, 1, 10_000));
     try std.testing.expectEqual(@as(u8, 0), scan_probe.failed.load(.monotonic));
-    scan_thread.await(std.testing.io);
+    scan_thread.await(platform.testing.io);
 
     held.release.store(1, .monotonic);
-    held_thread.await(std.testing.io);
+    held_thread.await(platform.testing.io);
 }
 
 test "db rw lock keeps batch writes blocked behind shared read lock" {
@@ -126562,18 +126546,18 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
     });
 
     var held = SharedReadLockHold{ .db = &db };
-    var held_thread = try std.testing.io.concurrent(SharedReadLockHold.run, .{&held});
+    var held_thread = try platform.testing.io.concurrent(SharedReadLockHold.run, .{&held});
     defer {
         held.release.store(1, .release);
-        held_thread.await(std.testing.io);
+        held_thread.await(platform.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&held.acquired, 1, 10_000));
 
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    var write_thread = try std.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try platform.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     defer {
         held.release.store(1, .release);
-        write_thread.await(std.testing.io);
+        write_thread.await(platform.testing.io);
     }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
@@ -126585,13 +126569,13 @@ test "db rw lock keeps batch writes blocked behind shared read lock" {
             still_blocked = false;
             break;
         }
-        std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(still_blocked);
 
     held.release.store(1, .monotonic);
-    held_thread.await(std.testing.io);
-    write_thread.await(std.testing.io);
+    held_thread.await(platform.testing.io);
+    write_thread.await(platform.testing.io);
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
 
@@ -128202,10 +128186,10 @@ test "source vector migration offline resumes a physical shadow preserving every
         try source.core.store.runtime_store.sync(true);
     }
     const request: vector_migration.contract.Request = .{ .job_id = "offline-test", .mode = .offline, .budget = .{ .batch_bytes = 4096, .disk_reserve_bytes = 0 } };
-    try std.testing.expectEqual(.pending, try offline.run(alloc, std.testing.io, path, request, .{ .open = options, .max_steps = 1 }));
+    try std.testing.expectEqual(.pending, try offline.run(alloc, platform.testing.io, path, request, .{ .open = options, .max_steps = 1 }));
     try std.testing.expectError(error.VectorMigrationOfflineAdmission, DB.open(alloc, path, options));
-    try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
-    try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    try std.testing.expectEqual(.complete, try offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
+    try std.testing.expectEqual(.complete, try offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
     var target = try DB.open(alloc, path, options);
     defer target.close();
     try std.testing.expect(identity.eql(target.core.identity_namespace));
@@ -128420,7 +128404,7 @@ test "source vector migration cancelled snapshot preserves old readers and rejec
     const path = std.mem.span(tmp.path().ptr);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
     defer alloc.free(snapshots);
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, snapshots) catch {};
+    defer std.Io.Dir.cwd().deleteTree(platform.testing.io, snapshots) catch {};
     var db = try DB.open(alloc, path, .{ .table_storage = .{ .dense_embeddings = .primary_lsm }, .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
     try db.core.store.put("ordinary", "preserved");
@@ -128533,12 +128517,12 @@ test "source vector migration offline recovers every copy and publication bounda
         Hook.fired = false;
         offline.test_boundary = Hook.inject;
         defer offline.test_boundary = null;
-        try std.testing.expectError(error.InjectedMigrationCrash, offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+        try std.testing.expectError(error.InjectedMigrationCrash, offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
         try std.testing.expect(Hook.fired);
         offline.test_boundary = null;
-        try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
-        try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
-        try std.testing.expectError(error.VectorMigrationAlreadyPublished, offline.cancel(alloc, std.testing.io, path, request, options));
+        try std.testing.expectEqual(.complete, try offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
+        try std.testing.expectEqual(.complete, try offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
+        try std.testing.expectError(error.VectorMigrationAlreadyPublished, offline.cancel(alloc, platform.testing.io, path, request, options));
         var target = try DB.open(alloc, path, options);
         defer target.close();
         try std.testing.expectEqual(.vector_store, target.local_execution.table_storage.dense_embeddings);
@@ -128561,10 +128545,10 @@ test "source vector migration offline cancellation retains an idempotency receip
         try source.core.store.put("preserve", "original");
     }
     const request: vector_migration.contract.Request = .{ .job_id = "cancel", .mode = .offline, .budget = .{ .batch_bytes = 4096, .disk_reserve_bytes = 0 } };
-    try std.testing.expectEqual(.pending, try offline.run(alloc, std.testing.io, path, request, .{ .open = options, .max_steps = 1 }));
-    try offline.cancel(alloc, std.testing.io, path, request, options);
-    try offline.cancel(alloc, std.testing.io, path, request, options);
-    try std.testing.expectError(error.VectorMigrationCancelled, offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    try std.testing.expectEqual(.pending, try offline.run(alloc, platform.testing.io, path, request, .{ .open = options, .max_steps = 1 }));
+    try offline.cancel(alloc, platform.testing.io, path, request, options);
+    try offline.cancel(alloc, platform.testing.io, path, request, options);
+    try std.testing.expectError(error.VectorMigrationCancelled, offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
     var source = try DB.open(alloc, path, options);
     defer source.close();
     try std.testing.expectEqual(.primary_lsm, source.local_execution.table_storage.dense_embeddings);
@@ -128586,23 +128570,23 @@ test "source vector migration offline cancellation before the copy fence survive
         try source.core.store.put("preserve", "original");
     }
     const request: vector_migration.contract.Request = .{ .job_id = "cancel-before-fence", .mode = .offline, .budget = .{ .disk_reserve_bytes = std.math.maxInt(u64) } };
-    try std.testing.expectError(error.VectorMigrationDiskReserve, offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    try std.testing.expectError(error.VectorMigrationDiskReserve, offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
     const fence = try std.fs.path.join(alloc, &.{ path, vector_migration.contract.offline_fence_file });
     defer alloc.free(fence);
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, fence, .{}));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, fence, .{}));
     // Reopening between these calls models losing the successful cancellation
     // response before the operator can clear the persisted catalog marker.
-    try offline.cancel(alloc, std.testing.io, path, request, options);
-    try offline.cancel(alloc, std.testing.io, path, request, options);
-    try std.testing.expectError(error.VectorMigrationCancelled, offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+    try offline.cancel(alloc, platform.testing.io, path, request, options);
+    try offline.cancel(alloc, platform.testing.io, path, request, options);
+    try std.testing.expectError(error.VectorMigrationCancelled, offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
     var conflict = request;
     conflict.budget.disk_reserve_bytes = 0;
-    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.cancel(alloc, std.testing.io, path, conflict, options));
-    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.run(alloc, std.testing.io, path, conflict, .{ .open = options }));
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.cancel(alloc, platform.testing.io, path, conflict, options));
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.run(alloc, platform.testing.io, path, conflict, .{ .open = options }));
     conflict.job_id = "replacement";
-    try std.testing.expectEqual(.pending, try offline.run(alloc, std.testing.io, path, conflict, .{ .open = options, .max_steps = 1 }));
-    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.cancel(alloc, std.testing.io, path, request, options));
-    try offline.cancel(alloc, std.testing.io, path, conflict, options);
+    try std.testing.expectEqual(.pending, try offline.run(alloc, platform.testing.io, path, conflict, .{ .open = options, .max_steps = 1 }));
+    try std.testing.expectError(error.VectorMigrationIdempotencyConflict, offline.cancel(alloc, platform.testing.io, path, request, options));
+    try offline.cancel(alloc, platform.testing.io, path, conflict, options);
     var source = try DB.open(alloc, path, options);
     defer source.close();
     try std.testing.expectEqual(.primary_lsm, source.local_execution.table_storage.dense_embeddings);
@@ -128693,7 +128677,7 @@ test "source vector migration converts legacy ANN generations in both modes" {
             }
         }
         gate.permitted = true;
-        if (mode == .offline) try std.testing.expectEqual(.complete, try offline.run(alloc, std.testing.io, path, request, .{ .open = options }));
+        if (mode == .offline) try std.testing.expectEqual(.complete, try offline.run(alloc, platform.testing.io, path, request, .{ .open = options }));
         var migrated = try DB.open(alloc, path, options);
         defer migrated.close();
         try std.testing.expectEqual(.vector_store, migrated.local_execution.table_storage.dense_embeddings);
@@ -128708,7 +128692,7 @@ test "source vector migration converts legacy ANN generations in both modes" {
 test "db cold initial FK retirement cancels exact hidden publication durably" {
     const alloc = std.testing.allocator;
     const hidden = @import("relational_initial_child_publication.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cold-retirement", .{tmp.sub_path});
     defer alloc.free(path);
@@ -128760,7 +128744,7 @@ test "db empty-generation install receipt survives hidden to public owner reopen
     defer parsed_schema.deinit(alloc);
     const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
     defer schema_mod.freeSchema(alloc, runtime_schema);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/handoff-public-reopen", .{tmp.sub_path});
     defer alloc.free(path);
@@ -128835,7 +128819,7 @@ test "db ordered artifact inventory staged generations resume and switch snapsho
             if (!self.valid) return error.EnrichmentSourceChanged;
         }
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/staged-generations", .{tmp.sub_path});
     defer alloc.free(path);
@@ -129073,7 +129057,7 @@ test "db ordered artifact inventory generation retirement resumes after restart 
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/generation-retirement", .{tmp.sub_path});
     defer alloc.free(path);
@@ -129191,7 +129175,7 @@ test "db ordered artifact inventory generation discovery resumes scoped cursors 
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/generation-discovery", .{tmp.sub_path});
     defer alloc.free(path);
@@ -129303,7 +129287,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/logical-chunks", .{tmp.sub_path});
     defer alloc.free(path);
@@ -129387,7 +129371,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectEqualStrings("generation-only", generated[0].object.get("body").?.string);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{&db});
+    try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{&db});
     var expected_nums: [2]u32 = undefined;
     for ([_]?[]const u8{ null, "z" }, &expected_nums) |unit, *expected| {
         const key = if (unit) |id|
@@ -129435,7 +129419,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectError(error.InvalidBatchRequest, binary.seekAfter(tail));
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ProjectionCheck.run, .{ &db, expected_nums });
+    try platform.allocator.checkAllAllocationFailures(alloc, ProjectionCheck.run, .{ &db, expected_nums });
     // A selected empty unit and a shadowed root tail still have vector bytes
     // to retire. Reconciliation must enumerate them without exposing their
     // obsolete chunk payloads or confusing another embedding's outputs.
@@ -129476,7 +129460,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expect((try cursor.next()) == null);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, CandidateCheck.run, .{&db});
+    try platform.allocator.checkAllAllocationFailures(alloc, CandidateCheck.run, .{&db});
     const PollCheck = struct {
         fn run(a: Allocator, owner: *DB, minimum_yields: usize, extra_outputs: usize) !void {
             const candidates = @import("artifact_chunk_vector_cursor.zig");
@@ -129553,7 +129537,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expect(yields >= minimum_yields);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PollCheck.run, .{ &db, 1, 0 });
+    try platform.allocator.checkAllAllocationFailures(alloc, PollCheck.run, .{ &db, 1, 0 });
     // Long obsolete tails are opaque here: malformed payloads and another
     // embedding's keys consume bounded scan work, never provider invocations.
     for (2..66) |ordinal| {
@@ -129604,7 +129588,7 @@ test "db ordered artifact inventory local stream checkpoints survive restart wit
     const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 1, .catalog_digest = @splat(2) };
     var incarnation: u128 = undefined;
     var selected: checkpoints.Key = undefined;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/stream-checkpoint", .{tmp.sub_path});
     defer alloc.free(path);
@@ -129801,7 +129785,7 @@ test "db ordered artifact inventory chunk reconstruction resumes bounded pages a
     const reconstruction = @import("artifact_chunk_reconstruction.zig");
     const chunks = @import("artifact_chunk_manifest.zig");
     const publication = @import("artifact_publication.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-reconstruction", .{tmp.sub_path});
     defer alloc.free(path);
@@ -129915,7 +129899,7 @@ test "db ordered artifact inventory chunk replacement rolls back and reopens as 
     const alloc = std.testing.allocator;
     const chunks = @import("artifact_chunk_manifest.zig");
     const publication = @import("artifact_publication.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/chunk-output-set", .{tmp.sub_path});
     defer alloc.free(path);
@@ -129984,7 +129968,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
     const alloc = std.testing.allocator;
     const publication = @import("artifact_publication.zig");
     const obligations = @import("artifact_producer_obligations.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/producer-dispatch", .{tmp.sub_path});
     defer alloc.free(path);
@@ -130141,7 +130125,7 @@ test "db ordered artifact inventory producer pages resume after restart without 
     const alloc = std.testing.allocator;
     const publication = @import("artifact_publication.zig");
     const obligations = @import("artifact_producer_obligations.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-producer-dispatch", .{tmp.sub_path});
     defer alloc.free(path);
@@ -130191,7 +130175,7 @@ test "db ordered artifact inventory obsolete producer work is bounded and preser
     const alloc = std.testing.allocator;
     const publication = @import("artifact_publication.zig");
     const obligations = @import("artifact_producer_obligations.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/producer-work-gc", .{tmp.sub_path});
     defer alloc.free(path);
@@ -130242,7 +130226,7 @@ test "db ordered artifact inventory obsolete producer work is bounded and preser
 
 test "db ordered artifact inventory resolver commit invalidates pinned producer catalog" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/producer-catalog-resolver", .{tmp.sub_path});
     defer alloc.free(path);
@@ -130268,7 +130252,7 @@ test "db ordered artifact inventory writer reopen revokes external projection ev
     const alloc = std.testing.allocator;
     const publication = @import("artifact_publication.zig");
     const epoch = @import("artifact_projection_epoch.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-reopen", .{tmp.sub_path});
     defer alloc.free(path);
@@ -130306,7 +130290,7 @@ test "db ordered artifact inventory full text reset revokes before destructive w
     const publication = @import("artifact_publication.zig");
     const epoch = @import("artifact_projection_epoch.zig");
     const rebuild = @import("backfill_state.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-reset-order", .{tmp.sub_path});
     defer alloc.free(path);
@@ -132596,7 +132580,7 @@ test "db document extraction concurrent writes with unchanged TTL timestamps con
 
     const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     try std.testing.expect(hook.entered.load(.acquire));
 

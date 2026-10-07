@@ -17,7 +17,9 @@
 //! scheduling deliberately live outside this module so the same algorithms can
 //! be used by embedded and immutable lake-native graph implementations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const metric_cost = @import("metric_cost.zig");
@@ -1239,7 +1241,7 @@ test "serverless graph metric runtime fanout preserves deterministic target-owne
         var serial = try pageRankTopologyAlloc(alloc, topology, options);
         defer serial.deinit(alloc);
 
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         var parallel_options = options;
         parallel_options.io = io_impl.io();
@@ -1371,7 +1373,7 @@ test "serverless graph metric spectral kernels reject personalized teleports" {
 
 test "serverless graph metric edge tiles split hubs with deterministic bounded reductions" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     for ([_]usize{ 2, parallel_edge_threshold + 1 }) |n| {
         const edges = try alloc.alloc(Edge, parallel_edge_threshold);

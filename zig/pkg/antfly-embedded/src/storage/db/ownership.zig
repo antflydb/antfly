@@ -13,10 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const lsm_backend = @import("../lsm_backend.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const docstore_mod = @import("../docstore.zig");
 const mem_backend = @import("../mem_backend.zig");
 const lease_mod = @import("lease.zig");
@@ -238,7 +240,7 @@ fn tempPath(buf: []u8) [*:0]const u8 {
 }
 
 fn cleanupTempDir(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

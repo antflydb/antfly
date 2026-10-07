@@ -14,7 +14,9 @@
 // limitations.
 
 // Run: zig build antfly-system-catalog-bench
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const catalog = @import("system_catalog");
 const samples = 5;
 const lookups = 1000;
@@ -29,7 +31,7 @@ noinline fn scanTablespace(state: catalog.State, id: u64) ?catalog.Resource {
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
     for ([_]usize{ 1000, 10000, 100000 }) |n| {

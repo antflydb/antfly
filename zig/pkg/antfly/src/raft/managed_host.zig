@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const raft_engine = @import("raft_engine");
 const storage_source_options = @import("storage_source_options");
 const control_only_storage_sources = storage_source_options.control_only;
@@ -902,7 +904,7 @@ const DataApplyPreparedSnapshotSource = struct {
         errdefer file.deinit(alloc);
         const artifact = try storage.file_snapshot_artifact.FileSnapshotArtifact.create(
             alloc,
-            std.Options.debug_io,
+            platform.debug_io,
             file.path,
             file.size,
         );
@@ -1340,7 +1342,7 @@ test "managed host restores replicas from file-backed catalog and persisted stat
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/managed-raft", .{tmp.sub_path});
@@ -1455,7 +1457,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
     };
 
     const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/managed-raft-backup", .{tmp.sub_path});
@@ -1467,7 +1469,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
     const source_db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/managed-raft-backup/source", .{tmp.sub_path});
     defer std.testing.allocator.free(source_db_path);
 
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -1494,7 +1496,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
     const dest_root = try backups_api.shardSnapshotPath(std.testing.allocator, backup_root, "snap1", 903);
     defer std.testing.allocator.free(dest_root);
     try backups_api.copyDirectoryRecursive(std.testing.allocator, snapshot_root, dest_root);
-    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
     defer std.testing.allocator.free(backup_root_abs);
@@ -1502,7 +1504,7 @@ test "managed host restores backup bootstrap replicas from file-backed catalog o
     defer std.testing.allocator.free(restore_location);
     var artifact_integrity = try backups_api.artifactIntegrityAlloc(
         std.testing.allocator,
-        std.testing.io,
+        platform.testing.io,
         .native,
         dest_root,
     );
@@ -1662,7 +1664,7 @@ test "managed host restores replicas from file-backed catalog with WAL replica s
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/managed-raft-wal", .{tmp.sub_path});
@@ -1982,7 +1984,7 @@ test "managed host routes metadata and data groups through distinct apply builde
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/managed-raft-builders", .{tmp.sub_path});
@@ -2089,7 +2091,7 @@ test "managed host defaults metadata and data apply stores when durable state is
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/managed-raft-default-builders", .{tmp.sub_path});
@@ -2187,7 +2189,7 @@ test "managed host default metadata and data apply stores survive restart" {
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/managed-raft-default-builders-restart", .{tmp.sub_path});
@@ -2304,7 +2306,7 @@ test "managed host installs backup restore bootstrapper when replica root is con
         }
     };
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/managed-backup-bootstrapper", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);

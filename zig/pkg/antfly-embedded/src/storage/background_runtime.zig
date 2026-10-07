@@ -458,7 +458,7 @@ pub const Backend = runtime_backend.Backend;
 // Keep the concrete type available so host-oriented code remains type-correct
 // when compiled for WASI; `initIoLane` prevents constructing it on hostless
 // targets.
-pub const IoImpl = if (builtin.os.tag == .freestanding) void else Io.Threaded;
+pub const IoImpl = if (builtin.os.tag == .freestanding) void else platform.Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.backend_runtime_durable_background;
 
 pub const Config = struct {
@@ -565,7 +565,7 @@ const LaneLeaseGate = struct {
         // Manual runtimes have no executor to park on. They ordinarily have
         // no successful lane leases; retain an executor-independent fallback
         // for a close racing an unavailable acquisition.
-        while (self.active() != 0) @import("antfly_platform").time.yieldNow();
+        while (self.active() != 0) platform.time.yieldNow();
     }
 };
 
@@ -685,7 +685,7 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
         // lanes. Threaded retains concurrent workers until deinit, so a finite
         // ceiling prevents any lane from converting a transient fan-out spike
         // into an unbounded kernel-thread/stack reservation ratchet.
-        io_impl.* = Io.Threaded.init(alloc, .{
+        io_impl.* = platform.Io.Threaded.init(alloc, .{
             .async_limit = boundedIoAsyncLimit(concurrent_limit),
             .concurrent_limit = .limited(concurrent_limit),
         });
@@ -693,7 +693,7 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
     }
 }
 
-/// `std.Io.Threaded` controls `async` and `concurrent` fan-out independently.
+/// `platform.Io.Threaded` controls `async` and `concurrent` fan-out independently.
 /// CPU stages use `Group.async`, so leaving the async side at its default would
 /// bypass the runtime lane's configured backstop. Keep at most one async worker
 /// per additional detected CPU; the caller always runs one task inline.
@@ -728,7 +728,7 @@ const OwnerRegistry = struct {
     };
 
     alloc: Allocator,
-    sync_io: Io = if (builtin.os.tag == .freestanding) .failing else std.Io.Threaded.global_single_threaded.io(),
+    sync_io: Io = if (builtin.os.tag == .freestanding) .failing else platform.Io.Threaded.global_single_threaded.io(),
     mutex: Io.Mutex = .init,
     idle: Io.Condition = .init,
     states: std.AutoHashMapUnmanaged(u64, State) = .empty,
@@ -990,23 +990,23 @@ pub const BackendRuntime = struct {
     borrowed_io: ?BorrowedIo = null,
     api_lane_gate: LaneLeaseGate = .{},
     api_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    api_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    api_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    api_lane_acquisitions_total: platform.atomic.Value(u64) = .init(0),
+    api_lane_rejections_total: platform.atomic.Value(u64) = .init(0),
     inference_lane_gate: LaneLeaseGate = .{},
     inference_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    inference_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    inference_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    inference_lane_acquisitions_total: platform.atomic.Value(u64) = .init(0),
+    inference_lane_rejections_total: platform.atomic.Value(u64) = .init(0),
     pdf_render_lane_gate: LaneLeaseGate = .{},
     pdf_render_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    pdf_render_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    pdf_render_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    pdf_render_lane_acquisitions_total: platform.atomic.Value(u64) = .init(0),
+    pdf_render_lane_rejections_total: platform.atomic.Value(u64) = .init(0),
     worker_lane_gate: LaneLeaseGate = .{},
     reserved_workers: std.atomic.Value(usize) = .init(0),
     peak_reserved_workers: std.atomic.Value(usize) = .init(0),
     control_lane_gate: LaneLeaseGate = .{},
     control_lane_peak_leases: std.atomic.Value(usize) = .init(0),
-    control_lane_acquisitions_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    control_lane_rejections_total: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    control_lane_acquisitions_total: platform.atomic.Value(u64) = .init(0),
+    control_lane_rejections_total: platform.atomic.Value(u64) = .init(0),
     threaded_jobs: ?*ThreadedDurableJobLane = null,
     durable_jobs: DurableJobLane,
     db_open_configurator: ?DbOpenConfigurator = null,
@@ -1366,7 +1366,7 @@ pub const BackendRuntime = struct {
             // This deliberately overcounts already-submitted work: observing
             // spare capacity must not steal a sibling's as-yet-unused grant.
             // No waiting, task submission, or transport occurs under this lock.
-            const sync_io = Io.Threaded.global_single_threaded.io();
+            const sync_io = platform.Io.Threaded.global_single_threaded.io();
             impl.mutex.lockUncancelable(sync_io);
             const remaining = @backingInt(impl.concurrent_limit) -| impl.busy_count;
             const reserved = self.request_forward_lane_gate.active() * threaded_io_limits.request_forward_workers_per_request;
@@ -1699,7 +1699,7 @@ pub const BackendRuntime = struct {
 
     pub const WorkerOptions = struct {
         capacity: usize = 1,
-        stack_size: usize = (Io.Threaded.InitOptions{}).stack_size,
+        stack_size: usize = (platform.Io.Threaded.InitOptions{}).stack_size,
     };
 
     /// An exclusive scheduling lane, separate from request and durable-job
@@ -1748,7 +1748,7 @@ pub const BackendRuntime = struct {
             return .{ .runtime = self, .borrowed_io = borrowed.general, .capacity = options.capacity };
         }
         const io_impl = try self.alloc.create(IoImpl);
-        io_impl.* = Io.Threaded.init(self.alloc, .{
+        io_impl.* = platform.Io.Threaded.init(self.alloc, .{
             .stack_size = options.stack_size,
             .async_limit = .nothing,
             .concurrent_limit = .limited(options.capacity),
@@ -2254,7 +2254,7 @@ const threaded_vtable = DurableJobLane.VTable{
 };
 
 fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    @import("antfly_platform").sync.lockYielding(mutex);
+    platform.sync.lockYielding(mutex);
 }
 
 test "lane lease gate closes admission and drains a committed borrower" {
@@ -2264,7 +2264,7 @@ test "lane lease gate closes admission and drains a committed borrower" {
     try std.testing.expectEqual(@as(?usize, 1), gate.tryAcquire());
 
     var drained = std.atomic.Value(bool).init(false);
-    var closer = try std.testing.io.concurrent(struct {
+    var closer = try platform.testing.io.concurrent(struct {
         fn run(g: *LaneLeaseGate, done: *std.atomic.Value(bool)) void {
             g.close();
             g.waitDrained(null);
@@ -2274,14 +2274,14 @@ test "lane lease gate closes admission and drains a committed borrower" {
     var closer_awaited = false;
     defer if (!closer_awaited) {
         gate.release(null);
-        closer.await(std.testing.io);
+        closer.await(platform.testing.io);
     };
 
-    while (!gate.isClosed()) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!gate.isClosed()) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectEqual(@as(?usize, null), gate.tryAcquire());
     try std.testing.expect(!drained.load(.acquire));
     gate.release(null);
-    closer.await(std.testing.io);
+    closer.await(platform.testing.io);
     closer_awaited = true;
     try std.testing.expect(drained.load(.acquire));
 }
@@ -2289,7 +2289,7 @@ test "lane lease gate closes admission and drains a committed borrower" {
 test "backend runtime handle owns a stable runtime pointer" {
     var handle = try BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .manual,
-        .filesystem_io = std.testing.io,
+        .filesystem_io = platform.testing.io,
     });
     defer handle.deinit();
 
@@ -3147,7 +3147,7 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     var lease = try runtime.acquireApiLane();
     var forwarding = try runtime.acquireRequestForwardLane();
     var deinitialized = std.atomic.Value(bool).init(false);
-    var deinit_thread = try std.testing.io.concurrent(struct {
+    var deinit_thread = try platform.testing.io.concurrent(struct {
         fn run(h: *BackendRuntimeHandle, done: *std.atomic.Value(bool)) void {
             h.deinit();
             done.store(true, .release);
@@ -3157,10 +3157,10 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     defer if (!deinit_thread_awaited) {
         lease.release();
         forwarding.release();
-        deinit_thread.await(std.testing.io);
+        deinit_thread.await(platform.testing.io);
     };
 
-    while (!runtime.api_lane_gate.isClosed()) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!runtime.api_lane_gate.isClosed()) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireApiLane());
     try std.testing.expectError(error.RequestForwardCapacityUnavailable, runtime.acquireRequestForwardLane());
     try std.testing.expect(runtime.inferenceIo() == null);
@@ -3169,7 +3169,7 @@ test "backend runtime deinit closes admission and waits for active lane leases" 
     lease.release();
     try std.testing.expect(!deinitialized.load(.acquire));
     forwarding.release();
-    deinit_thread.await(std.testing.io);
+    deinit_thread.await(platform.testing.io);
     deinit_thread_awaited = true;
     try std.testing.expect(deinitialized.load(.acquire));
 }
@@ -3327,7 +3327,7 @@ test "backend runtime shutdown drains PDF render leases before worker destructio
         }
     }.run, .{ &handle, &deinitialized });
 
-    while (!runtime.pdf_render_lane_gate.isClosed()) @import("antfly_platform").time.yieldNow();
+    while (!runtime.pdf_render_lane_gate.isClosed()) platform.time.yieldNow();
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquirePdfRenderLane());
     try std.testing.expect(!deinitialized.load(.acquire));
     lease.release();
@@ -3392,8 +3392,8 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
         fn free(ptr: *anyopaque, buf: []u8, align_: std.mem.Alignment, ra: usize) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.hold.load(.acquire)) {
-                if (self.retiring.fetchAdd(1, .release) + 1 == 6) self.all_retiring.set(std.testing.io);
-                self.release.waitUncancelable(std.testing.io);
+                if (self.retiring.fetchAdd(1, .release) + 1 == 6) self.all_retiring.set(platform.testing.io);
+                self.release.waitUncancelable(platform.testing.io);
             }
             std.heap.page_allocator.rawFree(buf, align_, ra);
         }
@@ -3412,7 +3412,7 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
     var tasks: Io.Group = .init;
     defer {
         allocator.hold.store(false, .release);
-        allocator.release.set(std.testing.io);
+        allocator.release.set(platform.testing.io);
         release.set(io);
         tasks.cancel(io);
     }
@@ -3428,7 +3428,7 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
     try tasks.await(io);
     // Pause real executor retirement after every task has reported completion.
     // The request has finished and releases its lease, but its slots are busy.
-    try allocator.all_retiring.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try allocator.all_retiring.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
     lease.release();
     const admission = runtime.acquireRequestForwardLane();
     if (admission) |value| {
@@ -3438,18 +3438,18 @@ test "backend runtime forwarding admission includes retiring executor tasks" {
     } else |err| try std.testing.expectEqual(error.RequestForwardCapacityUnavailable, err);
     try std.testing.expectEqual(@as(usize, 0), runtime.request_forward_lane_gate.active());
     allocator.hold.store(false, .release);
-    allocator.release.set(std.testing.io);
+    allocator.release.set(platform.testing.io);
     // Only this test waits for the deliberately paused retirement. Production
     // rejects overload immediately before any request bytes are sent.
-    const deadline = Io.Clock.Timestamp.fromNow(std.testing.io, .{ .raw = .fromSeconds(5), .clock = .awake });
+    const deadline = Io.Clock.Timestamp.fromNow(platform.testing.io, .{ .raw = .fromSeconds(5), .clock = .awake });
     while (true) {
         if (runtime.acquireRequestForwardLane()) |value| {
             var recovered = value;
             recovered.release();
             break;
         } else |err| try std.testing.expectEqual(error.RequestForwardCapacityUnavailable, err);
-        if (Io.Clock.Timestamp.now(std.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        if (Io.Clock.Timestamp.now(platform.testing.io, .awake).compare(.gte, deadline)) return error.TestUnexpectedResult;
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
 }
 
@@ -3582,7 +3582,7 @@ test "backend runtime exposes native API filesystem IO separately" {
     try std.testing.expect(api_io.vtable == handle.ptr().apiIo().?.vtable);
     try std.testing.expect(api_io.vtable != handle.ptr().apiNetworkIo().?.vtable);
     try std.testing.expect(handle.ptr().filesystemIo().?.vtable == handle.ptr().io_impl.?.io().vtable);
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try std.testing.expectError(
         error.FileNotFound,
@@ -3786,7 +3786,7 @@ const OwnerDrainWaitProbe = struct {
     vtable: Io.VTable = undefined,
 
     fn io(self: *@This()) Io {
-        self.vtable = std.testing.io.vtable.*;
+        self.vtable = platform.testing.io.vtable.*;
         self.vtable.futexWaitUncancelable = wait;
         self.vtable.futexWake = wake;
         return .{ .userdata = self, .vtable = &self.vtable };
@@ -3795,17 +3795,17 @@ const OwnerDrainWaitProbe = struct {
     fn wait(ptr: ?*anyopaque, address: *const u32, expected: u32) void {
         const self: *@This() = @ptrCast(@alignCast(ptr.?));
         const previous = self.waits.fetchAdd(1, .acq_rel);
-        if (previous == 0) self.first_wait.set(std.testing.io);
-        if (previous == 1) self.second_wait.set(std.testing.io);
-        std.testing.io.vtable.futexWaitUncancelable(std.testing.io.userdata, address, expected);
+        if (previous == 0) self.first_wait.set(platform.testing.io);
+        if (previous == 1) self.second_wait.set(platform.testing.io);
+        platform.testing.io.vtable.futexWaitUncancelable(platform.testing.io.userdata, address, expected);
     }
 
     fn wake(_: ?*anyopaque, address: *const u32, count: u32) void {
-        std.testing.io.vtable.futexWake(std.testing.io.userdata, address, count);
+        platform.testing.io.vtable.futexWake(platform.testing.io.userdata, address, count);
     }
 
     fn expectWait(event: *Io.Event) void {
-        event.waitTimeout(std.testing.io, .{
+        event.waitTimeout(platform.testing.io, .{
             .duration = .{ .raw = .fromSeconds(5), .clock = .awake },
         }) catch @panic("owner drain did not reach its unlocked completion barrier");
     }
@@ -3831,7 +3831,7 @@ test "backend runtime nested owner teardown completes during drain close and shu
         }
         fn parentRun(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.parent_release.waitUncancelable(std.testing.io);
+            self.parent_release.waitUncancelable(platform.testing.io);
             if (!self.close_in_deinit) self.closeChild();
         }
         fn parentDeinit(ptr: *anyopaque) void {
@@ -3841,7 +3841,7 @@ test "backend runtime nested owner teardown completes during drain close and shu
         }
         fn childRun(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.child_release.waitUncancelable(std.testing.io);
+            self.child_release.waitUncancelable(platform.testing.io);
         }
         fn childDeinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -3871,8 +3871,8 @@ test "backend runtime nested owner teardown completes during drain close and shu
                 .mode = mode,
             };
             defer {
-                ctx.parent_release.set(std.testing.io);
-                ctx.child_release.set(std.testing.io);
+                ctx.parent_release.set(platform.testing.io);
+                ctx.child_release.set(platform.testing.io);
             }
             try handle.ptr().durable_jobs.submit(.{
                 .owner_id = ctx.parent_id,
@@ -3888,19 +3888,19 @@ test "backend runtime nested owner teardown completes during drain close and shu
                 .run = Ctx.childRun,
                 .deinit = Ctx.childDeinit,
             });
-            var draining = try std.testing.io.concurrent(Ctx.drain, .{&ctx});
+            var draining = try platform.testing.io.concurrent(Ctx.drain, .{&ctx});
             if (mode == .shutdown) live = false;
             defer {
-                ctx.parent_release.set(std.testing.io);
-                ctx.child_release.set(std.testing.io);
-                draining.await(std.testing.io);
+                ctx.parent_release.set(platform.testing.io);
+                ctx.child_release.set(platform.testing.io);
+                draining.await(platform.testing.io);
             }
             OwnerDrainWaitProbe.expectWait(&probe.first_wait);
-            ctx.parent_release.set(std.testing.io);
+            ctx.parent_release.set(platform.testing.io);
             OwnerDrainWaitProbe.expectWait(&probe.second_wait);
             try std.testing.expect(!ctx.child_closed.load(.acquire));
-            ctx.child_release.set(std.testing.io);
-            draining.await(std.testing.io);
+            ctx.child_release.set(platform.testing.io);
+            draining.await(platform.testing.io);
             try std.testing.expect(ctx.child_closed.load(.acquire));
             try std.testing.expectEqual(@as(usize, 2), ctx.deinits.load(.acquire));
         }
@@ -3918,7 +3918,7 @@ test "backend runtime concurrent owner drains both wait for payload teardown" {
         fn run(_: *anyopaque) !void {}
         pub fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.release.waitUncancelable(std.testing.io);
+            self.release.waitUncancelable(platform.testing.io);
             _ = self.deinits.fetchAdd(1, .release);
         }
         fn drain(self: *@This()) void {
@@ -3931,24 +3931,24 @@ test "backend runtime concurrent owner drains both wait for payload teardown" {
     var probe: OwnerDrainWaitProbe = .{};
     handle.ptr().owner_registry.sync_io = probe.io();
     var ctx: Ctx = .{ .lane = handle.ptr().durable_jobs, .owner_id = try handle.ptr().allocOwnerId() };
-    defer ctx.release.set(std.testing.io);
+    defer ctx.release.set(platform.testing.io);
     try ctx.lane.submit(.{ .owner_id = ctx.owner_id, .class = .cleanup, .ptr = &ctx, .run = Ctx.run, .deinit = Ctx.deinit });
-    var first = try std.testing.io.concurrent(Ctx.drain, .{&ctx});
+    var first = try platform.testing.io.concurrent(Ctx.drain, .{&ctx});
     defer {
-        ctx.release.set(std.testing.io);
-        first.await(std.testing.io);
+        ctx.release.set(platform.testing.io);
+        first.await(platform.testing.io);
     }
     OwnerDrainWaitProbe.expectWait(&probe.first_wait);
-    var second = try std.testing.io.concurrent(Ctx.drain, .{&ctx});
+    var second = try platform.testing.io.concurrent(Ctx.drain, .{&ctx});
     defer {
-        ctx.release.set(std.testing.io);
-        second.await(std.testing.io);
+        ctx.release.set(platform.testing.io);
+        second.await(platform.testing.io);
     }
     OwnerDrainWaitProbe.expectWait(&probe.second_wait);
     try std.testing.expectEqual(@as(usize, 0), ctx.finished_drains.load(.acquire));
-    ctx.release.set(std.testing.io);
-    first.await(std.testing.io);
-    second.await(std.testing.io);
+    ctx.release.set(platform.testing.io);
+    first.await(platform.testing.io);
+    second.await(platform.testing.io);
     try std.testing.expectEqual(@as(usize, 2), ctx.finished_drains.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), ctx.deinits.load(.acquire));
 }
@@ -3962,12 +3962,12 @@ test "backend runtime idle reaper waits on shutdown instead of an unconditional 
         fn wait(ptr: ?*anyopaque, _: *const u32, _: u32, _: Io.Timeout) Io.Cancelable!void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.waits += 1;
-            self.lane.shutdown_reaper.set(std.testing.io);
+            self.lane.shutdown_reaper.set(platform.testing.io);
         }
         fn sleep(ptr: ?*anyopaque, _: Io.Timeout) Io.Cancelable!void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.sleeps += 1;
-            self.lane.shutdown_reaper.set(std.testing.io);
+            self.lane.shutdown_reaper.set(platform.testing.io);
         }
     };
     var io_impl = IoImpl.init(std.testing.allocator, .{});
@@ -3977,7 +3977,7 @@ test "backend runtime idle reaper waits on shutdown instead of an unconditional 
     var lane = ThreadedDurableJobLane.init(std.testing.allocator, &io_impl, &owners);
     defer lane.deinit();
     var probe: Probe = .{ .lane = &lane };
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.futexWait = Probe.wait;
     vtable.sleep = Probe.sleep;
     const io: Io = .{ .userdata = &probe, .vtable = &vtable };
@@ -4138,7 +4138,7 @@ test "backend runtime shutdown waits for worker owners and closes reservations" 
     var lease = try runtime.acquireWorkers(.{});
     defer lease.release();
     var destroyed: std.atomic.Value(bool) = .init(false);
-    var closer = try std.testing.io.concurrent(struct {
+    var closer = try platform.testing.io.concurrent(struct {
         fn close(h: *BackendRuntimeHandle, flag: *std.atomic.Value(bool)) void {
             h.deinit();
             flag.store(true, .release);
@@ -4147,13 +4147,13 @@ test "backend runtime shutdown waits for worker owners and closes reservations" 
     handle_live = false;
     defer {
         lease.release();
-        closer.await(std.testing.io);
+        closer.await(platform.testing.io);
     }
-    while (!runtime.worker_lane_gate.isClosed()) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (!runtime.worker_lane_gate.isClosed()) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expectError(error.BackendRuntimeShuttingDown, runtime.acquireWorkers(.{}));
     try std.testing.expect(!destroyed.load(.acquire));
     lease.release();
-    closer.await(std.testing.io);
+    closer.await(platform.testing.io);
     try std.testing.expect(destroyed.load(.acquire));
 }
 
@@ -4171,41 +4171,41 @@ test "lane release retains its lifetime count while shutdown owns the drain lock
         parked: Io.Event = .unset,
         fn wait(ptr: ?*anyopaque, address: *const u32, expected: u32) void {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            self.parked.set(std.testing.io);
-            std.testing.io.vtable.futexWaitUncancelable(std.testing.io.userdata, address, expected);
+            self.parked.set(platform.testing.io);
+            platform.testing.io.vtable.futexWaitUncancelable(platform.testing.io.userdata, address, expected);
         }
         fn wake(_: ?*anyopaque, address: *const u32, count: u32) void {
-            std.testing.io.vtable.futexWake(std.testing.io.userdata, address, count);
+            platform.testing.io.vtable.futexWake(platform.testing.io.userdata, address, count);
         }
         fn release(gate: *LaneLeaseGate, io: Io) void {
             gate.release(io);
         }
     };
     var probe = Probe{};
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.futexWaitUncancelable = Probe.wait;
     vtable.futexWake = Probe.wake;
     const observed_io: Io = .{ .userdata = &probe, .vtable = &vtable };
     var gate = LaneLeaseGate{};
     _ = gate.tryAcquire().?;
     gate.close();
-    gate.drain_mutex.lockUncancelable(std.testing.io);
+    gate.drain_mutex.lockUncancelable(platform.testing.io);
     var locked = true;
-    defer if (locked) gate.drain_mutex.unlock(std.testing.io);
-    var releasing = try std.testing.io.concurrent(Probe.release, .{ &gate, observed_io });
+    defer if (locked) gate.drain_mutex.unlock(platform.testing.io);
+    var releasing = try platform.testing.io.concurrent(Probe.release, .{ &gate, observed_io });
     defer {
         if (locked) {
-            gate.drain_mutex.unlock(std.testing.io);
+            gate.drain_mutex.unlock(platform.testing.io);
             locked = false;
         }
-        releasing.await(std.testing.io);
+        releasing.await(platform.testing.io);
     }
-    probe.parked.waitUncancelable(std.testing.io);
+    probe.parked.waitUncancelable(platform.testing.io);
     try std.testing.expectEqual(@as(usize, 1), gate.active());
-    gate.drain_mutex.unlock(std.testing.io);
+    gate.drain_mutex.unlock(platform.testing.io);
     locked = false;
-    releasing.await(std.testing.io);
-    gate.waitDrained(std.testing.io);
+    releasing.await(platform.testing.io);
+    gate.waitDrained(platform.testing.io);
     try std.testing.expectEqual(@as(usize, 0), gate.active());
 }
 

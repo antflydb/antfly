@@ -15,7 +15,9 @@
 
 //! Bounded SQL pages over one pinned external snapshot. Conditions are evaluated
 //! before page limits, so short filtered pages never masquerade as exhaustion.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const catalog = @import("catalog.zig");
 const scalar = @import("scalar.zig");
 const rows = @import("../serverless/query/lake_rows.zig");
@@ -671,7 +673,7 @@ const TestLake = struct {
                 self.active -= 1;
                 self.mutex.unlock();
             }
-            if (self.delay_reads) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+            if (self.delay_reads) try platform.testing.io.sleep(.fromMilliseconds(5), .awake);
             const result = try base.getObject(bucket, key, options);
             self.lock();
             self.bytes += result.body.len;
@@ -1191,7 +1193,7 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
     defer lake.deinit(a);
     var cache = Cache.init(a);
     defer cache.deinit();
-    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = platform.testing.io });
     lake.meter.delay_reads = true;
     const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
     defer parent.close(parent.ptr);
@@ -1252,7 +1254,7 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
         var serial = try runtime.execute(a, fixture.backend(), &compiled, &.{}, .{});
         defer serial.deinit();
         var backend = fixture.backend();
-        backend.execution_io = std.testing.io;
+        backend.execution_io = platform.testing.io;
         var parallel = try runtime.execute(a, backend, &compiled, &.{}, .{});
         defer parallel.deinit();
         try std.testing.expectEqualDeep(serial.output.rows, parallel.output.rows);
@@ -1262,7 +1264,7 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
     var high = try compiler.compile(a, "SELECT amount, SUM(amount) FROM events GROUP BY amount ORDER BY amount LIMIT 3", .{});
     defer high.deinit();
     var backend = fixture.backend();
-    backend.execution_io = std.testing.io;
+    backend.execution_io = platform.testing.io;
     var small = try runtime.execute(a, backend, &high, &.{}, .{ .retained_bytes = 1024 * 1024 });
     defer small.deinit();
     try std.testing.expectEqual(@as(usize, 3), small.output.rows.len);
@@ -1281,7 +1283,7 @@ test "lake SQL empty independent Parquet layouts retain schema and exhaust witho
         defer lake.deinit(a);
         var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
         defer cache.deinit();
-        try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+        try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = platform.testing.io });
         const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
         defer parent.close(parent.ptr);
         try std.testing.expect((try parent.split_scan.?(parent.ptr, a, 4)) == null);
@@ -1409,7 +1411,7 @@ test "lake SQL ordered splits preserve serial identity ordering" {
     var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
     try lake.populate(a, 3, &.{ 1, 2, 3 });
     defer lake.deinit(a);
-    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = platform.testing.io });
     var ids: std.ArrayList([]const u8) = .empty;
     defer {
         for (ids.items) |id| a.free(id);
@@ -1564,7 +1566,7 @@ test "lake SQL candidate windows share owned projected reader plans after cursor
     defer lake.deinit(a);
     var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
     defer cache.deinit();
-    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = platform.testing.io });
     const ref: @import("../storage/rowsource/types.zig").RowRef = .{ .external = .{ .source_id = lake.source.inventory.source_id, .snapshot_id = lake.source.inventory.snapshot_id, .file_id = lake.source.inventory.files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 3 } };
     var previous: ?*anyopaque = null;
     for (0..3) |iteration| {

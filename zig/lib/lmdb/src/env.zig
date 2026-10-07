@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const format = @import("format.zig");
@@ -28,9 +30,9 @@ fn heapAllocator() std.mem.Allocator {
 const use_evented_async_runtime =
     build_options.lmdb_evented_async_io and
     builtin.os.tag == .macos and
-    @import("antfly_platform").Evented != void;
+    platform.Io.Evented != void;
 
-const AsyncRuntime = if (use_evented_async_runtime) @import("antfly_platform").Evented else std.Io.Threaded;
+const AsyncRuntime = if (use_evented_async_runtime) platform.Io.Evented else platform.Io.Threaded;
 // This module is built independently from the Antfly root module, so it cannot
 // import common/threaded_io_limits.zig. Keep the LMDB commit runtime finite at
 // the same conservative process-lifetime ceiling.
@@ -120,7 +122,7 @@ pub const CommitWorker = struct {
     use_async_runtime: bool = false,
     init_err: ?Error = null,
     pending: ?CommitTask = null,
-    scheduler: std.Io.Threaded,
+    scheduler: platform.Io.Threaded,
     future: ?std.Io.Future(void) = null,
     io_runtime: ?*AsyncRuntime = null,
 
@@ -133,7 +135,7 @@ pub const CommitWorker = struct {
             .use_async_runtime = use_async_runtime,
             // Keep the persistent coordinator independent of the optional
             // runtime that it creates on its own worker for commit I/O.
-            .scheduler = std.Io.Threaded.init(alloc, .{
+            .scheduler = platform.Io.Threaded.init(alloc, .{
                 .async_limit = .nothing,
                 .concurrent_limit = .limited(1),
             }),
@@ -274,10 +276,10 @@ pub const Environment = struct {
             fd,
             0,
         );
-        errdefer std.posix.munmap(mapped);
+        errdefer platform.filesystem.unmapMemory(mapped);
 
         if (opts.no_read_ahead) {
-            try std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.RANDOM);
+            try platform.filesystem.adviseMemory(mapped.ptr, mapped.len, platform.c.MADV.RANDOM);
         }
 
         const alloc = heapAllocator();
@@ -289,7 +291,7 @@ pub const Environment = struct {
             if (metas.active.meta.mm_address) |map_address| {
                 const current_address: *anyopaque = @ptrCast(mapped.ptr);
                 if (current_address != map_address) {
-                    std.posix.munmap(mapped);
+                    platform.filesystem.unmapMemory(mapped);
                     mapped = try mapFile(fd, file_len, opts, @ptrCast(@alignCast(map_address)));
                     metas = try selectMetas(mapped);
                     const remapped_address: *anyopaque = @ptrCast(mapped.ptr);
@@ -319,7 +321,7 @@ pub const Environment = struct {
         if (self.commit_worker) |worker| worker.destroy();
         if (self.reader_registry) |*registry| registry.close();
         self.releaseRetiredMappings();
-        std.posix.munmap(self.mapped);
+        platform.filesystem.unmapMemory(self.mapped);
         _ = std.posix.system.close(self.fd);
         heapAllocator().free(self.data_path);
         self.* = undefined;
@@ -332,7 +334,7 @@ pub const Environment = struct {
         if (file_len != self.mapped.len) {
             if (self.opts.fixed_map) {
                 const preferred_address = self.mapped.ptr;
-                std.posix.munmap(self.mapped);
+                platform.filesystem.unmapMemory(self.mapped);
                 self.mapped = try mapFile(
                     self.fd,
                     file_len,
@@ -346,7 +348,7 @@ pub const Environment = struct {
                     self.opts,
                     null,
                 );
-                errdefer std.posix.munmap(remapped);
+                errdefer platform.filesystem.unmapMemory(remapped);
                 try self.installRemappedMapping(remapped);
             }
         }
@@ -365,7 +367,7 @@ pub const Environment = struct {
         };
         if (self.opts.fixed_map) {
             const preferred_address = self.mapped.ptr;
-            std.posix.munmap(self.mapped);
+            platform.filesystem.unmapMemory(self.mapped);
             self.mapped = try mapFile(
                 self.fd,
                 size,
@@ -379,7 +381,7 @@ pub const Environment = struct {
                 self.opts,
                 null,
             );
-            errdefer std.posix.munmap(remapped);
+            errdefer platform.filesystem.unmapMemory(remapped);
             try self.installRemappedMapping(remapped);
         }
         self.metas = try selectMetas(self.mapped);
@@ -401,13 +403,13 @@ pub const Environment = struct {
 
     pub fn localReaderEnter(self: *Environment) void {
         lockAtomic(&self.mapping_mutex);
-        defer self.mapping_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.mapping_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
         self.local_readers += 1;
     }
 
     pub fn localReaderLeave(self: *Environment) void {
         lockAtomic(&self.mapping_mutex);
-        defer self.mapping_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.mapping_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
         std.debug.assert(self.local_readers > 0);
         self.local_readers -= 1;
         if (self.local_readers == 0) self.releaseRetiredMappingsLocked();
@@ -438,13 +440,13 @@ pub const Environment = struct {
 
     pub fn commitStatsSnapshot(self: *Environment) CommitStats {
         lockAtomic(&self.commit_stats_mutex);
-        defer self.commit_stats_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.commit_stats_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
         return self.commit_stats;
     }
 
     pub fn recordCommitStats(self: *Environment, delta: CommitStatsDelta) void {
         lockAtomic(&self.commit_stats_mutex);
-        defer self.commit_stats_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.commit_stats_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
         self.commit_stats.publish_calls += delta.publish_calls;
         self.commit_stats.full_publish_calls += delta.full_publish_calls;
         self.commit_stats.selected_sync_calls += delta.selected_sync_calls;
@@ -464,7 +466,7 @@ pub const Environment = struct {
     pub fn ensureCommitWorker(self: *Environment, use_async_runtime: bool) Error!*CommitWorker {
         if (self.opts.read_only) return error.Incompatible;
         lockAtomic(&self.commit_resource_mutex);
-        defer self.commit_resource_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.commit_resource_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
         if (self.commit_worker == null) {
             self.commit_worker = try CommitWorker.create(use_async_runtime);
         }
@@ -474,7 +476,7 @@ pub const Environment = struct {
     pub fn ensureAsyncRuntime(self: *Environment) Error!*AsyncRuntime {
         if (self.opts.read_only) return error.Incompatible;
         lockAtomic(&self.commit_resource_mutex);
-        defer self.commit_resource_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.commit_resource_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
         if (self.io_runtime == null) {
             const runtime = heapAllocator().create(AsyncRuntime) catch return error.OutOfMemory;
             errdefer heapAllocator().destroy(runtime);
@@ -494,7 +496,7 @@ pub const Environment = struct {
     fn selectAdaptiveCommitBackendCached(self: *Environment) CommitBackend {
         const stats = self.commitStatsSnapshot();
         lockAtomic(&self.adaptive_mutex);
-        defer self.adaptive_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.adaptive_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
         if (stats.publish_calls < self.adaptive_recheck_after) {
             return self.adaptive_backend;
         }
@@ -529,12 +531,12 @@ pub const Environment = struct {
 
     fn installRemappedMapping(self: *Environment, remapped: MappedBytes) Error!void {
         lockAtomic(&self.mapping_mutex);
-        defer self.mapping_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.mapping_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
 
         const previous = self.mapped;
         if (self.local_readers == 0) {
             self.mapped = remapped;
-            std.posix.munmap(previous);
+            platform.filesystem.unmapMemory(previous);
             return;
         }
 
@@ -544,19 +546,19 @@ pub const Environment = struct {
 
     fn releaseRetiredMappings(self: *Environment) void {
         lockAtomic(&self.mapping_mutex);
-        defer self.mapping_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
+        defer self.mapping_mutex.unlock(platform.Io.Threaded.global_single_threaded.io());
         self.releaseRetiredMappingsLocked();
         self.retired_mappings.deinit(heapAllocator());
     }
 
     fn releaseRetiredMappingsLocked(self: *Environment) void {
-        for (self.retired_mappings.items) |mapping| std.posix.munmap(mapping);
+        for (self.retired_mappings.items) |mapping| platform.filesystem.unmapMemory(mapping);
         self.retired_mappings.clearRetainingCapacity();
     }
 };
 
 fn lockAtomic(mutex: *std.Io.Mutex) void {
-    mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+    mutex.lockUncancelable(platform.Io.Threaded.global_single_threaded.io());
 }
 
 pub fn initAsyncRuntime(runtime: *AsyncRuntime) Error!void {
@@ -726,16 +728,16 @@ fn writeMetaPage(page_bytes: []u8, pgno: format.Pgno, page_size: u32, txnid: for
 }
 
 test "environment opens directory-backed data file and selects newest meta" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var env_dir = try tmp.dir.createDirPathOpen(std.testing.io, "env", .{});
-    defer env_dir.close(std.testing.io);
+    var env_dir = try tmp.dir.createDirPathOpen(platform.testing.io, "env", .{});
+    defer env_dir.close(platform.testing.io);
 
     var bytes: [4096 * 2]u8 = undefined;
     writeMetaPage(bytes[0..4096], 0, 4096, 3);
     writeMetaPage(bytes[4096..8192], 1, 4096, 7);
-    try env_dir.writeFile(std.testing.io, .{ .sub_path = "data.mdb", .data = &bytes });
+    try env_dir.writeFile(platform.testing.io, .{ .sub_path = "data.mdb", .data = &bytes });
 
     var path_buf: [256]u8 = undefined;
     const env_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/env", .{tmp.sub_path});
@@ -751,13 +753,13 @@ test "environment opens directory-backed data file and selects newest meta" {
 }
 
 test "environment opens MDB_NOSUBDIR-style file path" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var bytes: [2048 * 2]u8 = undefined;
     writeMetaPage(bytes[0..2048], 0, 2048, 1);
     writeMetaPage(bytes[2048..4096], 1, 2048, 2);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "single.mdb", .data = &bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "single.mdb", .data = &bytes });
 
     var path_buf: [256]u8 = undefined;
     const file_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/single.mdb", .{tmp.sub_path});
@@ -771,13 +773,13 @@ test "environment opens MDB_NOSUBDIR-style file path" {
 }
 
 test "environment supports no_read_ahead advisory" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var bytes: [2048 * 2]u8 = undefined;
     writeMetaPage(bytes[0..2048], 0, 2048, 1);
     writeMetaPage(bytes[2048..4096], 1, 2048, 2);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "random.mdb", .data = &bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "random.mdb", .data = &bytes });
 
     var path_buf: [256]u8 = undefined;
     const file_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/random.mdb", .{tmp.sub_path});
@@ -792,11 +794,11 @@ test "environment supports no_read_ahead advisory" {
 }
 
 test "environment rejects files without valid meta pages" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const bytes = @as([4096]u8, @splat(0));
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "broken.mdb", .data = &bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "broken.mdb", .data = &bytes });
 
     var path_buf: [256]u8 = undefined;
     const file_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/broken.mdb", .{tmp.sub_path});
@@ -830,12 +832,12 @@ test "commit worker serializes synchronous submitters and owns optional I/O" {
         var ctx = Context{ .worker = worker };
         var futures: [4]std.Io.Future(void) = undefined;
         var started: usize = 0;
-        defer for (futures[0..started]) |*future| future.await(std.testing.io);
+        defer for (futures[0..started]) |*future| future.await(platform.testing.io);
         for (&futures) |*future| {
-            future.* = try std.testing.io.concurrent(Context.submit, .{&ctx});
+            future.* = try platform.testing.io.concurrent(Context.submit, .{&ctx});
             started += 1;
         }
-        for (futures[0..started]) |*future| future.await(std.testing.io);
+        for (futures[0..started]) |*future| future.await(platform.testing.io);
         started = 0;
         try std.testing.expectEqual(@as(u32, 64), ctx.total.load(.acquire));
         try std.testing.expect(!ctx.overlap.load(.acquire));
@@ -845,7 +847,7 @@ test "commit worker serializes synchronous submitters and owns optional I/O" {
 
 test "commit worker maps unavailable scheduling capacity without publishing ready" {
     var worker = CommitWorker{
-        .scheduler = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing }),
+        .scheduler = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing }),
     };
     defer worker.scheduler.deinit();
     try std.testing.expectError(error.OutOfMemory, worker.start());

@@ -35,7 +35,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = platform.sync;
 const platform = @import("antfly_platform");
 const zig_lmdb = @import("lmdb_engine");
 const lmdb_sim_test = @import("lmdb_sim_test.zig");
@@ -62,7 +62,7 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 }
 
 fn backoffWriterLockRetry() void {
-    std.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_lock_retry_sleep_ns)), .awake) catch {};
+    platform.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_lock_retry_sleep_ns)), .awake) catch {};
 }
 
 fn lockWrapperEnvironment(env: *Environment) void {
@@ -2492,7 +2492,7 @@ test "zig backend wrapper shares one environment across concurrent reader and wr
                     self.err = err;
                     return;
                 };
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
 
@@ -2516,7 +2516,7 @@ test "zig backend wrapper shares one environment across concurrent reader and wr
                     },
                 };
                 _ = self.env.commitStatsSnapshot();
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+                platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             }
         }
     };
@@ -2531,11 +2531,11 @@ test "zig backend wrapper shares one environment across concurrent reader and wr
     var writer = Worker{ .env = &env, .iterations = 128 };
     var reader = Worker{ .env = &env, .iterations = 256 };
 
-    var writer_thread = try std.testing.io.concurrent(Worker.runWriter, .{&writer});
-    defer writer_thread.await(std.testing.io);
-    var reader_thread = try std.testing.io.concurrent(Worker.runReader, .{&reader});
-    writer_thread.await(std.testing.io);
-    reader_thread.await(std.testing.io);
+    var writer_thread = try platform.testing.io.concurrent(Worker.runWriter, .{&writer});
+    defer writer_thread.await(platform.testing.io);
+    var reader_thread = try platform.testing.io.concurrent(Worker.runReader, .{&reader});
+    writer_thread.await(platform.testing.io);
+    reader_thread.await(platform.testing.io);
 
     if (writer.err) |err| return err;
     if (reader.err) |err| return err;
@@ -2880,22 +2880,22 @@ fn runZigMixedModeSoak(base_opts: EnvironmentOptions) !void {
 
 fn tmpPath(buf: []u8) [*:0]const u8 {
     const base = "/tmp/antfly-lmdb-test-";
-    var tspec: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &tspec))) {
+    var tspec: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &tspec))) {
         .SUCCESS => {},
         else => unreachable,
     }
     const ts = @as(u64, @intCast(tspec.sec)) * std.time.ns_per_s + @as(u64, @intCast(tspec.nsec));
     const pid: u32 = @intCast(std.posix.system.getpid());
     const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, pid, ts }) catch unreachable;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

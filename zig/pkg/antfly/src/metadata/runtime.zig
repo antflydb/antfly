@@ -27,7 +27,7 @@ const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("antfly_local_sources").storage_background_runtime;
 const metadata_http_client = @import("http_client.zig");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const thread_config = @import("antfly_local_sources").runtime_thread_config;
 
 const linked_storage = storage_source_options.control_only;
@@ -511,7 +511,7 @@ pub const ServerConfig = struct {
 
 test "metadata server online merge default preserves unsupported startup and explicit disable" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-install", .{tmp.sub_path});
     defer alloc.free(root);
@@ -1040,7 +1040,7 @@ pub fn runFromIterator(
     }
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
-    var setup_io = std.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
+    var setup_io = platform.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
@@ -1639,7 +1639,7 @@ fn resolveExtensionPackageStoreDirWithEnv(
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
-    const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(std.Options.debug_io, path, alloc) catch |err| switch (err) {
+    const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(platform.debug_io, path, alloc) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => null,
         else => return err,
     };
@@ -2028,7 +2028,7 @@ test "metadata runtime cli accepts secret and extension package store paths" {
         "--extension-package-store",
         "/opt/antfly/extensions",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("/run/antfly/secrets/secrets.json", cfg.secret_store_paths.items[0]);
@@ -2038,17 +2038,17 @@ test "metadata runtime cli accepts secret and extension package store paths" {
 test "metadata runtime cli online merge defaults on and accepts explicit disable" {
     try std.testing.expect((CliConfig{}).online_merge_enabled);
     var argv = [_][*:0]const u8{ "--online-merge-enabled", "true" };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.online_merge_enabled);
     var off = [_][*:0]const u8{"--online-merge-enabled=false"};
-    var off_iter = std.process.Args.Iterator.init(.{ .vector = off[0..] });
+    var off_iter = platform.process.argsIterator(off[0..]);
     var off_cfg = try parseCli(std.testing.allocator, &off_iter);
     defer off_cfg.deinit(std.testing.allocator);
     try std.testing.expect(!off_cfg.online_merge_enabled);
     var invalid = [_][*:0]const u8{"--online-merge-enabled=maybe"};
-    var invalid_iter = std.process.Args.Iterator.init(.{ .vector = invalid[0..] });
+    var invalid_iter = platform.process.argsIterator(invalid[0..]);
     try std.testing.expectError(error.InvalidArguments, parseCli(std.testing.allocator, &invalid_iter));
 }
 
@@ -2059,7 +2059,7 @@ test "metadata runtime cli accepts layered secret store paths" {
         "--secret-store-path",
         "/run/antfly/system-secrets/secrets.json",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), cfg.secret_store_paths.items.len);
@@ -2071,7 +2071,7 @@ test "metadata runtime cli accepts auth flag" {
     var argv = [_][*:0]const u8{
         "--auth=true",
     };
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, cfg.auth_enabled.?);
@@ -2079,7 +2079,7 @@ test "metadata runtime cli accepts auth flag" {
 
 test "metadata runtime cli accepts experimental flag" {
     var argv = [_][*:0]const u8{"--experimental"};
-    var iter = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var iter = platform.process.argsIterator(argv[0..]);
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expect(cfg.experimental);
@@ -2142,7 +2142,7 @@ test "metadata runtime cluster json carries raft and orchestration endpoints" {
 
 test "metadata runtime preserves trusted principal auth material bytes" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-trusted-principal-secrets.json", .{tmp.sub_path});
@@ -2230,7 +2230,7 @@ fn printMetadataMemorySoakSample(label: []const u8, round: usize, memory: anytyp
 }
 
 test "metadata runtime server uses wal replica state backend by default" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-default-wal/replicas", .{tmp.sub_path});
@@ -2252,7 +2252,7 @@ test "metadata runtime server uses wal replica state backend by default" {
 }
 
 test "metadata runtime legacy multi-node cluster config does not require orchestration endpoints at startup" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-legacy-cluster/replicas", .{tmp.sub_path});
@@ -2401,7 +2401,7 @@ test "metadata runtime scales bootstrap campaign retry interval with tick" {
 }
 
 test "metadata runtime serves raft and admin listener requests on threaded io connections" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-threaded-listener/replicas", .{tmp.sub_path});
@@ -2429,7 +2429,7 @@ test "metadata runtime serves raft and admin listener requests on threaded io co
 }
 
 test "metadata runtime metrics expose memory ownership buckets" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-metrics/replicas", .{tmp.sub_path});
@@ -2489,7 +2489,7 @@ test "metadata runtime memory soak diagnostic" {
     const table_count = @max(@as(usize, 1), metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_TABLES", 4));
     const ranges_per_table = @max(@as(usize, 1), metadataMemorySoakEnvUsize("ANTFLY_METADATA_MEMORY_SOAK_RANGES_PER_TABLE", 8));
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(soak_alloc, ".zig-cache/tmp/{s}/metadata-memory-soak/replicas", .{tmp.sub_path});
@@ -2725,10 +2725,10 @@ fn awaitMetadataTestPrefix(server: *Server) !void {
     const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
     while (true) {
         try svc.runRaftRoundOnly();
-        svc.runtime_mutex.lockUncancelable(std.Options.debug_io);
+        svc.runtime_mutex.lockUncancelable(platform.debug_io);
         const pending = svc.raft.pending_updates.items.len;
         const status_value = svc.raft.host.http_host.host.raftStatus(svc.metadata_group_id);
-        svc.runtime_mutex.unlock(std.Options.debug_io);
+        svc.runtime_mutex.unlock(platform.debug_io);
         if (pending == 0) if (status_value) |value| {
             if (value.last_index != 0) {
                 try svc.waitForTransitionApplied(.{ .term = value.last_term, .index = value.last_index });
@@ -2736,7 +2736,7 @@ fn awaitMetadataTestPrefix(server: *Server) !void {
             }
         };
         if (platform_time.monotonicNs() >= deadline) return error.MetadataTestPrefixTimeout;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
 }
 
@@ -2752,12 +2752,12 @@ fn awaitMetadataTestControlProjection(server: *Server) !void {
             svc.local_placement_epoch != null and
             svc.local_placement_epoch.? == svc.placement_epoch.load(.monotonic)) return;
         if (platform_time.monotonicNs() >= deadline) return error.MetadataTestControlProjectionTimeout;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
 }
 
 test "metadata runtime preserves projected tables across restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-restart/replicas", .{tmp.sub_path});
@@ -2818,7 +2818,7 @@ test "metadata runtime preserves projected tables across restart" {
 }
 
 test "metadata runtime bootstrapLocal skips local replica-root reconcile on the bootstrap round" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-runtime-bootstrap-skip/replicas", .{tmp.sub_path});
@@ -2869,7 +2869,7 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
 
 test "metadata ownership rejects direct data replica admission" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
     defer paths.deinit(alloc);
@@ -2892,7 +2892,7 @@ test "metadata ownership rejects direct data replica admission" {
 
 test "metadata ownership ignores retained foreign catalog before serving" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
     defer paths.deinit(alloc);
@@ -2931,7 +2931,7 @@ test "metadata ownership ignores retained foreign catalog before serving" {
 
 test "metadata ownership excludes colliding data placements across control rounds and restart" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
     defer paths.deinit(alloc);
@@ -2994,7 +2994,7 @@ test "metadata ownership excludes colliding data placements across control round
 
 test "metadata ownership never provisions data roots on repeated control rounds" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
     defer paths.deinit(alloc);
@@ -3071,7 +3071,7 @@ const MetadataOwnershipProjectionCase = enum { progress, scalar_route, batch_rou
 
 fn exerciseMetadataOwnershipProjection(case: MetadataOwnershipProjectionCase) !void {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const paths = try MetadataOwnershipTestPaths.init(alloc, &tmp.sub_path);
     defer paths.deinit(alloc);

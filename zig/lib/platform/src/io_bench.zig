@@ -22,7 +22,7 @@ const read_ops = 16384;
 const write_ops = 128;
 const Workload = enum { cached_read, durable_write };
 const Worker = struct {
-    io: std.Io,
+    io: platform.Io.Context,
     file: std.Io.File,
     workload: Workload,
     index: usize,
@@ -53,7 +53,7 @@ const Worker = struct {
         return checksum;
     }
 };
-fn measure(io: std.Io, file: std.Io.File, workload: Workload, concurrency: usize) !u64 {
+fn measure(io: platform.Io.Context, file: std.Io.File, workload: Workload, concurrency: usize) !u64 {
     var futures: [32]std.Io.Future(anyerror!u64) = undefined;
     var launched: usize = 0;
     var joined: usize = 0;
@@ -87,7 +87,7 @@ fn measure(io: std.Io, file: std.Io.File, workload: Workload, concurrency: usize
     if (checksum != expected) return error.ChecksumMismatch;
     return elapsed;
 }
-fn verifyWrites(io: std.Io, file: std.Io.File) !void {
+fn verifyWrites(io: platform.Io.Context, file: std.Io.File) !void {
     var actual: [block_size]u8 = undefined;
     var expected: [block_size]u8 = undefined;
     for (0..write_ops) |op| {
@@ -102,12 +102,12 @@ pub fn main(init: std.process.Init) !void {
     const directory = args.next() orelse return error.ExpectedExistingTemporaryDirectory;
     const samples = if (args.next()) |value| try std.fmt.parseInt(usize, value, 10) else 7;
     if (samples == 0 or args.next() != null) return error.InvalidArguments;
-    const threaded = try init.gpa.create(std.Io.Threaded);
+    const threaded = try init.gpa.create(platform.Io.Threaded);
     defer init.gpa.destroy(threaded);
-    threaded.* = std.Io.Threaded.init(init.gpa, .{ .concurrent_limit = .limited(64), .async_limit = .nothing });
+    threaded.* = platform.Io.Threaded.init(init.gpa, .{ .concurrent_limit = .limited(64), .async_limit = .nothing });
     defer threaded.deinit();
     const io = threaded.io();
-    const evented = try init.gpa.create(platform.Evented);
+    const evented = try init.gpa.create(platform.Io.Evented);
     defer init.gpa.destroy(evented);
     try evented.init(init.gpa, .{});
     defer evented.deinit();

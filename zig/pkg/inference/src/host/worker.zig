@@ -347,7 +347,7 @@ fn fileExists(io: std.Io, path: []const u8) bool {
 /// loaded from, independent of argv[0] -- which belongs to whatever process
 /// linked libantfly and is meaningless as a worker executable candidate.
 fn selfImagePathAlloc(alloc: std.mem.Allocator) ![]u8 {
-    if (comptime !builtin.link_libc) return error.Unsupported;
+    if (comptime !builtin.link_libc or builtin.os.tag == .windows) return error.Unsupported;
     var info: DlInfo = undefined;
     const anchor: *const anyopaque = @ptrCast(&selfImagePathAlloc);
     if (dladdr(anchor, &info) == 0) return error.Unsupported;
@@ -936,7 +936,7 @@ test "inference worker retains reservations until reaped cleanup and owns partia
     var budget: Budget = .{};
     var client: Client = .{
         .alloc = alloc,
-        .io = std.testing.io,
+        .io = platform.testing.io,
         .create_json = undefined,
         .environment = undefined,
         .budget = .{
@@ -954,7 +954,7 @@ test "inference worker retains reservations until reaped cleanup and owns partia
     var worker: Worker = .{
         .owner = &client,
         .child = undefined,
-        .endpoint = .{ .alloc = alloc, .io = std.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.rejectRequest, .resource_handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
+        .endpoint = .{ .alloc = alloc, .io = platform.testing.io, .input = undefined, .output = undefined, .context = undefined, .handler = Worker.rejectRequest, .resource_handler = Worker.resourceRequest, .on_closed = Worker.closed, .next_id = 1 },
     };
     defer worker.releaseResources();
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -1010,18 +1010,18 @@ test "inference worker retains reservations until reaped cleanup and owns partia
         fn concurrent(raw: ?*anyopaque, group: *std.Io.Group, context: []const u8, alignment: std.mem.Alignment, start: *const fn (*const anyopaque) void) std.Io.ConcurrentError!void {
             groups += 1;
             if (groups == fail_at) return error.ConcurrencyUnavailable;
-            return std.testing.io.vtable.groupConcurrent(raw, group, context, alignment, start);
+            return platform.testing.io.vtable.groupConcurrent(raw, group, context, alignment, start);
         }
         fn spawn(raw: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
             var modified = options;
             modified.argv = &.{"/bin/cat"};
             modified.environ_map = null;
-            return std.testing.io.vtable.processSpawn(raw, modified);
+            return platform.testing.io.vtable.processSpawn(raw, modified);
         }
         fn kill(raw: ?*anyopaque, child: *std.process.Child) void {
             kills += 1;
             if (kills == 1) {
-                std.testing.io.vtable.childKill(raw, child);
+                platform.testing.io.vtable.childKill(raw, child);
             } else {
                 // Count a duplicate cleanup without signaling a reused PID or
                 // closing unrelated descriptors if this regression returns.
@@ -1032,11 +1032,11 @@ test "inference worker retains reservations until reaped cleanup and owns partia
             }
         }
     };
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.groupConcurrent = Fault.concurrent;
     vtable.processSpawn = Fault.spawn;
     vtable.childKill = Fault.kill;
-    client.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    client.io = .{ .userdata = platform.testing.io.userdata, .vtable = &vtable };
     // Failure before any reader, failure after the reader owns cleanup, and
     // failure during initialization must all use the same child handle. With
     // no injected spawn failure, cat echoes our offer as an invalid peer frame.

@@ -16,7 +16,9 @@
 //! Exact source payload ownership independent of ANN index lifetime.
 //! Immutable identities include the complete logical artifact key and envelope.
 //! Primary commit, not preparation in this store, selects visible artifacts.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const payload = @import("artifact_payload.zig");
 const native = @import("vector_block_store.zig");
 const lsm = @import("lsm_backend/mod.zig");
@@ -25,7 +27,7 @@ const erased = @import("backend_erased.zig");
 const vector_block = @import("antfly_vectorindex").vector_block;
 const Allocator = std.mem.Allocator;
 const resources = @import("resource_manager.zig");
-const time = @import("antfly_platform").time;
+const time = platform.time;
 const LiveSet = @import("source_vector_live_set.zig").LiveSet;
 const generation_publication = @import("generation_publication.zig");
 
@@ -69,7 +71,7 @@ const MarkInterleaving = if (@import("builtin").is_test) struct {
 
     fn pause(_: *Store) void {
         entered.store(true, .release);
-        while (!resume_scan.load(.acquire)) @import("antfly_platform").time.yieldNow();
+        while (!resume_scan.load(.acquire)) platform.time.yieldNow();
     }
     fn scan(source: *Store) void {
         source.advanceMarkingSnapshot() catch |err| {
@@ -85,7 +87,7 @@ const MarkInterleaving = if (@import("builtin").is_test) struct {
         const start = time.monotonicNs();
         while (!flag.load(.acquire)) {
             if (time.monotonicNs() -| start > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
         }
     }
 } else void;
@@ -116,8 +118,8 @@ pub const Store = struct {
     /// Candidate references are protected by the durable migration job until
     /// all primary rows and their final reference coverage have been verified.
     migration_retention: std.atomic.Value(bool) = .init(false),
-    migration_disk_reserve: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    migration_temporary_limit: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    migration_disk_reserve: platform.atomic.Value(u64) = .init(0),
+    migration_temporary_limit: platform.atomic.Value(u64) = .init(0),
 
     alloc: Allocator,
     mutex: std.atomic.Mutex = .unlocked,
@@ -131,8 +133,8 @@ pub const Store = struct {
     checkpoint_write_waiters: std.atomic.Value(usize) = .init(0),
     checkpoint_epoch: std.atomic.Value(u32) = .init(0),
     checkpoint_test_hook: if (@import("builtin").is_test) ?*const fn (*Store, CheckpointPhase) anyerror!void else void = if (@import("builtin").is_test) null else {},
-    active_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    session_start_epoch: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    active_sessions: platform.atomic.Value(u64) = .init(0),
+    session_start_epoch: platform.atomic.Value(u64) = .init(0),
     read_stats: ReadStats = .{},
     opened: native.Opened,
     stats: Stats = .{},
@@ -194,7 +196,7 @@ pub const Store = struct {
     prepare_head: ?*PrepareRequest = null,
     prepare_tail: ?*PrepareRequest = null,
     prepare_running: bool = false,
-    prepare_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    prepare_requests: platform.atomic.Value(u64) = .init(0),
 
     directory: ?*@import("source_location_directory.zig").Directory = null,
 
@@ -232,21 +234,21 @@ pub const Store = struct {
             std.atomic.spinLoopHint();
             return;
         }
-        std.Io.Threaded.global_single_threaded.io().futexWaitUncancelable(u32, &self.checkpoint_epoch.raw, observed);
+        platform.Io.Threaded.global_single_threaded.io().futexWaitUncancelable(u32, &self.checkpoint_epoch.raw, observed);
     }
 
     fn notifyCheckpointFinished(self: *Store) void {
         _ = self.checkpoint_epoch.fetchAdd(1, .release);
         if (comptime @import("builtin").os.tag != .freestanding)
-            std.Io.Threaded.global_single_threaded.io().futexWake(u32, &self.checkpoint_epoch.raw, std.math.maxInt(u32));
+            platform.Io.Threaded.global_single_threaded.io().futexWake(u32, &self.checkpoint_epoch.raw, std.math.maxInt(u32));
     }
 
     const ReadStats = struct {
-        resolved_payloads: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        resolved_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        snapshot_read_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        catalog_metadata_bytes_shared: @import("antfly_platform").atomic.Value(u64) = .init(0),
-        catalog_metadata_bytes_copied: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        resolved_payloads: platform.atomic.Value(u64) = .init(0),
+        resolved_bytes: platform.atomic.Value(u64) = .init(0),
+        snapshot_read_ns: platform.atomic.Value(u64) = .init(0),
+        catalog_metadata_bytes_shared: platform.atomic.Value(u64) = .init(0),
+        catalog_metadata_bytes_copied: platform.atomic.Value(u64) = .init(0),
     };
 
     const ReadView = struct {
@@ -271,7 +273,7 @@ pub const Store = struct {
     }
 
     fn lockPublication(self: *Store) void {
-        while (!self.publication_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+        while (!self.publication_mutex.tryLock()) platform.time.yieldNow();
     }
 
     // Allocate before durability. Publication itself cannot fail and never
@@ -1211,7 +1213,7 @@ pub const Store = struct {
             if (self.marking) |marking| {
                 if (marking.running) {
                     self.mutex.unlock();
-                    @import("antfly_platform").time.yieldNow();
+                    platform.time.yieldNow();
                     continue;
                 }
                 marking.deinit(self.alloc);
@@ -1540,7 +1542,7 @@ pub const Store = struct {
         return @ptrCast(@alignCast(ptr));
     }
     fn lock(self: *Store) void {
-        while (!self.mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+        while (!self.mutex.tryLock()) platform.time.yieldNow();
     }
     fn retain(ptr: *anyopaque) void {
         const self = cast(ptr);
@@ -1638,13 +1640,13 @@ pub const Store = struct {
                     return;
                 },
                 2 => return if (request.err) |err| err else {},
-                else => @import("antfly_platform").time.yieldNow(),
+                else => platform.time.yieldNow(),
             }
         }
     }
 
     fn queueLock(self: *Store) void {
-        while (!self.prepare_queue_mutex.tryLock()) @import("antfly_platform").time.yieldNow();
+        while (!self.prepare_queue_mutex.tryLock()) platform.time.yieldNow();
     }
 
     /// Cancelling unpublished work retains every preparation in the WAL.
@@ -1769,7 +1771,7 @@ pub const Store = struct {
         if (reserve != 0) {
             var bytes: u64 = 0;
             for (prepared) |item| bytes +|= @as(u64, item.artifact.len) *| 8;
-            const capacity = try @import("antfly_platform").filesystem.capacity(self.opened.store.root_dir);
+            const capacity = try platform.filesystem.capacity(self.opened.store.root_dir);
             if (capacity.available_bytes < reserve +| bytes) return error.VectorMigrationDiskReserve;
         }
         // Decode independent artifact envelopes before entering source writer
@@ -3317,7 +3319,7 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
             self.count += 1;
         }
         fn sink(self: *@This()) payload.DenseSink {
-            return .{ .ptr = self, .put = put, .io = std.testing.io };
+            return .{ .ptr = self, .put = put, .io = platform.testing.io };
         }
     };
     var sink: Sink = .{ .source = &source, .expected = &.{ 1, -0.0, 3 } };
@@ -3427,7 +3429,7 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
     var reference = try payload.Reference.forArtifact(key, first);
     reference.digest[0] ^= 1;
     var scratch: [3]f32 = undefined;
-    try std.testing.expectError(error.MissingCommittedVectorPayload, Store.resolveDenseBatch(&source, &.{.{ .key = key, .reference = reference }}, 3, &scratch, std.testing.io));
+    try std.testing.expectError(error.MissingCommittedVectorPayload, Store.resolveDenseBatch(&source, &.{.{ .key = key, .reference = reference }}, 3, &scratch, platform.testing.io));
 }
 
 test "source vector payloads collect obsolete versions only after readers retire" {
@@ -4547,7 +4549,7 @@ test "source vector payloads group commit batches waiting preparations without a
         source.prepare_queue_mutex.unlock();
         if (queued == 8) break;
         if (time.monotonicNs() > deadline) return error.TestUnexpectedResult;
-        @import("antfly_platform").time.yieldNow();
+        platform.time.yieldNow();
     }
     for (&contexts) |*ctx| try std.testing.expect(!ctx.done.load(.acquire));
     source.queueLock();
@@ -5513,7 +5515,7 @@ test "source vector payloads publication allocation failures preserve usable aut
             if (!failing.has_induced_failure) {
                 try std.testing.expect(try result);
                 try std.testing.expect(mode_failures > 0);
-                if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
+                if (platform.env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
                     std.debug.print("\nWORK payload publication incremental={} attempts={d}\n", .{ incremental, fail_index + 1 });
                 break;
             }
@@ -6222,7 +6224,7 @@ fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPha
         fn hook(_: *Store, current: Store.CheckpointPhase) !void {
             if (current != phase) return;
             entered.store(true, .release);
-            while (!resume_work.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            while (!resume_work.load(.acquire)) platform.time.yieldNow();
         }
         fn run(source: *Store) void {
             source.lock();
@@ -6276,7 +6278,7 @@ fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPha
         Store.retain(&source);
         defer Store.release(&source);
         var vector: [2]f32 = undefined;
-        const stats = try Store.resolveDenseBatch(&source, &.{.{ .key = "model-a", .reference = ref1 }}, 2, &vector, std.testing.io);
+        const stats = try Store.resolveDenseBatch(&source, &.{.{ .key = "model-a", .reference = ref1 }}, 2, &vector, platform.testing.io);
         try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, &vector);
         try std.testing.expectEqual(@as(u64, 1), stats.positional_batches);
         const artifact = try Store.resolve(&source, alloc, "model-a", ref1);
@@ -6305,12 +6307,12 @@ fn checkPublishedCheckpointProgress(base: bool, pause_phase: Store.CheckpointPha
         const wait_started = time.monotonicNs();
         while (source.checkpoint_write_waiters.load(.acquire) == 0) {
             if (time.monotonicNs() -| wait_started > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
         }
         // A blocked writer releases SourceLock so publication can finish.
         while (!source.mutex.tryLock()) {
             if (time.monotonicNs() -| wait_started > 10 * std.time.ns_per_s) return error.InterleavingTimedOut;
-            @import("antfly_platform").time.yieldNow();
+            platform.time.yieldNow();
         }
         source.mutex.unlock();
     } else {

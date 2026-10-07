@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Ledger = @import("obsolete_ledger.zig").Ledger;
 const Account = @import("memory_account.zig").Account;
 const runtime = @import("runtime.zig");
@@ -191,9 +193,9 @@ test "ledger reclamation preserves administrative fences and drains under cancel
     Hook.visits = 0;
     Hook.sleeps = 0;
     Hook.wakes = 0;
-    var io_vtable = std.testing.io.vtable.*;
+    var io_vtable = platform.testing.io.vtable.*;
     io_vtable.sleep = Hook.sleep;
-    var io = std.testing.io;
+    var io = platform.testing.io;
     io.vtable = &io_vtable;
     var manager = resources.ResourceManager.init(.{});
     var backend = Backend.init(std.testing.allocator, .{ .resource_manager = &manager, .read_runtime = .{ .io = io }, .maintenance_waker = .{ .ptr = &manager, .wake_fn = Hook.wake } });
@@ -334,21 +336,21 @@ test "ledger reclamation checkpoint churn benchmark" {
         var old = baseline.fork();
         baseline.deinit(allocator);
         try std.testing.expect(backend.mu.tryLock());
-        const old_start = std.Io.Clock.awake.now(std.testing.io);
+        const old_start = std.Io.Clock.awake.now(platform.testing.io);
         old.deinit(allocator);
-        const old_ns = old_start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+        const old_ns = old_start.durationTo(std.Io.Clock.awake.now(platform.testing.io)).toNanoseconds();
         backend.mu.unlock();
         try fill(allocator, &baseline, count);
         const snapshot = try Snapshot.capture(&backend, &baseline);
         baseline.deinit(allocator);
         try std.testing.expect(backend.mu.tryLock());
-        const start = std.Io.Clock.awake.now(std.testing.io);
+        const start = std.Io.Clock.awake.now(platform.testing.io);
         snapshot.retire(&backend);
-        const handoff_ns = start.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+        const handoff_ns = start.durationTo(std.Io.Clock.awake.now(platform.testing.io)).toNanoseconds();
         backend.mu.unlock();
-        const cleanup = std.Io.Clock.awake.now(std.testing.io);
+        const cleanup = std.Io.Clock.awake.now(platform.testing.io);
         backend.drainRetiredLedgers();
-        const cleanup_ns = cleanup.durationTo(std.Io.Clock.awake.now(std.testing.io)).toNanoseconds();
+        const cleanup_ns = cleanup.durationTo(std.Io.Clock.awake.now(platform.testing.io)).toNanoseconds();
         std.debug.print("\nledger-churn paths={d} old_locked_ns={d} handoff_ns={d} cleanup_ns={d} slices={d} max_slice_ns={d}\n", .{ count, old_ns, handoff_ns, cleanup_ns, backend.ledger_reclaim_slices, backend.ledger_reclaim_max_slice_ns });
     }
 }

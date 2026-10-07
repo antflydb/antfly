@@ -14,17 +14,19 @@
 // limitations under the License.
 
 //! End-to-end LSM lifecycle and standby contracts, plus reproducible work counts.
+const platform = @import("antfly_platform");
 const server_test_adapter = if (builtin.is_test) @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter else struct {};
 const builtin = @import("builtin");
 const hot_standby_publisher_adapter = @import("antfly_server_test_sources").local_test_sources.storage_hot_standby_db_commit;
 const replication_ingress = @import("replication_ingress.zig");
 const std = @import("std");
+
 const db_mod = @import("mod.zig");
 const rows = @import("relational_rows.zig");
 const records = @import("relational_index_records.zig");
 const internal = @import("../internal_keys.zig");
 const primary_mod = @import("antfly_server_test_sources").local_test_sources.storage_hot_standby_primary;
-const time = @import("antfly_platform").time;
+const time = platform.time;
 const alloc = std.testing.allocator;
 
 test {
@@ -600,7 +602,7 @@ test "relational index system automatic bounds use compiled collation identity" 
     } });
     defer reader.deinit();
     try std.testing.expectEqualStrings("z_binary", reader.index.?.name);
-    var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+    var page = try reader.nextPage(alloc, platform.testing.io, .{ .time_ns = std.time.ns_per_s });
     defer page.deinit();
     try std.testing.expectEqual(@as(usize, 1), page.rows.len);
     try std.testing.expectEqualStrings("upper", page.rows[0].key);
@@ -637,7 +639,7 @@ test "relational index system automatic ranges and snapshot costing bound scan w
         defer reader.deinit();
         try std.testing.expectEqualStrings("tenant_score", reader.index.?.name);
         try std.testing.expectEqual(@as(usize, 0), reader.planner_records);
-        var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .time_ns = std.time.ns_per_s });
         defer page.deinit();
         try std.testing.expectEqual(@as(usize, 6), page.rows.len);
         try std.testing.expectEqual(@as(usize, 6), page.records_examined);
@@ -653,7 +655,7 @@ test "relational index system automatic ranges and snapshot costing bound scan w
         try std.testing.expectEqualStrings("bucket", reader.index.?.name);
         try std.testing.expectEqual(@as(usize, 2), reader.planner_candidates);
         try std.testing.expectEqual(@as(usize, 7), reader.planner_records);
-        var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .time_ns = std.time.ns_per_s });
         defer page.deinit();
         try std.testing.expectEqual(@as(usize, 1), page.rows.len);
         try std.testing.expectEqualStrings("row:015", page.rows[0].key);
@@ -669,7 +671,7 @@ test "relational index system automatic ranges and snapshot costing bound scan w
         } });
         defer reader.deinit();
         try std.testing.expectEqualStrings("bucket", reader.index.?.name);
-        var page = try reader.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .time_ns = std.time.ns_per_s });
         defer page.deinit();
         try std.testing.expectEqual(@as(usize, 1), page.rows.len);
         try std.testing.expectEqual(@as(usize, 1), page.records_examined);
@@ -698,7 +700,7 @@ test "relational index system historical scan evicts bounded snapshot bindings" 
     defer reader.deinit();
     var count: usize = 0;
     while (true) {
-        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 1 });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 1 });
         defer page.deinit();
         count += page.rows.len;
         if (!page.more) break;
@@ -737,7 +739,7 @@ test "relational index system mixed schema scan compiles each snapshot layout on
     var count: usize = 0;
     const started = time.monotonicNs();
     while (true) {
-        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 7 });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 7 });
         defer page.deinit();
         for (page.rows) |row| {
             try std.testing.expectEqualStrings(if (count % 2 == 0) "{\"payload\":\"old\"}" else "{\"payload\":\"new\"}", row.json);
@@ -803,7 +805,7 @@ fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {
 }
 
 test "relational index system expression keys share typed bounds historical projections and allocation cleanup" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, expressionKeyAllocations, .{});
+    try platform.allocator.checkAllAllocationFailures(alloc, expressionKeyAllocations, .{});
 }
 
 test "relational index system expression keys fence declarations dependency changes and aggregate expansion" {
@@ -849,7 +851,7 @@ fn expressionIndexCount(db: *db_mod.DB, doubled_price: i64) !usize {
     defer reader.deinit();
     var count: usize = 0;
     for (0..32) |_| {
-        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 100, .records = 100 });
         defer page.deinit();
         try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
         count += page.rows.len;
@@ -1194,7 +1196,7 @@ test "relational index system expression composite cold covering work avoids wid
         var count: usize = 0;
         probes[i] = 0;
         for (0..256) |_| {
-            var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 256, .records = 256 });
+            var page = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 256, .records = 256 });
             defer page.deinit();
             count += page.rows.len;
             probes[i] += page.primary_lookups;
@@ -1211,7 +1213,7 @@ fn partialPreparationAllocations(test_alloc: std.mem.Allocator) !void {
     const registry = @import("schema_registry.zig");
     const plans = @import("relational_index_plan.zig");
     const partial = @import("relational_index_predicate.zig");
-    var schemas = try registry.Registry.initCloned(test_alloc, std.testing.io, .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+    var schemas = try registry.Registry.initCloned(test_alloc, platform.testing.io, .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
         .{ .name = "id", .path = "id", .column_type = .integer },
         .{ .name = "label", .path = "label", .column_type = .string, .allows_null = true },
     } });
@@ -1274,7 +1276,7 @@ test "relational index system partial canonical typed identities and allocation 
 test "relational index system partial implication hashes wide operands once with bounded merge work" {
     const partial = @import("relational_index_predicate.zig");
     const predicates = @import("relational_predicate.zig");
-    var schemas = try @import("schema_registry.zig").Registry.initCloned(alloc, std.testing.io, .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+    var schemas = try @import("schema_registry.zig").Registry.initCloned(alloc, platform.testing.io, .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
         .{ .name = "label", .path = "label", .column_type = .string },
     } });
     defer schemas.deinit();
@@ -1365,7 +1367,7 @@ test "relational index system retirement work follows generation size not unrela
     }
     try installPartial(&db, 2, false);
     var empty_scanned: usize = 0;
-    while (try gc.Page.prepare(alloc, std.testing.io, db.core)) |value| {
+    while (try gc.Page.prepare(alloc, platform.testing.io, db.core)) |value| {
         var page = value;
         defer page.deinit();
         empty_scanned += page.records_scanned;
@@ -1396,7 +1398,7 @@ test "relational index system retirement work follows generation size not unrela
     try installPartial(&db, 4, false);
     var visited: usize = 0;
     var pages: usize = 0;
-    while (try gc.Page.prepare(alloc, std.testing.io, db.core)) |value| {
+    while (try gc.Page.prepare(alloc, platform.testing.io, db.core)) |value| {
         {
             var page = value;
             defer page.deinit();
@@ -1462,7 +1464,7 @@ test "relational index system partial membership discharges uncovered predicates
     for (cases) |case| {
         var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = case.fields, .conditions = case.conditions, .include_primary_digest = case.digest });
         defer reader.deinit();
-        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 256, .records = 1024, .time_ns = std.time.ns_per_s });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 256, .records = 1024, .time_ns = std.time.ns_per_s });
         defer page.deinit();
         try std.testing.expect(!page.more);
         try std.testing.expectEqual(case.expected_rows, page.rows.len);
@@ -1475,7 +1477,7 @@ test "relational index system partial membership discharges uncovered predicates
 fn partialCount(db: *db_mod.DB) !usize {
     var reader = try db.beginRelationalRows(alloc, .{ .index = "tenant_id", .fields = &.{ "id", "payload" }, .conditions = &.{.{ .column = "tenant", .op = .gt, .value = .{ .integer = 0 } }} });
     defer reader.deinit();
-    var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 100, .records = 100 });
+    var page = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 100, .records = 100 });
     defer page.deinit();
     try std.testing.expect(!page.more);
     try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);
@@ -1510,7 +1512,7 @@ test "relational index system partial stronger query bounds preserve residual co
         } });
         defer automatic.deinit();
         try std.testing.expectEqualStrings("scores", automatic.index.?.name);
-        var selected = try automatic.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        var selected = try automatic.nextPage(alloc, platform.testing.io, .{ .time_ns = std.time.ns_per_s });
         defer selected.deinit();
         try std.testing.expectEqual(@as(usize, 1), selected.rows.len);
         try std.testing.expectEqualStrings("row:015", selected.rows[0].key);
@@ -1520,7 +1522,7 @@ test "relational index system partial stronger query bounds preserve residual co
         } });
         defer fallback.deinit();
         try std.testing.expect(fallback.index == null);
-        var primary_page = try fallback.nextPage(alloc, std.testing.io, .{ .time_ns = std.time.ns_per_s });
+        var primary_page = try fallback.nextPage(alloc, platform.testing.io, .{ .time_ns = std.time.ns_per_s });
         defer primary_page.deinit();
         try std.testing.expectEqual(@as(usize, 1), primary_page.rows.len);
         try std.testing.expectEqualStrings("row:005", primary_page.rows[0].key);
@@ -1532,7 +1534,7 @@ test "relational index system partial stronger query bounds preserve residual co
         .{ .column = "score", .op = .is_not_null },
     } });
     defer reader.deinit();
-    var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 64, .records = 128, .time_ns = std.time.ns_per_s });
+    var page = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 64, .records = 128, .time_ns = std.time.ns_per_s });
     defer page.deinit();
     try std.testing.expect(!page.more);
     try std.testing.expectEqual(@as(usize, 6), page.rows.len);
@@ -2205,7 +2207,7 @@ test "relational index system repair is primary authoritative resumable and cont
         try txn.commit();
     }
     try std.testing.expectEqual(.building, (try db.relationalIndexBuildStatus("tenant_id")).state);
-    var old_page = (try jobs.Page.prepare(alloc, std.testing.io, db.core, "tenant_id", .{ .records = 1 })).?;
+    var old_page = (try jobs.Page.prepare(alloc, platform.testing.io, db.core, "tenant_id", .{ .records = 1 })).?;
     {
         var txn = try db.core.store.beginWriteTxn();
         errdefer txn.abort();
@@ -2347,9 +2349,9 @@ test "relational index system replicated maintenance tolerates divergent local p
     const repair_txn = try first.beginTransaction(9000);
     try first.writeTransaction(repair_txn, .{ .relational_index_maintenance = repair_command });
     try first.commitTransaction(repair_txn, 10000);
-    var pending_page = (try jobs.Page.prepare(alloc, std.testing.io, first.core, "tenant_id", .{ .records = 1 })).?;
+    var pending_page = (try jobs.Page.prepare(alloc, platform.testing.io, first.core, "tenant_id", .{ .records = 1 })).?;
     defer pending_page.deinit();
-    var obsolete_page = (try jobs.Page.prepare(alloc, std.testing.io, first.core, "tenant_id", .{ .records = 1 })).?;
+    var obsolete_page = (try jobs.Page.prepare(alloc, platform.testing.io, first.core, "tenant_id", .{ .records = 1 })).?;
     defer obsolete_page.deinit();
     repair_command.expected_maintenance_epoch = 2;
     const next_repair = try first.beginTransaction(11000);
@@ -2404,7 +2406,7 @@ fn scan(db: *db_mod.DB, indexed: bool) !Scan {
     defer reader.deinit();
     var result: Scan = .{};
     for (0..4096) |_| {
-        var page = try reader.nextPage(alloc, std.testing.io, .{ .rows = 32, .records = 64, .output_bytes = 64 * 1024 });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 32, .records = 64, .output_bytes = 64 * 1024 });
         defer page.deinit();
         result.count += page.rows.len;
         result.examined += page.records_examined;
@@ -2424,12 +2426,12 @@ fn replay(primary: *primary_mod.Primary, replica: *db_mod.DB, next: *u64) !void 
 }
 
 test "relational index system standby replays schema churn and rebuilds ready generations after restart" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const owned = arena.allocator();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", owned);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", owned);
     const source_path = try std.fmt.allocPrint(owned, "{s}/source", .{root});
     const replica_path = try std.fmt.allocPrint(owned, "{s}/replica", .{root});
     var primary = try primary_mod.Primary.open(alloc, try std.fmt.allocPrintSentinel(owned, "{s}/log", .{root}, 0), try std.fmt.allocPrintSentinel(owned, "{s}/slots", .{root}, 0), .{ .cluster_id = 71, .table_id = 7, .shard_id = 71, .timeline_id = 1, .epoch = 1 }, .{});
@@ -2596,7 +2598,7 @@ test "relational index system LSM build work is linear in rows times indexes" {
             const name = item.object.get("name").?.string;
             var target_examined: usize = 0;
             for (0..256) |_| {
-                var page = (try jobs.Page.prepare(alloc, std.testing.io, db.core, name, .{ .records = 7 })) orelse break;
+                var page = (try jobs.Page.prepare(alloc, platform.testing.io, db.core, name, .{ .records = 7 })) orelse break;
                 defer page.deinit();
                 target_examined += page.records_examined;
                 try page.commit(db.core);
@@ -2613,7 +2615,7 @@ test "relational index system LSM build work is linear in rows times indexes" {
             var primary_reader = try db.beginRelationalRows(alloc, .{ .fields = &.{"id"} });
             defer primary_reader.deinit();
             while (true) {
-                var page = try primary_reader.nextPage(alloc, std.testing.io, .{ .rows = 1, .records = 1 });
+                var page = try primary_reader.nextPage(alloc, platform.testing.io, .{ .rows = 1, .records = 1 });
                 defer page.deinit();
                 primary_rows += page.rows.len;
                 primary_records += page.records_examined;
@@ -2624,7 +2626,7 @@ test "relational index system LSM build work is linear in rows times indexes" {
         try std.testing.expectEqual(count, primary_records);
         const checks = @import("relational_constraint_jobs.zig");
         var check_records: usize = 0;
-        while (try checks.Page.prepare(alloc, std.testing.io, db.core, .{ .records = 7 })) |prepared| {
+        while (try checks.Page.prepare(alloc, platform.testing.io, db.core, .{ .records = 7 })) |prepared| {
             {
                 var page = prepared;
                 defer page.deinit();
@@ -2647,9 +2649,9 @@ test "relational index system LSM build work is linear in rows times indexes" {
 }
 
 test "relational index system LSM write rebuild query and churn work benchmark" {
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/lsm", .{root});
     defer alloc.free(path);

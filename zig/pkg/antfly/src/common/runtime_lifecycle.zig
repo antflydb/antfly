@@ -19,10 +19,13 @@
 //! submit, publish failure through this state, and join before releasing their
 //! executor lease.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
+const builtin = @import("builtin");
 const httpx = @import("httpx");
-const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
+const platform_sync = platform.sync;
+const platform_time = platform.time;
 
 const shutdown_watchdog_poll_ns: u64 = 10 * std.time.ns_per_ms;
 
@@ -36,11 +39,11 @@ fn sleepWatchdog(ns: u64) void {
         WindowsSleep.Sleep(@intCast(@min(ms, @as(u64, std.math.maxInt(u32)))));
         return;
     }
-    var req = std.posix.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -114,15 +117,30 @@ fn processSignalHandler(_: std.posix.SIG) callconv(.c) void {
     process_signal_requested.store(true, .release);
 }
 
+/// Windows counterpart to `processSignalHandler`: console control events
+/// (Ctrl+C, Ctrl+Break, close, logoff, shutdown) request process shutdown.
+const WindowsConsole = struct {
+    extern "kernel32" fn SetConsoleCtrlHandler(handler: ?*const fn (u32) callconv(.winapi) c_int, add: c_int) callconv(.winapi) c_int;
+
+    fn handler(_: u32) callconv(.winapi) c_int {
+        process_signal_requested.store(true, .release);
+        return 1;
+    }
+};
+
 /// Process-wide SIGINT/SIGTERM bridge. The scope restores prior handlers and
 /// presents signal state as an owned cancellation source to each role instead
 /// of requiring role-local globals and handlers.
 pub const ProcessSignalScope = struct {
-    old_int: std.posix.Sigaction,
-    old_term: std.posix.Sigaction,
+    old_int: if (builtin.os.tag == .windows) void else std.posix.Sigaction,
+    old_term: if (builtin.os.tag == .windows) void else std.posix.Sigaction,
 
     pub fn install() ProcessSignalScope {
         process_signal_requested.store(false, .release);
+        if (comptime builtin.os.tag == .windows) {
+            _ = WindowsConsole.SetConsoleCtrlHandler(&WindowsConsole.handler, 1);
+            return .{ .old_int = {}, .old_term = {} };
+        }
         const action = std.posix.Sigaction{
             .handler = .{ .handler = processSignalHandler },
             .mask = std.posix.sigemptyset(),
@@ -144,6 +162,12 @@ pub const ProcessSignalScope = struct {
     }
 
     pub fn deinit(self: *ProcessSignalScope) void {
+        if (comptime builtin.os.tag == .windows) {
+            _ = WindowsConsole.SetConsoleCtrlHandler(&WindowsConsole.handler, 0);
+            process_signal_requested.store(false, .release);
+            self.* = undefined;
+            return;
+        }
         std.posix.sigaction(.INT, &self.old_int, null);
         std.posix.sigaction(.TERM, &self.old_term, null);
         process_signal_requested.store(false, .release);
@@ -518,7 +542,7 @@ pub const HttpServerLifecycle = struct {
 };
 
 test "runtime lifecycle cancellation and shutdown deadline share state" {
-    var lifecycle = HttpServerLifecycle.init(std.testing.io);
+    var lifecycle = HttpServerLifecycle.init(platform.testing.io);
     const token = lifecycle.token();
     try std.testing.expect(!token.isCancelled());
     lifecycle.stop();
@@ -536,12 +560,12 @@ test "runtime lifecycle cancellation and shutdown deadline share state" {
 }
 
 test "http lifecycle startup wait observes event cancellation and timeout" {
-    var ready = HttpServerLifecycle.init(std.testing.io);
+    var ready = HttpServerLifecycle.init(platform.testing.io);
     try ready.publishReady();
     var inactive = CancellationSource{};
     try ready.waitForStartup(ShutdownDeadline.afterMilliseconds(100), inactive.token());
 
-    var canceled = HttpServerLifecycle.init(std.testing.io);
+    var canceled = HttpServerLifecycle.init(platform.testing.io);
     var cancellation = CancellationSource{};
     cancellation.cancel();
     try std.testing.expectError(
@@ -550,7 +574,7 @@ test "http lifecycle startup wait observes event cancellation and timeout" {
     );
     try std.testing.expectEqual(HttpServerLifecycle.State.stopping, canceled.currentState());
 
-    var timed_out = HttpServerLifecycle.init(std.testing.io);
+    var timed_out = HttpServerLifecycle.init(platform.testing.io);
     try std.testing.expectError(
         error.StartupTimeout,
         timed_out.waitForStartup(ShutdownDeadline.afterMilliseconds(0), inactive.token()),
@@ -559,7 +583,7 @@ test "http lifecycle startup wait observes event cancellation and timeout" {
 }
 
 test "http lifecycle startup wait parks until publication" {
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var lifecycle = HttpServerLifecycle.init(io);
@@ -577,7 +601,7 @@ test "http lifecycle startup wait parks until publication" {
 }
 
 test "http lifecycle stop cannot be overwritten by ready or failure" {
-    var lifecycle = HttpServerLifecycle.init(std.testing.io);
+    var lifecycle = HttpServerLifecycle.init(platform.testing.io);
     lifecycle.stop();
     try std.testing.expectEqual(HttpServerLifecycle.State.stopping, lifecycle.currentState());
     try std.testing.expectError(error.ServerStopped, lifecycle.publishReady());
@@ -587,9 +611,9 @@ test "http lifecycle stop cannot be overwritten by ready or failure" {
 }
 
 test "http lifecycle rejects a listener that attaches after stop" {
-    var lifecycle = HttpServerLifecycle.init(std.testing.io);
+    var lifecycle = HttpServerLifecycle.init(platform.testing.io);
     lifecycle.stop();
-    var server = httpx.Server.init(std.testing.allocator, std.testing.io);
+    var server = httpx.Server.init(std.testing.allocator, platform.testing.io);
     defer server.deinit();
 
     try std.testing.expectError(error.ServerStopped, lifecycle.attach(&server));
@@ -597,7 +621,7 @@ test "http lifecycle rejects a listener that attaches after stop" {
 }
 
 test "http lifecycle retains its first terminal failure" {
-    var lifecycle = HttpServerLifecycle.init(std.testing.io);
+    var lifecycle = HttpServerLifecycle.init(platform.testing.io);
     lifecycle.publishFailure(error.AddressInUse);
     lifecycle.publishFailure(error.ConnectionRefused);
     lifecycle.publishStopped();

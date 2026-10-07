@@ -13,12 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const secrets = @import("antfly_local_sources").common_secrets;
 
 pub const Projection = struct {
-    tmp: std.testing.TmpDir,
+    tmp: platform.testing.TmpDir,
     root: [:0]u8,
     path: []u8,
     io: std.Io,
@@ -27,7 +29,7 @@ pub const Projection = struct {
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding)
             return error.SkipZigTest;
         const alloc = std.testing.allocator;
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         errdefer tmp.cleanup();
         const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
         errdefer alloc.free(root);
@@ -87,7 +89,7 @@ pub fn expectHealthyRotation(store: *secrets.FileStore, initial_generation: u64)
 // existing direct-construction symlink tests.
 pub fn expectRuntimeRotation(comptime init_store: anytype) !void {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var primary = try Projection.init(io_impl.io(), "projected.primary");
     defer primary.deinit();
@@ -119,7 +121,7 @@ pub fn expectRuntimeRotation(comptime init_store: anytype) !void {
 
 pub fn expectRuntimeWrites(comptime init_store: anytype) !void {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", alloc);

@@ -7922,7 +7922,7 @@ fn normalizeCudaBundleTypes(allocator: std.mem.Allocator, source: []const u8) ![
 }
 
 test "quant kernel compiler promoted CUDA renderer fragments stay in sync with the production bundle" {
-    const bundle = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
+    const bundle = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
     defer std.testing.allocator.free(bundle);
     for (first_generated_matmul_artifacts) |artifact| {
         if (artifact.backend != .cuda or !artifact.production_enabled) continue;
@@ -7949,7 +7949,7 @@ test "quant kernel compiler promoted CUDA renderer fragments stay in sync with t
 }
 
 test "quant kernel compiler paged CUDA address helpers stay in sync with the production bundle" {
-    const bundle = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
+    const bundle = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
     defer std.testing.allocator.free(bundle);
     for (cuda_renderer.attention_score_prework_runtime_external_helpers) |helper| {
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bundle, helper.source));
@@ -8045,7 +8045,7 @@ test "quant kernel compiler renders runtime-wired dev CUDA matmul candidates det
 }
 
 test "quant kernel compiler CUDA attention candidate stays in sync with the runtime bundle" {
-    const bundle = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
+    const bundle = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(4 * 1024 * 1024));
     defer std.testing.allocator.free(bundle);
     const attention_marker = "// quant-kernel-codegen:begin generated CUDA attention kernels";
     const attention_region_begin = std.mem.indexOf(u8, bundle, attention_marker) orelse return error.MissingCudaAttentionRuntimeMarker;
@@ -10314,7 +10314,7 @@ test "quant kernel compiler names checked-in CUDA production route symbols" {
         .{ .format = .q6_k, .row_bucket = .rows_2_8, .epilogue = .none, .symbol = "termite_linear_q6_k_f32_tile4" },
     };
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/ops/cuda/artifacts/inference_cuda_kernels.cu", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(contents);
     for (cases) |case| {
         const route = loweringFor(.cuda, case.format, case.row_bucket, case.epilogue);
@@ -11299,7 +11299,7 @@ test "quant kernel compiler generated artifact manifest maps to route candidates
             try std.testing.expectEqual(expected_threads_per_block, candidate_schedule.threads_per_block);
         }
 
-        const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.source_path, std.testing.allocator, .limited(128 * 1024));
+        const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, artifact.source_path, std.testing.allocator, .limited(128 * 1024));
         defer std.testing.allocator.free(contents);
         const emitted = try emitCompiledSource(std.testing.allocator, compiled);
         defer emitted.deinit(std.testing.allocator);
@@ -11607,7 +11607,7 @@ test "quant kernel compiler first CUDA candidate stays dev-only but checked in" 
     try std.testing.expect(!first_lazy_benchmark.production_enabled);
     try std.testing.expect(!std.mem.containsAtLeast(u8, first_lazy_benchmark.generated_source_path, 1, "/artifacts/"));
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, first_lazy_benchmark.generated_source_path, std.testing.allocator, .limited(128 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, first_lazy_benchmark.generated_source_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(contents);
     const emitted = try emitFirstLazyCudaSource(std.testing.allocator);
     defer std.testing.allocator.free(emitted);
@@ -11652,7 +11652,7 @@ test "quant kernel compiler first Metal lazy target stays blocked by timing drif
     try std.testing.expectEqual(@as(usize, 0), counters.quant_kernel_generated_production);
     try std.testing.expectEqual(@as(usize, 1), counters.quant_kernel_generated_candidates);
 
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, first_lazy_metal_source_path, std.testing.allocator, .limited(128 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, first_lazy_metal_source_path, std.testing.allocator, .limited(128 * 1024));
     defer std.testing.allocator.free(contents);
     const compiled_lazy = compileMetalKernelSource(.q4_k, .rows_2_8, .bias_gelu).?;
     const emitted = try emitCompiledSource(std.testing.allocator, compiled_lazy);
@@ -12351,7 +12351,7 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
         try std.testing.expect(std.mem.containsAtLeast(u8, metal_renderer.paged_attention_params_field_body, 1, field));
     }
 
-    const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const host_source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(host_source);
     const field_count = std.mem.count(u8, metal_renderer.paged_attention_params_field_body, ";");
     const expected_size_assert = try std.fmt.allocPrint(
@@ -12389,7 +12389,7 @@ test "quant kernel compiler pins the paged-attention params layout drift guard" 
 }
 
 test "metal runtime source narrowly gates the small-row split GQA route" {
-    const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const host_source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(host_source);
 
     // Stage 1 maps query rows x KV heads x context splits and shares each KV
@@ -12497,7 +12497,7 @@ test "metal runtime source narrowly gates the small-row split GQA route" {
 }
 
 test "metal runtime selected-page MoE closes owned encoders on access failure" {
-    const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const host_source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(host_source);
 
     const start = std.mem.indexOf(
@@ -12539,7 +12539,7 @@ test "metal runtime selected-page MoE closes owned encoders on access failure" {
 }
 
 test "metal runtime source gates aligned and unrolled Q4 MM to measured shapes" {
-    const host_source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const host_source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(host_source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, host_source, 1, "kernel void termite_q4_0_linear_mm_sg_aligned("));
@@ -12623,7 +12623,7 @@ test "quant kernel compiler emits single-sourced backend source for every genera
         try std.testing.expect(emitted.owned);
         try std.testing.expectEqualStrings(compiled.source, emitted.data);
 
-        const checked_in = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, artifact.source_path, std.testing.allocator, .limited(1 << 20));
+        const checked_in = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, artifact.source_path, std.testing.allocator, .limited(1 << 20));
         defer std.testing.allocator.free(checked_in);
         try std.testing.expectEqualStrings(checked_in, emitted.data);
     }
@@ -12686,7 +12686,7 @@ test "quant kernel compiler compile API rejects route metadata drift" {
 }
 
 test "quant kernel compiler docs describe compile API guardrail" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "QUANT_KERNEL_COMPILER.md", std.testing.allocator, .limited(64 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "QUANT_KERNEL_COMPILER.md", std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(contents);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, contents, 1, "compileQuantKernelSource(...)"));
@@ -12754,7 +12754,7 @@ fn metalRuntimeGeneratedEpilogueConstant(epilogue: Epilogue) ?[]const u8 {
 }
 
 test "quant kernel compiler production Metal source includes only runtime-wired generated kernels" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
     // Branch-added GPU fast paths stay positive opt-ins until their runtime
@@ -13024,7 +13024,7 @@ fn metalCBespokeRuntimeWrapperHasArtifact(
 }
 
 test "quant kernel compiler generated Metal wrapper gates follow artifact metadata" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
     var runtime_checked: usize = 0;
@@ -13069,7 +13069,7 @@ test "quant kernel compiler generated Metal wrapper gates follow artifact metada
 }
 
 test "quant kernel compiler embedded Metal source keeps generated q5 reduction and q6 tile" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(contents);
 
     // The hybrid-simd reduction structure, independent of the simdgroup count
@@ -13145,9 +13145,9 @@ test "quant kernel compiler generated Metal headers match production state" {
 }
 
 test "quant kernel compiler Metal build check covers generated and promoted artifacts" {
-    const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "build.zig", std.testing.allocator, .limited(256 * 1024));
+    const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "build.zig", std.testing.allocator, .limited(256 * 1024));
     defer std.testing.allocator.free(contents);
-    const test_filter_contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "build/test_filters.zig", std.testing.allocator, .limited(16 * 1024));
+    const test_filter_contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "build/test_filters.zig", std.testing.allocator, .limited(16 * 1024));
     defer std.testing.allocator.free(test_filter_contents);
 
     const macos_gate = std.mem.indexOf(u8, contents, "if (target.result.os.tag == .macos) {\n        const quant_kernel_metal_artifact_check = b.addRunArtifact(quant_kernel_codegen_exe);") orelse return error.MissingMetalBuildMacosGate;

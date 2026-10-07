@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const ast = @import("antfly_local_sources").sql_ast;
 const catalog = @import("antfly_local_sources").sql_catalog;
 const compiler = @import("antfly_local_sources").sql_compiler;
@@ -472,10 +474,10 @@ test "SQL joined mutation equality work scales with inputs not Cartesian candida
     var backend: Backend = .{ .row_count = rows };
     var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=t.n+s.delta,cold='new' FROM source s WHERE t._id=s.id", .{});
     defer compiled.deinit();
-    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const started = std.Io.Clock.now(.awake, platform.testing.io).nanoseconds;
     var result = try runtime.execute(execution_alloc, backend.backend(), &compiled, &.{}, .{ .mutation_rows = rows, .retained_bytes = if (benchmark) 64 << 20 else 8 << 20 });
     defer result.deinit();
-    const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started;
+    const elapsed = std.Io.Clock.now(.awake, platform.testing.io).nanoseconds - started;
     try std.testing.expectEqual(@as(u64, rows), result.output.rows_affected);
     try std.testing.expectEqual(@as(usize, rows * 2), backend.rows_read);
     try std.testing.expectEqual(@as(usize, 1), backend.captures);
@@ -519,5 +521,5 @@ test "SQL joined mutations release every failed allocation without partial commi
             try std.testing.expectEqual(@as(usize, 1), backend.commits);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

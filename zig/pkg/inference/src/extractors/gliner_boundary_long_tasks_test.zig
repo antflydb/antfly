@@ -219,7 +219,7 @@ fn pinnedFiles(a: Allocator, directory: []const u8, pins: pipeline.PublishedMode
         const pin = @field(pins, reflected_name);
         const path = try std.fs.path.join(a, &.{ directory, reflected_name });
         defer a.free(path);
-        const digest = try snapshot.digest(std.testing.io, std.Io.Dir.cwd(), path, 1024 * mib, control);
+        const digest = try snapshot.digest(platform.testing.io, std.Io.Dir.cwd(), path, 1024 * mib, control);
         try std.testing.expectEqual(pin.size_bytes, digest.size_bytes);
         try std.testing.expectEqualStrings(pin.sha256, &std.fmt.bytesToHex(digest.sha256, .lower));
     }
@@ -303,8 +303,8 @@ fn runBackend(comptime backend: Backend, directory: []const u8, corpus: *const C
     const output = captures.budget.allocator();
     const watchdog: ?*Watchdog = if (on_device) try Watchdog.create(a) else null;
     defer if (watchdog) |value| value.destroy();
-    if (watchdog) |value| try value.start(std.testing.io);
-    const lifetime = Control{ .io = std.testing.io, .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s, .hard_cancellation = if (watchdog) |value| value.boundary() else null };
+    if (watchdog) |value| try value.start(platform.testing.io);
+    const lifetime = Control{ .io = platform.testing.io, .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s, .hard_cancellation = if (watchdog) |value| value.boundary() else null };
     // This independent guard spans constructor and physical close. The
     // deliberate cancellation is cooperative at a completed-window cut, and
     // is never installed as a fatal watchdog callback.
@@ -322,7 +322,7 @@ fn runBackend(comptime backend: Backend, directory: []const u8, corpus: *const C
     const config = try factory.getGlinerBoundaryConfig(session);
     const token_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
     defer a.free(token_path);
-    const token_bytes = try snapshot.read(a, std.testing.io, std.Io.Dir.cwd(), token_path, 32 * mib, lifetime);
+    const token_bytes = try snapshot.read(a, platform.testing.io, std.Io.Dir.cwd(), token_path, 32 * mib, lifetime);
     defer a.free(token_bytes);
     const tokenizer = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, token_bytes);
     defer tokenizer.tokenizer().deinitTokenizer();

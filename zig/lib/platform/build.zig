@@ -18,6 +18,7 @@ const platform_build = @import("build_support.zig");
 pub const ModuleOptions = platform_build.ModuleOptions;
 pub const createModule = platform_build.createModule;
 pub const addModule = platform_build.addModule;
+pub const bindPlatform = platform_build.bindPlatform;
 pub const addFilesystemCapacitySource = platform_build.addFilesystemCapacitySource;
 pub const addTests = platform_build.addTests;
 pub const canRunNativeProcess = platform_build.canRunNativeProcess;
@@ -64,4 +65,30 @@ pub fn build(b: *std.Build) void {
     command_test_step.dependOn(&tests.one_shot_unit.step);
     if (tests.one_shot_process) |process| command_test_step.dependOn(process);
     test_step.dependOn(command_test_step);
+}
+
+/// Configure standalone libraries, including anonymous test and cross-target
+/// modules, with a platform dependency matching each artifact's target.
+pub fn bindBuild(b: *std.Build) void {
+    const arena = b.graph.arena;
+    for (b.modules.values()) |module| bindStandaloneModule(b, module);
+    var seen: std.AutoHashMap(*std.Build.Step, void) = .init(arena);
+    var pending: std.ArrayList(*std.Build.Step) = .empty;
+    for (b.top_level_steps.values()) |top| pending.append(arena, &top.step) catch @panic("OOM");
+    var index: usize = 0;
+    while (index < pending.items.len) : (index += 1) {
+        const step = pending.items[index];
+        const entry = seen.getOrPut(step) catch @panic("OOM");
+        if (entry.found_existing) continue;
+        if (step.cast(std.Build.Step.Compile)) |compile| bindStandaloneModule(b, compile.root_module);
+        for (step.dependencies.items) |dependency| pending.append(arena, dependency) catch @panic("OOM");
+    }
+}
+
+fn bindStandaloneModule(b: *std.Build, module: *std.Build.Module) void {
+    const dependency = b.dependency("antfly_platform", .{
+        .target = module.resolved_target orelse b.graph.host,
+        .optimize = module.optimize orelse .debug,
+    });
+    bindPlatform(module, dependency.module("antfly_platform"));
 }

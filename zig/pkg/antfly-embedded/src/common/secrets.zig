@@ -13,8 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
-const platform_sync = @import("antfly_platform").sync;
+
+const platform_sync = platform.sync;
 const builtin = @import("builtin");
 const contract = @import("secret_contract.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
@@ -445,7 +447,7 @@ pub const FileStore = struct {
     entries: std.StringArrayHashMapUnmanaged(StoredSecret) = .{},
     observed_metadata: ?FileMetadata = null,
     generation_value: u64 = 0,
-    generation_snapshot: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    generation_snapshot: platform.atomic.Value(u64) = .init(0),
     content_hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
     source_generation: ?[std.crypto.hash.sha2.Sha256.digest_length]u8 = null,
     last_reload_failed: bool = false,
@@ -453,10 +455,10 @@ pub const FileStore = struct {
     reload_failure_count: u64 = 0,
     last_success_ns: u64 = 0,
     last_failure_ns: u64 = 0,
-    next_throttled_refresh_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    next_throttled_refresh_ns: platform.atomic.Value(u64) = .init(0),
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileStore {
-        return initWithIo(alloc, std.Options.debug_io, path);
+        return initWithIo(alloc, platform.debug_io, path);
     }
 
     pub fn initWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !FileStore {
@@ -471,7 +473,7 @@ pub const FileStore = struct {
     }
 
     pub fn initLayered(alloc: std.mem.Allocator, paths: []const []const u8) !FileStore {
-        return initLayeredWithIo(alloc, std.Options.debug_io, paths);
+        return initLayeredWithIo(alloc, platform.debug_io, paths);
     }
 
     pub fn initLayeredWithIo(alloc: std.mem.Allocator, io: std.Io, paths: []const []const u8) !FileStore {
@@ -1156,7 +1158,7 @@ const LoadedEntries = struct {
 };
 
 fn loadEntriesFromFile(alloc: std.mem.Allocator, path: []const u8) !LoadedEntries {
-    return loadEntriesFromFileWithIo(alloc, std.Options.debug_io, path);
+    return loadEntriesFromFileWithIo(alloc, platform.debug_io, path);
 }
 
 fn loadEntriesFromFileWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !LoadedEntries {
@@ -1410,7 +1412,7 @@ fn formatTimestampOwned(alloc: std.mem.Allocator, ns: u64) ![]u8 {
 }
 
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    return readFileAllocWithIo(alloc, std.Options.debug_io, path);
+    return readFileAllocWithIo(alloc, platform.debug_io, path);
 }
 
 fn readFileAllocWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
@@ -1418,7 +1420,7 @@ fn readFileAllocWithIo(alloc: std.mem.Allocator, io: std.Io, path: []const u8) !
 }
 
 fn statFileMetadata(path: []const u8) !?FileMetadata {
-    return statFileMetadataWithIo(std.Options.debug_io, path);
+    return statFileMetadataWithIo(platform.debug_io, path);
 }
 
 fn statFileMetadataWithIo(io: std.Io, path: []const u8) !?FileMetadata {
@@ -1441,7 +1443,7 @@ fn statFileMetadataWithIo(io: std.Io, path: []const u8) !?FileMetadata {
 }
 
 fn ensureParentDir(path: []const u8) !void {
-    return ensureParentDirWithIo(std.Options.debug_io, path);
+    return ensureParentDirWithIo(platform.debug_io, path);
 }
 
 fn ensureParentDirWithIo(io: std.Io, path: []const u8) !void {
@@ -1450,7 +1452,7 @@ fn ensureParentDirWithIo(io: std.Io, path: []const u8) !void {
 }
 
 fn writeFileAtomically(path: []const u8, contents: []const u8) !void {
-    return writeFileAtomicallyWithIo(std.Options.debug_io, path, contents);
+    return writeFileAtomicallyWithIo(platform.debug_io, path, contents);
 }
 
 fn writeFileAtomicallyWithIo(io: std.Io, path: []const u8, contents: []const u8) !void {
@@ -1484,7 +1486,7 @@ fn writeFileAtomicallyWithIo(io: std.Io, path: []const u8, contents: []const u8)
 }
 
 fn deleteFile(path: []const u8) !void {
-    try deleteFileWithIo(std.Options.debug_io, path);
+    try deleteFileWithIo(platform.debug_io, path);
 }
 
 fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
@@ -1496,7 +1498,7 @@ fn deleteFileWithIo(io: std.Io, path: []const u8) !void {
 }
 
 fn nowNs() u64 {
-    return nowNsWithIo(std.Options.debug_io);
+    return nowNsWithIo(platform.debug_io);
 }
 
 fn nowNsWithIo(io: std.Io) u64 {
@@ -1535,9 +1537,9 @@ test "file secret store persists values and overlays env status" {
     try std.testing.expect(!std.mem.startsWith(u8, entry.created_at.?, "1970-"));
     try std.testing.expect(!std.mem.startsWith(u8, entry.updated_at.?, "1970-"));
     if (builtin.os.tag != .windows and builtin.os.tag != .wasi and builtin.os.tag != .freestanding) {
-        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_only });
-        defer file.close(std.testing.io);
-        const stat = try file.stat(std.testing.io);
+        var file = try std.Io.Dir.cwd().openFile(platform.testing.io, path, .{ .mode = .read_only });
+        defer file.close(platform.testing.io);
+        const stat = try file.stat(platform.testing.io);
         try std.testing.expectEqual(@as(std.posix.mode_t, 0), stat.permissions.toMode() & 0o077);
     }
 
@@ -1596,7 +1598,7 @@ test "file secret store writes preserve symlinks across target rotation" {
 test "file secret store refuses to replace a dangling symlink" {
     const projection_test = @import("antfly_server_test_sources").local_test_sources.common_secret_projection_test_support;
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var projection = try projection_test.Projection.init(io, "projected.primary");
@@ -1621,7 +1623,7 @@ test "file secret store detects projected volume symlink target replacement" {
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/test-secrets-projected-{d}", .{nowNs()});
     defer alloc.free(root);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     defer std.Io.Dir.cwd().deleteTree(io, root) catch {};
@@ -2041,7 +2043,7 @@ test "file secret store configured secret sources preserve order and native owne
         .{ .name = "tenant", .type = .file, .path = source_path },
         .{ .name = "system", .type = .file, .path = other_path },
     };
-    var store = try FileStore.initConfiguredWithIo(alloc, std.Options.debug_io, .{
+    var store = try FileStore.initConfiguredWithIo(alloc, platform.debug_io, .{
         .native = .{ .path = native_path },
         .sources = &sources,
         .environment = false,
@@ -2065,7 +2067,7 @@ test "file secret store configured secret sources preserve order and native owne
     try std.testing.expectEqualStrings("tenant", listed[0].source.?);
     try std.testing.expect(!listed[0].managed);
     try std.testing.expectError(error.WriteUnavailable, store.fallbacks[0].put(alloc, "test.token", "bad"));
-    var readonly = try FileStore.initConfiguredWithIo(alloc, std.Options.debug_io, .{ .sources = &sources });
+    var readonly = try FileStore.initConfiguredWithIo(alloc, platform.debug_io, .{ .sources = &sources });
     defer readonly.deinit();
     try std.testing.expect(!readonly.writable);
     try std.testing.expectError(error.WriteUnavailable, readonly.put(alloc, "test.token", "bad"));
@@ -2083,11 +2085,11 @@ test "file secret store configured secret sources preserve order and native owne
 
 test "file secret store configured secret environment defaults enabled and can be disabled without files" {
     const alloc = std.testing.allocator;
-    var enabled = try FileStore.initConfiguredWithIo(alloc, std.Options.debug_io, .{});
+    var enabled = try FileStore.initConfiguredWithIo(alloc, platform.debug_io, .{});
     defer enabled.deinit();
     try std.testing.expect(enabled.environment_enabled);
     try std.testing.expect(!enabled.writable);
-    var disabled = try FileStore.initConfiguredWithIo(alloc, std.Options.debug_io, .{ .environment = false });
+    var disabled = try FileStore.initConfiguredWithIo(alloc, platform.debug_io, .{ .environment = false });
     defer disabled.deinit();
     const listed = try disabled.list(alloc);
     defer freeListedSecrets(alloc, listed);
@@ -2123,18 +2125,18 @@ test "file secret store source configuration rejects ambiguity and bootstraps be
     defer alloc.free(path);
     defer deleteFile(path) catch {};
     try writeFileAtomically(path, "{\"secrets\":{\"environment\":false},\"unresolved\":\"${secret:missing}\"}");
-    var store = (try initFromConfigPathWithIo(alloc, std.Options.debug_io, path, &.{})).?;
+    var store = (try initFromConfigPathWithIo(alloc, platform.debug_io, path, &.{})).?;
     defer store.deinit();
     try std.testing.expect(!store.environment_enabled);
-    try std.testing.expectError(error.InvalidConfig, initFromConfigPathWithIo(alloc, std.Options.debug_io, path, &.{"legacy.json"}));
+    try std.testing.expectError(error.InvalidConfig, initFromConfigPathWithIo(alloc, platform.debug_io, path, &.{"legacy.json"}));
     try writeFileAtomically(path, "{}");
-    try std.testing.expect((try initFromConfigPathWithIo(alloc, std.Options.debug_io, path, &.{})) == null);
+    try std.testing.expect((try initFromConfigPathWithIo(alloc, platform.debug_io, path, &.{})) == null);
 }
 
 test "file secret store rejects canonical native source aliases including missing destinations" {
     const alloc = std.testing.allocator;
-    const io = std.Options.debug_io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.debug_io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(dir);
@@ -2166,8 +2168,8 @@ test "file secret store rejects canonical native source aliases including missin
 test "file secret store rejects symlink aliases at startup and after source replacement" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const io = std.Options.debug_io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.debug_io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(dir);

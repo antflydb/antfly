@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const antfly_client = @import("antfly-client");
 const cli = @import("mod.zig");
 const hbs = @import("handlebars");
@@ -1058,33 +1060,33 @@ fn writeCheckpointAtomically(alloc: std.mem.Allocator, io: std.Io, path: []const
 
 test "mutation parser defaults to write and accepts an explicit visibility barrier" {
     var valid_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--document", "{}" };
-    const valid = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = valid_argv[0..] }), true);
+    const valid = parseMutationOptions(platform.process.argsIterator(valid_argv[0..]), true);
     try std.testing.expectEqualStrings("docs", valid.value.table_name.?);
     try std.testing.expectEqualStrings("{}", valid.value.value_json.?);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.write, valid.value.sync_level orelse .write);
 
     var full_index_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--document", "{}", "--sync-level", "full_index" };
-    const full_index = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = full_index_argv[0..] }), true);
+    const full_index = parseMutationOptions(platform.process.argsIterator(full_index_argv[0..]), true);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.full_index, full_index.value.sync_level.?);
 
     var unknown_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--typo", "value" };
-    const unknown = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = unknown_argv[0..] }), false);
+    const unknown = parseMutationOptions(platform.process.argsIterator(unknown_argv[0..]), false);
     try std.testing.expectEqualStrings("--typo", unknown.issue.unknown);
 
     var duplicate_argv = [_][*:0]const u8{ "--table", "docs", "-t", "other" };
-    const duplicate = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = duplicate_argv[0..] }), false);
+    const duplicate = parseMutationOptions(platform.process.argsIterator(duplicate_argv[0..]), false);
     try std.testing.expectEqualStrings("-t", duplicate.issue.duplicate);
 
     var missing_argv = [_][*:0]const u8{"--document"};
-    const missing = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = missing_argv[0..] }), true);
+    const missing = parseMutationOptions(platform.process.argsIterator(missing_argv[0..]), true);
     try std.testing.expectEqualStrings("--document", missing.issue.missing_value);
 
     var delete_document_argv = [_][*:0]const u8{ "--document", "{}" };
-    const delete_document = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = delete_document_argv[0..] }), false);
+    const delete_document = parseMutationOptions(platform.process.argsIterator(delete_document_argv[0..]), false);
     try std.testing.expectEqualStrings("--document", delete_document.issue.unknown);
 
     var invalid_sync_argv = [_][*:0]const u8{ "--sync-level", "eventual" };
-    const invalid_sync = parseMutationOptions(std.process.Args.Iterator.init(.{ .vector = invalid_sync_argv[0..] }), false);
+    const invalid_sync = parseMutationOptions(platform.process.argsIterator(invalid_sync_argv[0..]), false);
     try std.testing.expectEqualStrings("eventual", invalid_sync.issue.invalid_sync_level);
 }
 
@@ -1100,42 +1102,42 @@ test "load parser rejects missing duplicate conflicting and malformed options" {
         "--batch-bytes",    "4096",
         "--max-line-bytes", "8192",
     };
-    const valid = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = valid_argv[0..] }));
+    const valid = parseLoadOptionsIterator(platform.process.argsIterator(valid_argv[0..]));
     try std.testing.expectEqualStrings("docs", valid.value.table_name);
     try std.testing.expectEqual(@as(usize, 25), valid.value.batch_size);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.full_index, valid.value.sync_level.?);
     try std.testing.expectEqual(@as(?u64, 3), valid.value.max_errors);
 
     var missing_checkpoint_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--checkpoint" };
-    const missing_checkpoint = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = missing_checkpoint_argv[0..] }));
+    const missing_checkpoint = parseLoadOptionsIterator(platform.process.argsIterator(missing_checkpoint_argv[0..]));
     try std.testing.expectEqualStrings("--checkpoint", missing_checkpoint.issue.missing_value);
 
     var missing_id_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--id-field" };
-    const missing_id = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = missing_id_argv[0..] }));
+    const missing_id = parseLoadOptionsIterator(platform.process.argsIterator(missing_id_argv[0..]));
     try std.testing.expectEqualStrings("--id-field", missing_id.issue.missing_value);
 
     var swallowed_dry_run_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--id-field", "--dry-run" };
-    const swallowed_dry_run = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = swallowed_dry_run_argv[0..] }));
+    const swallowed_dry_run = parseLoadOptionsIterator(platform.process.argsIterator(swallowed_dry_run_argv[0..]));
     try std.testing.expectEqualStrings("--id-field", swallowed_dry_run.issue.missing_value);
 
     var duplicate_argv = [_][*:0]const u8{ "--table", "docs", "-t", "other", "--file", "docs.jsonl" };
-    const duplicate = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = duplicate_argv[0..] }));
+    const duplicate = parseLoadOptionsIterator(platform.process.argsIterator(duplicate_argv[0..]));
     try std.testing.expectEqualStrings("-t", duplicate.issue.duplicate);
 
     var conflict_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--checkpoint", "state", "--no-checkpoint" };
-    const conflict = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = conflict_argv[0..] }));
+    const conflict = parseLoadOptionsIterator(platform.process.argsIterator(conflict_argv[0..]));
     try std.testing.expectEqual(LoadConflict.checkpoint_disabled, conflict.issue.conflict);
 
     var strict_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--strict", "--max-errors", "2" };
-    const strict = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = strict_argv[0..] }));
+    const strict = parseLoadOptionsIterator(platform.process.argsIterator(strict_argv[0..]));
     try std.testing.expectEqual(LoadConflict.error_policy, strict.issue.conflict);
 
     var zero_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--size", "0" };
-    const zero = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = zero_argv[0..] }));
+    const zero = parseLoadOptionsIterator(platform.process.argsIterator(zero_argv[0..]));
     try std.testing.expectEqualStrings("--size", zero.issue.non_positive.flag);
 
     var unknown_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--chekpoint", "state" };
-    const unknown = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = unknown_argv[0..] }));
+    const unknown = parseLoadOptionsIterator(platform.process.argsIterator(unknown_argv[0..]));
     try std.testing.expectEqualStrings("--chekpoint", unknown.issue.unknown);
 }
 
@@ -1180,7 +1182,7 @@ test "line scanner handles split lines crlf final line and long lines" {
 
 test "load processor allocates parsed strings independent of streaming buffer" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1216,7 +1218,7 @@ test "load processor allocates parsed strings independent of streaming buffer" {
 
 test "load processor rejects malformed json and bad ids" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1240,7 +1242,7 @@ test "load processor rejects malformed json and bad ids" {
 
 test "load processor advances resume cursor for tolerated rejected and empty lines" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1275,7 +1277,7 @@ test "load processor advances resume cursor for tolerated rejected and empty lin
 
 test "load processor handles duplicate ids as last write wins without inflating loaded count" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1302,7 +1304,7 @@ test "load processor handles duplicate ids as last write wins without inflating 
 
 test "load processor renders ids from handlebars template" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1323,7 +1325,7 @@ test "load processor renders ids from handlebars template" {
 
 test "load processor rejects empty rendered id template" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1354,7 +1356,7 @@ test "load sync level parser supports public values" {
 
 test "load parser defaults to applied write visibility" {
     var argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl" };
-    const parsed = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = argv[0..] }));
+    const parsed = parseLoadOptionsIterator(platform.process.argsIterator(argv[0..]));
     try std.testing.expect(parsed.value.sync_level == null);
     try std.testing.expectEqual(
         antfly_client.types.SyncLevel.write,
@@ -1362,7 +1364,7 @@ test "load parser defaults to applied write visibility" {
     );
 
     var propose_argv = [_][*:0]const u8{ "--table", "docs", "--file", "docs.jsonl", "--sync-level", "propose" };
-    const propose = parseLoadOptionsIterator(std.process.Args.Iterator.init(.{ .vector = propose_argv[0..] }));
+    const propose = parseLoadOptionsIterator(platform.process.argsIterator(propose_argv[0..]));
     try std.testing.expectEqual(
         antfly_client.types.SyncLevel.propose,
         effectiveLoadSyncLevel(propose.value.sync_level),
@@ -1455,11 +1457,11 @@ test "checkpoint validation rejects changed source and load config" {
 
 test "load checkpoint owns strings independently of read buffer" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1495,11 +1497,11 @@ test "load checkpoint owns strings independently of read buffer" {
 
 test "dry-run load streams boundary-straddling ndjson without bogus invalid json" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

@@ -15,7 +15,9 @@
 
 //! Receiver-owned preparation. The existing replicated checkpoint/page
 //! appliers remain the only mutation and exact cleanup-prefix authority.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const wire = @import("online_merge_io_contract.zig");
 const pages = @import("merge_page_contract.zig");
@@ -216,7 +218,7 @@ fn rangeValid(range: types.ByteRange) bool {
 
 test "relational index system online receiver bounds cleanup and uses shared checkpoint receipts" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/receiver", .{tmp.sub_path});
     defer alloc.free(path);

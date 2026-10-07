@@ -18,7 +18,9 @@
 //! Loads a PJRT plugin (e.g., CPU or TPU) via dlopen and provides
 //! Zig-idiomatic wrappers for compilation and execution.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const c = @import("pjrt_c_types.zig");
 const hlo = @import("hlo.zig");
 
@@ -261,11 +263,11 @@ pub const Client = struct {
     api: *const c.Api,
     handle: *c.PjrtClient,
     device: *c.PjrtDevice,
-    lib: std.DynLib,
+    lib: platform.DynLib,
 
     pub fn init(plugin_path: [:0]const u8) PjrtError!Client {
         // Load plugin shared library
-        var lib = std.DynLib.open(plugin_path) catch return PjrtError.PluginLoadFailed;
+        var lib = platform.DynLib.open(plugin_path) catch return PjrtError.PluginLoadFailed;
         errdefer lib.close();
 
         // Get API function pointer table
@@ -608,7 +610,7 @@ fn resolvePjrtPluginPath(allocator: std.mem.Allocator) ![]u8 {
     if (try getEnvVarOwned(allocator, "PJRT_PLUGIN")) |env_path| return env_path;
 
     // Determine platform-specific subdirectory and extension
-    const platform = switch (@import("builtin").target.os.tag) {
+    const os_name = switch (@import("builtin").target.os.tag) {
         .macos => "darwin",
         .linux => "linux",
         else => return error.PjrtPluginNotFound,
@@ -623,7 +625,7 @@ fn resolvePjrtPluginPath(allocator: std.mem.Allocator) ![]u8 {
         else => "so",
     };
 
-    const plat_dir = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ platform, arch });
+    const plat_dir = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ os_name, arch });
     defer allocator.free(plat_dir);
     const lib_name = try std.fmt.allocPrint(allocator, "pjrt_c_api_cpu_plugin.{s}", .{ext});
     defer allocator.free(lib_name);

@@ -13,12 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const structlog = @import("structlog");
 const build_info = @import("build_info");
 const completion = @import("completion.zig");
 const runtime_bridge = @import("runtime_bridge.zig");
-const inference_process_supervisor = @import("antfly_platform").inference_process_supervisor;
+const inference_process_supervisor = platform.inference_process_supervisor;
 
 const antfly_cloud_binary = "antfly-cloud";
 
@@ -27,7 +29,18 @@ pub const std_options: std.Options = .{
 };
 
 pub fn main(init: std.process.Init) void {
-    mainImpl(init) catch |err| failMain(err);
+    if (@import("builtin").os.tag == .windows) {
+        var executor = platform.Io.Threaded.init(init.gpa, .{
+            .argv0 = .init(init.minimal.args),
+            .environ = init.minimal.environ,
+        });
+        defer executor.deinit();
+        var platform_init = init;
+        platform_init.io = executor.io();
+        mainImpl(platform_init) catch |err| failMain(err);
+    } else {
+        mainImpl(init) catch |err| failMain(err);
+    }
 }
 
 fn failMain(err: anyerror) noreturn {
@@ -122,7 +135,7 @@ pub fn runRuntimeUnit(
     while (args.next()) |arg| try argument_views.append(init.gpa, .init(arg));
 
     if (comptime role == .inference) {
-        const one_shot = @import("antfly_platform").one_shot_process;
+        const one_shot = platform.one_shot_process;
         if (one_shot.isTrainingInvocation(init.minimal.args)) {
             // RuntimeProcess reconstructs synthetic arguments across this ABI.
             // A training worker must re-execute the actual public invocation.
@@ -302,12 +315,12 @@ test "cloud shim argv starts with antfly-cloud and preserves args" {
 }
 
 test "cloud shim reports missing antfly-cloud as 127" {
-    const code = try runAntflyCloudArgvMaybeReport(std.testing.io, &.{"definitely-missing-antfly-cloud-for-test"}, false);
+    const code = try runAntflyCloudArgvMaybeReport(platform.testing.io, &.{"definitely-missing-antfly-cloud-for-test"}, false);
     try std.testing.expectEqual(@as(u8, 127), code);
 }
 
 test "cloud shim propagates child exit code" {
-    const code = try runAntflyCloudArgv(std.testing.io, &.{ "/bin/sh", "-c", "exit 23" });
+    const code = try runAntflyCloudArgv(platform.testing.io, &.{ "/bin/sh", "-c", "exit 23" });
     try std.testing.expectEqual(@as(u8, 23), code);
 }
 

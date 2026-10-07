@@ -16,7 +16,9 @@
 //! Grace hash join: sequentially partition both relations, then retain one
 //! build partition. Oversized partitions repartition on remaining hash bits;
 //! indistinguishable/skewed keys keep the bounded disk-chain fallback.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const operators = @import("operators.zig");
 const spill = @import("spill.zig");
 const Datum = @import("scalar.zig").Datum;
@@ -636,7 +638,7 @@ test "SQL partitioned join retains one partition and preserves residual outer ma
     };
     for ([_]usize{ 64 * 1024, 512 * 1024 }) |bytes| for ([_]bool{ false, true }) |batched| {
         var dummy: u8 = 0;
-        var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+        var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
         defer manager.deinit();
         const join = try Join.create(std.testing.allocator, &manager, bytes, 10000, 200000, true, true);
         defer join.close();
@@ -691,7 +693,7 @@ test "SQL partitioned join runtime filter preserves null and skew semantics" {
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const join = try Join.create(std.testing.allocator, &manager, 32768, 10000, 100000, false, true);
     defer join.close();
@@ -731,7 +733,7 @@ test "SQL partitioned join recursively splits underestimated builds within file 
     var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 256 * 1024 };
     const a = budget.allocator();
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     {
         // Deliberately underestimate bytes: two initial partitions cannot fit.
@@ -780,7 +782,7 @@ test "SQL complete parallel join partitions evaluate residuals and preserve both
     for ([_]bool{ false, true }) |flipped| {
         for ([_]bool{ false, true }) |batches| {
             var dummy: u8 = 0;
-            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+            var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
             defer manager.deinit();
             var compiled = try @import("compiler.zig").compileScalar(a, "l = r AND l <> 777", .{});
             defer compiled.deinit();
@@ -851,7 +853,7 @@ test "SQL parallel partition joins defer errors beyond the delivered prefix" {
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var compiled = try @import("compiler.zig").compileScalar(a, "1 / (1 - l) > 0", .{});
     defer compiled.deinit();
@@ -876,7 +878,7 @@ test "SQL review regression oversized identical-key partition preserves forward 
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = std.heap.page_allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = std.heap.page_allocator, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const join = try Join.create(std.heap.page_allocator, &manager, 2 * 1024 * 1024, 100000, 0, false, false);
     defer join.close();
@@ -894,7 +896,7 @@ test "SQL partition join child keeps its assigned workspace and prioritizes larg
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     for ([_]usize{ 128 * 1024, 2 * 1024 * 1024 }) |bytes| {
         const serial = try Join.createWithLanes(&manager, bytes, 10000, 0, false, false, 1, false);
@@ -929,7 +931,7 @@ test "SQL compact probe blocks retain rows through duplicate matches and early c
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     for ([_]bool{ false, true }) |early_close| {
         const join = try Join.create(a, &manager, 256 * 1024, 10000, 0, true, false);

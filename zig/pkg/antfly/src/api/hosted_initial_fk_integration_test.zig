@@ -78,9 +78,9 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
     const internal_secret = "hosted-fk-internal-service-secret-v1";
     const trusted_secret = "hosted-fk-trusted-principal-secret-v1";
     const issuer = "hosted-fk-test";
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const meta_root = try std.fmt.allocPrint(alloc, "{s}/metadata", .{root});
     defer alloc.free(meta_root);
@@ -92,7 +92,7 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
     defer alloc.free(data_catalog);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -339,7 +339,7 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
         if (!published) {
             placement_diagnostic: {
                 const svc = metadata.server.svc;
-                if (!svc.catalog_mutation_mutex.tryLock(std.Options.debug_io)) {
+                if (!svc.catalog_mutation_mutex.tryLock(platform.debug_io)) {
                     std.debug.print("linked hosted initial placement catalog lane is busy at deadline\n", .{});
                     break :placement_diagnostic;
                 }

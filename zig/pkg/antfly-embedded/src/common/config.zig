@@ -1249,7 +1249,7 @@ pub fn loadFromPathWithSecrets(
     path: []const u8,
     secret_store: ?*secrets.FileStore,
 ) !Config {
-    return loadFromPathWithSecretsWithIo(alloc, std.Options.debug_io, path, secret_store);
+    return loadFromPathWithSecretsWithIo(alloc, platform.debug_io, path, secret_store);
 }
 
 pub fn loadFromPathWithSecretsWithIo(
@@ -1269,7 +1269,7 @@ pub fn loadFromPathWithSecretsForDeployment(
     secret_store: ?*secrets.FileStore,
     deployment_mode: DeploymentMode,
 ) !Config {
-    return loadFromPathWithSecretsForDeploymentWithIo(alloc, std.Options.debug_io, path, secret_store, deployment_mode);
+    return loadFromPathWithSecretsForDeploymentWithIo(alloc, platform.debug_io, path, secret_store, deployment_mode);
 }
 
 pub fn loadFromPathWithSecretsForDeploymentWithIo(
@@ -3237,7 +3237,7 @@ test "common config resolves secret references through the provided store" {
     const alloc = std.testing.allocator;
     const store_path = ".zig-cache/test-config-secrets.json";
     defer {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
     }
@@ -3275,7 +3275,7 @@ test "common config external io credentials retain references and observe secret
     const alloc = std.testing.allocator;
     const store_path = ".zig-cache/test-connection-secret-rotation.json";
     defer {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
     }
@@ -3444,7 +3444,7 @@ test "common config preserves live secret references inside remote content crede
     const alloc = std.testing.allocator;
     const store_path = ".zig-cache/test-remote-content-secrets.json";
     defer {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
     }
@@ -3847,10 +3847,10 @@ test "common config applies standalone shard defaults when standalone mode is se
 
 test "common config bootstraps named secret sources before resolving credentials" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(dir);

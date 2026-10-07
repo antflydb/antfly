@@ -13,13 +13,15 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const object_storage = @import("antfly_local_sources").storage_object_storage;
 const manifest_types = @import("types.zig");
 const manifest_codec = @import("codec.zig");
 const manifest_store = @import("store.zig");
 const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
-const platform_clock = @import("antfly_platform").clock;
+const platform_clock = platform.clock;
 
 const winner_visibility_attempts: usize = 5;
 const winner_visibility_initial_backoff_ms: u64 = 1;
@@ -670,8 +672,8 @@ test "objectstore-backed manifest store resolves conditional create races by con
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

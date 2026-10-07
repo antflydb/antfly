@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const artifacts_mod = @import("../artifacts/mod.zig");
@@ -848,7 +850,7 @@ pub const CatalogService = struct {
 
     pub fn buildNamespaceWithCancellation(self: *CatalogService, namespace: []const u8, cancellation: CancellationToken) !builder_mod.BuildResult {
         try cancellation.check();
-        var fallback: ?std.Io.Threaded = if (self.builder.io == null) std.Io.Threaded.init(self.alloc, .{}) else null;
+        var fallback: ?platform.Io.Threaded = if (self.builder.io == null) platform.Io.Threaded.init(self.alloc, .{}) else null;
         defer if (fallback) |*value| value.deinit();
         return self.buildNamespaceGuardedUntil(namespace, null, .{ .io = self.builder.io orelse fallback.?.io(), .cooperative = cancellation });
     }
@@ -867,7 +869,7 @@ pub const CatalogService = struct {
         publication_guard: ?@import("../build/work_lease.zig").PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !builder_mod.BuildResult {
-        var fallback: ?std.Io.Threaded = if (self.builder.io == null and cancellation == null) std.Io.Threaded.init(self.alloc, .{}) else null;
+        var fallback: ?platform.Io.Threaded = if (self.builder.io == null and cancellation == null) platform.Io.Threaded.init(self.alloc, .{}) else null;
         defer if (fallback) |*value| value.deinit();
         const io = if (cancellation) |token| token.io else self.builder.io orelse fallback.?.io();
         try maintenance_cancellation.check(cancellation);
@@ -2297,7 +2299,7 @@ test "serverless named graph planning reuses topology for metric-only changes" {
 }
 
 test "serverless named graph planning unwinds every failed allocation" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, struct {
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(a: Allocator) !void {
             const actions = try planNamedIndexActionsAlloc(a, "{\"old\":{\"type\":\"graph\"}}", "{\"a\":{\"type\":\"graph\"},\"b\":{\"type\":\"graph\"},\"c\":{\"type\":\"graph\"},\"d\":{\"type\":\"graph\"},\"e\":{\"type\":\"graph\"},\"f\":{\"type\":\"graph\"},\"g\":{\"type\":\"graph\"},\"h\":{\"type\":\"graph\"}}", .graph, 1);
             defer freeNamedArtifactActions(a, actions);
@@ -2529,7 +2531,7 @@ fn enrichmentCompletionFromFactsAlloc(
 
 test "serverless catalog facts completion uses exact counters and authoritative policy refresh" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/facts-completion", .{tmp.sub_path});
     defer alloc.free(path);
@@ -4462,7 +4464,7 @@ test "serverless catalog service recommends compaction based on document base li
     // Publication pins are shared read rights and remain valid after the
     // writer returns. Test eventual pruning once those rights have expired.
     const lease = @import("../manifest/read_lease.zig");
-    const gc_now = @import("antfly_platform").time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    const gc_now = platform.time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
     pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
         fn now(ptr: *const anyopaque) u64 {
             return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
@@ -5528,8 +5530,8 @@ test "serverless external readiness shares exact publication bindings and actual
             defer plan.deinit(alloc);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, current.stats.indexes_json });
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, "{}" });
+    try platform.allocator.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, current.stats.indexes_json });
+    try platform.allocator.checkAllAllocationFailures(a, AllocationExercise.run, .{ current, "{}" });
 }
 
 test "serverless materialization readiness distinguishes absent drops from real work" {
@@ -5829,8 +5831,8 @@ test "serverless catalog status stays local and write admission rejects read-onl
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

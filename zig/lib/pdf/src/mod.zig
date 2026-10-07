@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const image = @import("antfly_image");
 const darwin_render = if (builtin.os.tag == .macos) @import("darwin_render.zig") else struct {};
@@ -1614,7 +1616,7 @@ const RenderBatchThreadControl = struct {
     stopping: bool = false,
 
     fn init() @This() {
-        return .{ .sync_io = std.Io.Threaded.global_single_threaded.io() };
+        return .{ .sync_io = platform.Io.Threaded.global_single_threaded.io() };
     }
 
     fn startWave(self: *@This(), active_len: usize) void {
@@ -1939,8 +1941,8 @@ const PageRenderWorker = struct {
 
 fn monotonicNowNs() u64 {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .windows) return 0;
-    var ts: std.posix.timespec = undefined;
-    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => {},
         else => return 0,
     }
@@ -5417,7 +5419,7 @@ test "bounded render batch uses a caller-owned executor without local threads" {
     defer parsed.deinit();
     var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &requests, .{
         .max_parallel_pages = 2,
-        .executor_io = std.testing.io,
+        .executor_io = platform.testing.io,
     });
     defer batch.deinit(alloc);
 
@@ -5495,7 +5497,7 @@ test "bounded render batch keeps results alive across fixed-executor scratch res
                 .concurrent_capacity = 2,
                 .run_batch_fn = InlineExecutor.runBatch,
             },
-            .executor_io = std.testing.io,
+            .executor_io = platform.testing.io,
         },
     ));
 }

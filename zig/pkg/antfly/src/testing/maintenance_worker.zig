@@ -1051,7 +1051,7 @@ fn parseCliWithFirst(alloc: std.mem.Allocator, args: *std.process.Args.Iterator,
 }
 
 fn writeReadyFile(path: []const u8) void {
-    std.Io.Dir.cwd().writeFile(std.Io.Threaded.global_single_threaded.io(), .{
+    std.Io.Dir.cwd().writeFile(platform.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = path,
         .data = "ready\n",
     }) catch {};
@@ -1559,8 +1559,8 @@ fn acquireLocalDbWriterLock(io: std.Io, alloc: std.mem.Allocator, db_path: []con
 
 test "graph metric maintenance local writer lock is backend independent bounded and cancelable" {
     const a = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/db", .{tmp.sub_path});
     defer a.free(path);
@@ -1975,7 +1975,7 @@ const FakeServiceMaintenanceClient = struct {
         self.captured_target = target;
         if (self.expect_ready_file_before_release) |ready_file| {
             if (std.mem.indexOf(u8, body, "\"action\":\"release\"") != null) {
-                try std.Io.Dir.cwd().access(std.Io.Threaded.global_single_threaded.io(), ready_file, .{});
+                try std.Io.Dir.cwd().access(platform.Io.Threaded.global_single_threaded.io(), ready_file, .{});
             }
         }
         const response_body = try alloc.dupe(u8, self.responses[self.calls]);
@@ -2013,7 +2013,7 @@ const LoopbackSupervisorChildRunner = struct {
             arg_z.* = (try alloc.dupeSentinel(u8, arg, 0)).ptr;
             initialized += 1;
         }
-        var args = std.process.Args.Iterator.init(.{ .vector = argv_z });
+        var args = platform.process.argsIterator(argv_z);
         var cli = try parseCli(alloc, &args);
         defer cli.deinit(alloc);
         const db_path = cli.db_path orelse return error.InvalidArguments;
@@ -2120,12 +2120,12 @@ fn startInProcessServiceBuildForTest(
 }
 
 fn expectParseCliInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) !void {
-    var args = std.process.Args.Iterator.init(.{ .vector = argv });
+    var args = platform.process.argsIterator(argv);
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &args));
 }
 
 fn expectParseSupervisorInvalid(alloc: std.mem.Allocator, argv: []const [*:0]const u8) !void {
-    var args = std.process.Args.Iterator.init(.{ .vector = argv });
+    var args = platform.process.argsIterator(argv);
     try std.testing.expectError(error.InvalidArguments, parseSupervisorCli(alloc, &args));
 }
 
@@ -2157,7 +2157,7 @@ test "graph metric maintenance command parses worker pool config" {
         "5",            "--max-pages",
         "2",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = platform.process.argsIterator(argv[0..]);
     var parsed = try parseCli(alloc, &args);
     defer parsed.deinit(alloc);
 
@@ -2189,7 +2189,7 @@ test "graph metric maintenance command parses service target config" {
         "--worker-ids", "worker-a,worker-b",
         "--max-pages",  "3",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = platform.process.argsIterator(argv[0..]);
     var parsed = try parseCli(alloc, &args);
     defer parsed.deinit(alloc);
 
@@ -2417,13 +2417,13 @@ test "graph metric maintenance service boundary preserves worker pool owner requ
 
 test "graph metric maintenance service test ready marker is written before clean release" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var ready_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const ready_path = try std.fmt.bufPrint(&ready_path_buf, ".zig-cache/tmp/{s}/graph-metric-service-ready-before-release", .{tmp.sub_path});
-    std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), ready_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(std.Io.Threaded.global_single_threaded.io(), ready_path) catch {};
+    std.Io.Dir.cwd().deleteFile(platform.Io.Threaded.global_single_threaded.io(), ready_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(platform.Io.Threaded.global_single_threaded.io(), ready_path) catch {};
 
     const responses = [_][]const u8{
         "{\"metrics_scanned\":1}",
@@ -2473,7 +2473,7 @@ test "graph metric maintenance service test ready marker is written before clean
 
 test "graph metric maintenance service owners drain degree through internal route" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2602,7 +2602,7 @@ test "graph metric maintenance service owners drain degree through internal rout
 
 test "graph metric maintenance service owners preserve degree freshness while rebuild is active" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -2797,7 +2797,7 @@ test "graph metric maintenance service owners preserve degree freshness while re
 
 test "graph metric maintenance service owners fence abandoned degree leases and recover after ttl" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -3035,7 +3035,7 @@ test "graph metric maintenance service owners fence abandoned degree leases and 
 
 test "graph metric maintenance service owners drain pagerank through internal route" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -3170,7 +3170,7 @@ test "graph metric maintenance service owners drain pagerank through internal ro
 
 test "graph metric maintenance service owners preserve pagerank freshness while rebuild is active" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -3366,7 +3366,7 @@ test "graph metric maintenance service owners preserve pagerank freshness while 
 
 test "graph metric maintenance service owners fence abandoned pagerank leases and recover after ttl" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -3616,7 +3616,7 @@ test "graph metric maintenance command rejects duplicate worker pool ids" {
         "--owner-id",   "owner-a",
         "--worker-ids", "worker-a,worker-a",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = platform.process.argsIterator(argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &args));
 }
 
@@ -3629,7 +3629,7 @@ test "graph metric maintenance command rejects worker id lists for single-owner 
         "--owner-id",   "owner-a",
         "--worker-ids", "worker-a,worker-b",
     };
-    var coordinator_args = std.process.Args.Iterator.init(.{ .vector = coordinator_argv[0..] });
+    var coordinator_args = platform.process.argsIterator(coordinator_argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &coordinator_args));
 
     const worker_argv = [_][*:0]const u8{
@@ -3639,7 +3639,7 @@ test "graph metric maintenance command rejects worker id lists for single-owner 
         "--owner-id",   "owner-a",
         "--worker-ids", "worker-a,worker-b",
     };
-    var worker_args = std.process.Args.Iterator.init(.{ .vector = worker_argv[0..] });
+    var worker_args = platform.process.argsIterator(worker_argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseCli(alloc, &worker_args));
 }
 
@@ -3692,7 +3692,7 @@ test "graph metric maintenance supervisor parses config and defaults workers" {
         "--max-pages",
         "7",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = platform.process.argsIterator(argv[0..]);
     var parsed = try parseSupervisorCli(alloc, &args);
     defer parsed.deinit(alloc);
 
@@ -3727,7 +3727,7 @@ test "graph metric maintenance supervisor parses service target config" {
         "--max-pages",
         "5",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = platform.process.argsIterator(argv[0..]);
     var parsed = try parseSupervisorCli(alloc, &args);
     defer parsed.deinit(alloc);
 
@@ -3751,7 +3751,7 @@ test "graph metric maintenance supervisor rejects duplicate worker pool ids" {
         "--worker-ids",
         "worker-a,worker-b,worker-a",
     };
-    var args = std.process.Args.Iterator.init(.{ .vector = argv[0..] });
+    var args = platform.process.argsIterator(argv[0..]);
     try std.testing.expectError(error.InvalidArguments, parseSupervisorCli(alloc, &args));
 }
 
@@ -3952,7 +3952,7 @@ test "graph metric maintenance supervisor restart policy is bounded" {
 
 test "graph metric maintenance supervisor loops until global idle" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const sequence = [_]ChildRunSummary{
         fakeChild(false, 0),
@@ -3992,9 +3992,9 @@ test "graph metric maintenance supervisor loops until global idle" {
 
 test "graph metric maintenance supervisor drives degree through child role argv" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -4121,7 +4121,7 @@ test "graph metric maintenance supervisor drives degree through child role argv"
 
 test "graph metric maintenance supervisor stops at restart limit" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const sequence = [_]ChildRunSummary{
         fakeChild(null, 17),
@@ -4228,7 +4228,7 @@ test "graph metric maintenance supervisor parses child runtime telemetry" {
 
 test "graph metric maintenance command exits after configured idle streak" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -4241,7 +4241,7 @@ test "graph metric maintenance command exits after configured idle streak" {
         defer db.close();
     }
 
-    const summary = try runConfigured(std.testing.io, alloc, path, .{
+    const summary = try runConfigured(platform.testing.io, alloc, path, .{
         .role = .coordinator,
         .runtime_id = "command-idle-coordinator",
         .owner_id = "command-idle-coordinator",
@@ -4261,7 +4261,7 @@ test "graph metric maintenance command exits after configured idle streak" {
 
 test "graph metric maintenance command summary exposes ownership telemetry" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -4274,7 +4274,7 @@ test "graph metric maintenance command summary exposes ownership telemetry" {
         defer db.close();
     }
 
-    const coordinator_summary = try runConfigured(std.testing.io, alloc, path, .{
+    const coordinator_summary = try runConfigured(platform.testing.io, alloc, path, .{
         .role = .coordinator,
         .runtime_id = "command-telemetry-coordinator-runtime",
         .owner_id = "command-telemetry-coordinator-owner",
@@ -4314,7 +4314,7 @@ test "graph metric maintenance command summary exposes ownership telemetry" {
     defer worker_ids.deinit(alloc);
     try worker_ids.appendSlice(alloc, workers[0..]);
 
-    const worker_pool_summary = try runConfigured(std.testing.io, alloc, path, .{
+    const worker_pool_summary = try runConfigured(platform.testing.io, alloc, path, .{
         .role = .worker_pool,
         .runtime_id = "command-telemetry-worker-runtime",
         .owner_id = "command-telemetry-worker-owner",
@@ -4350,7 +4350,7 @@ test "graph metric maintenance command summary exposes ownership telemetry" {
 
 test "graph metric maintenance command drives split degree through db-open runtime" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -4417,11 +4417,11 @@ test "graph metric maintenance command drives split degree through db-open runti
 
     var fresh = false;
     for (0..80) |_| {
-        _ = try runConfigured(std.testing.io, alloc, path, coordinator);
-        const worker_summary = try runConfigured(std.testing.io, alloc, path, worker_pool);
+        _ = try runConfigured(platform.testing.io, alloc, path, coordinator);
+        const worker_summary = try runConfigured(platform.testing.io, alloc, path, worker_pool);
         try std.testing.expectEqual(RuntimeRole.worker_pool, worker_summary.role);
         try std.testing.expect(!worker_summary.stats.started);
-        _ = try runConfigured(std.testing.io, alloc, path, coordinator);
+        _ = try runConfigured(platform.testing.io, alloc, path, coordinator);
 
         var reader = try antfly.db.DB.open(alloc, path, .{
             .open_mode = .query_readonly,

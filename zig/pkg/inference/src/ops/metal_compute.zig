@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const ml = @import("ml");
 const build_options = @import("build_options");
@@ -4406,8 +4408,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn monotonicNowNs() u128 {
-        var ts: std.posix.timespec = undefined;
-        switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        var ts: platform.c.timespec = undefined;
+        switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
             .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
             else => return 0,
         }
@@ -31129,7 +31131,7 @@ pub fn deinitPackedExpertViews(data: *WeightStore, allocator: std.mem.Allocator)
 }
 
 fn lockSharedMetalData(data: *WeightStore, io: ?std.Io) !std.Io {
-    const lock_io = io orelse if (builtin.is_test) std.testing.io else std.Io.failing;
+    const lock_io = io orelse if (builtin.is_test) platform.testing.io else std.Io.failing;
     // Never park an inference worker (or a nested caller) behind another
     // request's GPU stream. The caller/broker can drain and retry admission.
     if (!data.shared_metal_native_provider_lock.tryLock()) return error.QueueFull;
@@ -34042,7 +34044,7 @@ fn testNativeDenseMaterializationAllocationFailures(allocator: std.mem.Allocator
 
 test "metal_compute: native dense materialization cleans up allocation failures" {
     if (!build_options.enable_metal) return error.SkipZigTest;
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testNativeDenseMaterializationAllocationFailures, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, testNativeDenseMaterializationAllocationFailures, .{});
 }
 
 test "metal_compute: add native dense logits bias keeps single and batched rows resident" {
@@ -36508,7 +36510,7 @@ fn exerciseCompactDebertaRows(allocator: std.mem.Allocator) !void {
 test "metal_compute: compact DeBERTa rows validate indices and unwind allocation or cancellation" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     const a = std.testing.allocator;
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseCompactDebertaRows, .{});
+    try platform.allocator.checkAllAllocationFailures(a, exerciseCompactDebertaRows, .{});
     try std.testing.expectError(error.InvalidTensorShape, MetalCompute.compactEmbeddingRows(a, &.{ 1, 2 }, 2, 1, &.{-1}, null));
     try std.testing.expectError(error.InvalidTensorShape, MetalCompute.compactEmbeddingRows(a, &.{ 1, 2 }, 2, 1, &.{2}, null));
     try std.testing.expectError(error.InvalidTensorShape, MetalCompute.compactEmbeddingRows(a, &.{ 1, 2 }, 3, 1, &.{0}, null));
@@ -38065,8 +38067,8 @@ fn exerciseImmutableF32Borrow(allocator: std.mem.Allocator, enabled: bool) !void
 
 test "metal_compute: immutable F32 borrowing pins sources and unwinds allocation failures" {
     if (!build_options.enable_metal) return error.SkipZigTest;
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseImmutableF32Borrow, .{false});
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseImmutableF32Borrow, .{true});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseImmutableF32Borrow, .{false});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseImmutableF32Borrow, .{true});
 }
 
 test "metal_compute: legacy immutable F32 MPS policy excludes mutable reduced and narrow weights" {
@@ -38423,8 +38425,8 @@ test "metal_compute: weight handle lifetime bounds materializations and lazy pin
 
 test "metal_compute: weight handle lifetime unwinds allocation failures" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{false});
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{true});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{false});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, testMetalWeightHandleLifetime, .{true});
 }
 
 test "metal_compute: dense cache owns native bytes independently of weight handles" {
@@ -39246,7 +39248,7 @@ test "strict GLiNER boundary scope allocation failures clean pending storage and
     const input = try cb.glinerBoundaryDevice(&.{ .upload_f32 = .{ .values = &.{ 3, 5 }, .shape = &.{2} } });
     defer cb.free(input);
     const before = metal_tensor_mod.memoryStatsSnapshot();
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseBoundaryScopeAllocationFailure, .{ &compute, input });
+    try platform.allocator.checkAllAllocationFailures(a, exerciseBoundaryScopeAllocationFailure, .{ &compute, input });
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
     try std.testing.expect(!metal_runtime_mod.hasActiveFrame(compute.provider_impl.raw_decode_runtime));
     try std.testing.expect(!metal_runtime_mod.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
@@ -39290,7 +39292,7 @@ test "strict GLiNER boundary request allocation failures cover uploads and alloc
     var compute = try MetalCompute.init(a, &store, null);
     defer compute.deinit();
     const before = metal_tensor_mod.memoryStatsSnapshot();
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseBoundaryRequestAllocations, .{&compute});
+    try platform.allocator.checkAllAllocationFailures(a, exerciseBoundaryRequestAllocations, .{&compute});
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
     try std.testing.expect(!metal_runtime_mod.hasActiveFrame(compute.provider_impl.raw_decode_runtime));
     try std.testing.expect(!metal_runtime_mod.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
@@ -39560,7 +39562,7 @@ test "strict GLiNER boundary scope workspace OOM cancellation and oversized prod
     const bias = try cb.glinerBoundaryDevice(&.{ .upload_f32 = .{ .values = &.{ 0.5, -0.5 }, .shape = &.{2} } });
     defer cb.free(bias);
     const before = metal_tensor_mod.memoryStatsSnapshot();
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseBoundaryWorkspaceAllocationFailure, .{ &compute, input, weight, bias });
+    try platform.allocator.checkAllAllocationFailures(a, exerciseBoundaryWorkspaceAllocationFailure, .{ &compute, input, weight, bias });
     try std.testing.expectEqual(before.device_owned_live_bytes, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
     try std.testing.expectEqual(@as(usize, 0), compute.boundary_workspace_cursor.?.used_bytes);
     try std.testing.expect(!metal_runtime_mod.hasActiveFrame(compute.provider_impl.raw_decode_runtime));

@@ -335,7 +335,7 @@ test "GLiNER2.5 ModernBERT checkpoint trains full and heads jobs on resident Met
     for (0..4) |i| try bytes.writer.print("{{\"version\":1,\"id\":\"{d}\",\"text\":\"John works at Apple. Alice works at Google.\",\"schema\":{{\"entities\":[\"person\",\"organization\"],\"classifications\":[{{\"name\":\"sentiment\",\"labels\":[\"positive\",\"negative\"]}}]}},\"entities\":[{{\"id\":\"john\",\"type\":\"person\",\"span\":{{\"start\":0,\"end\":4}}}},{{\"id\":\"apple\",\"type\":\"organization\",\"span\":{{\"start\":14,\"end\":19}}}}],\"classifications\":[{{\"task\":\"sentiment\",\"labels\":[\"positive\"]}}]}}\n", .{i});
     var samples = try data.Dataset.fromBytes(a, bytes.written(), .{ .limits = .{ .max_host_bytes = 16 * 1024 * 1024 } }, null, null);
     defer samples.deinit();
-    var temporary = std.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/modernbert.safetensors", .{temporary.sub_path});
     defer a.free(path);

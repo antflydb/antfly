@@ -58,7 +58,7 @@ const HeldColdRequest = struct {
         const until = clock() + wait_ms * std.time.ns_per_ms;
         while (!self.node.model_manager.load_lock.tryLock()) {
             if (clock() >= until) return error.ColdLoadLockTimeout;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
         self.lock_held = true;
         errdefer self.release();
@@ -95,7 +95,7 @@ const HeldColdRequest = struct {
                 amounts.host_scratch_bytes == scratch_bytes and
                 self.node.metrics.extraction_v2.phase_visits.get(.preflight) > 0) break;
             if (clock() >= until) return error.ColdRequestAdmissionTimeout;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
         // Registry reads are protected by the lock owned here. The actual
         // managed load cannot create a flight or model until release().
@@ -156,9 +156,9 @@ test "gliner boundary socket pinned small concurrent admission rejection release
     const a = std.testing.allocator;
     var path: [Io.Dir.max_path_bytes]u8 = undefined;
     const length = if (std.fs.path.isAbsolute(requested))
-        try Io.Dir.realPathFileAbsolute(std.testing.io, requested, &path)
+        try Io.Dir.realPathFileAbsolute(platform.testing.io, requested, &path)
     else
-        try Io.Dir.cwd().realPathFile(std.testing.io, requested, &path);
+        try Io.Dir.cwd().realPathFile(platform.testing.io, requested, &path);
     const directory = path[0..length];
     const name = std.fs.path.basename(directory);
     const fixture_bytes = try fixtures.fixtureBytes(a, "pipeline_cases.json");
@@ -182,7 +182,7 @@ test "gliner boundary socket pinned small concurrent admission rejection release
         });
         defer node.deinit();
         shared.useNativeBackend(&node);
-        try node.attachIo(std.testing.io);
+        try node.attachIo(platform.testing.io);
         try std.testing.expect(!node.test_allow_unqualified_gliner_boundary);
         node.test_allow_unqualified_gliner_boundary = true;
         const transport = try Loopback.init(a, &node);
@@ -205,9 +205,9 @@ test "gliner boundary socket pinned small concurrent admission rejection release
         // driver must therefore run outside that four-lane client executor.
         // One separate driver lane is sufficient; it and the competing
         // client's metadata share this existing 4 MiB bounded owner.
-        var driver = Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
+        var driver = platform.Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
         defer driver.deinit();
-        var second_io = Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
+        var second_io = platform.Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
         defer second_io.deinit();
         var second = httpx.Client.initWithConfig(second_budget.allocator(), second_io.io(), .{
             .timeouts = .{ .connect_ms = wait_ms, .read_ms = request_ms, .write_ms = wait_ms, .request_ms = request_ms },

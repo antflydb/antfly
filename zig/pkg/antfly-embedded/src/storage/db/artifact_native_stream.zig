@@ -16,7 +16,9 @@
 //! Receiver-local census of surviving native/base-vector effects. The primary
 //! row belongs to the exact-input obligation; generated assets, unit scopes and
 //! index projections retain their own separate completion requirements.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const publication = @import("artifact_publication.zig");
 const inventory = @import("artifact_inventory.zig");
 const checkpoint = @import("artifact_stream_checkpoint.zig");
@@ -164,7 +166,7 @@ pub fn prepare(alloc: std.mem.Allocator, txn: anytype, root: u128, document: []c
     if (state.scan_cursor.len == 0 and state.cursor.len != 0) if (entry) |item| if (std.mem.eql(u8, item.key, state.cursor)) {
         entry = try cursor.next();
     };
-    var budget: @import("artifact_scan_budget.zig").Budget = .{ .max_visits = limits.visits, .max_bytes = limits.bytes, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| 2 * std.time.ns_per_ms };
+    var budget: @import("artifact_scan_budget.zig").Budget = .{ .max_visits = limits.visits, .max_bytes = limits.bytes, .deadline_ns = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms };
     var source: ?publication.Source = null;
     var advanced = false;
     while (entry) |item| {
@@ -337,7 +339,7 @@ test "ordered artifact inventory native census resumes authored inventory and re
     const authored = @import("artifact_authored_acceptance.zig");
     const obligations = @import("artifact_producer_obligations.zig");
     const completion = @import("artifact_completion_progress.zig");
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-census", .{tmp.sub_path});
     defer alloc.free(path);

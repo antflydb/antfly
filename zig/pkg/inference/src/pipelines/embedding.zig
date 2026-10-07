@@ -2677,8 +2677,8 @@ fn embedTimingEnabled(explicit: bool) bool {
 }
 
 fn embedTimingNowNs() u128 {
-    var ts: std.posix.timespec = undefined;
-    return switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    return switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => 0,
     };
@@ -3479,7 +3479,7 @@ test "image embedding broker fuses concurrent callers and transfers owned vector
 
         fn run(self: *@This()) std.Io.Cancelable!void {
             const payload: []const u8 = &red_png_2x2;
-            const results = self.broker.submitBatchControlled([]const u8, []f32, std.testing.io, shared, .{ .model = "clip", .generation = 1, .task = .embed, .transform = "encoded-image", .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_wait_us = 500_000 }, &.{.{ .bytes = payload.len, .pixels = 4 }}, &.{.{}}, null, .{}, &.{payload}, self.executor, Executor.run) catch |err| {
+            const results = self.broker.submitBatchControlled([]const u8, []f32, platform.testing.io, shared, .{ .model = "clip", .generation = 1, .task = .embed, .transform = "encoded-image", .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_wait_us = 500_000 }, &.{.{ .bytes = payload.len, .pixels = 4 }}, &.{.{}}, null, .{}, &.{payload}, self.executor, Executor.run) catch |err| {
                 self.err = err;
                 return;
             };
@@ -3499,10 +3499,10 @@ test "image embedding broker fuses concurrent callers and transfers owned vector
     var second = Submit{ .broker = &broker, .executor = &executor };
     defer second.deinit();
     var group: std.Io.Group = .init;
-    defer group.cancel(std.testing.io);
-    try group.concurrent(std.testing.io, Submit.run, .{&first});
-    try group.concurrent(std.testing.io, Submit.run, .{&second});
-    try group.await(std.testing.io);
+    defer group.cancel(platform.testing.io);
+    try group.concurrent(platform.testing.io, Submit.run, .{&first});
+    try group.concurrent(platform.testing.io, Submit.run, .{&second});
+    try group.await(platform.testing.io);
     if (first.err) |err| return err;
     if (second.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), executor.vision.run_count);

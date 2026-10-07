@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const build_options = @import("build_options");
 const ml = @import("ml");
 const onnx_graph = @import("onnx_graph");
@@ -1130,8 +1132,8 @@ pub fn createSessionWithOptions(
     self.io = options.io;
     self.requested_strategy = options.graph_runtime_strategy orelse graph_runtime_mod.strategyFromEnv();
     if (requested_backend == .metal and options.graph_runtime_strategy == null and
-        @import("antfly_platform").env.getenv("TERMITE_GRAPH_RUNTIME") == null and
-        @import("antfly_platform").env.getenv("TERMITE_ONNX_GRAPH_RUNTIME") == null)
+        platform.env.getenv("TERMITE_GRAPH_RUNTIME") == null and
+        platform.env.getenv("TERMITE_ONNX_GRAPH_RUNTIME") == null)
         self.requested_strategy = .compiled_preferred;
     if (requested_backend == .metal and options.input_shapes == null) {
         for (self.input_node_ids) |node_id| {
@@ -1259,7 +1261,7 @@ pub const ExecutionStats = struct {
 pub fn executionStats(session: Session) ?ExecutionStats {
     if (session.vtable != &imported_session_vtable) return null;
     const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
-    @import("antfly_platform").sync.lockYielding(&self.specialization_mutex);
+    platform.sync.lockYielding(&self.specialization_mutex);
     defer self.specialization_mutex.unlock();
     return .{
         .strategy = self.requested_strategy,
@@ -1445,7 +1447,7 @@ fn runResidentImpl(
     }
     if (control) |active| try active.check();
     if (self.source_path != null) {
-        @import("antfly_platform").sync.lockYielding(&self.specialization_mutex);
+        platform.sync.lockYielding(&self.specialization_mutex);
         defer self.specialization_mutex.unlock();
         // Shape metadata is sufficient to select a plan for device inputs;
         // never download resident tensors merely to bind dynamic dimensions.
@@ -2302,9 +2304,9 @@ test "imported onnx session runs simple add model" {
     const model_bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
     defer allocator.free(model_bytes);
 
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
 
     const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
     defer allocator.free(path);
@@ -2387,9 +2389,9 @@ test "imported Reshape copies dynamic axes before inferring and transposing" {
     };
     const model_bytes = try onnx_graph.serializeModel(allocator, &model);
     defer allocator.free(model_bytes);
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
     const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
     defer allocator.free(path);
     var session = try createSessionWithOptions(allocator, path, .native, .{ .graph_runtime_strategy = .partitioned });
@@ -2476,9 +2478,9 @@ test "imported AveragePool preserves local windows and dynamic image dimensions"
     };
     const model_bytes = try onnx_graph.serializeModel(allocator, &model);
     defer allocator.free(model_bytes);
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
     const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
     defer allocator.free(path);
     var session = try createSessionWithOptions(allocator, path, .native, .{ .graph_runtime_strategy = .partitioned });
@@ -2564,9 +2566,9 @@ test "imported AveragePool roundtrip preserves padding divisors alignment and di
         try graph.markOutput(pooled);
         const bytes = try onnx_graph.exportGraph(allocator, &graph, .{});
         defer allocator.free(bytes);
-        var dir = std.testing.tmpDir(.{});
+        var dir = platform.testing.tmpDir(.{});
         defer dir.cleanup();
-        try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
+        try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
         const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
         defer allocator.free(path);
         var session = try createSessionWithOptions(allocator, path, .native, .{ .graph_runtime_strategy = .partitioned });
@@ -2681,9 +2683,9 @@ test "imported onnx session matches dynamic quantized integer matmul semantics" 
     const model_bytes = try onnx_graph.serializeModel(allocator, &model);
     defer allocator.free(model_bytes);
 
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "model.onnx", .data = model_bytes });
     const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
     defer allocator.free(path);
 
@@ -2737,13 +2739,13 @@ test "ONNX artifact inspection includes and validates external tensor files" {
     );
     defer exported.deinit(allocator);
 
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.onnx",
         .data = exported.model_bytes,
     });
-    try dir.dir.writeFile(std.testing.io, .{
+    try dir.dir.writeFile(platform.testing.io, .{
         .sub_path = "model.data",
         .data = exported.external_data.?.bytes,
     });
@@ -2761,7 +2763,7 @@ test "ONNX artifact inspection includes and validates external tensor files" {
         artifacts.encoded_bytes,
     );
 
-    try dir.dir.deleteFile(std.testing.io, "model.data");
+    try dir.dir.deleteFile(platform.testing.io, "model.data");
     try std.testing.expectError(error.FileNotFound, inspectArtifactSet(allocator, path));
 }
 
@@ -3434,9 +3436,9 @@ test "imported ONNX Metal shape cache shares weights and survives eviction" {
     const bias_values = @as([32]f32, @splat(2));
     const bytes = try onnx_graph.exportGraph(allocator, &graph, .{ .parameter_initializers = &.{.{ .name = "bias", .shape = Shape.init(.f32, &.{32}), .data = .{ .f32 = &bias_values } }} });
     defer allocator.free(bytes);
-    var dir = std.testing.tmpDir(.{});
+    var dir = platform.testing.tmpDir(.{});
     defer dir.cleanup();
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "model.onnx", .data = bytes });
     const path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", dir.sub_path[0..], "model.onnx" });
     defer allocator.free(path);
     var session = try createSessionWithOptions(allocator, path, .metal, .{ .graph_runtime_strategy = .partitioned });
@@ -3445,7 +3447,7 @@ test "imported ONNX Metal shape cache shares weights and survives eviction" {
     try std.testing.expect(parent.source_path != null);
     // A new shape must keep working even after an atomic model replacement.
     // The cache owns a compact immutable graph, not a path to reload later.
-    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.onnx", .data = "replaced model" });
+    try dir.dir.writeFile(platform.testing.io, .{ .sub_path = "model.onnx", .data = "replaced model" });
     var template = try onnx_graph.parseLazyAsModel(allocator, parent.shape_template.?);
     defer template.deinit();
     try std.testing.expectEqual(@as(usize, 0), template.getInitializer("bias").?.tensor.raw_data.len);

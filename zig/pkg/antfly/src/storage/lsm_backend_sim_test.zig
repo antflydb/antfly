@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const backend_types = @import("antfly_local_sources").storage_backend_types;
 const mem_backend_mod = @import("antfly_local_sources").storage_mem_backend;
 const lsm_backend_mod = @import("antfly_local_sources").storage_lsm_backend_mod;
@@ -42,7 +44,7 @@ const keys = [_][]const u8{
 var sim_nonce: std.atomic.Value(u64) = .init(0);
 
 fn nowNs() u64 {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const now = std.Io.Timestamp.now(io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());
@@ -59,7 +61,7 @@ fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

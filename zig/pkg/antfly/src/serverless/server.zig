@@ -13,7 +13,9 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const runtime_mod = @import("runtime/mod.zig");
 const serverless_http_server = @import("../serverless_http_server.zig");
@@ -224,7 +226,7 @@ test "serverless server starts managed runtime and serves listener requests" {
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, std.testing.io, .{
+    var server = try ServerlessServer.init(alloc, platform.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -310,7 +312,7 @@ test "serverless server query-only role rejects maintenance routes but serves re
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, std.testing.io, .{
+    var server = try ServerlessServer.init(alloc, platform.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -427,7 +429,7 @@ test "serverless server public table routes preserve published and latest cutove
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, std.testing.io, .{
+    var server = try ServerlessServer.init(alloc, platform.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -575,7 +577,7 @@ test "serverless server hides remapped serving namespaces behind public table ro
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, std.testing.io, .{
+    var server = try ServerlessServer.init(alloc, platform.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -727,7 +729,7 @@ test "serverless server public table graph routes stay pinned until publish cuto
     const catalog_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{std.mem.span(catalog_root)});
     defer alloc.free(catalog_uri);
 
-    var server = try ServerlessServer.init(alloc, std.testing.io, .{
+    var server = try ServerlessServer.init(alloc, platform.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = artifacts_uri,
             .manifests_uri = manifests_uri,
@@ -904,7 +906,7 @@ test "serverless server serves requests over env-configured s3 backend" {
     var uris = try test_backend.makeNamespaceUris(alloc, .s3, bucket, prefix_root);
     defer uris.deinit(alloc);
 
-    var server = try ServerlessServer.init(alloc, std.testing.io, .{
+    var server = try ServerlessServer.init(alloc, platform.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = uris.artifacts,
             .manifests_uri = uris.manifests,
@@ -968,7 +970,7 @@ test "serverless server serves requests over env-configured gs backend" {
     var uris = try test_backend.makeNamespaceUris(alloc, .gs, bucket, prefix_root);
     defer uris.deinit(alloc);
 
-    var server = try ServerlessServer.init(alloc, std.testing.io, .{
+    var server = try ServerlessServer.init(alloc, platform.testing.io, .{
         .bootstrap = .{
             .artifacts_uri = uris.artifacts,
             .manifests_uri = uris.manifests,
@@ -1055,8 +1057,8 @@ fn hasDocId(items: anytype, doc_id: []const u8) bool {
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() std.Io.Threaded {
-    return std.Io.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

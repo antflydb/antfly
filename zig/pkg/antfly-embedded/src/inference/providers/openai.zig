@@ -18,7 +18,9 @@
 // Works with OpenAI, Ollama, vLLM, and any OpenAI-compatible API.
 // Uses the generated client from the official OpenAI 3.1 spec.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 const openai_api = @import("openai_api");
 const inference = @import("antfly_inference_types");
@@ -359,7 +361,7 @@ test "openai provider compiles" {
 
 test "openai embed round trip and non-200 response" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -452,7 +454,7 @@ test "openai embed round trip and non-200 response" {
 
 test "openai generate round trip and empty choices failure" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

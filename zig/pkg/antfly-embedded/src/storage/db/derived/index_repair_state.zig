@@ -22,12 +22,14 @@
 //! external storage supplies equivalent atomic publication so restart can
 //! never observe one without the other.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const platform_sync = @import("antfly_platform").sync;
+const platform_sync = platform.sync;
 const storage_io = @import("../../lsm_backend/storage_io.zig");
 const types = @import("../types.zig");
 
@@ -57,7 +59,7 @@ pub const Location = struct {
     /// Native checkpoint operations borrow their caller's runtime. The
     /// process-wide debug runtime is retained only for compatibility callers
     /// that do not yet have an owning runtime to pass.
-    io: std.Io = std.Options.debug_io,
+    io: std.Io = platform.debug_io,
 
     pub fn native(path: []const u8) Location {
         return .{
@@ -426,13 +428,13 @@ pub fn checkpointPathAlloc(alloc: Allocator, db_path: []const u8) ![]u8 {
 }
 
 pub fn newReplicaIdentity(alloc: Allocator, root_generation: u64) !ReplicaIdentity {
-    return newReplicaIdentityWithIo(alloc, std.Options.debug_io, root_generation);
+    return newReplicaIdentityWithIo(alloc, platform.debug_io, root_generation);
 }
 
 pub fn newReplicaIdentityWithIo(alloc: Allocator, io: std.Io, root_generation: u64) !ReplicaIdentity {
     _ = alloc;
     var entropy: [32]u8 = undefined;
-    try @import("antfly_platform").entropy.fill(io, &entropy);
+    try platform.entropy.fill(io, &entropy);
     var db_identity = std.mem.readInt(u128, entropy[0..16], .little);
     var replica_id = std.mem.readInt(u128, entropy[16..32], .little);
     if (db_identity == 0) db_identity = 1;
@@ -445,13 +447,13 @@ pub fn newReplicaIdentityWithIo(alloc: Allocator, io: std.Io, root_generation: u
 }
 
 pub fn newRepairId(alloc: Allocator) !u128 {
-    return newRepairIdWithIo(alloc, std.Options.debug_io);
+    return newRepairIdWithIo(alloc, platform.debug_io);
 }
 
 pub fn newRepairIdWithIo(alloc: Allocator, io: std.Io) !u128 {
     _ = alloc;
     var entropy: [16]u8 = undefined;
-    try @import("antfly_platform").entropy.fill(io, &entropy);
+    try platform.entropy.fill(io, &entropy);
     const value = std.mem.readInt(u128, &entropy, .little);
     return if (value == 0) 1 else value;
 }
@@ -1108,7 +1110,7 @@ test "index repair state persists through backend storage" {
 
 test "index repair state persists intent and provisional replay pin atomically" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -1185,7 +1187,7 @@ test "index repair state persists intent and provisional replay pin atomically" 
 
 test "index repair state rejects non-detected initial intents" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -1202,7 +1204,7 @@ test "index repair state rejects non-detected initial intents" {
 
 test "index repair state transitions are fenced and remove intent with pin" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -1270,7 +1272,7 @@ test "index repair state transitions are fenced and remove intent with pin" {
 
 test "index repair state revision fences same-phase mutations" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -1329,7 +1331,7 @@ test "index repair state revision fences same-phase mutations" {
 
 test "index repair state root-generation reset atomically rebinds replacement debt" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});

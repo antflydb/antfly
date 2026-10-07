@@ -22,7 +22,9 @@
 //! concurrent writer therefore makes cleanup retry or fail rather than leaving
 //! a false-success receipt.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const object_storage = @import("antfly_local_sources").storage_object_storage;
@@ -572,7 +574,7 @@ fn isRfc3339Nano(value: []const u8) bool {
 }
 
 fn nowRfc3339NanoAlloc(alloc: Allocator) ![]u8 {
-    var io_impl = std.Io.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const raw = std.Io.Clock.real.now(io_impl.io()).nanoseconds;
     if (raw < 0 or raw > std.math.maxInt(u64)) return error.InvalidSeedPrefixCleanupClock;

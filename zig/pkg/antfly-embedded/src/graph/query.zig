@@ -21,10 +21,12 @@
 //!   - shortest_path: via paths.findShortestPath()
 //!   - k_shortest_paths: via paths.findKShortestPaths()
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 pub const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 const graph_mod = @import("graph.zig");
 const edge_type_mod = @import("edge_type.zig");
 const node_identity = @import("node_identity.zig");
@@ -2987,14 +2989,14 @@ const docstore = @import("../storage/docstore.zig");
 fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
     const ns = platform_time.monotonicNs();
     const slice = std.fmt.bufPrint(buf, "/tmp/antfly-gq-{s}-{d}\x00", .{ label, ns }) catch unreachable;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

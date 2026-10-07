@@ -17,11 +17,13 @@
 //! Distributed sources retain routing, admission, consistency, aggregation,
 //! and lifecycle; this source owns only coarse physical operations.
 
+const platform = @import("antfly_platform");
 const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const std = @import("std");
+
 const request_operation = @import("antfly_local_sources").api_operation;
-const platform_sync = @import("antfly_platform").sync;
-const platform_time = @import("antfly_platform").time;
+const platform_sync = platform.sync;
+const platform_time = platform.time;
 const abi = @import("kernel_owner_abi");
 const kernel_error_identity = @import("kernel_error_identity");
 const client = @import("../storage/kernel_owner_client.zig");
@@ -112,7 +114,7 @@ test "source owner deadlines normalize executor clock epochs without extending b
         }
     };
     var clock_now: u64 = 10;
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.now = FakeClock.now;
     const io: std.Io = .{ .userdata = &clock_now, .vtable = &vtable };
     const context: request_operation.RequestContext = .{ .deadline_ns = 10 + std.time.ns_per_s, .deadline_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) };
@@ -151,7 +153,7 @@ test "source owner routed admission preserves the fence clock" {
         }
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.now = Fixture.clock;
     var request: Fixture = .{ .now = 10 };
     request.io = .{ .userdata = &request, .vtable = &vtable };
@@ -213,7 +215,7 @@ test "source owner lookup and descriptor admission preserve one cancellable cata
         }
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
     };
-    var vtable = std.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.now = Fixture.now;
     for ([_]@FieldType(Fixture, "mode"){ .confirm, .cancel, .expire }) |mode| {
         for ([_]bool{ false, true }) |lookup| {
@@ -1436,7 +1438,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
     ) !void {
         if (group_id == 0) return error.InvalidArgument;
-        var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
+        var wait_io_impl = platform.Io.Threaded.init(self.alloc, .{});
         defer wait_io_impl.deinit();
         const wait_io = wait_io_impl.io();
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
@@ -3795,7 +3797,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         controls: ReadControls,
     ) !Lease {
         errdefer if (exclusive) self.clearExclusivePending(group_id, table_name);
-        var wait_io_impl = std.Io.Threaded.init(self.alloc, .{});
+        var wait_io_impl = platform.Io.Threaded.init(self.alloc, .{});
         defer wait_io_impl.deinit();
         const wait_io = wait_io_impl.io();
         const deadline_ns = platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
@@ -4451,7 +4453,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         fn check(self: *@This()) !void {
             if (self.cancellation) |token| try token.check();
-            if (self.deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+            if (self.deadline_ns) |deadline| if (platform.time.monotonicNs() >= deadline) return error.DeadlineExceeded;
             try self.source.validateRoutedRead(self.alloc, self.route, self.group, self.table);
             const validate = self.source.read_safety_barrier.vtable.validate_frozen orelse return error.SqlStatementSnapshotRequired;
             try validate(self.source.read_safety_barrier.ptr, self.group, self.frozen_proof, self.deadline_ns, self.cancellation orelse .none);
@@ -6300,7 +6302,7 @@ test "storage owner quiesce drains leases and promotion callbacks before context
         fn isLeader(ptr: *anyopaque, _: u64) bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.entered.store(true, .release);
-            while (!self.released.load(.acquire)) std.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            while (!self.released.load(.acquire)) platform.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
             return false;
         }
     };
@@ -6326,28 +6328,28 @@ test "storage owner quiesce drains leases and promotion callbacks before context
     const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
     while (!callback.entered.load(.acquire)) {
         if (platform_time.monotonicNs() >= deadline) return error.PromotionCallbackDidNotStart;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     const Shutdown = struct {
         source: *ProvisionedKernelOwnerSource,
         done: std.atomic.Value(bool) = .init(false),
         err: ?anyerror = null,
         fn run(self: *@This()) void {
-            self.source.quiesce(std.testing.io) catch |err| {
+            self.source.quiesce(platform.testing.io) catch |err| {
                 self.err = err;
             };
             self.done.store(true, .release);
         }
     };
     var shutdown = Shutdown{ .source = &source };
-    var shutdown_task = try std.testing.io.concurrent(Shutdown.run, .{&shutdown});
+    var shutdown_task = try platform.testing.io.concurrent(Shutdown.run, .{&shutdown});
     defer {
         callback.released.store(true, .release);
         if (lease_active) {
             lease.deinit();
             lease_active = false;
         }
-        shutdown_task.await(std.testing.io);
+        shutdown_task.await(platform.testing.io);
     }
     while (true) {
         ProvisionedKernelOwnerSource.lock(&source.mutex);
@@ -6355,16 +6357,16 @@ test "storage owner quiesce drains leases and promotion callbacks before context
         source.mutex.unlock();
         if (quiescing) break;
         if (platform_time.monotonicNs() >= deadline) return error.QuiesceDidNotStart;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expect(!shutdown.done.load(.acquire));
     try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
     // Closing the last lease must wait for the autonomous callback as well.
-    var release_task = try std.testing.io.concurrent(ProvisionedKernelOwnerSource.Lease.deinit, .{&lease});
+    var release_task = try platform.testing.io.concurrent(ProvisionedKernelOwnerSource.Lease.deinit, .{&lease});
     lease_active = false;
     defer {
         callback.released.store(true, .release);
-        release_task.await(std.testing.io);
+        release_task.await(platform.testing.io);
     }
     while (true) {
         ProvisionedKernelOwnerSource.lock(&source.mutex);
@@ -6372,14 +6374,14 @@ test "storage owner quiesce drains leases and promotion callbacks before context
         source.mutex.unlock();
         if (closing) break;
         if (platform_time.monotonicNs() >= deadline) return error.OwnerCloseDidNotStart;
-        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     }
     try std.testing.expect(!shutdown.done.load(.acquire));
     callback.released.store(true, .release);
-    while (!shutdown.done.load(.acquire)) try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+    while (!shutdown.done.load(.acquire)) try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     if (shutdown.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), source.ownerCountForTest());
-    try source.quiesce(std.testing.io);
+    try source.quiesce(platform.testing.io);
     try std.testing.expectError(error.Canceled, source.acquireDescriptor(7001, "docs", path, descriptor));
 }
 
@@ -6387,7 +6389,7 @@ test "committed owner apply yields admission conflicts and retries the exact ent
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
     for ([_]enum { registry, exclusive, publication }{ .registry, .exclusive, .publication }) |history| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
         defer alloc.free(root);
@@ -6449,8 +6451,8 @@ test "committed owner apply yields admission conflicts and retries the exact ent
 test "committed owner apply never opens or closes storage under the raft apply lock" {
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -6628,8 +6630,8 @@ test "committed owner apply never opens or closes storage under the raft apply l
 
 test "owner shutdown joins recovery close while raft progress remains available" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -6729,8 +6731,8 @@ test "historical apply requires the exact restore binding" {
 
 test "committed catch-up retains newer durable schema across an older pinned descriptor" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -6746,7 +6748,7 @@ test "committed catch-up retains newer durable schema across an older pinned des
                 source_ptr.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(std.testing.allocator, 1, "docs", descriptor, batch, 1, index) catch |err| switch (err) {
                     error.RaftApplyWriterUnavailable => {
                         if (platform_time.monotonicNs() >= deadline) return error.TestOwnerAdmissionDidNotRecover;
-                        try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
                         continue;
                     },
                     else => return err,
@@ -6801,7 +6803,7 @@ test "committed catch-up retains newer durable schema across an older pinned des
 
 test "committed relational catch-up applies an older pinned schema version" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -6841,7 +6843,7 @@ test "committed relational catch-up applies an older pinned schema version" {
 
 test "hidden initial child descriptor requires exact private bootstrap" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -6877,7 +6879,7 @@ test "hidden initial child descriptor requires exact private bootstrap" {
 
 test "committed catch-up does not reconcile an older index-only descriptor" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -6927,7 +6929,7 @@ test "committed catch-up does not reconcile an older index-only descriptor" {
 
 test "current catalog acquisition replaces a replay-only owner with the same descriptor" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -6962,7 +6964,7 @@ test "current catalog acquisition replaces a replay-only owner with the same des
             var status = replay.owner().runtimeStatusJson("docs") catch |err| switch (err) {
                 error.StorageBusy => {
                     if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotObservable;
-                    try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                    try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
                     continue;
                 },
                 else => return err,
@@ -6973,7 +6975,7 @@ test "current catalog acquisition replaces a replay-only owner with the same des
             const enrichment = parsed.value.object.get("stats").?.object.get("enrichment").?.object;
             if (enrichment.get("enabled").?.bool and enrichment.get("worker_started").?.bool) break;
             if (platform_time.monotonicNs() >= deadline) return error.TestEnrichmentRuntimeNotStarted;
-            try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
         }
     }
     var current = try source.acquireDescriptor(1, "docs", path, descriptor);
@@ -7037,7 +7039,7 @@ test "transient storage owner retirement drains borrowers and permits foreground
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
     for ([_]enum { observation_finished, observation_held, maintenance_held, foreground_adoption, prepared_adoption }{ .observation_finished, .observation_held, .maintenance_held, .foreground_adoption, .prepared_adoption }) |history| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owner", .{tmp.sub_path});
         defer alloc.free(path);
@@ -7399,7 +7401,7 @@ const PublicationWaitTest = struct {
     }
 
     fn io(self: *@This(), vtable: *std.Io.VTable) std.Io {
-        vtable.* = std.testing.io.vtable.*;
+        vtable.* = platform.testing.io.vtable.*;
         vtable.now = now;
         vtable.sleep = sleep;
         return .{ .userdata = self, .vtable = vtable };
@@ -7410,7 +7412,7 @@ test "publication drains existing readers status and maintenance before reopenin
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
     for ([_]enum { reader, status, maintenance }{ .reader, .status, .maintenance }) |history| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owner", .{tmp.sub_path});
         defer alloc.free(path);
@@ -7477,7 +7479,7 @@ test "publication drains existing readers status and maintenance before reopenin
 test "maintenance on one owner does not pin another owner against publication" {
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -7520,7 +7522,7 @@ test "publication cancellation and timeout release admission without invalidatin
     const alloc = std.testing.allocator;
     const Source = ProvisionedKernelOwnerSource;
     for ([_]bool{ false, true }) |cancel| {
-        var tmp = std.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/owner", .{tmp.sub_path});
         defer alloc.free(path);

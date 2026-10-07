@@ -16,7 +16,9 @@
 //! Bounded physical SQL operators shared by local and distributed execution.
 //! Inputs may borrow a scan page. Competitive top-K rows and aggregate extrema
 //! take ownership before that page closes; discarded rows allocate nothing.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const scalar = @import("scalar.zig");
 const ast = @import("ast.zig");
 const Allocator = std.mem.Allocator;
@@ -1608,14 +1610,14 @@ test "SQL top K replacement churn stays bounded by actual allocation quota" {
     var quota: MemoryBudget = .{ .backing = std.testing.allocator, .limit = 8192 };
     var top = try TopK.init(quota.allocator(), 5, &.{.{}}, 8192);
     defer top.deinit();
-    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const start = std.Io.Clock.now(.awake, platform.testing.io).nanoseconds;
     for (0..10000) |i| {
         const value = Datum.json(.{ .integer = @intCast(10000 - i) });
         try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = i });
     }
     const result = try top.finish(std.testing.allocator);
     defer std.testing.allocator.free(result);
-    const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+    const elapsed = std.Io.Clock.now(.awake, platform.testing.io).nanoseconds - start;
     try std.testing.expectEqual(@as(usize, 10000), top.copied_rows);
     for (result, 0..) |row, i| try std.testing.expectEqual(@as(i64, @intCast(i + 1)), row.values[0].value.integer);
     try std.testing.expectEqual(quota.live, top.retained_bytes + if (top.scratch) |*scratch| arenaBytes(scratch) else @as(usize, 0));
@@ -1699,7 +1701,7 @@ test "SQL disk spilling sorts offset pages aggregates distinct keys and outer jo
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     {
         var top = try TopK.initWithSpill(a, 501, &.{.{}}, 32 * 1024, &manager);
@@ -1775,7 +1777,7 @@ test "SQL spilled aggregate partials merge averages extrema booleans and high ca
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const group = try Grouped.create(a, &.{
         .{ .kind = .count },                                         .{ .kind = .sum, .input_type = .integer },
@@ -1810,7 +1812,7 @@ test "SQL pattern sets spill distinct state and preserve reusable quantified nul
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: @import("spill.zig").Manager = .{ .alloc = std.heap.page_allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: @import("spill.zig").Manager = .{ .alloc = std.heap.page_allocator, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const group = try Grouped.create(std.heap.page_allocator, &.{ .{ .kind = .pattern_set, .input_type = .string, .distinct = true }, .{ .kind = .pattern_set, .input_type = .string, .distinct = true } }, .{ .bytes = 128 * 1024, .spill = &manager });
     defer group.deinit();
@@ -1872,7 +1874,7 @@ test "SQL spilled worker partials preserve wide sums until final merge" {
     };
     const a = std.testing.allocator;
     var dummy: u8 = 0;
-    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const specs = [_]AggregateSpec{.{ .kind = .sum, .input_type = .integer }};
     const positive = try Grouped.create(a, &specs, .{ .bytes = 64 * 1024, .groups = 4096, .spill = &manager });
@@ -1910,7 +1912,7 @@ test "SQL bounded native join admission transfers a prefix without a chain spool
     };
     const a = std.testing.allocator;
     var dummy: u8 = 0;
-    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const count = 256;
     var integers: [count]Datum = undefined;

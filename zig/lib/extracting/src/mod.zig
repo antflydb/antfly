@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const httpx = @import("httpx");
 
 const Allocator = std.mem.Allocator;
@@ -1179,7 +1181,7 @@ fn expectExtractRequest(req: httpx.testing_mod.RequestInfo) !void {
 
 test "extracting antfly provider posts canonical extract request" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1227,7 +1229,7 @@ test "extracting antfly provider posts canonical extract request" {
 
 test "extracting HTTP provider preserves rejection and transient failure identities" {
     const alloc = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const cases = .{

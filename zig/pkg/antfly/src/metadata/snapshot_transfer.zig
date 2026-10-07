@@ -15,6 +15,7 @@
 
 //! Bounded, immutable metadata snapshot transfers. A token names one encoded
 //! view; consumers never combine pages from different projection generations.
+const platform = @import("antfly_platform");
 const std = @import("std");
 pub const path = "/internal/v1/snapshots/read";
 pub const peer_path = "/internal/v1/snapshots/peers";
@@ -47,8 +48,8 @@ pub const Cache = struct {
     /// Reserve both the token and worst-case encoding before taking a metadata
     /// lease. Busy readers fail immediately; they never queue behind a capture.
     pub fn reserve(self: *Cache, alloc: std.mem.Allocator, now: u64) !u64 {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         for (&self.entries) |*entry| if (entry.*) |e| {
             if (!e.capturing and now -| e.touched >= ttl_ns) self.remove(alloc, entry);
         };
@@ -66,8 +67,8 @@ pub const Cache = struct {
     }
 
     pub fn cancel(self: *Cache, alloc: std.mem.Allocator, token: u64) void {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         for (&self.entries) |*entry| if (entry.*) |e| {
             if (e.token == token and e.capturing) self.remove(alloc, entry);
         };
@@ -77,8 +78,8 @@ pub const Cache = struct {
     /// reservation through cancel, so retries cannot exhaust slots or bytes.
     pub fn publish(self: *Cache, bytes: []u8, token: u64, now: u64) !void {
         if (bytes.len > self.snapshot_limit) return error.ResourceRequestTooLarge;
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         for (&self.entries) |*slot| if (slot.*) |*entry| {
             if (entry.token != token or !entry.capturing) continue;
             self.reserved -= self.snapshot_limit;
@@ -107,8 +108,8 @@ pub const Cache = struct {
         return token;
     }
     pub fn read(self: *Cache, alloc: std.mem.Allocator, output: std.mem.Allocator, request: Request, now: u64) !Page {
-        self.mutex.lockUncancelable(std.Options.debug_io);
-        defer self.mutex.unlock(std.Options.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         for (&self.entries) |*slot| if (slot.*) |*entry| {
             if (entry.token != request.token or entry.capturing) continue;
             if (request.release or now -| entry.touched >= ttl_ns) {

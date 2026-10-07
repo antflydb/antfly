@@ -21,6 +21,7 @@
 //! owns no thread pool and allocates no idle workers; the first item in a group
 //! becomes its bounded leader and uses the caller's existing `std.Io` executor.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 /// Request-local arenas and bounded allocators may be touched by a peer that
@@ -77,10 +78,10 @@ test "microbatch synchronized allocator protects request-local arenas" {
         }
     };
     var group = std.Io.Group.init;
-    defer group.cancel(std.testing.io);
-    try group.concurrent(std.testing.io, Worker.run, .{ synchronized.allocator(), 1 });
-    try group.concurrent(std.testing.io, Worker.run, .{ synchronized.allocator(), 2 });
-    try group.await(std.testing.io);
+    defer group.cancel(platform.testing.io);
+    try group.concurrent(platform.testing.io, Worker.run, .{ synchronized.allocator(), 1 });
+    try group.concurrent(platform.testing.io, Worker.run, .{ synchronized.allocator(), 2 });
+    try group.await(platform.testing.io);
 }
 
 test "microbatch owned collection cleans partial caller allocation failures" {
@@ -105,7 +106,7 @@ test "microbatch owned collection cleans partial caller allocation failures" {
             try std.testing.expectEqualStrings("second", rows[1]);
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Rows.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Rows.run, .{});
 }
 
 test "microbatch working budgets and task families are distinct execution keys" {
@@ -961,16 +962,16 @@ test "fused execution stays live for healthy members and stops when all members 
     second_canceled.store(true, .release);
     try std.testing.expectError(error.Canceled, ExecutionControl.check(&control));
     second_canceled.store(false, .release);
-    items[1].control.io = std.testing.io;
-    items[1].control.deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    items[1].control.io = platform.testing.io;
+    items[1].control.deadline = std.Io.Clock.Timestamp.now(platform.testing.io, .awake);
     try std.testing.expectError(error.DeadlineExceeded, ExecutionControl.check(&control));
 
     // An expired member still makes the group deadline hard when a later
     // member is cancelled. The result cannot depend on iteration order.
     first_canceled.store(false, .release);
     second_canceled.store(true, .release);
-    items[0].control.io = std.testing.io;
-    items[0].control.deadline = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    items[0].control.io = platform.testing.io;
+    items[0].control.deadline = std.Io.Clock.Timestamp.now(platform.testing.io, .awake);
     try std.testing.expectError(error.DeadlineExceeded, ExecutionControl.check(&control));
 
     // Once the same caller is both cancelled and expired, its deadline still
@@ -1032,7 +1033,7 @@ test "microbatch broker groups native work and preserves provenance" {
             self.result = self.broker.submit(
                 usize,
                 usize,
-                std.testing.io,
+                platform.testing.io,
                 std.testing.allocator,
                 self.key,
                 self.limits,
@@ -1066,9 +1067,9 @@ test "microbatch broker groups native work and preserves provenance" {
         .identity = .{ .item_id = "page-2", .source_fingerprint = "doc-b", .page_number = 2 },
     };
     var group = std.Io.Group.init;
-    try group.concurrent(std.testing.io, Submit.run, .{&first});
-    try group.concurrent(std.testing.io, Submit.run, .{&second});
-    try group.await(std.testing.io);
+    try group.concurrent(platform.testing.io, Submit.run, .{&first});
+    try group.concurrent(platform.testing.io, Submit.run, .{&second});
+    try group.await(platform.testing.io);
 
     try std.testing.expect(first.err == null);
     try std.testing.expect(second.err == null);
@@ -1079,14 +1080,14 @@ test "microbatch broker groups native work and preserves provenance" {
     try std.testing.expectEqualStrings("doc-a", first.result.?.identity.source_fingerprint.?);
     try std.testing.expectEqual(@as(?u32, 2), second.result.?.identity.page_number);
     try std.testing.expectEqual(Execution.native_batch, first.result.?.execution);
-    const stats = broker.snapshot(std.testing.io);
+    const stats = broker.snapshot(platform.testing.io);
     try std.testing.expectEqual(@as(u64, 1), stats.native_batches);
     try std.testing.expectEqual(@as(u64, 2), stats.native_items);
 }
 
 test "microbatch broker preserves bounded native waves without spare workers" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    var io_impl = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
     defer io_impl.deinit();
     for ([_]u64{ 0, 200 }) |wait_us| {
         var broker = Broker.init(allocator);
@@ -1108,7 +1109,7 @@ test "microbatch broker preserves bounded native waves without spare workers" {
 
 test "microbatch native wave splits resource limits and isolates oversized items" {
     const allocator = std.testing.allocator;
-    var io_impl = std.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
+    var io_impl = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
     defer io_impl.deinit();
     for (0..3) |dimension| {
         var broker = Broker.init(allocator);
@@ -1137,7 +1138,7 @@ test "microbatch array enrollment drains groups on allocation failure" {
             const inputs = [_]usize{ 1, 2, 3, 4, 5 };
             const shapes = @as([inputs.len]Shape, @splat(.{ .bytes = 1 }));
             const identities = @as([inputs.len]Identity, @splat(.{}));
-            const results = try broker.submitBatchControlled(usize, usize, std.testing.io, allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_bytes = 2 }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
+            const results = try broker.submitBatchControlled(usize, usize, platform.testing.io, allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_bytes = 2 }, &shapes, &identities, null, .{}, &inputs, &executor, TestExecutor.run);
             defer allocator.free(results);
             for (results) |result| switch (result.result) {
                 .item_error => |failure| return failure.cause,
@@ -1145,7 +1146,7 @@ test "microbatch array enrollment drains groups on allocation failure" {
             };
         }
     };
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
 
 test "microbatch concurrent array tails coalesce without item workers" {
@@ -1162,7 +1163,7 @@ test "microbatch concurrent array tails coalesce without item workers" {
         fn run(self: *@This()) std.Io.Cancelable!void {
             const shapes = @as([2]Shape, @splat(.{ .bytes = 1 }));
             const identities = @as([2]Identity, @splat(.{ .source_fingerprint = self.source }));
-            self.output = self.broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_wait_us = 500_000 }, &shapes, &identities, null, .{}, &self.input, self.executor, TestExecutor.run) catch |err| {
+            self.output = self.broker.submitBatchControlled(usize, usize, platform.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 4, .max_items = 4, .max_wait_us = 500_000 }, &shapes, &identities, null, .{}, &self.input, self.executor, TestExecutor.run) catch |err| {
                 self.err = err;
                 return;
             };
@@ -1173,10 +1174,10 @@ test "microbatch concurrent array tails coalesce without item workers" {
     defer if (first.output) |result| std.testing.allocator.free(result);
     defer if (second.output) |result| std.testing.allocator.free(result);
     var group: std.Io.Group = .init;
-    defer group.cancel(std.testing.io);
-    try group.concurrent(std.testing.io, Submit.run, .{&first});
-    try group.concurrent(std.testing.io, Submit.run, .{&second});
-    try group.await(std.testing.io);
+    defer group.cancel(platform.testing.io);
+    try group.concurrent(platform.testing.io, Submit.run, .{&first});
+    try group.concurrent(platform.testing.io, Submit.run, .{&second});
+    try group.await(platform.testing.io);
     if (first.err) |err| return err;
     if (second.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 1), executor.calls.load(.monotonic));
@@ -1207,7 +1208,7 @@ test "microbatch array rechecks cancellation between bounded waves" {
     const inputs = [_]usize{ 1, 2, 3, 4 };
     const shapes = @as([4]Shape, @splat(.{}));
     const identities = @as([4]Identity, @splat(.{}));
-    const results = try broker.submitBatchControlled(usize, usize, std.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &shapes, &identities, null, Cancellation.fromAtomic(&executor.canceled), &inputs, &executor, Executor.run);
+    const results = try broker.submitBatchControlled(usize, usize, platform.testing.io, std.testing.allocator, .{ .model = "reader", .task = .read, .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &shapes, &identities, null, Cancellation.fromAtomic(&executor.canceled), &inputs, &executor, Executor.run);
     defer std.testing.allocator.free(results);
     try std.testing.expectEqual(@as(usize, 1), executor.calls);
     try std.testing.expectEqual(@as(usize, 1), results[0].result.value);
@@ -1234,7 +1235,7 @@ test "microbatch broker flattens an existing request batch" {
     const results = try broker.submitBatchControlled(
         usize,
         usize,
-        std.testing.io,
+        platform.testing.io,
         allocator,
         .{ .model = "reader", .task = .read, .prompt = "ocr", .resource_class = .gpu },
         .{
@@ -1280,7 +1281,7 @@ test "microbatch array preserves serial compatibility execution" {
     const results = try broker.submitBatchControlled(
         usize,
         usize,
-        std.testing.io,
+        platform.testing.io,
         allocator,
         .{ .model = "compat", .task = .extract, .resource_class = .cpu },
         .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 },
@@ -1325,7 +1326,7 @@ test "microbatch follower deadline shortens window without forcing an immediate 
             self.result = self.broker.submit(
                 usize,
                 usize,
-                std.testing.io,
+                platform.testing.io,
                 std.testing.allocator,
                 .{ .model = "reader", .task = .read, .resource_class = .gpu },
                 self.limits,
@@ -1343,7 +1344,7 @@ test "microbatch follower deadline shortens window without forcing an immediate 
         }
     };
 
-    const now = std.Io.Clock.Timestamp.now(std.testing.io, .awake);
+    const now = std.Io.Clock.Timestamp.now(platform.testing.io, .awake);
     const follower_deadline = now.addDuration(.{
         .raw = std.Io.Duration.fromMilliseconds(100),
         .clock = .awake,
@@ -1351,15 +1352,15 @@ test "microbatch follower deadline shortens window without forcing an immediate 
     var first = Submit{ .broker = &broker, .executor = &executor, .limits = limits, .input = 1 };
     var second = Submit{ .broker = &broker, .executor = &executor, .limits = limits, .input = 2, .deadline = follower_deadline };
     var third = Submit{ .broker = &broker, .executor = &executor, .limits = limits, .input = 3 };
-    var first_future = try std.testing.io.concurrent(Submit.run, .{&first});
-    try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake);
-    var second_future = try std.testing.io.concurrent(Submit.run, .{&second});
-    try std.testing.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake);
+    var first_future = try platform.testing.io.concurrent(Submit.run, .{&first});
+    try platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake);
+    var second_future = try platform.testing.io.concurrent(Submit.run, .{&second});
+    try platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(2), .awake);
     try std.testing.expectEqual(@as(usize, 0), executor.calls.load(.monotonic));
-    var third_future = try std.testing.io.concurrent(Submit.run, .{&third});
-    try first_future.await(std.testing.io);
-    try second_future.await(std.testing.io);
-    try third_future.await(std.testing.io);
+    var third_future = try platform.testing.io.concurrent(Submit.run, .{&third});
+    try first_future.await(platform.testing.io);
+    try second_future.await(platform.testing.io);
+    try third_future.await(platform.testing.io);
 
     try std.testing.expect(first.err == null);
     try std.testing.expect(second.err == null);
@@ -1390,7 +1391,7 @@ test "microbatch broker never coalesces republished model generations" {
             self.result = self.broker.submit(
                 usize,
                 usize,
-                std.testing.io,
+                platform.testing.io,
                 std.testing.allocator,
                 .{
                     .model = "readers/owner/model",
@@ -1415,9 +1416,9 @@ test "microbatch broker never coalesces republished model generations" {
     var old = Submit{ .broker = &broker, .executor = &executor, .generation = 41, .input = 3 };
     var current = Submit{ .broker = &broker, .executor = &executor, .generation = 42, .input = 4 };
     var group = std.Io.Group.init;
-    try group.concurrent(std.testing.io, Submit.run, .{&old});
-    try group.concurrent(std.testing.io, Submit.run, .{&current});
-    try group.await(std.testing.io);
+    try group.concurrent(platform.testing.io, Submit.run, .{&old});
+    try group.concurrent(platform.testing.io, Submit.run, .{&current});
+    try group.await(platform.testing.io);
 
     try std.testing.expect(old.err == null);
     try std.testing.expect(current.err == null);
@@ -1437,7 +1438,7 @@ test "microbatch cancellation after execution starts returns owned output" {
 
         fn run(raw: *anyopaque, items: []const ExecuteItem) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.started.set(std.testing.io);
+            self.started.set(platform.testing.io);
             while (!self.release.load(.acquire)) std.Thread.yield() catch {};
             for (items) |item| {
                 const value = item.allocator.dupe(u8, "owned") catch |err| {
@@ -1495,7 +1496,7 @@ test "microbatch cancellation after execution starts returns owned output" {
     defer first.deinitResult();
     var second = Submit{ .broker = &broker, .executor = &executor, .payload = 2 };
     defer second.deinitResult();
-    const io = std.testing.io;
+    const io = platform.testing.io;
     var first_future = try io.concurrent(Submit.run, .{ &first, io });
     try io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     var second_future = try io.concurrent(Submit.run, .{ &second, io });
@@ -1529,7 +1530,7 @@ test "microbatch broker enforces grouping resource caps and max wait flush" {
     const result = try broker.submit(
         usize,
         usize,
-        std.testing.io,
+        platform.testing.io,
         allocator,
         .{ .model = "embedder", .task = .embed, .prompt = "a", .resource_class = .cpu },
         limits,
@@ -1547,7 +1548,7 @@ test "microbatch broker enforces grouping resource caps and max wait flush" {
     const rejected = try broker.submit(
         usize,
         usize,
-        std.testing.io,
+        platform.testing.io,
         allocator,
         .{ .model = "embedder", .task = .embed, .prompt = "b", .resource_class = .cpu },
         limits,
@@ -1583,7 +1584,7 @@ test "microbatch broker bypasses nonnative work and honors cancellation deadline
         const result = try broker.submit(
             usize,
             usize,
-            std.testing.io,
+            platform.testing.io,
             allocator,
             .{ .model = "model", .task = task, .resource_class = .remote },
             .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 },
@@ -1603,7 +1604,7 @@ test "microbatch broker bypasses nonnative work and honors cancellation deadline
     const canceled_result = try broker.submit(
         usize,
         usize,
-        std.testing.io,
+        platform.testing.io,
         allocator,
         .{ .model = "model", .task = .read, .resource_class = .cpu },
         .{ .mode = .native, .preferred_items = 2, .max_items = 2 },
@@ -1621,7 +1622,7 @@ test "microbatch broker bypasses nonnative work and honors cancellation deadline
     const expired_result = try broker.submit(
         usize,
         usize,
-        std.testing.io,
+        platform.testing.io,
         allocator,
         .{ .model = "model", .task = .read, .resource_class = .cpu },
         .{ .mode = .native, .preferred_items = 2, .max_items = 2 },
@@ -1639,7 +1640,7 @@ test "microbatch broker bypasses nonnative work and honors cancellation deadline
     const foreign_clock_result = try broker.submit(
         usize,
         usize,
-        std.testing.io,
+        platform.testing.io,
         allocator,
         .{ .model = "model", .task = .read, .resource_class = .cpu },
         .{ .mode = .native, .preferred_items = 2, .max_items = 2 },

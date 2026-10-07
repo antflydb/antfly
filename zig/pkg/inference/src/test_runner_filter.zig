@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     const runtime_offset = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET") orelse 0;
     const runtime_limit = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT") orelse std.math.maxInt(usize);
-    var progress_io = std.Io.Threaded.init(allocator, .{});
+    var progress_io = platform.Io.Threaded.init(allocator, .{});
     defer progress_io.deinit();
     const progress = RuntimeProgress.open(allocator, progress_io.io(), args);
     defer if (progress) |p| p.file.close(p.io);
@@ -218,11 +218,11 @@ fn writeSelectedRuntimeTests(
     filters: []const []const u8,
     skip_filters: []const []const u8,
 ) !void {
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
-    defer file.close(std.testing.io);
+    var file = try std.Io.Dir.createFileAbsolute(platform.testing.io, path, .{ .truncate = true });
+    defer file.close(platform.testing.io);
 
     var buf: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &buf);
+    var writer = file.writer(platform.testing.io, &buf);
     for (test_fn_list) |test_fn| {
         if (!matchesSelected(test_fn.name, filters, skip_filters)) continue;
         try writer.interface.writeAll(test_fn.name);
@@ -242,11 +242,11 @@ fn writeRuntimeTestProgress(index: usize, name: []const u8) void {
 }
 
 fn writeRuntimeCurrentTestPath(path: []const u8, name: []const u8) !void {
-    var file = try std.Io.Dir.createFileAbsolute(std.testing.io, path, .{ .truncate = true });
-    defer file.close(std.testing.io);
+    var file = try std.Io.Dir.createFileAbsolute(platform.testing.io, path, .{ .truncate = true });
+    defer file.close(platform.testing.io);
 
     var buf: [4096]u8 = undefined;
-    var writer = file.writer(std.testing.io, &buf);
+    var writer = file.writer(platform.testing.io, &buf);
     try writer.interface.writeAll(name);
     try writer.interface.writeAll("\n");
     try writer.end();
@@ -266,7 +266,7 @@ fn appendRuntimeTracePath(path: []const u8, index: usize, name: []const u8) !voi
     }, 0o666);
 
     var file: std.Io.File = .{ .handle = fd, .flags = .{ .nonblocking = false } };
-    defer file.close(std.testing.io);
+    defer file.close(platform.testing.io);
     try writeAllFd(fd, line);
     try fsyncFile(fd);
 }

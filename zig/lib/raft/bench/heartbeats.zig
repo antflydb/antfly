@@ -15,7 +15,9 @@
 
 // Idle tenant/range workloads: codec framing and the production transport
 // routing/encoding path. The counting driver excludes HTTP/network latency.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const raft = @import("raft");
 const CountingDriver = struct {
     frames: usize = 0,
@@ -32,7 +34,7 @@ const CountingDriver = struct {
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
-    var io_runtime = std.Io.Threaded.init(alloc, .{});
+    var io_runtime = platform.Io.Threaded.init(alloc, .{});
     defer io_runtime.deinit();
     const io = io_runtime.io();
     const codec = raft.runtime.BinaryCodec.codec();

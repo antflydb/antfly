@@ -13,8 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
-const platform_time = @import("antfly_platform").time;
+
+const platform_time = platform.time;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const transactions_mod = @import("antfly_local_sources").storage_transactions;
 const tracing = @import("antfly_local_sources").tracing_antfly_trace_writer;
@@ -2984,7 +2986,7 @@ test "distributed txn restore plan identity survives begin resolve and private b
 
 test "distributed txn scoped participant recovery survives LSM reopen without resident authority" {
     const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/scoped-participant-recovery", .{tmp.sub_path});
     defer alloc.free(path);
@@ -3691,11 +3693,11 @@ fn participantTornStateConflict(participant: ParticipantTxn, phase: ParticipantP
 }
 
 fn sleepNs(duration_ns: u64) void {
-    var req = std.posix.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
         .nsec = @intCast(duration_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -3776,7 +3778,7 @@ fn implementationTests() type {
         test "db transaction recovery runtime resolves table-group participants through distributed txn resolver" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/distributed-txn-recovery-db", .{tmp.sub_path});
             defer alloc.free(path);
@@ -3864,7 +3866,7 @@ fn implementationTests() type {
         test "db one-shot transaction recovery resolves table-group participants through distributed txn resolver" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/distributed-txn-recovery-once-db", .{tmp.sub_path});
             defer alloc.free(path);
@@ -3927,7 +3929,7 @@ fn implementationTests() type {
         test "db one-shot transaction recovery does not auto-abort fresh pending transactions by default" {
             const alloc = std.testing.allocator;
 
-            var tmp = std.testing.tmpDir(.{});
+            var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/distributed-txn-recovery-fresh-pending-db", .{tmp.sub_path});
             defer alloc.free(path);
@@ -5262,7 +5264,7 @@ fn consumerTests() type {
                 .{ .table_name = "docs", .group_id = 7004, .topology_epoch = 1 },
             };
             var slots: [participants.len]ParticipantFanoutSlot = undefined;
-            var io_impl = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
             defer io_impl.deinit();
 
             runPrepareFanout(

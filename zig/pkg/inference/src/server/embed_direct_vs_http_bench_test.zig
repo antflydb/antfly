@@ -61,7 +61,7 @@ fn httpEmbedOnce(a: std.mem.Allocator, node: *Node, model_path: []const u8, inpu
     var request = try httpx.Request.init(a, .POST, "/ai/v1/embeddings");
     defer request.deinit();
     try request.setJson(body);
-    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    var ctx = httpx.Context.init(a, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try node.createEmbedding(&ctx);
     defer response.deinit();
@@ -76,9 +76,9 @@ test "embedding managed_direct path matches HTTP path per-batch latency for a wa
     const a = std.testing.allocator;
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_len = if (std.fs.path.isAbsolute(directory))
-        try std.Io.Dir.realPathFileAbsolute(std.testing.io, directory, &path_buffer)
+        try std.Io.Dir.realPathFileAbsolute(platform.testing.io, directory, &path_buffer)
     else
-        try std.Io.Dir.cwd().realPathFile(std.testing.io, directory, &path_buffer);
+        try std.Io.Dir.cwd().realPathFile(platform.testing.io, directory, &path_buffer);
     const model_path = path_buffer[0..path_len];
     const models_root = std.fs.path.dirname(model_path) orelse return error.InvalidModelPath;
     // The HTTP-facing resolver requires a relative identifier within
@@ -100,14 +100,14 @@ test "embedding managed_direct path matches HTTP path per-batch latency for a wa
         .generation_budget_overrides = .{ .host_limit_bytes = 4 * 1024 * 1024 * 1024, .scratch_limit_bytes = 512 * 1024 * 1024 },
     });
     defer node.deinit();
-    try node.attachIo(std.testing.io);
+    try node.attachIo(platform.testing.io);
 
     // Warm the session on both entry points before timing anything: model
     // load, tokenizer materialization, and first-call setup must not be
     // charged to either path's steady-state per-batch cost.
     try httpEmbedOnce(a, &node, http_model_name, &texts_buf);
     {
-        const warm = try node.embedDenseTextsDirectWithExecutionControl(a, std.testing.io, .{}, model_path, &texts_buf);
+        const warm = try node.embedDenseTextsDirectWithExecutionControl(a, platform.testing.io, .{}, model_path, &texts_buf);
         for (warm) |vector| a.free(vector);
         a.free(warm);
     }
@@ -122,7 +122,7 @@ test "embedding managed_direct path matches HTTP path per-batch latency for a wa
     var direct_total: u64 = 0;
     for (0..iterations) |_| {
         const started = now();
-        const result = try node.embedDenseTextsDirectWithExecutionControl(a, std.testing.io, .{}, model_path, &texts_buf);
+        const result = try node.embedDenseTextsDirectWithExecutionControl(a, platform.testing.io, .{}, model_path, &texts_buf);
         direct_total += now() -| started;
         for (result) |vector| a.free(vector);
         a.free(result);

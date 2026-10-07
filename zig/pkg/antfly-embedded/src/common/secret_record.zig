@@ -15,6 +15,7 @@
 
 //! AFSE v1 envelope-encrypted records. Persistence, authorization, and trusted
 //! current-revision selection belong to the backend, not this codec.
+const platform = @import("antfly_platform");
 const std = @import("std");
 const contract = @import("secret_contract.zig");
 const callback = @import("../runtime_callback_abi.zig");
@@ -183,7 +184,7 @@ const TestProvider = struct {
         errdefer alloc.free(id);
         const bytes = try alloc.alloc(u8, 24 + 32 + 16);
         errdefer alloc.free(bytes);
-        try std.Options.debug_io.randomSecure(bytes[0..24]);
+        try platform.debug_io.randomSecure(bytes[0..24]);
         var tag: [16]u8 = undefined;
         Aead.encrypt(bytes[24..56], &tag, key, identity.scope, bytes[0..24].*, self.key);
         @memcpy(bytes[56..72], &tag);
@@ -204,12 +205,12 @@ test "secret record round trips binary and empty values with randomized cipherte
     const alloc = std.testing.allocator;
     var provider = TestProvider{};
     for ([_][]const u8{ "", "credential\x00\xff" }) |plaintext| {
-        const encoded = try seal(alloc, std.Options.debug_io, provider.provider(), test_identity, plaintext);
+        const encoded = try seal(alloc, platform.debug_io, provider.provider(), test_identity, plaintext);
         defer alloc.free(encoded);
         var opened = try open(alloc, provider.provider(), test_identity, encoded);
         defer opened.deinit(alloc);
         try std.testing.expectEqualSlices(u8, plaintext, opened.bytes);
-        const another = try seal(alloc, std.Options.debug_io, provider.provider(), test_identity, plaintext);
+        const another = try seal(alloc, platform.debug_io, provider.provider(), test_identity, plaintext);
         defer alloc.free(another);
         try std.testing.expect(!std.mem.eql(u8, encoded, another));
         try std.testing.expectEqual(@as(u64, 42), (try decode(encoded)).identity.revision);
@@ -219,7 +220,7 @@ test "secret record round trips binary and empty values with randomized cipherte
 test "secret record rejects every modified byte truncation trailing data and identity substitution" {
     const alloc = std.testing.allocator;
     var provider = TestProvider{};
-    const encoded = try seal(alloc, std.Options.debug_io, provider.provider(), test_identity, "credential");
+    const encoded = try seal(alloc, platform.debug_io, provider.provider(), test_identity, "credential");
     defer alloc.free(encoded);
     for (0..encoded.len) |i| {
         encoded[i] ^= 1;
@@ -246,13 +247,13 @@ test "secret record rejects every modified byte truncation trailing data and ide
     provider.key[0] ^= 1;
     provider.unavailable = true;
     try std.testing.expectError(error.Unavailable, open(alloc, provider.provider(), test_identity, encoded));
-    try std.testing.expectError(error.Unavailable, seal(alloc, std.Options.debug_io, provider.provider(), test_identity, "credential"));
+    try std.testing.expectError(error.Unavailable, seal(alloc, platform.debug_io, provider.provider(), test_identity, "credential"));
 }
 
 test "secret record validates bounds and refuses unsupported formats" {
     const alloc = std.testing.allocator;
     var provider = TestProvider{};
-    const encoded = try seal(alloc, std.Options.debug_io, provider.provider(), test_identity, "value");
+    const encoded = try seal(alloc, platform.debug_io, provider.provider(), test_identity, "value");
     defer alloc.free(encoded);
     encoded[4] = 2;
     try std.testing.expectError(error.UnsupportedVersion, decode(encoded));
@@ -262,8 +263,8 @@ test "secret record validates bounds and refuses unsupported formats" {
     encoded[6] = 1;
     @memset(encoded[22..30], 255);
     try std.testing.expectError(error.CorruptInput, decode(encoded));
-    try std.testing.expectError(error.InvalidArgument, seal(alloc, std.Options.debug_io, provider.provider(), .{ .scope = "", .key = "key", .revision = 1 }, "value"));
-    try std.testing.expectError(error.InvalidArgument, seal(alloc, std.Options.debug_io, provider.provider(), .{ .scope = "s", .key = "key", .revision = 0 }, "value"));
+    try std.testing.expectError(error.InvalidArgument, seal(alloc, platform.debug_io, provider.provider(), .{ .scope = "", .key = "key", .revision = 1 }, "value"));
+    try std.testing.expectError(error.InvalidArgument, seal(alloc, platform.debug_io, provider.provider(), .{ .scope = "s", .key = "key", .revision = 0 }, "value"));
 }
 
 test "secret record fails closed without entropy and cleans up allocation failures" {
@@ -272,7 +273,7 @@ test "secret record fails closed without entropy and cleans up allocation failur
     const Scenario = struct {
         fn run(alloc: std.mem.Allocator) !void {
             var keys = TestProvider{};
-            const record = try seal(alloc, std.Options.debug_io, keys.provider(), test_identity, "private-value");
+            const record = try seal(alloc, platform.debug_io, keys.provider(), test_identity, "private-value");
             defer alloc.free(record);
             try std.testing.expect(std.mem.indexOf(u8, record, "private-value") == null);
             var plaintext = try open(alloc, keys.provider(), test_identity, record);

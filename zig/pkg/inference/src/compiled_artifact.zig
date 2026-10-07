@@ -577,8 +577,8 @@ test "defaultArtifactDirForModel uses ~/.antfly/inference/artifacts layout when 
 
 test "writeManifest and readManifest roundtrip" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const manifest_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "artifact.inference.json" });
@@ -609,8 +609,8 @@ test "writeManifest and readManifest roundtrip" {
 
 test "writePackageManifest and readPackageManifest roundtrip" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const manifest_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "artifact.antfly-inference-package.json" });
@@ -653,8 +653,8 @@ test "writePackageManifest and readPackageManifest roundtrip" {
 
 test "writeManifest and readManifest support absolute paths" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const manifest_path = try std.fs.path.resolve(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "absolute-artifact.inference.json" });
@@ -682,8 +682,8 @@ test "writeManifest and readManifest support absolute paths" {
 
 test "writePackageManifest and readPackageManifest support absolute paths" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const manifest_path = try std.fs.path.resolve(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "absolute-package.antfly-inference-package.json" });
@@ -716,8 +716,8 @@ test "writePackageManifest and readPackageManifest support absolute paths" {
 
 test "findMatchingArtifactPath returns the matching sidecar artifact" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -768,8 +768,8 @@ test "findMatchingArtifactPath returns the matching sidecar artifact" {
 
 test "findUniqueMatchingArtifactPath rejects ambiguous matches" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });

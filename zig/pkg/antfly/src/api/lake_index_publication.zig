@@ -16,6 +16,7 @@
 //! Artifact construction for one native catalog-fenced lake index attempt.
 //! The coordinator commits the returned state with a full definition CAS;
 //! successful uploads alone never make an index ready.
+const platform = @import("antfly_platform");
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const catalog = local.metadata_lake_index_catalog;
@@ -233,7 +234,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     var artifact_store = fs_artifacts.artifactStore();
     const store_identity: catalog.Digest = @splat(4);
     const table: records.TableRecord = .{ .table_id = 4, .name = "lake", .schema_json = schema_json, .indexes_json = "{\"body_text\":{\"type\":\"full_text\",\"field\":\"body\"},\"stats\":{\"type\":\"algebraic\",\"materializations\":[{\"name\":\"rows\",\"op\":\"count\"}]}}" };
-    const pending_bytes = try begin(a, std.testing.io, table, &source, store_identity, .{}, 100, 20);
+    const pending_bytes = try begin(a, platform.testing.io, table, &source, store_identity, .{}, 100, 20);
     defer a.free(pending_bytes);
     var pending = table;
     pending.lake_index_catalog_json = pending_bytes;
@@ -247,7 +248,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     };
     var time: TestClock = .{};
     const clock: Clock = .{ .ptr = &time, .now_ms = TestClock.read };
-    const published_bytes = try build(a, &artifact_store, pending, &source, store_identity, .{ .io = std.testing.io }, .none, clock);
+    const published_bytes = try build(a, &artifact_store, pending, &source, store_identity, .{ .io = platform.testing.io }, .none, clock);
     defer a.free(published_bytes);
     var published = pending;
     published.lake_index_catalog_json = published_bytes;
@@ -279,7 +280,7 @@ test "external lake native publication builds scoped text artifacts and fences e
         const results = try snapshot.search(a, "body", &.{"first"}, 10);
         defer a.free(results.hits);
         try std.testing.expectEqual(@as(u32, 1), results.total_count);
-        var cache_io = std.Io.Threaded.init(a, .{});
+        var cache_io = platform.Io.Threaded.init(a, .{});
         defer cache_io.deinit();
         var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
         defer cache.deinit();
@@ -341,7 +342,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     appended.deinit(a);
     var next_source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = binding }, .{});
     defer next_source.deinit();
-    const next_pending_bytes = try begin(a, std.testing.io, published, &next_source, store_identity, .{}, 102, 20);
+    const next_pending_bytes = try begin(a, platform.testing.io, published, &next_source, store_identity, .{}, 102, 20);
     defer a.free(next_pending_bytes);
     var next_pending = published;
     next_pending.lake_index_catalog_json = next_pending_bytes;
@@ -359,7 +360,7 @@ test "external lake native publication builds scoped text artifacts and fences e
     denied.get_object = Denied.get;
     next_source.scanner.object_reader.client.vtable = &denied;
     time.now = 103;
-    const next_bytes = try build(a, &artifact_store, next_pending, &next_source, store_identity, .{ .io = std.testing.io }, .none, clock);
+    const next_bytes = try build(a, &artifact_store, next_pending, &next_source, store_identity, .{ .io = platform.testing.io }, .none, clock);
     defer a.free(next_bytes);
     var next = try catalog.parse(a, next_bytes);
     defer next.deinit();

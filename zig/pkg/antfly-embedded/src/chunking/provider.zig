@@ -19,6 +19,7 @@
 //! inference provider graph. The executor restores the typed callback before
 //! crossing the checked native boundary.
 
+const platform = @import("antfly_platform");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
 const execution_context = @import("antfly_inference_execution_context");
 const httpx = @import("httpx");
@@ -119,7 +120,7 @@ test "durable chunk provider owns execution routing strings" {
 test "durable chunk provider owns one thread-safe HTTP pool" {
     var provider = try (Provider{}).ownExecutionStrings(std.testing.allocator);
     defer provider.deinit();
-    try provider.attachOwnedHttpClient(std.Io.Threaded.global_single_threaded.io());
+    try provider.attachOwnedHttpClient(platform.Io.Threaded.global_single_threaded.io());
     try std.testing.expect(provider.execution.http_client == provider.owned_http_client);
     try std.testing.expect(provider.owned_http_client.?.allocator.vtable == std.heap.smp_allocator.vtable);
     try std.testing.expect(!provider.owned_http_client.?.config.cookies_enabled);

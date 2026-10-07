@@ -17,7 +17,9 @@
 //! or frame locks; compilation is single-flight and never holds either lock.
 //! A lease pins the program through page preparation. Replicated staging state,
 //! not this disposable cache, remains the publication/progress authority.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const programs = @import("db/relational_rewrite_program.zig");
 const contract = @import("db/relational_rewrite_contract.zig");
 const staging = @import("db/restore_staging_contract.zig");
@@ -269,7 +271,7 @@ fn hashPart(hash: *std.crypto.hash.Blake3, bytes: []const u8) void {
 
 test "relational index system rewrite program cache owns validates and budgets immutable programs" {
     const alloc = std.testing.allocator;
-    const io = std.testing.io;
+    const io = platform.testing.io;
     const schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
     var reference = try programs.ProgramSet.init(alloc, &.{schema}, schema, .{});
     defer reference.deinit();
@@ -363,14 +365,14 @@ test "relational index system rewrite program cache owns validates and budgets i
     const Failure = struct {
         fn attempt(failing_alloc: std.mem.Allocator, bound_scope: staging.Scope, request: contract.Intent) !void {
             var candidate: Cache = .{};
-            defer candidate.deinit(std.testing.io);
-            var lease = try candidate.acquire(std.testing.io, failing_alloc, null, bound_scope, request, .{});
+            defer candidate.deinit(platform.testing.io);
+            var lease = try candidate.acquire(platform.testing.io, failing_alloc, null, bound_scope, request, .{});
             lease.deinit();
         }
     };
     try std.testing.checkAllAllocationFailures(alloc, Failure.attempt, .{ scope, intent });
     // Contending RPCs share one compile; no std.Thread lifecycle or spin waits.
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const concurrent_io = runtime.io();
     var parallel: Cache = .{};
@@ -409,7 +411,7 @@ test "relational index system rewrite program cache owns validates and budgets i
 
 test "relational index system rewrite program cache leases survive eviction and waiters cancel independently" {
     const alloc = std.testing.allocator;
-    var runtime = std.Io.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
     const schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
@@ -499,7 +501,7 @@ test "relational index system rewrite program cache leases survive eviction and 
 
         fn run(self: *@This()) void {
             defer self.done.set(self.io);
-            if (self.deadline_after_start) |duration| self.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + duration;
+            if (self.deadline_after_start) |duration| self.context.deadline_ns = platform.time.monotonicNs() + duration;
             self.lease = self.cache.acquire(self.io, std.testing.allocator, self.manager, self.scope, self.intent, self.context) catch |err| {
                 self.err = err;
                 return;

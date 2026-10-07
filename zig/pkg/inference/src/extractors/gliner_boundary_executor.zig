@@ -17,7 +17,9 @@
 //! physical batch bounds peak scratch independently of HTTP batch cardinality;
 //! the native engine/pipeline retain their batched interfaces for the scheduler.
 //! Output is buffered atomically and independently bounded across all inputs.
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const wire = @import("extraction_v2.zig");
 const model = @import("../models/gliner_boundary.zig");
 const engine = @import("../architectures/gliner/boundary_engine.zig");
@@ -382,18 +384,18 @@ test "gliner boundary executor device scratch admits simultaneous owners and rej
 }
 
 test "gliner boundary executor pinned small production session and wire parity" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
     try testPinnedSmallExecutor(directory, false, false);
 }
 
 test "gliner boundary executor pinned small converted FP32 session and wire parity" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_SMALL_FP32_BUNDLE_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_SMALL_FP32_BUNDLE_DIR") orelse return error.SkipZigTest;
     try testPinnedSmallExecutor(directory, true, false);
 }
 
 test "gliner boundary executor pinned small Metal converted FP32 session and wire parity" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_SMALL_FP32_BUNDLE_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_SMALL_FP32_BUNDLE_DIR") orelse return error.SkipZigTest;
     try testPinnedSmallExecutor(directory, true, true);
 }
 
@@ -464,8 +466,8 @@ fn testPinnedSmallExecutor(directory: []const u8, converted: bool, metal: bool) 
     defer request.deinit();
     const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
-    if (watchdog) |owner| try owner.start(std.testing.io);
-    const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
+    if (watchdog) |owner| try owner.start(platform.testing.io);
+    const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s };
     var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
     defer managed.deinit();
     const response = try execute(&managed.backend, scratch, &config, tokenizer.tokenizer(), &request, .{ .identity = try factory.getGlinerBoundaryIdentity(session), .control = control });
@@ -517,13 +519,13 @@ test "gliner boundary executor output count includes attribute labels at every v
 }
 
 test "gliner boundary executor pinned small window batch shares admission and recovers atomically" {
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
     try testWindowBatch(directory, false);
 }
 
 test "gliner boundary executor pinned small Metal window batch shares admission and recovers atomically" {
     if (!@import("build_options").enable_metal) return error.SkipZigTest;
-    const directory = @import("antfly_platform").env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
     try testWindowBatch(directory, true);
 }
 
@@ -562,8 +564,8 @@ fn testWindowBatch(directory: []const u8, metal: bool) !void {
     defer request.deinit();
     const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
-    if (watchdog) |owner| try owner.start(std.testing.io);
-    const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 180 * std.time.ns_per_s };
+    if (watchdog) |owner| try owner.start(platform.testing.io);
+    const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = platform.time.monotonicNs() + 180 * std.time.ns_per_s };
     var managed = try factory.getManagedComputeBackend(session, scratch, null, control);
     defer managed.deinit();
     const options = Options{ .identity = identity, .control = control };
@@ -888,5 +890,5 @@ test "boundary qualification later item and window rejection cancels quietly and
 }
 
 test "boundary qualification quiet geometry releases every failed allocation" {
-    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, QualificationGeometryTest.exercise, .{.success});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, QualificationGeometryTest.exercise, .{.success});
 }

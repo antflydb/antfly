@@ -13,9 +13,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const platform = @import("antfly_platform");
 const std = @import("std");
+
 const cache_budget = @import("antfly_cache_budget");
-const platform_time = @import("antfly_platform").time;
+const platform_time = platform.time;
 
 pub const Key = [32]u8;
 
@@ -558,7 +560,7 @@ fn deadlineExpiredAt(now_ns: u64, deadline_ns: ?u64) bool {
 }
 
 const TestCompute = struct {
-    calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    calls: platform.atomic.Value(u64) = .init(0),
     value: f32,
 
     fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
@@ -594,7 +596,7 @@ test "query embedding cache translates native query deadlines" {
 
 pub fn testOwnedValuesAndHits() !void {
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{});
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, platform.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 4 };
     const key: Key = @as([32]u8, @splat(7));
@@ -618,7 +620,7 @@ test "query embedding cache owns values and serves LRU hits" {
 
 pub fn testConcurrentCoalescing() !void {
     const SlowCompute = struct {
-        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        calls: platform.atomic.Value(u64) = .init(0),
         io: std.Io,
 
         fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
@@ -643,7 +645,7 @@ pub fn testConcurrentCoalescing() !void {
             };
         }
     };
-    var compute_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var compute_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer compute_io.deinit();
     var budget = cache_budget.CacheBudget.init(0);
     var cache = QueryEmbeddingCache.init(std.heap.page_allocator, compute_io.io(), .{ .max_bytes = 0 });
@@ -653,19 +655,19 @@ pub fn testConcurrentCoalescing() !void {
     var first = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = key };
     var second = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = key };
 
-    var first_thread = try std.testing.io.concurrent(Worker.run, .{&first});
+    var first_thread = try platform.testing.io.concurrent(Worker.run, .{&first});
     defer {
-        first_thread.await(std.testing.io);
+        first_thread.await(platform.testing.io);
         if (first.result) |result| std.heap.page_allocator.free(result);
     }
     while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
-    var second_thread = try std.testing.io.concurrent(Worker.run, .{&second});
+    var second_thread = try platform.testing.io.concurrent(Worker.run, .{&second});
     defer {
-        second_thread.await(std.testing.io);
+        second_thread.await(platform.testing.io);
         if (second.result) |result| std.heap.page_allocator.free(result);
     }
-    first_thread.await(std.testing.io);
-    second_thread.await(std.testing.io);
+    first_thread.await(platform.testing.io);
+    second_thread.await(platform.testing.io);
 
     try std.testing.expectEqual(@as(?anyerror, null), first.err);
     try std.testing.expectEqual(@as(?anyerror, null), second.err);
@@ -685,7 +687,7 @@ test "query embedding cache coalesces concurrent misses" {
 
 pub fn testInflightAdmissionBound() !void {
     const BlockingCompute = struct {
-        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        calls: platform.atomic.Value(u64) = .init(0),
         release: std.atomic.Value(bool) = .init(false),
         io: std.Io,
 
@@ -718,22 +720,22 @@ pub fn testInflightAdmissionBound() !void {
         }
     };
 
-    var compute_io = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    var compute_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer compute_io.deinit();
     var budget = cache_budget.CacheBudget.init(0);
     var cache = QueryEmbeddingCache.init(std.heap.page_allocator, compute_io.io(), .{ .max_bytes = 0, .max_inflight = 1 });
     defer cache.deinit(&budget);
     var compute = BlockingCompute{ .io = compute_io.io() };
     var producer = Worker{ .cache = &cache, .budget = &budget, .compute = &compute, .key = @as([32]u8, @splat(1)) };
-    var producer_thread = try std.testing.io.concurrent(Worker.run, .{&producer});
+    var producer_thread = try platform.testing.io.concurrent(Worker.run, .{&producer});
     defer {
         compute.release.store(true, .release);
-        producer_thread.await(std.testing.io);
+        producer_thread.await(platform.testing.io);
         if (producer.result) |result| std.heap.page_allocator.free(result);
     }
     while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
-    var releaser_thread = try std.testing.io.concurrent(Releaser.run, .{&compute});
-    defer releaser_thread.await(std.testing.io);
+    var releaser_thread = try platform.testing.io.concurrent(Releaser.run, .{&compute});
+    defer releaser_thread.await(platform.testing.io);
 
     const producer_key: Key = @as([32]u8, @splat(1));
     try std.testing.expectError(
@@ -764,8 +766,8 @@ pub fn testInflightAdmissionBound() !void {
     try std.testing.expectEqual(@as(u64, 1), compute.calls.load(.monotonic));
 
     compute.release.store(true, .release);
-    releaser_thread.await(std.testing.io);
-    producer_thread.await(std.testing.io);
+    releaser_thread.await(platform.testing.io);
+    producer_thread.await(platform.testing.io);
     try std.testing.expectEqual(@as(?anyerror, null), producer.err);
 
     const uncached = try cache.computeUncached(std.testing.allocator, null, &compute, BlockingCompute.run);
@@ -778,7 +780,7 @@ pub fn testInflightAdmissionBound() !void {
 
 pub fn testDisabledCacheRetainsAdmissionBound() !void {
     const BlockingCompute = struct {
-        calls: @import("antfly_platform").atomic.Value(u64) = .init(0),
+        calls: platform.atomic.Value(u64) = .init(0),
         release: std.atomic.Value(bool) = .init(false),
 
         fn run(ptr: *anyopaque, alloc: std.mem.Allocator) ![]f32 {
@@ -810,7 +812,7 @@ pub fn testDisabledCacheRetainsAdmissionBound() !void {
         }
     };
 
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = platform.Io.Threaded.global_single_threaded.io();
     var budget = cache_budget.CacheBudget.init(0);
     var cache = QueryEmbeddingCache.init(std.heap.page_allocator, io, .{
         .enabled = false,
@@ -820,10 +822,10 @@ pub fn testDisabledCacheRetainsAdmissionBound() !void {
     defer cache.deinit(&budget);
     var compute = BlockingCompute{};
     var worker = Worker{ .cache = &cache, .budget = &budget, .compute = &compute };
-    var producer_thread = try std.testing.io.concurrent(Worker.run, .{&worker});
+    var producer_thread = try platform.testing.io.concurrent(Worker.run, .{&worker});
     defer {
         compute.release.store(true, .release);
-        producer_thread.await(std.testing.io);
+        producer_thread.await(platform.testing.io);
         if (worker.result) |result| std.heap.page_allocator.free(result);
     }
     while (compute.calls.load(.acquire) == 0) std.atomic.spinLoopHint();
@@ -835,7 +837,7 @@ pub fn testDisabledCacheRetainsAdmissionBound() !void {
     try std.testing.expectEqual(@as(usize, 1), cache.stats(&budget).inflight);
 
     compute.release.store(true, .release);
-    producer_thread.await(std.testing.io);
+    producer_thread.await(platform.testing.io);
     try std.testing.expectEqual(@as(?anyerror, null), worker.err);
     try std.testing.expectEqual(@as(usize, 0), cache.stats(&budget).entries);
 }
@@ -851,7 +853,7 @@ test "query embedding cache bounds distinct in-flight misses" {
 pub fn testFlightBookkeepingOOMFailsClosed() !void {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = QueryEmbeddingCache.init(failing.allocator(), std.Io.Threaded.global_single_threaded.io(), .{});
+    var cache = QueryEmbeddingCache.init(failing.allocator(), platform.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 1 };
 
@@ -871,7 +873,7 @@ test "query embedding cache fails closed when flight bookkeeping allocation fail
 pub fn testByteBudgetEviction() !void {
     const one_entry_bytes = QueryEmbeddingCache.entryCharge(2);
     var budget = cache_budget.CacheBudget.init(one_entry_bytes);
-    var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{ .max_bytes = one_entry_bytes });
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, platform.Io.Threaded.global_single_threaded.io(), .{ .max_bytes = one_entry_bytes });
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 8 };
     const first_key: Key = @as([32]u8, @splat(1));
@@ -899,7 +901,7 @@ test "query embedding cache enforces byte budget with LRU eviction" {
 }
 
 pub fn testPinnedHitRetainsBudgetUntilCopyCompletes() !void {
-    const io = std.Io.Threaded.global_single_threaded.io();
+    const io = platform.Io.Threaded.global_single_threaded.io();
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
     var cache = QueryEmbeddingCache.init(std.testing.allocator, io, .{});
     defer cache.deinit(&budget);
@@ -937,7 +939,7 @@ test "query embedding cache pins hit values outside the LRU lock" {
 
 pub fn testStatsExpireIdleEntries() !void {
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{ .ttl_ns = 0 });
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, platform.Io.Threaded.global_single_threaded.io(), .{ .ttl_ns = 0 });
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 3 };
     const key: Key = @as([32]u8, @splat(3));
@@ -958,7 +960,7 @@ test "query embedding cache skips zero TTL retention" {
 
 pub fn testStatsBoundExpirationWork() !void {
     var budget = cache_budget.CacheBudget.init(1024 * 1024);
-    var cache = QueryEmbeddingCache.init(std.testing.allocator, std.Io.Threaded.global_single_threaded.io(), .{});
+    var cache = QueryEmbeddingCache.init(std.testing.allocator, platform.Io.Threaded.global_single_threaded.io(), .{});
     defer cache.deinit(&budget);
     var compute = TestCompute{ .value = 3 };
 
