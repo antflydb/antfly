@@ -17,6 +17,10 @@
 //! Inputs may borrow a scan page. Competitive top-K rows and aggregate extrema
 //! take ownership before that page closes; discarded rows allocate nothing.
 const std = @import("std");
+pub const OrderedAggregate = @import("ordered_aggregate.zig").State;
+test {
+    _ = @import("ordered_aggregate.zig");
+}
 const scalar = @import("scalar.zig");
 const ast = @import("ast.zig");
 const Allocator = std.mem.Allocator;

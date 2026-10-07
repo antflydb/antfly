@@ -533,6 +533,31 @@ General grouped/window scalar-subquery output staging, cross-level aggregate lif
 ORDER BY ordinal mapping remain unfinished. These shared execution regressions
 do not change the original-case dispositions or the 1,025 unresolved total.
 
+### Ordered-set execution core (SQL activation unfinished)
+
+`operators.OrderedAggregate` provides a statement-owned, bounded external-sort
+transition for compatible `mode`, continuous percentile and discrete percentile
+requests. A group retains one copy of each ordering payload, not separate row
+and key copies. Multiple percentile targets become a bounded, rank-sorted event
+directory and share one final streaming pass; mode retains only the current run
+and best candidate. Temporary files use the existing spill manager's admission,
+cancellation and cleanup machinery. Final values are copied into the caller's
+result arena, so no output borrows a mutable spill head.
+
+The operator tests cover ascending/descending ties, multiple requested ranks,
+SQL NULL versus logical JSON null, exact discrete integers beyond 2^53, string
+ownership, empty-group direct-argument validation, real spilling, cancellation,
+disk quotas and allocation faults. Independent PostgreSQL tests check the same
+rank/tie/direct-argument contracts. A 512-row forced-spill comparison writes
+207,562 bytes for four compatible requests together versus 830,248 bytes for
+four independent sorts (4× less I/O in this operator fixture, not an endpoint
+latency claim). This is **not** completed SQL support:
+ordered-set AST/binding, grouped invocation ownership, FILTER integration,
+array-fraction shape reconstruction, compatible-sort sharing across bound
+aggregate slots and mounted exact-source execution still need integration.
+The seven original ordered-set cases `sql-0560`–`sql-0566` remain unresolved;
+no corpus disposition or coverage count changes from this core alone.
+
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json
 ```

@@ -40,6 +40,63 @@ class PostgresReferenceTest(unittest.TestCase):
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
 
+    def test_ordered_set_streaming_reducer_rank_and_tie_contracts(self):
+        for direction in ("ASC", "DESC"):
+            with self.subTest(direction=direction):
+                order = f"WITHIN GROUP (ORDER BY x {direction})"
+                values = self.db.execute(
+                    "SELECT "
+                    + ",".join(
+                        f"{function} {order}"
+                        for function in (
+                            "mode()",
+                            "percentile_cont(0.5)",
+                            "percentile_disc(0.5)",
+                            "percentile_cont(0.25)",
+                            "percentile_cont(0.75)",
+                            "percentile_cont(NULL::float8)",
+                            "percentile_disc(0)",
+                            "percentile_disc(1)",
+                        )
+                    )
+                    + " FROM (SELECT ((511-n)%16)::bigint x "
+                    "FROM generate_series(0,511)n UNION ALL SELECT NULL) t"
+                ).fetchone()
+                self.assertEqual(
+                    (0, 7.5, 7, 3.75, 11.25, None, 0, 15)
+                    if direction == "ASC"
+                    else (15, 7.5, 8, 11.25, 3.75, None, 15, 0),
+                    values,
+                )
+
+    def test_ordered_set_empty_direct_arguments_and_exact_discrete_values(self):
+        import psycopg
+
+        with self.assertRaises(psycopg.errors.NumericValueOutOfRange) as error:
+            with self.db.transaction(force_rollback=True):
+                self.db.execute(
+                    "SELECT percentile_cont(-1) WITHIN GROUP (ORDER BY x) "
+                    "FROM (SELECT 1 AS x WHERE FALSE) t"
+                )
+        self.assertEqual("22003", error.exception.sqlstate)
+        self.assertEqual(
+            (9007199254740993,),
+            self.db.execute(
+                "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) "
+                "FROM (VALUES(9007199254740993::bigint),(9007199254740995))t(x)"
+            ).fetchone(),
+        )
+        self.assertEqual(
+            ("b", "b", None, "z"),
+            self.db.execute(
+                "SELECT mode() WITHIN GROUP(ORDER BY x),"
+                "percentile_disc(0.5) WITHIN GROUP(ORDER BY x),"
+                "percentile_disc(NULL::float8) WITHIN GROUP(ORDER BY x),"
+                "percentile_disc(1) WITHIN GROUP(ORDER BY x) "
+                "FROM (VALUES('z'),('a'),('a'),('b'),('b'),('b'))t(x)"
+            ).fetchone(),
+        )
+
     def test_original_grouped_output_labels_are_not_visible_to_having(self):
         import json
         from pathlib import Path
