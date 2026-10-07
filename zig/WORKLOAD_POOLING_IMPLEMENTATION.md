@@ -1226,3 +1226,7 @@ gates also pass all 23 steps; ABI v30 full API and combined startup/default gate
 remain required. Defaults are still disabled.
 
 The ABI30 production archive and subprocess probes now pass on both native macOS and pinned Nix/glibc aarch64-linux-gnu. The GNU run validates all seven recorded source hashes and retains its exit-0 result and full log beside the native production-worker receipts. Numerical model execution and combined overload/default qualification remain pending.
+
+### Owning-thread inference checkpoints (2026-10-07, focused gates passed)
+
+Borrowed local provider phases now lend their scheduler checkpoint to the owning OS worker through a synchronous TLS scope. Existing inference execution checks can yield/check original parent authority; watchdogs and parallel children do not receive the borrowed callback. Nested scopes restore in stack order, and callbacks are removed before returning the grant. All eight focused host/wire contracts pass on macOS and pinned Nix/glibc Linux; [receipts](qualification/workload-pooling/receipts/2026-10-07/inference-owning-checkpoints/README.md) retain hashes, commands, full logs and the initial mountpoint failure. These focused contracts do not qualify model numerical work, subprocess physical scheduling, other resource waits or automatic defaults. Full API and production qualification must use these newer source bytes.

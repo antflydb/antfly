@@ -16,6 +16,48 @@
 const std = @import("std");
 const platform_time = @import("antfly_platform").time;
 
+/// A synchronous caller may lend its scheduler checkpoint to this OS worker.
+/// Controls copied to watchdogs or parallel children carry no callback: those
+/// threads have their own empty TLS slot. The host must join synchronous work
+/// and restore this scope before returning the caller's borrowed grant.
+pub const SynchronousCheckpoint = struct {
+    context: *anyopaque,
+    check_fn: *const fn (*anyopaque) anyerror!void,
+};
+threadlocal var synchronous_checkpoint: ?SynchronousCheckpoint = null;
+threadlocal var synchronous_checkpoint_depth: usize = 0;
+threadlocal var checking_synchronous_checkpoint: bool = false;
+
+pub const CheckpointScope = struct {
+    previous: ?SynchronousCheckpoint,
+    depth: usize,
+    thread: if (@import("builtin").single_threaded) void else std.Thread.Id,
+    active: bool = true,
+
+    pub fn init(checkpoint: SynchronousCheckpoint) CheckpointScope {
+        const previous = synchronous_checkpoint;
+        synchronous_checkpoint_depth += 1;
+        synchronous_checkpoint = checkpoint;
+        return .{ .previous = previous, .depth = synchronous_checkpoint_depth, .thread = if (comptime @import("builtin").single_threaded) {} else std.Thread.getCurrentId() };
+    }
+
+    pub fn deinit(self: *CheckpointScope) void {
+        if (comptime !@import("builtin").single_threaded) std.debug.assert(self.thread == std.Thread.getCurrentId());
+        std.debug.assert(self.active and self.depth == synchronous_checkpoint_depth);
+        synchronous_checkpoint = self.previous;
+        synchronous_checkpoint_depth -= 1;
+        self.active = false;
+    }
+};
+
+fn checkSynchronousCheckpoint() !void {
+    if (checking_synchronous_checkpoint) return;
+    const checkpoint = synchronous_checkpoint orelse return;
+    checking_synchronous_checkpoint = true;
+    defer checking_synchronous_checkpoint = false;
+    try checkpoint.check_fn(checkpoint.context);
+}
+
 /// Stable phases shared by API, enrichment, model loading, pipelines, and
 /// backends. Progress is advisory; cancellation and deadlines are mandatory.
 pub const Phase = enum(u8) {
@@ -163,6 +205,7 @@ pub const InferenceExecutionControl = struct {
     }
 
     pub fn check(self: InferenceExecutionControl) !void {
+        try checkSynchronousCheckpoint();
         if (self.check_fn) |check_fn| try check_fn(self.ptr);
         if (self.cancellation) |token| {
             if (token.isCancelled()) return error.Cancelled;
@@ -288,4 +331,43 @@ test "uninterruptible work fails closed without a process owner" {
     );
     var cooperative = try control.enterUninterruptible(.cooperative);
     cooperative.deinit();
+}
+
+pub fn testSynchronousCheckpoint() !void {
+    const Probe = struct {
+        calls: usize = 0,
+        fail: bool = false,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.Forbidden;
+        }
+        fn child() void {
+            const control = InferenceExecutionControl{};
+            control.check() catch @panic("child inherited parent checkpoint");
+        }
+    };
+    const control = InferenceExecutionControl{};
+    var parent = Probe{};
+    var child = Probe{ .fail = true };
+    var outer = CheckpointScope.init(.{ .context = &parent, .check_fn = Probe.check });
+    defer if (outer.active) outer.deinit();
+    try control.check();
+    var inner = CheckpointScope.init(.{ .context = &child, .check_fn = Probe.check });
+    try std.testing.expectError(error.Forbidden, control.check());
+    inner.deinit();
+    try control.check();
+    if (comptime !@import("builtin").single_threaded) {
+        const worker = try std.Thread.spawn(.{}, Probe.child, .{});
+        worker.join();
+    }
+    try std.testing.expectEqual(@as(usize, 2), parent.calls);
+    try std.testing.expectEqual(@as(usize, 1), child.calls);
+    outer.deinit();
+    try control.check();
+    try std.testing.expectEqual(@as(usize, 2), parent.calls);
+}
+
+test "runnable execution synchronous checkpoint stays on its worker and restores nested scopes" {
+    try testSynchronousCheckpoint();
 }
