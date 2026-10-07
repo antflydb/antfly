@@ -859,3 +859,19 @@ records exact source hashes and platform evidence. General storage/RPC/directory
 waits, external credential refresh, parallel children, preparation/serialization,
 all-workload scheduling, remote attempt completion and automatic defaults remain
 required for the full design.
+
+
+Private directory acquisition and file creation/unlinking now suspend runnable
+ownership around filesystem operations, alongside existing positional spill I/O.
+Owned wait results are discarded if execution reacquisition or the post-resume
+authority checkpoint fails. Mandatory cancellation-protected cleanup closes
+handles and removes private artifacts without depending on a new scheduler grant.
+All 269 embedded and 118 coordinator SQL tests pass without skips or leaks on
+macOS and pinned Nix/glibc GNU AArch64, including seven real creation/retirement
+schedules and the existing ten stalled positional I/O schedules. The
+[creation receipt](qualification/workload-pooling/receipts/2026-10-07/spill-creation-waits/README.md)
+records source hashes, complete logs and the 737-source production boundary.
+Whole API qualification of the new creation hooks remains required. General
+storage/RPC waits and cleanup execution ownership, independent parallel children,
+preparation/serialization, wider workloads, uncertain remote completion and
+automatic default qualification remain incomplete.

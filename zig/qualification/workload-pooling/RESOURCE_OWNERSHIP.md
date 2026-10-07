@@ -123,8 +123,12 @@ through the original operation owners and never becomes a successful cached
 check. [Qualification evidence](receipts/2026-10-07/read-resume-fences/README.md)
 records the covered schedules and platform results.
 
-Private spill reads/writes currently release runnable capacity. General storage,
-RPC and directory waits still need suspension boundaries. Authority validation
+Private spill reads/writes and directory/file creation currently release runnable
+capacity. Owned creation results are discarded if reacquisition or the subsequent
+authority checkpoint fails; mandatory cleanup does not need a new grant. The
+[creation qualification](receipts/2026-10-07/spill-creation-waits/README.md) covers
+real handle retirement on both platforms. General storage/RPC waits and cleanup
+execution ownership still need suspension boundaries. Authority validation
 itself performs catalog I/O: extending these boundaries must avoid recursively
 validating a guard already in validation, and must reacquire execution capacity
 before parsing or consuming returned data. Preparation, serialization, parallel

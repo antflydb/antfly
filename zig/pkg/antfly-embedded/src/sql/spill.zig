@@ -68,6 +68,12 @@ pub const Manager = struct {
         if (self.wait != null) try self.check();
         return result;
     }
+    fn performOwned(self: *Manager, comptime operation: anytype, args: anytype, comptime discard: anytype, discard_args: anytype) anyerror!@typeInfo(@typeInfo(@TypeOf(operation)).@"fn".return_type.?).error_union.payload {
+        const result = try @import("execution_wait.zig").runOwned(self.wait, operation, args, discard, discard_args);
+        errdefer @call(.auto, discard, .{result} ++ discard_args);
+        if (self.wait != null) try self.check();
+        return result;
+    }
     fn lock(self: *Manager) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
@@ -148,15 +154,57 @@ pub const Manager = struct {
     fn open(self: *Manager) !void {
         if (self.dir != null) return;
         try self.check();
-        const parent = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
-        errdefer parent.close(self.io);
         var random: [16]u8 = undefined;
         try self.io.randomSecure(&random);
         _ = try std.fmt.bufPrint(&self.directory_name, "antfly-sql-{s}", .{std.fmt.bytesToHex(random, .lower)});
-        try parent.createDir(self.io, &self.directory_name, .fromMode(0o700));
-        errdefer parent.deleteTree(self.io, &self.directory_name) catch {};
-        self.dir = try parent.openDir(self.io, &self.directory_name, .{});
-        self.parent = parent;
+        const opened = try self.performOwned(openPrivateDirectory, .{ self.io, self.root, &self.directory_name }, PrivateDirectory.discard, .{ self.io, &self.directory_name });
+        self.dir = opened.dir;
+        self.parent = opened.parent;
+    }
+    const PrivateDirectory = struct {
+        parent: std.Io.Dir,
+        dir: std.Io.Dir,
+        fn discard(self: @This(), io: std.Io, name: []const u8) void {
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            self.dir.close(io);
+            self.parent.deleteTree(io, name) catch {};
+            self.parent.close(io);
+        }
+    };
+    /// Only private filesystem operations run without a runnable permit. The
+    /// random name and all SQL preparation remain in the caller's CPU phase.
+    fn openPrivateDirectory(io: std.Io, root: []const u8, name: []const u8) !PrivateDirectory {
+        const parent = try std.Io.Dir.openDirAbsolute(io, root, .{});
+        var created = false;
+        errdefer {
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            if (created) parent.deleteTree(io, name) catch {};
+            parent.close(io);
+        }
+        try parent.createDir(io, name, .fromMode(0o700));
+        created = true;
+        const dir = try parent.openDir(io, name, .{});
+        return .{ .parent = parent, .dir = dir };
+    }
+    fn createPrivateFile(dir: std.Io.Dir, io: std.Io, name: []const u8) !std.Io.File {
+        const file = try dir.createFile(io, name, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
+        // Runs are accessed through open handles only. Unlink immediately so
+        // process crashes cannot leave row payloads behind on supported hosts.
+        errdefer {
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            file.close(io);
+            dir.deleteFile(io, name) catch {};
+        }
+        try dir.deleteFile(io, name);
+        return file;
+    }
+    fn discardPrivateFile(file: std.Io.File, io: std.Io) void {
+        const protection = io.swapCancelProtection(.blocked);
+        defer _ = io.swapCancelProtection(protection);
+        file.close(io);
     }
     pub fn create(self: *Manager) !File {
         self.lock();
@@ -166,11 +214,7 @@ pub const Manager = struct {
         self.sequence += 1;
         var name: [24]u8 = undefined;
         const text = try std.fmt.bufPrint(&name, "{d}", .{self.sequence});
-        const file = try self.dir.?.createFile(self.io, text, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
-        // Runs are accessed through open handles only. Unlink immediately so
-        // process crashes cannot leave row payloads behind on supported hosts.
-        errdefer file.close(self.io);
-        try self.dir.?.deleteFile(self.io, text);
+        const file = try self.performOwned(createPrivateFile, .{ self.dir.?, self.io, text }, discardPrivateFile, .{self.io});
         self.files += 1;
         return .{ .manager = self, .file = file, .id = self.sequence };
     }
@@ -1619,6 +1663,125 @@ test "SQL independent merge compaction jobs preserve sorted output and release f
         try std.testing.expect(sort.parallel_merges_started >= 2);
     }
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "SQL spill creation waits retire acquired handles after failed resume or authority check" {
+    const runnable = @import("../common/runnable_scheduler.zig");
+    const Case = enum { success, directory_resume, directory_check, file_resume, file_check, begin_failure, io_failure };
+    const Owner = struct {
+        var active: *@This() = undefined;
+        io: std.Io,
+        case: Case,
+        scheduler: *runnable.Scheduler,
+        execution: runnable.Execution = .{},
+        ends: usize = 0,
+        file_closes: usize = 0,
+        dir_closes: usize = 0,
+        fn fileClose(raw: ?*anyopaque, files: []const std.Io.File) void {
+            active.file_closes += files.len;
+            active.io.vtable.fileClose(raw, files);
+        }
+        fn dirClose(raw: ?*anyopaque, dirs: []const std.Io.Dir) void {
+            active.dir_closes += dirs.len;
+            active.io.vtable.dirClose(raw, dirs);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.case == .begin_failure) return error.QueryCanceled;
+            try self.execution.park(.resource_blocked);
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.ends += 1;
+            const blocked = self.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 0), blocked.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 1), blocked.resource_blocked);
+            try std.testing.expectEqual(@as(u64, 17), blocked.retained_bytes);
+            var other: runnable.Execution = .{};
+            defer other.finish();
+            try other.start(self.scheduler, .{ .io = self.io }, .query);
+            var control: runnable.Execution = .{};
+            defer control.finish();
+            try control.start(self.scheduler, .{ .io = self.io }, .control);
+            try std.testing.expectEqual(@as(usize, 2), self.scheduler.stats().runnable_slots);
+            other.finish();
+            control.finish();
+            if ((self.case == .directory_resume and self.ends == 1) or
+                (self.case == .file_resume and self.ends == 2)) self.scheduler.close();
+            try self.execution.enter(.query);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if ((self.case == .directory_check and self.ends == 1) or
+                (self.case == .file_check and self.ends == 2)) return error.Forbidden;
+            try std.testing.expectEqual(@as(usize, 1), self.scheduler.stats().runnable_slots);
+        }
+    };
+    const io = std.testing.io;
+    for (std.enums.values(Case)) |case| {
+        var temp = std.testing.tmpDir(.{ .iterate = true });
+        defer temp.cleanup();
+        var path: [std.fs.max_path_bytes]u8 = undefined;
+        const length = try temp.dir.realPath(io, &path);
+        var scheduler = try runnable.Scheduler.init(.{ .slots = 2, .max_operations = 8, .max_bytes = 100, .control_bytes = 10 });
+        defer scheduler.close();
+        var owner: Owner = .{ .io = io, .case = case, .scheduler = &scheduler };
+        defer owner.execution.finish();
+        Owner.active = &owner;
+        // Preserve the real I/O userdata for every native filesystem callback.
+        // Only close counters are intercepted by this sequential fixture.
+        var vtable = io.vtable.*;
+        vtable.fileClose = Owner.fileClose;
+        vtable.dirClose = Owner.dirClose;
+        var manager: Manager = .{ .alloc = std.testing.allocator, .io = .{ .userdata = io.userdata, .vtable = &vtable }, .context = &owner, .checkpoint = Owner.check, .root = path[0..length], .parallel_work = false, .wait = .{ .ptr = &owner, .begin = Owner.begin, .end = Owner.end } };
+        defer manager.deinit();
+        if (case == .io_failure) manager.root = try std.fmt.bufPrint(path[length..], "{s}/absent", .{path[0..length]});
+        try owner.execution.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
+        const result = manager.create();
+        if (case == .success) {
+            var file = try result;
+            try std.testing.expectEqual(@as(usize, 1), manager.files);
+            try std.testing.expectEqual(@as(usize, 0), owner.file_closes);
+            const iterable = try manager.dir.?.openDir(manager.io, ".", .{ .iterate = true });
+            defer iterable.close(manager.io);
+            var empty = iterable.iterate();
+            try std.testing.expectEqual(null, try empty.next(manager.io));
+            file.close();
+            try std.testing.expectEqual(@as(usize, 1), owner.file_closes);
+        } else {
+            try std.testing.expectError(switch (case) {
+                .directory_resume, .file_resume => error.SchedulerClosed,
+                .directory_check, .file_check => error.Forbidden,
+                .begin_failure => error.QueryCanceled,
+                .io_failure => error.FileNotFound,
+                .success => unreachable,
+            }, result);
+            try std.testing.expectEqual(@as(usize, 0), manager.files);
+            try std.testing.expectEqual(@as(usize, if (case == .file_resume or case == .file_check) 1 else 0), owner.file_closes);
+            if (manager.dir) |dir| {
+                const iterable = try dir.openDir(manager.io, ".", .{ .iterate = true });
+                defer iterable.close(manager.io);
+                var empty = iterable.iterate();
+                try std.testing.expectEqual(null, try empty.next(manager.io));
+            } else {
+                var empty = temp.dir.iterate();
+                try std.testing.expectEqual(null, try empty.next(io));
+            }
+        }
+        try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+        manager.deinit();
+        // Failed directory reacquisition/validation closes both newly acquired
+        // handles immediately; file failures keep only the manager's directory
+        // until deinit. deleteTree may temporarily open additional handles.
+        if (case != .begin_failure and case != .io_failure) try std.testing.expect(owner.dir_closes >= 2);
+        var empty = temp.dir.iterate();
+        try std.testing.expectEqual(null, try empty.next(io));
+        owner.execution.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
+        std.debug.print("SQL spill creation case={s}: handles retired, operations=0 slots=0 spill_bytes=0\n", .{@tagName(case)});
+    }
 }
 
 test "SQL spill waits release runnable slots and preserve ownership through resume failures" {

@@ -97,8 +97,13 @@ resumes. Private spill positional reads and writes now use that boundary, keepin
 stable buffers and their quota owners across the wait. Reacquisition runs on I/O
 failure as well as success; backend checkpoints run before successful data is
 decoded. Ten stalled read/write schedules pass on both platforms, including
-cancellation, expiry, shutdown and I/O errors. Storage/RPC and directory waits
-remain outstanding, as do parallel child owners.
+cancellation, expiry, shutdown and I/O errors. Private directory/file creation also suspends runnable ownership. Owned I/O
+results are discarded if capacity or authority cannot be reacquired, with cleanup
+independent of a new grant. The full SQL corpus passes all 387 tests on both
+platforms; the [creation receipt](qualification/workload-pooling/receipts/2026-10-07/spill-creation-waits/README.md)
+records seven handle-retirement schedules. Whole API qualification of creation
+hooks, general storage/RPC waits, cleanup execution ownership and parallel child
+owners remain outstanding.
 
 ## Read authority after resumption
 
