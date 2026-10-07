@@ -411,7 +411,7 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 49 result contracts and twelve error
+The shared PostgreSQL/native fixture checks 49 result contracts and eighteen error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused
@@ -455,6 +455,10 @@ inference normalizes scalar children before constraining their parameters;
 RETURNING's child LIMIT no longer reaches the scalar-function binder as `$scalar`.
 NULL LIMIT retains unbounded admission for ordinary result sets instead of
 silently truncating at the configured result quota, and NULL OFFSET means zero.
+Negative literal and parameter bounds are execution errors, with PostgreSQL's
+distinct LIMIT (`2201W`) and OFFSET (`2201X`) diagnostics rather than syntax or
+capacity errors. Binding does not reject an undemanded scalar child's negative
+literal. These contracts do not activate arbitrary LIMIT/OFFSET expressions.
 
 Probe batches retain their caller's demand, and a known one-row frame builds
 against an unestimated input rather than eagerly building that entire source.

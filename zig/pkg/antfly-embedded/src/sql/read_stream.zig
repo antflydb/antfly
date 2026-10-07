@@ -197,6 +197,23 @@ test "SQL pull stream pipelines aliased nested CTEs without eager source materia
     try std.testing.expectEqual(@as(usize, 9), seen);
 }
 
+test "SQL pull stream validates row bound domains before opening a cursor" {
+    for ([_]struct { sql: []const u8, parameters: []const Json = &.{}, failure: anyerror }{
+        .{ .sql = "SELECT n FROM docs LIMIT -1", .failure = error.SqlNegativeLimit },
+        .{ .sql = "SELECT n FROM docs OFFSET -1", .failure = error.SqlNegativeOffset },
+        .{ .sql = "SELECT n FROM docs LIMIT $1", .parameters = &.{.{ .integer = -1 }}, .failure = error.SqlNegativeLimit },
+        .{ .sql = "SELECT n FROM docs OFFSET $1", .parameters = &.{.{ .integer = -1 }}, .failure = error.SqlNegativeOffset },
+        .{ .sql = "SELECT n FROM docs LIMIT 0 OFFSET -1", .failure = error.SqlNegativeOffset },
+    }) |case| {
+        var fixture: Fixture = .{ .count = 0 };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, Stream.open(std.testing.allocator, fixture.backend(), &compiled, case.parameters, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.opened);
+        try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    }
+}
+
 test "SQL pull stream quotas fail rather than silently truncate and blocking shapes decline" {
     var fixture: Fixture = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT n FROM docs", .{});
@@ -531,7 +548,7 @@ pub const Stream = struct {
             if (!slot.found_existing) try needed.append(arena, field);
         }
         self.fields = fields.items;
-        self.skip = try self.context.count(statement.offset, 0);
+        self.skip = try self.context.offsetCount(statement.offset);
         self.remaining = statement.capRows(try self.context.count(statement.limit, std.math.maxInt(usize)));
         const explicit_limit = try self.context.hasRowLimit(statement.limit);
         if (self.skip > limits.scan_rows or (explicit_limit and self.remaining > limits.scan_rows)) return error.SqlProgramLimitExceeded;

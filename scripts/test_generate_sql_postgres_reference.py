@@ -517,7 +517,7 @@ class PostgresReferenceTest(unittest.TestCase):
             ).read_text()
         )
         self.assertEqual(49, len(fixture["entries"]))
-        self.assertEqual(12, len(fixture["errors"]))
+        self.assertEqual(18, len(fixture["errors"]))
         for case in fixture["entries"]:
             with self.subTest(sql=case["sql"]):
                 self.assertEqual(
@@ -530,6 +530,31 @@ class PostgresReferenceTest(unittest.TestCase):
                     with self.db.transaction(force_rollback=True):
                         self.db.execute(case["sql"]).fetchall()
                 self.assertEqual(case["code"], error.exception.sqlstate)
+
+    def test_negative_row_bounds_validate_only_demanded_execution(self):
+        import psycopg
+
+        for sql, code in (
+            ("SELECT 1 LIMIT $1", "2201W"),
+            ("SELECT 1 OFFSET $1", "2201X"),
+            ("SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1", "2201W"),
+            ("SELECT i.x FROM (SELECT 1 AS x) i OFFSET $1", "2201X"),
+            ("SELECT (SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1)", "2201W"),
+            ("SELECT (SELECT i.x FROM (SELECT 1 AS x) i OFFSET $1)", "2201X"),
+        ):
+            with self.subTest(sql=sql):
+                with self.assertRaises(psycopg.Error) as error:
+                    with self.db.transaction(force_rollback=True):
+                        with psycopg.RawCursor(self.db) as cursor:
+                            cursor.execute(sql, [-1])
+                            cursor.fetchall()
+                self.assertEqual(code, error.exception.sqlstate)
+        self.assertEqual(
+            [(7,)],
+            self.db.execute(
+                "SELECT CASE WHEN FALSE THEN (SELECT 1 LIMIT -1) ELSE 7 END"
+            ).fetchall(),
+        )
 
     def test_scalar_cardinality_stops_before_third_row_value_errors(self):
         import psycopg

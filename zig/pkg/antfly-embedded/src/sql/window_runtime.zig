@@ -638,7 +638,7 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
         else => {},
     };
     const limit = statement.capRows(try context.count(statement.limit, context.limits.result_rows));
-    const offset = try context.count(statement.offset, 0);
+    const offset = try context.offsetCount(statement.offset);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
     if (context.spill != null) if (try @import("window_spill.zig").execute(context, statement)) |output| return output;
@@ -727,7 +727,7 @@ pub fn finishCells(context: anytype, statement: ast.Select, cells: anytype) !@im
 pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytype, physical_order: ?binding.Sort) !@import("runtime.zig").Output {
     const bound = context.binding.window.?;
     const limit = statement.capRows(try context.count(statement.limit, context.limits.result_rows));
-    const offset = try context.count(statement.offset, 0);
+    const offset = try context.offsetCount(statement.offset);
     if (physical_order) |sort| if (@import("ordering_reuse.zig").finalOrder(sort, bound.orders, statement.order_by) and
         !@import("decision_eval.zig").hasExternalPrograms(bound.outputs))
     {

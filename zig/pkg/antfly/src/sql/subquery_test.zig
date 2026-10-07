@@ -73,6 +73,32 @@ test "SQL masked Apply preserves PostgreSQL conditional subquery demand and NULL
     }
 }
 
+test "SQL row bounds validate negative parameters at execution in their own domain" {
+    var backend: Backend = .{};
+    for ([_]struct { sql: []const u8, code: []const u8 }{
+        .{ .sql = "SELECT 1 LIMIT $1", .code = "2201W" },
+        .{ .sql = "SELECT 1 OFFSET $1", .code = "2201X" },
+        .{ .sql = "SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1", .code = "2201W" },
+        .{ .sql = "SELECT i.x FROM (SELECT 1 AS x) i OFFSET $1", .code = "2201X" },
+        .{ .sql = "SELECT (SELECT i.x FROM (SELECT 1 AS x) i LIMIT $1)", .code = "2201W" },
+        .{ .sql = "SELECT (SELECT i.x FROM (SELECT 1 AS x) i OFFSET $1)", .code = "2201X" },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{.{ .integer = -1 }}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            return error.ExpectedNegativeRowBoundFailure;
+        } else |err| try std.testing.expectEqualStrings(case.code, @import("antfly_local_sources").sql_errors.describe(err).code);
+    }
+    // Binding negative literal bounds must not reject an undemanded child.
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT CASE WHEN FALSE THEN (SELECT 1 LIMIT -1) ELSE 7 END", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("7", result.output.rows[0][0].string);
+}
+
 test "SQL scalar cardinality NULL limits retain unbounded result admission" {
     var backend: Backend = .{};
     for ([_]struct { sql: []const u8, parameters: []const std.json.Value = &.{} }{

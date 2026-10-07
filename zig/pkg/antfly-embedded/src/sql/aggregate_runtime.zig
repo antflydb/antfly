@@ -235,7 +235,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         external = external or @import("decision_eval.zig").hasExternal(program);
     };
     const limit = statement.capRows(try context.count(statement.limit, context.limits.result_rows));
-    const offset = try context.count(statement.offset, 0);
+    const offset = try context.offsetCount(statement.offset);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
     const grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });

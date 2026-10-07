@@ -802,7 +802,7 @@ fn Engine(comptime Context: type) type {
                     const fields = try self.arena.allocator().alloc([]const u8, query.statement.columns.len);
                     for (query.statement.columns, fields) |column, *field| field.* = if (column.expression != null) "" else column.field;
                     self.query_fields = fields;
-                    self.query_skip = try context.count(query.statement.offset, 0);
+                    self.query_skip = try context.offsetCount(query.statement.offset);
                     self.query_remaining = query.statement.capRows(try context.count(query.statement.limit, std.math.maxInt(usize)));
                 }
                 while (self.query_remaining != 0) {
@@ -909,7 +909,7 @@ fn Engine(comptime Context: type) type {
                     const fields = try self.arena.allocator().alloc([]const u8, query.statement.columns.len);
                     for (query.statement.columns, fields) |column, *field| field.* = if (column.expression != null) "" else column.field;
                     self.query_fields = fields;
-                    self.query_skip = try context.count(query.statement.offset, 0);
+                    self.query_skip = try context.offsetCount(query.statement.offset);
                     self.query_remaining = query.statement.capRows(try context.count(query.statement.limit, std.math.maxInt(usize)));
                 }
                 if (self.query_remaining == 0) return null;

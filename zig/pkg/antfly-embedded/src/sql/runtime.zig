@@ -328,13 +328,21 @@ pub const Context = struct {
         const node = input orelse return default;
         const parsed = try self.value(node, .{ .name = "limit", .path = "limit", .type = .integer });
         if (parsed == .null) return default;
-        if (parsed != .integer or parsed.integer < 0) return error.InvalidSqlLimit;
+        if (parsed != .integer) return error.InvalidSqlLimit;
+        if (parsed.integer < 0) return error.SqlNegativeLimit;
         return std.math.cast(usize, parsed.integer) orelse error.InvalidSqlLimit;
     }
 
     pub fn hasRowLimit(self: Context, input: ?ast.Value) !bool {
         const value_ = input orelse return false;
         return (try self.value(value_, .{ .name = "limit", .path = "limit", .type = .integer })) != .null;
+    }
+
+    pub fn offsetCount(self: Context, input: ?ast.Value) !usize {
+        return self.count(input, 0) catch |err| switch (err) {
+            error.SqlNegativeLimit => error.SqlNegativeOffset,
+            else => err,
+        };
     }
 
     const BoundPredicates = struct {
@@ -422,7 +430,7 @@ pub const Context = struct {
         const table_def = self.binding.table orelse return self.constantSelect(statement);
         const predicates = try self.conditions(table_def, statement.predicate);
         const limit = statement.capRows(try self.count(statement.limit, self.limits.result_rows));
-        const offset = try self.count(statement.offset, 0);
+        const offset = try self.offsetCount(statement.offset);
         if (limit > self.limits.result_rows or offset > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
         var fields: std.ArrayList([]const u8) = .empty;
         const columns = self.binding.columns;
@@ -730,7 +738,7 @@ pub const Context = struct {
 
     fn constantSelect(self: Context, statement: ast.Select) !Output {
         const limit = statement.capRows(try self.count(statement.limit, self.limits.result_rows));
-        const offset = try self.count(statement.offset, 0);
+        const offset = try self.offsetCount(statement.offset);
         if (limit > self.limits.result_rows or offset > self.limits.scan_rows) return error.SqlProgramLimitExceeded;
         const columns = self.binding.columns;
         if (limit == 0 or offset != 0) return .{ .columns = columns, .command_tag = "SELECT" };
