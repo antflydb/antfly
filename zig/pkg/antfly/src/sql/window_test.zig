@@ -99,11 +99,11 @@ test "SQL JSON numeric scalars retain logical type across relation aggregate and
     }
 }
 
-test "SQL window ORDER BY expressions bind aliases without recursive source rebinding" {
+test "SQL window ORDER BY labels are standalone and expressions bind input columns" {
     var backend: Backend = .{};
     const cases = [_][]const u8{
-        "SELECT x, row_number() OVER (ORDER BY x) AS n FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY (n + $1) DESC",
-        "SELECT * FROM (SELECT x, row_number() OVER (ORDER BY x) AS n FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY (n + $1) DESC) q",
+        "SELECT x, row_number() OVER (ORDER BY x) AS n FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY (x + $1) DESC",
+        "SELECT * FROM (SELECT x, row_number() OVER (ORDER BY x) AS n FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY (x + $1) DESC) q",
         "SELECT x, row_number() OVER (ORDER BY x) AS x FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY (x + $1) DESC",
     };
     for (cases) |text| {
@@ -119,10 +119,45 @@ test "SQL window ORDER BY expressions bind aliases without recursive source rebi
     }
     var ambiguous = try compiler.compile(std.testing.allocator, "SELECT row_number() OVER () AS n, rank() OVER () AS n ORDER BY (n+1)", .{});
     defer ambiguous.deinit();
-    try std.testing.expectError(error.AmbiguousSqlColumn, runtime.execute(std.testing.allocator, backend.backend(), &ambiguous, &.{}, .{}));
+    try std.testing.expectError(error.UnknownColumn, runtime.execute(std.testing.allocator, backend.backend(), &ambiguous, &.{}, .{}));
     var invalid_input = try compiler.compile(std.testing.allocator, "SELECT row_number() OVER () AS n ORDER BY sum(n) OVER ()", .{});
     defer invalid_input.deinit();
     try std.testing.expectError(error.UnknownColumn, runtime.execute(std.testing.allocator, backend.backend(), &invalid_input, &.{}, .{}));
+}
+
+test "SQL window ORDER BY rejects aliases nested in source expressions" {
+    var backend: Backend = .{};
+    for ([_][]const u8{
+        "SELECT row_number() OVER () AS n ORDER BY n+1",
+        "SELECT row_number() OVER () AS n ORDER BY CAST(n AS bigint)",
+        "SELECT row_number() OVER () AS n ORDER BY coalesce(n,0)",
+        "SELECT row_number() OVER () AS n ORDER BY CASE WHEN TRUE THEN n ELSE 0 END",
+        "SELECT row_number() OVER () ORDER BY row_number+1",
+        "SELECT row_number() OVER () AS \"n.total\" ORDER BY \"n.total\"+1",
+        "SELECT x,row_number() OVER (ORDER BY x) AS n FROM (SELECT 1 AS x) t ORDER BY n+1",
+    }) |sql| {
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        if (runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{})) |value| {
+            var result = value;
+            result.deinit();
+            return error.ExpectedUndefinedColumn;
+        } else |err| switch (err) {
+            error.UnknownColumn, error.UndefinedColumn => {},
+            else => return err,
+        }
+    }
+    // A standalone output label takes precedence over the identically named
+    // input; placing that name in an expression selects the input instead.
+    for ([_][]const u8{ "x", "(x+0)" }, [_][]const u8{ "-1", "-3" }) |key, first| {
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "SELECT -x AS x,row_number() OVER (ORDER BY x) AS n FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY {s} DESC", .{key});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings(first, result.output.rows[0][0].string);
+    }
 }
 
 test "SQL mixed wildcard projections expand in the pinned visible input domain" {
@@ -196,7 +231,7 @@ test "SQL implicit window labels share the statement output order domain" {
     var backend: Backend = .{};
     for ([_][]const u8{
         "SELECT x, row_number() OVER (ORDER BY x) FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY row_number DESC",
-        "SELECT * FROM (SELECT x, row_number() OVER (ORDER BY x) FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY (row_number+1) DESC) q",
+        "SELECT * FROM (SELECT x, row_number() OVER (ORDER BY x) FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t) q ORDER BY (row_number+1) DESC",
     }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
@@ -207,14 +242,14 @@ test "SQL implicit window labels share the statement output order domain" {
         for (result.output.rows, [_][]const u8{ "3", "2", "1" }) |row, number| try std.testing.expectEqualStrings(number, row[1].string);
     }
     for ([_][]const u8{
-        "SELECT row_number() OVER (), row_number() OVER () ORDER BY row_number",
+        "SELECT row_number() OVER (ORDER BY 1), row_number() OVER (ORDER BY 2) ORDER BY row_number",
         "SELECT row_number() OVER () AS n, rank() OVER () AS n ORDER BY n",
     }) |sql| {
         var compiled = try compiler.compile(std.testing.allocator, sql, .{});
         defer compiled.deinit();
         try std.testing.expectError(error.AmbiguousSqlColumn, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
     }
-    var quoted = try compiler.compile(std.testing.allocator, "SELECT row_number() OVER (ORDER BY x) AS \"n.total\" FROM (SELECT 2 AS x UNION ALL SELECT 1) t ORDER BY (\"n.total\"+1) DESC", .{});
+    var quoted = try compiler.compile(std.testing.allocator, "SELECT row_number() OVER (ORDER BY x) AS \"n.total\" FROM (SELECT 2 AS x UNION ALL SELECT 1) t ORDER BY \"n.total\" DESC", .{});
     defer quoted.deinit();
     var result = try runtime.execute(std.testing.allocator, backend.backend(), &quoted, &.{}, .{});
     defer result.deinit();
@@ -234,13 +269,13 @@ test "SQL window aliases expand once across inference and virtual table lowering
         defer compiled.deinit();
         var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
         defer result.deinit();
-        for (result.output.rows, [_][]const u8{ "-1", "-2", "-3" }) |row, expected| try std.testing.expectEqualStrings(expected, row[0].string);
+        for (result.output.rows, [_][]const u8{ "-3", "-2", "-1" }) |row, expected| try std.testing.expectEqualStrings(expected, row[0].string);
     }
 }
 
 test "SQL window final ordering allocates for actual rows not response headroom" {
     var backend: Backend = .{};
-    var compiled = try compiler.compile(std.testing.allocator, "SELECT x, row_number() OVER (ORDER BY x) AS n FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY (n+1) DESC", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT x, row_number() OVER (ORDER BY x) AS n FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY n DESC", .{});
     defer compiled.deinit();
     var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .result_rows = 4096, .retained_bytes = 256 * 1024 });
     defer result.deinit();
@@ -254,7 +289,7 @@ test "SQL window alias reuse retains one computed slot without merging different
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
-    var compiled = try compiler.compile(std.testing.allocator, "SELECT row_number() OVER (ORDER BY 1) AS n, row_number() OVER (ORDER BY 2) AS other ORDER BY (n+1)", .{});
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT row_number() OVER (ORDER BY 1) AS n, row_number() OVER (ORDER BY 2) AS other ORDER BY n", .{});
     defer compiled.deinit();
     const bound = try @import("antfly_local_sources").sql_describe.bind(alloc, backend.backend(), &compiled, &.{});
     try std.testing.expectEqual(@as(usize, 2), bound.window.?.specs.len);
@@ -418,7 +453,7 @@ test "SQL window input preparation releases every allocation failure" {
     const Case = struct {
         fn run(alloc: std.mem.Allocator) !void {
             var backend: Backend = .{};
-            var compiled = try compiler.compile(alloc, "SELECT sum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), row_number() OVER (ORDER BY x) AS n FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY (n+1) DESC", .{});
+            var compiled = try compiler.compile(alloc, "SELECT sum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), row_number() OVER (ORDER BY x) AS n FROM (SELECT 1 AS x UNION ALL SELECT 2) t ORDER BY n DESC", .{});
             defer compiled.deinit();
             var result = try runtime.execute(alloc, backend.backend(), &compiled, &.{}, .{});
             defer result.deinit();

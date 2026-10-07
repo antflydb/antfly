@@ -13320,12 +13320,15 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         "sql-0522", "sql-0523", "sql-0524", "sql-0525", "sql-0526", "sql-0527", "sql-0528",
         "sql-0529", "sql-0530", "sql-0531", "sql-0532", "sql-0533", "sql-0534", "sql-0535",
         "sql-0536", "sql-0538", "sql-0539", "sql-0545", "sql-0546", "sql-0550", "sql-0551",
-        "sql-0558", "sql-0559", "sql-1219", "sql-1220", "sql-1223", "sql-1240", "sql-1241",
-        "sql-1249", "sql-1252", "sql-1267", "sql-1337", "sql-1367", "sql-1368", "sql-1371",
-        "sql-1372", "sql-1373", "sql-1375", "sql-1377", "sql-1382", "sql-1383", "sql-1384",
-        "sql-1385", "sql-1386", "sql-1387",
+        "sql-0558", "sql-0559", "sql-1220", "sql-1223", "sql-1240", "sql-1241", "sql-1249",
+        "sql-1252", "sql-1267", "sql-1337", "sql-1367", "sql-1368", "sql-1371", "sql-1372",
+        "sql-1375", "sql-1377", "sql-1382", "sql-1383", "sql-1384", "sql-1385", "sql-1386",
+        "sql-1387",
     };
     try @import("sql_parity_reference.zig").runArrayExpressions(alloc, &handler);
+    // These historical SQLite-positive originals are invalid in PostgreSQL:
+    // an output alias is not an input variable inside ORDER BY arithmetic.
+    for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, "42703");
     try @import("sql_parity_reference.zig").run(alloc, &handler, &reference_cases);
     {
         const parity = @import("sql_parity_reference.zig");

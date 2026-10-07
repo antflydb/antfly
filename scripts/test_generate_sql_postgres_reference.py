@@ -69,6 +69,65 @@ class PostgresReferenceTest(unittest.TestCase):
     def case(self, sql, params=()):
         return {"id": "sql-0001", "sql": sql, "params": params}
 
+    def test_window_order_aliases_are_standalone_not_expression_variables(self):
+        import psycopg
+
+        rejected = [
+            "SELECT row_number() OVER () AS n ORDER BY n+1",
+            "SELECT row_number() OVER () AS n ORDER BY CAST(n AS bigint)",
+            "SELECT row_number() OVER () AS n ORDER BY coalesce(n,0)",
+            "SELECT row_number() OVER () AS n ORDER BY CASE WHEN TRUE THEN n ELSE 0 END",
+            "SELECT row_number() OVER () ORDER BY row_number+1",
+            'SELECT row_number() OVER () AS "n.total" ORDER BY "n.total"+1',
+            "SELECT x,row_number() OVER (ORDER BY x) AS n FROM (SELECT 1 AS x) t ORDER BY n+1",
+        ]
+        for sql in rejected:
+            with self.subTest(sql=sql):
+                with self.db.transaction(force_rollback=True):
+                    with self.assertRaises(psycopg.errors.UndefinedColumn) as error:
+                        self.db.execute(sql)
+                    self.assertEqual(error.exception.sqlstate, "42703")
+        prefix = "SELECT -x AS x,row_number() OVER (ORDER BY x) AS n FROM (SELECT 2 AS x UNION ALL SELECT 1 UNION ALL SELECT 3) t ORDER BY "
+        self.assertEqual(
+            self.db.execute(prefix + "x DESC").fetchall(),
+            [(-1, 1), (-2, 2), (-3, 3)],
+        )
+        self.assertEqual(
+            self.db.execute(prefix + "(x+0) DESC").fetchall(),
+            [(-3, 3), (-2, 2), (-1, 1)],
+        )
+        for sql in [
+            "SELECT row_number() OVER (ORDER BY 1),row_number() OVER (ORDER BY 2) ORDER BY row_number",
+            "SELECT row_number() OVER () AS n,rank() OVER () AS n ORDER BY n",
+        ]:
+            with self.subTest(sql=sql):
+                with self.assertRaises(psycopg.errors.AmbiguousColumn) as error:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(sql)
+                self.assertEqual("42702", error.exception.sqlstate)
+
+    def test_original_window_output_expression_orders_are_not_postgres_features(self):
+        import json
+        from pathlib import Path
+        import psycopg
+        from generate_sql_postgres_reference import create_table, properties
+
+        fixtures = Path(__file__).resolve().parents[1] / "zig/pkg/antfly-embedded/src/sql/fixtures"
+        profile = json.loads((fixtures / "sql_read_campaign_profile.json").read_text())
+        inventory = json.loads((fixtures / "sql_parity_inventory.json").read_text())["entries"]
+        cases = [case for case in inventory if case["id"] in {"sql-1219", "sql-1373"}]
+        self.assertEqual(2, len(cases))
+        self.assertNotIn("row_num", properties(profile["schema"]))
+        with self.db.transaction(force_rollback=True):
+            create_table(self.db, "usage_records", properties(profile["schema"]), profile["rows"])
+            for case in cases:
+                with self.subTest(id=case["id"]):
+                    with self.assertRaises(psycopg.errors.UndefinedColumn) as error:
+                        with self.db.transaction(force_rollback=True):
+                            self.db.execute(case["sql"])
+                    self.assertEqual("42703", error.exception.sqlstate)
+                    self.assertIn('"row_num"', str(error.exception))
+
     def test_like_explicit_escape_contracts(self):
         cases = [
             ("'bot_agent' LIKE 'bot!_%' ESCAPE '!'", True),

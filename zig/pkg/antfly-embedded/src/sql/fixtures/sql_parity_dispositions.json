@@ -11113,8 +11113,8 @@
     },
     {
       "id": "sql-1219",
-      "status": "implemented",
-      "reason": "Exact original SELECT and logical parameters execute through public HTTP over native typed rows. An independent bounded SQLite reference checks complete results, SQL NULL provenance and explicit column labels on the shared nine-row fixture. Tagged source parameters become current public JSON values without integer rounding. Distributed activation and legacy physical plan fingerprints are not certified.",
+      "status": "superseded",
+      "reason": "The historical SQLite-positive result is not PostgreSQL-compatible: ORDER BY arithmetic cannot use row_num as an output-alias variable. PostgreSQL rejects the unchanged original specifically for row_num with SQLSTATE 42703 on the complete typed schema. The mounted native endpoint now checks the same exact-source rejection; the old SQLite success golden is removed, not counted as implemented.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
@@ -11124,11 +11124,11 @@
         {
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
           "test": "httpx SQL executes one relational page with exact integer parameters",
-          "gate": "sql-read-reference-reproducibility"
+          "gate": "sql-postgres-oracle-contracts"
         },
         {
           "path": "zig/pkg/antfly/src/sql/window_test.zig",
-          "test": "SQL window ORDER BY expressions bind aliases without recursive source rebinding",
+          "test": "SQL window ORDER BY rejects aliases nested in source expressions",
           "gate": "sql-window-binding"
         }
       ]
@@ -12735,8 +12735,8 @@
     },
     {
       "id": "sql-1373",
-      "status": "implemented",
-      "reason": "Exact original SELECT and logical parameters execute through public HTTP over native typed rows. An independent bounded SQLite reference checks complete results, SQL NULL provenance and explicit column labels on the shared nine-row fixture. Tagged source parameters become current public JSON values without integer rounding. Distributed activation and legacy physical plan fingerprints are not certified.",
+      "status": "superseded",
+      "reason": "The historical SQLite-positive result is not PostgreSQL-compatible: ORDER BY arithmetic cannot use row_num as an output-alias variable. PostgreSQL rejects the unchanged original specifically for row_num with SQLSTATE 42703 on the complete typed schema. The mounted native endpoint now checks the same exact-source rejection; the old SQLite success golden is removed, not counted as implemented.",
       "evidence": [
         {
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
@@ -12746,11 +12746,11 @@
         {
           "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
           "test": "httpx SQL executes one relational page with exact integer parameters",
-          "gate": "sql-read-reference-reproducibility"
+          "gate": "sql-postgres-oracle-contracts"
         },
         {
           "path": "zig/pkg/antfly/src/sql/window_test.zig",
-          "test": "SQL window ORDER BY expressions bind aliases without recursive source rebinding",
+          "test": "SQL window ORDER BY rejects aliases nested in source expressions",
           "gate": "sql-window-binding"
         }
       ]

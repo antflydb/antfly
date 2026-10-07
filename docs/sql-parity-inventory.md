@@ -205,9 +205,9 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 354 implemented, 136 rejected and 68 superseded
+The current branch records 352 implemented, 136 rejected and 70 superseded
 cases, with 1,028 still unresolved. The earlier batches add 77 exact compiler
-rejection contracts, 117 mounted native reads, twelve native UPDATE/DELETE
+rejection contracts, 115 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
 activation. The immutable corpus remains 1,586 original cases.
@@ -298,6 +298,20 @@ pattern. A local debug containment probe evaluated 10,000 rows in approximately
 10 ms with zero row allocations; this is a microbenchmark, not a production
 latency claim or independent evidence of public array-column activation.
 
+Window ordering now resolves output labels only when the label is the complete
+sort key. Arithmetic, casts, scalar calls and CASE expressions bind to input
+columns, even when an output label has the same spelling. Normalization retains
+those expression trees instead of recursively cloning and substituting aliases.
+PostgreSQL and native regressions verify the differing order of a standalone
+shadowing alias versus an input expression, quoted and implicit labels, derived
+query boundaries and undefined-column rejection. Existing allocation-fault and
+window-slot reuse tests use valid standalone sort labels. These supplemental
+checks do not grant original window-campaign completion credit. The exact
+originals `sql-1219` and `sql-1373` were incorrectly credited from SQLite-positive
+alias arithmetic. They now have PostgreSQL and strict public API SQLSTATE 42703
+rejection evidence and are superseded, not implemented. Their old success
+goldens are removed; the negative contracts remain mounted and executable.
+
 The mutation fixture verifies complete RETURNING rows and labels, SQL NULL
 provenance, affected rows, persisted state and untouched rows. A failed RETURNING
 projection must leave physical primary bytes, version and content digest
@@ -342,7 +356,7 @@ growth, quota exhaustion, allocation faults and exact output.
 The shared read reference preserves exact source SQL and logical parameters,
 checks complete results and SQL NULL provenance, and runs on a native relational
 fixture. Its independent SQLite generator is read-only and work/result bounded;
-SQLite-specific behavior is not a waiver for a missing native contract. The 115
+SQLite-specific behavior is not a waiver for a missing native contract. The 113
 SQLite-backed cases are separate from the two explicit native contracts
 (default NULL ordering and implicit window labels). Regenerate
 or check only explicitly selected golden IDs with:

@@ -520,6 +520,28 @@ pub fn runDocuments(alloc: std.mem.Allocator, handler: anytype, db: anytype, sou
     std.debug.print("SQL document campaign native outcomes {d}/{d}; discovery alone grants no disposition credit\n", .{ passed, reference.entries.len });
 }
 
+/// Exact-source negative contracts are strict regardless of discovery settings.
+pub fn expectRejection(alloc: std.mem.Allocator, handler: anytype, case_id: []const u8, sqlstate: []const u8) !void {
+    var corpus = try fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    const case = try corpus.get(case_id);
+    var parameters = std.heap.ArenaAllocator.init(alloc);
+    defer parameters.deinit();
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql, .parameters = try fixtures.Corpus.logicalParameters(parameters.allocator(), case) }, .{});
+    defer alloc.free(body);
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = body;
+    var context = httpx.Context.init(alloc, std.testing.io, &request);
+    defer context.deinit();
+    var response = try handler.executeSQL(&context);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    const diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, alloc, response.body.?, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings(sqlstate, diagnostic.value.code);
+}
+
 pub fn run(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8) !void {
     return runReference(alloc, handler, case_ids, fixtures.read_reference);
 }
