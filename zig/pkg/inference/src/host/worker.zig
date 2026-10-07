@@ -271,10 +271,15 @@ pub const Client = struct {
     }
 
     fn invokePayload(self: *Client, operation: wire.Operation, options: []const u8, payload: rpc.Payload, control: rpc.Control) !rpc.OwnedPayload {
-        while (!self.mutex.tryLock()) {
-            if (control.check) |check| try check(control.ptr);
-            try self.io.sleep(.fromMilliseconds(1), .awake);
-        }
+        // Startup/replacement contention precedes this caller's physical RPC.
+        // Park its borrowed grant while queued, then restore it before worker
+        // startup or dispatch; retain that grant throughout active child work.
+        const execution = @import("inference_server").execution_control.InferenceExecutionControl{
+            .io = self.io,
+            .ptr = control.ptr,
+            .check_fn = control.check,
+        };
+        try execution.lockIo(self.io, &self.mutex);
         const worker = self.ensureWorker(control) catch |err| {
             self.mutex.unlock(self.io);
             return err;

@@ -306,6 +306,33 @@ pub const InferenceExecutionControl = struct {
         };
     }
 
+    /// Only the queued mutex wait parks capacity. Reacquire before returning
+    /// a held lock; an active worker RPC must retain its physical CPU grant.
+    pub fn lockIo(self: InferenceExecutionControl, io: std.Io, mutex: *std.Io.Mutex) !void {
+        try self.check();
+        if (mutex.tryLock()) return;
+        var wait = try ResourceWait.init();
+        while (true) {
+            self.check() catch |err| {
+                try wait.finish();
+                return err;
+            };
+            if (mutex.tryLock()) break;
+            io.sleep(.fromMilliseconds(1), .awake) catch |err| {
+                try wait.finish();
+                return err;
+            };
+        }
+        wait.finish() catch |err| {
+            mutex.unlock(io);
+            return err;
+        };
+        self.check() catch |err| {
+            mutex.unlock(io);
+            return err;
+        };
+    }
+
     pub fn enterUninterruptible(
         self: InferenceExecutionControl,
         interruption: Interruption,
