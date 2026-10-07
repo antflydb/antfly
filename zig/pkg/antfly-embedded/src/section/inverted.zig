@@ -5176,6 +5176,7 @@ pub const FileDocMap = struct {
     ids: @import("../segment_source.zig").View,
     records: @import("../segment_source.zig").View,
     monotonic: bool = true,
+    scratch: ?@import("../spill_sort.zig").Options = null,
 };
 const FileNormStream = struct {
     len: usize,
@@ -5431,6 +5432,18 @@ fn writeMappedInvertedSection(
             continue;
         }
 
+        if (file_maps and !stream_postings and candidate_frequency >= 4096 and config.wireVersion() == wire_version_current and config.postings_layout == .posting_count_v35) {
+            var stream = try ExternalPostingStream.init(alloc, current_entries, merged_term.items, effective_maps);
+            defer stream.deinit();
+            const value = try appendPostingStreamToSink(alloc, sink, section_start, &stream, stream.has_positions, merged_norms, &total_field_len, config);
+            for (current_entries, 0..) |entry_opt, i| {
+                const entry = entry_opt orelse continue;
+                if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
+            }
+            if (value) |dict_value| try dict_builder.add(merged_term.items, dict_value);
+            continue;
+        }
+
         {
             var acc = PostingAccumulator.init();
             defer acc.deinit(alloc);
@@ -5596,6 +5609,80 @@ fn appendLookupResultToAccumulator(
         },
     }
 }
+
+/// Historical nonmonotonic maps reorder bounded posting records on disk.
+/// Position lists are copied once into private runs, never accumulated for an
+/// entire high-frequency term or reread from its source during sort carries.
+const ExternalPostingStream = struct {
+    const Spill = @import("../spill_sort.zig");
+    allocator: Allocator,
+    sorter: Spill.Sorter,
+    cursor: ?Spill.Cursor = null,
+    positions: std.ArrayListUnmanaged(u32) = .empty,
+    has_positions: bool = false,
+    previous: ?u32 = null,
+    fn init(alloc: Allocator, entries: []const ?TermIterator.Entry, term: []const u8, maps: []const FileDocMap) !@This() {
+        if (maps.len == 0) return error.InvalidData;
+        var self = @This(){ .allocator = alloc, .sorter = try Spill.Sorter.init(alloc, maps[0].scratch orelse return error.InvalidData) };
+        errdefer self.deinit();
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(alloc);
+        for (entries, maps) |entry_opt, map| {
+            const entry = entry_opt orelse continue;
+            if (!std.mem.eql(u8, entry.term, term)) continue;
+            var result = entry.result;
+            var iterator = try result.iterator(alloc);
+            defer iterator.deinit();
+            while (try iterator.next()) |hit| {
+                if (hit.doc_id >= map.len) return error.InvalidData;
+                const doc = try mapDocument(map, hit.doc_id);
+                if (doc == std.math.maxInt(u32)) continue;
+                encoded.clearRetainingCapacity();
+                var header: [12]u8 = undefined;
+                std.mem.writeInt(u32, header[0..4], hit.freq, .little);
+                std.mem.writeInt(u32, header[4..8], hit.norm, .little);
+                std.mem.writeInt(u32, header[8..12], @intCast(hit.positions.len), .little);
+                try encoded.appendSlice(alloc, &header);
+                for (hit.positions) |position| {
+                    var bytes: [4]u8 = undefined;
+                    std.mem.writeInt(u32, &bytes, position, .little);
+                    try encoded.appendSlice(alloc, &bytes);
+                }
+                self.has_positions = self.has_positions or hit.positions.len != 0;
+                try self.sorter.add(doc, encoded.items);
+            }
+        }
+        if (try self.sorter.finish()) |range| self.cursor = Spill.Cursor.init(alloc, self.sorter.run, range);
+        return self;
+    }
+    fn deinit(self: *@This()) void {
+        if (self.cursor) |*cursor| cursor.deinit();
+        self.positions.deinit(self.allocator);
+        self.sorter.deinit();
+    }
+    fn block(self: *@This(), acc: *PostingAccumulator, count: u32) !bool {
+        acc.doc_ids.clearRetainingCapacity();
+        acc.metas.clearRetainingCapacity();
+        acc.all_positions.clearRetainingCapacity();
+        if (self.cursor == null) return false;
+        while (acc.doc_ids.items.len < count) {
+            const record = (try self.cursor.?.next()) orelse break;
+            if (record.key >= std.math.maxInt(u32) or record.payload.len < 12) return error.InvalidData;
+            const doc: u32 = @intCast(record.key);
+            if (self.previous) |previous| if (previous >= doc) return error.InvalidData;
+            self.previous = doc;
+            const frequency = std.mem.readInt(u32, record.payload[0..4], .little);
+            const norm = std.mem.readInt(u32, record.payload[4..8], .little);
+            const length = std.mem.readInt(u32, record.payload[8..12], .little);
+            if (@as(u64, length) * 4 != record.payload.len - 12) return error.InvalidData;
+            self.positions.clearRetainingCapacity();
+            try self.positions.ensureTotalCapacity(self.allocator, length);
+            for (0..length) |i| self.positions.appendAssumeCapacity(std.mem.readInt(u32, record.payload[12 + i * 4 ..][0..4], .little));
+            try acc.add(self.allocator, doc, frequency, norm, self.positions.items);
+        }
+        return acc.doc_ids.items.len != 0;
+    }
+};
 
 /// A heap contains one borrowed hit per source iterator. Each hit is copied
 /// into the output block before advancing its source, so positions never escape

@@ -112401,6 +112401,7 @@ test "db text merge descriptor admission failures retry without quarantine" {
     defer text_merge_runtime_mod.test_finish_admission_failures_remaining.store(0, .release);
     defer text_merge_runtime_mod.test_finish_lookup_required_remaining.store(0, .release);
     defer text_merge_runtime_mod.test_lookup_prepare_apply_lock_released.store(false, .release);
+    defer text_merge_runtime_mod.test_publication_handoffs.store(0, .release);
 
     text_merge_runtime_mod.test_execute_admission_failures_remaining.store(1, .release);
     try std.testing.expect(!try runtime.runOnce());
@@ -112420,9 +112421,11 @@ test "db text merge descriptor admission failures retry without quarantine" {
     // its identity map outside the runtime apply lock, and retries immediately
     // rather than counting a failure or quarantine.
     text_merge_runtime_mod.test_lookup_prepare_apply_lock_released.store(false, .release);
-    text_merge_runtime_mod.test_finish_lookup_required_remaining.store(1, .release);
+    text_merge_runtime_mod.test_publication_handoffs.store(0, .release);
+    text_merge_runtime_mod.test_finish_lookup_required_remaining.store(3, .release);
     try std.testing.expect(try runtime.runOnce());
     try std.testing.expect(text_merge_runtime_mod.test_lookup_prepare_apply_lock_released.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), text_merge_runtime_mod.test_publication_handoffs.load(.acquire));
     stats = runtime.stats();
     try std.testing.expectEqual(@as(u64, 0), stats.failed_merges);
     try std.testing.expectEqual(@as(u64, 0), stats.quarantined_merges);
