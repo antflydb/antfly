@@ -1606,14 +1606,13 @@ pub const AntflyApiHandler = struct {
 
     fn handleTableBatchOffEventLoop(
         ctx: *httpx.Context,
-        backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
+        executor: ?std.Io,
         table_name: []const u8,
         body_data: []const u8,
         api: public_table_http.TableApi,
         handler: *const fn (std.mem.Allocator, []const u8, []const u8, public_table_http.TableApi) anyerror!public_table_http.OwnedResponse,
     ) !httpx.Response {
-        const runtime = backend_runtime orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
-        var runtime_io = runtime.io() orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
+        const runtime_io = executor orelse return handleTableBatchInline(ctx, ctx.allocator, table_name, body_data, api, handler);
         const job_alloc = std.heap.page_allocator;
         const owned_table_name = job_alloc.dupe(u8, table_name) catch |err| {
             std.log.warn("batch offload table-name allocation failed; executing inline err={s}", .{@errorName(err)});
@@ -7561,7 +7560,7 @@ pub const AntflyApiHandler = struct {
         defer self.releasePublicOperation("batchWrite");
         return try handleTableBatchOffEventLoop(
             ctx,
-            self.api_server.cfg.backend_runtime,
+            http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg),
             decoded_table_name,
             body_data,
             self.api_server.tableApi(tableMutationContext(ctx, &authenticated_identity)),
@@ -7610,7 +7609,7 @@ pub const AntflyApiHandler = struct {
             .retire => public_table_http.handleRelationalConstraintRetirement,
             else => public_table_http.handleRelationalRowsMutation,
         };
-        return handleTableBatchOffEventLoop(ctx, self.api_server.cfg.backend_runtime, decoded_table_name, body, self.api_server.tableApi(request), handler);
+        return handleTableBatchOffEventLoop(ctx, http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg), decoded_table_name, body, self.api_server.tableApi(request), handler);
     }
 
     pub fn linearMerge(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {

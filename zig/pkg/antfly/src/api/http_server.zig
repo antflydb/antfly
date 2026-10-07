@@ -4161,7 +4161,9 @@ pub const ApiHttpServer = struct {
         return runtime.apiFilesystemIo();
     }
 
-    fn configuredDurableIo(cfg: ApiHttpServerConfig) ?std.Io {
+    /// Imported views preserve the owning archive's executor state. Rebuilding
+    /// Threaded's vtable from a foreign runtime pointer splits wakeup/TLS state.
+    pub fn configuredDurableIo(cfg: ApiHttpServerConfig) ?std.Io {
         if (cfg.imported_runtime_io) |views| return views.durable;
         const runtime = cfg.backend_runtime orelse return null;
         return runtime.io();
