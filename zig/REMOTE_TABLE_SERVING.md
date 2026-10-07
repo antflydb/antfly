@@ -635,18 +635,25 @@ exceed `max_deleted`. Destructive collections retain their durable continuation.
 
 ### Keyed contribution state, grouped partitions, and cold-load admission
 
-Reader/topology protocol 26 admits `native-lake-index-directory-v3` and
-`native-sql-aggregate-v3`. Readers retain compatibility with protocols 24/25
+Reader/topology protocol 27 persists reduction ownership in
+`native-lake-index-directory-v3`; protocol 26 introduced that directory and
+`native-sql-aggregate-v3`. Readers retain compatibility with protocols 24/25/26
 and aggregate versions 1/2. Coordinated metadata admission prevents publishing
 these directories while an older metadata voter is still active.
 
 A v3 directory authenticates a native immutable page-tree root keyed by the
 file/reduction identity, exact recipe, and materialization name. Builders look
 up inherited contributions lazily, using a hash-indexed build-local page cache
-bounded to 4096 pages and 128 MiB. Publication compares the complete current
-live key set and applies only changed/deleted records to the prior tree. It
-retains unchanged pages and removes obsolete contributions, rather than
-retaining an ever-growing history. Planning still visits the live file/key set;
+bounded to 4096 pages and 128 MiB. Reduction nodes persist bounded ownership
+edges to two child contributions and up to 64 range aliases. Builders probe
+unchanged nodes before descending into reduction work and retain their
+ownership graph without opening aggregate roots or range directories. Legacy
+records acquire ownership on their next refresh. Publication authenticates the
+retained lookup identities, adopts fully retained page branches by reference,
+drops obsolete branches without fetching their leaves, and applies changed
+records. It avoids canonicalizing every inherited record and keeps only the
+current live graph, rather than retaining an ever-growing history. Planning
+and ownership validation still visit the live file/key set;
 it does not promise constant-time snapshot refresh. Serving reads only the
 small declaration directory. Durable GC checkpoints contribution-tree pages
 and their aggregate references as ordinary authenticated frontier jobs.
@@ -663,6 +670,19 @@ retain their conservative paths. This reduces high-cardinality rewrite work
 when a delta touches few ranges; broad or skewed deltas can still touch every
 range. Partition readers validate recipe/slot provenance, range uniqueness,
 counts, and authenticated child references before exposing their state.
+Compatible partitioned cohorts fuse SUM/COUNT/MIN/MAX slots and decode each
+shared block once. Fusion checks every child directory before changing slot
+maps; a mismatch anywhere leaves the readers independent. Preflight retains
+one directory pair at a time and bounded per-partition slot maps, then serving
+retains one active child reader.
+
+Unordered parallel scans discover file footers and physical plans in bounded
+waves through the shared native scheduler. Each planner owns version pins and
+reader state; synchronized statement allocation and a join-before-transfer
+boundary protect request arenas. Prepared delete membership stays immutable.
+The coordinator publishes the largest-first row-group queue after all planners
+join. Ordered multi-file scans keep lazy contiguous planning so a later file's
+failure cannot move ahead of an earlier successful prefix.
 
 Non-covering index hydration shares fully owned projected file-reader plans,
 immutable footer metadata, parsed Parquet
@@ -675,11 +695,16 @@ page seeks use binary search rather than walking every preceding page. Index
 order is still restored after gathering physical candidates, and delete and
 residual checks remain mandatory.
 
-Decoded metadata and parsed page-directory misses use one in-flight owner per
-immutable key. Waiters retain their own deadlines/cancellation and share the
-result even when it cannot enter resident cache. Active decodes reserve from a
-separate 64 MiB admission budget; resident cache saturation cannot silently
-create unbounded parallel decoding. A canceled leader permits another live
+Decoded metadata, footer, parsed page-directory, dictionary and vector-page
+misses use one in-flight owner per immutable key. Waiters retain their own deadlines/cancellation and share the
+result even when it cannot enter resident cache. At most sixteen cold loaders
+share a separate 64 MiB allocation admission budget. Reservations grow and
+shrink with actual allocator capacity, allowing unrelated small metadata loads
+to overlap even when each has a 64 MiB ceiling. A contending decoder releases
+its partial state and retries in an exclusive lane; it never waits while
+holding allocations that another decoder needs. Dependencies, such as a
+hydration plan's footer, are resolved before decoder admission. Resident cache
+saturation cannot silently create unbounded parallel decoding. A canceled leader permits another live
 reader to retry, and an in-flight result stays pinned until every waiter leaves.
 
 Filesystem scoped uploads append their content identity before creating a

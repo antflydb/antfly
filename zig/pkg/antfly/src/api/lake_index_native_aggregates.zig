@@ -225,10 +225,14 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                     try provider.context.ensureActive();
                     const refs = try out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, cohort.items.len);
                     var all_present = true;
+                    var from_index = true;
                     for (cohort.items, 0..) |request_index, slot| {
                         const single = requests.items[request_index].recipe;
                         const key = contributionKey(file_key, single.fingerprint(), names[slot]);
-                        if (old.get(key)) |old_index| refs[slot] = old_contributions[old_index].artifact else if (contribution_lookup) |lookup| {
+                        if (old.get(key)) |old_index| {
+                            refs[slot] = old_contributions[old_index].artifact;
+                            from_index = false;
+                        } else if (contribution_lookup) |lookup| {
                             if (try lookup.lookup(out, key)) |value| refs[slot] = value.artifact else all_present = false;
                         } else all_present = false;
                     }
@@ -242,7 +246,9 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                         @memcpy(refs, published);
                         out.free(published);
                     }
-                    for (refs, cohort.items, names) |ref, request_index, name| try contributions.append(out, .{ .file = file_key, .recipe = requests.items[request_index].recipe.fingerprint(), .name = name, .artifact = ref });
+                    if (all_present and from_index and contribution_lookup != null) {
+                        for (cohort.items, names) |request_index, name| try contribution_lookup.?.retain(contributionKey(file_key, requests.items[request_index].recipe.fingerprint(), name));
+                    } else for (refs, cohort.items, names) |ref, request_index, name| try contributions.append(out, .{ .file = file_key, .recipe = requests.items[request_index].recipe.fingerprint(), .name = name, .artifact = ref });
                     leaf.* = .{ .key = file_key, .refs = refs };
                 }
                 native_provider.only_file = null;
@@ -252,6 +258,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
                     }
                 }.less);
                 var reduction: Reduction = .{ .a = a, .out = out, .store = store, .recipe = recipe, .specs = specs, .names = names, .old = &old, .previous = old_contributions, .index = contribution_lookup, .contributions = &contributions, .spill = &spill, .cancellation = cancellation };
+                defer reduction.shape_keys.deinit(a);
                 const root = try reduction.reduce(leaves);
                 for (root.refs, names, cohort.items) |artifact, name, index| {
                     var slot_binding = binding;
@@ -323,21 +330,64 @@ const Reduction = struct {
     contributions: *std.ArrayList(local.metadata_lake_index_catalog.FileContribution),
     spill: *local.sql_spill.Manager,
     cancellation: @import("antfly_cancellation").CancellationToken,
+    shape_keys: std.AutoHashMapUnmanaged([2][32]u8, [32]u8) = .empty,
+    fn shapeKey(self: *@This(), leaves: []const Leaf) anyerror![32]u8 {
+        if (leaves.len == 1) return leaves[0].key;
+        const range = [2][32]u8{ leaves[0].key, leaves[leaves.len - 1].key };
+        if (self.shape_keys.get(range)) |key| return key;
+        const split = splitAt(leaves);
+        if (split == 0) return error.InvalidLakeIndexCatalog;
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update("native-aggregate-reduction-v1");
+        hash.update(&try self.shapeKey(leaves[0..split]));
+        hash.update(&try self.shapeKey(leaves[split..]));
+        const key = hash.finalResult();
+        try self.shape_keys.put(self.a, range, key);
+        return key;
+    }
+    fn splitAt(leaves: []const Leaf) usize {
+        var bit: usize = 0;
+        while (bit < 256 and bitAt(leaves[0].key, bit) == bitAt(leaves[leaves.len - 1].key, bit)) : (bit += 1) {}
+        if (bit == 256) return 0;
+        var split: usize = 1;
+        while (split < leaves.len and !bitAt(leaves[split].key, bit)) : (split += 1) {}
+        return split;
+    }
     fn reduce(self: *@This(), leaves: []const Leaf) anyerror!Leaf {
         try self.cancellation.check();
         if (leaves.len == 1) return leaves[0];
-        var bit: usize = 0;
-        while (bit < 256 and bitAt(leaves[0].key, bit) == bitAt(leaves[leaves.len - 1].key, bit)) : (bit += 1) {}
-        if (bit == 256) return error.InvalidLakeIndexCatalog;
-        var split: usize = 1;
-        while (split < leaves.len and !bitAt(leaves[split].key, bit)) : (split += 1) {}
+        const split = splitAt(leaves);
+        if (split == 0) return error.InvalidLakeIndexCatalog;
+        const key = try self.shapeKey(leaves);
+        // Probe before descending. Ownership keeps all internal nodes and
+        // range aliases live without rebuilding their aggregate directories.
+        if (self.index) |index| {
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            const retained_refs = try self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, self.names.len);
+            var complete_owned = true;
+            for (self.names, 0..) |name, slot| {
+                const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+                const lookup_key = contributionKey(key, single.fingerprint(), name);
+                const value = try index.lookup(scratch.allocator(), lookup_key);
+                if (value == null or value.?.owned == null) {
+                    complete_owned = false;
+                    break;
+                }
+                const bytes = try std.json.Stringify.valueAlloc(scratch.allocator(), value.?.artifact, .{});
+                retained_refs[slot] = try std.json.parseFromSliceLeaky(local.serverless_manifest_artifact_ref.ArtifactRef, self.out, bytes, .{ .allocate = .alloc_always });
+            }
+            if (complete_owned) {
+                for (self.names, 0..) |name, slot| {
+                    const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
+                    try index.retain(contributionKey(key, single.fingerprint(), name));
+                }
+                return .{ .key = key, .refs = retained_refs };
+            }
+            self.out.free(retained_refs);
+        }
         const left = try self.reduce(leaves[0..split]);
         const right = try self.reduce(leaves[split..]);
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("native-aggregate-reduction-v1");
-        hash.update(&left.key);
-        hash.update(&right.key);
-        const key = hash.finalResult();
         const refs = try self.out.alloc(local.serverless_manifest_artifact_ref.ArtifactRef, self.names.len);
         var complete = true;
         for (self.names, 0..) |name, slot| {
@@ -347,6 +397,7 @@ const Reduction = struct {
                 if (try lookup.lookup(self.out, lookup_key)) |value| refs[slot] = value.artifact else complete = false;
             } else complete = false;
         }
+        const alias_start = self.contributions.items.len;
         const was_complete = complete;
         if (!complete and self.recipe.keys.len != 0 and left.refs[0].metadata_version == 3 and right.refs[0].metadata_version == 3) {
             const published = try self.mergePartitions(left, right, null);
@@ -369,7 +420,13 @@ const Reduction = struct {
         }
         for (self.names, refs, 0..) |name, ref, slot| {
             const single: recipes.Recipe = .{ .keys = self.recipe.keys, .inputs = self.recipe.inputs[slot..][0..1] };
-            try self.contributions.append(self.out, .{ .file = key, .recipe = single.fingerprint(), .name = name, .artifact = ref });
+            var owned: std.ArrayList([32]u8) = .empty;
+            try owned.append(self.out, contributionKey(left.key, single.fingerprint(), name));
+            try owned.append(self.out, contributionKey(right.key, single.fingerprint(), name));
+            // Range aliases are recipe-local; child ownership handles all
+            // descendants. Each record stays bounded independently of files.
+            for (self.contributions.items[alias_start..]) |alias| if (std.mem.eql(u8, alias.name, name) and std.mem.eql(u8, &alias.recipe, &single.fingerprint())) try owned.append(self.out, contributionKey(alias.file, alias.recipe, alias.name));
+            try self.contributions.append(self.out, .{ .file = key, .recipe = single.fingerprint(), .name = name, .artifact = ref, .owned = try owned.toOwnedSlice(self.out) });
         }
         return .{ .key = key, .refs = refs };
     }
@@ -814,24 +871,42 @@ test "external lake partitioned aggregate trees retain unaffected groups with la
         }
         const built = try buildIndexed(a, output.allocator(), table, &source, &store, &provider, .none, &.{}, &.{}, &index);
         try std.testing.expectEqual(@as(usize, 4), built.declarations.len);
-        try std.testing.expect(built.contributions.len >= (2 * source.inventory.files.len - 1) * 4);
+        if (phase == 0) try std.testing.expect(built.contributions.len >= (2 * source.inventory.files.len - 1) * 4) else {
+            try std.testing.expect(index.retained.count() > source.inventory.files.len * 4);
+            try std.testing.expect(built.contributions.len < index.retained.count());
+        }
         previous_root = try index.update(built.contributions);
         const unchanged = try index.update(built.contributions);
         try std.testing.expect(previous_root.?.eql(unchanged.?));
-        if (phase != 0) {
-            var reused_nodes: usize = 0;
-            for (built.contributions) |current| {
-                const leaf = for (source.inventory.files) |file| {
-                    if (std.mem.eql(u8, &current.file, &fileIdentity(&source, file))) break true;
-                } else false;
-                if (leaf) continue;
-                for (previous.contributions) |old| if (std.mem.eql(u8, current.artifact.artifact_id, old.artifact.artifact_id)) {
-                    reused_nodes += 1;
-                    break;
-                };
+        try std.testing.expect(previous_root.?.records >= (2 * source.inventory.files.len - 1) * 4);
+        // A no-change refresh may read authenticated contribution pages, but
+        // must not open even one aggregate/range directory or payload block.
+        const MetadataOnly = struct {
+            var base: stores.ArtifactStore = undefined;
+            fn get(_: *anyopaque, alloc: A, id: []const u8) ![]u8 {
+                var read = base;
+                const bytes = try read.getAllocWithCancellationUsingAllocator(alloc, id, .none);
+                if (!std.mem.startsWith(u8, bytes, "AFGPT003")) {
+                    alloc.free(bytes);
+                    return error.UnexpectedUnchangedAggregateRead;
+                }
+                return bytes;
             }
-            try std.testing.expect(reused_nodes != 0);
-        }
+        };
+        MetadataOnly.base = store;
+        var metadata_vtable = store.vtable.*;
+        metadata_vtable.get_alloc = MetadataOnly.get;
+        metadata_vtable.get_alloc_with_cancellation = null;
+        var metadata_store = store;
+        metadata_store.vtable = &metadata_vtable;
+        var retained_index: @import("lake_index_contributions.zig").Index = undefined;
+        try retained_index.init(a, metadata_store, previous_root, .none);
+        defer retained_index.deinit();
+        const retained_build = try buildIndexed(a, output.allocator(), table, &source, &metadata_store, &provider, .none, &.{}, &.{}, &retained_index);
+        try std.testing.expectEqual(@as(usize, 0), retained_build.contributions.len);
+        const retained_root = (try retained_index.update(retained_build.contributions)).?;
+        try std.testing.expect(previous_root.?.eql(retained_root));
+        for (built.declarations, retained_build.declarations) |before, after| try std.testing.expectEqualStrings(before.artifact.artifact_id, after.artifact.artifact_id);
         for (built.declarations, 0..) |declaration, slot| {
             const recipe = try artifacts.loadRecipe(output.allocator(), store, declaration.artifact, .none);
             const reader = try artifacts.Reader.open(a, store, declaration.artifact, recipe, .none);

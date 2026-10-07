@@ -17,6 +17,7 @@ pub const Index = struct {
     writes: u64 = 512 * 1024 * 1024,
     bridge: pages.PageStore = undefined,
     cache: PageCache = undefined,
+    retained: std.AutoHashMapUnmanaged([32]u8, bool) = .empty,
     pub fn init(self: *Index, a: A, store: stores.ArtifactStore, root: ?tree.Ref, cancellation: Cancellation) !void {
         const scope = store.upload_scope orelse return error.InvalidArtifactUploadScope;
         self.* = .{ .a = a, .root = root, .store = store };
@@ -25,6 +26,7 @@ pub const Index = struct {
         @memset(self.cache.slots, null);
     }
     pub fn deinit(self: *Index) void {
+        self.retained.deinit(self.a);
         self.cache.deinit();
     }
     pub fn lookup(self: *Index, a: A, key: [32]u8) !?catalog.FileContribution {
@@ -36,6 +38,23 @@ pub const Index = struct {
         try validate(value);
         if (!std.mem.eql(u8, &key, &identity(value))) return error.InvalidLakeIndexCatalog;
         return value;
+    }
+    /// Retain the authenticated ownership graph without opening aggregate
+    /// roots, range directories or blocks. A gray entry detects cycles; the
+    /// depth and total live-set bounds also cover malformed durable metadata.
+    pub fn retain(self: *Index, key: [32]u8) !void {
+        return self.retainAt(key, 0);
+    }
+    fn retainAt(self: *Index, key: [32]u8, depth: usize) anyerror!void {
+        try self.bridge.cancellation.check();
+        if (self.retained.get(key)) |complete| return if (complete) {} else error.InvalidLakeIndexCatalog;
+        if (depth > 256 or self.retained.count() >= catalog.max_contributions) return error.InvalidLakeIndexCatalog;
+        try self.retained.put(self.a, key, false);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const value = try self.lookup(arena.allocator(), key) orelse return error.InvalidLakeIndexCatalog;
+        for (value.owned orelse &.{}) |child| try self.retainAt(child, depth + 1);
+        self.retained.getPtr(key).?.* = true;
     }
     pub fn update(self: *Index, values: []const catalog.FileContribution) !?tree.Ref {
         if (values.len > catalog.max_contributions) return error.InvalidLakeIndexCatalog;
@@ -51,29 +70,52 @@ pub const Index = struct {
             if (entry.found_existing) {
                 const previous = values[entry.value_ptr.*].artifact;
                 if (!std.mem.eql(u8, previous.artifact_id, value.artifact.artifact_id) or !std.mem.eql(u8, previous.checksum, value.artifact.checksum) or previous.byte_len != value.artifact.byte_len or previous.metadata_version != value.artifact.metadata_version) return error.InvalidLakeIndexCatalog;
+                const owned = values[entry.value_ptr.*].owned;
+                if ((owned == null) != (value.owned == null)) return error.InvalidLakeIndexCatalog;
+                if (owned) |keys| {
+                    if (keys.len != value.owned.?.len) return error.InvalidLakeIndexCatalog;
+                    for (keys, value.owned.?) |left, right| if (!std.mem.eql(u8, &left, &right)) return error.InvalidLakeIndexCatalog;
+                }
             }
             entry.value_ptr.* = position;
         }
+        for (values) |value| for (value.owned orelse &.{}) |child| {
+            if (!live.contains(child) and !self.retained.contains(child)) return error.InvalidLakeIndexCatalog;
+        };
         var changes: std.ArrayList(tree.Mutation) = .empty;
-        var cursor = try tree.Cursor.init(std.heap.page_allocator, self.cache.store(), self.root, "", null);
-        defer cursor.deinit();
-        while (try cursor.next()) |entry| {
-            if (entry.key.len != 32) return error.InvalidLakeIndexCatalog;
-            const key = entry.key[0..32].*;
-            if (live.fetchRemove(key)) |next| {
-                const bytes = try std.json.Stringify.valueAlloc(std.heap.page_allocator, values[next.value], .{});
-                defer std.heap.page_allocator.free(bytes);
-                if (!std.mem.eql(u8, entry.value, bytes)) try changes.append(a, .{ .key = try a.dupe(u8, &key), .value = try a.dupe(u8, bytes) });
-            } else try changes.append(a, .{ .key = try a.dupe(u8, &key), .value = null });
-        }
         var it = live.iterator();
-        while (it.next()) |entry| try changes.append(a, .{ .key = try a.dupe(u8, entry.key_ptr), .value = try std.json.Stringify.valueAlloc(a, values[entry.value_ptr.*], .{}) });
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const bytes = try std.json.Stringify.valueAlloc(a, values[entry.value_ptr.*], .{});
+            var cursor = try tree.Cursor.init(std.heap.page_allocator, self.cache.store(), self.root, &key, null);
+            defer cursor.deinit();
+            const prior = try cursor.next();
+            if (prior != null and std.mem.eql(u8, prior.?.key, &key) and std.mem.eql(u8, prior.?.value, bytes)) {
+                try self.retained.put(self.a, key, true);
+            } else try changes.append(a, .{ .key = try a.dupe(u8, &key), .value = bytes });
+        }
+        const keep = try a.alloc([]const u8, self.retained.count());
+        var retained = self.retained.iterator();
+        var next: usize = 0;
+        while (retained.next()) |entry| {
+            if (!entry.value_ptr.*) return error.InvalidLakeIndexCatalog;
+            keep[next] = try a.dupe(u8, entry.key_ptr);
+            next += 1;
+        }
+        std.mem.sort([]const u8, keep, {}, struct {
+            fn less(_: void, l: []const u8, r: []const u8) bool {
+                return std.mem.order(u8, l, r) == .lt;
+            }
+        }.less);
         std.mem.sort(tree.Mutation, changes.items, {}, struct {
             fn less(_: void, l: tree.Mutation, r: tree.Mutation) bool {
                 return std.mem.order(u8, l.key, r.key) == .lt;
             }
         }.less);
-        return tree.apply(std.heap.page_allocator, self.cache.store(), self.root, changes.items);
+        const base = try tree.retainKnown(std.heap.page_allocator, self.cache.store(), self.root, keep);
+        const result = try tree.apply(std.heap.page_allocator, self.cache.store(), base, changes.items);
+        if (result) |root| if (root.records > catalog.max_contributions) return error.InvalidLakeIndexCatalog;
+        return result;
     }
 };
 pub fn identity(value: catalog.FileContribution) [32]u8 {
@@ -87,6 +129,13 @@ pub fn identity(value: catalog.FileContribution) [32]u8 {
 pub fn validate(value: catalog.FileContribution) !void {
     if (value.name.len == 0 or value.name.len > 128 or std.mem.allEqual(u8, &value.file, 0) or std.mem.allEqual(u8, &value.recipe, 0) or value.artifact.kind != .algebraic_segment) return error.InvalidLakeIndexCatalog;
     try stores.validateSha256ArtifactIdentity(value.artifact.artifact_id, value.artifact.checksum);
+    if (value.owned) |keys| {
+        if (keys.len > 66) return error.InvalidLakeIndexCatalog;
+        for (keys, 0..) |key, i| {
+            if (std.mem.allEqual(u8, &key, 0) or std.mem.eql(u8, &key, &identity(value))) return error.InvalidLakeIndexCatalog;
+            for (keys[0..i]) |prior| if (std.mem.eql(u8, &key, &prior)) return error.InvalidLakeIndexCatalog;
+        }
+    }
 }
 
 /// Build-local FIFO metadata cache. Hash lookup avoids a linear cache search

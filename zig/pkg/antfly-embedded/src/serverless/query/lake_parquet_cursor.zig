@@ -214,13 +214,16 @@ pub const Cursor = struct {
                         const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "chunk-dictionary-v1", .chunk = column.chunk }, .{});
                         defer self.a.free(interpretation);
                         const key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset - len, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
-                        const lease = reader.cache.decoded.lookup(key) orelse blk: {
-                            const owned = try reader.cache.decoded.create(self.limits.max_decoded_bytes / share *| 4);
-                            errdefer owned.release();
-                            owned.item.payload = .{ .dictionary = try decodeDictionaryAlloc(owned.item.arena.allocator(), column.chunk, parsed.header, encoded[parsed.header_len..]) };
-                            reader.cache.decoded.publish(key, owned);
-                            break :blk owned;
-                        };
+                        var loader = struct {
+                            chunk: external.ColumnChunk,
+                            header: @TypeOf(parsed.header),
+                            bytes: []const u8,
+                            fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+                                const value: *@This() = @ptrCast(@alignCast(raw));
+                                item.payload = .{ .dictionary = try decodeDictionaryAlloc(item.arena.allocator(), value.chunk, value.header, value.bytes) };
+                            }
+                        }{ .chunk = column.chunk, .header = parsed.header, .bytes = encoded[parsed.header_len..] };
+                        const lease = try reader.cache.decoded.acquire(key, @min(reader.cache.decoded.max_loading_bytes, self.limits.max_decoded_bytes / share *| 4), reader.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
                         errdefer lease.release();
                         if (lease.item.payload.dictionary.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
                         column.dictionary_lease = lease;
@@ -250,15 +253,21 @@ pub const Cursor = struct {
             const input = [_]parquet.ColumnChunkInput{.{ .column_id = column.chunk.column_id, .bytes = encoded, .dictionary = if (column.dictionary) |*dictionary| dictionary else null }};
             if (cache_key) |key| {
                 const cache = &self.shared_reader.?.cache.decoded;
-                const lease = try cache.create(self.limits.max_decoded_bytes / share *| 4 +| self.limits.max_struct_allocation_bytes);
-                errdefer lease.release();
-                if (column.dictionary_lease) |dictionary| {
-                    cache.depend(lease, dictionary);
-                    limits.borrow_dictionary = true;
-                }
-                const decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(lease.item.arena.allocator(), self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
-                lease.item.payload = .{ .columns = decoded.columns };
-                cache.publish(key, lease);
+                if (column.dictionary_lease != null) limits.borrow_dictionary = true;
+                var loader = struct {
+                    cursor: *Cursor,
+                    input: []const parquet.ColumnChunkInput,
+                    limits: parquet.MaterializationLimits,
+                    dictionary: ?@import("lake_decoded_cache.zig").Lease,
+                    fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+                        const value: *@This() = @ptrCast(@alignCast(raw));
+                        const cursor = value.cursor;
+                        const decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(item.arena.allocator(), cursor.inventory, cursor.file.file_id, cursor.group.ordinal, value.input, value.limits);
+                        item.payload = .{ .columns = decoded.columns };
+                        if (value.dictionary) |dictionary| dictionary.cache.depend(.{ .cache = dictionary.cache, .item = item }, dictionary);
+                    }
+                }{ .cursor = self, .input = &input, .limits = limits, .dictionary = column.dictionary_lease };
+                const lease = try cache.acquire(key, @min(cache.max_loading_bytes, self.limits.max_decoded_bytes / share *| 4 +| self.limits.max_struct_allocation_bytes), self.shared_reader.?.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
                 column.cached = lease;
             } else {
                 // Cursor-owned dictionaries outlive every uncached page. Only

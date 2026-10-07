@@ -95,6 +95,7 @@ pub const Stream = struct {
     ordered_end: usize = 0,
     borrowed_plan: bool = false,
     hydration_plan: ?@import("lake_decoded_cache.zig").Lease = null,
+    planning_footer: ?@import("lake_decoded_cache.zig").Lease = null,
     partition_index: usize = 0,
     partition_count: usize = 1,
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
@@ -300,6 +301,7 @@ pub const Stream = struct {
     pub fn partitionCount(self: *Stream, maximum: usize) !usize {
         if (self.files.len == 0 or maximum < 2 or self.source.scanner.shared_reader == null) return 1;
         if (self.work) |work| return @min(maximum, work.units.len);
+        const planning_io = self.source.scanner.shared_reader.?.context.io orelse self.context.io;
         var units: std.ArrayList(ScanWork.Unit) = .empty;
         errdefer units.deinit(self.alloc);
         const plans = try self.alloc.alloc(?ScanWork.FilePlan, self.source.inventory.files.len);
@@ -309,24 +311,55 @@ pub const Stream = struct {
             self.alloc.free(plans);
         }
         defer self.clearFile();
-        for (self.files) |index| {
-            self.clearFile();
-            if (!self.fileMatches(self.source.inventory.files[index])) continue;
-            try self.loadFile(index);
-            if (self.selection) |selection| try selection.validateFile(index, self.discovered.?.inventory.files[0]);
-            const plan = self.discovered orelse continue;
-            if (self.source.prepared_deletes) |prepared| try prepared.bindFile(plan.inventory.files[0]);
-            for (plan.row_group_plan.row_groups, 0..) |input, group_index| {
-                const group = plan.inventory.files[0].row_groups[input.row_group_ordinal];
-                if (group.row_count == 0 or !groupMayMatch(group, self.groupPredicates())) continue;
-                try units.append(self.alloc, .{ .file = index, .ordinal = input.row_group_ordinal, .group_index = group_index, .bytes = group.total_byte_len });
+        if (planning_io != null and self.selection == null and self.files.len > 1) {
+            // Each planner owns version pins, its reader and temporary file
+            // state. The coordinator prepares deletes after a footer survives.
+            const scheduler = @import("../../sql/parallel_scheduler.zig");
+            var locked: scheduler.LockedAllocator = .{ .backing = self.alloc };
+            const width = @min(maximum, scheduler.global().fanout(self.files.len, self.limits.max_decoded_bytes, 1024 * 1024));
+            var offset: usize = 0;
+            while (offset < self.files.len) {
+                const count = @min(width, self.files.len - offset);
+                var jobs: [8]PlanningJob = undefined;
+                var tasks: [8]?scheduler.Task(anyerror!void) = @splat(null);
+                var failures: [8]?anyerror = @splat(null);
+                for (jobs[0..count], 0..) |*job, lane| job.* = .{ .parent = self, .alloc = locked.allocator(), .index = self.files[offset + lane] };
+                // While tasks run, every request allocation uses the same
+                // lock. Join the entire wave before touching coordinator state.
+                for (jobs[0..count], 0..) |*job, lane| {
+                    tasks[lane] = scheduler.global().submit(planning_io.?, 1024 * 1024, PlanningJob.run, .{job});
+                    if (tasks[lane] == null) PlanningJob.run(job) catch |err| {
+                        failures[lane] = err;
+                    };
+                }
+                for (tasks[0..count], 0..) |*task, lane| if (task.*) |*pending| {
+                    pending.await(planning_io.?) catch |err| {
+                        failures[lane] = err;
+                    };
+                };
+                defer for (jobs[0..count]) |*job| if (job.plan) |*plan| plan.deinit(self.alloc);
+                for (failures[0..count]) |failure| if (failure) |err| return err;
+                for (jobs[0..count]) |*job| {
+                    self.stats.files_opened += job.stats.files_opened;
+                    self.stats.files_pruned += job.stats.files_pruned;
+                    if (job.plan) |*plan| {
+                        try self.appendPlanUnits(&units, job.index, plan);
+                        plans[job.index] = plan.*;
+                        job.plan = null;
+                    }
+                }
+                offset += count;
             }
-            plans[index] = .{ .discovered = plan, .columns = self.file_columns, .logical_names = self.file_logical_names, .predicates = self.file_predicates, .position_starts = self.position_starts };
-            self.discovered = null;
-            self.position_starts = &.{};
-            self.file_columns = &.{};
-            self.file_logical_names = &.{};
-            self.file_predicates = &.{};
+        } else {
+            for (self.files) |index| {
+                self.clearFile();
+                if (!self.fileMatches(self.source.inventory.files[index])) continue;
+                try self.loadFile(index);
+                if (self.selection) |selection| try selection.validateFile(index, self.discovered.?.inventory.files[0]);
+                const plan = self.takeFilePlan() orelse continue;
+                plans[index] = plan;
+                try self.appendPlanUnits(&units, index, &plans[index].?);
+            }
         }
         const work = try self.alloc.create(ScanWork);
         errdefer self.alloc.destroy(work);
@@ -340,6 +373,71 @@ pub const Stream = struct {
         self.owns_work = true;
         return @min(maximum, work.units.len);
     }
+    fn takeFilePlan(self: *Stream) ?ScanWork.FilePlan {
+        const discovered = self.discovered orelse return null;
+        const plan: ScanWork.FilePlan = .{ .discovered = discovered, .columns = self.file_columns, .logical_names = self.file_logical_names, .predicates = self.file_predicates, .position_starts = self.position_starts };
+        self.discovered = null;
+        self.position_starts = &.{};
+        self.file_columns = &.{};
+        self.file_logical_names = &.{};
+        self.file_predicates = &.{};
+        return plan;
+    }
+    fn appendPlanUnits(self: *Stream, units: *std.ArrayList(ScanWork.Unit), index: usize, plan: *ScanWork.FilePlan) !void {
+        try self.prepareDeletes();
+        if (self.source.prepared_deletes) |prepared| try prepared.bindFile(plan.discovered.inventory.files[0]);
+        if (plan.position_starts.len == 0) plan.position_starts = try self.positionStarts(plan.discovered.inventory.files[0]);
+        for (plan.discovered.row_group_plan.row_groups, 0..) |input, group_index| {
+            const group = plan.discovered.inventory.files[0].row_groups[input.row_group_ordinal];
+            if (group.row_count == 0 or !groupMayMatch(group, plan.predicates)) continue;
+            try units.append(self.alloc, .{ .file = index, .ordinal = input.row_group_ordinal, .group_index = group_index, .bytes = group.total_byte_len });
+        }
+    }
+    const PlanningJob = struct {
+        parent: *Stream,
+        alloc: Allocator,
+        index: usize,
+        plan: ?ScanWork.FilePlan = null,
+        stats: Stats = .{},
+        fn run(job: *@This()) anyerror!void {
+            const parent = job.parent;
+            try parent.context.ensureActive();
+            if (!parent.fileMatches(parent.source.inventory.files[job.index])) {
+                job.stats.files_pruned = 1;
+                return;
+            }
+            var source = parent.source.*;
+            source.alloc = job.alloc;
+            source.inventory_owned = false;
+            source.scanner.iceberg_delete_plan = null;
+            source.prepared_deletes = null;
+            source.delete_lease = null;
+            source.versions = .empty;
+            defer source.clearVersions();
+            if (parent.source.versions.get(job.index)) |pinned| {
+                var owned = pinned;
+                owned.etag = try job.alloc.dupe(u8, pinned.etag);
+                errdefer job.alloc.free(owned.etag);
+                owned.version_id = try job.alloc.dupe(u8, pinned.version_id);
+                errdefer job.alloc.free(owned.version_id);
+                try source.versions.put(job.alloc, job.index, owned);
+            }
+            var reader = @import("lake_serving_cache.zig").Reader{
+                .cache = parent.source.scanner.shared_reader.?.cache,
+                .base = parent.source.scanner.shared_reader.?.base,
+                .scope = parent.source.scanner.shared_reader.?.scope,
+                .context = parent.source.scanner.shared_reader.?.context,
+            };
+            reader.base.client.allocator = job.alloc;
+            source.scanner.shared_reader = &reader;
+            source.scanner.object_reader.client.allocator = job.alloc;
+            var worker: Stream = .{ .alloc = job.alloc, .source = &source, .columns = parent.columns, .predicates = parent.predicates, .context = parent.context, .limits = parent.limits, .files = &.{}, .owns_files = false, .schema_contract = parent.schema_contract, .identity_only = parent.identity_only };
+            defer worker.deinit();
+            try worker.loadFile(job.index);
+            job.plan = worker.takeFilePlan();
+            job.stats = worker.stats;
+        }
+    };
     pub fn deinit(self: *Stream) void {
         self.clearFile();
         if (self.owns_work) if (self.work) |work| {
@@ -602,8 +700,14 @@ pub const Stream = struct {
             const interpretation = try std.json.Stringify.valueAlloc(self.alloc, .{ .version = "hydration-file-plan-v1", .file = file.file_id, .format = self.source.inventory.format, .source = self.source.inventory.source_id, .source_uri = self.source.inventory.source_uri, .snapshot = self.source.inventory.snapshot_id, .schema = self.source.inventory.schema_fingerprint, .columns = self.columns, .contract = self.schema_contract, .predicates = self.predicates, .limits = self.limits }, .{});
             defer self.alloc.free(interpretation);
             const key = try reader.objectKey(self.alloc, .{ .object = try @import("lake_range_io.zig").objectRefForExternalFileUri(file), .range = .{ .offset = 0, .len = file.byte_len }, .purpose = .parquet_footer }, interpretation);
+            const ready_plan = reader.cache.decoded.lookup(key);
+            // Resolve dependencies before taking decoder admission, including
+            // the exclusive retry lane. A loader never waits on itself.
+            const footer = if (ready_plan == null) try reader.footer(file) else null;
+            defer if (footer) |lease| lease.release();
             var loader = struct {
                 stream: *Stream,
+                footer: ?@import("lake_decoded_cache.zig").Lease,
                 index: usize,
                 fn clone(a: Allocator, value: anytype) !@TypeOf(value) {
                     const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
@@ -615,6 +719,7 @@ pub const Stream = struct {
                     const a = item.arena.allocator();
                     var worker = self_loader.stream.*;
                     worker.alloc = a;
+                    worker.planning_footer = self_loader.footer;
                     worker.columns = try clone(a, worker.columns);
                     worker.schema_contract = try clone(a, worker.schema_contract);
                     worker.predicates = try clone(a, worker.predicates);
@@ -627,10 +732,10 @@ pub const Stream = struct {
                     plan.* = .{ .discovered = worker.discovered, .columns = worker.file_columns, .logical_names = worker.file_logical_names, .predicates = worker.file_predicates };
                     item.payload = .{ .extension = plan };
                 }
-            }{ .stream = self, .index = index };
+            }{ .stream = self, .index = index, .footer = footer };
             var load_context = self.context;
             load_context.io = reader.context.io;
-            const lease = try reader.cache.decoded.acquire(key, 64 * 1024 * 1024, load_context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+            const lease = ready_plan orelse try reader.cache.decoded.acquire(key, 64 * 1024 * 1024, load_context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
             self.hydration_plan = lease;
             self.borrowed_plan = true;
             const plan: *const HydrationPlan = @ptrCast(@alignCast(lease.item.payload.extension));
@@ -656,7 +761,7 @@ pub const Stream = struct {
         inventory.files = @as(*[1]@TypeOf(file_entry), @ptrCast(&file_entry));
         inventory.deleted_row_groups = &.{};
         if (self.schema_contract.len != 0 or self.source.scanner.shared_reader != null) {
-            const lease = if (self.source.scanner.shared_reader) |reader| try reader.footer(inventory.files[0]) else null;
+            const lease = if (self.planning_footer) |footer| footer.retain() else if (self.source.scanner.shared_reader) |reader| try reader.footer(inventory.files[0]) else null;
             defer if (lease) |borrowed| borrowed.release();
             var footer = if (lease) |borrowed| borrowed.item.payload.footer else try @import("lake_schema.zig").readFooter(self.alloc, self.source.scanner.reader(), inventory.files[0]);
             defer if (lease == null) footer.deinit(self.alloc);
@@ -803,10 +908,11 @@ pub const Stream = struct {
         }
     }
     fn bindPositions(self: *Stream) !void {
-        if (self.position_starts.len != 0) return;
-        const prepared = self.source.prepared_deletes orelse return;
-        if (prepared.positions.count() == 0) return;
-        const file = self.discovered.?.inventory.files[0];
+        if (self.position_starts.len == 0) self.position_starts = try self.positionStarts(self.discovered.?.inventory.files[0]);
+    }
+    fn positionStarts(self: *Stream, file: external.FileEntry) ![]const u64 {
+        const prepared = self.source.prepared_deletes orelse return &.{};
+        if (prepared.positions.count() == 0) return &.{};
         const starts = try self.alloc.alloc(u64, file.row_groups.len);
         errdefer self.alloc.free(starts);
         var total: u64 = 0;
@@ -814,7 +920,7 @@ pub const Stream = struct {
             start.* = total;
             total = try std.math.add(u64, total, group.row_count);
         }
-        self.position_starts = starts;
+        return starts;
     }
     pub fn countAll(self: *Stream) !?u64 {
         if (self.file_index != 0 or self.predicates.len != 0) return null;

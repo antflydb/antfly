@@ -635,6 +635,13 @@ const TestLake = struct {
         reads: usize = 0,
         stats: usize = 0,
         bytes: usize = 0,
+        active: usize = 0,
+        peak: usize = 0,
+        delay_reads: bool = false,
+        mutex: std.atomic.Mutex = .unlocked,
+        fn lock(self: *Meter) void {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        }
         fn client(self: *Meter) storage.ObjectStorage {
             self.vtable.get_object = get;
             self.vtable.stat_object = stat;
@@ -645,16 +652,30 @@ const TestLake = struct {
             const self: *Meter = @ptrCast(@alignCast(raw));
             var base = self.base;
             base.allocator = alloc;
+            self.lock();
             self.stats += 1;
+            self.mutex.unlock();
             return base.statObject(bucket, key);
         }
         fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
             const self: *Meter = @ptrCast(@alignCast(raw));
             var base = self.base;
             base.allocator = alloc;
+            self.lock();
             self.reads += 1;
+            self.active += 1;
+            self.peak = @max(self.peak, self.active);
+            self.mutex.unlock();
+            defer {
+                self.lock();
+                self.active -= 1;
+                self.mutex.unlock();
+            }
+            if (self.delay_reads) try std.testing.io.sleep(.fromMilliseconds(5), .awake);
             const result = try base.getObject(bucket, key, options);
+            self.lock();
             self.bytes += result.body.len;
+            self.mutex.unlock();
             return result;
         }
     };
@@ -1171,12 +1192,15 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
     var cache = Cache.init(a);
     defer cache.deinit();
     try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    lake.meter.delay_reads = true;
     const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
     defer parent.close(parent.ptr);
     const parts = (try parent.split_scan.?(parent.ptr, a, 4)).?;
     defer a.free(parts);
     defer for (parts) |part| part.close(part.ptr);
     try std.testing.expectEqual(@as(usize, 4), parts.len);
+    try std.testing.expect(lake.meter.peak >= 2);
+    lake.meter.delay_reads = false;
     const parent_owner: *Owner = @ptrCast(@alignCast(parent.ptr));
     try std.testing.expectEqual(@as(usize, 4), parent_owner.stream.stats.files_opened);
     var total: usize = 0;

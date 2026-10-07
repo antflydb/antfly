@@ -160,6 +160,8 @@ pub const Reader = struct {
     state_slots: ?[]const u16 = null,
     child: ?*Reader = null,
     partition_index: usize = 0,
+    partition_states: ?[]const []const u16 = null,
+    blocks_decoded: usize = 0,
 
     /// The caller selects an authorized publication first. Errors after that
     /// selection abort the query, never combine partials with a fresh scan.
@@ -207,13 +209,21 @@ pub const Reader = struct {
         self.state_slots = try self.control.allocator().dupe(u16, &.{self.root.state_slot orelse 0});
     }
     pub fn fuse(self: *Reader, other: *const Reader, output_slot: u16) !bool {
-        if (self.root.partitions.len != 0 or other.root.partitions.len != 0) return false;
+        if (self.root.partitions.len != 0 or other.root.partitions.len != 0) return self.fusePartitions(other, output_slot);
+        if (!sameFlatCohort(self, other)) return false;
+        try self.appendSlot(other, output_slot);
+        return true;
+    }
+    fn sameFlatCohort(self: *const Reader, other: *const Reader) bool {
         const state = self.root.state_recipe orelse return false;
         const incoming = other.root.state_recipe orelse return false;
         if (!state.eql(incoming) or self.root.groups != other.root.groups or self.root.blocks.len != other.root.blocks.len) return false;
         for (self.root.blocks, other.root.blocks) |left, right| {
             if (left.rows != right.rows or left.artifact.byte_len != right.artifact.byte_len or !std.mem.eql(u8, left.artifact.artifact_id, right.artifact.artifact_id) or !std.mem.eql(u8, left.artifact.checksum, right.artifact.checksum)) return false;
         }
+        return true;
+    }
+    fn appendSlot(self: *Reader, other: *const Reader, output_slot: u16) !void {
         const output = self.output_slots orelse return error.InvalidNativeAggregateArtifact;
         const physical = self.state_slots orelse return error.InvalidNativeAggregateArtifact;
         const a = self.control.allocator();
@@ -225,6 +235,46 @@ pub const Reader = struct {
         states[physical.len] = other.root.state_slot.?;
         self.output_slots = slots;
         self.state_slots = states;
+    }
+    fn partitionReader(self: *Reader, index: usize) !*Reader {
+        const part = self.root.partitions[index];
+        const reader = try Reader.openWithCache(self.a, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached);
+        errdefer reader.cursor().close(reader);
+        if (reader.root.groups != part.groups) return error.InvalidNativeAggregateArtifact;
+        if (self.output_slots) |slots| {
+            if (self.partition_states) |maps| {
+                reader.output_slots = try reader.control.allocator().dupe(u16, slots);
+                reader.state_slots = try reader.control.allocator().dupe(u16, maps[index]);
+            } else try reader.setOutputSlot(slots[0]);
+        }
+        return reader;
+    }
+    fn fusePartitions(self: *Reader, other: *const Reader, output_slot: u16) !bool {
+        const state = self.root.state_recipe orelse return false;
+        const incoming = other.root.state_recipe orelse return false;
+        if (self.partition_index != 0 or self.emitted != 0 or !state.eql(incoming) or self.root.groups != other.root.groups or self.root.partitions.len != other.root.partitions.len or self.root.partitions.len == 0) return false;
+        // Validate every child before changing any slot map. Keep only one
+        // pair of directories resident, regardless of partition count.
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        const maps = try scratch.allocator().alloc([]const u16, self.root.partitions.len);
+        for (self.root.partitions, other.root.partitions, 0..) |left, right, index| {
+            if (left.bucket != right.bucket or left.groups != right.groups) return false;
+            const current = try Reader.openWithCache(self.a, self.store, left.artifact, self.root.recipe, self.cancellation, self.cached);
+            defer current.cursor().close(current);
+            const candidate = try Reader.openWithCache(self.a, other.store, right.artifact, other.root.recipe, other.cancellation, other.cached);
+            defer candidate.cursor().close(candidate);
+            if (current.root.groups != left.groups or candidate.root.groups != right.groups or !sameFlatCohort(current, candidate)) return false;
+            const prior = if (self.partition_states) |existing| existing[index] else &.{current.root.state_slot.?};
+            const map = try scratch.allocator().alloc(u16, prior.len + 1);
+            @memcpy(map[0..prior.len], prior);
+            map[prior.len] = candidate.root.state_slot.?;
+            maps[index] = map;
+        }
+        const owned = try self.control.allocator().alloc([]const u16, maps.len);
+        for (owned, maps) |*target, map| target.* = try self.control.allocator().dupe(u16, map);
+        try self.appendSlot(other, output_slot);
+        self.partition_states = owned;
         return true;
     }
     pub fn groupCount(self: *const Reader) u64 {
@@ -243,16 +293,14 @@ pub const Reader = struct {
                     if (self.emitted != self.root.groups) return error.InvalidNativeAggregateArtifact;
                     return null;
                 }
-                const part = self.root.partitions[self.partition_index];
-                self.child = try Reader.openWithCache(self.a, self.store, part.artifact, self.root.recipe, self.cancellation, self.cached);
-                if (self.child.?.root.groups != part.groups) return error.InvalidNativeAggregateArtifact;
-                if (self.output_slots) |slots| try self.child.?.setOutputSlot(slots[0]);
+                self.child = try self.partitionReader(self.partition_index);
                 self.partition_index += 1;
             }
             if (try self.child.?.cursor().next(self.child.?, a, maximum)) |rows| {
                 self.emitted += rows.len;
                 return rows;
             }
+            self.blocks_decoded += self.child.?.blocks_decoded;
             self.child.?.cursor().close(self.child.?);
             self.child = null;
         };
@@ -272,6 +320,7 @@ pub const Reader = struct {
             if (block.count() != ref.rows or block.keys.len != self.root.recipe.keys.len or block.values.len != state_width) return error.InvalidNativeAggregateArtifact;
             self.block = block;
             self.block_index += 1;
+            self.blocks_decoded += 1;
         }
         const block = self.block.?;
         const count = @min(maximum, block.count() - self.position);
@@ -554,4 +603,81 @@ pub fn partitionChildren(a: A, store: stores.ArtifactStore, ref: Ref, cancellati
     const refs = try a.alloc(Ref, parts.len);
     for (refs, parts) |*child, part| child.* = part.artifact;
     return refs;
+}
+
+test "external lake partitioned cohorts fuse once per block and decline late mismatches atomically" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("native-partition-fusion");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .sum, .input_type = .integer }, .{ .kind = .count } };
+    const recipe: recipes.Recipe = .{ .keys = &.{.{ .path = "id", .type = .integer, .nullable = false }}, .inputs = &.{ .{ .spec = specs[0], .column = .{ .path = "amount", .type = .integer, .nullable = false } }, .{ .spec = specs[1], .column = null } } };
+    const group = try operators.Grouped.create(a, &specs, .{});
+    defer group.deinit();
+    for (0..128) |id| for (0..2) |_| try group.add(&.{local.sql_scalar.Datum.fromJson(.{ .integer = @intCast(id) })}, &.{ local.sql_scalar.Datum.fromJson(.{ .integer = 9007199254740993 }), local.sql_scalar.Datum.fromJson(.{ .integer = 1 }) });
+    var output = std.heap.ArenaAllocator.init(a);
+    defer output.deinit();
+    const out = output.allocator();
+    var manager_context: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &manager_context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer manager.deinit();
+    const refs = try publishPartitioned(a, out, &store, &.{ "stats.sum", "stats.count" }, group, recipe, &manager, .none);
+    const left = try Reader.open(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none);
+    defer left.cursor().close(left);
+    const right = try Reader.open(a, store, refs[1], .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none);
+    defer right.cursor().close(right);
+    try std.testing.expect(left.root.partitions.len > 1);
+    try left.setOutputSlot(1);
+    try std.testing.expect(try left.fuse(right, 0));
+    const imported = try operators.Grouped.create(a, &.{ specs[1], specs[0] }, .{});
+    defer imported.deinit();
+    while (try left.cursor().next(left, out, 7)) |rows| for (rows) |row| {
+        try std.testing.expectEqualSlices(u16, &.{ 1, 0 }, row.aggregate_slots.?);
+        try imported.importPartialMapped(row.keys, row.aggregates, row.aggregate_slots, row.ordinal);
+    };
+    var count: usize = 0;
+    while (try imported.nextResult(out)) |row| : (count += 1) {
+        try std.testing.expectEqual(@as(i64, 2), row.aggregates[0].value.integer);
+        try std.testing.expectEqual(@as(i64, 18014398509481986), row.aggregates[1].value.integer);
+    }
+    try std.testing.expectEqual(@as(usize, 128), count);
+    try std.testing.expectEqual(left.root.partitions.len, left.blocks_decoded);
+    try std.testing.expectEqual(@as(usize, 0), right.blocks_decoded);
+
+    // Replace only the last range with a valid, independently built cohort.
+    // All earlier ranges agree; declining fusion must leave them untouched.
+    const parts = try out.dupe(Partition, right.root.partitions);
+    const replacement = try operators.Grouped.create(a, &specs, .{});
+    defer replacement.deinit();
+    for (0..@intCast(parts[parts.len - 1].groups)) |id| try replacement.add(&.{local.sql_scalar.Datum.fromJson(.{ .integer = @intCast(id + 1000) })}, &.{ local.sql_scalar.Datum.fromJson(.{ .integer = 1 }), local.sql_scalar.Datum.fromJson(.{ .integer = 1 }) });
+    const independent = try publishCohort(a, out, &store, &.{ "stats.sum", "stats.count" }, replacement, recipe, .none);
+    parts[parts.len - 1].artifact = independent[1];
+    var root = right.root;
+    root.partitions = parts;
+    const bytes = try std.json.Stringify.valueAlloc(out, root, .{});
+    var upload = store;
+    upload.allocator = out;
+    const artifact = try upload.put(bytes);
+    var mismatched = refs[1];
+    mismatched.artifact_id = artifact.artifact_id;
+    mismatched.checksum = artifact.checksum;
+    mismatched.byte_len = artifact.byte_len;
+    const fresh = try Reader.open(a, store, refs[0], .{ .keys = recipe.keys, .inputs = recipe.inputs[0..1] }, .none);
+    defer fresh.cursor().close(fresh);
+    const other = try Reader.open(a, store, mismatched, .{ .keys = recipe.keys, .inputs = recipe.inputs[1..2] }, .none);
+    defer other.cursor().close(other);
+    try fresh.setOutputSlot(1);
+    try std.testing.expect(!try fresh.fuse(other, 0));
+    try std.testing.expectEqualSlices(u16, &.{1}, fresh.output_slots.?);
+    try std.testing.expect(fresh.partition_states == null);
+    count = 0;
+    while (try fresh.cursor().next(fresh, out, 11)) |rows| for (rows) |row| {
+        try std.testing.expectEqualSlices(u16, &.{1}, row.aggregate_slots.?);
+        count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 128), count);
 }

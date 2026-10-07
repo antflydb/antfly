@@ -413,26 +413,27 @@ pub const Reader = struct {
     fn footerRead(self: *Reader, read: ranges.RangeRead) !@import("lake_decoded_cache.zig").Lease {
         try self.context.ensureActive();
         const key = try self.objectKey(std.heap.page_allocator, read, "parsed-footer-v1");
-        if (self.cache.decoded.lookup(key)) |lease| return lease;
-        const lease = try self.cache.decoded.create(32 * 1024 * 1024);
-        errdefer lease.release();
-        const a = lease.item.arena.allocator();
+        var loader = struct {
+            reader: *Reader,
+            read: ranges.RangeRead,
+            fn load(raw: *anyopaque, item: *@import("lake_decoded_cache.zig").Item) !void {
+                const self_loader: *@This() = @ptrCast(@alignCast(raw));
+                item.payload = .{ .footer = try self_loader.reader.decodeFooter(item.arena.allocator(), self_loader.read) };
+            }
+        }{ .reader = self, .read = read };
+        return self.cache.decoded.acquire(key, 32 * 1024 * 1024, self.context, .{ .ptr = &loader, .load = @TypeOf(loader).load });
+    }
+    fn decodeFooter(self: *Reader, a: Allocator, read: ranges.RangeRead) !@import("lake_parquet_metadata.zig").ParsedFooter {
         const tail_lease = try self.reader().readPlannedLease(a, read);
         defer tail_lease.release();
         const tail = tail_lease.bytes;
         const footer_api = @import("lake_parquet_footer.zig");
         const preflight = try footer_api.parseFooterPreflight(read.object.byte_len, read.range.offset, tail);
-        if (preflight.metadataSlice(tail)) |bytes| {
-            lease.item.payload = .{ .footer = try @import("lake_parquet_metadata.zig").parseFooterMetadataAlloc(a, bytes, read.object.byte_len) };
-        } else {
-            const bytes_lease = try self.reader().readPlannedLease(a, try footer_api.planFooterMetadataRead(read.object, read.range.offset, tail));
-            defer bytes_lease.release();
-            const bytes = bytes_lease.bytes;
-            lease.item.payload = .{ .footer = try @import("lake_parquet_metadata.zig").parseFooterMetadataAlloc(a, bytes, read.object.byte_len) };
-        }
-        try self.context.ensureActive();
-        self.cache.decoded.publish(key, lease);
-        return lease;
+        if (preflight.metadataSlice(tail)) |bytes|
+            return @import("lake_parquet_metadata.zig").parseFooterMetadataAlloc(a, bytes, read.object.byte_len);
+        const bytes_lease = try self.reader().readPlannedLease(a, try footer_api.planFooterMetadataRead(read.object, read.range.offset, tail));
+        defer bytes_lease.release();
+        return @import("lake_parquet_metadata.zig").parseFooterMetadataAlloc(a, bytes_lease.bytes, read.object.byte_len);
     }
     fn readRange(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, offset: u64, len: usize) ![]u8 {
         const self: *Reader = @ptrCast(@alignCast(raw));

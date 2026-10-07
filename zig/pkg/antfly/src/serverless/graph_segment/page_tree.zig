@@ -494,6 +494,65 @@ pub fn apply(alloc: Allocator, store: Store, prior: ?Ref, changes: []const Mutat
     return root;
 }
 
+/// Retain a strictly ordered subset whose membership the caller has already
+/// authenticated against prior. Counts let a complete branch survive without
+/// fetching any descendant pages. Empty branches are dropped without reads.
+/// This is intentionally separate from apply: unknown keys are mutations,
+/// never evidence that an old branch is wholly retained.
+pub fn retainKnown(alloc: Allocator, store: Store, prior: ?Ref, keys: []const []const u8) !?Ref {
+    try store.check(store.ptr);
+    for (keys, 0..) |key, i| if (key.len == 0 or (i != 0 and !less(keys[i - 1], key))) return error.UnsortedGraphPageMutations;
+    const root = prior orelse return if (keys.len == 0) null else error.InvalidGraphPage;
+    try root.validate();
+    if (keys.len > root.records) return error.InvalidGraphPage;
+    if (keys.len == root.records) return root;
+    if (keys.len == 0) return null;
+    var children: Children = .empty;
+    defer freeChildren(alloc, &children);
+    try retainPage(alloc, store, root, keys, &children);
+    if (children.items.len != 1) return error.InvalidGraphPage;
+    var result = children.items[0].ref;
+    while (result.height != 0) {
+        var page = try load(alloc, store, result);
+        defer page.deinit(alloc);
+        if (page.entries.len != 1) break;
+        result = page.entries[0].child.?;
+    }
+    return result;
+}
+fn retainPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8, out: *Children) anyerror!void {
+    try store.check(store.ptr);
+    if (keys.len == 0) return;
+    if (keys.len > ref.records) return error.InvalidGraphPage;
+    if (keys.len == ref.records) return appendChild(alloc, out, keys[0], ref);
+    var page = try load(alloc, store, ref);
+    defer page.deinit(alloc);
+    if (ref.height == 0) {
+        var entries: std.ArrayList(Entry) = .empty;
+        defer entries.deinit(alloc);
+        var next: usize = 0;
+        for (page.entries) |entry| if (next < keys.len and std.mem.eql(u8, entry.key, keys[next])) {
+            try entries.append(alloc, entry);
+            next += 1;
+        };
+        if (next != keys.len) return error.InvalidGraphPage;
+        return pack(alloc, store, entries.items, 0, out);
+    }
+    var children: Children = .empty;
+    defer freeChildren(alloc, &children);
+    var begin: usize = 0;
+    for (page.entries, 0..) |entry, i| {
+        var end = begin;
+        while (end < keys.len and (i + 1 == page.entries.len or less(keys[end], page.entries[i + 1].key))) : (end += 1) {}
+        try retainPage(alloc, store, entry.child.?, keys[begin..end], &children);
+        begin = end;
+    }
+    try rebalance(alloc, store, &children);
+    const entries = try childEntries(alloc, children.items);
+    defer alloc.free(entries);
+    try pack(alloc, store, entries, ref.height, out);
+}
+
 /// Construct an initial tree from a strictly ordered stream. Only one pending
 /// page per height is retained; leaf records and every level's routing entries
 /// are released as soon as their page is persisted. The source's borrowed
@@ -1263,4 +1322,44 @@ test "external lake batched membership visits shared routing paths once" {
     for (found) |present| try std.testing.expect(!present);
     std.mem.swap([]const u8, &keys[0], &keys[1]);
     try std.testing.expectError(error.InvalidGraphPage, containsMany(a, backing.store(), root, &keys, &found));
+}
+
+test "external lake contribution retention adopts full branches and removes obsolete keys" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    const count = 2000;
+    const names = try a.alloc([8]u8, count);
+    defer a.free(names);
+    const changes = try a.alloc(Mutation, count);
+    defer a.free(changes);
+    const keep = try a.alloc([]const u8, count);
+    defer a.free(keep);
+    const value = @as([128]u8, @splat(42));
+    for (names, changes, keep, 0..) |*name, *change, *key, i| {
+        std.mem.writeInt(u64, name, i, .big);
+        change.* = .{ .key = name, .value = &value };
+        key.* = name;
+    }
+    const prior = (try apply(a, backing.store(), null, changes)).?;
+    const reads = backing.reads;
+    const writes = backing.writes;
+    try std.testing.expect(prior.eql((try retainKnown(a, backing.store(), prior, keep)).?));
+    try std.testing.expectEqual(reads, backing.reads);
+    try std.testing.expectEqual(writes, backing.writes);
+    const retained = (try retainKnown(a, backing.store(), prior, keep[0..1500])).?;
+    try std.testing.expectEqual(@as(u64, 1500), retained.records);
+    // Only the frontier and a partially retained leaf need reads.
+    try std.testing.expect(backing.reads - reads < 8);
+    var cursor = try Cursor.init(a, backing.store(), retained, "", null);
+    defer cursor.deinit();
+    var index: usize = 0;
+    while (try cursor.next()) |row| : (index += 1) {
+        try std.testing.expectEqualSlices(u8, &names[index], row.key);
+        try std.testing.expectEqualSlices(u8, &value, row.value);
+    }
+    try std.testing.expectEqual(@as(usize, 1500), index);
+    try std.testing.expect(try retainKnown(a, backing.store(), prior, &.{}) == null);
+    // Prior generations remain immutable and readable after the cut.
+    try std.testing.expectEqual(@as(u64, 2000), try countRange(a, backing.store(), prior, "", null));
 }
