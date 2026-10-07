@@ -26,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
     }
     if (std.mem.eql(u8, command, "run")) {
         try cli.runServer(allocator, init.io, arguments[0..count]);
+    } else if (std.mem.eql(u8, command, "decide-bench")) {
+        try @import("inference").decide_benchmark.runProductionBenchmark(allocator, init.io, arguments[0..count]);
     } else if (std.mem.eql(u8, command, "cuda-info")) {
         // Qualification needs the identity and capabilities of this exact
         // server binary, including when built on a memory-constrained host.

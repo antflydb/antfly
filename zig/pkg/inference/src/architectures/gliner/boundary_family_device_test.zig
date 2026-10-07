@@ -506,8 +506,8 @@ test "GLiNER2.5 multilingual Decide public wire capture Metal resident parity" {
     const capture_bytes = try fixtures.fixtureBytes(a, "family/multi_decide_decide_capture.json");
     defer a.free(capture_bytes);
     try expectPin(.{
-        .sha256 = "b435f0fb3d638b27828b949235e9a9c2b35e1171aa55ef94263cf53edb589900",
-        .size_bytes = 31_736,
+        .sha256 = "04d9bbf219858166a1b0d7199b12673dd81eac7fae37454757d213debdd6e732",
+        .size_bytes = 23_332,
     }, capture_bytes);
     const capture = try std.json.parseFromSlice(DecideCapture, a, capture_bytes, .{ .ignore_unknown_fields = true });
     defer capture.deinit();

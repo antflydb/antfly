@@ -1924,12 +1924,15 @@ fn createCudaSessionWithRequiredProfile(
         );
     }
 
+    const decision_identity_handoff = unsealedGlinerDecisionIdentityHandoff(native_impl);
     const impl = try allocator.create(ArchSession);
     impl.* = .{
         .allocator = allocator,
         .arch_config = native_impl.arch_config,
         .task = native_impl.task,
         .gliner_span_encoder_family = native_impl.gliner_span_encoder_family,
+        .gliner_decision_identity = decision_identity_handoff.identity,
+        .gliner_decision_identity_sealed = decision_identity_handoff.sealed,
         .backend_type = .cuda,
         .kernel_jit_config = config,
         .backend_data = .{ .cuda = .{ .compute = cuda_compute } },
@@ -7303,6 +7306,19 @@ const ArchSession = struct {
     laya_trunk_cache_lock: std.atomic.Mutex = .unlocked,
 };
 
+const GlinerDecisionIdentityHandoff = struct {
+    identity: ?gliner_decide_qualification.Identity,
+    sealed: bool,
+};
+
+/// Backend conversion preserves the exact artifact identity captured by the
+/// source loader, but the published session must be sealed independently only
+/// after ModelManager parses and verifies its tokenizer snapshot. An already
+/// sealed source therefore never transfers sealing authority to a new owner.
+fn unsealedGlinerDecisionIdentityHandoff(source: *const ArchSession) GlinerDecisionIdentityHandoff {
+    return .{ .identity = source.gliner_decision_identity, .sealed = false };
+}
+
 fn layaTrunkCache(self: *ArchSession) ?*@import("laya_trunk_cache.zig").Cache {
     platform.sync.lockYielding(&self.laya_trunk_cache_lock);
     defer self.laya_trunk_cache_lock.unlock();
@@ -8814,6 +8830,47 @@ test "GLiNER decision identity seals only the exact tokenizer snapshot" {
     try verifyGlinerDecisionSnapshot("config", gliner_decide_qualification.Digest.of("config"));
     try std.testing.expectError(error.GlinerDecisionArtifactMismatch, verifyGlinerDecisionSnapshot("changed", gliner_decide_qualification.Digest.of("config")));
     try std.testing.expectError(error.MissingGlinerDecisionIdentity, verifyGlinerDecisionSnapshot("config", null));
+}
+
+test "CUDA backend identity handoff preserves bytes but requires fresh tokenizer sealing" {
+    const tokenizer = gliner_decide_qualification.Digest.of("tokenizer");
+    const other = gliner_decide_qualification.Digest.of("other");
+    const identity = gliner_decide_qualification.Identity{
+        .encoder_family = .modern_bert,
+        .geometry = .{ .hidden_size = 1, .intermediate_size = 1, .num_hidden_layers = 1, .num_attention_heads = 1, .vocab_size = 1, .max_position_embeddings = 1 },
+        .markers = .{ .p = 1, .c = 2, .e = 3, .r = 4, .l = 5, .sep_struct = 6, .sep_text = 7 },
+        .inventory = .{ .count = 1, .all_f32 = true },
+        .weight = other,
+        .sidecars = .{ .config = other, .encoder_config = other, .tokenizer = tokenizer, .tokenizer_config = other, .special_tokens_map = null },
+    };
+    const source = ArchSession{
+        .allocator = std.testing.allocator,
+        .arch_config = .{ .modern_bert = .{} },
+        .gliner_decision_identity = identity,
+        // Even a previously published source cannot confer tokenizer sealing
+        // authority on a newly constructed backend session.
+        .gliner_decision_identity_sealed = true,
+        .backend_type = .native,
+        .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+    };
+    const handoff = unsealedGlinerDecisionIdentityHandoff(&source);
+    try std.testing.expect(handoff.identity != null);
+    try std.testing.expect(std.meta.eql(identity, handoff.identity.?));
+    try std.testing.expect(!handoff.sealed);
+
+    var converted = ArchSession{
+        .allocator = std.testing.allocator,
+        .arch_config = source.arch_config,
+        .gliner_decision_identity = handoff.identity,
+        .gliner_decision_identity_sealed = handoff.sealed,
+        .backend_type = .native,
+        .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } },
+    };
+    const session = Session{ .ptr = &converted, .vtable = &arch_vtable };
+    try std.testing.expectError(error.MissingGlinerDecisionIdentity, getGlinerDecisionIdentity(session));
+    try std.testing.expectError(error.GlinerDecisionArtifactMismatch, sealGlinerDecisionTokenizerDigest(session, other));
+    try sealGlinerDecisionTokenizerDigest(session, tokenizer);
+    try std.testing.expect(std.meta.eql(identity, try getGlinerDecisionIdentity(session)));
 }
 
 /// Test-only observation of the actual loaded owner. A caller must retain the

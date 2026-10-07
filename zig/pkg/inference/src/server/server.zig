@@ -3729,8 +3729,12 @@ fn decideExecutionContract(manifest: manifest_mod.ModelManifest) ?decide_mod.Exe
         if (!manifest.mayLoadQualifiedGlinerBoundaryRuntime()) return null;
         return .boundary;
     }
+    // A raw ModernBERT span directory has no Antfly-owned model manifest yet.
+    // Its nested encoder contract may select the qualified route, but it gains
+    // no advertised capability: extractV2Span still requires the exact loaded
+    // artifact identity, backend, and request geometry before learned work.
+    if (requiresQualifiedSpanClassification(manifest)) return .span_marker;
     if (!manifest.hasCapability("typed_decisions")) return null;
-    if (manifest.gliner_architecture == .span and manifest.gliner_span_declared) return .span_marker;
     if (manifest.laya_declared) return .laya;
     return null;
 }
@@ -3770,6 +3774,24 @@ test "typed decision execution contracts distinguish span boundary and Laya" {
     manifest.laya_declared = true;
     try std.testing.expectEqual(decide_mod.ExecutionContract.laya, decideExecutionContract(manifest).?);
     manifest.capabilities = &.{};
+    try std.testing.expect(decideExecutionContract(manifest) == null);
+}
+
+test "raw ModernBERT span listing selects only the qualified decision route" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .gliner_architecture = .span,
+        .gliner_span_declared = true,
+        .gliner_span_encoder_family = .modern_bert,
+    };
+    try std.testing.expectEqual(@as(usize, 0), manifest.capabilities.len);
+    try std.testing.expectEqual(decide_mod.ExecutionContract.span_marker, decideExecutionContract(manifest).?);
+
+    // Family similarity selects a fail-closed exact-identity gate only for the
+    // reviewed ModernBERT route. It does not advertise arbitrary span models.
+    manifest.gliner_span_encoder_family = .deberta;
+    try std.testing.expect(decideExecutionContract(manifest) == null);
+    manifest.gliner_span_encoder_family = .unknown;
     try std.testing.expect(decideExecutionContract(manifest) == null);
 }
 
@@ -8936,8 +8958,16 @@ pub const Node = struct {
 
     const ExtractionAdmissionOwner = enum { direct, http_route };
     const ClassificationCompatibility = enum { none, legacy_extraction, provider };
+    const DecideSpanInput = struct {
+        request: decide_mod.Request,
+        envelope: std.json.Value,
+        // Only decideJsonWithAdmission creates this after name containment and
+        // listing validation. Execution still requires the live artifact identity.
+        resolved_path: []const u8,
+    };
     const ExtractionV2Input = union(enum) {
         json: []const u8,
+        decide_span: DecideSpanInput,
         // An origin marker owned by the legacy HTTP upgrade; never a wire field.
         legacy_classification_json: []const u8,
         typed: struct {
@@ -9005,7 +9035,7 @@ pub const Node = struct {
         const control: ?InferenceExecutionControl = self.extractionExecutionControl(supplied_control);
         if (control) |active| try active.check();
         const serialized: ?[]u8 = switch (input) {
-            .json, .legacy_classification_json => null,
+            .json, .legacy_classification_json, .decide_span => null,
             .typed => |typed| blk: {
                 observer.emit(.{ .phase = .parsing });
                 if (typed.request.attachments.len != 0) return error.UnsupportedExtractionInput;
@@ -9017,6 +9047,7 @@ pub const Node = struct {
             .json => |bytes| bytes,
             .legacy_classification_json => |bytes| bytes,
             .typed => serialized.?,
+            .decide_span => "",
         };
         observer.emit(.{ .phase = .admission });
         switch (admission_owner) {
@@ -9044,16 +9075,18 @@ pub const Node = struct {
         const scratch = allocation_failure.allocator(&bounded);
         defer std.debug.assert(bounded.live == 0);
         const resolved_span_path = switch (input) {
-            .json, .legacy_classification_json => null,
+            .json, .legacy_classification_json, .decide_span => null,
             .typed => |typed| typed.resolved_span_path,
         };
         const classification_compatibility: ClassificationCompatibility = switch (input) {
-            .json => .none,
+            .json, .decide_span => .none,
             .legacy_classification_json => .legacy_extraction,
             .typed => |typed| typed.classification_compatibility,
         };
-        const json = self.extractV2InMemory(scratch, request_json, resolved_span_path, classification_compatibility, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure) catch |err|
-            return allocation_failure.translate(err);
+        const json = (switch (input) {
+            .decide_span => |decision| self.extractDecideSpanInMemory(scratch, decision, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure),
+            else => self.extractV2InMemory(scratch, request_json, resolved_span_path, classification_compatibility, control, failure, response_limit, observer, &budget, working_bytes, &allocation_failure),
+        }) catch |err| return allocation_failure.translate(err);
         defer scratch.free(json);
         observer.emit(.{ .phase = .teardown });
         // Inner teardown can outlast the last execution check. Discard the
@@ -9062,6 +9095,27 @@ pub const Node = struct {
         // This allocation belongs to the caller, after all model/backend work
         // has drained. Its genuine backing OOM is not a request-heap denial.
         return .{ .allocator = allocator, .json = try allocator.dupe(u8, json) };
+    }
+
+    fn extractDecideSpanInMemory(
+        self: *Node,
+        scratch: std.mem.Allocator,
+        decision: DecideSpanInput,
+        control: ?InferenceExecutionControl,
+        failure: *extraction_v2.FailureContext,
+        response_limit: ?usize,
+        observer: metrics_mod.extraction.observation.Observer,
+        budget: *runtime.tier.memory.RunBudget,
+        working_bytes: usize,
+        allocation_failure: *ExtractionAllocationFailure,
+    ) ![]u8 {
+        observer.emit(.{ .phase = .parsing });
+        // The trusted envelope has fixed depth; all input/schema/option limits
+        // and schema compiler checks remain identical to the JSON entry point.
+        var request = try extraction_v2.parseValue(scratch, decision.envelope, .{ .failure = failure });
+        defer request.deinit();
+        observer.emit(.{ .parsed = .{ .items = request.items.len, .input_bytes = decision.request.state.len } });
+        return self.extractV2Span(scratch, decision.resolved_path, &request, true, .none, control, failure, response_limit, budget, working_bytes, allocation_failure, observer, decision.request);
     }
 
     fn tryExtractLayaV2(self: *Node, scratch: std.mem.Allocator, request_json: []const u8, control: ?InferenceExecutionControl, response_limit: ?usize, failure: *extraction_v2.FailureContext) !?[]u8 {
@@ -9179,7 +9233,7 @@ pub const Node = struct {
         // on every qualified backend. The legacy decision executor below is
         // reserved for non-span label-marker bundles.
         if (usesDeclaredSpanV2Route(manifest))
-            return self.extractV2Span(scratch, model_path, &request, resolved_span_path != null, classification_compatibility, control, failure, response_limit, budget, working_bytes, allocation_failure);
+            return self.extractV2Span(scratch, model_path, &request, resolved_span_path != null, classification_compatibility, control, failure, response_limit, budget, working_bytes, allocation_failure, observer, null);
         if (manifest.gliner_classification_head == .label_marker_mlp) {
             try decision_executor.preflight(&request);
             failure.* = .{ .stage = "model" };
@@ -9315,15 +9369,20 @@ pub const Node = struct {
         budget: *runtime.tier.memory.RunBudget,
         working_bytes: usize,
         allocation_failure: *ExtractionAllocationFailure,
+        observer: metrics_mod.extraction.observation.Observer,
+        decision: ?decide_mod.Request,
     ) ![]u8 {
         var options = span_v2_executor.Options{
             .control = control,
+            .observer = observer,
+            .decide_request = decision,
             .failure = failure,
             .pipeline = .{ .classification_multi_label_fallback = classification_compatibility != .legacy_extraction },
             .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
         };
         try span_v2_executor.preflight(request, options);
         failure.* = .{ .stage = "model" };
+        observer.emit(.{ .phase = .model });
         allocation_failure.clear();
         var handle = self.model_manager.acquireFromDirWithControl(model_path, control orelse .{}) catch |err| {
             allocation_failure.clear();
@@ -9379,6 +9438,7 @@ pub const Node = struct {
         // Tokenize and split before any model lock, like the boundary
         // route's workspace geometry pass.
         failure.* = .{ .stage = "tokenizing" };
+        observer.emit(.{ .phase = .tokenizing });
         var request_plan = try span_v2_executor.plan(scratch, loaded.getTokenizer(), request, options);
         defer request_plan.deinit(scratch);
         const longest = span_v2_executor.maxPlannedSequenceTokens(&request_plan);
@@ -9388,6 +9448,7 @@ pub const Node = struct {
             try gliner_decide_qualification.requireRequest(variant, qualified_backend, request.items.len, prepared_sequences, longest);
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, longest, max_labels, 0);
         failure.* = .{ .stage = "model" };
+        observer.emit(.{ .phase = .model });
 
         // Metal work is admitted like the boundary route: a GPU run budget
         // and a process-wide backend-scratch lease, acquired before the
@@ -19470,15 +19531,20 @@ pub const Node = struct {
         var manifest = try manifest_mod.loadListingFromDir(a, path);
         defer manifest.deinit();
         const decision_contract = decideExecutionContract(manifest) orelse return error.UnsupportedDecideModel;
-        const extraction_input = try decide_mod.extractionInput(a, request, decision_contract);
+        const extraction_input = try decide_mod.extractionValue(a, request, decision_contract);
         const contract = try resolvedInferenceExecutorContract(self, "decide", &manifest);
         var max_labels: usize = 0;
         for (request.questions) |question| max_labels = @max(max_labels, question.labels.len);
         try validateTextExecutorInvocation(contract, 1, &.{request.state}, 0, 0, max_labels, extraction_input.schema_bytes);
         var failure = extraction_v2.FailureContext{};
-        var extraction = try self.extractV2WithAdmission(a, .{ .json = extraction_input.json }, owner, control, &failure, null, "decide");
+        const typed_span = decision_contract == .span_marker and usesDeclaredSpanV2Route(manifest);
+        const input: ExtractionV2Input = if (typed_span)
+            .{ .decide_span = .{ .request = request, .envelope = extraction_input.value, .resolved_path = path } }
+        else
+            .{ .json = try std.json.Stringify.valueAlloc(a, extraction_input.value, .{}) };
+        var extraction = try self.extractV2WithAdmission(a, input, owner, control, &failure, null, "decide");
         defer extraction.deinit();
-        const response_json = try decide_mod.responseJson(a, request, extraction.json, decision_contract);
+        const response_json = if (typed_span) extraction.json else try decide_mod.responseJson(a, request, extraction.json, decision_contract);
         return allocator.dupe(u8, response_json);
     }
 

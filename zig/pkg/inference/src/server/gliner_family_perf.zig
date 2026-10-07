@@ -138,6 +138,10 @@ pub const SampleSet = struct {
     }
 
     pub fn write(self: *const SampleSet, allocator: std.mem.Allocator, config: Config, metadata: Metadata) !void {
+        return self.writeWithIo(allocator, std.testing.io, config, metadata);
+    }
+
+    pub fn writeWithIo(self: *const SampleSet, allocator: std.mem.Allocator, io: std.Io, config: Config, metadata: Metadata) !void {
         if (self.len != measured_count) return error.IncompleteGliner25PerfSamples;
         try safeComponent(metadata.profile);
         try safeComponent(metadata.backend);
@@ -206,12 +210,12 @@ pub const SampleSet = struct {
         };
         const bytes = try std.json.Stringify.valueAlloc(allocator, report, .{});
         defer allocator.free(bytes);
-        try std.Io.Dir.cwd().createDirPath(std.testing.io, config.output_dir);
+        try std.Io.Dir.cwd().createDirPath(io, config.output_dir);
         const filename = try std.fmt.allocPrint(allocator, "gliner25-{s}-{s}-{s}-{s}.json", .{ metadata.profile, metadata.backend, metadata.case_id, metadata.path });
         defer allocator.free(filename);
         const output_path = try std.fs.path.join(allocator, &.{ config.output_dir, filename });
         defer allocator.free(output_path);
-        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = output_path, .data = bytes });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = bytes });
     }
 };
 

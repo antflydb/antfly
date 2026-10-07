@@ -141,6 +141,48 @@ pipeline job also passed without skips or leaks, with source identity unchanged
 during the run. Its two p95 values were 123.68 and 178.83 ms; scheduling outliers
 in the longer multilingual AB/BA runs still preclude a service-tail claim.
 
+## Decide-1B production-allocator follow-up (2026-10-07)
+
+The standalone `inference-bench-server decide-bench` command measures the
+loaded pipeline, encoder/head, direct Node call, and in-process HTTP handler
+separately with the production allocator. The typed Decide span route avoids
+the extraction JSON round trip, tokenizer listing projects marker metadata
+without allocating the vocabulary, and native/Metal compute implement the
+existing packed exact-GeGLU hook. Native M-RoPE also shares each token's phases
+across heads; Accelerate attention specializes single contiguous segments up
+to 198 tokens with 64-wide heads and retains the general fallback.
+
+The latest completed exploratory Metal block below includes the typed route,
+tokenizer projection, and packed GeGLU. It predates the final CPU attention and
+M-RoPE changes and subsequent review fixes. These numbers are not final-source
+qualification. Both processes use the pinned FP32 checkpoint, two CPU threads,
+three warmups, and twenty measured samples per case on an Apple M4. Python is
+3.12.3 with torch 2.9.1 and transformers 5.17.0. Antfly includes complete HTTP
+handler dispatch, admission, and serialization; Python measures the loaded
+pipeline. Neither includes socket transport.
+
+| Request | Tokens | Antfly Metal median ms | Python MPS median ms |
+| --- | ---: | ---: | ---: |
+| Binary short holdout | 40 | 105.99 | 69.72 |
+| Four-label holdout | 79 | 134.50 | 125.18 |
+| Described choice | 87 | 136.87 | 130.23 |
+| Score/NoUL holdout | 93 | 141.06 | 131.23 |
+| Choice/score/NoUL | 158 | 199.70 | 206.82 |
+| Longer mixed holdout | 174 | 210.67 | 221.16 |
+
+All six cases passed the run's output and ownership checks. Performance
+acceptance failed: only one of six required paired blocks ran, shorter cases
+still regress, several p95 ratios exceed the 5% ceiling, and whole-process host
+swap grew by 0.62 MiB. This does not establish an overall win over Python.
+The final production build was cancelled before fresh full-model CPU/Metal
+runs. The final CPU optimizations have focused numerical and allocation-failure
+coverage, but their full-model performance remains unmeasured.
+
+Campaign instructions and acceptance boundaries are in the
+[development tools README](../../scripts/gliner25/README.md#decide-1b-production-allocator-comparison).
+The local exploratory receipt is
+`.benchmark-results/gliner25-win-2026-10-07/metal-packed-exploration/comparison.json`.
+
 The 1B checkpoint has 199 tensors and a 4,755,208,228-byte FP32 weights file.
 Its typed classifier uses `[L]` marker states and an H→2H→1 MLP. The encoder
 uses bias-free fused QKV, GeGLU, alternating global and local attention (one

@@ -35,6 +35,8 @@ const modern_bert_arch = @import("../architectures/modern_bert.zig");
 const Tokenizer = @import("inference_tokenizer").Tokenizer;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Allocator = std.mem.Allocator;
+const decide = @import("decide.zig");
+const observation = @import("extraction_observer.zig");
 const CT = compute.CT;
 
 pub const Options = struct {
@@ -59,10 +61,14 @@ pub const Options = struct {
     pipeline: pipeline.Options = .{},
     control: ?Control = null,
     failure: ?*wire.FailureContext = null,
+    observer: ?observation.Observer = null,
+    /// Trusted single-item Decide route; normal extraction keeps its wire format.
+    decide_request: ?decide.Request = null,
 };
 
 fn progress(options: Options, index: ?usize, stage: []const u8) !void {
     if (options.control) |control| try control.check();
+    if (observation.Stage.fromFailure(stage)) |phase| observation.emit(options.observer, .{ .phase = phase });
     if (options.failure) |failure| failure.* = .{ .input_index = index, .stage = stage };
 }
 
@@ -559,6 +565,7 @@ pub fn plan(allocator: Allocator, tokenizer: Tokenizer, request: *const wire.Req
 pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
     if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .cuda) return error.UnsupportedExtractionBackend;
     if (request_plan.items.len != request.items.len) return error.InvalidExtractionInput;
+    if (options.decide_request != null and request.items.len != 1) return error.InvalidExtractionInput;
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
     try writer.begin(request.model);
@@ -581,7 +588,15 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
         if (presented.output_values > remaining_values) return error.ExtractionOutputLimitExceeded;
         remaining_values -= presented.output_values;
 
+        observation.emit(options.observer, .{ .sample_decoded = .{ .prompt_tokens = prepared_item.prompt_tokens, .output_values = presented.output_values } });
         try progress(options, index, "serializing");
+        if (options.decide_request) |decision| {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const json = try decide.responseClassifications(arena.allocator(), decision, presented.classifications, request_plan.prompt_tokens);
+            if (json.len > options.max_response_bytes) return error.ExtractionOutputLimitExceeded;
+            return allocator.dupe(u8, json);
+        }
         try writer.append(item.*, .{ .classifications = presented.classifications, .classification_solver = presented.diagnostics });
     }
     try progress(options, null, "serializing");

@@ -23505,6 +23505,33 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return self.ctFromOwnedMetalTensor(output);
     }
 
+    fn packedGegluExactOp(ctx: *anyopaque, input: CT, rows: usize, width: usize) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (rows == 0 or width == 0 or rows > std.math.maxInt(i32) or width > std.math.maxInt(i32)) return null;
+        if (getenvBool("TERMITE_METAL_DISABLE_PACKED_GEGLU")) return null;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return null;
+        metal_runtime.requireGlinerBoundaryReady(runtime) catch return null;
+        const count = try std.math.mul(usize, rows, width);
+        const buf = toBuf(input);
+        if (bufHasAnyQuantizedStorage(buf) or buf.lazy_multiply != null or buf.view_index_map != null or buf.view_strides != null or
+            buf.logical_view_strides != null or buf.view_base_offset != 0) return null;
+        const source = buf.metal_tensor orelse return null;
+        if (!source.isDevice() or source.dtype != .f32 or source.elemCount() != try std.math.mul(usize, count, 2)) return null;
+        const request = ops.gliner_boundary_device.Kernel{
+            .kind = .laya_geglu,
+            .dims = .{ @intCast(rows), @intCast(width), 0, 0, 0, 0, 0, 0 },
+        };
+        var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
+        inputs[0] = source;
+        var output = try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, count, 4), .private, &.{ @intCast(rows), @intCast(width) });
+        errdefer output.deinit();
+        if (!(try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output))) {
+            output.deinit();
+            return null;
+        }
+        return self.ctFromOwnedMetalTensor(output);
+    }
+
     fn geluOp(ctx: *anyopaque, input: CT) anyerror!CT {
         return applyUnaryActivationOp(ctx, input, .gelu, activations_mod.gelu);
     }
@@ -31029,6 +31056,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.glinerLabelGruCombined = glinerLabelGruCombinedOp;
         vt.gelu = geluOp;
         vt.geluExact = geluExactOp;
+        vt.packedGegluExact = packedGegluExactOp;
         vt.geluNew = geluNewOp;
         vt.relu = reluOp;
         vt.silu = siluOp;

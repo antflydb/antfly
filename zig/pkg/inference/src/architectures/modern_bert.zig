@@ -2175,3 +2175,37 @@ test "HuggingFace ModernBERT GeGLU uses exact erf activation" {
     // GELU(-2) = -1 * (1 + erf(-sqrt(2))). Tanh gives -0.0454023.
     try std.testing.expectApproxEqAbs(@as(f32, -0.0455002639), values[0], 3e-7);
 }
+
+test "ModernBERT packed GeGLU preserves odd rows widths and exact activation" {
+    const a = std.testing.allocator;
+    var store = native_compute.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer deinitTestWeightStore(a, &store);
+    var compute = native_compute.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    for ([_]usize{ 1, 7, 17 }) |width| {
+        const rows = 3;
+        const source = try a.alloc(f32, rows * width * 2);
+        defer a.free(source);
+        for (source, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 31)) / 4 - 4;
+        const input = try cb.fromFloat32Shape(source, &.{ rows, @intCast(width * 2) });
+        defer cb.free(input);
+        const fused = (try cb.packedGegluExact(input, rows, width)) orelse return error.MissingPackedGeglu;
+        defer cb.free(fused);
+        const gate = try cb.sliceLastDim(input, 0, width);
+        defer cb.free(gate);
+        const value = try cb.sliceLastDim(input, width, width * 2);
+        defer cb.free(value);
+        const activated = (try cb.geluExact(gate)).?;
+        defer cb.free(activated);
+        const expected = try cb.multiply(activated, value);
+        defer cb.free(expected);
+        const actual_values = try cb.toFloat32(fused, a);
+        defer a.free(actual_values);
+        const expected_values = try cb.toFloat32(expected, a);
+        defer a.free(expected_values);
+        for (actual_values, expected_values) |actual, reference|
+            try std.testing.expectApproxEqAbs(reference, actual, 2e-6);
+        try std.testing.expect(try cb.packedGegluExact(input, rows + 1, width) == null);
+    }
+}

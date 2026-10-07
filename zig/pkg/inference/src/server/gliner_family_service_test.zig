@@ -89,7 +89,7 @@ const profiles = [_]Profile{
         .revision = "2ca71aafb3446d9014e1c55c7ff51c9bc7209c47",
         .environment = "ANTFLY_GLINER25_MULTI_V1_MODEL_DIR",
         .capture_fixture = "family/multi_v1_capture.json",
-        .capture = .{ .sha256 = "602e6e4470163308de6b139ae829b11321adfdcb8371d64e6a3266dea431733b", .size_bytes = 90994 },
+        .capture = .{ .sha256 = "4c46106eaa56b5899ca607cb4deca877d197ecb0f3800ac5198c44a17fbddcd2", .size_bytes = 74084 },
         .pins = .{
             .@"config.json" = .{ .sha256 = "8b59a0f426a65859c89cd1ea850c3529c09aa3be3a6fafd8eddfdd17b1bf0146", .size_bytes = 3151 },
             .@"encoder_config/config.json" = .{ .sha256 = "fa4f9ef2903b5369ab172333aae4574e6a476511d7465845cf59f8360ee18716", .size_bytes = 857 },
@@ -104,7 +104,7 @@ const profiles = [_]Profile{
         .revision = "a35a0cd3b7a0f00f2effc576f454cd48fa98aa5f",
         .environment = "ANTFLY_GLINER25_MULTI_DECIDE_MODEL_DIR",
         .capture_fixture = "family/multi_decide_capture.json",
-        .capture = .{ .sha256 = "6b582e356c06d9f37e11b68b35707d7995df431f2af3e6fb0e7265f8a5d3bec0", .size_bytes = 85455 },
+        .capture = .{ .sha256 = "06163fe217ff9769df3a045a30c9583cd6c352e72a23077c11e7aaa6ce59074d", .size_bytes = 68545 },
         .pins = .{
             .@"config.json" = .{ .sha256 = "be5123080c0f3f01b938bc46a5dd0d7a2e515a34f6df798dfd70ed04c277c8bf", .size_bytes = 3152 },
             .@"encoder_config/config.json" = .{ .sha256 = "d0ebbcb8b458e285a39e12cc315cbaf3d1c6f631e7281e6b22dd5b4071183f83", .size_bytes = 858 },
@@ -134,7 +134,7 @@ const DecideCapture = struct {
     },
 };
 
-const decide_capture_pin = pipeline.PublishedModelPin{ .sha256 = "b435f0fb3d638b27828b949235e9a9c2b35e1171aa55ef94263cf53edb589900", .size_bytes = 31736 };
+const decide_capture_pin = pipeline.PublishedModelPin{ .sha256 = "04d9bbf219858166a1b0d7199b12673dd81eac7fae37454757d213debdd6e732", .size_bytes = 23332 };
 
 fn pinBytes(pin: pipeline.PublishedModelPin, bytes: []const u8) !void {
     try std.testing.expectEqual(pin.size_bytes, bytes.len);

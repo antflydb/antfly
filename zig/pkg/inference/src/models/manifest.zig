@@ -1453,6 +1453,11 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
         defer allocator.free(config_bytes);
         if (!try parseBoundaryConfigFromCatalog(&manifest, allocator, &catalog, config_bytes)) {
             try ignoreNonResourceMetadataError(parseListingConfigJson(&manifest, allocator, config_bytes));
+            // Route raw span checkpoints from their executable architecture
+            // contract even when Antfly has not synthesized model_manifest.json.
+            // This reads only the small nested config; exact weight, tokenizer,
+            // backend, and request qualification remains a live-session gate.
+            try parseSpanEncoderConfigFromCatalog(&manifest, allocator, &catalog, config_bytes);
         }
     }
     if (manifest.native_arch_hint == .none and manifest.config_model_arch.len == 0) {
@@ -1582,6 +1587,18 @@ fn isListingCandidateRejection(err: anyerror) bool {
         error.GlinerBoundaryArtifactMismatch,
         error.GlinerBoundaryBundleLimitExceeded,
         error.MissingGlinerBoundaryEncoderConfig,
+        error.MissingGlinerSpanEncoderConfig,
+        error.InvalidGlinerSpanEncoderConfig,
+        error.UnsupportedGlinerSpanEncoder,
+        error.InvalidDebertaConfig,
+        error.UnsupportedDebertaActivation,
+        error.UnsupportedDebertaShareAttKey,
+        error.InvalidModernBertConfig,
+        error.UnsupportedModernBertActivation,
+        error.UnsupportedModernBertConfig,
+        error.UnsupportedModernBertLayerTypes,
+        error.UnsupportedModernBertRope,
+        error.InvalidLayaConfig,
         => true,
         else => false,
     };
@@ -3979,12 +3996,10 @@ fn canSkipQwen3EmbedderGlinerTokenScan(manifest: *const ModelManifest, model_dir
 }
 
 fn parseTokenizerJsonSpecialTokens(manifest: *ModelManifest, allocator: std.mem.Allocator, json_bytes: []const u8) !void {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{});
+    const parsed = try @import("tokenizer_special_tokens.zig").parse(allocator, json_bytes);
     defer parsed.deinit();
-    if (parsed.value != .object) return;
-    const obj = parsed.value.object;
 
-    if (obj.get("added_tokens")) |tokens| {
+    if (parsed.value.added_tokens) |tokens| {
         if (tokens == .array) {
             for (tokens.array.items) |entry| {
                 if (entry != .object) continue;
@@ -3996,7 +4011,7 @@ fn parseTokenizerJsonSpecialTokens(manifest: *ModelManifest, allocator: std.mem.
         }
     }
 
-    if (obj.get("added_tokens_decoder")) |decoder| {
+    if (parsed.value.added_tokens_decoder) |decoder| {
         if (decoder == .object) {
             var it = decoder.object.iterator();
             while (it.next()) |entry| {
@@ -5059,6 +5074,12 @@ test "listing candidate rejection classification fails operational errors visibl
         error.InvalidModelManifest,
         error.InvalidEmbeddingTaskProfile,
         error.MissingEmbeddingTaskProfile,
+        error.MissingGlinerSpanEncoderConfig,
+        error.InvalidGlinerSpanEncoderConfig,
+        error.UnsupportedGlinerSpanEncoder,
+        error.InvalidModernBertConfig,
+        error.UnsupportedModernBertRope,
+        error.InvalidLayaConfig,
     }) |err| {
         try std.testing.expect(isListingCandidateRejection(err));
     }
@@ -7513,6 +7534,14 @@ test "span wrapper manifest selects ModernBERT from nested encoder contract" {
     try std.testing.expectEqual(@as(u32, 50378), manifest.bert_vocab_size);
     try std.testing.expectEqual(@as(i64, 50283), manifest.bert_pad_token_id);
     try std.testing.expectEqual(@as(u32, 7999), manifest.max_position_embeddings);
+
+    var listing = try loadListingFromDir(allocator, model_path);
+    defer listing.deinit();
+    try std.testing.expectEqual(gliner_boundary.Architecture.span, listing.gliner_architecture);
+    try std.testing.expect(listing.gliner_span_declared);
+    try std.testing.expectEqual(GlinerSpanEncoderFamily.modern_bert, listing.gliner_span_encoder_family);
+    try std.testing.expectEqual(@as(usize, 0), listing.tasks.len);
+    try std.testing.expectEqual(@as(usize, 0), listing.capabilities.len);
 }
 
 test "span wrapper manifest rejects unknown and malformed nested encoder contracts" {
@@ -7521,7 +7550,7 @@ test "span wrapper manifest rejects unknown and malformed nested encoder contrac
     defer tmp.cleanup();
     const io = std.testing.io;
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
-        \\{"model_type":"extractor","architecture":"span","architecture_version":1,"architectures":["SpanExtractor"],"config_version":3,"span_head":{"span_mode":"markerV0"}}
+        \\{"model_type":"extractor","architecture":"span","architecture_version":1,"architectures":["SpanExtractor"],"config_version":3,"span_head":{"span_mode":"markerV0"},"counting_layer":"count_lstm"}
     });
     try tmp.dir.createDirPath(io, "encoder_config");
     const model_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });

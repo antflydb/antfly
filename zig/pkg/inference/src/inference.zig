@@ -33,6 +33,7 @@ pub const audio = @import("inference_audio");
 pub const chunker = @import("inference_chunker");
 pub const pipelines = @import("pipelines/pipelines.zig");
 pub const extractors = @import("extractors/mod.zig");
+pub const decide_benchmark = @import("server/gliner_decide_1b_service_test.zig");
 pub const server = if (build_options.skip_openapi) struct {} else @import("server/server.zig");
 pub const executor_microbatch = @import("server/executor_microbatch.zig");
 pub const tensor_microbatch = @import("server/tensor_microbatch.zig");
@@ -113,6 +114,8 @@ pub const native_compute = struct {
 };
 
 test {
+    _ = @import("architectures/modern_bert.zig");
+    _ = @import("models/tokenizer_special_tokens.zig");
     _ = @import("hard_cancellation_watchdog.zig");
     _ = @import("models/laya.zig");
     _ = @import("finetune/laya/graph.zig");

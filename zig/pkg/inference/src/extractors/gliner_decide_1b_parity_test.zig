@@ -13,6 +13,7 @@ const pipeline = @import("../pipelines/gliner_boundary_pipeline.zig");
 const decide = @import("decide.zig");
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const service = @import("../server/gliner_boundary_service_test.zig");
+const qualification = @import("../models/gliner_decide_qualification.zig");
 
 pub const files = pipeline.PublishedModelFiles{
     .@"config.json" = .{ .size_bytes = 464, .sha256 = "d2732928820b95649bc87f051345b2394fff87fc28c01f945610f943d6f402b2" },
@@ -23,8 +24,8 @@ pub const files = pipeline.PublishedModelFiles{
 };
 
 pub const capture_pin = pipeline.PublishedModelPin{
-    .size_bytes = 100296,
-    .sha256 = "45828bb5e2d00812299d2a2b778d37a215bef231b821d74791a1d9d40335d34b",
+    .size_bytes = 73256,
+    .sha256 = "de9fe72fd2038a2c62290a2f8f90aeb8081c5007b82f82a47ef137c33d3c5d61",
 };
 
 pub fn verifyCaptureBytes(bytes: []const u8) !void {
@@ -430,4 +431,212 @@ test "GLiNER2.5 Decide 1B pinned full session native classifier parity" {
 test "GLiNER2.5 Decide 1B pinned full session Metal classifier parity" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
     try parity(true);
+}
+
+const LongContextReference = struct {
+    format_version: u32,
+    model_sha256: []const u8,
+    requests: []const struct {
+        id: []const u8,
+        text: []const u8,
+        native_schema_json: []const u8,
+        encoded: struct { input_ids: []const i64, attention_mask: []const i64 },
+        native_classification: struct {
+            input_ids: []const i64,
+            tasks: []const struct { name: []const u8, labels: []const []const u8, raw_logits: []const f64 },
+        },
+        probabilities: std.json.Value,
+        selected: std.json.Value,
+        semantic_expected: std.json.Value,
+    },
+};
+
+fn jsonNumber(value: std.json.Value) !f64 {
+    return switch (value) {
+        .float => |number| number,
+        .integer => |number| @floatFromInt(number),
+        else => error.InvalidFamilyReference,
+    };
+}
+
+fn expectLongContextProbabilities(compiled: *const schema_mod.CompiledSchema, rows: []const []const f64, expected: std.json.Value) !void {
+    if (expected != .object or expected.object.count() != rows.len) return error.InvalidFamilyReference;
+    const structured = schema_mod.usesStructuredClassification(compiled.schema.classifications, compiled.schema.classification_constraints.roots.len > 0);
+    for (compiled.schema.classifications, rows) |classification, row| {
+        const task = expected.object.get(classification.task.name) orelse return error.InvalidFamilyReference;
+        if (task != .object or task.object.count() != row.len) return error.InvalidFamilyReference;
+        const temperature: f64 = classification.task.temperature;
+        const exclusive = classification.task.min_labels == 1 and classification.task.maximum() == 1;
+        const sigmoid = switch (classification.activation) {
+            .sigmoid => true,
+            .softmax => false,
+            .auto => if (structured) !exclusive else classification.mode == .multi,
+        };
+        var maximum = -std.math.inf(f64);
+        if (!sigmoid) {
+            for (row) |logit| maximum = @max(maximum, logit / temperature);
+        }
+        var denominator: f64 = 0;
+        if (!sigmoid) {
+            for (row) |logit| denominator += @exp(logit / temperature - maximum);
+        }
+        for (classification.task.labels, row) |label, logit| {
+            const want = try jsonNumber(task.object.get(label) orelse return error.InvalidFamilyReference);
+            const got = if (sigmoid) 1.0 / (1.0 + @exp(-(logit / temperature))) else @exp(logit / temperature - maximum) / denominator;
+            try std.testing.expectApproxEqAbs(want, got, 5e-4);
+        }
+    }
+}
+
+fn expectLongContextPresentation(classifications: []const pipeline.Classification, probabilities: std.json.Value, selected: std.json.Value) !void {
+    if (probabilities != .object or probabilities.object.count() != classifications.len or selected != .object or selected.object.count() != classifications.len)
+        return error.InvalidFamilyReference;
+    for (classifications) |classification| {
+        const task_probabilities = probabilities.object.get(classification.name) orelse return error.InvalidFamilyReference;
+        const task_selected = selected.object.get(classification.name) orelse return error.InvalidFamilyReference;
+        if (task_probabilities != .object or task_probabilities.object.count() != classification.labels.len or task_selected != .array or task_selected.array.items.len != 1)
+            return error.InvalidFamilyReference;
+        if (task_selected.array.items[0] != .string or classification.labels.len == 0) return error.InvalidFamilyReference;
+        var best = classification.labels[0];
+        for (classification.labels) |label| {
+            const want = try jsonNumber(task_probabilities.object.get(label.label) orelse return error.InvalidFamilyReference);
+            try std.testing.expectApproxEqAbs(want, @as(f64, label.confidence), 5e-4);
+            if (label.confidence > best.confidence) best = label;
+        }
+        try std.testing.expectEqualStrings(task_selected.array.items[0].string, best.label);
+    }
+}
+
+fn semanticTargetMatch(classifications: []const pipeline.Classification, expected: std.json.Value) !bool {
+    if (expected != .object) return error.InvalidFamilyReference;
+    var matched = true;
+    var it = expected.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) return error.InvalidFamilyReference;
+        const task = for (classifications) |classification| {
+            if (std.mem.eql(u8, classification.name, entry.key_ptr.*)) break classification;
+        } else {
+            matched = false;
+            continue;
+        };
+        if (task.labels.len == 0) {
+            matched = false;
+            continue;
+        }
+        var best = task.labels[0];
+        for (task.labels[1..]) |label| if (label.confidence > best.confidence) {
+            best = label;
+        };
+        matched = matched and std.mem.eql(u8, best.label, entry.value_ptr.string);
+    }
+    return matched;
+}
+
+fn longContextParity(metal: bool) !void {
+    const directory = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_MODEL_DIR") orelse return error.SkipZigTest;
+    const reference_path = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_LONG_CONTEXT_REFERENCE") orelse return error.SkipZigTest;
+    if (metal and !@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = try @import("../util/c_file.zig").readFileMax(a, reference_path, 32 * 1024 * 1024);
+    defer a.free(bytes);
+    const parsed = try std.json.parseFromSlice(LongContextReference, a, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const ref = parsed.value;
+    try std.testing.expectEqual(@as(u32, 1), ref.format_version);
+    try std.testing.expectEqualStrings(files.@"model.safetensors".sha256, ref.model_sha256);
+    try service.verifyFiles(a, directory, files);
+
+    const session = if (metal) try factory.createMetalSession(a, directory) else try factory.createNativeSession(a, directory);
+    defer session.close();
+    const config = try factory.getGlinerSpanConfig(session);
+    if (config != .modern_bert or config.modern_bert.max_position_embeddings != 7999) return error.InvalidFamilyReference;
+    const tokenizer_path = try std.fs.path.join(a, &.{ directory, "tokenizer.json" });
+    defer a.free(tokenizer_path);
+    const tokenizer_bytes = try @import("../util/c_file.zig").readFile(a, tokenizer_path);
+    defer a.free(tokenizer_bytes);
+    const tok = try @import("inference_hf_tokenizer").HfTokenizer.loadFromBytes(a, tokenizer_bytes);
+    defer tok.tokenizer().deinitTokenizer();
+    const watchdog = if (metal) try @import("../hard_cancellation_watchdog.zig").HardCancellationWatchdog.create(a) else null;
+    defer if (watchdog) |owner| owner.destroy();
+    if (watchdog) |owner| try owner.start(std.testing.io);
+
+    const case_filter = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_LONG_CONTEXT_CASE");
+    const max_tokens = platform.env.getenvUsize("ANTFLY_GLINER25_DECIDE_1B_LONG_CONTEXT_MAX_TOKENS");
+    const tolerance: f64 = if (metal) 5e-3 else 2e-3;
+    var matching_case = case_filter == null;
+    var ran: usize = 0;
+    for (ref.requests) |request| {
+        if (case_filter) |filter| {
+            if (!std.mem.eql(u8, request.id, filter)) continue;
+            matching_case = true;
+        }
+        if (max_tokens) |limit| if (request.encoded.input_ids.len > limit) continue;
+        if (request.encoded.input_ids.len <= 198 or request.encoded.input_ids.len > 7999) return error.InvalidFamilyReference;
+        const qualified_backend: qualification.Backend = if (metal) .metal else .native;
+        try std.testing.expectError(error.UnsupportedGlinerDecisionGeometry, qualification.requireRequest(.decide_1b, qualified_backend, 1, 1, request.encoded.input_ids.len));
+        errdefer std.debug.print("Decide-1B long-context {s}/{s}\n", .{ if (metal) "metal" else "native", request.id });
+        const control = @import("../execution_control.zig").InferenceExecutionControl{
+            .hard_cancellation = if (watchdog) |owner| owner.boundary() else null,
+            .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s,
+        };
+        var compiled = try schema_mod.compile(a, request.native_schema_json, .{});
+        defer compiled.deinit();
+        var prepared = try processor.prepare(a, tok.tokenizer(), &.{.{ .text = request.text, .schema = &compiled }}, .{
+            .max_text_words = 7999,
+            .max_total_words = 7999,
+            .max_sequence_tokens = 7999,
+            .max_batch_tokens = 7999,
+            .control = control,
+        });
+        defer prepared.deinit();
+        try std.testing.expectEqualSlices(i64, request.encoded.input_ids, prepared.input_ids);
+        try std.testing.expectEqualSlices(i64, request.encoded.attention_mask, prepared.attention_mask);
+        try std.testing.expectEqualSlices(i64, request.native_classification.input_ids, prepared.input_ids);
+        const counts = try a.alloc(usize, compiled.schema.classifications.len);
+        defer a.free(counts);
+        for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
+        const began = platform.time.monotonicNs();
+        const rows = rows: {
+            var managed = try factory.getManagedComputeBackend(session, a, null, control);
+            defer managed.deinit();
+            break :rows try executor.classificationLogits(&managed.backend, a, .{ .modern_bert = config.modern_bert }, prepared.samples[0], counts);
+        };
+        defer {
+            for (rows) |row| a.free(row);
+            a.free(rows);
+        }
+        var max_error: f64 = 0;
+        try std.testing.expectEqual(request.native_classification.tasks.len, rows.len);
+        for (request.native_classification.tasks, rows, compiled.schema.classifications) |task, got, classification| {
+            try std.testing.expectEqualStrings(task.name, classification.task.name);
+            try std.testing.expectEqual(task.labels.len, got.len);
+            try std.testing.expectEqual(task.raw_logits.len, got.len);
+            for (task.labels, task.raw_logits, got, classification.task.labels) |label, want, actual, compiled_label| {
+                try std.testing.expectEqualStrings(label, compiled_label);
+                max_error = @max(max_error, @abs(want - actual));
+                try std.testing.expectApproxEqAbs(want, actual, tolerance);
+            }
+        }
+        try expectLongContextProbabilities(&compiled, rows, request.probabilities);
+        const const_rows = try a.alloc([]const f64, rows.len);
+        defer a.free(const_rows);
+        for (rows, const_rows) |row, *out| out.* = row;
+        var presented = try pipeline.presentClassifications(a, &compiled, const_rows, 1, .{});
+        defer presented.deinit();
+        try expectLongContextPresentation(presented.classifications, request.probabilities, request.selected);
+        const semantic_match = try semanticTargetMatch(presented.classifications, request.semantic_expected);
+        const elapsed_ms = @as(f64, @floatFromInt(platform.time.monotonicNs() - began)) / 1e6;
+        std.debug.print("GLiNER2.5-Decide-1B long-context {s}/{s}: tokens={d} elapsed_ms={d:.3} max_raw_logit_error={e} semantic_target_match={}\n", .{ if (metal) "metal" else "native", request.id, prepared.input_ids.len, elapsed_ms, max_error, semantic_match });
+        ran += 1;
+    }
+    if (!matching_case) return error.InvalidFamilyReference;
+    if (ran == 0) return error.SkipZigTest;
+}
+
+test "GLiNER2.5 Decide 1B long context native oracle parity" {
+    try longContextParity(false);
+}
+test "GLiNER2.5 Decide 1B long context Metal oracle parity" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    try longContextParity(true);
 }

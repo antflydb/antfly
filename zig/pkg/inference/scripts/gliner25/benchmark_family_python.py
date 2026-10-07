@@ -49,6 +49,8 @@ THREADS = 2
 MAX_WORDS = 4096
 PREFLIGHT_MAX_WORDS = 128
 MAX_ENCODED_TOKENS = 512
+SHORT_HOLDOUT = TESTDATA / "decide_1b_short_holdout.json"
+SHORT_HOLDOUT_SHA256 = "e429219899d3e3d470113f06756c9e807a286a6ba65cc210fd90b5c628628cff"
 OUTPUT_TOLERANCE = 5e-4
 RAW_LOGIT_TOLERANCE = 2e-3
 MPS_FALLBACK_WARNING = (
@@ -73,25 +75,25 @@ MPS_ENV_UNSET = (
 CAPTURES = {
     ("multi_v1", "extract"): (
         "multi_v1_capture.json",
-        "602e6e4470163308de6b139ae829b11321adfdcb8371d64e6a3266dea431733b",
+        "4c46106eaa56b5899ca607cb4deca877d197ecb0f3800ac5198c44a17fbddcd2",
         "requests",
         ("spanish_entities",),
     ),
     ("multi_decide", "extract"): (
         "multi_decide_capture.json",
-        "6b582e356c06d9f37e11b68b35707d7995df431f2af3e6fb0e7265f8a5d3bec0",
+        "06163fe217ff9769df3a045a30c9583cd6c352e72a23077c11e7aaa6ce59074d",
         "requests",
         ("spanish_entities",),
     ),
     ("multi_decide", "decide"): (
         "multi_decide_decide_capture.json",
-        "b435f0fb3d638b27828b949235e9a9c2b35e1171aa55ef94263cf53edb589900",
+        "04d9bbf219858166a1b0d7199b12673dd81eac7fae37454757d213debdd6e732",
         "requests",
         ("described_prompt_choice", "choice_score_noul"),
     ),
     ("decide_1b", "decide"): (
         "decide_1b_capture.json",
-        "45828bb5e2d00812299d2a2b778d37a215bef231b821d74791a1d9d40335d34b",
+        "de9fe72fd2038a2c62290a2f8f90aeb8081c5007b82f82a47ef137c33d3c5d61",
         "public_decide_requests",
         ("described_prompt_choice", "choice_score_noul"),
     ),
@@ -802,12 +804,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     started_utc = dt.datetime.now(dt.timezone.utc).isoformat()
     configure_environment()
     capture_path, capture, rows = load_capture(args.profile, args.task)
+    holdout = None
+    if getattr(args, "short_holdout", False):
+        if args.profile != "decide_1b" or args.task != "decide":
+            raise BenchmarkError("short holdouts require Decide-1B")
+        if sha256(SHORT_HOLDOUT) != SHORT_HOLDOUT_SHA256:
+            raise BenchmarkError("short holdout pin differs")
+        holdout = strict_json(SHORT_HOLDOUT)
+        rows = rows + holdout["public_decide_requests"]
     contract = strict_json(args.contract)
 
     source = verify_source(args.upstream, contract)
     model_before = family.verify_model(
         args.profile, args.model_dir, contract_path=args.contract, verify_model_sha256=True
     )
+    if holdout is not None and holdout.get("model") != model_before:
+        raise BenchmarkError("short holdout model identity differs")
     if capture.get("model") != model_before:
         raise BenchmarkError("capture model identity differs from the selected artifact")
 
@@ -881,6 +893,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if sha256(capture_path) != CAPTURES[(args.profile, args.task)][1]:
         raise BenchmarkError("capture changed during benchmark")
 
+    if holdout is not None and sha256(SHORT_HOLDOUT) != SHORT_HOLDOUT_SHA256:
+        raise BenchmarkError("short holdout changed during benchmark")
+
     imports = {
         name: str(Path(module.__file__).resolve())
         for name, module in sys.modules.items()
@@ -902,6 +917,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "qualification": False,
         "profile": args.profile,
         "task": args.task,
+        "short_holdout_sha256": SHORT_HOLDOUT_SHA256 if holdout is not None else None,
         "device": args.device,
         "warmups": WARMUPS,
         "measured_samples": SAMPLES,
@@ -950,6 +966,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", required=True, type=Path)
     parser.add_argument("--upstream", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--short-holdout", action="store_true", help="include the four frozen short-request holdouts")
     parser.add_argument("--threads", type=int, default=THREADS)
     parser.add_argument("--contract", type=Path, default=CONTRACT)
     parser.add_argument("--runtime-contract", type=Path, default=RUNTIME_CONTRACT_1B)

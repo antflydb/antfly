@@ -13,6 +13,7 @@ const platform = @import("antfly_platform");
 const server = @import("server.zig");
 const Node = server.Node;
 const registry = @import("../registry/registry.zig");
+const manifest_mod = @import("../models/manifest.zig");
 const decide_parity = @import("../extractors/gliner_decide_1b_parity_test.zig");
 const factory = @import("../architectures/session_factory.zig");
 const shared = @import("gliner_boundary_service_test.zig");
@@ -180,7 +181,7 @@ fn hardLink(a: Allocator, source: []const u8, destination: []const u8) !void {
     if (c_file.c.link(source_z.ptr, destination_z.ptr) != 0) return error.Decide1BServiceFixtureLinkFailed;
 }
 
-fn linkedModel(a: Allocator, temporary: *std.testing.TmpDir, source: []const u8) ![:0]u8 {
+fn linkedModel(a: Allocator, temporary: *std.testing.TmpDir, source: []const u8, synthesize_manifest: bool) ![:0]u8 {
     const io = std.testing.io;
     try temporary.dir.createDirPath(io, "model/encoder_config");
     const root = try temporary.dir.realPathFileAlloc(io, ".", a);
@@ -194,9 +195,11 @@ fn linkedModel(a: Allocator, temporary: *std.testing.TmpDir, source: []const u8)
     }
     const model_dir = try std.fs.path.join(a, &.{ root, "model" });
     defer a.free(model_dir);
-    const manifest_json = try registry.synthesizePulledModelManifestJson(a, model_dir, null, null);
-    defer a.free(manifest_json);
-    try temporary.dir.writeFile(io, .{ .sub_path = "model/model_manifest.json", .data = manifest_json });
+    if (synthesize_manifest) {
+        const manifest_json = try registry.synthesizePulledModelManifestJson(a, model_dir, null, null);
+        defer a.free(manifest_json);
+        try temporary.dir.writeFile(io, .{ .sub_path = "model/model_manifest.json", .data = manifest_json });
+    }
     return root;
 }
 
@@ -219,10 +222,14 @@ fn expectResponse(a: Allocator, bytes: []const u8, expected: std.json.Value) !vo
 }
 
 fn dispatch(a: Allocator, node: *Node, raw: []const u8) !httpx.Response {
+    return dispatchWithIo(a, std.testing.io, node, raw);
+}
+
+fn dispatchWithIo(a: Allocator, io: std.Io, node: *Node, raw: []const u8) !httpx.Response {
     var request = try httpx.Request.init(a, .POST, "/ai/v1/decide");
     defer request.deinit();
     request.body = raw;
-    var context = httpx.Context.init(a, std.testing.io, &request);
+    var context = httpx.Context.init(a, io, &request);
     defer context.deinit();
     context.max_request_body_size = 64 * 1024;
     context.application_deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s;
@@ -887,17 +894,35 @@ fn directKernelSample(
     wire_request: decide.Request,
     expected: std.json.Value,
 ) !u64 {
+    return (try directPipelineSample(a, std.testing.io, node, loaded, config, text, schema_json, expected_input_ids, expected_classification, wire_request, expected)).pipeline_ns;
+}
+
+fn directPipelineSample(
+    a: Allocator,
+    io: std.Io,
+    node: *Node,
+    loaded: *@import("model_manager.zig").LoadedModel,
+    config: span_executor.EncoderConfig,
+    text: []const u8,
+    schema_json: []const u8,
+    expected_input_ids: []const i64,
+    expected_classification: *const CapturedClassification,
+    wire_request: decide.Request,
+    expected: std.json.Value,
+) !struct { pipeline_ns: u64, encoder_head_ns: u64 } {
     const watchdog = node.hard_cancellation_watchdog orelse return error.MissingHardCancellationWatchdog;
     const control = @import("../execution_control.zig").InferenceExecutionControl{
-        .io = std.testing.io,
+        .io = io,
         .hard_cancellation = watchdog.boundary(),
         .deadline_ns = platform.time.monotonicNs() + 600 * std.time.ns_per_s,
         .cancellation_grace_ns = 5 * std.time.ns_per_s,
     };
+    const is_gpu = loaded.session.backend() == .metal;
+    const resource_class: memory.BackendClass = if (is_gpu) .gpu else .cpu;
     const device_limits = node.config.generation_budget_overrides.apply(
-        memory.defaultLimitsForBackendWithProcessLimit(.gpu, node.config.process_memory_limit_bytes),
+        memory.defaultLimitsForBackendWithProcessLimit(resource_class, node.config.process_memory_limit_bytes),
     );
-    const device_bytes = try span_executor.deviceScratchUpperBound(config, expected_input_ids.len);
+    const device_bytes = if (is_gpu) try span_executor.deviceScratchUpperBound(config, expected_input_ids.len) else 512 * 1024 * 1024;
     var budget = memory.RunBudget.init(device_limits);
     try budget.reserveEstimate(.{
         .prompt_tokens = 0,
@@ -905,13 +930,13 @@ fn directKernelSample(
         .kv_bytes = 0,
         .kv_tier = .host,
         .scratch_bytes = device_bytes,
-        .scratch_tier = .backend,
+        .scratch_tier = if (is_gpu) .backend else .host,
     });
-    var device_lease = try node.model_manager.acquireRunResourceAmounts(.gpu, device_limits, .{ .backend_scratch_bytes = device_bytes });
+    var device_lease = try node.model_manager.acquireRunResourceAmounts(resource_class, device_limits, if (is_gpu) .{ .backend_scratch_bytes = device_bytes } else .{ .host_scratch_bytes = device_bytes });
     defer device_lease.release();
-    const execution_mutex = loaded.targetInferenceExecutionMutex() orelse return error.MissingMetalExecutionMutex;
-    try control.lock(execution_mutex);
-    defer execution_mutex.unlock();
+    const execution_mutex = loaded.targetInferenceExecutionMutex();
+    if (execution_mutex) |mutex| try control.lock(mutex);
+    defer if (execution_mutex) |mutex| mutex.unlock();
 
     const started = perf.nowNs();
     // Match the Python `prepare_decide.execute` boundary: rebuild the schema,
@@ -924,10 +949,14 @@ fn directKernelSample(
     const counts = try a.alloc(usize, compiled.schema.classifications.len);
     defer a.free(counts);
     for (compiled.schema.classifications, counts) |classification, *count| count.* = classification.task.labels.len;
+    var encoder_elapsed: u64 = 0;
     const rows = rows: {
         var managed = try factory.getManagedComputeBackend(loaded.session, a, &budget, control);
         defer managed.deinit();
-        break :rows try span_executor.classificationLogits(&managed.backend, a, config, prepared.samples[0], counts);
+        const encoder_started = perf.nowNs();
+        const scored = try span_executor.classificationLogits(&managed.backend, a, config, prepared.samples[0], counts);
+        encoder_elapsed = perf.nowNs() - encoder_started;
+        break :rows scored;
     };
     defer {
         for (rows) |row| a.free(row);
@@ -961,7 +990,7 @@ fn directKernelSample(
     const extraction_json = try directExtractionResponseJson(validation, presented.classifications, prepared.input_ids.len);
     const response_json = try decide.responseJson(validation, wire_request, extraction_json, .span_marker);
     try expectResponse(validation, response_json, expected);
-    return elapsed;
+    return .{ .pipeline_ns = elapsed, .encoder_head_ns = encoder_elapsed };
 }
 
 fn directKernelPerformance() !void {
@@ -989,7 +1018,7 @@ fn directKernelPerformance() !void {
 
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const models_dir = try linkedModel(a, &temporary, source);
+    const models_dir = try linkedModel(a, &temporary, source, true);
     defer a.free(models_dir);
     const directory = try std.fs.path.join(a, &.{ models_dir, "model" });
     defer a.free(directory);
@@ -1087,11 +1116,25 @@ fn serviceParity(comptime backend: BackendType) !void {
 
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
-    const models_dir = try linkedModel(a, &temporary, source);
+    // Exercise the public Node routes against the exact upstream directory,
+    // without Antfly pull-time task/capability synthesis. Architecture-aware
+    // listing may select the qualified route, while the live session must
+    // still prove the pinned weight and sidecar identity before execution.
+    const models_dir = try linkedModel(a, &temporary, source, false);
     defer a.free(models_dir);
     const directory = try std.fs.path.join(a, &.{ models_dir, "model" });
     defer a.free(directory);
     try shared.verifyFiles(a, directory, pins);
+    const manifest_path = try std.fs.path.join(a, &.{ directory, "model_manifest.json" });
+    defer a.free(manifest_path);
+    try std.testing.expect(!c_file.fileExists(a, manifest_path));
+    var raw_listing = try manifest_mod.loadListingFromDir(a, directory);
+    defer raw_listing.deinit();
+    try std.testing.expectEqual(@import("../models/gliner_boundary.zig").Architecture.span, raw_listing.gliner_architecture);
+    try std.testing.expect(raw_listing.gliner_span_declared);
+    try std.testing.expectEqual(manifest_mod.GlinerSpanEncoderFamily.modern_bert, raw_listing.gliner_span_encoder_family);
+    try std.testing.expectEqual(@as(usize, 0), raw_listing.tasks.len);
+    try std.testing.expectEqual(@as(usize, 0), raw_listing.capabilities.len);
     var node = try Node.init(a, .{
         .models_dir = models_dir,
         .max_loaded_models = 1,
@@ -1225,7 +1268,11 @@ fn serviceParity(comptime backend: BackendType) !void {
     }
     // Performance receipts intentionally retain their original call count and
     // timing scope. These compatibility regressions run only in qualification.
-    if (!run_perf) try explicitV1ClassificationRegression(a, &node, directory, capture.value);
+    if (!run_perf) {
+        try explicitV1ClassificationRegression(a, &node, directory, capture.value);
+        try std.testing.expectEqual(cached.?, try expectCached(&node, directory, backend));
+        try expectSameModelWeights(resident_model.?, try modelOwned(&node));
+    }
     try shared.verifyFiles(a, directory, pins);
 }
 
@@ -1239,4 +1286,146 @@ test "GLiNER2.5 Decide-1B exact Metal direct and HTTP service parity" {
 
 test "GLiNER2.5 Decide-1B Metal direct-only kernel performance" {
     try directKernelPerformance();
+}
+
+/// Standalone production-allocation benchmark. Reuses qualification assertions,
+/// never the test allocator or test IO. The supervisor supplies a models root
+/// containing the pinned checkpoint as `model` and records process provenance.
+pub fn runProductionBenchmark(a: Allocator, io: std.Io, args: []const []const u8) !void {
+    if (args.len != 2) return error.ExpectedBackendAndModelsDirectory;
+    if (std.mem.eql(u8, args[0], "metal")) return productionBenchmark(a, io, .metal, args[1]);
+    if (std.mem.eql(u8, args[0], "native")) return productionBenchmark(a, io, .native, args[1]);
+    return error.UnsupportedBenchmarkBackend;
+}
+
+fn productionBenchmark(a: Allocator, io: std.Io, comptime backend: BackendType, models_dir: []const u8) !void {
+    if (backend == .metal and !@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.MetalUnavailable;
+    var config = (try perf.Config.fromEnv(a)) orelse return error.MissingBenchmarkOutputDirectory;
+    defer config.deinit();
+    const head = try perf.sourceHead();
+    const diff = try receiptSha256("ANTFLY_GLINER25_PERF_SOURCE_DIFF_SHA256");
+    const binary = try receiptSha256("ANTFLY_GLINER25_PERF_BINARY_SHA256");
+    const threads = try runtimeCpuThreadBudget();
+    if (threads != 2) return error.ExpectedTwoCpuThreads;
+    const directory = try std.fs.path.join(a, &.{ models_dir, "model" });
+    defer a.free(directory);
+    try shared.verifyFiles(a, directory, pins);
+    const bytes = try decide_parity.referenceBytes(a);
+    defer a.free(bytes);
+    var capture = try std.json.parseFromSlice(Capture, a, bytes, .{ .ignore_unknown_fields = true });
+    defer capture.deinit();
+    const holdout_path = platform.env.getenv("ANTFLY_GLINER25_DECIDE_1B_HOLDOUT") orelse return error.MissingShortHoldout;
+    const holdout_bytes = try c_file.readFileMax(a, holdout_path, 2 * 1024 * 1024);
+    defer a.free(holdout_bytes);
+    var holdout_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(holdout_bytes, &holdout_digest, .{});
+    if (!std.mem.eql(u8, &std.fmt.bytesToHex(holdout_digest, .lower), "e429219899d3e3d470113f06756c9e807a286a6ba65cc210fd90b5c628628cff")) return error.InvalidShortHoldout;
+    var holdout = try std.json.parseFromSlice(Capture, a, holdout_bytes, .{ .ignore_unknown_fields = true });
+    defer holdout.deinit();
+    const cases = try std.mem.concat(a, @typeInfo(@TypeOf(capture.value.public_decide_requests)).pointer.child, &.{ capture.value.public_decide_requests, holdout.value.public_decide_requests });
+    defer a.free(cases);
+    var node = try Node.init(a, .{
+        .models_dir = models_dir,
+        .max_loaded_models = 1,
+        .max_concurrent_requests = 1,
+        .keep_alive_ms = 30 * 60 * 1000,
+        .process_termination_available = true,
+        .process_memory_limit_bytes = service_process_memory_bytes,
+        .process_memory_limit_provenance = .explicit,
+        .generation_budget_overrides = .{ .host_limit_bytes = service_generation_memory_bytes, .backend_limit_bytes = service_generation_memory_bytes, .scratch_limit_bytes = service_generation_memory_bytes, .combined_limit_bytes = service_generation_memory_bytes, .kv_limit_bytes = 4 * 1024 * 1024 * 1024 },
+    });
+    defer node.deinit();
+    requireBackend(&node, backend);
+    try node.attachIo(io);
+    for (cases) |case| {
+        const request = try requestJson(a, case.decide_request_json);
+        defer a.free(request);
+        var request_arena = std.heap.ArenaAllocator.init(a);
+        defer request_arena.deinit();
+        const typed_request = try decide.parse(request_arena.allocator(), request);
+        var samples = [4]perf.SampleSet{ .init(), .init(), .init(), .init() };
+        const Stage = @import("extraction_metrics.zig").Stage;
+        var stage_start: [std.enums.values(Stage).len]u64 = undefined;
+        var cached: ?usize = null;
+        var resident: ?memory.AdmissionAmounts = null;
+        for (0..1 + perf.warmup_count + perf.measured_count) |iteration| {
+            if (iteration == 1 + perf.warmup_count) {
+                for (std.enums.values(Stage), &stage_start) |stage, *value| value.* = node.metrics.extraction_v2.phase_ns.get(stage);
+            }
+            for (0..2) |offset| {
+                const path_index = (iteration + offset) % 2;
+                const started = perf.nowNs();
+                var response: ?httpx.Response = null;
+                const result = if (path_index == 0)
+                    try node.decideDirectJsonWithControl(a, request, null)
+                else blk: {
+                    response = try dispatchWithIo(a, io, &node, request);
+                    if (response.?.status.code != 200) {
+                        std.debug.print("HTTP benchmark failure: {s}\n", .{response.?.body orelse "empty response"});
+                        response.?.deinit();
+                        return error.UnsuccessfulBenchmarkResponse;
+                    }
+                    break :blk response.?.body orelse return error.MissingResponseBody;
+                };
+                const elapsed = perf.nowNs() - started;
+                defer if (response) |*value| value.deinit() else a.free(result);
+                try expectResponse(a, result, case.decide_expected);
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, result, .{});
+                defer parsed.deinit();
+                const tokens = parsed.value.object.get("usage").?.object.get("input_tokens").?.integer;
+                try std.testing.expectEqual(@as(i64, @intCast(case.encoded.input_ids.len)), tokens);
+                const identity = try expectCached(&node, directory, backend);
+                const weights = try modelOwned(&node);
+                if (cached) |prior| try std.testing.expectEqual(prior, identity);
+                if (resident) |prior| try expectSameModelWeights(prior, weights);
+                cached = identity;
+                resident = weights;
+                _ = try expectIdle(&node);
+                if (iteration > perf.warmup_count) try samples[path_index].appendMeasured(elapsed);
+            }
+            var handle = try node.model_manager.acquireFromDir(directory);
+            const loaded = handle.get();
+            const encoder = switch (try factory.getGlinerSpanConfig(loaded.session)) {
+                .modern_bert => |value| span_executor.EncoderConfig{ .modern_bert = value },
+                else => return error.ExpectedModernBertSession,
+            };
+            const timing = directPipelineSample(a, io, &node, loaded, encoder, case.text, case.native_schema_json, case.encoded.input_ids, &case.native_classification, typed_request, case.decide_expected) catch |err| {
+                handle.release();
+                return err;
+            };
+            handle.release();
+            _ = try expectIdle(&node);
+            if (iteration > perf.warmup_count) {
+                try samples[2].appendMeasured(timing.pipeline_ns);
+                try samples[3].appendMeasured(timing.encoder_head_ns);
+            }
+        }
+        for (std.enums.values(Stage), stage_start) |stage, before| {
+            const total_ns = node.metrics.extraction_v2.phase_ns.get(stage) - before;
+            std.debug.print("decide_service_stage case={s} stage={s} mean_ns={d} samples=40\n", .{ case.id, @tagName(stage), total_ns / 40 });
+        }
+        const snapshot = try perfMemorySnapshot(&node);
+        for ([_][]const u8{ "direct", "http_handler", "loaded_pipeline", "encoder_head" }, 0..) |path, index| {
+            var metadata = perfMetadata(backend, case.id, path, case.text.len, case.encoded.input_ids.len, threads, head, snapshot);
+            if (!std.mem.eql(u8, case.id, "described_prompt_choice") and !std.mem.eql(u8, case.id, "choice_score_noul"))
+                metadata.capture_sha256 = "e429219899d3e3d470113f06756c9e807a286a6ba65cc210fd90b5c628628cff";
+            metadata.source_diff_sha256 = diff;
+            metadata.binary_sha256 = binary;
+            metadata.fixture_allocator = "platform.processAllocator(smp_allocator)";
+            metadata.measurement_scope = if (index < 2) "validated_production_allocator_service_latency" else "validated_production_allocator_pipeline_latency";
+            if (index >= 2) metadata.timing_boundary = if (index == 2)
+                "schema compilation, preprocessing, managed backend setup, encoder, head, readback and classification presentation; excludes admission, execution-lock acquisition, Decide JSON serialization and validation"
+            else
+                "prepared encoder, classification head and completed readback; excludes schema, preprocessing, admission, managed backend setup and presentation";
+            metadata.caveats = &.{
+                "Standalone executable using production allocator and IO; no test runner or testing allocator.",
+                "Three warmups and twenty samples follow a validation preflight on both paths.",
+                "HTTP means in-process handler dispatch, excluding socket transport; all request admission and serialization are timed.",
+                "Response, token count, cached identity and idle ownership validation run outside each timed interval.",
+                "Serial p95 is descriptive, not a concurrent-load service SLO.",
+            };
+            try samples[index].writeWithIo(a, io, config, metadata);
+        }
+    }
+    try shared.verifyFiles(a, directory, pins);
 }
