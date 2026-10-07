@@ -736,8 +736,9 @@ Native text corpus version 4 publishes authenticated 64 KiB ranges across the
 native segment. Readers use the shared native range codecs, retaining bounded
 navigation and decoder scratch instead of allocating and zeroing a segment-sized
 heap buffer. Term-frequency probes read dictionary addresses and posting headers;
-WAND seeks fetch only the document chunks they visit, and position records are
-read when phrase consumers request them. A block checksum may bring neighboring
+Required WAND reads fetch the document chunks they visit, while bounded lookahead
+may warm subsequent chunks. Position records are decoded when phrase consumers
+request them. A block checksum may bring neighboring
 bytes into cache, so the minimum read unit remains 64 KiB. Each query binds its
 current store capability, deadline, cancellation and reader lease to a private
 native reader. Query binding borrows the already admitted field navigation,
@@ -754,6 +755,20 @@ segment leases keep their disk-first policy for clean-page reclamation. GC trave
 version 1–3 roots. Reader/topology protocol 30 triggers automatic republication of
 older corpora during rolling upgrades.
 
+Native text readers hint the next document chunk using its authenticated native
+metadata, including explicit offsets in layouts that interleave position records.
+Up to four 64 KiB blocks per query source warm through the shared process scheduler;
+its worker and byte limits arbitrate with Parquet and other parallel consumers.
+A full speculative queue yields, required reads recycle consumed slots, and close
+cancels and joins every worker before releasing capabilities or physical owners.
+Releasing a pinned query source quiesces its bound readers even when a caller has
+retained the snapshot for immutable composition; later bound reads are canceled.
+Speculative failures do not become query errors until a required read reaches the
+failed block. Workers use independent scratch and current query cancellation.
+Term-frequency and BM25 bound-table caches belong to the exact immutable snapshot:
+query facades retain its cache owner, while cold frequency reads still use their
+own bound capability. Publishing a changed corpus starts new scoring caches.
+
 Automatic ordered-index access enumerates eligible definitions, proves partial
 predicates and covering columns, and counts ranges using authenticated B+tree
 subtree counts. Costing includes projected compressed column bytes and a
@@ -763,6 +778,10 @@ represented by its equality prefix and next-key lower/upper bounds. SQL binding
 marks disjunctions, scalar predicates and other unbound residuals as incomplete.
 Covered-column residuals and duplicate bounds with uncertain selectivity retain
 full-range costing. The goal never limits scan pages or changes residual semantics.
+Covering row-index windows preserve spill dictionary identities through their
+batch callbacks and selected lanes. Column-major residual evaluation memoizes each
+surviving dictionary identity per predicate, retaining separate SQL NULL and JSON
+null identities and exact integer values; only result delivery expands rows.
 Unknown residual selectivity costs the entire candidate range. Actual page clustering
 statistics remain a possible future refinement; explicit index requests retain
 their required semantics.
@@ -794,3 +813,14 @@ construction. Without replay, construction keeps the serial path rather than
 sharing mutable source discovery state across workers. Recursive join spill
 partitioning now selects typed blocks into child files, reusing key scratch and
 preserving physical ordinals without materializing payload row matrices.
+
+Remote native search attaches highlights through the same per-index analysis and
+fragment helper as local search, after final hit selection and before response
+encoding. Deferred projections retain original source until that final encoder,
+avoiding a second hydration for highlight fields. Projected or omitted source is hydrated in bounded, delete-aware batches
+from the same leased snapshot for highlighting, without widening returned source.
+Named full-text clauses retain their own index analysis and selected-field
+provenance. Highlight extraction shares the build projection path, including
+explicit field indexes that override general table text mapping. Vector-only requests do
+not synthesize text highlights. Real Parquet E2Es cover projected highlight fields
+and repeat the request after a cold restart.

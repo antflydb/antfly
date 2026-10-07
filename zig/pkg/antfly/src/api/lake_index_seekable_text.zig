@@ -119,12 +119,123 @@ const Owner = struct {
         a: A,
         owner: *Owner,
         capability: *const Read,
+        io: ?std.Io,
+        pending: [4]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null),
+        offsets: [4]?u64 = @splat(null),
+        recent_pages: [4]?u64 = @splat(null),
+        recent_cursor: usize = 0,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        mutex: std.atomic.Mutex = .unlocked,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.cancelled.load(.acquire)) return true;
+            self.capability.check() catch return true;
+            if (self.capability.cache) |cache| cache.context.ensureActive() catch return true;
+            return false;
+        }
+        fn warm(self: *@This(), piece: Piece) anyerror!void {
+            try self.capability.check();
+            const token: Cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+            var cached = self.capability.cache;
+            if (cached) |*cache| cache.context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
+            var lease = try artifacts.readArtifactLease(std.heap.page_allocator, self.capability.store, piece.ref, token, cached);
+            defer lease.deinit();
+        }
+        fn drain(self: *@This(), cancel: bool) void {
+            if (cancel) self.cancelled.store(true, .release);
+            const io = self.io orelse return;
+            for (&self.pending) |*slot| if (slot.*) |*task| {
+                if (cancel) task.cancel(io) catch {} else task.await(io) catch {};
+                slot.* = null;
+            };
+            self.offsets = @splat(null);
+        }
+        fn prefetch(raw: *anyopaque, start: u64, length: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.cancelled.load(.acquire)) return;
+            // Without a shared cache speculative work cannot benefit a reader.
+            if (self.capability.cache == null) return;
+            const io = self.capability.context.io orelse return;
+            self.capability.check() catch return;
+            if (start > self.owner.directory.bytes or length > self.owner.directory.bytes - start) return;
+            var offset = start;
+            var count: usize = 0;
+            while (offset < start + length and count < self.pending.len) : (count += 1) {
+                const metadata = containing(self.owner.directory.metadata, @intCast(offset));
+                const block = if (metadata == null) containing(self.owner.directory.blocks, @intCast(offset)) else null;
+                const piece = if (metadata) |i| self.owner.directory.metadata[i] else if (block) |i| self.owner.directory.blocks[i] else return;
+                offset = piece.offset + piece.ref.byte_len;
+                // Legacy v1 artifacts can be large; keep speculative bytes bounded.
+                if (piece.ref.byte_len > block_bytes) continue;
+                // Most native chunks share a page: do not spawn a worker for
+                // every small decoder read of an already consumed page.
+                var duplicate = false;
+                for (self.recent_pages) |page| if (page == piece.offset / block_bytes) {
+                    duplicate = true;
+                    break;
+                };
+                for (self.offsets) |prior| if (prior == piece.offset) {
+                    duplicate = true;
+                    break;
+                };
+                if (duplicate) continue;
+                var slot: usize = 0;
+                while (slot < self.pending.len and self.pending[slot] != null) : (slot += 1) {}
+                // A full speculative queue yields instead of stalling WAND
+                // on an unvisited range. Required reads recycle consumed slots.
+                if (slot == self.pending.len) return;
+                self.pending[slot] = local.sql_parallel_scheduler.global().submitTransient(io, block_bytes * 2, warm, .{ self, piece }) orelse return;
+                self.offsets[slot] = piece.offset;
+            }
+        }
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancelled.load(.acquire)) return error.Canceled;
+            // Large required ranges warm up to four authenticated blocks in parallel.
+            if (out.len > block_bytes) prefetch(raw, offset, out.len);
             try self.owner.read(self.capability.*, offset, out);
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (out.len != 0) {
+                var page = offset / block_bytes;
+                const last = (offset + out.len - 1) / block_bytes;
+                var count: usize = 0;
+                while (page <= last and count < self.recent_pages.len) : ({
+                    page += 1;
+                    count += 1;
+                }) {
+                    var seen = false;
+                    for (self.recent_pages) |prior| if (prior == page) {
+                        seen = true;
+                        break;
+                    };
+                    if (!seen) {
+                        self.recent_pages[self.recent_cursor] = page;
+                        self.recent_cursor = (self.recent_cursor + 1) % self.recent_pages.len;
+                    }
+                }
+            }
+            if (self.capability.context.io) |io| for (&self.pending, &self.offsets) |*slot, *start| {
+                if (start.*) |position| if (position < offset + out.len and position + block_bytes > offset) {
+                    if (slot.*) |*task| task.await(io) catch {};
+                    slot.* = null;
+                    start.* = null;
+                };
+            };
+            try self.capability.check();
+        }
+        fn quiesce(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancelled.store(true, .release);
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            self.drain(true);
         }
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            quiesce(raw);
             self.a.destroy(self);
         }
     };
@@ -133,8 +244,8 @@ const Owner = struct {
         const capability: *const Read = @ptrCast(@alignCast(context));
         try capability.check();
         const query = try a.create(Query);
-        query.* = .{ .a = a, .owner = owner, .capability = capability };
-        return .{ .ranges = .{ .ptr = query, .length = owner.directory.bytes, .read_into = Query.read, .close = Query.close } };
+        query.* = .{ .a = a, .owner = owner, .capability = capability, .io = capability.context.io };
+        return .{ .ranges = .{ .ptr = query, .length = owner.directory.bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce } };
     }
     fn containing(pieces: []const Piece, offset: usize) ?usize {
         var low: usize = 0;
@@ -252,6 +363,7 @@ test "external lake seekable text loads touched postings and keeps exact scoring
     var failed: Read = .{ .store = denied, .cache = null, .context = .{}, .cancellation = .none };
     const denied_snapshot = try retry_writer.acquireSnapshotWithReadContext(&failed);
     defer denied_snapshot.release();
+    try std.testing.expectError(error.TestRemoteUnavailable, denied_snapshot.termDocFreq(a, "body", "alpha"));
     var denied_bytes: [4]u8 = undefined;
     try std.testing.expectError(error.TestRemoteUnavailable, denied_snapshot.segments[0].query_source.?.readInto(0, &denied_bytes));
     var authorized: Read = .{ .store = store, .cache = null, .context = .{}, .cancellation = .none };
@@ -324,4 +436,59 @@ test "external lake native text seeks a common term without reading its position
     const bound = try writer.acquireSnapshotWithReadContext(&authorized);
     defer bound.release();
     try std.testing.expectEqual(@as(u32, 12000), try bound.termDocFreq(a, "body", "alpha"));
+}
+
+test "external lake native text prefetch warms bounded authenticated blocks and joins speculative failures" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("seekable-text-prefetch");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(7), 1, std.testing.io);
+    const bytes = try a.alloc(u8, block_bytes * 6);
+    defer a.free(bytes);
+    // Distinct block identities prevent cache deduplication hiding fan-out.
+    for (0..6) |i| @memset(bytes[i * block_bytes ..][0..block_bytes], @intCast(i));
+    const ref = try publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    const data = try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var physical = data.native;
+    defer physical.close();
+    const owner: *Owner = @ptrCast(@alignCast(physical.ranges.ptr));
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(std.heap.page_allocator);
+    defer cache.deinit();
+    var capability: Read = .{ .store = store, .cache = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } }, .context = .{ .io = std.testing.io }, .cancellation = .none };
+    var source = try Owner.bind(owner, a, &capability);
+    var open = true;
+    defer if (open) source.close();
+    source.prefetch(0, bytes.len);
+    const query: *Owner.Query = @ptrCast(@alignCast(source.ranges.ptr));
+    query.drain(false);
+    try std.testing.expectEqual(@as(u64, 4), cache.stats.provider_reads);
+    var sample: [1]u8 = undefined;
+    try source.readInto(block_bytes * 3, &sample);
+    try std.testing.expectEqual(@as(u8, 3), sample[0]);
+    try std.testing.expectEqual(@as(u64, 4), cache.stats.provider_reads);
+    // Speculative failures remain invisible until that block is required.
+    const Denied = struct {
+        fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
+            return error.TestRemoteUnavailable;
+        }
+    };
+    var vtable = store.vtable.*;
+    vtable.stat = Denied.stat;
+    vtable.stat_with_cancellation = null;
+    capability.store.vtable = &vtable;
+    source.prefetch(block_bytes * 4, block_bytes);
+    query.drain(false);
+    try std.testing.expectError(error.TestRemoteUnavailable, source.readInto(block_bytes * 4, &sample));
+    source.prefetch(block_bytes * 5, block_bytes);
+    source.quiesceReadContext();
+    try std.testing.expectError(error.Canceled, source.readInto(0, &sample));
+    source.close();
+    open = false;
+    try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().workers);
+    try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().bytes);
 }

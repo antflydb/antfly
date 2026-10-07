@@ -80,6 +80,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
         try search.searchComposed(a, effective, .{ .ctx = &owner, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
     else if (effective.dense) |dense| try Execution.searchDense(&owner, a, effective, dense) else if (effective.sparse) |sparse| try Execution.searchSparse(&owner, a, effective, sparse) else if (effective.full_text) |text| try Execution.searchText(&owner, a, effective, text) else try Execution.dispatchText(&owner, a, effective);
     defer result.deinit();
+    try owner.attachHighlights(a, effective, &result);
     try context.ensureActive();
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
@@ -161,6 +162,52 @@ const Execution = struct {
         if (!std.mem.eql(u8, &root.domain, &self.domain)) return error.InvalidNativeLakeTextCorpus;
         if (!@import("../serverless/build/lake_rebuild.zig").bindingsEqual(root.binding, selected.binding)) return error.InvalidNativeLakeTextCorpus;
         return try self.server.lake_text_corpora.acquire(self.server.embedding_provider_runtime.io, self.store.artifactStore(), selected.artifact, root, self.schema_json, cached, self.context, cancellation);
+    }
+    fn attachHighlights(self: *Execution, a: A, req: types.SearchRequest, result: *types.SearchResult) !void {
+        const options = req.highlight orelse return;
+        if (req.defer_hierarchy_child_hydration or result.hits.len == 0) return;
+        if (req.full_text == null and req.full_text_queries.len == 0) return;
+        try self.context.ensureActive();
+        var pins: std.ArrayList(search.PinnedTextSource) = .empty;
+        defer {
+            for (pins.items) |*pin| pin.deinit();
+            pins.deinit(a);
+        }
+        var queries: std.ArrayList(search.HighlightQuery) = .empty;
+        defer queries.deinit(a);
+        if (req.full_text_queries.len != 0) {
+            for (req.full_text_queries) |named| {
+                var pin = (try acquire(self, named.index_name)) orelse continue;
+                pins.append(a, pin) catch |err| {
+                    pin.deinit();
+                    return err;
+                };
+                try queries.append(a, .{ .query = named.query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
+            }
+        } else if (req.full_text) |query| {
+            var pin = (try acquire(self, req.primary_text_index_name orelse req.index_name)) orelse return;
+            pins.append(a, pin) catch |err| {
+                pin.deinit();
+                return err;
+            };
+            try queries.append(a, .{ .query = query, .text_analysis = pin.text_analysis, .runtime_schema = pin.runtime_schema, .selected_field = pin.selected_field });
+        }
+        if (queries.items.len == 0) return;
+        // Highlight the original source even when result shaping projected it
+        // away. Hydration keeps the same snapshot, deletes and reader lease.
+        var sources: ?[]?[]u8 = null;
+        defer if (sources) |items| {
+            for (items) |bytes| if (bytes) |owned| a.free(owned);
+            a.free(items);
+        };
+        if (!req.include_stored or (!req.include_all_fields and !req.defer_stored_projection)) {
+            const keys = try a.alloc([]const u8, result.hits.len);
+            defer a.free(keys);
+            for (result.hits, keys) |hit, *key| key.* = hit.id;
+            sources = try loadMany(self, a, keys);
+        }
+        try search.attachHighlightsWithIndexQueries(a, options, queries.items, result.hits, sources);
+        try self.context.ensureActive();
     }
     fn noLocal(_: ?*anyopaque, _: ?[]const u8) !?*local.storage_db_catalog_index_manager.IndexManager.TextIndex {
         return null;
@@ -385,6 +432,9 @@ const Execution = struct {
         return null;
     }
     fn project(raw: ?*anyopaque, a: A, req: types.SearchRequest, key: []const u8, bytes: []const u8) ![]u8 {
+        // Match the local DB contract: highlighting and other postprocessing
+        // consume original source; the public encoder applies deferred fields.
+        if (req.defer_stored_projection) return a.dupe(u8, bytes);
         return local.storage_db_query_projection.projectStoredBytesForSearch(a, req, key, bytes, .{ .ctx = raw, .load_chunks = absent, .load_embeddings = absent, .load_artifacts = absent });
     }
     fn visible(raw: ?*anyopaque, _: A, _: types.SearchHit) !bool {
@@ -450,4 +500,20 @@ test "external lake hydration projection narrows includes and retains exclusion 
     try std.testing.expect(projectionMayUse("*", "body"));
     try std.testing.expect(projectionMayUse("nested", "nested.value"));
     try std.testing.expect(!projectionMayUse("different.*", "nested.value"));
+}
+
+test "external lake deferred search projection retains highlight fields until public encoding" {
+    const a = std.testing.allocator;
+    const raw = "{\"body\":\"a needle in the source\",\"label\":\"row\"}";
+    var req: types.SearchRequest = .{ .fields = &.{"label"}, .include_all_fields = false, .defer_stored_projection = true };
+    const deferred = try Execution.project(null, a, req, "row", raw);
+    defer a.free(deferred);
+    try std.testing.expectEqualStrings(raw, deferred);
+    req.defer_stored_projection = false;
+    const projected = try Execution.project(null, a, req, "row", raw);
+    defer a.free(projected);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, projected, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("row", parsed.value.object.get("label").?.string);
+    try std.testing.expect(parsed.value.object.get("body") == null);
 }

@@ -44,13 +44,21 @@ pub const Source = union(enum) {
         length: u64,
         read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
         close: *const fn (*anyopaque) void,
+        /// Advisory bounded lookahead; errors belong to subsequent required reads.
+        prefetch: ?*const fn (*anyopaque, u64, u64) void = null,
         checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32 = null,
         retained_bytes: ?*const fn (*anyopaque) usize = null,
         /// Bind an independent query capability without changing the shared source.
         bind_read_context: ?*const fn (*anyopaque, std.mem.Allocator, *anyopaque) anyerror!Source = null,
         seal_read_context: ?*const fn (*anyopaque) void = null,
+        quiesce_read_context: ?*const fn (*anyopaque) void = null,
         resource_manager: ?*resources.ResourceManager = null,
     },
+
+    /// Stop query-owned work before its borrowed capability is released.
+    pub fn quiesceReadContext(self: Source) void {
+        if (self == .ranges) if (self.ranges.quiesce_read_context) |quiesce| quiesce(self.ranges.ptr);
+    }
 
     pub fn resourceManager(self: Source) ?*resources.ResourceManager {
         return switch (self) {
@@ -75,6 +83,11 @@ pub const Source = union(enum) {
             .contiguous => |bytes| @memcpy(out, bytes[@intCast(offset)..][0..out.len]),
             .ranges => |range| try range.read_into(range.ptr, offset, out),
         }
+    }
+
+    pub fn prefetch(self: Source, offset: u64, length: u64) void {
+        if (offset > self.len() or length > self.len() - offset or length == 0) return;
+        if (self == .ranges) if (self.ranges.prefetch) |hint| hint(self.ranges.ptr, offset, length);
     }
 
     pub fn retainedBytes(self: Source) usize {

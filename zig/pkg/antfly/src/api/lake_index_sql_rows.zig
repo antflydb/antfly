@@ -175,6 +175,19 @@ const Owner = struct {
         const covered = self.covered_blocks[row];
         return covered.block.cell(covered.row, column);
     }
+    fn coveredIdentity(raw: *anyopaque, row: usize, column: usize) !?u64 {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        const covered = self.covered_blocks[row];
+        return covered.block.dictionaryIdentity(covered.row, column, false);
+    }
+    fn coveredDictionary(raw: *anyopaque, a: A, column: usize) !?local.sql_execution_batch.Batch {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        // Each covering window belongs to exactly one authenticated block.
+        const dictionary = (try self.covered_blocks[0].block.dictionaryColumn(a, column, false)) orelse return null;
+        const indices = try a.alloc(u32, self.covered_blocks.len);
+        for (indices, self.covered_blocks) |*id, covered| id.* = dictionary.dictionary.indices[covered.row];
+        return .{ .dictionary = .{ .values = dictionary.dictionary.values, .indices = indices } };
+    }
     fn nextCovered(self: *Owner, limit: u32) !catalog.ColumnPage {
         if (limit == 0) return error.InvalidRelationalRowsRequest;
         try self.read_context.ensureActive();
@@ -210,11 +223,37 @@ const Owner = struct {
                 position.* = .{ .block = block, .row = candidate.row };
             }
             self.covered_blocks = covered;
-            self.covered_batch = .{ .reader = .{ .ptr = self, .read = coveredCell, .count = covered.len, .width = self.reader.root.cover.len } };
+            self.covered_batch = .{ .reader = .{ .ptr = self, .read = coveredCell, .read_identity = coveredIdentity, .read_dictionary = coveredDictionary, .count = covered.len, .width = self.reader.root.cover.len } };
             var selected: std.ArrayList(usize) = .empty;
-            for (covered, 0..) |_, row| {
+            const mask = try a.alloc(bool, covered.len);
+            @memset(mask, true);
+            // Evaluate each predicate once per dictionary identity. Surviving
+            // lanes alone participate, preserving short-circuit error behavior.
+            for (self.request.conditions) |condition| {
+                var results: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+                defer results.deinit(a);
+                var column: ?usize = null;
+                for (self.reader.root.cover, 0..) |name, i| if (std.mem.eql(u8, name, condition.column)) {
+                    column = i;
+                    break;
+                };
+                for (mask, 0..) |*keep, row| {
+                    if (!keep.*) continue;
+                    const one: catalog.ColumnPage = .{ .native = .{ .values = &self.covered_batch, .names = self.reader.root.cover }, .selection = &.{row} };
+                    const identity = if (column) |c| try self.covered_batch.dictionaryIdentity(row, c) else null;
+                    if (identity) |id| {
+                        if (results.get(id)) |cached| {
+                            keep.* = cached;
+                            continue;
+                        }
+                    }
+                    keep.* = try local.sql_lake_cursor.matchesColumns(one, a, self.table, &.{condition});
+                    if (identity) |id| try results.put(a, id, keep.*);
+                }
+            }
+            for (mask, 0..) |keep, row| {
+                if (!keep) continue;
                 const one: catalog.ColumnPage = .{ .native = .{ .values = &self.covered_batch, .names = self.reader.root.cover }, .selection = &.{row} };
-                if (!try local.sql_lake_cursor.matchesColumns(one, a, self.table, self.request.conditions)) continue;
                 if (self.dynamic) |filter| {
                     const values = try a.alloc(local.sql_scalar.Datum, filter.columns.len);
                     defer a.free(values);
@@ -704,4 +743,35 @@ test "external lake filtered row goals require every predicate to be enforced by
     try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
     request.conditions = &.{ .{ .column = "tenant", .op = .eq, .value = .{ .string = "a" } }, .{ .column = "ts", .op = .gte, .value = .{ .integer = 1 } }, .{ .column = "ts", .op = .gt, .value = .{ .integer = 5 } } };
     try std.testing.expect(!rangeEnforcesConditions(index, request, 1));
+}
+
+test "external lake covering batch preserves dictionary identity across reordered candidates and null domains" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Datum = local.sql_scalar.Datum;
+    var cells: [32][1]Datum = undefined;
+    var rows: [32]local.sql_operators.Row = undefined;
+    for (&cells, &rows, 0..) |*cell, *row, i| {
+        cell[0] = if (i == 0) .{} else if (i == 1) Datum.json(.null) else Datum.json(.{ .string = if (i % 2 == 0) "a repeated covering payload" else "another repeated covering payload" });
+        row.* = .{ .values = cell, .keys = &.{}, .ordinal = i };
+    }
+    const bytes = try local.sql_spill.encodeColumnarBlockAlloc(a, &rows, 1024 * 1024);
+    const block = try local.sql_spill.decodeColumnarBlockInArena(a, bytes, 1024 * 1024);
+    const positions = try a.alloc(@typeInfo(@TypeOf(@as(Owner, undefined).covered_blocks)).pointer.child, 5);
+    for (positions, [_]u16{ 31, 0, 1, 3, 2 }) |*position, row| position.* = .{ .block = block, .row = row };
+    var owner: Owner = undefined;
+    owner.covered_blocks = positions;
+    const batch: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &owner, .read = Owner.coveredCell, .read_identity = Owner.coveredIdentity, .read_dictionary = Owner.coveredDictionary, .count = positions.len, .width = 1 } };
+    try std.testing.expectEqual(try batch.dictionaryIdentity(0, 0), try batch.dictionaryIdentity(3, 0));
+    try std.testing.expect((try batch.dictionaryIdentity(1, 0)).? != (try batch.dictionaryIdentity(2, 0)).?);
+    const selected = try batch.select(a, &.{ 2, 4, 1, 0 });
+    const dictionary = (try selected.dictionaryColumn(a, 0)).?;
+    for (0..selected.len()) |i| {
+        const expected = try selected.cell(a, i, 0);
+        const actual = try dictionary.cell(a, i, 0);
+        try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+        try std.testing.expectEqual(std.meta.activeTag(expected.value), std.meta.activeTag(actual.value));
+        if (expected.value == .string) try std.testing.expectEqualStrings(expected.value.string, actual.value.string);
+    }
 }

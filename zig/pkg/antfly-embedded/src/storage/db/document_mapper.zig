@@ -2679,7 +2679,19 @@ pub fn highlightTextFieldsFromValue(
     text_analysis: introducer_mod.TextAnalysisConfig,
     schema: ?runtime_schema.TableSchema,
 ) ![]const HighlightTextField {
-    const extracted = try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
+    return highlightTextFieldsFromValueWithSelectedField(alloc, root, text_analysis, schema, null);
+}
+
+/// Keep highlight provenance identical to TextProjectionBatchBuilder, including
+/// explicit field indexes that override the table's general text mapping.
+pub fn highlightTextFieldsFromValueWithSelectedField(
+    alloc: Allocator,
+    root: std.json.Value,
+    text_analysis: introducer_mod.TextAnalysisConfig,
+    schema: ?runtime_schema.TableSchema,
+    selected_field: ?[]const u8,
+) ![]const HighlightTextField {
+    const extracted = if (selected_field) |field| try extractSelectedTextField(alloc, root, field) else try extractTextFieldsFromValue(alloc, root, text_analysis, schema, null);
     var fields = std.ArrayListUnmanaged(HighlightTextField).empty;
     for (extracted.fields) |field| {
         try fields.append(alloc, .{

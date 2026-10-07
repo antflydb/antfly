@@ -928,10 +928,24 @@ pub const IndexSnapshot = struct {
     term_doc_freq_cache_misses: u64,
     bm25_bound_table_cache_mu: std.atomic.Mutex,
     bm25_bound_table_cache: BM25BoundTableCache,
+    /// Query facades share scoring state only with this exact immutable corpus.
+    /// The owner contains no query capability; cache misses use this facade.
+    scoring_owner: ?*IndexSnapshot = null,
+
+    fn scoringCache(self: *const IndexSnapshot) *IndexSnapshot {
+        return self.scoring_owner orelse @constCast(self);
+    }
+
     /// Increment reference count. Returns self for chaining.
     pub fn retain(self: *IndexSnapshot) *IndexSnapshot {
         _ = @atomicRmw(u32, &self.ref_count, .Add, 1, .monotonic);
         return self;
+    }
+
+    /// A retained snapshot pins immutable data, not the opening query's
+    /// authority. Stop capability-bound work before releasing that authority.
+    pub fn quiesceReadContext(self: *IndexSnapshot) void {
+        for (self.segments) |segment| if (segment.query_source) |source| source.quiesceReadContext();
     }
 
     /// Decrement reference count. Frees the snapshot when the count reaches
@@ -973,6 +987,7 @@ pub const IndexSnapshot = struct {
             self.bm25_bound_table_cache.deinit(alloc);
         }
         self.global_total_field_len.deinit(alloc);
+        if (self.scoring_owner) |owner| owner.release();
         alloc.destroy(self);
     }
 
@@ -986,7 +1001,7 @@ pub const IndexSnapshot = struct {
             .k1_bits = @bitCast(config.k1),
             .b_bits = @bitCast(config.b),
         };
-        const mutable = @constCast(self);
+        const mutable = self.scoringCache();
         const cache_mu = &mutable.bm25_bound_table_cache_mu;
         while (!cache_mu.tryLock()) spinOrYield();
         defer cache_mu.unlock();
@@ -994,10 +1009,10 @@ pub const IndexSnapshot = struct {
         if (mutable.bm25_bound_table_cache.get(key)) |table| return table;
         if (mutable.bm25_bound_table_cache.count() >= max_bm25_bound_tables_per_snapshot) return null;
 
-        const table = try self.alloc.create(inverted.BM25BoundTable);
-        errdefer self.alloc.destroy(table);
+        const table = try mutable.alloc.create(inverted.BM25BoundTable);
+        errdefer mutable.alloc.destroy(table);
         table.* = inverted.BM25BoundTable.init(avg_doc_len, config);
-        try mutable.bm25_bound_table_cache.put(self.alloc, key, table);
+        try mutable.bm25_bound_table_cache.put(mutable.alloc, key, table);
         return table;
     }
 
@@ -1378,7 +1393,7 @@ pub const IndexSnapshot = struct {
 
     pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
         if (self.liveDocCount() == 0) return 0;
-        const mutable = @constCast(self);
+        const mutable = self.scoringCache();
         const adapted = TermDocFreqAdapted{ .field = field, .term = term };
         const adapted_ctx = TermDocFreqAdaptedCtx{};
         const cache_mu = &mutable.term_doc_freq_cache_mu;
@@ -1405,9 +1420,9 @@ pub const IndexSnapshot = struct {
         if (key_bytes > max_term_doc_freq_cache_key_bytes) return total;
         // Cache admission is optional. Memory pressure must not turn an
         // otherwise successful exact frequency read into a query failure.
-        const storage = self.alloc.alloc(u8, key_bytes) catch return total;
-        mutable.term_doc_freq_cache.ensureUnusedCapacity(self.alloc, 1) catch {
-            self.alloc.free(storage);
+        const storage = mutable.alloc.alloc(u8, key_bytes) catch return total;
+        mutable.term_doc_freq_cache.ensureUnusedCapacity(mutable.alloc, 1) catch {
+            mutable.alloc.free(storage);
             return total;
         };
         while (mutable.term_doc_freq_cache.count() >= max_term_doc_freq_cache_entries or
@@ -1426,7 +1441,7 @@ pub const IndexSnapshot = struct {
             const evicted = victim.key_ptr.*;
             _ = mutable.term_doc_freq_cache.remove(evicted);
             mutable.term_doc_freq_cache_key_bytes -= evicted.storage.len;
-            self.alloc.free(evicted.storage);
+            mutable.alloc.free(evicted.storage);
         }
         @memcpy(storage[0..field.len], field);
         @memcpy(storage[field.len..], term);
@@ -1693,6 +1708,7 @@ pub const IndexWriter = struct {
         transferred = true;
         for (segments) |*segment| segment.retain();
         errdefer snapshot_ref.release();
+        snapshot_ref.scoring_owner = old.scoringCache().retain();
         for (segments) |*segment| {
             if (segment.reader.postings_loader) |*loader| loader.context = context;
             if (segment.data == .native and segment.data.native == .ranges) {
@@ -3717,4 +3733,32 @@ fn boundNativeSnapshotScenario(a: Allocator) !void {
 test "external lake query-bound native snapshots retain their source and unwind every allocation failure" {
     try boundNativeSnapshotScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, boundNativeSnapshotScenario, .{});
+}
+
+test "external lake query scoring caches share only the exact immutable generation" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "one", .terms = &.{.{ .term = "common", .freq = 2, .norm = 2 }} }});
+    defer a.free(bytes);
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    var context: u8 = 0;
+    const first = try writer.acquireSnapshotWithReadContext(&context);
+    defer first.release();
+    try std.testing.expectEqual(@as(u32, 1), try first.termDocFreq(a, "body", "common"));
+    const table = (try first.bm25BoundTable(2, .{})).?;
+    const second = try writer.acquireSnapshotWithReadContext(&context);
+    defer second.release();
+    try std.testing.expectEqual(table, (try second.bm25BoundTable(2, .{})).?);
+    const owner = first.scoringCache();
+    try std.testing.expectEqual(@as(u64, 1), owner.term_doc_freq_cache_misses);
+    try std.testing.expectEqual(@as(u32, 1), try second.termDocFreq(a, "body", "common"));
+    try std.testing.expectEqual(@as(u64, 1), owner.term_doc_freq_cache_hits);
+    // Publishing a changed corpus must not inherit the old frequency cache.
+    try writer.addSegment(bytes);
+    const changed = try writer.acquireSnapshotWithReadContext(&context);
+    defer changed.release();
+    try std.testing.expect(changed.scoringCache() != owner);
+    try std.testing.expectEqual(@as(u32, 2), try changed.termDocFreq(a, "body", "common"));
+    try std.testing.expectEqual(@as(u32, 1), try first.termDocFreq(a, "body", "common"));
 }

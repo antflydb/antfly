@@ -3703,6 +3703,18 @@ pub const PostingsIterator = struct {
             try self.payload_buffer.ensureTotalCapacityPrecise(self.alloc, meta.doc_ctrl_len);
             self.payload_buffer.items.len = meta.doc_ctrl_len;
             try view.readInto(payload_offset, self.payload_buffer.items);
+            // Warm only the next document chunk. Streamed layouts interleave
+            // positions; never assume the bytes after this chunk are documents.
+            if (view.source == .ranges and view.source.ranges.prefetch != null and index + 1 < self.chunk_meta_count) lookahead: {
+                const next_meta = self.chunkMeta(index + 1) catch break :lookahead;
+                const next_offset: u64 = if (self.hasStreamedRecords()) blk2: {
+                    const record = self.streamedRecord(index + 1) catch break :lookahead;
+                    break :blk2 std.mem.readInt(u64, record[8..16], .little);
+                } else next_meta.doc_ctrl_off;
+                if (next_offset <= view.length and next_meta.doc_ctrl_len <= view.length - next_offset)
+                    view.source.prefetch(view.offset + next_offset, next_meta.doc_ctrl_len);
+            }
+
             break :blk self.payload_buffer.items;
         } else self.payload_data[@intCast(payload_offset)..][0..meta.doc_ctrl_len];
         var payload_cursor: usize = 0;

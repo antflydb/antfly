@@ -119,7 +119,9 @@ pub const PinnedTextSource = struct {
     runtime_schema: @FieldType(index_manager_mod.IndexManager.TextIndex, "runtime_schema"),
     owner: ?*anyopaque = null,
     release_owner: ?*const fn (*anyopaque) void = null,
+    selected_field: ?[]const u8 = null,
     pub fn deinit(self: *PinnedTextSource) void {
+        self.snapshot.quiesceReadContext();
         self.snapshot.release();
         if (self.release_owner) |release| release(self.owner.?);
         self.* = undefined;
@@ -18436,9 +18438,11 @@ pub const HighlightQuery = struct {
     query: types.TextQuery,
     text_analysis: introducer_mod.TextAnalysisConfig,
     runtime_schema: ?runtime_schema_mod.TableSchema,
+    selected_field: ?[]const u8 = null,
 };
 
 fn highlightUsesSchemaLessText(indexed: HighlightQuery) bool {
+    if (indexed.selected_field != null) return true;
     return if (indexed.runtime_schema) |schema| !mapper_mod.runtimeHasSchemaDrivenText(schema) else true;
 }
 
@@ -18795,7 +18799,7 @@ pub fn attachHighlightsWithIndexQueries(
         var fields = std.ArrayListUnmanaged([]const u8).empty;
         if (options.fields.len > 0) try fields.appendSlice(hit_arena, options.fields);
         for (indexed_queries, 0..) |indexed, query_index| {
-            text_fields[query_index] = try mapper_mod.highlightTextFieldsFromValue(hit_arena, parsed, indexed.text_analysis, indexed.runtime_schema);
+            text_fields[query_index] = try mapper_mod.highlightTextFieldsFromValueWithSelectedField(hit_arena, parsed, indexed.text_analysis, indexed.runtime_schema, indexed.selected_field);
             if (options.fields.len > 0) continue;
             for (text_fields[query_index]) |contribution| {
                 const referenced = for (entries.items) |entry| {
@@ -32099,4 +32103,22 @@ test "match_all native ordinal counts avoid materializing large identities and p
     executor.is_expired_key = null;
     try std.testing.expectEqual(@as(usize, 2), try visibleMatchAllOrdinalDocValueCandidateCount(a, .{}, executor, writer.snapshot(), &keyed, &ordinals));
     std.debug.print("ordinal-only counts id_bytes_avoided=393216 scratch_peak={d}\n", .{budget.peak});
+}
+
+test "external lake selected-field highlights follow native projection rather than general table text mapping" {
+    const a = std.testing.allocator;
+    const schema: runtime_schema_mod.TableSchema = .{ .full_text_documents = &.{.{ .name = "_default", .fields = &.{.{ .path = "title", .emitted_name = "title", .analyzer = "standard" }} }} };
+    const query: types.TextQuery = .{ .match = .{ .field = "body", .text = "needle" } };
+    for ([_]?[]const u8{ null, "body" }) |selected| {
+        var hits = [_]types.SearchHit{.{ .id = try a.dupe(u8, "doc"), .stored_data = try a.dupe(u8, "{\"body\":\"a needle in the source\",\"title\":\"needle\"}") }};
+        defer hits[0].deinit(a);
+        const queries = [_]HighlightQuery{.{ .query = query, .text_analysis = .{}, .runtime_schema = schema, .selected_field = selected }};
+        try attachHighlightsWithIndexQueries(a, .{}, &queries, &hits, null);
+        try std.testing.expectEqual(@as(usize, if (selected != null) 1 else 0), hits[0].highlights.len);
+        if (selected != null) {
+            try std.testing.expectEqualStrings("body", hits[0].highlights[0].field);
+            const fragment = hits[0].highlights[0].fragments[0];
+            try std.testing.expectEqualStrings("needle", fragment.text[fragment.spans[0].start..fragment.spans[0].end]);
+        }
+    }
 }

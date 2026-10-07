@@ -961,6 +961,28 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         assert len(hits) == 4, result
         assert {hit["_source"]["label"] for hit in hits} == {"row-17", "row-18", "row-129", "row-2055"}
         assert all(hit["_score"] > 0 for hit in hits)
+        # Highlight from the pinned original document, including fields omitted
+        # from the result projection. Returned source must stay projected.
+        highlight_request = dict(request, fields=["label"], highlight={"fields": ["body"]})
+        def assert_highlights(response, include_source=True):
+            highlighted = response["hits"]["hits"]
+            assert [hit["_id"] for hit in highlighted] == [hit["_id"] for hit in hits], response
+            for hit in highlighted:
+                if include_source:
+                    assert set(hit["_source"]) == {"label"}, hit
+                else:
+                    assert not hit.get("_source"), hit
+                fragments = hit["_highlights"]["body"]
+                assert fragments and any(
+                    fragment["text"][span["start"]:span["end"]].lower() == "needle"
+                    for fragment in fragments for span in fragment["spans"]), hit
+        assert_highlights(call("POST", "/tables/lake_text/query", highlight_request))
+        assert_highlights(call("POST", "/tables/lake_text/query",
+                               dict(highlight_request, full_text_index="all_text")))
+        assert_highlights(call("POST", "/tables/lake_text/query", dict(highlight_request, fields=[])),
+                          include_source=False)
+        all_highlighted = call("POST", "/tables/lake_text/query", dict(request, highlight={}))
+        assert all(hit["_highlights"]["body"] for hit in all_highlighted["hits"]["hits"]), all_highlighted
         prefix_request = dict(request, full_text_search={"prefix": "need", "field": "body"})
         prefix_result = call("POST", "/tables/lake_text/query", prefix_request)
         assert {hit["_id"] for hit in prefix_result["hits"]["hits"]} == {hit["_id"] for hit in hits}
@@ -1017,6 +1039,7 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         assert [(hit["_id"], hit["_score"]) for hit in dense_reopened["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in dense_result["hits"]["hits"]]
         sparse_reopened = call("POST", "/tables/lake_text/query", sparse_request)
         assert [(hit["_id"], hit["_score"]) for hit in sparse_reopened["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in sparse_result["hits"]["hits"]]
+        assert_highlights(call("POST", "/tables/lake_text/query", highlight_request))
         warm = call("POST", "/tables/lake_text/query", request)
         assert [(hit["_id"], hit["_score"]) for hit in warm["hits"]["hits"]] == [(hit["_id"], hit["_score"]) for hit in hits]
         prefix_reopened = call("POST", "/tables/lake_text/query", prefix_request)

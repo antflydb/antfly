@@ -567,6 +567,31 @@ pub const ColumnarBlock = struct {
         if (row >= self.count() or column >= self.values.len) return error.InvalidSqlSpill;
         return self.values[column].cell(row);
     }
+    /// Dictionary identities are local to this immutable block, including two
+    /// distinct identities for SQL NULL and JSON null.
+    pub fn dictionaryIdentity(self: ColumnarBlock, row: usize, column: usize, keys: bool) !?u64 {
+        const columns = if (keys) self.keys else self.values;
+        if (row >= self.count() or column >= columns.len) return error.InvalidSqlSpill;
+        const stored = columns[column];
+        if (stored.values != .dictionary) return null;
+        const flag = (stored.flags[row / 4] >> @as(u3, @intCast(row % 4 * 2))) & 3;
+        return if (flag != 0) flag - 1 else @as(u64, stored.values.dictionary.indices[row]) + 2;
+    }
+    pub fn dictionaryColumn(self: ColumnarBlock, a: Allocator, column: usize, keys: bool) !?@import("execution_batch.zig").Batch {
+        const columns = if (keys) self.keys else self.values;
+        if (column >= columns.len) return error.InvalidSqlSpill;
+        const stored = columns[column];
+        if (stored.values != .dictionary) return null;
+        const entries = stored.values.dictionary;
+        const values = try a.alloc(Datum, entries.size + 2);
+        errdefer a.free(values);
+        values[0] = .{};
+        values[1] = Datum.json(.null);
+        for (values[2..], 0..) |*value, index| value.* = Datum.json(entries.entry(index));
+        const indices = try a.alloc(u32, self.count());
+        for (indices, 0..) |*id, row| id.* = @intCast((try self.dictionaryIdentity(row, column, keys)).?);
+        return .{ .dictionary = .{ .values = values, .indices = indices } };
+    }
     pub fn keyCell(self: ColumnarBlock, row: usize, column: usize) !Datum {
         if (row >= self.count() or column >= self.keys.len) return error.InvalidSqlSpill;
         return self.keys[column].cell(row);
@@ -1169,25 +1194,12 @@ pub const Sequential = struct {
                 fn identity(raw: *anyopaque, row_index: usize, column: usize) anyerror!?u64 {
                     const view: *@This() = @ptrCast(@alignCast(raw));
                     const encoded = view.block.encoded orelse return null;
-                    const stored = (if (view.keys) encoded.keys else encoded.values)[column];
-                    if (stored.values != .dictionary) return null;
-                    const flag = (stored.flags[row_index / 4] >> @as(u3, @intCast(row_index % 4 * 2))) & 3;
-                    return if (flag != 0) flag - 1 else @as(u64, stored.values.dictionary.indices[row_index]) + 2;
+                    return encoded.dictionaryIdentity(row_index, column, view.keys);
                 }
                 fn dictionary(raw: *anyopaque, alloc: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
                     const view: *@This() = @ptrCast(@alignCast(raw));
                     const encoded = view.block.encoded orelse return null;
-                    const stored = (if (view.keys) encoded.keys else encoded.values)[column];
-                    if (stored.values != .dictionary) return null;
-                    const entries = stored.values.dictionary;
-                    const values = try alloc.alloc(Datum, entries.size + 2);
-                    errdefer alloc.free(values);
-                    values[0] = .{};
-                    values[1] = Datum.json(.null);
-                    for (values[2..], 0..) |*value, index| value.* = Datum.json(entries.entry(index));
-                    const indices = try alloc.alloc(u32, view.block.count());
-                    for (indices, 0..) |*id, row_index| id.* = @intCast((try identity(raw, row_index, column)).?);
-                    return .{ .dictionary = .{ .values = values, .indices = indices } };
+                    return encoded.dictionaryColumn(alloc, column, view.keys);
                 }
             };
             const view = try a.create(View);
@@ -2662,6 +2674,12 @@ fn portableColumnBlockScenario(a: Allocator) !void {
         try std.testing.expectEqualStrings(row.values[3].value.number_string, (try block.cell(index, 3)).value.number_string);
         try std.testing.expectEqual(row.keys[0].sql_null, (try block.keyCell(index, 0)).sql_null);
     }
+    const dictionary = (try block.dictionaryColumn(arena.allocator(), 0, false)).?;
+    try std.testing.expectEqual(try block.dictionaryIdentity(0, 0, false), try block.dictionaryIdentity(2, 0, false));
+    try std.testing.expect((try block.dictionaryIdentity(0, 0, false)).? != (try block.dictionaryIdentity(1, 0, false)).?);
+    const selected = try dictionary.select(arena.allocator(), &.{ 31, 0, 2 });
+    try std.testing.expectEqual(@as(i64, -9007199254740993), (try selected.cell(arena.allocator(), 0, 0)).value.integer);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try selected.cell(arena.allocator(), 2, 0)).value.integer);
     const borrowed = (try block.cell(0, 2)).value.string;
     try std.testing.expect(@intFromPtr(borrowed.ptr) >= @intFromPtr(bytes.ptr) and @intFromPtr(borrowed.ptr) + borrowed.len <= @intFromPtr(bytes.ptr) + bytes.len);
 }

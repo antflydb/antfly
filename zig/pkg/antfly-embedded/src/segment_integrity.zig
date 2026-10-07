@@ -85,7 +85,11 @@ pub const PagedSource = struct {
         allocator.destroy(self);
     }
     pub fn source(self: *PagedSource) source_mod.Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.original.len(), .read_into = read, .close = close, .resource_manager = self.original.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.original.len(), .read_into = read, .close = close, .prefetch = if (self.original == .ranges and self.original.ranges.prefetch != null) prefetch else null, .resource_manager = self.original.resourceManager() } };
+    }
+    fn prefetch(ptr: *anyopaque, offset: u64, length: u64) void {
+        const self: *PagedSource = @ptrCast(@alignCast(ptr));
+        self.original.prefetch(offset, length);
     }
     fn close(ptr: *anyopaque) void {
         const self: *PagedSource = @ptrCast(@alignCast(ptr));
