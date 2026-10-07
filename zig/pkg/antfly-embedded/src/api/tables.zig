@@ -169,6 +169,21 @@ pub fn schemaDerivedAlgebraicIndexValueAlloc(
             try cloneJsonValueAlloc(alloc, entry.value_ptr.*),
         );
     }
+    if (source.object.get("aggregates")) |aggregates| {
+        try validatePublicAggregateRecipes(aggregates);
+        var canonical: std.json.Array = .init(alloc);
+        for (aggregates.array.items) |recipe| {
+            var object: std.json.ObjectMap = .empty;
+            var fields = recipe.object.iterator();
+            while (fields.next()) |entry| {
+                if (entry.value_ptr.* == .null) continue;
+                try object.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try cloneJsonValueAlloc(alloc, entry.value_ptr.*));
+            }
+            try canonical.append(.{ .object = object });
+        }
+        try derived.object.put(alloc, "aggregates", .{ .array = canonical });
+        try derived.object.put(alloc, "materializations", .{ .array = canonical });
+    }
     return derived;
 }
 
@@ -182,6 +197,40 @@ pub fn schemaDerivedAlgebraicIndexValueAlloc(
 /// preserved from the stored config, then revalidated against the regenerated
 /// schema before publication. Returns the original bytes when there are no
 /// algebraic indexes to refresh.
+/// Public recipes describe SQL semantics, never physical reducer state or
+/// private planner policy. Schema derivation validates the referenced fields.
+pub fn validatePublicAggregateRecipes(value: std.json.Value) !void {
+    if (value != .array or value.array.items.len > 64) return error.InvalidCreateTableRequest;
+    for (value.array.items, 0..) |recipe, index| {
+        if (recipe != .object) return error.InvalidCreateTableRequest;
+        var fields = recipe.object.iterator();
+        while (fields.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "name") and !std.mem.eql(u8, entry.key_ptr.*, "op") and !std.mem.eql(u8, entry.key_ptr.*, "group_by") and !std.mem.eql(u8, entry.key_ptr.*, "measure")) return error.InvalidCreateTableRequest;
+        }
+        const name = recipe.object.get("name") orelse return error.InvalidCreateTableRequest;
+        const op = recipe.object.get("op") orelse return error.InvalidCreateTableRequest;
+        if (name != .string or name.string.len == 0 or name.string.len > 128 or op != .string) return error.InvalidCreateTableRequest;
+        const known = for ([_][]const u8{ "count", "sum", "avg", "min", "max" }) |kind| {
+            if (std.mem.eql(u8, op.string, kind)) break true;
+        } else false;
+        if (!known) return error.InvalidCreateTableRequest;
+        const measure = recipe.object.get("measure");
+        if (measure != null and measure.? != .null) {
+            if (measure.? != .string or measure.?.string.len == 0) return error.InvalidCreateTableRequest;
+        } else if (!std.mem.eql(u8, op.string, "count")) return error.InvalidCreateTableRequest;
+        if (recipe.object.get("group_by")) |groups| {
+            if (groups != .null) {
+                if (groups != .array or groups.array.items.len > 32) return error.InvalidCreateTableRequest;
+                for (groups.array.items, 0..) |key, key_index| {
+                    if (key != .string or key.string.len == 0) return error.InvalidCreateTableRequest;
+                    for (groups.array.items[0..key_index]) |previous| if (std.mem.eql(u8, previous.string, key.string)) return error.InvalidCreateTableRequest;
+                }
+            }
+        }
+        for (value.array.items[0..index]) |previous| if (std.mem.eql(u8, previous.object.get("name").?.string, name.string)) return error.InvalidCreateTableRequest;
+    }
+}
+
 pub fn isAlgebraicInternalConfigField(field: []const u8) bool {
     const internal_fields = [_][]const u8{
         "materializations",
@@ -210,4 +259,64 @@ pub fn parseJsonValueAlloc(alloc: std.mem.Allocator, body: []const u8) !std.json
 
 pub fn cloneJsonValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) !std.json.Value {
     return try json_helpers.cloneJsonValue(alloc, value);
+}
+
+/// Admission and publication share a table-wide declaration ceiling. Public
+/// recipes must not commit definitions that can never fit their artifact directory.
+pub fn validateLakeIndexCapacity(a: std.mem.Allocator, schema_json: []const u8, indexes_json: []const u8) !void {
+    var schema = try std.json.parseFromSlice(std.json.Value, a, schema_json, .{});
+    defer schema.deinit();
+    if (schema.value != .object) return;
+    const base_source = schema.value.object.get("base_source") orelse return;
+    if (base_source != .object) return;
+    const kind = base_source.object.get("kind") orelse return;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "external")) return;
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, indexes_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCreateTableRequest;
+    var count: usize = 0;
+    if (schema.value.object.get("relational_indexes")) |rows| {
+        if (rows != .array) return error.InvalidCreateTableRequest;
+        count = rows.array.items.len;
+    }
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        const config = entry.value_ptr.*;
+        if (config != .object) return error.InvalidCreateTableRequest;
+        const index_kind = config.object.get("type") orelse continue;
+        if (index_kind != .string) return error.InvalidCreateTableRequest;
+        if (std.mem.eql(u8, index_kind.string, "algebraic")) {
+            const recipes = config.object.get("materializations") orelse config.object.get("aggregates") orelse continue;
+            if (recipes != .array) return error.InvalidCreateTableRequest;
+            count += recipes.array.items.len;
+        } else {
+            count += 1;
+            if (config.object.get("metrics")) |metrics| {
+                if (metrics == .object) count += metrics.object.count();
+            }
+        }
+        if (count > @import("../metadata/lake_index_catalog.zig").max_directory_artifacts) return error.InvalidCreateTableRequest;
+    }
+}
+
+test "lake catalog admission bounds recipes across indexes before commit" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var configs = std.json.ObjectMap.empty;
+    var recipes: std.json.Array = .init(aa);
+    for (0..64) |_| try recipes.append(.null);
+    for (0..65) |index| {
+        var config = std.json.ObjectMap.empty;
+        try config.put(aa, "type", .{ .string = "algebraic" });
+        try config.put(aa, "materializations", .{ .array = recipes });
+        try configs.put(aa, try std.fmt.allocPrint(aa, "index{d}", .{index}), .{ .object = config });
+    }
+    const schema = "{\"base_source\":{\"kind\":\"external\"}}";
+    const too_many = try std.json.Stringify.valueAlloc(aa, std.json.Value{ .object = configs }, .{});
+    try std.testing.expectError(error.InvalidCreateTableRequest, validateLakeIndexCapacity(a, schema, too_many));
+    _ = configs.orderedRemove("index64");
+    const accepted = try std.json.Stringify.valueAlloc(aa, std.json.Value{ .object = configs }, .{});
+    try validateLakeIndexCapacity(a, schema, accepted);
 }

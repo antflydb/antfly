@@ -472,7 +472,19 @@ pub const Aggregate = struct {
 };
 
 pub const AggregateSpec = struct { kind: Aggregate.Kind, input_type: ?ast.ColumnType = null, distinct: bool = false };
-pub const GroupResult = struct { keys: []const Datum, aggregates: []const Datum, ordinal: u64 };
+pub const GroupBatch = struct {
+    keys: @import("execution_batch.zig").Batch,
+    aggregates: @import("execution_batch.zig").Batch,
+    ordinals: []const u64,
+};
+pub const GroupResult = struct {
+    keys: []const Datum,
+    aggregates: []const Datum,
+    ordinal: u64,
+    /// Partial providers may supply selected reducer slots. Final results and
+    /// dense partials leave this null; slot identities never depend on aliases.
+    aggregate_slots: ?[]const u16 = null,
+};
 
 /// Build-side ownership for a streaming hash join. Probe rows remain borrowed
 /// from one native page; only the build relation occupies retained memory.
@@ -843,6 +855,44 @@ pub const Grouped = struct {
         self.clearGroups();
         self.external = external;
     }
+    /// Borrowed columns remain valid until the next result pull. Retaining
+    /// consumers admit them directly; scalar consumers materialize at the edge.
+    pub fn nextResultBatch(self: *Grouped, a: Allocator, maximum: usize, exact: bool) !?GroupBatch {
+        if (maximum == 0) return error.InvalidSqlLimit;
+        if (self.failed) return error.InvalidSqlBackendResponse;
+        if (self.external) |external| {
+            const result = try external.nextBatch(a, maximum, exact);
+            if (result != null and external.output_count > self.limits.groups) return error.SqlProgramLimitExceeded;
+            self.finished = true;
+            return result;
+        }
+        if (self.result_cursor == self.groups.items.len) return null;
+        const begin = self.result_cursor;
+        const count = @min(maximum, self.groups.items.len - begin);
+        const ordinals = try a.alloc(u64, count);
+        for (self.groups.items[begin..][0..count], ordinals) |group, *ordinal| ordinal.* = group.ordinal;
+        const Reader = struct {
+            group: *Grouped,
+            begin: usize,
+            exact: bool,
+            fn cell(raw: *anyopaque, alloc: Allocator, row: usize, column: usize) anyerror!Datum {
+                const reader: *@This() = @ptrCast(@alignCast(raw));
+                const index = reader.begin + row;
+                if (!reader.exact) return reader.group.state_columns[column].finish(index);
+                const state = try reader.group.state_columns[column].snapshot(alloc, index);
+                return @import("aggregate_partial.zig").cell(alloc, state);
+            }
+        };
+        const reader = try a.create(Reader);
+        reader.* = .{ .group = self, .begin = begin, .exact = exact };
+        self.result_cursor += count;
+        self.finished = true;
+        return .{
+            .keys = .{ .retained = .{ .store = &self.key_columns, .begin = begin, .count = count } },
+            .aggregates = .{ .reader = .{ .ptr = reader, .read = Reader.cell, .count = count, .width = self.specs.len } },
+            .ordinals = ordinals,
+        };
+    }
     pub fn nextResult(self: *Grouped, alloc: Allocator) !?GroupResult {
         if (self.external) |external| {
             const result = try external.next(alloc);
@@ -936,6 +986,9 @@ pub const Grouped = struct {
         for (keys) |column| for (column) |value| {
             needed +|= (try datumBytes(value)) *| 4;
         };
+        for (self.specs, inputs) |spec, column| if (spec.kind == .min or spec.kind == .max) {
+            for (column) |value| needed +|= (try datumBytes(value)) *| 4;
+        };
         var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
         for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) {
             fast = false;
@@ -960,6 +1013,50 @@ pub const Grouped = struct {
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
         }
         for (self.state_columns, inputs) |*column, values| try column.updateBatch(self.budget.allocator(), ids, values);
+    }
+
+    /// Keep encoded expression columns intact through group ID resolution.
+    /// Admission precedes mutation; disk, DISTINCT and pattern reducers use
+    /// the same ordered fallback as row input.
+    pub fn addEncodedColumns(self: *Grouped, keys: []const @import("execution_batch.zig").Batch, inputs: []const @import("execution_batch.zig").Batch, count: usize) !void {
+        if (self.failed or self.finished or inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
+        for (keys) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
+        for (inputs) |column| if (column.len() != count or column.width() != 1) return error.InvalidSqlBackendResponse;
+        if (count == 0) return;
+        var scratch = std.heap.ArenaAllocator.init(self.backing);
+        defer scratch.deinit();
+        const a = scratch.allocator();
+        const row_keys = try a.alloc(Datum, keys.len);
+        const row_inputs = try a.alloc(Datum, inputs.len);
+        var needed: usize = 4096 +| count *| (512 +| self.specs.len *| @sizeOf(Aggregate) *| 2);
+        for (keys) |column| for (0..count) |index| {
+            needed +|= (try datumBytes(try column.cell(a, index, 0))) *| 4;
+        };
+        for (self.specs, inputs) |spec, column| if (spec.kind == .min or spec.kind == .max) {
+            for (0..count) |index| needed +|= (try datumBytes(try column.cell(a, index, 0))) *| 4;
+        };
+        var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) {
+            fast = false;
+        };
+        if (!fast) {
+            for (0..count) |index| {
+                for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
+                for (inputs, row_inputs) |column, *cell| cell.* = try column.cell(a, index, 0);
+                try self.add(row_keys, row_inputs);
+            }
+            return;
+        }
+        const ids = try a.alloc(usize, count);
+        self.key_count = keys.len;
+        errdefer self.failed = true;
+        const hashes = try @import("batch_hash.zig").encodedColumns(a, keys, count, true);
+        for (ids, 0..) |*id, index| {
+            for (keys, row_keys) |column, *cell| cell.* = try column.cell(a, index, 0);
+            id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
+            self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+        }
+        for (self.state_columns, inputs) |*column, values| try column.updateEncoded(self.budget.allocator(), ids, values);
     }
 
     /// Global COUNT, integer SUM and boolean reductions do not need a hash
@@ -1012,25 +1109,74 @@ pub const Grouped = struct {
                 const previous = self.groups.items.len;
                 const slot = try self.resolveGroup(keys);
                 self.groups.items[slot].ordinal = if (slot >= previous) ordinal else @min(self.groups.items[slot].ordinal, ordinal);
-                for (self.state_columns, states) |*column, state| try column.mergeExact(slot, state);
+                for (self.state_columns, states) |*column, state| try column.mergeExact(self.budget.allocator(), slot, state);
             }
         }
         self.rows_seen = std.math.add(u64, self.rows_seen, source.rows_seen) catch return error.SqlNumericOutOfRange;
     }
     pub fn importPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
-        if (cells.len != self.specs.len * 7) return error.InvalidSqlSpill;
-        const inputs = try self.backing.alloc(Datum, self.specs.len);
-        defer self.backing.free(inputs);
+        return self.importPartialMapped(keys, cells, null, ordinal);
+    }
+    pub fn importPartialMapped(self: *Grouped, keys: []const Datum, cells: []const Datum, slots: ?[]const u16, ordinal: u64) !void {
+        if (slots) |mapping| {
+            if (mapping.len == 0 or mapping.len != cells.len or mapping.len > self.specs.len) return error.InvalidSqlSpill;
+            for (mapping, 0..) |slot, i| {
+                if (slot >= self.specs.len) return error.InvalidSqlSpill;
+                for (mapping[0..i]) |prior| if (prior == slot) return error.InvalidSqlSpill;
+            }
+        } else if (cells.len != self.specs.len) return error.InvalidSqlSpill;
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const states = try a.alloc(Aggregate, cells.len);
+        var initialized: usize = 0;
+        defer for (states[0..initialized]) |*state| state.deinit();
+        // Decode and validate every signature before mutating destination state.
+        for (states, cells, 0..) |*state, value, i| {
+            const slot = if (slots) |mapping| mapping[i] else i;
+            state.* = try @import("aggregate_partial.zig").decode(a, value, self.specs[slot]);
+            initialized += 1;
+        }
+        var input_storage: [256]Datum = undefined;
+        const inputs = input_storage[0..self.specs.len];
         @memset(inputs, .{});
         self.key_count = keys.len;
-        if (self.external == null and self.limits.spill != null and !try self.canRetain(keys, inputs)) try self.startSpill();
-        if (self.external) |external| return external.appendPartial(keys, cells, ordinal);
-        try self.addOrdered(keys, inputs, ordinal);
-        const index = self.last_group.?;
-        for (self.state_columns, 0..) |*column, slot| {
-            var state = try column.snapshot(self.backing, index);
-            try @import("spill_grouped.zig").Grouped.merge(&state, cells[slot * 7 ..][0..7]);
-            column.set(index, state);
+        var state_bytes: usize = 0;
+        for (states) |state| {
+            if (state.selected) |selected| state_bytes +|= (try datumBytes(selected.row.values[0])) *| 4;
+            for (state.distinct_values.items) |entry| state_bytes +|= (try datumBytes(entry.row.row.values[0]) +| @sizeOf(Aggregate)) *| 4;
+        }
+        if (self.external == null and self.limits.spill != null and (state_bytes > self.budget.limit -| self.budget.live or !try self.canRetain(keys, inputs))) try self.startSpill();
+        if (self.external) |external| {
+            if (slots) |mapping| {
+                // Existing spill frames are dense. Expand only at this durable
+                // boundary, while the in-memory typed columns touch used slots.
+                const dense = try a.alloc(Aggregate, self.specs.len);
+                var initialized_dense: usize = 0;
+                defer for (dense[0..initialized_dense]) |*state| state.deinit();
+                for (dense, self.specs) |*state, spec| {
+                    state.* = try Aggregate.init(a, spec.kind, spec.input_type);
+                    state.distinct = spec.distinct;
+                    initialized_dense += 1;
+                }
+                for (mapping, cells) |slot, value| {
+                    // A separate decode gives the dense frame its own payload
+                    // ownership and keeps failure cleanup independent.
+                    const replacement = try @import("aggregate_partial.zig").decode(a, value, self.specs[slot]);
+                    dense[slot].deinit();
+                    dense[slot] = replacement;
+                }
+                return external.partial(keys, dense, ordinal);
+            }
+            return external.partial(keys, states, ordinal);
+        }
+        errdefer self.failed = true;
+        const previous = self.groups.items.len;
+        const index = try self.resolveGroup(keys);
+        self.groups.items[index].ordinal = if (index >= previous) ordinal else @min(self.groups.items[index].ordinal, ordinal);
+        for (states, 0..) |state, i| {
+            const slot = if (slots) |mapping| mapping[i] else i;
+            try self.state_columns[slot].mergeExact(self.budget.allocator(), index, state);
         }
     }
     pub fn exportPartial(self: *Grouped, external: *@import("spill_grouped.zig").Grouped) !void {
@@ -1801,4 +1947,260 @@ test "SQL bounded native join admission transfers a prefix without a chain spool
         matches += 1;
     }
     try std.testing.expectEqual(@as(usize, count), matches);
+}
+
+fn groupBatchScenario(a: Allocator) !void {
+    const specs = [_]AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .bool_or, .input_type = .boolean } };
+    const grouped = try Grouped.create(a, &specs, .{});
+    defer grouped.deinit();
+    for (0..128) |row| try grouped.add(&.{ Datum.json(.{ .integer = @intCast(row % 8) }), if (row % 2 == 0) .{} else Datum.json(.null) }, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = @intCast(row) }), Datum.json(.{ .bool = row % 2 == 0 }) });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var seen: usize = 0;
+    while (true) {
+        _ = arena.reset(.free_all);
+        const batch = (try grouped.nextResultBatch(arena.allocator(), 3, false)) orelse break;
+        for (0..batch.ordinals.len) |row| {
+            const key = (try batch.keys.cell(a, row, 0)).value.integer;
+            const null_ = try batch.keys.cell(a, row, 1);
+            try std.testing.expectEqual(@mod(key, 2) == 0, null_.sql_null);
+            try std.testing.expectEqual(@as(i64, 16), (try batch.aggregates.cell(a, row, 0)).value.integer);
+            try std.testing.expectEqual(16 * key + 960, (try batch.aggregates.cell(a, row, 1)).value.integer);
+            try std.testing.expectEqual(@mod(key, 2) == 0, (try batch.aggregates.cell(a, row, 2)).value.bool);
+            seen += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8), seen);
+}
+test "SQL grouped result batches preserve null domains and unwind allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, groupBatchScenario, .{});
+}
+
+test "SQL typed aggregate partial batches preserve i128 sums through cancellation" {
+    const a = std.testing.allocator;
+    const specs = [_]AggregateSpec{.{ .kind = .sum, .input_type = .integer }};
+    const positive = try Grouped.create(a, &specs, .{});
+    defer positive.deinit();
+    const merged = try Grouped.create(a, &specs, .{});
+    defer merged.deinit();
+    for (0..3) |_| try positive.add(&.{Datum.json(.{ .integer = 7 })}, &.{Datum.json(.{ .integer = std.math.maxInt(i64) })});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const batch = (try positive.nextResultBatch(arena.allocator(), 64, true)).?;
+    try std.testing.expectEqual(@as(usize, 1), batch.aggregates.width());
+    var sum = try @import("aggregate_partial.zig").decode(arena.allocator(), try batch.aggregates.cell(arena.allocator(), 0, 0), specs[0]);
+    defer sum.deinit();
+    try std.testing.expectEqual(@as(i128, 27670116110564327421), sum.integer_sum);
+    try merged.importPartial(try batch.keys.row(arena.allocator(), 0), try batch.aggregates.row(arena.allocator(), 0), batch.ordinals[0]);
+    for (0..3) |_| try merged.add(&.{Datum.json(.{ .integer = 7 })}, &.{Datum.json(.{ .integer = -std.math.maxInt(i64) })});
+    const result = (try merged.nextResultBatch(arena.allocator(), 64, false)).?;
+    try std.testing.expectEqual(@as(i64, 0), (try result.aggregates.cell(a, 0, 0)).value.integer);
+}
+
+test "SQL binary partial import composes typed extrema floats distinct and pattern domains" {
+    const a = std.testing.allocator;
+    const specs = [_]AggregateSpec{
+        .{ .kind = .count },
+        .{ .kind = .sum, .input_type = .integer },
+        .{ .kind = .sum, .input_type = .number },
+        .{ .kind = .avg, .input_type = .number },
+        .{ .kind = .min, .input_type = .integer },
+        .{ .kind = .max, .input_type = .number },
+        .{ .kind = .min, .input_type = .string },
+        .{ .kind = .max, .input_type = .boolean },
+        .{ .kind = .min, .input_type = .json },
+        .{ .kind = .sum, .input_type = .integer, .distinct = true },
+        .{ .kind = .pattern_set, .input_type = .string, .distinct = true },
+    };
+    const target = try Grouped.create(a, &specs, .{});
+    defer target.deinit();
+    const reference = try Grouped.create(a, &specs, .{});
+    defer reference.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (0..2) |partition| {
+        const source = try Grouped.create(a, &specs, .{});
+        defer source.deinit();
+        for (0..3) |i| {
+            const n: i64 = @intCast(i + partition);
+            const row = [_]Datum{
+                Datum.json(.{ .integer = 1 }),                               Datum.json(.{ .integer = n }),
+                Datum.json(.{ .float = @floatFromInt(n) }),                  Datum.json(.{ .float = @floatFromInt(n) }),
+                Datum.json(.{ .integer = n }),                               Datum.json(.{ .float = @floatFromInt(n) }),
+                Datum.json(.{ .string = if (partition == 0) "z" else "a" }), Datum.json(.{ .bool = partition == 1 }),
+                Datum.json(.null),                                           Datum.json(.{ .integer = n }),
+                if (i == 0) Datum{} else Datum.json(.{ .string = "%cat%" }),
+            };
+            try source.add(&.{}, &row);
+            try reference.add(&.{}, &row);
+        }
+        const partial = (try source.nextResultBatch(arena.allocator(), 1, true)).?;
+        try target.importPartial(&.{}, try partial.aggregates.row(arena.allocator(), 0), @intCast(partition));
+    }
+    const actual = try target.resultAt(arena.allocator(), 0);
+    const expected = try reference.resultAt(arena.allocator(), 0);
+    for (actual.aggregates, expected.aggregates) |got, wanted| {
+        try std.testing.expectEqual(wanted.sql_null, got.sql_null);
+        const left = try std.json.Stringify.valueAlloc(arena.allocator(), got.value, .{});
+        const right = try std.json.Stringify.valueAlloc(arena.allocator(), wanted.value, .{});
+        try std.testing.expectEqualStrings(right, left);
+    }
+    try std.testing.expect(!actual.aggregates[8].sql_null and actual.aggregates[8].value == .null);
+}
+
+fn mixedExtremaPartialScenario(a: Allocator) !void {
+    for ([_]Aggregate.Kind{ .min, .max }) |kind| {
+        const specs = [_]AggregateSpec{.{ .kind = kind, .input_type = .number }};
+        const source = try Grouped.create(a, &specs, .{});
+        defer source.deinit();
+        const target = try Grouped.create(a, &specs, .{});
+        defer target.deinit();
+        const exact: i64 = if (kind == .min) -9007199254740993 else 9007199254740993;
+        for (0..3) |_| try source.add(&.{}, &.{Datum.json(.{ .integer = exact })});
+        try target.add(&.{}, &.{Datum.json(.{ .float = 2.5 })});
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const partial = (try source.nextResultBatch(arena.allocator(), 1, true)).?;
+        try target.importPartial(&.{}, try partial.aggregates.row(arena.allocator(), 0), 0);
+        const state = try target.state_columns[0].snapshot(arena.allocator(), 0);
+        try std.testing.expectEqual(@as(u64, 4), state.count);
+        const result = (try target.nextResultBatch(arena.allocator(), 1, false)).?;
+        try std.testing.expectEqual(exact, (try result.aggregates.cell(a, 0, 0)).value.integer);
+    }
+}
+test "SQL mixed numeric extrema partials promote without narrowing or losing counts" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, mixedExtremaPartialScenario, .{});
+}
+
+fn encodedGroupScenario(a: Allocator) !void {
+    const Batch = @import("execution_batch.zig").Batch;
+    const specs = [_]AggregateSpec{ .{ .kind = .count, .input_type = .integer }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .sum, .input_type = .number } };
+    const encoded = try Grouped.create(a, &specs, .{});
+    defer encoded.deinit();
+    const reference = try Grouped.create(a, &specs, .{});
+    defer reference.deinit();
+    const indices = [_]u32{ 0, 1, 0, 2, 1, 2, 0, 1 };
+    const keys: Batch = .{ .dictionary = .{ .values = &.{ Datum.json(.{ .string = "repeated" }), .{}, Datum.json(.null) }, .indices = &indices } };
+    const integers: Batch = .{ .dictionary = .{ .values = &.{ Datum.json(.{ .integer = 9007199254740993 }), .{}, Datum.json(.{ .integer = -9007199254740993 }) }, .indices = &indices } };
+    const numbers: Batch = .{ .dictionary = .{ .values = &.{ Datum.json(.{ .float = 1e16 }), Datum.json(.{ .float = -1e16 }), Datum.json(.{ .float = 1.5 }) }, .indices = &indices } };
+    try encoded.addEncodedColumns(&.{keys}, &.{ integers, integers, numbers }, indices.len);
+    for (0..indices.len) |index| try reference.add(&.{try keys.cell(a, index, 0)}, &.{ try integers.cell(a, index, 0), try integers.cell(a, index, 0), try numbers.cell(a, index, 0) });
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectEqualDeep(try reference.finish(arena.allocator()), try encoded.finish(arena.allocator()));
+}
+test "SQL encoded grouping preserves exact integers floating lane order and distinct NULL keys" {
+    try encodedGroupScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, encodedGroupScenario, .{});
+}
+
+test "SQL exact partial restoration preserves compensated floating sum bits" {
+    const a = std.testing.allocator;
+    const specs = [_]AggregateSpec{.{ .kind = .sum, .input_type = .number }};
+    for ([_]f64{ 9007199254740994.0, -9007199254740994.0 }) |sum| {
+        for ([_]f64{ 1.0, -1.0 }) |compensation| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            const state: Aggregate = .{ .alloc = scratch, .kind = .sum, .input_type = .number, .count = 3, .number_sum = sum, .compensation = compensation };
+            const encoded = try @import("aggregate_partial.zig").cell(scratch, state);
+            const target = try Grouped.create(a, &specs, .{});
+            defer target.deinit();
+            try target.importPartial(&.{}, &.{encoded}, 0);
+            const result = try target.resultAt(scratch, 0);
+            try std.testing.expectEqual(@as(u64, @bitCast(sum)), @as(u64, @bitCast(result.aggregates[0].value.float)));
+            const restored = try target.state_columns[0].snapshot(scratch, 0);
+            try std.testing.expectEqual(@as(u64, @bitCast(compensation)), @as(u64, @bitCast(restored.compensation)));
+            try std.testing.expectEqual(@as(u64, 3), restored.count);
+        }
+    }
+}
+
+test "SQL sparse partial slots validate before mutation and retain untouched floating state" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const specs = [_]AggregateSpec{ .{ .kind = .sum, .input_type = .number }, .{ .kind = .count } };
+    const target = try Grouped.create(a, &specs, .{});
+    defer target.deinit();
+    const sum: Aggregate = .{ .alloc = pa, .kind = .sum, .input_type = .number, .count = 3, .number_sum = 9007199254740994.0, .compensation = 1.0 };
+    const sum_cell = try @import("aggregate_partial.zig").cell(pa, sum);
+    const count_cell = try @import("aggregate_partial.zig").cell(pa, .{ .alloc = pa, .kind = .count, .input_type = null, .count = 7 });
+    try std.testing.expectError(error.InvalidSqlSpill, target.importPartialMapped(&.{}, &.{count_cell}, &.{2}, 0));
+    try std.testing.expectError(error.InvalidSqlSpill, target.importPartialMapped(&.{}, &.{ sum_cell, sum_cell }, &.{ 0, 0 }, 0));
+    try std.testing.expectEqual(@as(usize, 0), target.groups.items.len);
+    try target.importPartialMapped(&.{}, &.{sum_cell}, &.{0}, 0);
+    try target.importPartialMapped(&.{}, &.{count_cell}, &.{1}, 0);
+    const restored = try target.state_columns[0].snapshot(pa, 0);
+    try std.testing.expectEqual(@as(u64, @bitCast(sum.number_sum)), @as(u64, @bitCast(restored.number_sum)));
+    try std.testing.expectEqual(@as(u64, @bitCast(sum.compensation)), @as(u64, @bitCast(restored.compensation)));
+    const result = try target.resultAt(pa, 0);
+    try std.testing.expectEqual(@as(i64, 7), result.aggregates[1].value.integer);
+}
+
+test "SQL sparse partial slots survive native group spilling" {
+    const a = std.testing.allocator;
+    var context: u8 = 0;
+    var spill: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &context, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .async_writes = false };
+    defer spill.deinit();
+    const specs = [_]AggregateSpec{ .{ .kind = .sum, .input_type = .integer }, .{ .kind = .count } };
+    const target = try Grouped.create(a, &specs, .{ .bytes = 16 * 1024, .spill = &spill });
+    defer target.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const pa = arena.allocator();
+    const sum = try @import("aggregate_partial.zig").cell(pa, .{ .alloc = pa, .kind = .sum, .input_type = .integer, .count = 1, .integer_sum = 9007199254740993 });
+    const count = try @import("aggregate_partial.zig").cell(pa, .{ .alloc = pa, .kind = .count, .input_type = null, .count = 1 });
+    for (0..600) |key| try target.importPartialMapped(&.{Datum.json(.{ .integer = @intCast(key) })}, &.{sum}, &.{0}, key);
+    for (0..600) |key| try target.importPartialMapped(&.{Datum.json(.{ .integer = @intCast(599 - key) })}, &.{count}, &.{1}, 599 - key);
+    try std.testing.expect(target.external != null);
+    var seen: usize = 0;
+    while (true) {
+        var page = std.heap.ArenaAllocator.init(a);
+        defer page.deinit();
+        const result = (try target.nextResult(page.allocator())) orelse break;
+        try std.testing.expectEqual(@as(i64, 9007199254740993), result.aggregates[0].value.integer);
+        try std.testing.expectEqual(@as(i64, 1), result.aggregates[1].value.integer);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 600), seen);
+}
+
+test "SQL variable extrema batch admission spills before retaining payloads" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const bytes = try a.alloc(u8, 16384);
+    defer a.free(bytes);
+    @memset(bytes, 'x');
+    var keys: [32]Datum = undefined;
+    var values: [32]Datum = undefined;
+    for (&keys, &values, 0..) |*key, *value, index| {
+        key.* = Datum.json(.{ .integer = @intCast(index) });
+        value.* = Datum.json(.{ .string = bytes });
+    }
+    for ([_]bool{ false, true }) |encoded| {
+        const group = try Grouped.create(a, &.{.{ .kind = .min, .input_type = .string }}, .{ .groups = 64, .bytes = 256 * 1024, .spill = &manager });
+        defer group.deinit();
+        if (encoded) {
+            const Batch = @import("execution_batch.zig").Batch;
+            try group.addEncodedColumns(&.{Batch{ .vectors = .{ .values = &.{&keys}, .count = keys.len } }}, &.{Batch{ .vectors = .{ .values = &.{&values}, .count = values.len } }}, keys.len);
+        } else try group.addColumns(&.{&keys}, &.{&values}, keys.len);
+        try std.testing.expect(group.external != null);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var count: usize = 0;
+        while (try group.nextResult(arena.allocator())) |result| {
+            try std.testing.expectEqualStrings(bytes, result.aggregates[0].value.string);
+            count += 1;
+        }
+        try std.testing.expectEqual(keys.len, count);
+    }
 }

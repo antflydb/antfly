@@ -1,0 +1,108 @@
+{
+  "base_commit": "e4d707de5634a8d758c606b4432037e1a1682052",
+  "build": "zig build sql-native-pipeline-bench -Doptimize=ReleaseFast -j2",
+  "scope": "Local native microbenchmarks with alternating execution order and three samples. These are individual operation comparisons, not end-to-end or remote-I/O speedup claims.",
+  "comparisons": {
+    "wide_column_cache": "Eight integer columns, 1024 rows, sequential reconstruction after writing input. Four active cache entries versus the bounded cache for the active column set; identical checksums. 8192 versus 144 decoded records.",
+    "owned_column_transfer": "4096 rows, eight columns including repeated 384-byte text; 16 repeats. Reconstruct rows and clone a typed store versus reference-counted spans of the existing store; identical checksums. Queue and scheduling costs are excluded.",
+    "primitive_numeric_hash": "100000 alternating integer and fractional float keys from 1024 values. Prior exact decimal conversion/hash versus normalized dyadic primitive hashing. Hash encodings differ; each path checks stable checksums and separate equivalence tests check primitive/decimal/mixed-number equality. Software wide-integer decimal conversion dominates the reference; this ratio is not a join or grouping throughput claim."
+  },
+  "medians": {
+    "wide_column_cache": {
+      "four_entry_ns": 34975208,
+      "active_ns": 1289375,
+      "ratio": 27.125706640814347
+    },
+    "owned_column_transfer": {
+      "copy_ns": 14592667,
+      "transfer_ns": 43166,
+      "ratio": 338.05928276884583
+    },
+    "primitive_numeric_hash": {
+      "decimal_ns": 9642383875,
+      "primitive_ns": 297542,
+      "ratio": 32406.799292200765
+    }
+  },
+  "samples": [
+    {
+      "case": "wide_column_cache",
+      "rows": 1024,
+      "width": 8,
+      "sample": 0,
+      "four_entry_ns": 85543500,
+      "active_ns": 1542333,
+      "four_entry_decodes": 8192,
+      "active_decodes": 144
+    },
+    {
+      "case": "wide_column_cache",
+      "rows": 1024,
+      "width": 8,
+      "sample": 1,
+      "four_entry_ns": 34975208,
+      "active_ns": 1289375,
+      "four_entry_decodes": 8192,
+      "active_decodes": 144
+    },
+    {
+      "case": "wide_column_cache",
+      "rows": 1024,
+      "width": 8,
+      "sample": 2,
+      "four_entry_ns": 33608500,
+      "active_ns": 1142417,
+      "four_entry_decodes": 8192,
+      "active_decodes": 144
+    },
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 0,
+      "copy_ns": 14592667,
+      "transfer_ns": 43166
+    },
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 1,
+      "copy_ns": 14582125,
+      "transfer_ns": 43666
+    },
+    {
+      "case": "owned_column_transfer",
+      "rows": 4096,
+      "width": 8,
+      "repeats": 16,
+      "sample": 2,
+      "copy_ns": 14694375,
+      "transfer_ns": 40875
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 0,
+      "decimal_ns": 10184635833,
+      "primitive_ns": 297542
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 1,
+      "decimal_ns": 9628208666,
+      "primitive_ns": 297125
+    },
+    {
+      "case": "primitive_numeric_hash",
+      "rows": 100000,
+      "sample": 2,
+      "decimal_ns": 9642383875,
+      "primitive_ns": 376375
+    }
+  ],
+  "zig_version": "0.17.0"
+}

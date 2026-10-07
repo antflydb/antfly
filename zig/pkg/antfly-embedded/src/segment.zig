@@ -670,7 +670,9 @@ pub const SegmentWriter = struct {
 // ============================================================================
 
 /// Reads a segment file.
+pub const PostingsLoader = inverted.PostingsLoader;
 pub const SegmentReader = struct {
+    postings_loader: ?PostingsLoader = null,
     alloc: Allocator,
     data: []const u8,
     stored_offset: u64,
@@ -1023,6 +1025,11 @@ pub const SegmentReader = struct {
                         const offset: usize = @intCast(section.offset);
                         const length: usize = @intCast(section.length);
                         const bytes = self.data[offset..][0..length];
+                        // Seekable remote payloads authenticate each immutable
+                        // posting block separately; metadata is authenticated
+                        // before admission. A whole-section CRC would read all
+                        // postings and defeat selective access.
+                        if (section_type == .inverted_text and self.postings_loader != null) return bytes;
                         const validation = @constCast(&section.validation);
                         switch (validation.load(.acquire)) {
                             integrity_valid => return bytes,
@@ -1139,7 +1146,12 @@ pub const SegmentReader = struct {
     /// Get an inverted index reader for a field.
     pub fn invertedIndex(self: *const SegmentReader, field_name: []const u8) !?inverted.InvertedIndexReader {
         const section_data = (try self.getSection(field_name, .inverted_text)) orelse return null;
-        return try inverted.InvertedIndexReader.init(self.alloc, section_data);
+        var reader = try inverted.InvertedIndexReader.init(self.alloc, section_data);
+        if (self.postings_loader) |loader| {
+            reader.postings_loader = loader;
+            reader.postings_loader.?.base = @intFromPtr(section_data.ptr) - @intFromPtr(self.data.ptr);
+        }
+        return reader;
     }
 
     /// Collection statistics preserve lazy payload checksum validation. Native
@@ -1249,7 +1261,12 @@ pub const SegmentReader = struct {
     pub fn invertedIndexScoped(self: *const SegmentReader, allocator: Allocator, field_name: []const u8) !?inverted.ScopedInvertedIndexReader {
         if (self.native) |native| return native.range.invertedIndexScoped(allocator, field_name, .{});
         const data = (try self.getSection(field_name, .inverted_text)) orelse return null;
-        return try inverted.ScopedInvertedIndexReader.initContiguous(allocator, data);
+        var scoped = try inverted.ScopedInvertedIndexReader.initContiguous(allocator, data);
+        if (self.postings_loader) |loader| {
+            scoped.contiguous.?.postings_loader = loader;
+            scoped.contiguous.?.postings_loader.?.base = @intFromPtr(data.ptr) - @intFromPtr(self.data.ptr);
+        }
+        return scoped;
     }
 
     pub const StoredDocRef = struct { id: []const u8, data: []const u8 };

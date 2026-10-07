@@ -384,6 +384,9 @@ pub const AntflyRootImports = struct {
         self.configureServerContracts(mod);
         inline for (api_imports) |field| self.addImport(mod, field);
         mod.addImport("antfly_openapi_specs", self.embedded_openapi);
+        // Native remote corpora share local analysis and scoring semantics.
+        addSnowballModule(mod.owner, mod);
+        self.addImport(mod, "vectorindex");
     }
 
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {

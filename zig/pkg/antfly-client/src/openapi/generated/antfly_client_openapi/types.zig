@@ -791,6 +791,47 @@ pub const AggregationType = enum {
     }
 };
 
+pub const AlgebraicAggregateConfig = struct {
+    name: []const u8,
+    op: []const u8,
+    group_by: ?[]const []const u8 = null,
+    /// Required except for count. Omitted count means COUNT(*); a supplied column means COUNT(column), excluding SQL NULL values.
+    measure: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "name", "name", false },
+        .{ "op", "op", false },
+        .{ "group_by", "group_by", true },
+        .{ "measure", "measure", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(self.name);
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.group_by) |value| {
+            try jw.objectField("group_by");
+            try jw.write(value);
+        }
+        if (self.measure) |value| {
+            try jw.objectField("measure");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const AlgebraicAggregationJoin = struct {
     /// Algebraic join materialization or capability name
     name: []const u8,
@@ -833,14 +874,17 @@ pub const AlgebraicAggregationJoin = struct {
     }
 };
 
-/// Schema-derived algebraic sidecar configuration. Public requests may opt into schema derivation, while materializations remain engine-owned.
+/// Schema-derived algebraic index capabilities with optional declarative aggregate recipes. Physical materialization state remains engine-owned.
 pub const AlgebraicIndexConfig = struct {
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    /// When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned.
     derive_from_schema: ?bool = null,
+    /// Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+    aggregates: ?[]const AlgebraicAggregateConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "aggregates", "aggregates", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -855,6 +899,10 @@ pub const AlgebraicIndexConfig = struct {
         try jw.beginObject();
         if (self.derive_from_schema) |value| {
             try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
             try jw.write(value);
         }
         try jw.endObject();
@@ -5244,8 +5292,10 @@ pub const CreateAlgebraicIndexRequest = struct {
     version: ?i64 = null,
     /// Inline managed enrichment definitions required by this index.
     enrichments: ?[]const EnrichmentConfig = null,
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    /// When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned.
     derive_from_schema: ?bool = null,
+    /// Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+    aggregates: ?[]const AlgebraicAggregateConfig = null,
     type: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -5254,6 +5304,7 @@ pub const CreateAlgebraicIndexRequest = struct {
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "aggregates", "aggregates", true },
         .{ "type", "type", false },
     };
 
@@ -5281,6 +5332,10 @@ pub const CreateAlgebraicIndexRequest = struct {
         }
         if (self.derive_from_schema) |value| {
             try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
             try jw.write(value);
         }
         try jw.objectField("type");
@@ -6092,8 +6147,10 @@ pub const CreatedAlgebraicIndex = struct {
     version: ?i64 = null,
     /// Normalized inline managed enrichment definitions required by this index.
     enrichments: ?[]const CreatedEnrichmentConfig = null,
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    /// When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned.
     derive_from_schema: ?bool = null,
+    /// Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+    aggregates: ?[]const AlgebraicAggregateConfig = null,
     type: []const u8,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -6103,6 +6160,7 @@ pub const CreatedAlgebraicIndex = struct {
         .{ "version", "version", true },
         .{ "enrichments", "enrichments", true },
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "aggregates", "aggregates", true },
         .{ "type", "type", false },
     };
 
@@ -6132,6 +6190,10 @@ pub const CreatedAlgebraicIndex = struct {
         }
         if (self.derive_from_schema) |value| {
             try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
             try jw.write(value);
         }
         try jw.objectField("type");
@@ -11602,6 +11664,8 @@ pub const ExternalLakeTableSource = struct {
     uri: []const u8,
     schema_fingerprint: ?[]const u8 = null,
     write_policy: ?[]const u8 = null,
+    /// Set immutable only when data files are never replaced at an existing URI. Allows authenticated provider-version proofs from retained index generations to be reused for unchanged data files. Metadata and delete files are still verified.
+    object_mutability: ?[]const u8 = null,
     credentials: ?ExternalLakeCredentialRef = null,
     snapshot: ?ExternalLakeSnapshotSelector = null,
 
@@ -11613,6 +11677,7 @@ pub const ExternalLakeTableSource = struct {
         .{ "uri", "uri", false },
         .{ "schema_fingerprint", "schema_fingerprint", true },
         .{ "write_policy", "write_policy", true },
+        .{ "object_mutability", "object_mutability", true },
         .{ "credentials", "credentials", true },
         .{ "snapshot", "snapshot", true },
     };
@@ -11641,6 +11706,10 @@ pub const ExternalLakeTableSource = struct {
         }
         if (self.write_policy) |value| {
             try jw.objectField("write_policy");
+            try jw.write(value);
+        }
+        if (self.object_mutability) |value| {
+            try jw.objectField("object_mutability");
             try jw.write(value);
         }
         if (self.credentials) |value| {
@@ -15282,6 +15351,8 @@ pub const GeoShapeQuery = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -15360,6 +15431,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", false },
@@ -15412,6 +15484,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -20859,8 +20935,10 @@ pub const IndexConfig = struct {
     artifact: ?GraphArtifactProducerConfig = null,
     algebraic_planning: ?GraphAlgebraicPlanningConfig = null,
     resolvers: ?[]const GraphResolverConfig = null,
-    /// When true, derive the algebraic capability sidecar from the table schema. Internal fields and materialization definitions are not public API.
+    /// When true, derive typed fields and capabilities from the table schema. Physical fields, laws, joins and state remain engine-owned.
     derive_from_schema: ?bool = null,
+    /// Desired exact aggregate recipes over schema column names. Eligible SQL automatically reuses complete, snapshot-bound materializations; unsupported SQL shapes retain scanning.
+    aggregates: ?[]const AlgebraicAggregateConfig = null,
     keys: ?[]const RelationalIndexKey = null,
     /// Non-key columns stored for index-only projection; distinct from keys.
     include_columns: ?[]const []const u8 = null,
@@ -20905,6 +20983,7 @@ pub const IndexConfig = struct {
         .{ "algebraic_planning", "algebraic_planning", true },
         .{ "resolvers", "resolvers", true },
         .{ "derive_from_schema", "derive_from_schema", true },
+        .{ "aggregates", "aggregates", true },
         .{ "keys", "keys", true },
         .{ "include_columns", "include_columns", true },
         .{ "where", "where", true },
@@ -21058,6 +21137,10 @@ pub const IndexConfig = struct {
         }
         if (self.derive_from_schema) |value| {
             try jw.objectField("derive_from_schema");
+            try jw.write(value);
+        }
+        if (self.aggregates) |value| {
+            try jw.objectField("aggregates");
             try jw.write(value);
         }
         if (self.keys) |value| {
@@ -30988,6 +31071,8 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -31062,6 +31147,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
@@ -31112,6 +31198,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -31297,6 +31387,8 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -31320,6 +31412,7 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -31343,6 +31436,10 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);
@@ -31389,6 +31486,8 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -31411,6 +31510,7 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -31433,6 +31533,10 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);
@@ -38419,6 +38523,8 @@ pub const StatefulGraphResult = union(enum) {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
+    /// Opaque remote index snapshot token returned by a previous query. Required when replaying search_after or search_before against an external table; a changed publication returns 409.
+    remote_snapshot: ?[]const u8 = null,
     evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -38497,6 +38603,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
@@ -38549,6 +38656,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluate) |value| {
             try jw.objectField("evaluate");
             try jw.write(value);
@@ -38742,6 +38853,8 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
+    /// Opaque remote publication and schema fence to echo with ordered pagination. This token does not grant access or retain the publication.
+    remote_snapshot: ?[]const u8 = null,
     /// Function evaluation scope, population, usage, and scoped aggregations.
     evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
@@ -38765,6 +38878,7 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "remote_snapshot", "remote_snapshot", true },
         .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
@@ -38788,6 +38902,10 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.remote_snapshot) |value| {
+            try jw.objectField("remote_snapshot");
+            try jw.write(value);
+        }
         if (self.evaluation) |value| {
             try jw.objectField("evaluation");
             try jw.write(value);
