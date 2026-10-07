@@ -25,3 +25,13 @@ and verifies their result order and total input-token usage. The same 47-step,
 HTTP SQL fixture cover the adapter selection for scheduled reads, serial writes
 and unscheduled callers, but those assertions await the full API gate. They are
 not covered by this provider-only result.
+
+Scheduled read provider runtimes now borrow the adapter checkpoint. It is
+called during preflight, before/after provider invocation, and before result
+normalization. Attaching it forces serial provider execution even with the
+parallel default enabled. The native fixture verifies parent-thread confinement
+and rejects a result when the parent stops after invocation; the second provider
+is never invoked. All 24 selected native tests and 47 build steps pass.
+`native-checkpoint.json` pins candidate sources, with the complete output in
+`native-checkpoint.log.gz`. The full SQL API and Linux gates remain pending;
+provider I/O still holds its grant and backend inference has no new admission.

@@ -57,6 +57,12 @@ pub const Runtime = struct {
     /// A scheduled parent without independently admitted children evaluates
     /// provider jobs on its own worker. Preserve parallel batches otherwise.
     parallel_work: bool = true,
+    /// Borrowed until evaluation returns. A parent grant can only be checked
+    /// from its worker, so attaching it also disables provider task fan-out.
+    parent_execution: ?struct {
+        ptr: *anyopaque,
+        checkpoint: *const fn (*anyopaque) anyerror!void,
+    } = null,
     context: ?execution.RequestContext = null,
     secret_store: ?*secrets.FileStore = null,
     antfly_provider: ?managed.AntflyProvider = null,
@@ -76,6 +82,7 @@ pub const Runtime = struct {
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
         if (self.context) |ctx| try ctx.check();
+        if (self.parent_execution) |parent| try parent.checkpoint(parent.ptr);
     }
     fn validate(ptr: *anyopaque, name: []const u8, questions: decisions.Json) !void {
         const self: *Runtime = @ptrCast(@alignCast(ptr));
@@ -136,6 +143,7 @@ pub const Runtime = struct {
                     if (err == error.DecisionRateLimited) feedback = httpx.Response.init(a, 429);
                     return operationalError(err);
                 };
+                try checkpoint(self.runtime);
                 return parseResponse(a, bytes);
             };
             const key = key_source.resolveOwned(a, self.runtime.secret_store) catch |err| return operationalError(err);
@@ -169,6 +177,7 @@ pub const Runtime = struct {
                 else => error.DecisionUpstreamFailure,
             };
             const bytes = response.body orelse return error.InvalidDecisionOutput;
+            try checkpoint(self.runtime);
             return parseResponse(a, bytes);
         }
     };
@@ -182,6 +191,7 @@ pub const Runtime = struct {
         var batch_size: usize = 32;
         var estimated = self.estimated_input_tokens;
         for (requests) |request| {
+            try checkpoint(ptr);
             const cfg = try self.registry.getDeciderConfig(request.decider);
             if (self.rows + requests.len > cfg.max_rows or self.input_tokens >= cfg.max_input_tokens) return error.DecisionLimitExceeded;
             if (request.input.len > decisions.capabilities(cfg.provider).max_input_bytes) return error.DecisionLimitExceeded;
@@ -208,12 +218,13 @@ pub const Runtime = struct {
                 job.* = .{ .runtime = self, .request = request, .cfg = try self.registry.getDeciderConfig(request.decider), .arena = undefined, .budget = .{ .backing = std.heap.smp_allocator, .limit = 8 * 1024 * 1024 } };
                 job.arena = std.heap.ArenaAllocator.init(job.budget.allocator());
                 initialized += 1;
-                if (self.parallel_work) try group.concurrent(self.io, Job.run, .{job}) else Job.run(job);
+                if (self.parallel_work and self.parent_execution == null) try group.concurrent(self.io, Job.run, .{job}) else Job.run(job);
             }
             try group.await(self.io);
             self.batches += 1;
             for (jobs, out[begin..end]) |*job, *value| {
                 if (job.failure) |err| return err;
+                try checkpoint(ptr);
                 const normalized = try decisions.normalizeResponse(a, job.request.questions, job.response.?);
                 const usage = normalized.object.get("usage").?.object;
                 if (self.profile_allocator) |stats_a| {
@@ -375,6 +386,14 @@ test "decision functions serial provider batches remain on the admitted parent w
     const Provider = struct {
         thread: std.Thread.Id,
         calls: usize = 0,
+        checkpoints: usize = 0,
+        stop_after_provider: bool = false,
+        fn checkpoint(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            self.checkpoints += 1;
+            if (self.stop_after_provider and self.calls != 0) return error.ParentExecutionStopped;
+        }
         fn decide(ptr: *anyopaque, alloc: std.mem.Allocator, body: []const u8, _: ?execution.RequestContext) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
@@ -408,4 +427,33 @@ test "decision functions serial provider batches remain on the admitted parent w
     try std.testing.expectEqual(@as(u64, 2), runtime.rows);
     try std.testing.expectEqual(@as(u64, 1), runtime.batches);
     try std.testing.expectEqual(@as(u64, 4), runtime.input_tokens);
+
+    // A borrowed parent is sufficient to prevent unsafe child tasks even when
+    // the caller leaves the ordinary parallel-batch default enabled.
+    embedded.calls = 0;
+    runtime = .{
+        .registry = &registry,
+        .http = &client,
+        .io = io,
+        .parent_execution = .{ .ptr = &embedded, .checkpoint = Provider.checkpoint },
+        .antfly_provider = .{ .ptr = &embedded, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Provider.decide },
+    };
+    _ = try runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = "first", .decider = "serial", .questions = questions },
+        .{ .input = "second", .decider = "serial", .questions = questions },
+    });
+    try std.testing.expectEqual(@as(usize, 2), embedded.calls);
+    try std.testing.expect(embedded.checkpoints > 0);
+
+    // Revocation after provider completion must stop before parsing/consuming
+    // its result, and before invoking the next provider request.
+    embedded.calls = 0;
+    embedded.stop_after_provider = true;
+    runtime.rows = 0;
+    try std.testing.expectError(error.ParentExecutionStopped, runtime.provider().evaluateBatch(arena.allocator(), &.{
+        .{ .input = "first", .decider = "serial", .questions = questions },
+        .{ .input = "second", .decider = "serial", .questions = questions },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), embedded.calls);
+    try std.testing.expectEqual(@as(u64, 0), runtime.rows);
 }

@@ -13536,16 +13536,20 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer server.cfg.node_config = previous_config;
             const write_runtime = (try serial_write_adapter.decisionRuntime()).?;
             try std.testing.expect(!write_runtime.parallel_work);
+            try std.testing.expect(write_runtime.parent_execution == null);
             var provider_execution: http_server_mod.RunnableScheduler.Execution = .{};
             defer provider_execution.finish();
             try server.startSqlRunnable(&provider_execution, .{ .io = server.embedding_provider_runtime.io }, .query);
             serial_write_adapter.serial_execution = false;
             serial_write_adapter.runnable = &provider_execution;
-            const read_runtime = (try serial_write_adapter.decisionRuntime()).?;
+            var read_runtime = (try serial_write_adapter.decisionRuntime()).?;
             try std.testing.expect(!read_runtime.parallel_work);
+            try std.testing.expect(read_runtime.parent_execution.?.ptr == &serial_write_adapter);
+            try read_runtime.provider().checkpoint();
             serial_write_adapter.runnable = null;
             const unscheduled_runtime = (try serial_write_adapter.decisionRuntime()).?;
             try std.testing.expect(unscheduled_runtime.parallel_work);
+            try std.testing.expect(unscheduled_runtime.parent_execution == null);
         }
         try server.query_admission.update(server.queryAdmissionStats().policy_version, 1, server.cfg.query_waiting, false);
         try @import("sql_pgwire_socket_test.zig").qualify(&server, &storage_manager);

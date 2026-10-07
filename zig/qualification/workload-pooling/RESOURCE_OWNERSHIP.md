@@ -175,3 +175,10 @@ worker until provider children acquire independently owned execution entries.
 This confines provider frontend CPU to the existing grant; it does not schedule
 model-server/backend inference or release the grant during provider waits.
 Unscheduled decision batches retain their existing parallel behavior.
+Scheduled read runtimes borrow the adapter's execution checkpoint through the
+provider call. Preflight, provider invocation/completion and result normalization
+reach that checkpoint, preserving the original deadline and revalidating read
+authority after a cooperative yield. A borrowed parent always prevents task
+fan-out, including when a caller leaves the parallel default enabled. The parent
+and its adapter outlive evaluation. Ordinary writes do not borrow this read
+checkpoint; their accepted completion obligations remain unchanged.
