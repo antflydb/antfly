@@ -26,7 +26,10 @@ const Context = local.serverless_query_lake_read_context.Context;
 const Store = @import("lake_index_store.zig").Store;
 const A = std.mem.Allocator;
 pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext) !?local.api_query.QueryResponse {
-    return executePinned(a, server, table, req, request) catch |err| switch (err) {
+    return executeWithDelivery(a, server, table, req, request, null);
+}
+pub fn executeWithDelivery(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery) !?local.api_query.QueryResponse {
+    return executePinned(a, server, table, req, request, delivery) catch |err| switch (err) {
         error.ExternalLakeIndexNotPublished, error.ExternalLakeIndexUnavailable => error.IndexRebuilding,
         error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexSourceChanged, error.ExternalLakeSnapshotMismatch => error.CatalogGenerationChanged,
         error.LakeIndexReaderLeaseExpired, error.NativeLakeTextCacheBusy, error.NativeLakeRuntimeCacheBusy => error.StorageReadTemporarilyUnavailable,
@@ -35,7 +38,7 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
         else => err,
     };
 }
-fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext) !?local.api_query.QueryResponse {
+fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_topology_records.TableRecord, req: types.SearchRequest, request: local.api_operation.RequestContext, delivery: ?local.api_query_response.Delivery) !?local.api_query.QueryResponse {
     var schema = (try local.serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(a, table.schema_json)) orelse return null;
     defer schema.deinit(a);
     // Graph and search aggregation execution require their own native ports;
@@ -109,7 +112,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
         try owner.attachHighlights(a, effective, &result);
     }
     meta.took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms);
-    return try local.api_query.encodeQueryResponses(a, table.name, effective, meta, result);
+    return try local.api_query.encodeQueryResponsesWithDelivery(a, table.name, effective, meta, result, delivery);
 }
 const Execution = struct {
     server: *server_api.ApiHttpServer,

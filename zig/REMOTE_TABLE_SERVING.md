@@ -934,3 +934,42 @@ existing behavior. Final response-size limits and the owned response buffer rema
 Boolean conjunctions check local required-term lookups before requesting global
 scoring frequencies, retaining successful navigation for iterator construction.
 An impossible conjunction therefore performs no corpus-wide scoring reads.
+
+
+Physical text reads use pack-scoped in-flight coordination separate from unit
+cache admission. A leader probes verified RAM/mapped/disk residency and reads
+only contiguous cold runs; fifteen warm units plus one cold unit transfer only
+64 KiB. Concurrent leaders for different units can share the verified physical
+result even when RAM admission is denied. Flight payloads are temporary leases,
+with no second resident copy of a pack. Every consumer still authenticates its
+unit and checks its own current authority. Waiting readers use their own
+cancellation/deadline; a canceled leader does not cancel another reader.
+Planners never join unit flights while owning a physical flight, avoiding
+cycles between overlapping unit and pack leaders.
+
+Required multi-pack reads use at most four lanes through the shared scheduler.
+Each lane owns bounded scratch and a disjoint output slice; saturation runs
+required work inline. All lanes join on success, failure, or cancellation before
+query capabilities and output storage can be released. Speculative hints keep
+their separate transient admission and may yield under pressure.
+
+Eligible single public remote searches deliver the existing JSON envelope
+through a synchronous transport sink. A validation/count pass rejects malformed
+sources, cancellation, and the caller's response-size ceiling before headers
+commit. A second pass writes through a 16 KiB buffer with transport backpressure;
+no complete response buffer or per-hit JSON source tree is retained. The query,
+publication reader lease, and selected column pages remain alive through the
+last write. A disconnect or error after commitment terminates the stream rather
+than retrying execution or sending a second response. Internal/group callers,
+composed dispatch consumers, and NDJSON multi-query retain buffered delivery.
+The two-pass encoding trades additional serialization CPU for bounded response
+memory and preserves pre-commit error semantics; it is not a measured latency
+claim. Existing row/candidate limits and caller response ceilings still apply.
+
+The `x-antfly-response-streaming` OpenAPI operation flag exports optional
+transport streaming for global, table, and namespace query routes through the
+kernel manifest. It leaves the ordinary typed JSON response schema unchanged.
+Adapters with no streaming transport use buffered delivery; internal group
+queries do not inherit the public route capability. Route-policy and manifest
+contracts exercise this boundary, and the real Parquet E2E checks chunked HTTP
+framing as well as the decoded response.

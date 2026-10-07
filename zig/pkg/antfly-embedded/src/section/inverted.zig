@@ -9777,7 +9777,9 @@ test "packed spill preserves legacy and current positional sources with bounded 
                 };
             }
         };
-        try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
+        // Spill scratch growth must enumerate the same allocations even when
+        // SafeAllocator can resize/remap differently between fault iterations.
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
     }
 }
 

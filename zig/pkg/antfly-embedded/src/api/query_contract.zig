@@ -3669,12 +3669,32 @@ fn writeWireField(w: *std.json.Stringify, comptime name: []const u8, value: anyt
     try w.objectField(name);
     try w.write(value);
 }
-fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, base: anytype, hits: []const db_mod.types.SearchHit) ![]u8 {
+fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, base: anytype, hits: []const db_mod.types.SearchHit, delivery: ?@import("query_response.zig").Delivery, delivered: *?usize) ![]u8 {
     var failure: ?anyerror = null;
     var scratch = std.heap.ArenaAllocator.init(alloc);
     defer scratch.deinit();
     const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .failure = &failure };
-    return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, .{ .emit_null_optional_fields = false }) catch |err| return failure orelse err;
+    const envelope = .{ .responses = &.{wrapped} };
+    const options: std.json.Stringify.Options = .{ .emit_null_optional_fields = false };
+    if (delivery) |sink| {
+        var count_buffer: [4096]u8 = undefined;
+        var count: std.Io.Writer.Discarding = .init(&count_buffer);
+        std.json.Stringify.value(envelope, options, &count.writer) catch |err| return failure orelse err;
+        if (failure) |err| return err;
+        const length = std.math.cast(usize, count.fullCount()) orelse return error.QueryResponseTooLarge;
+        if (length > sink.max_bytes) return error.QueryResponseTooLarge;
+        // Allocate the empty ownership marker before committing transport state.
+        const empty = try alloc.alloc(u8, 0);
+        errdefer alloc.free(empty);
+        try sink.start_fn(sink.ptr, length);
+        var output: @import("query_response.zig").Delivery.Writer = .{ .sink = sink };
+        output.init(sink);
+        std.json.Stringify.value(envelope, options, &output.writer) catch return error.QueryDeliveryFailed;
+        output.writer.flush() catch return error.QueryDeliveryFailed;
+        delivered.* = length;
+        return empty;
+    }
+    return std.json.Stringify.valueAlloc(alloc, envelope, options) catch |err| return failure orelse err;
 }
 
 pub fn encodeQueryResponses(
@@ -3684,6 +3704,18 @@ pub fn encodeQueryResponses(
     meta: QueryResponseMeta,
     result: db_mod.types.SearchResult,
 ) !QueryResponse {
+    return encodeQueryResponsesWithDelivery(alloc, table_name, req, meta, result, null);
+}
+
+pub fn encodeQueryResponsesWithDelivery(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    req: db_mod.types.SearchRequest,
+    meta: QueryResponseMeta,
+    result: db_mod.types.SearchResult,
+    delivery: ?@import("query_response.zig").Delivery,
+) !QueryResponse {
+    var delivered: ?usize = null;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
@@ -3731,7 +3763,7 @@ pub fn encodeQueryResponses(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot,
             };
-            break :blk if (hasColumnSources(emitted_hits)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits) else try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.QueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -3763,7 +3795,7 @@ pub fn encodeQueryResponses(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot,
             };
-            break :blk if (hasColumnSources(emitted_hits)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits) else try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits, delivery, &delivered) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.StatefulQueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -3772,6 +3804,7 @@ pub fn encodeQueryResponses(
     };
 
     return .{
+        .delivered_bytes = delivered,
         .identity_read_generation = result.identity_read_generation orelse req.identity_read_generation,
         .graph_dialect = graph_dialect,
         // OpenAPI optional response fields are absent unless populated; they
@@ -18658,4 +18691,70 @@ test "external lake column response delivery preserves cancellation and malforme
     const marker: u8 = 0;
     try std.testing.expectError(error.Canceled, encodeQueryResponses(a, "docs", .{ .cancellation = .{ .ptr = &marker, .is_cancelled_fn = Canceled.check } }, .{}, result));
     try std.testing.expectError(error.SyntaxError, encodeQueryResponses(a, "docs", .{}, .{}, result));
+}
+
+test "external lake streamed column delivery validates limits before headers and closes failed writes" {
+    const a = std.testing.allocator;
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "doc" }};
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "body", .values = .{ .bytes = &.{"needle"} } },
+        .{ .name = "amount", .values = .{ .i64 = &.{9007199254740993} } },
+    };
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hits = try a.alloc(db_mod.types.SearchHit, 600);
+    defer a.free(hits);
+    var initialized: usize = 0;
+    defer for (hits[0..initialized]) |*hit| hit.deinit(a);
+    for (hits) |*hit| {
+        hit.* = .{ .id = try a.dupe(u8, "doc"), .column_source = page.row(0) };
+        initialized += 1;
+    }
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = hits, .total_hits = @intCast(hits.len) };
+    var expected = try encodeQueryResponses(a, "docs", .{}, .{}, result);
+    defer expected.deinit(a);
+    const Capture = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        starts: usize = 0,
+        length: usize = 0,
+        writes: usize = 0,
+        fail: bool = false,
+        fn start(raw: *anyopaque, length: usize) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.starts += 1;
+            self.length = length;
+        }
+        fn write(raw: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.ClientDisconnected;
+            self.writes += 1;
+            try self.bytes.appendSlice(std.testing.allocator, bytes);
+        }
+        fn sink(self: *@This(), limit: usize) @import("query_response.zig").Delivery {
+            return .{ .ptr = self, .start_fn = start, .write_fn = write, .max_bytes = limit };
+        }
+    };
+    var capture: Capture = .{};
+    defer capture.bytes.deinit(a);
+    try std.testing.expectError(error.QueryResponseTooLarge, encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, capture.sink(expected.json.len - 1)));
+    try std.testing.expectEqual(@as(usize, 0), capture.starts);
+    var response = try encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, capture.sink(expected.json.len));
+    defer response.deinit(a);
+    try std.testing.expectEqual(expected.json.len, response.delivered_bytes.?);
+    try std.testing.expectEqual(@as(usize, 0), response.json.len);
+    try std.testing.expectEqualStrings(expected.json, capture.bytes.items);
+    try std.testing.expect(capture.writes > 1);
+    try std.testing.expectEqual(@as(usize, 1), capture.starts);
+    capture.fail = true;
+    try std.testing.expectError(error.QueryDeliveryFailed, encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, result, capture.sink(expected.json.len)));
+    try std.testing.expectEqual(@as(usize, 2), capture.starts);
+    // Invalid JSON is rejected in the validation/count pass before a sink starts.
+    const bad_columns = [_]rows.ColumnVector{.{ .name = "bad", .values = .{ .json = &.{"{invalid}"} } }};
+    const bad_page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &bad_columns }, &.{0});
+    defer bad_page.release();
+    var bad_hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "bad"), .column_source = bad_page.row(0) };
+    defer bad_hit.deinit(a);
+    try std.testing.expectError(error.SyntaxError, encodeQueryResponsesWithDelivery(a, "docs", .{}, .{}, .{ .alloc = a, .hits = @as(*[1]db_mod.types.SearchHit, @ptrCast(&bad_hit)), .total_hits = 1 }, capture.sink(expected.json.len)));
+    try std.testing.expectEqual(@as(usize, 2), capture.starts);
 }

@@ -14215,7 +14215,7 @@ pub const ApiHttpServer = struct {
         try ensureRequestActive(cancellation);
         try ensureRequestDeadline(request_deadline_ns);
         if (try shouldDispatchPlainPublicSearch(alloc, body)) {
-            const result = self.executePlainPublicTableQuery(
+            const result = self.executePlainPublicTableQueryWithDelivery(
                 alloc,
                 source,
                 table_name,
@@ -14227,6 +14227,7 @@ pub const ApiHttpServer = struct {
                 cancellation,
                 response_label,
                 resolver,
+                resolver.delivery,
             ) catch |err| switch (err) {
                 error.InvalidQueryRequest,
                 error.InvalidFilterQueryRequest,
@@ -14903,6 +14904,24 @@ pub const ApiHttpServer = struct {
         response_label: ?[]const u8,
         catalog_resolver: ?*CatalogQueryResolver,
     ) !query_api.QueryResponse {
+        return self.executePlainPublicTableQueryWithDelivery(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, query_embedding_security_scope, cancellation, response_label, catalog_resolver, null);
+    }
+
+    fn executePlainPublicTableQueryWithDelivery(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        source: table_reads.TableReadSource,
+        table_name: []const u8,
+        body: []const u8,
+        row_filter_json: ?[]const u8,
+        authenticated_identity: ?AuthenticatedIdentity,
+        request_deadline_ns: ?u64,
+        query_embedding_security_scope: QueryEmbeddingSecurityScope,
+        cancellation: ?CancellationToken,
+        response_label: ?[]const u8,
+        catalog_resolver: ?*CatalogQueryResolver,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+    ) !query_api.QueryResponse {
         var catalog_arena = std.heap.ArenaAllocator.init(alloc);
         defer catalog_arena.deinit();
         var local_catalog = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
@@ -14965,7 +14984,7 @@ pub const ApiHttpServer = struct {
         }
         const lake_request: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
         if (try self.queryTableDefinition(resolver.arena, resolver, table_name, lake_request)) |table| {
-            if (try @import("lake_index_text_query.zig").execute(alloc, self, table, query_req.req, lake_request)) |result| return result;
+            if (try @import("lake_index_text_query.zig").executeWithDelivery(alloc, self, table, query_req.req, lake_request, delivery)) |result| return result;
         }
         if (query_req.req.remote_snapshot != null) return error.InvalidQueryRequest;
         return (queryWithTransientReadRetry(
@@ -16137,7 +16156,7 @@ pub const ApiHttpServer = struct {
         var authoritative_snapshot = (self.source.linearizableSnapshot(.{}) catch return .retry) orelse return .retry;
         defer self.source.freeAdminSnapshot(&authoritative_snapshot);
         const table = tables_api.findTableByName(&authoritative_snapshot, pending.table_name) orelse return .complete;
-        var schema = if (table.schema_json.len == 0) schema_mod.ParsedTableSchema{} else schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch return .retry;
+        var schema = schema_mod.parseValidatedTableSchema(alloc, if (table.schema_json.len == 0) "{}" else table.schema_json) catch return .retry;
         defer schema.deinit(alloc);
         if (schema.external_base_source != null) {
             self.reconcileNativeLakeIndexes(table.*, schema) catch |err| {
@@ -16291,7 +16310,7 @@ pub const ApiHttpServer = struct {
         try ensureTableOperationActive(request);
         const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
-        var table_schema = if (table_before.schema_json.len == 0) schema_mod.ParsedTableSchema{} else schema_mod.parseValidatedTableSchema(alloc, table_before.schema_json) catch return error.InvalidIndexRequest;
+        var table_schema = schema_mod.parseValidatedTableSchema(alloc, if (table_before.schema_json.len == 0) "{}" else table_before.schema_json) catch return error.InvalidIndexRequest;
         defer table_schema.deinit(alloc);
         const external_table = table_schema.external_base_source != null;
         const index_json = table_contract.parseCreateIndexRequest(alloc, index_name, body) catch {
@@ -20476,6 +20495,7 @@ pub const ApiHttpServer = struct {
 
     const CatalogQueryResolver = struct {
         arena: std.mem.Allocator,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery = null,
         revision: ?u64 = null,
         tables: std.StringHashMapUnmanaged(?system_catalog.ResolvedTable) = .empty,
         definitions: std.StringHashMapUnmanaged(system_catalog.QueryDefinition) = .empty,
@@ -21234,15 +21254,43 @@ pub const ApiHttpServer = struct {
         borrowed_identity: ?AuthenticatedIdentity,
         cancellation: ?*const http_common.RequestCancellation,
     ) !contextual_operations.OwnedResponse {
+        return self.handleAdmittedPublicTableQueryWithDelivery(table_name, body, content_type, borrowed_identity, cancellation, null);
+    }
+
+    pub fn handleAdmittedPublicTableQueryWithDelivery(
+        self: *ApiHttpServer,
+        table_name: []const u8,
+        body: []const u8,
+        content_type: ?[]const u8,
+        borrowed_identity: ?AuthenticatedIdentity,
+        cancellation: ?*const http_common.RequestCancellation,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+    ) !contextual_operations.OwnedResponse {
         if (isNdjsonContentType(content_type)) return self.handlePublicTableMultiQueryWithCancellation(table_name, body, borrowed_identity, cancellation, null, null);
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         const deadline = query_contract.queryExecutionDeadlineNsFromBody(self.alloc, body) catch return self.publicQueryOperationErrorResponse(table_name, body, error.InvalidQueryRequest);
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer catalog_arena.deinit();
-        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator() };
+        const Bridge = struct {
+            server: *ApiHttpServer,
+            table_name: []const u8,
+            target: @import("antfly_local_sources").api_query_response.Delivery,
+            fn start(raw: *anyopaque, length: usize) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                try self_.server.reachQueryResultLifecycle("public.table.query", self_.table_name, length);
+                try self_.target.start_fn(self_.target.ptr, length);
+            }
+            fn write(raw: *anyopaque, bytes: []const u8) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                try self_.target.write_fn(self_.target.ptr, bytes);
+            }
+        };
+        var bridge: ?Bridge = if (delivery) |target| .{ .server = self, .table_name = table_name, .target = target } else null;
+        var resolver = CatalogQueryResolver{ .arena = catalog_arena.allocator(), .delivery = if (bridge) |*value| .{ .ptr = value, .start_fn = Bridge.start, .write_fn = Bridge.write, .max_bytes = value.target.max_bytes } else null };
         var binding = self.bindCatalogQuery(self.alloc, .{ .deadline_ns = deadline, .cancellation = if (cancellation) |value| value.token() else .none }, table_name, body, &identity, &resolver) catch |err| return self.publicQueryOperationErrorResponse(table_name, body, err);
         defer binding.deinit();
+        if (bridge) |*value| value.table_name = binding.physical;
         return self.handleAdmittedResolvedTableQueryWithContentTypeCancellation(binding.physical, body, content_type, identity, cancellation, binding.label, if (binding.join) |*value| value else null, &resolver);
     }
 
@@ -21473,7 +21521,7 @@ pub const ApiHttpServer = struct {
             bound_join,
             catalog_resolver,
         ) catch |err| return try self.publicQueryOperationErrorResponse(table_name, body, err);
-        self.reachQueryResultLifecycle("public.table.query", table_name, query_response.json.len) catch |err| {
+        if (query_response.delivered_bytes == null) self.reachQueryResultLifecycle("public.table.query", table_name, query_response.json.len) catch |err| {
             query_response.deinit(self.alloc);
             return err;
         };

@@ -24,6 +24,8 @@ const Allocator = std.mem.Allocator;
 pub const Cache = struct {
     alloc: Allocator,
     decoded: @import("lake_decoded_cache.zig").Cache,
+    /// In-flight physical reads share owned results even when residency is denied.
+    physical: @import("lake_decoded_cache.zig").Cache,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
     flights: std.StringHashMapUnmanaged(*Flight) = .empty,
@@ -150,11 +152,14 @@ pub const Cache = struct {
             self.stats.provider_bytes +|= bytes;
         }
     }
+    pub fn recordPhysicalRead(self: *Cache, bytes: usize) void {
+        self.recordRead(false, bytes);
+    }
     pub fn init(alloc: Allocator) Cache {
         return initWithMemoryLimit(alloc, 64 * 1024 * 1024);
     }
     pub fn initWithMemoryLimit(alloc: Allocator, maximum: usize) Cache {
-        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .max_bytes = maximum };
+        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .physical = .{ .a = alloc, .max_bytes = 0, .max_entries = 0 }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
         // Readers are quiescent. Join accepted writes before destroying the
@@ -165,6 +170,7 @@ pub const Cache = struct {
         self.mappings.deinit(self.alloc);
         if (self.persistent) |*disk| disk.deinit();
         self.decoded.deinit();
+        self.physical.deinit();
         std.debug.assert(self.flights.count() == 0);
         self.flights.deinit(self.alloc);
         var iter = self.entries.iterator();
@@ -278,6 +284,24 @@ pub const Cache = struct {
         };
         if (lease == .mapped) return self.admitMapping(key, lease.mapped);
         return lease;
+    }
+    /// Probe verified residency without joining unit flights or issuing provider I/O.
+    /// Physical read planners must never wait on a unit flight while owning a
+    /// physical flight: another unit leader may already be waiting on them.
+    pub fn probeImmutableBlock(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context) !bool {
+        try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        const resident = self.entries.contains(key) or self.mappings.contains(key);
+        self.mutex.unlock();
+        if (resident) return true;
+        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |value| {
+            var lease = self.admitMapping(key, value);
+            lease.deinit();
+            return true;
+        };
+        return false;
     }
     fn pinMapping(self: *Cache, key: []const u8) ?*Mapping {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();

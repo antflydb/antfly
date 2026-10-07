@@ -48,6 +48,7 @@ pub const encodePublicFilterQueryErrorBodyAlloc = query_contract.encodePublicFil
 pub const parseAggregationRequestsJson = query_contract.parseAggregationRequestsJson;
 pub const freeAggregationRequests = query_contract.freeAggregationRequests;
 pub const encodeQueryResponses = query_contract.encodeQueryResponses;
+pub const encodeQueryResponsesWithDelivery = query_contract.encodeQueryResponsesWithDelivery;
 
 const FakeSemanticResolver = struct {
     fn iface() query_contract.SemanticResolver {

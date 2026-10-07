@@ -13366,6 +13366,7 @@ paths:
         {"table":"docs","full_text_search":{"query":"tutorial"},"limit":10}
         ```
       operationId: globalQuery
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -14045,6 +14046,7 @@ paths:
       tags:
         - query_operations
       operationId: queryTable
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:
@@ -16631,6 +16633,7 @@ paths:
       tags:
         - query_operations
       operationId: queryNamespaceTable
+      x-antfly-response-streaming: true
       requestBody:
         required: true
         content:

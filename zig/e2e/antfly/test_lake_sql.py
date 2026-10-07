@@ -1037,6 +1037,20 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
             "full_text_search": {"match": "filler", "field": "body"},
             "full_text_index": "body_text", "fields": ["label", "amount", "body"],
             "highlight": {"fields": ["body"]}, "limit": 600})
+        # The native column path must stream the normal JSON envelope. Inspect
+        # framing as well as parsed values so a buffered fallback cannot pass.
+        streamed = requests.post(server.api_url + "/tables/lake_text/query", json={
+            "full_text_search": {"match": "filler", "field": "body"},
+            "full_text_index": "body_text", "fields": ["label", "amount", "body"],
+            "highlight": {"fields": ["body"]}, "limit": 600},
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60, stream=True)
+        with streamed:
+            assert streamed.ok, streamed.text
+            assert "chunked" in streamed.headers.get("Transfer-Encoding", "").lower(), streamed.headers
+            chunks = list(streamed.iter_content(chunk_size=4096))
+            assert len(chunks) > 1
+            delivered = json.loads(b"".join(chunks))["responses"][0]
+            assert delivered["hits"] == broad["hits"]
         assert len(broad["hits"]["hits"]) == 600, broad
         assert len({hit["_id"] for hit in broad["hits"]["hits"]}) == 600
         for hit in broad["hits"]["hits"]:
