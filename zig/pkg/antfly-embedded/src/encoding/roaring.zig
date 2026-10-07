@@ -1770,3 +1770,97 @@ test "iterator seekTo: matches sequential next() output" {
         try std.testing.expectEqual(found, it.seekTo(target));
     }
 }
+
+/// Immutable, borrowed bitmap navigation for repeated rank lookups. Dense
+/// containers retain one u16 prefix per 64-bit word rather than popcounting
+/// hundreds of preceding words for every posting. Mutation invalidates this
+/// view; its owner must freeze the bitmap until deinit.
+pub const FrozenRankIndex = struct {
+    const Entry = struct { before: usize = 0, words: ?[]u16 = null };
+    allocator: Allocator,
+    bitmap: RoaringBitmap,
+    entries: []Entry,
+    count: usize,
+    pub fn init(allocator: Allocator, bitmap: RoaringBitmap) !@This() {
+        const entries = try allocator.alloc(Entry, bitmap.containers.items.len);
+        for (entries) |*entry| entry.* = .{};
+        errdefer {
+            for (entries) |entry| if (entry.words) |words| allocator.free(words);
+            allocator.free(entries);
+        }
+        var count: usize = 0;
+        for (bitmap.containers.items, entries) |container, *entry| {
+            entry.before = count;
+            switch (container) {
+                .array => |array| count += array.items.len,
+                .bitmap => |bits| {
+                    const words = try allocator.alloc(u16, bitmap_words);
+                    entry.words = words;
+                    var within: usize = 0;
+                    for (bits, words) |word, *prefix| {
+                        prefix.* = @intCast(within);
+                        within += @popCount(word);
+                    }
+                    count += within;
+                },
+            }
+        }
+        return .{ .allocator = allocator, .bitmap = bitmap, .entries = entries, .count = count };
+    }
+    pub fn deinit(self: *@This()) void {
+        for (self.entries) |entry| if (entry.words) |words| self.allocator.free(words);
+        self.allocator.free(self.entries);
+        self.* = undefined;
+    }
+    pub fn rank(self: *const @This(), value: u32) usize {
+        const high: u16 = @intCast(value >> 16);
+        const low: u16 = @truncate(value);
+        var lo: usize = 0;
+        var hi = self.entries.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.bitmap.keys.items[mid] < high) lo = mid + 1 else hi = mid;
+        }
+        if (lo == self.entries.len) return self.count;
+        const entry = self.entries[lo];
+        if (self.bitmap.keys.items[lo] != high) return entry.before;
+        if (entry.words) |words| {
+            const bit: u6 = @truncate(low);
+            const mask = (@as(u64, 1) << bit) - 1;
+            return entry.before + words[low / 64] + @as(usize, @popCount(self.bitmap.containers.items[lo].bitmap[low / 64] & mask));
+        }
+        return entry.before + self.bitmap.containers.items[lo].rankBelow(low);
+    }
+    pub fn retainedBytes(self: *const @This()) usize {
+        var bytes = self.entries.len * @sizeOf(Entry);
+        for (self.entries) |entry| if (entry.words) |words| {
+            bytes += words.len * 2;
+        };
+        return bytes;
+    }
+};
+
+test "frozen rank navigation matches sparse dense and boundary ranks with bounded prefixes" {
+    var bitmap = RoaringBitmap.init(std.testing.allocator);
+    defer bitmap.deinit();
+    for (0..200_000) |i| if (i % 3 != 0) {
+        try bitmap.add(@intCast(i));
+    };
+    try bitmap.add(300_000);
+    var index = try FrozenRankIndex.init(std.testing.allocator, bitmap);
+    defer index.deinit();
+    for (0..200_002) |i| {
+        const expected = i - (i + 2) / 3;
+        try std.testing.expectEqual(@min(@as(usize, 133_333), expected), index.rank(@intCast(i)));
+    }
+    try std.testing.expectEqual(bitmap.rank(300_001), index.rank(300_001));
+    try std.testing.expect(index.retainedBytes() < 10 * 1024);
+    const Harness = struct {
+        fn run(allocator: Allocator, source: RoaringBitmap) !void {
+            var navigation = try FrozenRankIndex.init(allocator, source);
+            defer navigation.deinit();
+            try std.testing.expectEqual(source.rank(170_123), navigation.rank(170_123));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{bitmap});
+}
