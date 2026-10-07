@@ -1268,6 +1268,50 @@ class PostgresReferenceTest(unittest.TestCase):
                 with self.subTest(sql=sql):
                     self.assertEqual(self.db.execute(sql).fetchall(), [expected])
 
+    def test_internal_array_query_boundaries(self):
+        cases = [
+            (
+                "WITH q AS (SELECT ARRAY[1,NULL,3]::bigint[] a) "
+                "SELECT cardinality(a), array_length(a,1) FROM q",
+                [(3, 3)],
+            ),
+            (
+                "WITH q AS MATERIALIZED (SELECT ARRAY[1,NULL,3]::bigint[] a) "
+                "SELECT cardinality(a), array_lower(a,1) FROM q",
+                [(3, 1)],
+            ),
+            (
+                "SELECT cardinality(a) FROM "
+                "(SELECT ARRAY[1,NULL,3]::bigint[] a ORDER BY 1) q",
+                [(3,)],
+            ),
+            (
+                "SELECT cardinality(a) FROM (SELECT ARRAY[1,NULL,3]::bigint[] a "
+                "UNION ALL SELECT ARRAY[4]::bigint[]) q ORDER BY 1",
+                [(1,), (3,)],
+            ),
+            (
+                "SELECT cardinality(p), array_length(p,1), 1.5 = ANY(p), "
+                "2.5 = ANY(p), 2.0 = ANY(p) FROM "
+                "(SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP "
+                "(ORDER BY x) p FROM (SELECT 1.0 x UNION ALL SELECT 3.0 x) t) q",
+                [(3, 3, True, True, None)],
+            ),
+            (
+                "SELECT cardinality(a), row_number() OVER (ORDER BY cardinality(a)) "
+                "FROM (SELECT ARRAY[1,2]::bigint[] a UNION ALL "
+                "SELECT ARRAY[3]::bigint[]) q ORDER BY 1",
+                [(1, 1), (2, 2)],
+            ),
+            (
+                "SELECT cardinality((SELECT ARRAY[1,NULL,3]::bigint[]))",
+                [(3,)],
+            ),
+        ]
+        for sql, expected in cases:
+            with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                self.assertEqual(self.db.execute(sql).fetchall(), expected)
+
     def test_typed_array_scalar_expression_contracts(self):
         import json
         from pathlib import Path

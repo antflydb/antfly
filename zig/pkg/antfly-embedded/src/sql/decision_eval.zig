@@ -440,8 +440,8 @@ pub const SortedProjection = struct {
         if (implicit_limit and remaining > limit) return error.SqlResultTooLarge;
         const start = top.released;
         const selected = ordered[0..@min(remaining, limit)];
-        const rows = try context.arena.alloc([]const std.json.Value, selected.len);
-        const flags = try context.arena.alloc([]const bool, selected.len);
+        const rows = try context.arena.alloc([]const std.json.Value, if (context.sink == null) selected.len else 0);
+        const flags = try context.arena.alloc([]const bool, if (context.sink == null) selected.len else 0);
         var first: usize = 0;
         while (first < selected.len) {
             try context.checkpoint();
@@ -462,6 +462,11 @@ pub const SortedProjection = struct {
                 for (values, output) |row, value| row[column] = value;
             };
             for (values, first..) |row, index| {
+                if (context.sink) |sink| {
+                    try sink.append(sink.ptr, row);
+                    top.releaseFinishedRow(start + index);
+                    continue;
+                }
                 const output = try context.arena.alloc(std.json.Value, self.outputs.len);
                 const nulls = try context.arena.alloc(bool, self.outputs.len);
                 for (row, output, nulls, self.outputs) |value, *out, *flag, program| {

@@ -3515,7 +3515,32 @@ ownership after source mutation, allocation-failure cleanup, SQL/JSON NULL
 distinction and the public array-output guard. PostgreSQL independently checks
 the same scalar/join/grouped values. This is architectural progress, not an
 original-case activation: the inventory remains 358 implemented, 136 rejected,
-73 superseded and 1,019 unresolved. Array-valued derived-query outputs, blocking
-query/scalar result transport, common array element-type coercion across set
-arms and the generated public/pgwire array descriptors and codecs still need
-completion before the remaining array original cases can receive parity credit.
+73 superseded and 1,019 unresolved. Common array element-type coercion across
+set arms and the generated public/pgwire array descriptors and codecs still
+need completion before the remaining array original cases can receive parity
+credit.
+
+### Typed internal query results (2026-10-07)
+
+Internal binding now retains array-valued outputs instead of applying public
+wire restrictions at every derived-relation boundary. Public binding still
+rejects unsupported wire result types before execution. Nested blocking queries,
+scalar owners and window input use one typed sink boundary, with either a shared
+spill cursor or a bounded no-I/O replay cursor. Sorted results transfer their
+operator ownership rather than materializing another JSON result matrix. Scalar
+owners keep the two-row cardinality frontier; array-valued min/max capture keeps
+its element descriptor as well as its owned value.
+
+External window ingestion no longer rebinds and routes internal input through
+the public JSON stream. It retains one bounded typed page for the small-input
+fast path and then writes directly into its window row/column store. Memory
+window execution releases its input cursor before calculating windows. Deferred
+provider output and ordinary selected rows honor typed sinks as well, so neither
+path silently drops array payloads.
+
+Executable PostgreSQL contracts cover CTEs, materialization, ordered subqueries,
+same-type UNION ALL, array-valued ordered-set aggregates, windows and scalar
+subqueries. The engine exercises memory and spill modes, including array values,
+NULL elements and allocation-failure cleanup; the mounted HTTP gate checks the
+same seven query shapes, complete wire rows, column types and SQL-null flags.
+These contracts do not activate unrelated original cases or publish raw arrays.

@@ -60,6 +60,10 @@ fn publicKind(kind: ?ast.ColumnType) !ast.ColumnType {
     return kind orelse .string;
 }
 
+fn internalKind(kind: ?ast.ColumnType) ast.ColumnType {
+    return kind orelse .string;
+}
+
 test "SQL column JSON excludes internal unknown NULL provenance" {
     const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "value", .type = .integer, .untyped_null = true }, .{});
     defer std.testing.allocator.free(encoded);
@@ -187,9 +191,17 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
 /// The backend's definition lookup occurs once;
 /// execution reuses binding.table instead of resolving another schema epoch.
 pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
+    const result = try bindInternal(allocator, backend, compiled, explicit_parameter_types);
+    for (result.columns) |column| _ = try publicKind(column.type);
+    return result;
+}
+
+/// Internal plans retain full typed descriptors. Wire validation belongs only
+/// at the public statement boundary, never at a derived relation boundary.
+pub fn bindInternal(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
     if (compiled.statement == .explain) {
         const inner: compiler.Compiled = .{ .arena = undefined, .statement = compiled.statement.explain.statement.*, .parameter_count = compiled.parameter_count };
-        var inspected = try bind(allocator, backend, &inner, explicit_parameter_types);
+        var inspected = try bindInternal(allocator, backend, &inner, explicit_parameter_types);
         // Keep the complete inner identity manifest for prepared/pgwire
         // validation. An EXPLAIN of a join must not pin only its first table.
         inspected.action = .read;
@@ -201,7 +213,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     if (compiled.statement == .select and @import("subquery_lowering.zig").accepts(compiled.statement.select)) {
         var lowered = compiled.*;
         lowered.statement = .{ .select = try @import("subquery_lowering.zig").lower(allocator, compiled.statement.select) };
-        return bind(allocator, backend, &lowered, explicit_parameter_types);
+        return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
     }
     // A mutation scalar subquery needs the same captured, decorrelated source
     // plan as joined DML. Route target-only UPDATE/DELETE through that planner
@@ -222,7 +234,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
             mutation.source = source;
             var lowered = compiled.*;
             lowered.statement = .{ .update = mutation };
-            return bind(allocator, backend, &lowered, explicit_parameter_types);
+            return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
         }
     }
     if (compiled.statement == .delete and compiled.statement.delete.source == null) {
@@ -234,7 +246,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
             mutation.source = source;
             var lowered = compiled.*;
             lowered.statement = .{ .delete = mutation };
-            return bind(allocator, backend, &lowered, explicit_parameter_types);
+            return bindInternal(allocator, backend, &lowered, explicit_parameter_types);
         }
     }
     if (compiled.statement == .select and @import("relation_binding.zig").accepts(compiled.statement.select)) {
@@ -246,7 +258,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         relation.* = try relations.bind(allocator, backend, compiled.statement.select, parameters);
         var adapter: relations.ResolveAdapter = .{ .backend = backend, .table = relation.table };
         const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = relation.statement }, .parameter_count = compiled.parameter_count };
-        var result = try bind(allocator, adapter.iface(), &lowered, parameters);
+        var result = try bindInternal(allocator, adapter.iface(), &lowered, parameters);
         result.relation = relation;
         const output_columns = try allocator.dupe(Column, result.columns);
         for (output_columns, 0..) |*column, index| column.untyped_null = column.untyped_null or relations.outputUntypedNull(relation.*, index);
@@ -280,10 +292,10 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         query.windows = &.{};
         query.count_all = false;
         query.order_by = &.{};
-        const validated = try bind(allocator, pinned, &validation, explicit_parameter_types);
+        const validated = try bindInternal(allocator, pinned, &validation, explicit_parameter_types);
         var executable = compiled.*;
         executable.statement.select.windows = &.{};
-        return bind(allocator, pinned, &executable, validated.parameter_types);
+        return bindInternal(allocator, pinned, &executable, validated.parameter_types);
     }
     if (@import("ddl_runtime.zig").accepts(compiled.statement)) {
         if (compiled.parameter_count != 0) return error.InvalidSqlParameters;
@@ -301,7 +313,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const window = try allocator.create(@import("window_binding.zig").Bound);
         window.* = try @import("window_binding.zig").bind(allocator, backend, compiled, explicit_parameter_types);
         const columns = try allocator.alloc(Column, window.outputs.len);
-        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = try publicKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
+        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
         return .{ .table = window.input.table, .action = .read, .columns = columns, .parameter_types = window.input.parameter_types, .json_literals = .empty, .window = window };
     }
     if (compiled.statement == .select and @import("aggregate_binding.zig").accepts(compiled.statement.select)) {
@@ -313,7 +325,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const aggregate = try allocator.create(@import("aggregate_binding.zig").Bound);
         aggregate.* = try @import("aggregate_binding.zig").bindWithSettings(allocator, table, compiled.statement.select, parameters, backend.settings_view);
         const columns = try allocator.alloc(Column, aggregate.outputs.len);
-        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = try publicKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
+        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
         var json_literals: std.StringHashMapUnmanaged(Json) = .empty;
         if (table) |definition| {
             const contexts = try allocator.alloc(?ast.ColumnType, parameters.len);
@@ -450,7 +462,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         try @import("relation_binding.zig").inferExpected(allocator, backend, source_query, parameters, expected);
         const lowered: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = source_query }, .parameter_count = compiled.parameter_count };
         const bound = try allocator.create(BoundStatement);
-        bound.* = try bind(allocator, backend, &lowered, parameters);
+        bound.* = try bindInternal(allocator, backend, &lowered, parameters);
         if (bound.columns.len != expected.len) return error.InvalidSqlParameters;
         for (bound.columns[0..insertion.columns.len], insertion.columns) |source_column, name| {
             const destination = try table.column(name);
@@ -472,7 +484,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = target.name };
         const returning_compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = selection }, .parameter_count = compiled.parameter_count };
         const returning_bound = try allocator.create(BoundStatement);
-        returning_bound.* = try bind(allocator, adapter.iface(), &returning_compiled, result.parameter_types);
+        returning_bound.* = try bindInternal(allocator, adapter.iface(), &returning_compiled, result.parameter_types);
         result.returning = returning_bound;
         result.returning_projections = selection.columns;
         if (relational_returning) result.returning_query = selection;
@@ -513,7 +525,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
         columns[0] = .{ .name = try alloc.dupe(u8, statement.count_alias orelse "count"), .type = .integer };
     } else for (statement.columns, scalars.projections, columns) |projection, program, *column| {
         const expression = program orelse return error.UndefinedColumn;
-        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = try publicKind(expression.output_type.kind), .element_type = expression.output_type.element_type, .untyped_null = expression.output_type.kind == null };
+        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(expression.output_type.kind), .element_type = expression.output_type.element_type, .untyped_null = expression.output_type.kind == null };
     }
     // Ordering a singleton changes nothing, but names must still resolve.
     for (statement.order_by) |order| {
@@ -635,7 +647,7 @@ const Context = struct {
         if (statement.columns.len == 0) {
             if (self.table.columns.len > 256) return error.SqlProgramLimitExceeded;
             const columns = try self.allocator.alloc(Column, self.table.columns.len);
-            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = try publicKind(column.type), .element_type = column.element_type };
+            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = internalKind(column.type), .element_type = column.element_type };
             return columns;
         }
         const columns = try self.allocator.alloc(Column, statement.columns.len);
@@ -644,7 +656,7 @@ const Context = struct {
         for (statement.columns, columns, 0..) |projection, *output, index| {
             if (projection.expression != null) {
                 const program = self.scalars.projections[index] orelse return error.InvalidSqlBackendResponse;
-                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = try publicKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
+                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = internalKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
                 continue;
             }
             const column = try self.table.column(projection.field);
@@ -652,7 +664,7 @@ const Context = struct {
                 _ = try native_fields.getOrPut(self.allocator, column.path);
                 if (native_fields.count() > 256 and !statement.internal_projection) return error.SqlProgramLimitExceeded;
             }
-            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = try publicKind(column.type), .element_type = column.element_type };
+            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = internalKind(column.type), .element_type = column.element_type };
         }
         return columns;
     }

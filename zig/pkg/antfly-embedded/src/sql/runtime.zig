@@ -292,19 +292,54 @@ pub const Context = struct {
     /// the public bigint string representation must not enter row arithmetic.
     pub fn deferredScalar(self: Context, query: *const ast.Select, bound: *const describe.BoundStatement) !@import("scalar.zig").Datum {
         var nested = self;
-        nested.sink = null;
         nested.binding = bound.*;
         nested.typed_output = true;
         nested.limits.result_rows = @min(nested.limits.result_rows, 2);
         if (nested.limits.result_rows < 2) return error.SqlProgramLimitExceeded;
-        const output = nested.select(query.*) catch |err| switch (err) {
+        const cursor = nested.typedQuery(query.*) catch |err| switch (err) {
             error.SqlResultTooLarge => return error.SqlCardinalityViolation,
             else => return err,
         };
-        if (output.rows.len > 1) return error.SqlCardinalityViolation;
-        if (output.rows.len == 0) return .{ .value = .null, .sql_null = true };
-        if (output.rows[0].len != 1 or output.sql_nulls == null or output.sql_nulls.?.len != 1 or output.sql_nulls.?[0].len != 1) return error.InvalidSqlBackendResponse;
-        return .{ .value = output.rows[0][0], .sql_null = output.sql_nulls.?[0][0] };
+        defer cursor.close();
+        if (cursor.count() > 1) return error.SqlCardinalityViolation;
+        const row = (try cursor.next(self.arena)) orelse return .{};
+        if (row.len != 1) return error.InvalidSqlBackendResponse;
+        return row[0];
+    }
+
+    /// One typed blocking-result boundary for nested relations, windows and
+    /// scalar owners. Spill and no-I/O execution have identical value semantics.
+    pub fn typedQuery(self: Context, statement: ast.Select) !*@import("result_cursor.zig").Cursor {
+        const Cursor = @import("result_cursor.zig").Cursor;
+        const cursor = if (self.spill) |manager| try Cursor.create(self.alloc, manager, self.binding.columns.len) else try Cursor.createMemory(self.alloc, self.binding.columns.len, self.limits.retained_bytes / 2);
+        errdefer cursor.close();
+        try self.selectInto(statement, .{ .ptr = cursor, .append = Cursor.append, .take_sorted = Cursor.takeSorted });
+        return cursor;
+    }
+
+    pub fn selectInto(self: Context, statement: ast.Select, sink: RowSink) !void {
+        var nested = self;
+        nested.typed_output = true;
+        nested.sink = sink;
+        const output = try nested.select(statement);
+        // Metadata/count optimizations may return a tiny scalar JSON result.
+        // Never interpret an array placeholder through this compatibility path.
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        if (output.sql_nulls) |flags| if (flags.len != output.rows.len) return error.InvalidSqlBackendResponse;
+        if (output.pattern_sources) |sources| if (sources.len != output.rows.len) return error.InvalidSqlBackendResponse;
+        for (output.rows, 0..) |row, index| {
+            _ = scratch.reset(.retain_capacity);
+            if (row.len != self.binding.columns.len) return error.InvalidSqlBackendResponse;
+            if (output.sql_nulls) |flags| if (flags[index].len != row.len) return error.InvalidSqlBackendResponse;
+            if (output.pattern_sources) |sources| if (sources[index].len != row.len) return error.InvalidSqlBackendResponse;
+            const values = try scratch.allocator().alloc(Datum, row.len);
+            for (row, values, self.binding.columns, 0..) |value_, *cell, column, ordinal| {
+                if (column.type == .array) return error.InvalidSqlBackendResponse;
+                cell.* = try describe.coerceDatum(scratch.allocator(), .{ .value = value_, .sql_null = if (output.sql_nulls) |flags| flags[index][ordinal] else value_ == .null, .patterns = if (output.pattern_sources) |sources| sources[index][ordinal] else null }, column.type, column.element_type);
+            }
+            try sink.append(sink.ptr, values);
+        }
     }
 
     pub fn outputValue(self: Context, value_: Json) !Json {
@@ -498,6 +533,7 @@ pub const Context = struct {
         };
         const defer_projection = std.mem.indexOfScalar(bool, deferred, true) != null;
         var rows: std.ArrayList([]const Json) = .empty;
+        var delivered: usize = 0;
         var null_rows: std.ArrayList([]const bool) = .empty;
         var scanned: usize = 0;
         var visited: usize = 0;
@@ -528,7 +564,7 @@ pub const Context = struct {
             // Unfiltered, unsorted pulls can bound prefetch to output demand
             // without changing residual scan capacity or sort/count inputs.
             const wanted = if (top_k == null and !statement.count_all and self.binding.scalars.predicate == null)
-                @min(self.limits.page_rows, (offset -| scanned) +| (limit -| rows.items.len) +| @intFromBool(statement.limit == null))
+                @min(self.limits.page_rows, (offset -| scanned) +| (limit -| delivered) +| @intFromBool(statement.limit == null))
             else
                 self.limits.page_rows;
             const page = try scan_state.page(self, page_arena.allocator(), table_def, .{
@@ -566,7 +602,7 @@ pub const Context = struct {
                     }
                     page_scanned += 1;
                     if (statement.count_all or (top_k == null and page_scanned <= offset)) continue;
-                    if (top_k == null and selected_cells.items.len >= limit - rows.items.len) continue;
+                    if (top_k == null and selected_cells.items.len >= limit - delivered) continue;
                     selected_positions[index] = selected_cells.items.len;
                     try selected_cells.append(scratch, cells);
                 }
@@ -598,7 +634,7 @@ pub const Context = struct {
                             projection_values[index].?[selected_positions[row_index].?]
                         else blk: {
                             const cell = try row.cell(field);
-                            break :blk .{ .value = try coerce(scratch, cell.value, columns[index].type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+                            break :blk try describe.coerceDatum(scratch, cell, columns[index].type, columns[index].element_type);
                         };
                         const keys = try scratch.alloc(Datum, self.binding.order_keys.len);
                         for (self.binding.order_keys, keys) |key, *out| out.* = switch (key.source) {
@@ -606,16 +642,27 @@ pub const Context = struct {
                             .expression => |index| order_values[index].?[selected_positions[row_index].?],
                             .column => |column| blk: {
                                 const cell = try row.cell(column.path);
-                                break :blk .{ .value = try coerce(scratch, cell.value, column.type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+                                break :blk try describe.coerceDatum(scratch, cell, column.type, column.element_type);
                             },
                         };
                         try operator.add(.{ .values = values, .keys = keys, .ordinal = visited });
                         continue;
                     }
                     if (scanned <= offset) continue;
-                    if (rows.items.len == limit) {
+                    if (delivered == limit) {
                         if (statement.limit == null) return error.SqlResultTooLarge;
                         return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
+                    }
+                    if (self.sink) |sink| {
+                        const values = try scratch.alloc(Datum, fields.items.len);
+                        for (fields.items, columns, values, 0..) |field, column, *cell, index| {
+                            const input = if (index < projection_values.len and projection_values[index] != null) projection_values[index].?[selected_positions[row_index].?] else try row.cell(field);
+                            cell.* = try describe.coerceDatum(scratch, input, column.type, column.element_type);
+                        }
+                        try sink.append(sink.ptr, values);
+                        delivered += 1;
+                        if (delivered == limit and statement.limit != null) return .{ .columns = columns, .command_tag = "SELECT" };
+                        continue;
                     }
                     const cells = try self.arena.alloc(Json, fields.items.len);
                     const nulls = try self.arena.alloc(bool, fields.items.len);
@@ -635,7 +682,8 @@ pub const Context = struct {
                     }
                     try rows.append(self.arena, cells);
                     try null_rows.append(self.arena, nulls);
-                    if (rows.items.len == limit and statement.limit != null) return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
+                    delivered += 1;
+                    if (delivered == limit and statement.limit != null) return .{ .columns = columns, .rows = rows.items, .sql_nulls = null_rows.items, .command_tag = "SELECT" };
                 }
                 first += chunk_rows.len;
             }
@@ -676,6 +724,11 @@ pub const Context = struct {
                         for (output, values) |cells, datum| cells[column] = datum;
                     };
                     for (output, first + start..) |values, index| {
+                        if (self.sink) |sink| {
+                            try sink.append(sink.ptr, values);
+                            operator.releaseFinishedRow(index);
+                            continue;
+                        }
                         const cells = try self.arena.alloc(Json, values.len);
                         const nulls = try self.arena.alloc(bool, values.len);
                         for (values, cells, nulls, columns) |datum, *cell, *flag, column| {
@@ -762,6 +815,18 @@ pub const Context = struct {
         const matches = try self.binding.scalars.matchesWithProvider(evaluation.allocator(), &.{}, self.parameters, self.backend.decision_provider);
         if (!evaluation.reset(.retain_capacity)) return error.OutOfMemory;
         if (!matches and !statement.count_all) return .{ .columns = columns, .command_tag = "SELECT" };
+        if (self.sink) |sink| {
+            const values = try self.arena.alloc(Datum, columns.len);
+            if (statement.count_all) {
+                values[0] = Datum.json(.{ .integer = @intFromBool(matches) });
+            } else for (self.binding.scalars.projections, values) |optional, *out| {
+                const program = optional orelse return error.InvalidSqlBackendResponse;
+                if (!evaluation.reset(.retain_capacity)) return error.OutOfMemory;
+                out.* = try operators.cloneDatum(self.arena, try self.evaluate(evaluation.allocator(), program, &.{}));
+            }
+            try sink.append(sink.ptr, values);
+            return .{ .columns = columns, .command_tag = "SELECT" };
+        }
         const rows = try self.arena.alloc([]const Json, 1);
         const cells = try self.arena.alloc(Json, columns.len);
         const null_rows = try self.arena.alloc([]const bool, 1);

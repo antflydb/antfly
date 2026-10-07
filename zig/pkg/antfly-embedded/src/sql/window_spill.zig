@@ -29,57 +29,68 @@ fn same(left: []const Datum, right: []const Datum, count: usize) !bool {
     }
     return true;
 }
-fn appendPage(context: anytype, rows: *disk.Rows, output: @import("runtime.zig").Output, input_columns: anytype) !void {
-    var arena = std.heap.ArenaAllocator.init(context.alloc);
-    defer arena.deinit();
-    for (output.rows, 0..) |row, index| {
-        _ = arena.reset(.free_all);
-        const values = try arena.allocator().alloc(Datum, rows.width);
-        @memset(values, .{});
-        for (row, input_columns, values[0..row.len], 0..) |value, column, *out, i| out.* = .{ .value = try @import("describe.zig").coerceAlloc(arena.allocator(), value, column.type), .sql_null = if (output.sql_nulls) |flags| flags[index][i] else value == .null };
-        try rows.append(.{ .values = values, .keys = &.{}, .ordinal = rows.len });
-    }
+/// Retain one bounded typed page for the small-input fast path, then admit
+/// directly into the window store. No public JSON stream or second spool.
+fn Input(comptime Context: type) type {
+    return struct {
+        context: Context,
+        width: usize,
+        input_width: usize,
+        arena: std.heap.ArenaAllocator,
+        scratch: std.heap.ArenaAllocator,
+        pending: std.ArrayList([]Datum) = .empty,
+        bytes: usize = 0,
+        rows: ?disk.Rows = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.rows) |*rows| rows.deinit();
+            self.pending.deinit(self.context.alloc);
+            self.arena.deinit();
+            self.scratch.deinit();
+        }
+        fn append(raw: *anyopaque, input: []const Datum) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (input.len != self.input_width) return error.InvalidSqlBackendResponse;
+            var bytes: usize = self.width * @sizeOf(Datum) + @sizeOf([]Datum);
+            for (input) |value| bytes +|= try operators.datumBytes(value);
+            if (self.rows == null and (self.pending.items.len >= self.context.limits.page_rows or bytes > self.context.limits.page_bytes -| self.bytes)) {
+                self.rows = try disk.Rows.init(self.context.alloc, self.context.spill.?, self.width);
+                try self.rows.?.enableColumns();
+                for (self.pending.items) |values| try self.rows.?.append(.{ .values = values, .keys = &.{}, .ordinal = self.rows.?.len });
+                self.pending.clearAndFree(self.context.alloc);
+                _ = self.arena.reset(.free_all);
+            }
+            if (self.rows) |*rows| {
+                _ = self.scratch.reset(.retain_capacity);
+                const values = try self.scratch.allocator().alloc(Datum, self.width);
+                @memset(values, .{});
+                @memcpy(values[0..input.len], input);
+                try rows.append(.{ .values = values, .keys = &.{}, .ordinal = rows.len });
+            } else {
+                const values = try self.arena.allocator().alloc(Datum, self.width);
+                @memset(values, .{});
+                for (input, values[0..input.len]) |value, *out| out.* = try operators.cloneDatum(self.arena.allocator(), value);
+                try self.pending.append(self.context.alloc, values);
+                self.bytes +|= bytes;
+            }
+        }
+    };
 }
 pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import("runtime.zig").Output {
     const bound = context.binding.window.?;
     const manager = context.spill orelse return null;
-    const compiled: @import("compiler.zig").Compiled = .{ .arena = undefined, .statement = .{ .select = bound.statement }, .parameter_count = @intCast(context.parameters.len) };
-    var limits = context.limits;
-    limits.result_rows = limits.scan_rows;
-    var backend = context.backend;
-    backend.spill_manager = manager;
-    const input = (try @import("read_stream.zig").Stream.open(context.alloc, backend, &compiled, context.parameters, limits)) orelse return null;
-    var input_owned = true;
-    defer if (input_owned) input.close();
     const width = bound.input.columns.len + bound.specs.len;
-    var first = try input.next(context.limits.page_rows);
-    var first_owned = true;
-    defer if (first_owned) first.deinit();
-    if (first.exhausted) {
-        var arena = std.heap.ArenaAllocator.init(context.alloc);
-        defer arena.deinit();
-        const cells = try arena.allocator().alloc([]Datum, first.output.rows.len);
-        for (first.output.rows, cells, 0..) |row, *values, index| {
-            values.* = try arena.allocator().alloc(Datum, width);
-            @memset(values.*, .{});
-            for (row, bound.input.columns, values.*[0..row.len], 0..) |value, column, *out, i| out.* = .{ .value = try @import("describe.zig").coerceAlloc(arena.allocator(), value, column.type), .sql_null = if (first.output.sql_nulls) |flags| flags[index][i] else value == .null };
-        }
-        return try window.evaluateCells(context, statement, cells);
-    }
-    var rows = try disk.Rows.init(context.alloc, manager, width);
+    const Collector = Input(@TypeOf(context));
+    var input: Collector = .{ .context = context, .width = width, .input_width = bound.input.columns.len, .arena = .init(context.alloc), .scratch = .init(context.alloc) };
+    defer input.deinit();
+    var input_context = context;
+    input_context.binding = bound.input.*;
+    input_context.limits.result_rows = context.limits.scan_rows;
+    try input_context.selectInto(bound.statement, .{ .ptr = &input, .append = Collector.append });
+    if (input.rows == null) return try window.evaluateCells(context, statement, input.pending.items);
+    var rows = input.rows.?;
+    input.rows = null;
     defer rows.deinit();
-    try rows.enableColumns();
-    try appendPage(context, &rows, first.output, bound.input.columns);
-    first.deinit();
-    first_owned = false;
-    while (true) {
-        var page = try input.next(context.limits.page_rows);
-        defer page.deinit();
-        try appendPage(context, &rows, page.output, bound.input.columns);
-        if (page.exhausted) break;
-    }
-    input.close();
-    input_owned = false;
     const roots = try @import("ordering_reuse.zig").plan(context.arena, bound);
     try rows.enableColumnUpdates(bound.input.columns.len);
     var final_indices = try disk.Integers.init(manager);

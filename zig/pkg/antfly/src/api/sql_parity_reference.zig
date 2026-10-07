@@ -721,6 +721,40 @@ pub fn runArrayExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
     std.debug.print("SQL public array expression contracts: 164 passed; no original disposition credit\n", .{});
 }
 
+pub fn runInternalArrayQueries(alloc: std.mem.Allocator, handler: anytype) !void {
+    const Type = @FieldType(wire.SQLColumn, "type");
+    const Case = struct { sql: []const u8, rows: []const u8, types: []const Type };
+    const cases = [_]Case{
+        .{ .sql = "WITH q AS (SELECT ARRAY[1,NULL,3]::bigint[] a) SELECT cardinality(a), array_length(a,1) FROM q", .rows = "[[\"3\",\"3\"]]", .types = &.{ .integer, .integer } },
+        .{ .sql = "WITH q AS MATERIALIZED (SELECT ARRAY[1,NULL,3]::bigint[] a) SELECT cardinality(a), array_lower(a,1) FROM q", .rows = "[[\"3\",\"1\"]]", .types = &.{ .integer, .integer } },
+        .{ .sql = "SELECT cardinality(a) FROM (SELECT ARRAY[1,NULL,3]::bigint[] a ORDER BY 1) q", .rows = "[[\"3\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT cardinality(a) FROM (SELECT ARRAY[1,NULL,3]::bigint[] a UNION ALL SELECT ARRAY[4]::bigint[]) q ORDER BY 1", .rows = "[[\"1\"],[\"3\"]]", .types = &.{.integer} },
+        .{ .sql = "SELECT cardinality(p), array_length(p,1), 1.5 = ANY(p), 2.5 = ANY(p), 2.0 = ANY(p) FROM (SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) p FROM (SELECT 1.0 x UNION ALL SELECT 3.0 x) t) q", .rows = "[[\"3\",\"3\",true,true,null]]", .types = &.{ .integer, .integer, .boolean, .boolean, .boolean } },
+        .{ .sql = "SELECT cardinality(a), row_number() OVER (ORDER BY cardinality(a)) FROM (SELECT ARRAY[1,2]::bigint[] a UNION ALL SELECT ARRAY[3]::bigint[]) q ORDER BY 1", .rows = "[[\"1\",\"1\"],[\"2\",\"2\"]]", .types = &.{ .integer, .integer } },
+        .{ .sql = "SELECT cardinality((SELECT ARRAY[1,NULL,3]::bigint[]))", .rows = "[[\"3\"]]", .types = &.{.integer} },
+    };
+    for (cases) |entry| {
+        const case: fixtures.Corpus.Case = .{ .id = "internal-array-query-contract", .name = entry.sql, .family = "array", .sql = entry.sql, .params = &.{}, .source_expectation = "success" };
+        const response = try execute(alloc, handler, &case);
+        defer response.deinit();
+        const result = response.value;
+        const rows = try std.json.Stringify.valueAlloc(alloc, result.rows, .{});
+        defer alloc.free(rows);
+        try std.testing.expectEqualStrings(entry.rows, rows);
+        try std.testing.expectEqual(entry.types.len, result.columns.len);
+        for (entry.types, result.columns) |kind, column| try std.testing.expectEqual(kind, column.type);
+        try std.testing.expectEqualStrings("SELECT", result.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), result.rows_affected);
+        try std.testing.expect(result.sql_nulls != null);
+        try std.testing.expectEqual(result.rows.len, result.sql_nulls.?.len);
+        for (result.rows, result.sql_nulls.?) |row, nulls| {
+            try std.testing.expectEqual(row.len, nulls.len);
+            for (row, nulls) |cell, is_null| try std.testing.expectEqual(cell == .null, is_null);
+        }
+    }
+    std.debug.print("SQL public internal-array query contracts: 7 passed; no original disposition credit\n", .{});
+}
+
 pub fn runReference(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
     const discovery = try std.testing.environ.containsUnempty(alloc, "ANTFLY_SQL_READ_DISCOVERY");
     return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, discovery);

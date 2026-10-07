@@ -13382,6 +13382,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         "sql-1387",
     };
     try @import("sql_parity_reference.zig").runArrayExpressions(alloc, &handler);
+    try @import("sql_parity_reference.zig").runInternalArrayQueries(alloc, &handler);
     // These historical SQLite-positive originals are invalid in PostgreSQL:
     // an output alias is not an input variable inside ORDER BY arithmetic.
     for ([_][]const u8{ "sql-1219", "sql-1373" }) |id| try @import("sql_parity_reference.zig").expectRejection(alloc, &handler, id, "42703");

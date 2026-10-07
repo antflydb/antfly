@@ -241,7 +241,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     var input_compiled = compiled.*;
     input_compiled.statement = .{ .select = input_statement };
     const input = try alloc.create(describe.BoundStatement);
-    input.* = try describe.bind(alloc, pinned_backend, &input_compiled, inferred);
+    input.* = try describe.bindInternal(alloc, pinned_backend, &input_compiled, inferred);
     const parameters = @constCast(input.parameter_types);
     const columns = try alloc.alloc(scalar.Column, input.columns.len + builder.specs.items.len);
     for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type };

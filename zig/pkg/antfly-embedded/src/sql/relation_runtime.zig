@@ -156,6 +156,53 @@ test "SQL typed array rows survive scalar join and grouped relation adapters" {
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
+test "SQL internal array query boundaries preserve values in memory and spill execution" {
+    const Case = struct { sql: []const u8, expected: []const u8 };
+    for ([_]bool{ false, true }) |with_io| {
+        var fixture: SetTestBackend = .{};
+        var backend = fixture.backend();
+        backend.execution_io = if (with_io) std.testing.io else null;
+        for ([_]Case{
+            .{ .sql = "WITH q AS (SELECT ARRAY[1,NULL,3]::bigint[] a) SELECT cardinality(a), array_length(a,1) FROM q", .expected = "[[\"3\",\"3\"]]" },
+            .{ .sql = "WITH q AS MATERIALIZED (SELECT ARRAY[1,NULL,3]::bigint[] a) SELECT cardinality(a), array_lower(a,1) FROM q", .expected = "[[\"3\",\"1\"]]" },
+            .{ .sql = "SELECT cardinality(a) FROM (SELECT ARRAY[1,NULL,3]::bigint[] a ORDER BY 1) q", .expected = "[[\"3\"]]" },
+            .{ .sql = "SELECT cardinality(a) FROM (SELECT ARRAY[1,NULL,3]::bigint[] a UNION ALL SELECT ARRAY[4]::bigint[]) q ORDER BY 1", .expected = "[[\"1\"],[\"3\"]]" },
+            .{ .sql = "SELECT cardinality(p), array_length(p,1), 1.5 = ANY(p), 2.5 = ANY(p), 2.0 = ANY(p) FROM (SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) p FROM (SELECT 1.0 x UNION ALL SELECT 3.0 x) t) q", .expected = "[[\"3\",\"3\",true,true,null]]" },
+            .{ .sql = "SELECT cardinality(a), row_number() OVER (ORDER BY cardinality(a)) FROM (SELECT ARRAY[1,2]::bigint[] a UNION ALL SELECT ARRAY[3]::bigint[]) q ORDER BY 1", .expected = "[[\"1\",\"1\"],[\"2\",\"2\"]]" },
+            .{ .sql = "SELECT cardinality((SELECT ARRAY[1,NULL,3]::bigint[]))", .expected = "[[\"3\"]]" },
+        }) |case| {
+            var compiled = try @import("compiler.zig").compile(std.testing.allocator, case.sql, .{});
+            defer compiled.deinit();
+            var result = try @import("runtime.zig").execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+            defer std.testing.allocator.free(encoded);
+            try std.testing.expectEqualStrings(case.expected, encoded);
+        }
+    }
+}
+
+test "SQL typed blocking query boundaries unwind allocation failures" {
+    const Scenario = struct {
+        fn run(a: Allocator, with_io: bool) !void {
+            var fixture: SetTestBackend = .{};
+            var backend = fixture.backend();
+            backend.execution_io = if (with_io) std.testing.io else null;
+            for ([_][]const u8{
+                "SELECT cardinality((SELECT ARRAY[1,NULL,3]::bigint[]))",
+                "SELECT cardinality(a), row_number() OVER (ORDER BY cardinality(a)) FROM (SELECT ARRAY[1,2]::bigint[] a UNION ALL SELECT ARRAY[3]::bigint[]) q ORDER BY 1",
+            }) |sql| {
+                var compiled = try @import("compiler.zig").compile(a, sql, .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1 });
+                defer result.deinit();
+                try std.testing.expect(result.output.rows.len != 0);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |with_io| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{with_io});
+}
+
 test "SQL materialized relation replay spills once and shares a single statement capture" {
     const Fixture = struct {
         offset: usize = 0,
@@ -503,7 +550,6 @@ fn Engine(comptime Context: type) type {
             left_values: ?[]const Datum = null,
             left_matched: bool = false,
             unmatched_index: usize = 0,
-            output: ?@import("runtime.zig").Output = null,
             output_index: usize = 0,
             result_cursor: ?*@import("result_cursor.zig").Cursor = null,
             query_fields: ?[]const []const u8 = null,
@@ -749,7 +795,7 @@ fn Engine(comptime Context: type) type {
                         if (query.binding.aggregate == null and query.binding.window == null and !query.statement.count_all and query.binding.order_keys.len == 0)
                             break :blk try self.nextQuery(alloc, query);
                         if (self.result_cursor) |cursor| break :blk try cursor.next(alloc);
-                        if (self.output == null) {
+                        {
                             var adapter: Adapter = .{ .engine = self.engine, .iterator = self.left.?, .table = query.binding.table.? };
                             var context = self.engine.context;
                             context.backend = adapter.iface();
@@ -765,40 +811,12 @@ fn Engine(comptime Context: type) type {
                             }
                             context.invocation_constants = constants;
                             context.limits.result_rows = context.limits.scan_rows;
-                            if (context.spill) |manager| {
-                                const Cursor = @import("result_cursor.zig").Cursor;
-                                const cursor = try Cursor.create(context.alloc, manager, self.node.columns.len);
-                                errdefer cursor.close();
-                                context.typed_output = true;
-                                context.sink = .{ .ptr = cursor, .append = Cursor.append, .take_sorted = Cursor.takeSorted };
-                                const output = try context.select(query.statement);
-                                // Constant/count paths can return a small ordinary result.
-                                var scratch = std.heap.ArenaAllocator.init(context.alloc);
-                                defer scratch.deinit();
-                                for (output.rows, 0..) |row, index| {
-                                    _ = scratch.reset(.free_all);
-                                    const values = try scratch.allocator().alloc(Datum, row.len);
-                                    for (row, values, 0..) |value, *cell, column| cell.* = .{
-                                        .value = value,
-                                        .sql_null = if (output.sql_nulls) |flags| flags[index][column] else value == .null,
-                                        .patterns = if (output.pattern_sources) |sources| sources[index][column] else null,
-                                    };
-                                    try Cursor.append(cursor, values);
-                                }
-                                const first = try cursor.next(alloc);
-                                self.result_cursor = cursor;
-                                break :blk first;
-                            }
-                            self.output = try context.select(query.statement);
+                            const cursor = try context.typedQuery(query.statement);
+                            errdefer cursor.close();
+                            const first = try cursor.next(alloc);
+                            self.result_cursor = cursor;
+                            break :blk first;
                         }
-                        const output = self.output.?;
-                        if (self.output_index >= output.rows.len) break :blk null;
-                        const row = output.rows[self.output_index];
-                        const sql_nulls = if (output.sql_nulls) |nulls| nulls[self.output_index] else null;
-                        self.output_index += 1;
-                        const values = try alloc.alloc(Datum, row.len);
-                        for (row, self.node.columns, values, 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerceAlloc(alloc, value, column.type), .sql_null = if (sql_nulls) |flags| flags[i] else value == .null, .patterns = if (output.pattern_sources) |sources| sources[self.output_index - 1][i] else null };
-                        break :blk values;
                     },
                 };
             }

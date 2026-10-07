@@ -368,6 +368,7 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
             .pattern_set => .json,
             else => input_type orelse .string,
         };
+        if (column.type == .array) column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;
         if (node.call.within_group != null) {
             column.type = if (orderedKind(node.call.name).? == .continuous) .number else input_type orelse .string;
             column.element_type = if (index) |slot| input.projections[slot].?.output_type.element_type else null;

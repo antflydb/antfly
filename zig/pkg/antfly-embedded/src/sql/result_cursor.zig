@@ -22,6 +22,8 @@ pub const Cursor = struct {
     a: std.mem.Allocator,
     width: usize,
     rows: @import("spill.zig").Sequential,
+    memory: ?*@import("replay_rows.zig").Replay = null,
+    memory_reader: ?*@import("replay_rows.zig").Replay.Reader = null,
     index: usize = 0,
     sorted: ?*@import("operators.zig").TopK = null,
     sorted_rows: []const @import("operators.zig").Row = &.{},
@@ -32,6 +34,16 @@ pub const Cursor = struct {
         const self = try a.create(Cursor);
         errdefer a.destroy(self);
         self.* = .{ .manager = undefined, .shared = manager, .a = a, .width = width, .rows = try @import("spill.zig").Sequential.init(manager, @max(128, manager.buffer_bytes * 2)) };
+        return self;
+    }
+
+    /// No-I/O execution uses the same lossless cursor and sort ownership
+    /// transfer. Replay enforces a resident quota without a filesystem fallback.
+    pub fn createMemory(a: std.mem.Allocator, width: usize, memory_bytes: usize) !*Cursor {
+        const self = try a.create(Cursor);
+        errdefer a.destroy(self);
+        const memory = try @import("replay_rows.zig").Replay.create(a, width, memory_bytes, null);
+        self.* = .{ .manager = undefined, .a = a, .width = width, .rows = undefined, .memory = memory };
         return self;
     }
     pub fn next(self: *Cursor, a: std.mem.Allocator) !?[]const @import("scalar.zig").Datum {
@@ -48,11 +60,11 @@ pub const Cursor = struct {
         return values;
     }
     pub fn count(self: *const Cursor) usize {
-        return if (self.sorted != null) self.sorted_count else @intCast(self.rows.size);
+        return if (self.sorted != null) self.sorted_count else if (self.memory) |memory| memory.count else @intCast(self.rows.size);
     }
     pub fn takeSorted(raw: *anyopaque, top: *@import("operators.zig").TopK, offset: usize, limit: usize, implicit: bool) !void {
         const self: *Cursor = @ptrCast(@alignCast(raw));
-        if (self.sorted != null or self.rows.size != 0) return error.InvalidSqlBackendResponse;
+        if (self.sorted != null or self.count() != 0) return error.InvalidSqlBackendResponse;
         const total = if (top.external) |sort| @min(sort.total, top.capacity) else top.count;
         const available = total -| offset;
         if (implicit and available > limit) return error.SqlResultTooLarge;
@@ -84,11 +96,19 @@ pub const Cursor = struct {
             }
             return self.sorted_rows[self.sorted_offset + self.index];
         }
+        if (self.memory) |memory| {
+            if (self.memory_reader == null) {
+                try memory.finish();
+                self.memory_reader = try memory.openReader();
+            }
+            return .{ .values = (try self.memory_reader.?.next()) orelse return error.InvalidSqlBackendResponse, .keys = &.{}, .ordinal = self.index };
+        }
         return (try self.rows.readBorrowed(self.index)).row;
     }
     pub fn append(raw: *anyopaque, values: []const @import("scalar.zig").Datum) !void {
         const self: *Cursor = @ptrCast(@alignCast(raw));
         if (values.len != self.width or self.sorted != null) return error.InvalidSqlBackendResponse;
+        if (self.memory) |memory| return memory.append(values);
         _ = try self.rows.append(.{ .values = values, .keys = &.{}, .ordinal = self.rows.size }, @import("spill.zig").none);
     }
     pub fn close(self: *Cursor) void {
@@ -98,11 +118,39 @@ pub const Cursor = struct {
             top.deinit();
             a.destroy(top);
         }
-        self.rows.close();
-        if (self.shared == null) self.manager.deinit();
+        if (self.memory) |memory| {
+            if (self.memory_reader) |reader| reader.close();
+            memory.deinit();
+        } else {
+            self.rows.close();
+            if (self.shared == null) self.manager.deinit();
+        }
         a.destroy(self);
     }
 };
+
+test "SQL no-I/O blocking cursors preserve arrays bound memory and unwind allocation failures" {
+    const Scenario = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const Datum = @import("scalar.zig").Datum;
+            var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -2 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+            const cursor = try Cursor.createMemory(a, 1, 64 * 1024);
+            defer cursor.close();
+            try Cursor.append(cursor, &.{Datum.typedArray(&array)});
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const row = (try cursor.next(arena.allocator())).?;
+            try std.testing.expectEqual(@as(i64, 9007199254740993), row[0].array.?.elements[0].value.integer);
+            try std.testing.expectEqual(@as(i32, -2), row[0].array.?.dimensions[0].lower);
+            try std.testing.expect(row[0].array.?.elements[1].sql_null);
+            try std.testing.expect(try cursor.next(arena.allocator()) == null);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    const cursor = try Cursor.createMemory(std.testing.allocator, 1, 0);
+    defer cursor.close();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, Cursor.append(cursor, &.{.{}}));
+}
 
 test "SQL blocking result blocks preserve exact values and avoid row directories" {
     const a = std.testing.allocator;

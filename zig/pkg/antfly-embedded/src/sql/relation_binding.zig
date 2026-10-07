@@ -969,7 +969,7 @@ const Builder = struct {
         const table = try self.virtualTable(source.columns);
         var adapter: ResolveAdapter = .{ .backend = self.backend, .table = table };
         const compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = lowered }, .parameter_count = @intCast(self.parameters.len) };
-        const bound = try describe.bind(self.alloc, adapter.iface(), &compiled, self.parameters);
+        const bound = try describe.bindInternal(self.alloc, adapter.iface(), &compiled, self.parameters);
         for (bound.parameter_types, self.parameters) |hint, *parameter| if (hint != null) {
             parameter.* = hint;
         };
@@ -1021,7 +1021,7 @@ const Builder = struct {
         const table = try self.virtualTable(child.columns);
         var adapter: ResolveAdapter = .{ .backend = self.backend, .table = table };
         const compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = lowered }, .parameter_count = @intCast(self.parameters.len) };
-        const bound = try describe.bind(self.alloc, adapter.iface(), &compiled, self.parameters);
+        const bound = try describe.bindInternal(self.alloc, adapter.iface(), &compiled, self.parameters);
         for (bound.parameter_types, self.parameters) |hint, *parameter| if (hint != null) {
             parameter.* = hint;
         };

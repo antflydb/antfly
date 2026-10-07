@@ -524,6 +524,8 @@ pub const Stream = struct {
             owner.rows = try @import("spill.zig").Sequential.init(manager, @max(128, @min(32 * 1024, limits.retained_bytes / 64)));
             errdefer owner.rows.close();
             owner.index = 0;
+            owner.memory = null;
+            owner.memory_reader = null;
             owner.sorted = null;
             owner.sorted_rows = &.{};
             owner.sorted_offset = 0;

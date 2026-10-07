@@ -651,13 +651,18 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
     input_context.arena = alloc;
     input_context.typed_output = true;
     input_context.limits.result_rows = context.limits.scan_rows;
-    const input = try input_context.select(bound.statement);
-    const cells = try alloc.alloc([]Datum, input.rows.len);
-    for (input.rows, cells, 0..) |row, *values, index| {
-        values.* = try alloc.alloc(Datum, row.len + bound.specs.len);
-        @memset(values.*, .{});
-        for (row, bound.input.columns, values.*[0..row.len], 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerceAlloc(alloc, value, column.type), .sql_null = if (input.sql_nulls) |flags| flags[index][i] else value == .null };
-    }
+    const cells = blk: {
+        const input = try input_context.typedQuery(bound.statement);
+        defer input.close();
+        const gathered = try alloc.alloc([]Datum, input.count());
+        for (gathered) |*values| {
+            const row = (try input.next(alloc)) orelse return error.InvalidSqlBackendResponse;
+            values.* = try alloc.alloc(Datum, row.len + bound.specs.len);
+            @memset(values.*, .{});
+            @memcpy(values.*[0..row.len], row);
+        }
+        break :blk gathered;
+    };
     return evaluateCells(context, statement, cells);
 }
 pub fn evaluateCells(context: anytype, statement: ast.Select, cells: [][]Datum) !@import("runtime.zig").Output {
