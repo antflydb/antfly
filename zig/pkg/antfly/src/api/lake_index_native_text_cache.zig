@@ -372,7 +372,7 @@ const Entry = struct {
         defer self.allocator.free(replacements);
         var loaded: usize = 0;
         defer for (replacements[0..loaded]) |*replacement| replacement.data.deinit(self.allocator);
-        var loader: corpus.CachedSegments = .{ .store = store, .cache = cached, .seekable = root.seekable, .query_owned = true };
+        var loader: corpus.CachedSegments = .{ .store = store, .cache = cached, .seekable = root.seekable, .query_owned = true, .resource_manager = self.resource_manager };
         var read_bytes: u64 = 512 * 1024 * 1024;
         var position: usize = 0;
         while (position < additions.items.len) {
@@ -445,7 +445,7 @@ const Entry = struct {
         if (!self.seekable) return .{ .snapshot = self.writer.?.acquireSnapshot(), .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = self, .release_owner = releaseSource };
         const lease = self.allocator.create(QueryLease) catch return error.NativeLakeTextCacheBusy;
         errdefer self.allocator.destroy(lease);
-        lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation } };
+        lease.* = .{ .entry = self, .read = .{ .store = store, .cache = cached, .context = context, .cancellation = cancellation, .resource_manager = self.resource_manager } };
         return .{ .snapshot = self.writer.?.acquireSnapshotWithReadContext(&lease.read) catch |err| return if (err == error.OutOfMemory) error.NativeLakeTextCacheBusy else err, .name = self.name, .text_analysis = self.analysis, .runtime_schema = self.schema, .selected_field = self.selected_field, .owner = lease, .release_owner = QueryLease.release };
     }
     fn releaseSource(raw: *anyopaque) void {

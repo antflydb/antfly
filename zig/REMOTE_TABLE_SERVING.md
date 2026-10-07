@@ -732,15 +732,16 @@ census, using the same durable continuation and collection cutoff. Legacy
 nonce staging cleanup and private checkpoint reclamation run after the durable
 completion receipt; they cannot prevent a completed collection from advancing.
 
-Native text corpus version 4 publishes authenticated 64 KiB ranges across the
-native segment. Readers use the shared native range codecs, retaining bounded
+Native text corpus version 5 publishes 1 MiB immutable packs containing
+independently authenticated 256 KiB ranges across the native segment. Readers use the shared native range codecs, retaining bounded
 navigation and decoder scratch instead of allocating and zeroing a segment-sized
 heap buffer. Term-frequency probes read dictionary addresses and posting headers;
 Required WAND reads fetch the document chunks they visit, while bounded lookahead
 may warm subsequent chunks. Scoped field views and both block-cache adapters
 forward advisory hints, translating section-relative offsets at the field boundary. Position records are decoded when phrase consumers
 request them. A block checksum may bring neighboring
-bytes into cache, so the minimum read unit remains 64 KiB. Each query binds its
+bytes into cache, so the minimum read unit is 256 KiB for new publications
+(64 KiB for legacy directories). Each query binds its
 current store capability, deadline, cancellation and reader lease to a private
 native reader. Query binding borrows the already admitted field navigation,
 collection statistics, and atomic page-validation states; it performs no metadata
@@ -752,13 +753,14 @@ authority after admission. Bounded artifact reads pin verified RAM blocks or dis
 mappings instead of allocating and copying an entire block for each small read.
 Pinned RAM remains charged and cannot be evicted until released; current deadline,
 cancellation and reader-lease checks still run on warm hits. Large contiguous
-segment leases keep their disk-first policy for clean-page reclamation. GC traverses all range references and still understands retained
-version 1–3 roots. Reader/topology protocol 30 triggers automatic republication of
+segment leases keep their disk-first policy for clean-page reclamation. GC retains physical pack references rather than synthetic range cache identities,
+and still understands retained version 1–4 roots and unpacked directories.
+Reader/topology protocol 31 triggers automatic republication of
 older corpora during rolling upgrades.
 
 Native text readers hint the next document chunk using its authenticated native
 metadata, including explicit offsets in layouts that interleave position records.
-Up to four 64 KiB blocks per query source warm through the shared process scheduler;
+Up to four bounded ranges per query source warm through the shared process scheduler;
 its worker and byte limits arbitrate with Parquet and other parallel consumers.
 A full speculative queue yields, required reads recycle consumed slots, and close
 cancels and joins every worker before releasing capabilities or physical owners.
@@ -880,3 +882,37 @@ field sorting and cursor continuations retain their established execution path.
 This preserves response projection, exact integers, source omission, and
 highlight behavior while removing document encode/parse cycles from the common
 retrieval path.
+
+
+Packed text directory version 3 authenticates each range checksum, length and pack
+location through the corpus root. The provider returns only that range; the reader
+checks its exact length and SHA-256 before admitting it to the immutable RAM/disk
+cache. It never authenticates a sparse read by downloading the whole pack. Cache
+keys identify verified range contents within the publication scope, while GC marks
+the actual pack objects. A 1 MiB sequential read uses four range requests instead
+of sixteen, and publication uploads one pack instead of sixteen small objects.
+The tradeoff is up to 256 KiB transferred for a single uncached byte. This is a
+request-count improvement, not a claim of a measured wall-clock speedup.
+
+Cold scoring gathers all requested term frequencies with one dictionary reader
+per segment. Up to four disjoint segment lanes share process scheduler admission;
+saturated lanes run inline. Caller scratch is synchronized across workers, every
+worker is joined before scratch is released, and cancellation/deadline checks run
+while waiting for an equivalent lookup and between segment reads. Bounded hashed
+singleflight stripes coalesce equivalent term batches within the exact corpus
+generation. Warm requests avoid flight admission; failed reads do not populate
+scoring caches. Different term batches can proceed independently except for a
+bounded stripe collision. Cache admission remains optional under memory pressure.
+
+Native range sources forward the node resource manager into physical and
+query-bound page caches. Optional slabs participate in pressure reclamation and
+cache admission denial falls back to required uncached reads. Resource accounting
+outlives bound readers; current query authority remains separate from that owner.
+
+Final eligible search pages hydrate from selected Parquet column vectors directly,
+without constructing and cloning an intermediate JSON row. One owned result tree
+retains the values across subsequent cursor pulls. Public projection owns its
+containers but borrows immutable string and number lexemes from that result until
+response serialization completes. Nested inclusion/exclusion and highlighting
+retain the same behavior, and the view never mutates the source. This removes
+redundant payload copies; public JSON encoding and final response limits remain.

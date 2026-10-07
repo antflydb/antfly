@@ -475,6 +475,36 @@ const Execution = struct {
             request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
             const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = 256 }, request, self.source);
             defer cursor.close(cursor.ptr);
+            if (T == std.json.Value) if (cursor.next_columns) |next_columns| {
+                while (true) {
+                    var page_arena = std.heap.ArenaAllocator.init(a);
+                    defer page_arena.deinit();
+                    const pa = page_arena.allocator();
+                    const page = try next_columns(cursor.ptr, pa, 256);
+                    try page.validate();
+                    for (0..page.selection.len) |row_index| {
+                        const identity = try page.cell(pa, row_index, "_id");
+                        if (identity.value != .string) return error.InvalidSqlBackendResponse;
+                        const positions = by_key.get(identity.value.string) orelse return error.InvalidSqlBackendResponse;
+                        for (positions.items) |position| {
+                            if (result[position] != null) return error.InvalidSqlBackendResponse;
+                            var value: std.json.Value = .{ .object = .empty };
+                            errdefer types.deinitJsonValue(a, &value);
+                            for (page.batch.columns) |column| {
+                                const cell = try page.cell(pa, row_index, column.name);
+                                const name = try a.dupe(u8, column.name);
+                                errdefer a.free(name);
+                                var owned_cell = try types.cloneJsonValue(a, cell.value);
+                                errdefer types.deinitJsonValue(a, &owned_cell);
+                                try value.object.put(a, name, owned_cell);
+                            }
+                            result[position] = value;
+                        }
+                    }
+                    if (page.after == null) break;
+                }
+                continue;
+            };
             while (true) {
                 const page = try cursor.next(cursor.ptr, a, 256);
                 defer page.deinit();
