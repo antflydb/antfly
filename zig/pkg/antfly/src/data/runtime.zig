@@ -28953,6 +28953,7 @@ fn runtimeIndexStatusReportFromLocalIndex(
             .published_sequence = source.published_sequence,
             .target_sequence = source.target_sequence,
             .failed = source.failed,
+            .producer_complete = source.producer_complete,
         };
         source_count += 1;
     }

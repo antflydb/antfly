@@ -20064,7 +20064,7 @@ fn runtimeGroupStatusRecordVersion(record: metadata.RuntimeGroupStatusReport) u1
             }
         }
         if (index.source_replay.len != 0) {
-            version = @max(version, runtime_status_protocol.artifact_source_status_record_version);
+            version = @max(version, runtime_status_protocol.framed_index_status_record_version);
         }
         if (index.repair_status != null) {
             version = @max(version, runtime_status_protocol.repair_status_record_version);
@@ -20572,11 +20572,21 @@ fn appendRuntimeIndexStatusRecordBody(
     if (version >= runtime_status_protocol.framed_index_status_record_version) {
         // Optional field 1: graph counts are physical upper bounds while
         // ownership retirement is pending. Old readers skip the extension.
-        try appendInt(alloc, out, u32, if (record.graph_counts_pending) 7 else 0);
+        const producer_extension_len: u32 = if (record.source_replay.len == 0) 0 else @intCast(8 + record.source_replay.len);
+        try appendInt(alloc, out, u32, (if (record.graph_counts_pending) @as(u32, 7) else 0) + producer_extension_len);
         if (record.graph_counts_pending) {
             try appendInt(alloc, out, u16, 1);
             try appendInt(alloc, out, u32, 1);
             try out.append(alloc, 1);
+        }
+        if (record.source_replay.len != 0) {
+            // Field 2: producer closure for each configured source, in the
+            // same order as the positional source records. Missing evidence
+            // from older writers remains pending in current readers.
+            try appendInt(alloc, out, u16, 2);
+            try appendInt(alloc, out, u32, @intCast(2 + record.source_replay.len));
+            try appendInt(alloc, out, u16, @intCast(record.source_replay.len));
+            for (record.source_replay) |source| try out.append(alloc, @intFromBool(source.producer_complete));
         }
     }
 }
@@ -20759,6 +20769,15 @@ fn readRuntimeIndexStatusRecordBody(
             if (field_id == 1) {
                 if (field_len != 1 or encoded[pos.*] > 1) return error.InvalidMetadataTransitionEncoding;
                 graph_counts_pending = encoded[pos.*] == 1;
+            }
+            if (field_id == 2) {
+                const producer_count = try readInt(encoded[0..field_end], pos, u16);
+                if (producer_count != source_replay.len or field_len != 2 + producer_count) return error.InvalidMetadataTransitionEncoding;
+                for (source_replay) |*source| {
+                    if (encoded[pos.*] > 1) return error.InvalidMetadataTransitionEncoding;
+                    source.producer_complete = encoded[pos.*] == 1;
+                    pos.* += 1;
+                }
             }
             pos.* = field_end;
         }
@@ -31207,4 +31226,23 @@ test "metadata.lake reader authority survives DROP and snapshots without changin
     try std.testing.expect(control.dropped);
     try std.testing.expectEqual(@as(usize, 1), control.readers.len);
     try std.testing.expectEqual(@as(usize, 1), control.publications.len);
+}
+
+test "metadata runtime index source producer completion uses framed extension and missing proof stays pending" {
+    const alloc = std.testing.allocator;
+    const sources = [_]metadata.RuntimeIndexSourceReplayStatusReport{
+        .{ .artifact_name = "text", .producer_complete = true },
+        .{ .artifact_name = "relations", .producer_complete = false },
+    };
+    for ([_]u16{ runtime_status_protocol.positional_record_version, runtime_status_protocol.framed_index_record_version }) |version| {
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(alloc);
+        try appendRuntimeIndexStatusRecord(alloc, &encoded, .{ .name = "text", .kind = "full_text", .source_replay = @constCast(&sources) }, version);
+        var pos: usize = 0;
+        const decoded = try readRuntimeIndexStatusRecord(alloc, encoded.items, &pos, version);
+        defer metadata_table_manager.freeRuntimeIndexStatusReport(alloc, decoded);
+        try std.testing.expectEqual(encoded.items.len, pos);
+        try std.testing.expectEqual(version == runtime_status_protocol.framed_index_record_version, decoded.source_replay[0].producer_complete);
+        try std.testing.expect(!decoded.source_replay[1].producer_complete);
+    }
 }

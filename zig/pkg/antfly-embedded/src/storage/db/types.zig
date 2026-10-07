@@ -4221,6 +4221,8 @@ pub const IndexSourceReplayStatus = struct {
     /// False while the bounded repair-ledger summary is rebuilding. Readiness
     /// must remain pending until absence of source-local debt is proven.
     repair_summary_ready: bool = true,
+    /// Verified producer dependency closure, independent of replay progress.
+    producer_complete: bool = true,
     // Internal distributed-status proof; not part of the public contract.
     observation_count: u64 = 1,
 };

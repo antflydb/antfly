@@ -143,6 +143,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     test_imports.configure(b, antfly_test_mod, true, true);
     antfly_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const producer_readiness_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/producer_readiness_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, producer_readiness_test_mod, true, true);
+    producer_readiness_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const producer_readiness_tests = b.addTest(.{
+        .root_module = producer_readiness_test_mod,
+        .filters = &.{ "producer readiness", "source readiness waits", "producer completion uses" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-producer-readiness-test", "Run durable producer completion, source readiness and metadata transport regressions")
+        .dependOn(&addFilteredTestRunArtifact(b, producer_readiness_tests).step);
     const apple_provider_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{ "apple OCR", "document extraction Apple", "Apple generation", "Apple transcription", "Apple native" },
@@ -6168,6 +6182,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_producer_dispatch.",
             "storage.db.artifact_producer_input.",
             "storage.db.artifact_producer_obligations.",
+            "storage.db.artifact_producer_readiness.",
+            "storage.memory_budget.",
+            "storage.test_allocator.",
             "storage.db.artifact_producer_provenance.",
             "storage.db.artifact_producer_retry.",
             "storage.db.artifact_producer_validation.",
