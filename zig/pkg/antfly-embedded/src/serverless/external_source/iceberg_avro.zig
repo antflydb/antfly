@@ -184,7 +184,9 @@ pub fn parseManifestListAlloc(alloc: Allocator, avro_ocf: []const u8) !ManifestL
     defer metadata.deinit(alloc);
     const sync = try reader.readSlice(16);
 
-    const fields = try parseSchemaFieldPlansAlloc(alloc, metadata.schema_json);
+    var schema = try std.json.parseFromSlice(std.json.Value, alloc, metadata.schema_json, .{});
+    defer schema.deinit();
+    const fields = try parseSchemaFieldPlansAlloc(alloc, schema.value);
     defer alloc.free(fields);
 
     var entries = std.ArrayListUnmanaged(ManifestListEntry).empty;
@@ -485,16 +487,15 @@ const KnownField = enum {
 
 const FieldPlan = struct {
     known: KnownField,
-    primitive: AvroPrimitive,
+    primitive: AvroPrimitive = .long,
+    skip_schema: ?std.json.Value = null,
     nullable: bool = false,
     null_union_index: i64 = -1,
     value_union_index: i64 = -1,
 };
 
-fn parseSchemaFieldPlansAlloc(alloc: Allocator, schema_json: []const u8) ![]FieldPlan {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
+fn parseSchemaFieldPlansAlloc(alloc: Allocator, schema: std.json.Value) ![]FieldPlan {
+    const root = switch (schema) {
         .object => |object| object,
         else => return error.InvalidIcebergManifestList,
     };
@@ -518,8 +519,9 @@ fn parseSchemaFieldPlansAlloc(alloc: Allocator, schema_json: []const u8) ![]Fiel
             else => return error.InvalidIcebergManifestList,
         };
         const type_value = field_object.get("type") orelse return error.InvalidIcebergManifestList;
-        var plan = try parseAvroType(type_value);
-        plan.known = knownFieldForName(name);
+        const known = knownFieldForName(name);
+        var plan: FieldPlan = if (known == .unknown) .{ .known = .unknown, .skip_schema = type_value } else try parseAvroType(type_value);
+        plan.known = known;
         if (plan.known == .manifest_path) saw_manifest_path = true;
         try plans.append(alloc, plan);
     }
@@ -624,6 +626,10 @@ fn readManifestListEntryAlloc(alloc: Allocator, reader: *Reader, fields: []const
     errdefer scratch.deinit(alloc);
 
     for (fields) |field| {
+        if (field.skip_schema) |schema| {
+            try skipJsonAvroValue(reader, schema);
+            continue;
+        }
         const is_null = try readUnionTagIfNeeded(reader, field);
         if (is_null) continue;
         switch (field.primitive) {

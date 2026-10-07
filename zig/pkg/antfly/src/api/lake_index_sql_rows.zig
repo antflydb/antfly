@@ -575,7 +575,27 @@ fn openWithPolicy(a: A, server: *server_api.ApiHttpServer, table: catalog.Table,
         var source_rows: u64 = 0;
         for (source.inventory.files) |file| source_rows +|= file.row_count;
         source_rows = @max(source_rows, if (root.page) |page| page.records else 0);
-        cost.* = accessCost(candidates, owner.covered, order_satisfied);
+        const consumed = if (order_satisfied) if (request.row_goal) |goal| @min(candidates, goal) else candidates else candidates;
+        var physical_bytes: u64 = 0;
+        var row_groups: u64 = 0;
+        for (source.inventory.files) |file| {
+            for (file.row_groups) |group| {
+                row_groups +|= 1;
+                for (group.column_chunks) |chunk| {
+                    if (covers(request.fields, chunk.column_id)) physical_bytes +|= chunk.compressed_len;
+                }
+            }
+        }
+        cost.* = accessCost(consumed, owner.covered, order_satisfied);
+        // Random candidates may touch one decode region each until all groups
+        // are visited. Charge projected bytes instead of total file width.
+        if (!owner.covered and row_groups != 0 and source_rows != 0) {
+            const touched = @min(consumed, row_groups);
+            const gather_bytes = (physical_bytes / row_groups) *| touched;
+            const sequential_bytes = physical_bytes;
+            cost.* +|= gather_bytes / 1024;
+            if (cost.* > source_rows +| (sequential_bytes / 1024) and !order_satisfied and candidates != 0) return null;
+        }
         // Broad non-covering ranges prefer sequential physical page decoding.
         const scan_cost = source_rows *| @as(u64, if (order_satisfied) 2 else 1);
         if (cost.* > scan_cost and candidates != 0) return null;

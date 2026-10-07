@@ -902,6 +902,14 @@ pub const Sequential = struct {
             self.offset = block.following;
             return block;
         }
+        /// Compact physical blocks; no intermediate Datum row matrix. Boundaries
+        /// supplied by replayBoundary() are always physical record boundaries.
+        pub fn nextOwned(self: *Reader) !?*OwnedBlock {
+            if (self.offset == self.end) return null;
+            const block = try self.run.readOwnedBlock(self.offset);
+            self.offset += block.count();
+            return block;
+        }
         pub fn deinit(self: *Reader) void {
             self.run.file.manager.allocator().free(self.run.file.read_buffer);
             self.run.read_arena.deinit();

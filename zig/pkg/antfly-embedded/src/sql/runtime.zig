@@ -422,7 +422,7 @@ pub const Context = struct {
         var scan_state: ScanState = .{};
         defer scan_state.deinit();
         const requested_order = if (!self.binding.primary_order and !statement.count_all) try @import("describe.zig").scanOrder(self.arena, self.binding, statement) else &.{};
-        const scan_request: catalog.Scan = .{ .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = @intCast(self.limits.page_rows) };
+        const scan_request: catalog.Scan = .{ .row_goal = if (statement.limit != null and statement.predicate == null and !statement.count_all) offset +| limit else null, .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = @intCast(self.limits.page_rows) };
         var ordered_source = false;
         if (self.backend.vtable.supports_scan_order and requested_order.len != 0 and limit != 0 and !predicates.empty) {
             try scan_state.open(self, table_def, scan_request);
