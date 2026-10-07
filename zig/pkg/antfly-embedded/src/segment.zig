@@ -3385,15 +3385,20 @@ fn copyMergedStoredBlockIfPossible(
 
     const block_checksum = if (reader.native != null) blk: {
         var scratch: [8192]u8 = undefined;
-        const crc = try reader.source().checksum(first.block_start, first.block_end - first.block_start, &scratch);
-        if (crc != try reader.storedBlockChecksum(first.block_idx)) return error.CrcMismatch;
+        var checksum = Crc32.init();
+        const expected = try reader.storedBlockChecksum(first.block_idx);
         var offset = first.block_start;
         while (offset < first.block_end) {
             const bytes = scratch[0..@min(scratch.len, first.block_end - offset)];
             try reader.source().readInto(offset, bytes);
+            checksum.update(bytes);
             try sink.appendSlice(bytes);
             offset += bytes.len;
         }
+        // The task-private output is discarded on failure; no corrupt block
+        // can reach artifact publication.
+        const crc = checksum.final();
+        if (crc != expected) return error.CrcMismatch;
         break :blk crc;
     } else blk: {
         const block = reader.data[first.block_start..first.block_end];
@@ -8862,4 +8867,84 @@ test "sorted intact stored blocks copy compressed bytes and reduce scratch" {
     try std.testing.expectEqual(@as(usize, 0), new.live);
     try std.testing.expect(new.peak < old.peak / 4);
     std.debug.print("LITE_SORTED_STORED_COPY docs=2048 body_bytes=4092 old_peak={d} new_peak={d} old_allocations={d} new_allocations={d} old_ns={d} new_ns={d}\n", .{ old.peak, new.peak, old.alloc_calls, new.alloc_calls, old_ns, new_ns });
+}
+
+test "native compressed block copying reads payload once and rejects corruption" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    var body: [4092]u8 = undefined;
+    var random: u32 = 1729;
+    for (&body) |*byte_| {
+        random = random *% 1664525 +% 1013904223;
+        byte_.* = @truncate(random >> 24);
+    }
+    for (0..16) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), &body);
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var memory = try SegmentReader.init(a, bytes);
+    defer memory.deinit();
+    const first = (try memory.storedLocationMetadata(0)).?;
+    const last = (try memory.storedLocationMetadata(15)).?;
+    const State = struct {
+        data: []u8,
+        start: u64,
+        end: u64,
+        payload_bytes: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset >= self.start and offset + output.len <= self.end) self.payload_bytes += output.len;
+            @memcpy(output, self.data[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .data = bytes, .start = first.block_start, .end = last.block_end };
+    var native = try SegmentReader.initSource(a, .{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } });
+    defer native.deinit();
+    var records: [16]SortedMergeDoc = undefined;
+    for (&records, 0..) |*record, doc| {
+        record.* = .{ .ref = .{ .input_idx = 0, .doc_id = @intCast(doc) } };
+        _ = try native.storedLocationMetadata(@intCast(doc));
+    }
+    _ = try native.storedBlockChecksum(first.block_idx);
+    // Count logical source reads after page authentication/cache effects.
+    // The original range remains the cache's immutable backing source.
+    const Counted = struct {
+        source: SegmentSource,
+        start: u64,
+        end: u64,
+        payload_bytes: usize = 0,
+        corrupt: bool = false,
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.source.readInto(offset, output);
+            if (offset >= self.start and offset + output.len <= self.end) {
+                self.payload_bytes += output.len;
+                if (self.corrupt and output.len > 0) output[0] ^= 1;
+            }
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var counted = Counted{ .source = native.source(), .start = first.block_start, .end = last.block_end };
+    native.native.?.range.source = .{ .ranges = .{ .ptr = &counted, .length = bytes.len, .read_into = Counted.read, .close = Counted.close } };
+    var expected = MemorySegmentSink.init(a);
+    defer expected.deinit();
+    var expected_sink = expected.sink();
+    _ = try writeMergedStoredFieldsInOrder(a, &expected_sink, &.{.{ .reader = &memory }}, &records, 16);
+    state.payload_bytes = 0;
+    var output = MemorySegmentSink.init(a);
+    defer output.deinit();
+    var sink = output.sink();
+    _ = try writeMergedStoredFieldsInOrder(a, &sink, &.{.{ .reader = &native }}, &records, 16);
+    try std.testing.expectEqualSlices(u8, expected.out.items, output.out.items);
+    try std.testing.expectEqual(@as(usize, @intCast(counted.end - counted.start)), counted.payload_bytes);
+    std.debug.print("LITE_NATIVE_BLOCK_COPY payload_bytes={d} logical_read_bytes={d}\n", .{ counted.end - counted.start, counted.payload_bytes });
+    counted.corrupt = true;
+    var corrupt = MemorySegmentSink.init(a);
+    defer corrupt.deinit();
+    var corrupt_sink = corrupt.sink();
+    try std.testing.expectError(error.CrcMismatch, writeMergedStoredFieldsInOrder(a, &corrupt_sink, &.{.{ .reader = &native }}, &records, 16));
 }
