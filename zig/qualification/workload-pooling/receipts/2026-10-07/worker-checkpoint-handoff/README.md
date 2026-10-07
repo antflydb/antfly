@@ -25,6 +25,12 @@ This gate executes the production parent/child phase factory and actual pipe
 transport with a real scheduler capsule. It does not compile `worker.zig` or
 `worker_wire.zig`, nor execute an OS subprocess or real native model/team.
 Those recorded hashes are proposed wiring/descriptor provenance. Full production
-compilation, private handshake tests, real-model safe-boundary contracts,
+compilation, real-model safe-boundary contracts,
 checkpoint RPC overhead measurement, and broader overload/default qualification
 remain pending. Defaults stay disabled.
+
+The separate `antfly-inference-worker-rpc-test` also passed all 28 tests on both
+platforms: 23 actual pipe transport contracts and 5 private descriptor contracts.
+`transport-*-result.json` and logs preserve this evidence, including compilation
+of the version-8 descriptor and updated phase enum. This gate still excludes
+the worker caller/child implementation and real OS subprocesses.
