@@ -24,6 +24,24 @@ const std = @import("std");
 
 pub const abi_version: u32 = 1;
 
+test "execution wait scheduling details are append-only and preserve behavior classes" {
+    try std.testing.expectEqual(@backingInt(Detail.invalid_sql_spill) + 1, @backingInt(Detail.runnable_wait_timeout));
+    const cases = [_]struct { err: anyerror, code: Code }{
+        .{ .err = error.RunnableWaitTimeout, .code = .timeout },
+        .{ .err = error.SchedulerClosed, .code = .unavailable },
+        .{ .err = error.SchedulerFull, .code = .retryable },
+        .{ .err = error.InvalidRunnableTransition, .code = .internal },
+        .{ .err = error.InvalidReadFenceTransition, .code = .internal },
+        .{ .err = error.ExecutionWaitUnsupported, .code = .unsupported },
+    };
+    for (cases) |case| {
+        const transported = statusFromError(case.err);
+        try std.testing.expectEqual(@backingInt(case.code), transported.code);
+        try std.testing.expectEqual(case.err, errorFromStatus(transported));
+        try std.testing.expect(errorHasStableDetail(case.err));
+    }
+}
+
 test "FK publication progress and corrupt retirement proofs retain distinct boundary semantics" {
     const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
     const changed = statusFromError(error.GenerationRetirementChanged);
@@ -722,6 +740,14 @@ pub const Detail = enum(c_int) {
     unsupported_iceberg_schema_evolution,
     unsupported_iceberg_delete_file,
     invalid_sql_spill,
+    // Append-only scheduling details are shared by wait hooks in independently
+    // generated storage/coordinator archives. Do not move older detail IDs.
+    runnable_wait_timeout,
+    scheduler_closed,
+    scheduler_full,
+    invalid_runnable_transition,
+    invalid_read_fence_transition,
+    execution_wait_unsupported,
 };
 
 pub const Status = extern struct {
@@ -739,6 +765,12 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.RunnableWaitTimeout => status(.timeout, .runnable_wait_timeout),
+        error.SchedulerClosed => status(.unavailable, .scheduler_closed),
+        error.SchedulerFull => status(.retryable, .scheduler_full),
+        error.InvalidRunnableTransition => status(.internal, .invalid_runnable_transition),
+        error.InvalidReadFenceTransition => status(.internal, .invalid_read_fence_transition),
+        error.ExecutionWaitUnsupported => status(.unsupported, .execution_wait_unsupported),
         error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
         error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
         error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
@@ -1432,6 +1464,12 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .runnable_wait_timeout => "RunnableWaitTimeout",
+        .scheduler_closed => "SchedulerClosed",
+        .scheduler_full => "SchedulerFull",
+        .invalid_runnable_transition => "InvalidRunnableTransition",
+        .invalid_read_fence_transition => "InvalidReadFenceTransition",
+        .execution_wait_unsupported => "ExecutionWaitUnsupported",
         .external_lake_read_only => "ExternalLakeReadOnly",
         .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
         .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",

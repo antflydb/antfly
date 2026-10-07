@@ -605,6 +605,7 @@ pub const functions_materialization = @import("functions/materialization.zig");
 pub const functions_decisions = @import("functions/decisions.zig");
 pub const functions_expressions = @import("functions/expressions.zig");
 pub const sql_decision_eval = @import("sql/decision_eval.zig");
+pub const common_execution_wait = @import("common/execution_wait.zig");
 pub const common_request_admission = @import("common/request_admission.zig");
 pub const graph_metadata_tables = @import("graph/metadata_tables.zig");
 pub const graph_mutation_identity = @import("graph/mutation_identity.zig");
