@@ -41,6 +41,7 @@ then verify selected PostgreSQL goldens with:
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_read_campaign_reference.json
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py document --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_document_reference.json
+uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py typed_array_read --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_typed_array_read_reference.json
 uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_generate_sql_postgres_reference.py
 ```
 
@@ -48,6 +49,12 @@ The 261-case read and 211-case document campaign manifests still describe
 the complete cohorts, not a claim that every case works. Oracle admission and
 discovery-mode native runs do not change dispositions; selected goldens must
 pass the non-discovery native endpoint gate before receiving completion credit.
+
+The separate fourteen-case typed-array read campaign keeps the original SQL and
+parameters unchanged, but declares stored SQL arrays explicitly. Its seed codec
+preserves lower bounds, SQL NULL elements and builtin element domains; ordinary
+JSON arrays remain JSONB. The mounted endpoint gate compares complete values,
+type OIDs, labels and NULL flags against PostgreSQL, including nonempty witnesses.
 
 Catalog discovery separately exercises all 479 original `ddl`/`unsupported_ddl`
 cases, including the already-dispositioned negative contracts. The current

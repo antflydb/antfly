@@ -683,10 +683,14 @@ const Parser = struct {
                 continue;
             }
             const current = self.tokens[self.pos];
-            if ((current.kind == .at_contains or current.kind == .question) and minimum <= 4) {
+            if ((current.kind == .at_contains or current.kind == .range_overlap or current.kind == .question) and minimum <= 4) {
                 self.pos += 1;
                 const right = try self.scalar(depth + 1, 5);
-                left = try self.scalarNode(.{ .call = .{ .name = if (current.kind == .at_contains) "$contains" else "jsonb_exists", .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right }) } });
+                left = try self.scalarNode(.{ .call = .{ .name = switch (current.kind) {
+                    .at_contains => "$contains",
+                    .range_overlap => "$overlaps",
+                    else => "jsonb_exists",
+                }, .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right }) } });
                 continue;
             }
             const op: ast.Scalar.Binary = switch (current.kind) {

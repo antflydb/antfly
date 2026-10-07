@@ -294,6 +294,32 @@ fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("antfl
     return result;
 }
 
+test "pgwire native array page delivery preserves dimensions NULLs and exact integers" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const sources = @import("antfly_local_sources");
+            const array = (try sources.sql_array_text.decodeLeaky(alloc, .int64, "[-1:1]={9007199254740993,NULL,7}", .{})).value;
+            const values = [_]sources.sql_scalar.Datum{.{ .array = &array, .sql_null = false }};
+            var owner: OwnedRead.PageOwner = .{ .alloc = a, .page = .{
+                .arena = std.heap.ArenaAllocator.init(a),
+                .columns = &.{.{ .name = "a", .type = .array, .element_type = .int64 }},
+                .values = .{ .rows = &.{&values} },
+                .exhausted = true,
+            } };
+            defer owner.page.deinit();
+            const cell = try OwnedRead.PageOwner.cell(&owner, alloc, 0, 0);
+            try std.testing.expect(!cell.sql_null);
+            const decoded = try sources.sql_array_wire.decodeLeaky(alloc, .int64, cell.value, .{});
+            var work: sources.sql_array_value.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try array.compare(decoded, &work));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 /// The portal owns this entire capsule. No cursor retains Job.runInner's stack
 /// identity, authority, schema binding or temporary request context.
 const OwnedRead = struct {
@@ -515,6 +541,11 @@ const OwnedRead = struct {
         fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!wire.Cell {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const value = try self.page.values.cell(alloc, row, column);
+            if (value.array) |array| {
+                const definition = self.page.columns[column];
+                if (value.sql_null or value.value != .null or value.patterns != null or definition.type != .array or definition.element_type != array.element_type) return error.InvalidSqlBackendResponse;
+                return .{ .value = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(alloc, array.*, .{}), .sql_null = false };
+            }
             return .{ .value = if (!value.sql_null and self.page.columns[column].type == .datetime) try datetimeResult(alloc, value.value) else value.value, .sql_null = value.sql_null };
         }
     };

@@ -883,7 +883,10 @@ fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_id
         const case = try corpus.get(expected.id);
         try std.testing.expect(!std.mem.eql(u8, case.source_expectation, "rejection"));
         const parsed = execute(alloc, handler, case) catch |err| {
-            if (discovery and err == error.NativeParityAdmissionFailed) continue;
+            if (err == error.NativeParityAdmissionFailed) {
+                if (!discovery) failures += 1;
+                continue;
+            }
             return err;
         };
         defer parsed.deinit();

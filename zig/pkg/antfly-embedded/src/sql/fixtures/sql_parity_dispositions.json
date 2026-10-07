@@ -2,6 +2,16 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-original-typed-array-reads": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL original stored array reads preserve typed column semantics"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-postgres-typed-array-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "typed_array_read", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_typed_array_read_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
     "sql-postgres-correlated-mutations": {
       "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL PostgreSQL mutations capture native source relations and complete storage"],
       "cwd": "zig",
@@ -1309,13 +1319,21 @@
     },
     {
       "id": "sql-0167",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0168",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0169",
@@ -1498,18 +1516,30 @@
     },
     {
       "id": "sql-0185",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0186",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0187",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0188",
@@ -1683,8 +1713,12 @@
     },
     {
       "id": "sql-0200",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0201",
@@ -3002,23 +3036,39 @@
     },
     {
       "id": "sql-0288",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0289",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0290",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0291",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0292",
@@ -3027,13 +3077,21 @@
     },
     {
       "id": "sql-0293",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0294",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0295",
@@ -3064,13 +3122,21 @@
     },
     {
       "id": "sql-0298",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0299",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original query and parameters pass strict mounted HTTP comparison against PostgreSQL on explicitly typed native array columns, including complete results, labels, builtin type OIDs and SQL NULL flags. The frozen reference is independently reproducible against PostgreSQL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-original-typed-array-reads"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL PostgreSQL original stored array reads preserve typed column semantics", "gate": "sql-postgres-typed-array-reference"}
+      ]
     },
     {
       "id": "sql-0300",

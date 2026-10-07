@@ -24,6 +24,15 @@ const describe = @import("describe.zig");
 const Budget = @import("memory_budget.zig");
 const Json = std.json.Value;
 
+// Fallback plans expose owned wire cells. Re-enter the typed pipeline only
+// through the declared column identity, never through JSON shape inference.
+fn outputCellDatum(a: std.mem.Allocator, value: Json, sql_null: bool, column: describe.Column) !@import("scalar.zig").Datum {
+    if (column.type != .array or sql_null) return .{ .value = value, .sql_null = sql_null };
+    const array = try a.create(@import("array_value.zig").Value);
+    array.* = try @import("array_wire.zig").decodeLeaky(a, column.element_type orelse return error.SqlTypeMismatch, value, .{});
+    return .{ .array = array, .sql_null = false };
+}
+
 pub const Page = struct {
     arena: std.heap.ArenaAllocator,
     output: runtime.Output,
@@ -786,7 +795,7 @@ pub const Stream = struct {
                 var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
                 defer scratch.deinit();
                 const values = try scratch.allocator().alloc(@import("scalar.zig").Datum, row.len);
-                for (row, values, 0..) |value, *cell, column| cell.* = .{ .value = value, .sql_null = if (output.sql_nulls) |flags| flags[index][column] else value == .null };
+                for (row, values, 0..) |value, *cell, column| cell.* = try outputCellDatum(scratch.allocator(), value, if (output.sql_nulls) |flags| flags[index][column] else value == .null, output.columns[column]);
                 try Spool.append(owner, values);
             }
             self.spool = owner;
@@ -927,10 +936,10 @@ pub const Stream = struct {
             const output = try arena.allocator().create(runtime.Output);
             output.* = page.output;
             const Rows = struct {
-                fn cell(raw: *anyopaque, _: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
+                fn cell(raw: *anyopaque, alloc: std.mem.Allocator, row: usize, column: usize) anyerror!@import("scalar.zig").Datum {
                     const out: *runtime.Output = @ptrCast(@alignCast(raw));
                     const value = out.rows[row][column];
-                    return .{ .value = value, .sql_null = if (out.sql_nulls) |flags| flags[row][column] else value == .null };
+                    return outputCellDatum(alloc, value, if (out.sql_nulls) |flags| flags[row][column] else value == .null, out.columns[column]);
                 }
             };
             return .{ .arena = arena, .columns = page.output.columns, .values = .{ .reader = .{ .ptr = output, .read = Rows.cell, .count = page.output.rows.len, .width = page.output.columns.len } }, .exhausted = page.exhausted, .row_page = page };
@@ -985,8 +994,10 @@ pub const Stream = struct {
             const values = (try spool.next(a)) orelse return error.InvalidSqlSpill;
             out.* = try a.alloc(Json, values.len);
             bits.* = try a.alloc(bool, values.len);
-            for (values, @constCast(out.*), @constCast(bits.*)) |value, *cell, *flag| {
-                cell.* = value.value;
+            var output_context = self.context;
+            output_context.arena = a;
+            for (values, @constCast(out.*), @constCast(bits.*), self.context.binding.columns) |value, *cell, *flag, column| {
+                cell.* = try output_context.outputDatum(value, column.type, column.element_type);
                 flag.* = value.sql_null;
                 bytes +|= try @import("operators.zig").datumBytes(value);
             }
@@ -1141,7 +1152,8 @@ pub const Stream = struct {
             fn dictionary(raw: *anyopaque, alloc: std.mem.Allocator, ordinal: usize) anyerror!?@import("execution_batch.zig").Batch {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
                 const source = projection_.projections[ordinal] orelse blk: {
-                    const definition = [_]@import("scalar.zig").Column{.{ .name = projection_.stream.fields[ordinal], .type = projection_.stream.context.binding.columns[ordinal].type }};
+                    const column = projection_.stream.context.binding.columns[ordinal];
+                    const definition = [_]@import("scalar.zig").Column{.{ .name = projection_.stream.fields[ordinal], .type = column.type, .element_type = column.element_type }};
                     const direct: @import("execution_batch.zig").Batch = .{ .columns = .{ .page = projection_.page, .definitions = &definition } };
                     break :blk (direct.dictionaryColumn(alloc, 0) catch |err| {
                         if (err == error.OutOfMemory) return err;
@@ -1151,7 +1163,8 @@ pub const Stream = struct {
                 if (source != .dictionary) return null;
                 const values = try alloc.dupe(@import("scalar.zig").Datum, source.dictionary.values);
                 for (values) |*value| {
-                    value.value = describe.coerceAlloc(alloc, value.value, projection_.stream.context.binding.columns[ordinal].type) catch |err| {
+                    const column = projection_.stream.context.binding.columns[ordinal];
+                    value.* = describe.coerceDatum(alloc, value.*, column.type, column.element_type) catch |err| {
                         if (err == error.OutOfMemory) return err;
                         // Scalar delivery records the precise failing row.
                         return null;
@@ -1163,15 +1176,14 @@ pub const Stream = struct {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
                 const cell_ = if (projection_.projections[ordinal]) |values| try values.cell(alloc, index, 0) else blk: {
                     const raw_ = try projection_.page.cell(alloc, index, projection_.stream.fields[ordinal]);
-                    break :blk @import("scalar.zig").Datum{ .value = raw_.value, .sql_null = raw_.sql_null, .patterns = raw_.patterns };
+                    break :blk raw_;
                 };
-                const coerced = describe.coerceAlloc(alloc, cell_.value, projection_.stream.context.binding.columns[ordinal].type) catch |err| {
+                const column = projection_.stream.context.binding.columns[ordinal];
+                return describe.coerceDatum(alloc, cell_, column.type, column.element_type) catch |err| {
                     if (err == error.OutOfMemory) return err;
                     projection_.failures[index] = projection_.failures[index] orelse err;
                     return .{};
                 };
-                const value: @import("scalar.zig").Datum = .{ .value = coerced, .sql_null = cell_.sql_null, .patterns = cell_.patterns };
-                return value;
             }
         };
         var projection: Projection = .{ .stream = self, .page = selected, .projections = projections, .failures = failures };
@@ -1286,7 +1298,10 @@ pub const Stream = struct {
                 for (row, nulls, 0..) |*out, *sql_null, column| {
                     const datum = try pending.cell(a, index, column);
                     sql_null.* = datum.sql_null;
-                    out.* = (try @import("operators.zig").cloneDatum(a, datum)).value;
+                    var output_context = self.context;
+                    output_context.arena = a;
+                    const definition = self.context.binding.columns[column];
+                    out.* = try output_context.outputDatum(datum, definition.type, definition.element_type);
                     bytes +|= try @import("operators.zig").datumBytes(datum);
                 }
                 try rows.append(a, row);
@@ -1609,6 +1624,42 @@ const NativeColumns = struct {
         return .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = refs, .columns = columns }, .selection = selected, .after = if (fixture.offset < fixture.count) "more" else null };
     }
 };
+
+test "SQL native array projections retain bounds and NULL cells across leased and public pages" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            for ([_]bool{ false, true }) |native| {
+                var fixture: Fixture = .{ .count = 3 };
+                var backend = fixture.backend();
+                var vtable = backend.vtable.*;
+                vtable.open_scan = NativeColumns.open;
+                backend.vtable = &vtable;
+                var compiled = try compiler.compile(a, "SELECT $1::bigint[] a FROM docs", .{});
+                defer compiled.deinit();
+                const stream = (try Stream.open(a, backend, &compiled, &.{.{ .string = "[-1:1]={9007199254740993,NULL,7}" }}, .{ .page_rows = 1 })).?;
+                defer stream.close();
+                for (0..3) |_| {
+                    var arena = std.heap.ArenaAllocator.init(a);
+                    defer arena.deinit();
+                    const value = if (native) blk: {
+                        var page = try stream.nextBatch(1);
+                        defer page.deinit();
+                        break :blk try @import("operators.zig").cloneDatum(arena.allocator(), try page.values.cell(arena.allocator(), 0, 0));
+                    } else blk: {
+                        var page = try stream.next(1);
+                        defer page.deinit();
+                        break :blk try outputCellDatum(arena.allocator(), page.output.rows[0][0], page.output.sql_nulls.?[0][0], page.output.columns[0]);
+                    };
+                    try std.testing.expect(!value.sql_null);
+                    try std.testing.expectEqual(@as(i32, -1), value.array.?.dimensions[0].lower);
+                    try std.testing.expectEqual(@as(i64, 9007199254740993), value.array.?.elements[0].value.integer);
+                    try std.testing.expect(value.array.?.elements[1].sql_null);
+                }
+            }
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
 
 test "SQL native execution batches drain small delivery pages without rescan" {
     const a = std.testing.allocator;

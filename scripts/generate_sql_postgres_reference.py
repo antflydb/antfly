@@ -156,6 +156,11 @@ def properties(schema):
 
 def pg_type(prop):
     kind = prop.get("type")
+    if kind == "sql_array":
+        element = prop.get("x-antfly-sql-type")
+        if element not in ARRAY_ELEMENT_TYPES:
+            raise ValueError("SQL array columns require an explicit builtin identity")
+        return ARRAY_ELEMENT_TYPES[element] + "[]"
     return {
         "integer": "bigint",
         "numeric": "double precision",
@@ -200,6 +205,134 @@ ARRAY_TYPES = {
     2951: (2950, "uuid"),
     3807: (3802, "jsonb"),
 }
+
+ARRAY_ELEMENT_TYPES = {
+    "boolean": "boolean",
+    "int16": "smallint",
+    "int32": "integer",
+    "int64": "bigint",
+    "float32": "real",
+    "float64": "double precision",
+    "text": "text",
+    "uuid": "uuid",
+    "jsonb": "jsonb",
+}
+
+
+def array_seed_text(prop, envelope):
+    """Seed declared SQL arrays without losing bounds or SQL/JSON null identity.
+
+    The parameter is explicitly cast by create_table; PostgreSQL performs its
+    own element-domain validation. Never infer SQL arrays from ordinary lists.
+    """
+    if prop.get("type") != "sql_array":
+        raise ValueError("SQL array seed requires a declared array column")
+    pg_type(prop)  # Validate the declaration even for a whole-array SQL NULL.
+    if envelope is None:
+        return None
+    if not isinstance(envelope, dict) or set(envelope) != {
+        "dimensions",
+        "values",
+        "sql_nulls",
+    }:
+        raise ValueError("SQL array seed requires the ordinal envelope")
+    dimensions, values, nulls = (
+        envelope[key] for key in ("dimensions", "values", "sql_nulls")
+    )
+    if (
+        not all(isinstance(part, list) for part in (dimensions, values, nulls))
+        or len(dimensions) > 6
+    ):
+        raise ValueError("invalid bounded SQL array seed")
+    count = 1 if dimensions else 0
+    bounds = []
+    for dimension in dimensions:
+        if not isinstance(dimension, dict) or set(dimension) != {
+            "length",
+            "lower_bound",
+        }:
+            raise ValueError("invalid SQL array dimension")
+        length, lower = dimension["length"], dimension["lower_bound"]
+        if type(length) is not int or type(lower) is not int or length <= 0:
+            raise ValueError("noncanonical SQL array dimension")
+        upper = lower + length - 1
+        if not -(2**31) <= lower <= upper < 2**31:
+            raise ValueError("SQL array bound overflow")
+        count *= length
+        if count > 65536:
+            raise ValueError("SQL array seed exceeds element budget")
+        bounds.append(f"[{lower}:{upper}]")
+    if (
+        len(values) != count
+        or len(nulls) != count
+        or any(type(flag) is not bool for flag in nulls)
+    ):
+        raise ValueError("SQL array seed cardinality mismatch")
+    element = prop["x-antfly-sql-type"]
+    encoded_cells = []
+    wire_bytes = sum(len(bound) for bound in bounds) + count * 2 + 1
+    for value, is_null in zip(values, nulls, strict=True):
+        if is_null:
+            if value is not None:
+                raise ValueError("SQL NULL seed element must have a null payload")
+            encoded_cells.append("NULL")
+            wire_bytes += 4
+            continue
+        if element == "jsonb":
+            text = json.dumps(
+                value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            )
+        elif element == "boolean":
+            if type(value) is not bool:
+                raise ValueError("invalid boolean array seed")
+            text = "true" if value else "false"
+        elif element.startswith("int"):
+            if not isinstance(value, str) or not re.fullmatch(
+                r"-?(0|[1-9][0-9]*)", value
+            ):
+                raise ValueError("integer array seeds require exact decimal strings")
+            bits = int(element[3:])
+            if not -(2 ** (bits - 1)) <= int(value) < 2 ** (bits - 1):
+                raise ValueError("integer array seed out of range")
+            text = value
+        elif element.startswith("float"):
+            if isinstance(value, str) and value in {"NaN", "Infinity", "-Infinity"}:
+                text = value
+            elif type(value) in {int, float} and math.isfinite(value):
+                text = str(value)
+            else:
+                raise ValueError("invalid floating array seed")
+        else:
+            if not isinstance(value, str):
+                raise ValueError("invalid string array seed")
+            if element == "uuid" and str(UUID(value)) != value:
+                raise ValueError("UUID array seeds must be canonical")
+            text = value
+        if "\x00" in text:
+            raise ValueError("PostgreSQL text cannot contain NUL")
+        size = len(text.encode()) + text.count("\\") + text.count('"') + 2
+        wire_bytes += size
+        if wire_bytes > 8 * 1024 * 1024:
+            raise ValueError("SQL array seed exceeds wire budget")
+        encoded_cells.append('"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"')
+    offset = 0
+
+    def nested(depth):
+        nonlocal offset
+        if depth == len(dimensions):
+            value = encoded_cells[offset]
+            offset += 1
+            return value
+        return (
+            "{"
+            + ",".join(nested(depth + 1) for _ in range(dimensions[depth]["length"]))
+            + "}"
+        )
+
+    result = "".join(bounds) + "=" + nested(0) if dimensions else "{}"
+    if len(result.encode()) > 8 * 1024 * 1024:
+        raise ValueError("SQL array seed exceeds wire budget")
+    return result
 
 
 def array_reference(data, oid):
@@ -331,14 +464,22 @@ def create_table(db, name, props, rows, identity=False):
         )
     )
     insert = sql.SQL("INSERT INTO public.{} VALUES ({})").format(
-        sql.Identifier(name), sql.SQL(",").join(sql.Placeholder() for _ in columns)
+        sql.Identifier(name),
+        sql.SQL(",").join(
+            sql.SQL("{}::{}").format(sql.Placeholder(), sql.SQL(pg_type(prop)))
+            if prop.get("type") == "sql_array"
+            else sql.Placeholder()
+            for prop in columns.values()
+        ),
     )
     # Physical seed order must not serve as an implicit SQL ORDER BY contract.
     for row in sorted(rows, key=lambda row: row["key"]):
         values = []
         for key, prop in columns.items():
             value = row["key"] if identity and key == "_id" else row["value"].get(key)
-            if pg_type(prop) == "jsonb" and value is not None:
+            if prop.get("type") == "sql_array":
+                value = array_seed_text(prop, value)
+            elif pg_type(prop) == "jsonb" and value is not None:
                 value = Jsonb(value)
             values.append(value)
         db.execute(insert, values)
@@ -519,7 +660,9 @@ def mutation_reference(
     with db.transaction(force_rollback=True):
         for table in tables:
             props = properties(table["schema"])
-            if any(prop.get("type") == "array" for prop in props.values()):
+            if any(
+                prop.get("type") in {"array", "sql_array"} for prop in props.values()
+            ):
                 raise ValueError("typed SQL arrays require a dedicated column profile")
             if any(table.get(field) for field in ("checks", "foreign_keys", "indexes")):
                 raise ValueError("constraint/index owner profile is not declared")
@@ -668,6 +811,42 @@ def read_reference(db, cases, profile):
     }
 
 
+def typed_array_read_profile():
+    """Keep the scalar campaign stable; declare a separate stored-array domain."""
+    profile = json.loads((FIXTURES / "sql_read_campaign_profile.json").read_text())
+    properties(profile["schema"])["tags"] = {
+        "type": "sql_array",
+        "x-antfly-sql-type": "text",
+        "nullable": True,
+    }
+    for row in profile["rows"]:
+        if row["value"].get("quantity") == 0:
+            row["value"]["quantity"] = 1
+        values = row["value"].get("tags")
+        row["value"]["tags"] = (
+            None
+            if values is None
+            else {
+                "dimensions": [{"length": len(values), "lower_bound": 1}]
+                if values
+                else [],
+                "values": values,
+                "sql_nulls": [value is None for value in values],
+            }
+        )
+    # Exercise SQL NULL, empty arrays, nullable cells and non-default bounds.
+    # No statement or source-owned parameter is changed for this profile.
+    profile["rows"][2]["value"]["tags"] = None
+    profile["rows"][1]["value"]["tags"] = {
+        "dimensions": [{"length": 4, "lower_bound": 1}],
+        "values": ["cold", "old", "extra", "last"],
+        "sql_nulls": [False] * 4,
+    }
+    profile["rows"][3]["value"]["tags"]["dimensions"][0]["lower_bound"] = -1
+    profile["rows"][7]["value"]["tags"]["dimensions"][0]["lower_bound"] = 0
+    return profile
+
+
 def validate_ordered_groups(entry):
     """Check a complete ordered prefix, permitting only genuine peer ties."""
     offset = 0
@@ -793,7 +972,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "campaign",
-        choices=["read", "document", "lateral", "mutation", "correlated_mutation"],
+        choices=[
+            "read",
+            "typed_array_read",
+            "document",
+            "lateral",
+            "mutation",
+            "correlated_mutation",
+        ],
     )
     parser.add_argument(
         "--check",
@@ -829,9 +1015,21 @@ def main():
     ]
     cases = [case for case in inventory if case["id"] in set(requested)]
     with postgres() as db:
-        if args.campaign in {"read", "lateral", "mutation", "correlated_mutation"}:
-            profile = json.loads(
-                (FIXTURES / f"sql_{args.campaign}_campaign_profile.json").read_text()
+        if args.campaign in {
+            "read",
+            "typed_array_read",
+            "lateral",
+            "mutation",
+            "correlated_mutation",
+        }:
+            profile = (
+                typed_array_read_profile()
+                if args.campaign == "typed_array_read"
+                else json.loads(
+                    (
+                        FIXTURES / f"sql_{args.campaign}_campaign_profile.json"
+                    ).read_text()
+                )
             )
             result = (
                 mutation_reference

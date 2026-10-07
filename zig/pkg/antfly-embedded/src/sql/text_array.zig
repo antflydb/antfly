@@ -18,6 +18,79 @@
 const std = @import("std");
 const arrays = @import("array_value.zig");
 const A = std.mem.Allocator;
+
+fn writeJoined(a: A, value: *const arrays.Value, delimiter: []const u8, null_text: ?[]const u8, writer: *std.Io.Writer, byte_limit: usize, work: *arrays.Budget) !void {
+    var emitted = false;
+    for (value.elements) |cell| {
+        try work.consume(1);
+        if (cell.sql_null and null_text == null) continue;
+        if (emitted) {
+            try work.consume(delimiter.len);
+            try writer.writeAll(delimiter);
+        }
+        emitted = true;
+        if (cell.sql_null) {
+            try work.consume(null_text.?.len);
+            try writer.writeAll(null_text.?);
+            continue;
+        }
+        switch (value.element_type) {
+            .text, .uuid => {
+                try work.consume(cell.value.string.len);
+                try writer.writeAll(cell.value.string);
+            },
+            .int16, .int32, .int64 => {
+                try work.consume(20);
+                try writer.print("{d}", .{cell.value.integer});
+            },
+            .boolean => try writer.writeAll(if (cell.value.bool) "t" else "f"),
+            .float32, .float64 => {
+                try work.consume(64);
+                var buffer: [64]u8 = undefined;
+                const casts = @import("builtin_cast.zig");
+                const text = if (value.element_type == .float32) try casts.floatText(f32, @floatCast(cell.value.float), &buffer) else try casts.floatText(f64, cell.value.float, &buffer);
+                try writer.writeAll(text);
+            },
+            .jsonb => try @import("jsonb_text.zig").write(a, cell.value, writer, byte_limit, work, 0),
+        }
+    }
+}
+
+/// Flatten row-major cells without changing bounds or materializing an
+/// intermediate string per element. Two passes allocate exactly the output;
+/// scratch key directories for JSONB never enter the retained result owner.
+pub fn join(a: A, value: *const arrays.Value, delimiter: []const u8, null_text: ?[]const u8, byte_limit: usize, work: *arrays.Budget) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    try writeJoined(arena.allocator(), value, delimiter, null_text, &counter.writer, byte_limit, work);
+    if (counter.count > byte_limit) return error.SqlProgramLimitExceeded;
+    const bytes = try a.alloc(u8, @intCast(counter.count));
+    errdefer a.free(bytes);
+    _ = arena.reset(.retain_capacity);
+    var writer: std.Io.Writer = .fixed(bytes);
+    try writeJoined(arena.allocator(), value, delimiter, null_text, &writer, byte_limit, work);
+    std.debug.assert(writer.end == bytes.len);
+    return bytes;
+}
+
+test "SQL array string output uses one exact allocation for wide primitive arrays" {
+    const a = std.testing.allocator;
+    const elements = try a.alloc(arrays.Element, 32768);
+    defer a.free(elements);
+    @memset(elements, arrays.Element.json(.{ .string = "é" }));
+    const value = try arrays.Value.init(.text, &.{.{ .length = 32768, .lower = -7 }}, elements, .{ .bytes = 8 * 1024 * 1024 });
+    var counted = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var work: arrays.Budget = .{};
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const result = try join(counted.allocator(), &value, ",", null, 32768 * 3 - 1, &work);
+    defer counted.allocator().free(result);
+    try std.testing.expectEqual(@as(usize, 32768 * 3 - 1), result.len);
+    try std.testing.expect(std.mem.startsWith(u8, result, "é,é,"));
+    try std.testing.expectEqual(@as(usize, 1), counted.allocations);
+    std.debug.print("SQL array string: cells=32768 output_bytes={} output_allocations=1 elapsed_ns={}\n", .{ result.len, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+}
+
 const Split = struct {
     text: []const u8,
     delimiter: ?[]const u8,

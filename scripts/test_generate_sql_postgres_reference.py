@@ -26,6 +26,9 @@ from unittest.mock import patch
 
 from generate_sql_postgres_reference import (
     array_reference,
+    array_seed_text,
+    create_table,
+    pg_type,
     FIXTURES,
     main,
     document_reference,
@@ -64,6 +67,114 @@ class PostgresReferenceTest(unittest.TestCase):
         cls.server = postgres()
         cls.db = cls.server.__enter__()
         cls.addClassCleanup(cls.server.__exit__, None, None, None)
+
+    def test_array_overlap_and_string_output_match_shared_native_contracts(self):
+        import json
+        import psycopg
+
+        fixture = json.loads((FIXTURES / "sql_array_string_reference.json").read_text())
+        self.assertEqual(22, len(fixture["entries"]))
+        for case in fixture["entries"]:
+            with self.subTest(expression=case["expression"]):
+                if "error" in case:
+                    with self.assertRaises(psycopg.Error) as caught:
+                        self.db.execute("SELECT " + case["expression"])
+                    self.assertEqual(case["error"], caught.exception.sqlstate)
+                    continue
+                self.assertEqual(
+                    case["expected"],
+                    self.db.execute("SELECT " + case["expression"]).fetchone()[0],
+                )
+
+    def test_declared_array_columns_roundtrip_all_builtin_domains_and_bounds(self):
+        examples = {
+            "boolean": True,
+            "int16": "32767",
+            "int32": "2147483647",
+            "int64": "9007199254740993",
+            "float32": 1.5,
+            "float64": -0.25,
+            "text": 'NULL,{escaped}"\\雪',
+            "uuid": "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+            "jsonb": None,
+        }
+        for element, first in examples.items():
+            with (
+                self.subTest(element=element),
+                self.db.transaction(force_rollback=True),
+            ):
+                prop = {"type": "sql_array", "x-antfly-sql-type": element}
+                value = {
+                    "dimensions": [{"length": 2, "lower_bound": -3}],
+                    "values": [first, None],
+                    "sql_nulls": [False, True],
+                }
+                empty = {"dimensions": [], "values": [], "sql_nulls": []}
+                create_table(
+                    self.db,
+                    "typed_seed",
+                    {"id": {"type": "integer"}, "a": prop},
+                    [
+                        {"key": "a", "value": {"id": 1, "a": value}},
+                        {"key": "b", "value": {"id": 2, "a": empty}},
+                        {"key": "c", "value": {"id": 3, "a": None}},
+                    ],
+                )
+                result = execute(
+                    self.db,
+                    self.case("SELECT a FROM typed_seed ORDER BY id"),
+                    read=True,
+                )
+                self.assertEqual([[value], [empty], [None]], result["rows"])
+                self.assertEqual([[False], [False], [True]], result["sql_nulls"])
+
+    def test_declared_multidimensional_array_seed_retains_row_major_nulls(self):
+        prop = {"type": "sql_array", "x-antfly-sql-type": "int64"}
+        value = {
+            "dimensions": [
+                {"length": 2, "lower_bound": 0},
+                {"length": 2, "lower_bound": -1},
+            ],
+            "values": ["1", None, "9007199254740993", "4"],
+            "sql_nulls": [False, True, False, False],
+        }
+        with self.db.transaction(force_rollback=True):
+            create_table(
+                self.db,
+                "matrix_seed",
+                {"a": prop},
+                [{"key": "a", "value": {"a": value}}],
+            )
+            result = execute(self.db, self.case("SELECT a FROM matrix_seed"), read=True)
+            self.assertEqual([[value]], result["rows"])
+
+    def test_array_seed_rejects_implicit_types_domains_and_noncanonical_shapes(self):
+        prop = {"type": "sql_array", "x-antfly-sql-type": "int16"}
+        good = {
+            "dimensions": [{"length": 1, "lower_bound": 1}],
+            "values": ["1"],
+            "sql_nulls": [False],
+        }
+        for bad in (
+            [1],
+            {**good, "extra": 1},
+            {**good, "values": [1]},
+            {**good, "values": ["32768"]},
+            {**good, "sql_nulls": [1]},
+            {**good, "sql_nulls": [True]},
+            {**good, "values": []},
+            {**good, "dimensions": [{"length": 0, "lower_bound": 1}]},
+            {**good, "dimensions": [{"length": 1, "lower_bound": 2**31}]},
+        ):
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                array_seed_text(prop, bad)
+        for declaration in (
+            {"type": "sql_array"},
+            {"type": "sql_array", "x-antfly-sql-type": "not-a-type"},
+        ):
+            with self.subTest(declaration=declaration), self.assertRaises(ValueError):
+                pg_type(declaration)
+        self.assertEqual("jsonb", pg_type({"type": "array"}))
 
     def test_array_result_reference_preserves_bounds_width_and_json_nulls(self):
         cases = (
@@ -1073,6 +1184,9 @@ class PostgresReferenceTest(unittest.TestCase):
             lambda profile: profile["schema"]["document_schemas"]["row"]["schema"][
                 "properties"
             ]["metadata"].update(type="array"),
+            lambda profile: profile["schema"]["document_schemas"]["row"]["schema"][
+                "properties"
+            ]["metadata"].update(type="sql_array", **{"x-antfly-sql-type": "jsonb"}),
             lambda profile: profile["schema"]["document_schemas"]["row"]["schema"][
                 "properties"
             ]["amount"].update(default=1),

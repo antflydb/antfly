@@ -4288,3 +4288,33 @@ Allocation-failure, per-checkpoint cancellation, guard tampering, index
 saturation/readiness fallback, source-only inserts and resident lease/replay
 tests cover these boundaries. This is implementation and component evidence,
 not a claim that the remaining original SQL parity cases are complete.
+
+### Stored typed-array reads and text output
+
+Fourteen original cases now have strict native/PostgreSQL evidence. The ledger
+contains 379 implemented, 136 rejected, 73 superseded and 998 unresolved cases;
+the original 1,586-case inventory is unchanged.
+
+The PostgreSQL oracle has a separate `typed_array_read` profile: ordinary JSON
+arrays remain JSONB, while explicitly declared SQL arrays retain element type,
+dimensions, non-default lower bounds, whole-value NULLs and element NULLs. The
+campaign executes fourteen unchanged original queries against native storage
+through HTTP. Scalar fixtures separately cover all nine builtin element domains,
+multidimensional string output, JSONB numeric scale and exact bigint values.
+Mutation readback for this profile remains guarded until it has an equally
+lossless array codec; Python list conversion is not accepted as evidence.
+
+Array overlap uses the shared typed membership index. Either constant operand
+can be prepared once; dynamic evaluation indexes the smaller operand. The
+10,000-row debug workload completed in approximately 12 ms without hot-loop
+allocations. `array_to_string` counts output bytes before retaining its single
+exact-sized output allocation. The 32,768-element primitive workload produced
+98,303 bytes in approximately 2.8 ms with one allocation. These are local debug
+measurements, not production throughput claims.
+
+Column projection and result delivery retain complete Datums rather than their
+JSON-null placeholders. Arrays become envelopes only at the public boundary;
+fallback wire cells re-enter typed execution using their declared element type.
+Leased/native and public-page regressions exercise non-default bounds, NULL
+elements, exact bigint values and allocation failures. This does not activate
+array DDL, array index keys, or the unfinished broader SQL architecture.

@@ -77,7 +77,7 @@ pub const EvalLimits = struct {
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", @"$overlaps", array_to_string, jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace, array_append, array_prepend, array_cat };
 
 pub const Instruction = struct {
     type: Type,
@@ -138,8 +138,8 @@ pub const Program = struct {
         for (self.instructions) |instruction| {
             if (instruction.operation != .call) continue;
             const call = instruction.operation.call;
-            if (call.function != .@"$contains" and !(call.function == .array_position and call.args.len == 2)) continue;
-            const source = instruction.operation.call.args[0];
+            if (call.function != .@"$contains" and call.function != .@"$overlaps" and !(call.function == .array_position and call.args.len == 2)) continue;
+            const source = if (call.function == .@"$overlaps" and self.constant_arrays.contains(call.args[1])) call.args[1] else call.args[0];
             if (self.constant_memberships.contains(source)) continue;
             const array = self.constant_arrays.get(source) orelse continue;
             const index = try a.create(arrays.Membership);
@@ -1213,13 +1213,79 @@ test "SQL PostgreSQL array search prepared frames keep input widths and bounded 
     }
     std.debug.print("SQL array_position retained index: rows=10000 array_cells=16 evaluation_scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started});
 }
+fn arrayStringScenario(a: Allocator) !void {
+    const fixture = try std.json.parseFromSlice(struct { entries: []const struct { expression: []const u8, expected: Json = .null, @"error": ?[]const u8 = null } }, a, @embedFile("fixtures/sql_array_string_reference.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.entries) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(a, case.expression, .{});
+        defer compiled.deinit();
+        if (case.@"error") |state| {
+            try std.testing.expectEqualStrings("42883", state);
+            var unexpected = bind(a, compiled.expression, &.{}, &.{}, .{}) catch |err| switch (err) {
+                error.SqlUndefinedOperator => continue,
+                else => return err,
+            };
+            unexpected.deinit();
+            return error.TestExpectedError;
+        }
+        var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(case.expected == .null, value.sql_null);
+        if (case.expected != .null) try std.testing.expectEqualDeep(case.expected, value.value);
+    }
+}
+
+test "SQL array overlap and string output preserve PostgreSQL builtin element semantics" {
+    try arrayStringScenario(std.testing.allocator);
+}
+
+test "SQL array overlap and string output unwind every allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, arrayStringScenario, .{});
+}
+
+test "SQL array string output admits exact bytes and bounded work before retention" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "array_to_string(a,',','NULL')", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .text }}, &.{}, .{});
+    defer program.deinit();
+    const value = try arrays.Value.init(.text, &.{.{ .length = 3, .lower = -1 }}, &.{ Datum.json(.{ .string = "read" }), .{}, Datum.json(.{ .string = "write" }) }, .{});
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{Datum.typedArray(&value)}, &.{}, .{ .output_bytes = 14 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{Datum.typedArray(&value)}, &.{}, .{ .steps = 4 }));
+    const result = try program.evaluate(arena.allocator(), &.{Datum.typedArray(&value)}, &.{}, .{ .output_bytes = 15 });
+    try std.testing.expectEqualStrings("read,NULL,write", result.value.string);
+}
+
+test "SQL array overlap prepares either constant operand without hot loop allocation" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "a && ARRAY[1,5,9]", .{});
+    defer compiled.deinit();
+    var program = try bind(a, compiled.expression, &.{.{ .name = "a", .type = .array, .element_type = .int32 }}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(@as(usize, 1), program.constant_memberships.count());
+    const value = try arrays.Value.init(.int32, &.{.{ .length = 3, .lower = -1 }}, &.{ Datum.json(.{ .integer = 7 }), .{}, Datum.json(.{ .integer = 9 }) }, .{});
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const result = try program.evaluate(none.allocator(), &.{Datum.typedArray(&value)}, &.{}, .{});
+        try std.testing.expect(result.value.bool);
+    }
+    std.debug.print("SQL array overlap: rows=10000 constant_cells=3 evaluation_scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started});
+}
+
 fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
         .array_position => count == 2 or count == 3,
         .array_positions, .array_remove, .array_append, .array_prepend, .array_cat => count == 2,
         .array_replace => count == 3,
         .@"$like_escape" => count == 4,
-        .@"$contains", .jsonb_exists => count == 2,
+        .@"$contains", .@"$overlaps", .jsonb_exists => count == 2,
+        .array_to_string => count == 2 or count == 3,
         .string_to_array => count == 2 or count == 3,
         .jsonb_set => count == 3 or count == 4,
         .@"$array" => true,
@@ -1416,14 +1482,23 @@ const Binder = struct {
                     }
                     break :blk .{ .kind = .array, .element_type = .text, .nullable = true };
                 }
-                if (function == .@"$contains" or function == .jsonb_exists) {
+                if (function == .array_to_string) {
+                    const input = try self.infer(call.args[0], depth + 1);
+                    if (input.kind != null and (input.kind != .array or input.element_type == null)) return error.SqlTypeMismatch;
+                    for (call.args[1..]) |arg| {
+                        const actual = try self.infer(arg, depth + 1);
+                        if (actual.kind != null and actual.kind != .string) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = .string, .nullable = true };
+                }
+                if (function == .@"$contains" or function == .@"$overlaps" or function == .jsonb_exists) {
                     const left = try self.infer(call.args[0], depth + 1);
                     const right = try self.infer(call.args[1], depth + 1);
                     if (function == .jsonb_exists) {
                         if ((left.kind != null and left.kind != .json) or (right.kind != null and right.kind != .string)) return error.SqlTypeMismatch;
                     } else {
                         const merged = try common(left, right);
-                        if (merged.kind != .array and merged.kind != .json) return error.SqlTypeMismatch;
+                        if (merged.kind != .array and (function == .@"$overlaps" or merged.kind != .json)) return error.SqlTypeMismatch;
                         if (merged.kind == .array) try arrayOperator(left, right);
                     }
                     break :blk .{ .kind = .boolean, .nullable = left.nullable or right.nullable };
@@ -1723,7 +1798,8 @@ const Binder = struct {
                         .string_to_array => .string,
                         .jsonb_exists => if (i == 0) .json else .string,
                         .jsonb_set => if (i == 1) .array else if (i == 3) .boolean else .json,
-                        .@"$contains" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).kind,
+                        .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).kind,
+                        .array_to_string => if (i == 0) .array else .string,
                         .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
                         .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
@@ -1771,7 +1847,8 @@ const Binder = struct {
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
                     const element_context: ?arrays.ElementType = if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
                         .jsonb_set => if (i == 1) .text else null,
-                        .@"$contains" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
+                        .@"$contains", .@"$overlaps" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
+                        .array_to_string => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .text,
                         .@"$array_quantified" => if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
                         .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
@@ -2106,7 +2183,20 @@ const Evaluator = struct {
                         try self.charge(output.bytes);
                         break :blk Datum.typedArray(output.value);
                     },
-                    .@"$contains", .jsonb_exists => {
+                    .array_to_string => {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        const delimiter = try self.runDatum(call.args[1], depth + 1);
+                        const null_text = if (call.args.len == 3) try self.runDatum(call.args[2], depth + 1) else Datum{};
+                        if (input.sql_null or delimiter.sql_null) break :blk .{};
+                        if (delimiter.value != .string or (!null_text.sql_null and null_text.value != .string)) return error.SqlTypeMismatch;
+                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
+                        const initial = work.remaining;
+                        const text = try @import("text_array.zig").join(self.alloc, input.array orelse return error.SqlTypeMismatch, delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.bytes, &work);
+                        self.steps += initial - work.remaining;
+                        try self.charge(text.len);
+                        break :blk Datum.json(.{ .string = text });
+                    },
+                    .@"$contains", .@"$overlaps", .jsonb_exists => {
                         const left = try self.runDatum(call.args[0], depth + 1);
                         const right = try self.runDatum(call.args[1], depth + 1);
                         if (left.sql_null or right.sql_null) break :blk .{};
@@ -2117,11 +2207,13 @@ const Evaluator = struct {
                             break :exists try @import("json_containment.zig").exists(left.value, right.value.string, &work);
                         } else if (left.array) |array| contains: {
                             const other = right.array orelse return error.SqlTypeMismatch;
-                            if (self.program.constant_memberships.get(call.args[0])) |prepared| break :contains try prepared.contains(other.*, &work);
-                            var membership = try arrays.Membership.initWithBudget(self.alloc, array.*, .{ .bytes = self.limits.output_bytes -| self.bytes }, &work);
+                            if (self.program.constant_memberships.get(call.args[0])) |prepared| break :contains if (call.function == .@"$overlaps") try prepared.overlaps(other.*, &work) else try prepared.contains(other.*, &work);
+                            if (call.function == .@"$overlaps") if (self.program.constant_memberships.get(call.args[1])) |prepared| break :contains try prepared.overlaps(array.*, &work);
+                            const swapped = call.function == .@"$overlaps" and other.elements.len < array.elements.len;
+                            var membership = try arrays.Membership.initWithBudget(self.alloc, if (swapped) other.* else array.*, .{ .bytes = self.limits.output_bytes -| self.bytes }, &work);
                             defer membership.deinit();
                             try self.charge(membership.budget.live + @sizeOf(arrays.Membership));
-                            break :contains try membership.contains(other.*, &work);
+                            break :contains if (call.function == .@"$overlaps") try membership.overlaps(if (swapped) array.* else other.*, &work) else try membership.contains(other.*, &work);
                         } else try @import("json_containment.zig").contains(left.value, right.value, &work, 0);
                         self.steps += initial - work.remaining;
                         break :blk Datum.json(.{ .bool = accepted });
