@@ -351,6 +351,27 @@ zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
   -Mantfly_vector=lib/vector/src/mod.zig
 ```
 
+Lite's index writer has separate staging cleanup, also protected from pending
+I/O cancellation. Run its focused suite with:
+
+```sh
+zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
+  --test-filter 'storage.lite.index_storage.' \
+  -femit-bin=/path/to/lite-index-test.exe \
+  --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
+  --dep antfly_cache_budget \
+  -Mroot=pkg/antfly-embedded/src/local/windows_lite_index_test.zig \
+  -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
+  --dep antfly_platform -Mantfly_runtime_fs=lib/runtime/src/fs.zig \
+  --dep antfly_platform -Mantfly_cache_budget=lib/runtime/src/cache_budget.zig
+```
+
+For macOS execution, omit the Windows target and output/no-exec options and
+add `lib/platform/src/filesystem_capacity.c` before `-Mroot`.
+The suite passes all 24 tests on macOS. CrossOver passes 23 and fails the vacuum
+replacement test with `AccessDenied` in both Debug and ReleaseFast. Native
+Windows vacuum publication still needs verification; see the report.
+
 ## Prior native Windows qualification
 
 On a GCE `windows-2022` VM: `lite init`, `lite serve`, table creation, batch

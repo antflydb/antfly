@@ -425,6 +425,10 @@ const NativeAtomicWriteSink = struct {
         const io = self.storage.docs.file.runtime();
         if (self.file) |file| file.close(io);
         if (self.tmp_path) |path| {
+            // On Windows the named staging file survives closing its handle.
+            // Abort and failed publication must remove it even if canceled.
+            const previous = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(previous);
             std.Io.Dir.cwd().deleteFile(io, path) catch {};
             self.allocator.free(path);
         }
@@ -897,6 +901,55 @@ test "lite native index storage aborts atomic writes without publishing partial 
         try std.testing.expectEqualStrings("stable", stable);
         try std.testing.expectError(error.FileNotFound, storage.readFileAlloc(allocator, "/indexes/ft/new.tbl", 64));
     }
+}
+
+test "lite native staged abort removes staging despite pending cancellation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const path = try testPath(alloc, tmp, "canceled-staging.aflite");
+    defer alloc.free(path);
+    var pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
+    defer pool.deinit();
+    const io = pool.io();
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = io });
+    defer docs.close();
+    var indexes = Store.init(alloc, &docs);
+    const State = struct {
+        started: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        failure: ?anyerror = null,
+        fn run(i: std.Io, self: *@This(), storage: StorageIo) void {
+            self.write(i, storage) catch |err| {
+                self.failure = err;
+                self.started.set(i);
+            };
+        }
+        fn write(self: *@This(), i: std.Io, storage: StorageIo) !void {
+            var sink = try storage.beginAtomicWrite(std.testing.allocator, "/block");
+            defer sink.abort();
+            const chunk: [64 * 1024]u8 = @splat('x');
+            try sink.appendSlice(&chunk); // Force a physical staging file.
+            self.started.set(i);
+            self.release.waitUncancelable(i); // Leave cancellation for abort.
+        }
+        fn releaseChild(i: std.Io, self: *@This()) void {
+            i.sleep(.fromMilliseconds(50), .awake) catch {};
+            self.release.set(i);
+        }
+    };
+    var state: State = .{};
+    var child = try io.concurrent(State.run, .{ io, &state, indexes.storage() });
+    state.started.waitUncancelable(io);
+    var release = try io.concurrent(State.releaseChild, .{ io, &state });
+    child.cancel(io);
+    release.await(io);
+    if (state.failure) |err| return err;
+    var iter = tmp.dir.iterate();
+    while (try iter.next(io)) |entry| {
+        try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".aflite-write-"));
+    }
+    try std.testing.expectError(error.FileNotFound, indexes.storage().fileSize("/block"));
 }
 
 test "lite native index storage read-only open rejects mutations" {

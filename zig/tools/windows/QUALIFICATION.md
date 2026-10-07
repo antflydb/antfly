@@ -215,6 +215,32 @@ remain evidence for their explicitly identified earlier builds. The two Wine
 open-reader replacement failures and remaining qualification limits are
 unchanged.
 
+## Lite index staging review
+
+The preceding cancellation fix covered the LSM streaming writer, while Lite
+index storage has a separate physical staging writer. Its abort still deleted
+the named staging file through cancellable I/O. A new controlled regression
+forces the writer to spill, leaves cancellation pending until abort, and finds
+an orphaned `.aflite-write-*` file with the original cleanup. Lite cleanup now
+blocks cancellation around deletion and restores the previous protection.
+The regression passes after the fix on macOS and Windows Debug and ReleaseFast
+under CrossOver. No partial logical index record is published.
+
+The complete focused Lite index suite has 24 passes on macOS. Windows Debug
+and ReleaseFast each have 23 passes and one failure, with no skips. The failing
+test is `lite native staged atomic writes bound heap and survive concurrent
+commits and vacuum`: `replaceWithPreparedGeneration` returns `AccessDenied`
+while renaming the prepared generation over the open database. This exposes
+the same Wine open-destination replacement limitation documented above in
+the object-store tests. The failure occurs at vacuum publication, before the
+test can exercise publication of the staged index writer after vacuum.
+Native Windows Lite vacuum/replacement remains unqualified. The test is
+retained without an unlink-before-rename workaround or a skip.
+
+`windows_lite_index_test.zig` supplies a small test root for this suite. These
+results do not extend the earlier native Windows reset qualification to the
+latest source changes.
+
 ## Cleanup
 
 The disposable VM, auto-delete boot disk, artifact bucket, service account,
