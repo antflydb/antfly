@@ -14616,3 +14616,15 @@ test "system catalog offline migration publishes rows and fences server startup"
     try std.testing.expectEqual(.vector_store, reopened.findTableByNameLocked("docs").?.storage.dense_embeddings);
     try std.testing.expect(reopened.system_catalog_state.?.index.find(.database, 0, "preserved") != null);
 }
+
+test "standalone inference response cancellation retires host ownership" {
+    const Consumer = struct {
+        fn invoke(handle: *anyopaque, cancellation: runtime_http_abi.CancellationView) !void {
+            var lifetime = EmbeddedInferenceProviderLifetime{ .handle = handle };
+            defer std.debug.assert(lifetime.activeCallCount() == 0);
+            const response = try inference_provider.invokeEmbeddedInferenceRoute(&lifetime, std.testing.allocator, .post, "generate", "{}", 0, cancellation, .{});
+            defer std.testing.allocator.free(response.body);
+        }
+    };
+    try inference_host.testCanceledHttpResponseConsumer(Consumer.invoke);
+}
