@@ -20,12 +20,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	antfly "github.com/antflydb/antfly/go/pkg/sdk"
+	"github.com/antflydb/antfly/go/pkg/sdk/oapi"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
@@ -288,7 +291,7 @@ func TestCreateArtifactGraphIndexDefaultsToExtractorConfig(t *testing.T) {
 func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 	req := graphVisualizationQuery("Maxwell")
 	fullText, ok := req["full_text_search"].(map[string]any)
-	if !ok || fullText["query"] != "Maxwell" {
+	if !ok || fullText["match"].(map[string]any)["content"] != "Maxwell" || req["full_text_index"] != DefaultFullTextIndex {
 		t.Fatalf("unexpected full-text search: %#v", req["full_text_search"])
 	}
 	graphSearches, ok := req["graph_queries"].(map[string]any)
@@ -317,7 +320,7 @@ func TestGraphVisualizationQueryUsesAutographIndex(t *testing.T) {
 		t.Fatalf("graph traversal must hydrate visualization documents: %#v", traverse)
 	}
 	fields, ok := traverse["fields"].([]string)
-	if !ok || len(fields) != 3 || fields[0] != "title" || fields[1] != "url" || fields[2] != "metadata" {
+	if !ok || len(fields) != 4 || fields[0] != "title" || fields[1] != "url" || fields[2] != "original_url" || fields[3] != "metadata" {
 		t.Fatalf("unexpected graph document fields: %#v", traverse["fields"])
 	}
 }
@@ -1255,5 +1258,103 @@ func TestSplitPDFToPagesFromBytes_SinglePage(t *testing.T) {
 
 	if metadata.TotalPages != 1 {
 		t.Errorf("metadata.TotalPages = %d, want 1", metadata.TotalPages)
+	}
+}
+
+func TestGraphVisualizationHydratesSeedCitationsWithoutExtraNodes(t *testing.T) {
+	for _, qualified := range []bool{false, true} {
+		t.Run(fmt.Sprint(qualified), func(t *testing.T) {
+			table := "corpus"
+			seed := antfly.GraphPathEndpoint{Key: "seed"}
+			other := antfly.GraphPathEndpoint{Key: "seed", Table: new("other")}
+			if qualified {
+				seed.Table = &table
+			}
+			var graph antfly.GraphResult
+			if err := graph.FromGraphNodesResult(antfly.GraphNodesResult{
+				Kind:  antfly.GraphNodesResultKindNodes,
+				Stats: antfly.GraphResultStats{ReturnedItems: 2},
+				Nodes: []antfly.GraphResultNode{
+					{Key: "entity", Depth: 1, Path: []antfly.GraphPathEndpoint{seed, {Key: "entity"}}, PathEdges: []antfly.GraphPathEdge{{From: seed, To: antfly.GraphPathEndpoint{Key: "entity"}, Type: "mentions", Direction: antfly.GraphPathEdgeDirectionOut}}},
+					{Key: "another", Depth: 1, Path: []antfly.GraphPathEndpoint{other, {Key: "another"}}, PathEdges: []antfly.GraphPathEdge{{From: other, To: antfly.GraphPathEndpoint{Key: "another"}, Type: "mentions", Direction: antfly.GraphPathEdgeDirectionOut}}},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := antfly.DecodeCanonicalGraphResult(graph); err != nil {
+				t.Fatal(err)
+			}
+
+			resp := &antfly.QueryResponses{Responses: []antfly.QueryResult{{Table: table,
+				Hits: oapi.QueryHits{Hits: []antfly.QueryHit{
+					{ID: "seed", Source: map[string]any{"title": "Source page", "original_url": "https://example.test/source.pdf#page=12", "metadata": map[string]any{"page_number": float64(12)}}},
+					{ID: "unconnected", Source: map[string]any{"title": "Unconnected hit"}},
+				}}, GraphResults: map[string]antfly.GraphResult{"relations": graph},
+			}}}
+			viz := buildGraphVisualization("source", resp)
+			if len(viz.Nodes) != 4 {
+				t.Fatalf("unexpected nodes: %#v", viz.Nodes)
+			}
+			for _, node := range viz.Nodes {
+				switch node.ID {
+				case graphEndpointID(seed):
+					if node.Label != "Source page" || node.URL != "https://example.test/source.pdf#page=12" || node.Subtitle != "page 12" {
+						t.Fatalf("missing seed citation: %#v", node)
+					}
+				case "other/seed":
+					if node.URL != "" {
+						t.Fatalf("cross-table citation leaked: %#v", node)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestGraphHandlerDoesNotFetchUnrelatedFallback(t *testing.T) {
+	calls := 0
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		json.NewEncoder(w).Encode(antfly.QueryResponses{Responses: []antfly.QueryResult{{Status: 200}}})
+	}))
+	defer backend.Close()
+	server := &SearchServer{antflyURL: backend.URL, tableName: "corpus"}
+	w := httptest.NewRecorder()
+	server.handleAPIGraph(w, httptest.NewRequest(http.MethodGet, "/api/graph?q=unmatched", nil))
+	if calls != 1 || w.Code != http.StatusOK {
+		t.Fatalf("calls=%d status=%d body=%s", calls, w.Code, w.Body.String())
+	}
+	var viz GraphVisualization
+	if err := json.Unmarshal(w.Body.Bytes(), &viz); err != nil {
+		t.Fatal(err)
+	}
+	if len(viz.Edges) != 0 || viz.Query != "unmatched" {
+		t.Fatalf("unexpected visualization: %#v", viz)
+	}
+}
+
+func TestGraphHandlerSurfacesQueryFailure(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(antfly.QueryResponses{Responses: []antfly.QueryResult{{Status: 400, Error: "invalid graph query"}}})
+	}))
+	defer backend.Close()
+	server := &SearchServer{antflyURL: backend.URL, tableName: "corpus"}
+	w := httptest.NewRecorder()
+	server.handleAPIGraph(w, httptest.NewRequest(http.MethodGet, "/api/graph?q=source", nil))
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "invalid graph query") {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestGraphHandlerSurfacesMalformedCanonicalGraph(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"responses":[{"status":200,"graph_results":{"relations":{"kind":"unsupported","stats":{"returned_items":0}}}}]}`)
+	}))
+	defer backend.Close()
+	server := &SearchServer{antflyURL: backend.URL, tableName: "corpus"}
+	w := httptest.NewRecorder()
+	server.handleAPIGraph(w, httptest.NewRequest(http.MethodGet, "/api/graph?q=source", nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
 	}
 }

@@ -40,7 +40,7 @@ omitted here.
 ```bash
 cd zig
 ./zig-out/bin/antfly inference pull antflydb/clipclap:gguf:Q4_K --tasks embed
-./zig-out/bin/antfly inference pull antflydb/gliner2-base-v1-q4_k --tasks extract --capabilities extraction
+./zig-out/bin/antfly inference pull antflydb/gliner2-base-v1 --tasks extract --capabilities extraction
 ./zig-out/bin/antfly inference pull microsoft/Florence-2-base-ft --tasks read
 ```
 
@@ -102,7 +102,7 @@ export EPSTEIN_ZIP="/path/to/T9/DataSet_10.zip"
 ./epstein load --input epstein-smoke.json --table epstein_smoke --create-table \
   --enable-artifact-graph \
   --artifact-producer extractor \
-  --artifact-extractor-model antflydb/gliner2-base-v1-q4_k
+  --artifact-extractor-model antflydb/gliner2-base-v1
 
 # Optional: use the slower Gemma tool-call generator path for richer relation extraction.
 ./epstein load --input epstein-smoke.json --table epstein_smoke_gemma --create-table \
@@ -196,7 +196,7 @@ Flags:
                     (default: extractor)
   --artifact-extractor-model
                     Antfly model for artifact relation extraction
-                    (default: antflydb/gliner2-base-v1-q4_k)
+                    (default: antflydb/gliner2-base-v1)
   --artifact-labels Entity labels for the artifact extractor
   --artifact-relation-labels
                     Relation labels for the artifact extractor
@@ -300,7 +300,7 @@ Flags:
   --input           Input JSON file (default: epstein-docs.json)
   --output          Output JSON file (default: {input-base}-entities.json)
   --inference-url     Antfly inference URL (default: ANTFLY_INFERENCE_URL or http://localhost:8080)
-  --model           Recognizer model (default: antflydb/gliner2-base-v1-q4_k)
+  --model           Recognizer model (default: antflydb/gliner2-base-v1)
   --labels          Entity labels to extract
   --relation-labels Relation labels to extract (default: associated with, communicated with, traveled to, visited, worked for, represented by, mentioned in, located in)
   --batch-size      Text windows per Antfly inference recognize request (default: 16)
@@ -468,3 +468,177 @@ These documents are publicly available through official government channels and 
 - [DOJ Epstein Library](https://www.justice.gov/epstein)
 - [Internet Archive - Epstein Documents](https://archive.org/details/combined-all-epstein-files)
 - [PDF Association Analysis](https://pdfa.org/a-case-study-in-pdf-forensics-the-epstein-pdfs/)
+
+## Full corpus: native Apple OCR and audio transcription
+
+Use the `corpus` commands for directories and ZIP archives at full-dataset scale.
+They stream an NDJSON source manifest, externally sort and deduplicate it, and
+submit ordinary durable upserts. PDFs and audio stay in their original location;
+no permanent per-page PDF copies are needed. Video files are excluded.
+
+The Antfly server performs extraction as durable artifact enrichments. Good PDF
+text is retained, with Apple Vision OCR as the fallback. Apple speech transcription
+retains timestamps; page and transcript units feed BM25 and optional semantic search.
+Apple configurations have no `model` or `max_tokens`. Embeddings and graph extraction
+still use the example's Antfly inference models.
+
+Build Antfly on the Mac with `zig build antfly -Dapple-providers=true`; Apple speech
+requires macOS 26 or newer and installed speech assets for the selected locale.
+The source gateway and example CLI can run separately from the Antfly server.
+Audio formats: WAV, MP3, M4A, AIFF/AIF, CAF and FLAC. Apple transcription accepts up
+to 128 MiB and one hour per recording; split longer/larger recordings first.
+
+### Prepare a pilot on wolfspider
+
+Build the example with `GOWORK=off GOEXPERIMENT=simd go build -o epstein .`.
+Assign a stable dataset label to each source. Multiple sources may share a label
+when they contain copies of the same release. EFTA filenames identify documents
+within a dataset, including their extension; duplicate IDs are compared by SHA-256,
+and conflicting contents fail preparation. Other filenames use a hash of the
+relative path. Existing `pages/`, hidden files and AppleDouble files are excluded.
+
+```bash
+./epstein corpus prepare --state /Volumes/T9/epstein-pilot \
+  --source ds9=/Volumes/T9/epstein-docs/doj-dataset-9 \
+  --source ds10=/Volumes/T9/epstein-docs/doj-dataset-10.zip \
+  --source ds11=/Volumes/T9/epstein-docs/doj-dataset-11.zip \
+  --source ds12=/Volumes/T9/epstein-docs/doj-dataset-12.zip \
+  --base-url http://wolfspider:3001 \
+  --limit-pages 10000 --limit-files 2000 --pages-per-record 25
+
+./epstein corpus serve --state /Volumes/T9/epstein-pilot --listen :3001
+```
+
+Use the actual ZIP filenames on the volume. Select completed, stable sources;
+prepare later downloads in a new state when the download finishes. Consolidated
+PDFs from datasets 1–8 can also be supplied through their containing directories.
+A pilot stops before opening later PDFs or invoking OCR/transcription; discovery
+still reads directory/ZIP metadata to produce the deduplicated inventory.
+`--limit-pages` budgets PDF pages; `--limit-files` bounds both PDF and audio sources.
+
+Source URLs contain a signed locator, not an arbitrary filesystem path. The gateway
+checks signatures, root containment and source versions. Keep `sources.json` private:
+it contains the signing key. Keep the gateway running while enrichment or browsing
+needs the originals. ZIP audio supports browser range requests, and the search UI
+provides playback with transcript snippets and timestamp links. PDF links preserve
+original page numbers; PDF extraction URLs select at most `--pages-per-record` pages.
+Temporary ZIP/PDF ranges use the host's temporary directory, not permanent split
+files. Large consolidated PDFs require enough temporary space and memory for the
+PDF parser; smaller source PDFs avoid page rewriting when the whole file is selected.
+
+If Antfly fetches sources from localhost or Tailscale, explicitly allow the source
+host in its common JSON config (use your actual DNS name):
+
+```json
+{"remote_content":{"security":{"block_private_ips":false,"allowed_hosts":["wolfspider"]}}}
+```
+
+Start the Apple-enabled server with `antfly standalone --config antfly.json`.
+The advertised source URL must be reachable from both Antfly and the browser.
+
+### Load, resume, and build the graph
+
+```bash
+# Create an empty table, then measure a storage baseline.
+./epstein corpus load --state /Volumes/T9/epstein-pilot \
+  --table epstein_pilot --create-table --create-only --graph
+./epstein corpus stats --state /Volumes/T9/epstein-pilot \
+  --table epstein_pilot --data-dir /path/to/antfly-data --output baseline.json
+
+./epstein corpus load --state /Volumes/T9/epstein-pilot --table epstein_pilot --graph
+# Run after extraction finishes. Pending sources stop without advancing the checkpoint.
+./epstein corpus graph --state /Volumes/T9/epstein-pilot --table epstein_pilot
+./epstein serve --corpus --table epstein_pilot
+```
+
+Use `--semantic=false` on both load commands for a BM25-only pilot, and
+`serve --corpus --indexes document_text` for its search UI. Omit `--graph` and the
+`corpus graph` command to measure text/semantic storage without graph costs. Install
+the embedding model and optional extractor model using the existing model-pull
+instructions above. Use `--language` to select the Apple OCR/transcription locale.
+The relation extractor defaults to the registered model ID `antflydb/gliner2-base-v1`;
+its installed bundle selects the quantized weights. Use `--artifact-extractor-model`
+on both corpus load commands to select another registered extractor. Inspect
+`GET /ai/v1/models` to find registered IDs. Existing tables retain their producer
+configuration; changing the CLI default does not migrate them. For an existing
+pilot using `antflydb/gliner2-base-v1-q4_k`, create a new table with the corrected
+flags and rerun loading and graph materialization. Producer configuration is
+write-only, so an index status response cannot recover its original definition.
+Permanent extraction HTTP errors (including missing models and authorization
+failures) settle as failed artifacts; provider recovery or configuration changes
+require reprocessing. Rate limits, temporary server errors, and stale capability
+leases remain retryable. Provider logs include the HTTP status and error details.
+`ANTFLY_API_KEY`, when set, supplies a bearer token to corpus API requests.
+
+Preparation checkpoints every 100 sources and at completion. Resume with
+`corpus prepare --state ... --resume`; its saved configuration is immutable.
+Loading checkpoints only acknowledged `sync_level=write` batches. Rerun the same
+load command without `--create-table` after interruption. A lost acknowledgement
+may replay a batch safely using stable IDs. Resume checks bind the manifest,
+server, physical table ID and load configuration, so a recreated table cannot
+silently inherit an old checkpoint. The table also records its page-window and
+provider/index configuration; loading a different layout into that table is rejected
+to prevent overlapping page records. New source states can append to the same table
+when they use the same layout and settings. After a crashed process, remove the state
+`.lock` directory only once that process has stopped. Each state has one writer.
+
+OCR, transcription, chunking and embeddings run in Antfly's durable enrichment
+workers; completing `corpus load` means the source records were submitted, not that
+indexing finished. Failed provider work remains visible in server artifact/index
+status and can be repaired with the artifact reprocess API. Reprocessing acknowledges
+that repair was durably queued; poll the artifact generation/status for completion.
+Unrelated retrying providers do not turn that acknowledgment into a failure.
+`corpus graph` traverses
+units in bounded pages and reconciles deterministic graph-unit rows containing
+plain extracted text and provenance. Each source has a durable materialization
+revision marker in the table. Every invocation checks the latest artifact generation;
+unchanged revisions are reused, repaired revisions update their unit rows, and
+obsolete units are deleted along with their generated relations. The local checkpoint
+reports pass progress; deleting it does not cause unchanged sources to be rewritten.
+Existing graph checkpoints migrate automatically on the next pass.
+
+A source is staged on disk and its revision is rechecked before publication. Failed
+or changing extraction leaves its prior materialization intact during preparation.
+Interrupted publication is recovered on the next pass; the revision marker is
+written only after upserts and stale-row cleanup succeed. A version-checked
+publishing marker fences every mutation through Antfly's OCC transaction API;
+a superseding writer or source replacement rejects the older pass's writes.
+If a repair overlaps publication, rerun the command to converge to the latest
+revision. Graph reconciliation requires document lookup version tokens and OCC
+transactions from the server. Graph-unit links
+use original PDF page numbers or the audio unit's recording timestamp, and appear
+in the graph visualization. Completion reports materialization submission; inspect
+graph index `readiness.sources` and repair status separately for asynchronous
+relation extraction failures. The embedding index uses
+`coverage_policy: partial`: graph-unit rows, completion markers, and validated
+empty extraction outputs intentionally skip embedding work, while provider failures
+still block healthy coverage. Existing tables keep their previous policy; use a
+new pilot table with the updated load configuration. Graph visualization searches
+the row BM25 index's `content` field to seed the graph-unit keys that own edges;
+regular corpus search still groups artifact matches by source and keeps page/time
+citations.
+These optional rows add stored text and default BM25 postings as well as graph
+artifacts/edges. A validated OCR reader response with no detected text preserves
+embedded text (or completes an empty page) without counting as a provider failure;
+malformed responses, prompt echoes and actual rendering failures remain visible. The original small-dataset `prepare`, `enrich` and `entities`
+commands retain their JSON format; use the corpus pipeline for large inputs.
+
+### Measure storage before scaling up
+
+```bash
+./epstein corpus stats --state /Volumes/T9/epstein-pilot \
+  --table epstein_pilot --data-dir /path/to/antfly-data \
+  --baseline baseline.json --output pilot.json
+```
+
+Snapshots include prepared files/pages/audio and logical source bytes, preparation
+and submission rates, table storage status, individual index status, and optional
+allocated bytes from `du -sk`. Run `stats` on the machine that owns `--data-dir`.
+Take the final snapshot after artifact/index queues settle and compaction stabilizes.
+Allocated delta includes the whole supplied storage directory; use an isolated pilot
+server/data directory to attribute it to this table. Source bytes count whole chosen
+files, even when a pilot selects only some PDF pages. Raw source storage remains
+additional to Antfly storage. Compare representative text, scanned PDF and audio
+pilots, with and without semantic/graph indexes, before extrapolating to the corpus.
+
+Graph searches show only edges connected to the matching rows. A search with no edges stays empty. Citation labels and PDF page/audio time links come from the seed documents returned in the same query; graph rendering makes no additional document requests.

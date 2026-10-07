@@ -16,7 +16,7 @@ pub const cockroach_reference = .{
     .sql_y = "https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y",
 };
 
-pub const source_sha256_hex = "b3f79c232ec349183060b0e2b55a86b54c11f2e25fa39cb91350476d8caeffda";
+pub const source_sha256_hex = "a6fdc4e49063e563348fd488490cd71417147ebe840be6c51de4df995981be74";
 pub const start_symbol = "statement";
 pub const token_count = 293;
 pub const token_class_count = 101;

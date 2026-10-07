@@ -23309,7 +23309,7 @@ test "PDF render run ownership is allocation-failure safe" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "reader prefers Type3 charproc advance over widths array" {

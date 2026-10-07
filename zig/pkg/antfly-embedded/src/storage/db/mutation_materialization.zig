@@ -2761,6 +2761,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // across chunking, rendering, or model inference -- instead of reading
             // those arrays while a concurrent catalog publish could replace or free
             // them.
+            var pinned = try db.core.index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            const requirements = if (pinned.plan().completion_plan) |*value| value else return error.ArtifactCatalogDrift;
+            _ = requirements.providerFor(request) catch return error.EnrichmentSourceChanged;
             db.core.index_manager.catalog_mutex.lockShared();
             defer db.core.index_manager.catalog_mutex.unlockShared();
             const consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
@@ -2784,6 +2788,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .doc_key = owned_doc_key,
                     .outcome = outcome,
                 });
+                const readiness = @import("artifact_producer_readiness.zig");
+                const sources = try db.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
+                defer {
+                    for (sources) |source| alloc.free(source);
+                    alloc.free(sources);
+                }
+                for (sources) |source| {
+                    if (!readiness.localSourceProduced(pinned.plan(), requestArtifactName(request), source)) continue;
+                    const scope = try readiness.localScopeAlloc(alloc, index_name, source, pinned.plan());
+                    errdefer alloc.free(scope);
+                    const document = try alloc.dupe(u8, request.doc_key);
+                    errdefer alloc.free(document);
+                    try out.append(alloc, .{ .index_name = scope, .doc_key = document, .outcome = outcome });
+                }
             }
         }
 
@@ -2803,6 +2821,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             store: *docstore_mod.DocStore,
             index_manager: *index_manager_mod.IndexManager,
             outcomes: []const PrecomputedCoverageOutcome,
+            source_sequence: u64,
             writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
             owned_keys: *std.ArrayListUnmanaged([]u8),
             owned_values: *std.ArrayListUnmanaged([]u8),
@@ -2832,7 +2851,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             var groups = grouped.iterator();
             while (groups.next()) |group| {
                 const index_name = group.key_ptr.*;
-                const generation = index_manager.coverageGenerationForIndex(index_name) orelse continue;
+                const generation = index_manager.coverageGenerationForIndex(@import("artifact_producer_readiness.zig").localScopeIndex(index_name)) orelse continue;
                 // Multiple generated requests may feed one index for the same source
                 // document. The strongest exact terminal result wins deterministically.
                 const final_outcomes = group.value_ptr;
@@ -2859,6 +2878,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         entry.key_ptr.*,
                     );
                     errdefer alloc.free(marker_key);
+                    if (!std.mem.eql(u8, index_name, @import("artifact_producer_readiness.zig").localScopeIndex(index_name))) {
+                        const revision_key = try @import("artifact_producer_readiness.zig").localReceiptRevisionKeyAlloc(alloc, marker_key);
+                        owned_keys.append(alloc, revision_key) catch |err| {
+                            alloc.free(revision_key);
+                            return err;
+                        };
+                        const revision_value = try alloc.alloc(u8, 8);
+                        std.mem.writeInt(u64, revision_value[0..8], source_sequence, .little);
+                        owned_values.append(alloc, revision_value) catch |err| {
+                            alloc.free(revision_value);
+                            return err;
+                        };
+                        try writes.append(alloc, .{ .key = revision_key, .value = revision_value });
+                    }
                     const existing = store.get(alloc, marker_key) catch |err| switch (err) {
                         error.NotFound => null,
                         else => return err,
@@ -3416,6 +3449,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 };
                 var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
                 defer publication_context.deinit();
+                if (!ctx.projection_only) try invalidateLocalArtifactProducerCoverage(ctx, batch, index_ref);
                 // A document that can never gain visible content (issue #938: an
                 // `_edges`-only document reconstructed by replay as a synthetic
                 // full-text candidate) would otherwise make this exact window retry
@@ -3881,6 +3915,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 },
                 .graph => {
                     const apply_start_ns = monotonicTimeNs();
+                    if (!ctx.projection_only) try invalidateLocalArtifactProducerCoverage(ctx, batch, index_ref);
                     try ctx.index_manager.deleteGraphDocsByName(index_ref.name, batch.deleted_keys);
                     try applyGraphDocClearsForIndex(ctx, batch.graph_doc_clears, index_ref.name);
 
@@ -5720,18 +5755,20 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
                 if (producer_cfg.type == .document_extraction) {
                     try appendDocumentExtractionDeleteKeys(alloc, db, &document_extraction_view, request.doc_key, artifact_name, key, artifact_delete_keys);
+                    try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .skipped);
                     return;
                 }
                 try appendOwnedKey(alloc, artifact_delete_keys, key);
                 const state_key = try assetStateKeyAlloc(alloc, request.doc_key, artifact_name);
                 errdefer alloc.free(state_key);
                 try artifact_delete_keys.append(alloc, state_key);
+                try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .skipped);
                 return;
             }
             defer alloc.free(source_text.?);
 
             if (producer_cfg.type == .document_extraction) {
-                return try computeDocumentExtractionAssetRequestDerived(
+                try computeDocumentExtractionAssetRequestDerived(
                     alloc,
                     db,
                     &document_extraction_view,
@@ -5748,6 +5785,23 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     force_reprocess,
                     document_execution,
                 );
+                var selected_manifest: ?[]const u8 = null;
+                var i = artifact_writes.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    const write = artifact_writes.items[i];
+                    if (!std.mem.eql(u8, write.key, key)) continue;
+                    selected_manifest = write.value;
+                    break;
+                }
+                const retained_manifest = if (selected_manifest == null) try db.core.getStoreValue(alloc, key) else null;
+                defer if (retained_manifest) |value| alloc.free(value);
+                if (selected_manifest orelse retained_manifest) |manifest| {
+                    const failed = try documentExtractionManifestHasLastError(alloc, manifest) or
+                        try enrichment_runtime_mod.documentExtractionEmptyCoverageIsTerminalFailure(alloc, manifest);
+                    try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, if (failed) .terminal_failed else .produced);
+                }
+                return;
             }
 
             const source_parts_json = if (producer_cfg.type != .copy and request.source_template.len > 0)
@@ -5778,6 +5832,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                             .value = try alloc.dupe(u8, value),
                         });
                         try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
+                        try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
                         return;
                     }
                 }
@@ -5833,6 +5888,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .value = try alloc.dupe(u8, value),
             });
             try appendInlineFullTextDocument(alloc, documents, key, value, text_indexes);
+
+            try appendPrecomputedArtifactCoverageOutcomes(db, alloc, coverage_outcomes, request, .produced);
 
             if (producer_cfg.type != .copy) {
                 try artifact_writes.append(alloc, .{
@@ -7034,6 +7091,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return issue;
         }
 
+        fn invalidateLocalArtifactProducerCoverage(ctx: *const AsyncContext, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) !void {
+            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.deleted_keys);
+            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, batch.overwritten_doc_keys);
+            const pending = try pendingGeneratedCoverageDocKeysForIndexAlloc(ctx.alloc, ctx.index_manager, index_ref.name, index_ref.kind, batch.generated_enrichment_refs);
+            defer ctx.alloc.free(pending);
+            try deleteDerivedCoverageForDocKeys(ctx.alloc, ctx.store, ctx.index_manager, index_ref.name, pending);
+        }
+
         pub fn deleteDerivedCoverageForDocKeys(
             alloc: Allocator,
             store: *docstore_mod.DocStore,
@@ -7043,64 +7108,113 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
         ) !void {
             if (doc_keys.len == 0) return;
             if (try orderedCoverageActive(store)) return;
+            var local_coverage_guard = index_manager.lockLocalCoverage();
+            defer local_coverage_guard.release();
             const generation = index_manager.coverageGenerationForIndex(index_name) orelse return;
-
-            var deletes = std.ArrayListUnmanaged([]const u8).empty;
+            try deleteDerivedCoverageScopeForDocKeys(alloc, store, index_name, generation, doc_keys);
+            var pinned = try index_manager.acquireWritePlanSnapshot();
+            defer pinned.release();
+            const sources = try index_manager.artifactSourceNamesForIndexAlloc(alloc, index_name);
             defer {
-                for (deletes.items) |key| alloc.free(@constCast(key));
-                deletes.deinit(alloc);
+                for (sources) |source| alloc.free(source);
+                alloc.free(sources);
             }
-            var unique_deletes = std.StringHashMapUnmanaged(void).empty;
-            defer unique_deletes.deinit(alloc);
+            for (sources) |source| {
+                const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_name, source, pinned.plan());
+                defer alloc.free(scope);
+                try deleteDerivedCoverageScopeForDocKeys(alloc, store, scope, generation, doc_keys);
+            }
+        }
 
+        fn derivedCoverageOutcomeCounterValueForTxn(
+            alloc: Allocator,
+            txn: *docstore_mod.DocStore.Txn,
+            index_name: []const u8,
+            generation: u64,
+            outcome: []const u8,
+        ) !u64 {
+            const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, outcome);
+            defer alloc.free(key);
+            const raw = txn.get(key) catch |err| if (err == error.NotFound) null else return err;
+            if (raw) |value| return try internal_keys.decodeDerivedCoverageOutcomeCount(value);
+            // Only legacy tuples without maintained counters need a prefix scan.
+            const prefix = try internal_keys.derivedCoverageOutcomeMarkerPrefixAlloc(alloc, index_name, generation);
+            defer alloc.free(prefix);
+            var cursor = try txn.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(prefix);
+            var count: u64 = 0;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (std.mem.eql(u8, entry.value, outcome)) count += 1;
+                row = try cursor.next();
+            }
+            return count;
+        }
+
+        fn deleteDerivedCoverageScopeForDocKeys(
+            alloc: Allocator,
+            store: *docstore_mod.DocStore,
+            index_name: []const u8,
+            generation: u64,
+            doc_keys: []const []const u8,
+        ) !void {
+            // Read receipts, revalidate their primary revisions, and retire their
+            // counters in one writer transaction. A missing marker observed before
+            // acquiring the writer must never erase a concurrent completion.
+            var txn = try store.beginWriteTxn();
+            var committed = false;
+            defer if (!committed) txn.abort();
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
             const outcomes = std.meta.tags(DerivedCoverageOutcome);
+            var counts: [outcomes.len]u64 = undefined;
+            inline for (outcomes, 0..) |outcome, i| {
+                counts[i] = try derivedCoverageOutcomeCounterValueForTxn(scratch, &txn, index_name, generation, @tagName(outcome));
+            }
             var removed_counts = @as([outcomes.len]u64, @splat(0));
+            const readiness = @import("artifact_producer_readiness.zig");
+            const source_specific = !std.mem.eql(u8, index_name, readiness.localScopeIndex(index_name));
             for (doc_keys) |doc_key| {
-                const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key);
-                errdefer alloc.free(marker_key);
-                if (unique_deletes.contains(marker_key)) {
-                    alloc.free(marker_key);
-                    continue;
+                const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(scratch, index_name, generation, doc_key);
+                if (seen.contains(marker_key)) continue;
+                try seen.put(scratch, marker_key, {});
+                const existing = txn.get(marker_key) catch |err| if (err == error.NotFound) null else return err;
+                const value = existing orelse continue;
+                const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
+                if (source_specific) {
+                    const revision_key = try readiness.localReceiptRevisionKeyAlloc(scratch, marker_key);
+                    const revision = txn.get(revision_key) catch |err| if (err == error.NotFound) null else return err;
+                    const ordinal = try @import("doc_identity.zig").lookupOrdinalTxn(scratch, &txn, doc_key);
+                    const identity = if (ordinal) |id| try @import("doc_identity.zig").lookupStateTxn(&txn, id) else null;
+                    if (revision) |bytes| {
+                        if (bytes.len != 8) return error.InvalidDerivedCoverageOutcome;
+                        if (identity) |state| {
+                            // Untouched older documents have no primary stamp yet.
+                            // New primary writes always install it atomically.
+                            const primary = (try readiness.localPrimaryRevision(scratch, &txn, doc_key)) orelse state.created_generation;
+                            if (state.isLive() and std.mem.readInt(u64, bytes[0..8], .little) >= primary) continue;
+                        }
+                    }
+                    txn.delete(revision_key) catch |err| if (err != error.NotFound) return err;
                 }
-                const existing = store.get(alloc, marker_key) catch |err| switch (err) {
-                    error.NotFound => null,
-                    else => return err,
-                };
-                if (existing) |value| {
-                    defer alloc.free(value);
-                    const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
-                    removed_counts[@backingInt(outcome)] +|= 1;
-                }
-                try deletes.append(alloc, marker_key);
-                errdefer _ = deletes.pop();
-                try unique_deletes.put(alloc, marker_key, {});
+                try txn.delete(marker_key);
+                removed_counts[@backingInt(outcome)] += 1;
             }
-
-            if (deletes.items.len == 0) return;
-            var total_removed: u64 = 0;
-            for (removed_counts) |count| total_removed +|= count;
-            if (total_removed == 0) {
-                try store.putBatch(&.{}, deletes.items);
-                return;
+            var removed: u64 = 0;
+            for (outcomes, removed_counts, 0..) |outcome, count, i| {
+                if (count == 0) continue;
+                removed += count;
+                if (counts[i] < count) return error.InvalidDerivedCoverageCounter;
+                const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(scratch, index_name, generation, @tagName(outcome));
+                var bytes: [8]u8 = undefined;
+                try txn.put(key, internal_keys.encodeDerivedCoverageOutcomeCount(&bytes, counts[i] - count));
             }
-
-            var counter_keys: [outcomes.len]?[]u8 = @splat(null);
-            defer for (counter_keys) |key| if (key) |value| alloc.free(value);
-            var counter_values: [outcomes.len][8]u8 = undefined;
-            var counter_writes: [outcomes.len]docstore_mod.KVPair = undefined;
-            var counter_write_count: usize = 0;
-            for (outcomes, removed_counts, 0..) |outcome, removed_count, outcome_index| {
-                if (removed_count == 0) continue;
-                const current_count = try derivedCoverageOutcomeCounterValueForStore(alloc, store, index_name, generation, @tagName(outcome));
-                if (current_count < removed_count) return error.InvalidDerivedCoverageCounter;
-                counter_keys[outcome_index] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, index_name, generation, @tagName(outcome));
-                counter_writes[counter_write_count] = .{
-                    .key = counter_keys[outcome_index].?,
-                    .value = internal_keys.encodeDerivedCoverageOutcomeCount(&counter_values[outcome_index], current_count - removed_count),
-                };
-                counter_write_count += 1;
-            }
-            try store.putBatch(counter_writes[0..counter_write_count], deletes.items);
+            if (removed == 0) return;
+            try txn.commit();
+            committed = true;
         }
 
         pub fn denseApplyUsesLocalStreamingSession(ctx: *const AsyncContext, index_name: []const u8) bool {
@@ -10200,6 +10314,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         index_manager.denseIndexConsumesEmbedding(index_name, embedding_name),
                     .sparse_vector => ref.kind == .sparse_embedding and
                         index_manager.sparseIndexConsumesEmbedding(index_name, embedding_name),
+                    .full_text, .graph => blk: {
+                        if (ref.kind != .asset and ref.kind != .chunk_text) break :blk false;
+                        const consumers = try index_manager.indexesDependingOnArtifact(alloc, ref.artifact_name);
+                        defer {
+                            for (consumers) |consumer| alloc.free(consumer);
+                            alloc.free(consumers);
+                        }
+                        break :blk indexNameInSlice(index_name, consumers);
+                    },
                     else => false,
                 };
                 if (!targets_index or seen.contains(ref.doc_key)) continue;

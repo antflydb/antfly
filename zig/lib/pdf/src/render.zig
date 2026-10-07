@@ -177,11 +177,31 @@ pub fn renderPageContentRgbaInBoxRotatedWithAllocatorsCancelable(
     rotation: PageRotation,
     cancellation: reader.CancellationProbe,
 ) !RgbaCanvas {
+    return renderPageContentRgbaInBoxRotatedWithGeometryAllocatorsCancelable(scratch_alloc, output_alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, rotation, cancellation, null);
+}
+
+/// Unrotated raster dimensions computed from the source box before coordinates
+/// are scaled. Reusing this plan avoids rounding a floating-point extent twice.
+pub const CanvasSize = struct { width: usize, height: usize };
+
+pub fn renderPageContentRgbaInBoxRotatedWithGeometryAllocatorsCancelable(
+    scratch_alloc: Allocator,
+    output_alloc: Allocator,
+    page_box: reader.PageBox,
+    text_runs: []const reader.TextRun,
+    image_runs: []const reader.ImageRun,
+    shading_runs: []const reader.ShadingRun,
+    pattern_runs: []const reader.PatternRun,
+    shape_runs: []const reader.ShapeRun,
+    rotation: PageRotation,
+    cancellation: reader.CancellationProbe,
+    canvas_size: ?CanvasSize,
+) !RgbaCanvas {
     try cancellation.check();
     // Quarter turns require a second canvas. The unrotated image is temporary,
     // not retained output, and must not consume the final canvas's reservation.
     var canvas_alloc = if (rotation == .clockwise_90 or rotation == .clockwise_270) scratch_alloc else output_alloc;
-    var raw = try renderPageContentRgbaInBoxAllocWithBudget(scratch_alloc, canvas_alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
+    var raw = try renderPageContentRgbaInBoxAllocWithBudget(scratch_alloc, canvas_alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white, canvas_size);
     errdefer canvas_alloc.free(raw.rgba);
     try cancellation.check();
     try rotateRawPageCanvasWithAllocators(canvas_alloc, output_alloc, &raw, rotation, cancellation);
@@ -993,7 +1013,7 @@ fn renderPageContentRgbaInBoxAlloc(
     shape_runs: []const reader.ShapeRun,
     cancellation: reader.CancellationProbe,
 ) !RgbaCanvas {
-    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white);
+    return try renderPageContentRgbaInBoxAllocWithBudget(alloc, alloc, page_box, text_runs, image_runs, shading_runs, pattern_runs, shape_runs, cancellation, null, .opaque_white, null);
 }
 
 const CanvasBackground = enum { opaque_white, transparent };
@@ -1010,12 +1030,14 @@ fn renderPageContentRgbaInBoxAllocWithBudget(
     cancellation: reader.CancellationProbe,
     shared_bilevel_sample_budget: ?*BilevelSampleBudget,
     background: CanvasBackground,
+    canvas_size: ?CanvasSize,
 ) !RgbaCanvas {
     try cancellation.check();
     const page_w = @max(1.0, page_box.max_x - page_box.min_x);
     const page_h = @max(1.0, page_box.max_y - page_box.min_y);
-    const width = ceilPositiveToUsize(page_w, 1);
-    const height = ceilPositiveToUsize(page_h, 1);
+    const width = if (canvas_size) |size| size.width else ceilPositiveToUsize(page_w, 1);
+    const height = if (canvas_size) |size| size.height else ceilPositiveToUsize(page_h, 1);
+    if (width == 0 or height == 0) return error.RenderedPageTooLarge;
     const pixel_count = std.math.mul(usize, width, height) catch return error.RenderedPageTooLarge;
     if (pixel_count > 100_000_000) return error.RenderedPageTooLarge;
     const rgba_len = std.math.mul(usize, pixel_count, 4) catch return error.RenderedPageTooLarge;
@@ -2097,6 +2119,7 @@ fn renderPatternTileCanvasAlloc(
         cancellation,
         bilevel_sample_budget,
         .transparent,
+        null,
     );
     return .{ .rgba = raw.rgba, .width = raw.width, .height = raw.height };
 }
@@ -3222,6 +3245,7 @@ test "non-isolated coverage rendering consumes the shared bilevel budget" {
         .{},
         &budget,
         .opaque_white,
+        null,
     );
     defer alloc.free(raw.rgba);
     try std.testing.expectEqual(@as(u64, 0), budget.remaining_samples);

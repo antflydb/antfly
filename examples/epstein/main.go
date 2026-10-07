@@ -213,7 +213,7 @@ const (
 	DefaultEmbeddingDims    = 512
 	DefaultChunkerModel     = "fixed-bert-tokenizer"
 	DefaultOCRModel         = "microsoft/Florence-2-base-ft"
-	DefaultRecognizerModel  = "antflydb/gliner2-base-v1-q4_k"
+	DefaultRecognizerModel  = "antflydb/gliner2-base-v1"
 	DefaultAutographIndex   = "autograph_relations"
 	DefaultAutographAsset   = "relations_v1"
 	DefaultAutographModel   = DefaultRecognizerModel
@@ -1867,6 +1867,8 @@ func serveCmd(args []string) error {
 	antflyURL := fs.String("url", "http://localhost:8080/db/v1", "Antfly API URL")
 	tableName := fs.String("table", "epstein_docs", "Table name to search")
 	listenAddr := fs.String("listen", ":3000", "Listen address for web server")
+	corpusMode := fs.Bool("corpus", false, "Search native corpus artifacts and link to original PDF/audio sources")
+	searchIndexes := fs.String("indexes", "", "Comma-separated search indexes (corpus default: document_text,embeddings)")
 	pdfDir := fs.String("pdf-dir", "./epstein-docs", "Directory containing PDF files (including pages/ subdirectory)")
 
 	if err := fs.Parse(args); err != nil {
@@ -1893,6 +1895,13 @@ func serveCmd(args []string) error {
 		tmpl:      tmpl,
 	}
 
+	if *corpusMode {
+		server.corpus = true
+		server.indexes = []string{corpusTextIndex, DefaultEmbeddingIndex}
+	}
+	if *searchIndexes != "" {
+		server.indexes = strings.Split(*searchIndexes, ",")
+	}
 	// Create a new mux to avoid conflicts with default mux
 	mux := http.NewServeMux()
 
@@ -1918,7 +1927,7 @@ func serveCmd(args []string) error {
 		}))
 		mux.Handle("/pdfs/", pdfHandler)
 		fmt.Printf("PDF files: %s (serving at /pdfs/)\n", pagesDir)
-	} else {
+	} else if !*corpusMode {
 		fmt.Printf("Note: No pages/ directory found at %s\n", pagesDir)
 		fmt.Printf("      Run 'epstein prepare --split-pages' to create individual page PDFs\n")
 	}
@@ -1934,6 +1943,8 @@ func serveCmd(args []string) error {
 
 // SearchServer handles web requests
 type SearchServer struct {
+	corpus    bool
+	indexes   []string
 	client    *antfly.AntflyClient
 	antflyURL string
 	tableName string
@@ -1949,6 +1960,7 @@ type SearchResult struct {
 	FilePath string
 	PageNum  int
 	URL      string
+	Audio    bool
 	Entities []EntityChip
 }
 
@@ -2002,12 +2014,7 @@ func (s *SearchServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	// Perform search
-	resp, err := s.client.Query(ctx, antfly.QueryRequest{
-		Table:          s.tableName,
-		SemanticSearch: query,
-		Indexes:        searchIndexNames(),
-		Limit:          20,
-	})
+	resp, err := s.client.Query(ctx, s.searchRequest(query))
 
 	data := SearchPageData{
 		Query: query,
@@ -2047,6 +2054,9 @@ func (s *SearchServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+			if s.corpus {
+				applyCorpusHit(&result, hit)
+			}
 			data.Results = append(data.Results, result)
 		}
 	}
@@ -2063,12 +2073,7 @@ func (s *SearchServer) handleAPISearch(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
-	resp, err := s.client.Query(ctx, antfly.QueryRequest{
-		Table:          s.tableName,
-		SemanticSearch: query,
-		Indexes:        searchIndexNames(),
-		Limit:          20,
-	})
+	resp, err := s.client.Query(ctx, s.searchRequest(query))
 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -2093,11 +2098,6 @@ func (s *SearchServer) handleAPIGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	viz := buildGraphVisualization(query, resp)
-	if len(viz.Edges) == 0 {
-		if fallback, err := s.queryGraphVisualization(r.Context(), graphVisualizationSampleQuery()); err == nil {
-			viz = buildGraphVisualization(query, fallback)
-		}
-	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(viz)
 }
@@ -2130,15 +2130,29 @@ func (s *SearchServer) queryGraphVisualization(ctx context.Context, payload map[
 	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
 		return nil, fmt.Errorf("decode graph query: %w", err)
 	}
+	for _, result := range decoded.Responses {
+		if result.Error != "" || result.Status >= 400 {
+			return nil, fmt.Errorf("query graph: status %d: %s", result.Status, result.Error)
+		}
+		for name, graph := range result.GraphResults {
+			if _, err := antfly.DecodeCanonicalGraphResult(graph); err != nil {
+				return nil, fmt.Errorf("decode graph result %s: %w", name, err)
+			}
+		}
+	}
 	return &decoded, nil
 }
 
 func graphVisualizationQuery(searchText string) map[string]any {
 	return map[string]any{
+		// Graph edges are owned by the materialized rows. Artifact search can
+		// return their source PDFs instead, whose keys have no adjacency.
+		"full_text_index": DefaultFullTextIndex,
 		"full_text_search": map[string]any{
-			"query": searchText,
+			"match": map[string]any{"content": searchText},
 		},
-		"limit": 8,
+		"limit":  8,
+		"fields": []string{"title", "url", "original_url", "metadata"},
 		"graph_queries": map[string]any{
 			"relations": map[string]any{
 				"index": DefaultAutographIndex,
@@ -2149,30 +2163,7 @@ func graphVisualizationQuery(searchText string) map[string]any {
 					"limit":             80,
 					"include_paths":     true,
 					"include_documents": true,
-					"fields":            []string{"title", "url", "metadata"},
-				},
-			},
-		},
-	}
-}
-
-func graphVisualizationSampleQuery() map[string]any {
-	return map[string]any{
-		"query": map[string]any{
-			"match_all": map[string]any{},
-		},
-		"limit": 8,
-		"graph_queries": map[string]any{
-			"relations": map[string]any{
-				"index": DefaultAutographIndex,
-				"traverse": map[string]any{
-					"start":             map[string]any{"result_ref": "$query_results", "limit": 8},
-					"direction":         "both",
-					"max_depth":         1,
-					"limit":             80,
-					"include_paths":     true,
-					"include_documents": true,
-					"fields":            []string{"title", "url", "metadata"},
+					"fields":            []string{"title", "url", "original_url", "metadata"},
 				},
 			},
 		},
@@ -2191,6 +2182,16 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 	graphValue, err := antfly.DecodeCanonicalGraphResult(graph)
 	if err != nil {
 		return viz
+	}
+	// Search seeds can appear only as path endpoints. Reuse their projected
+	// documents; entity neighbors need no separate document requests.
+	response := resp.Responses[0]
+	documents := make(map[string]map[string]any, len(response.Hits.Hits))
+	for _, hit := range response.Hits.Hits {
+		documents[hit.ID] = hit.Source
+		if response.Table != "" {
+			documents[response.Table+"/"+hit.ID] = hit.Source
+		}
 	}
 	nodeByID := map[string]int{}
 	addNode := func(node GraphNode) {
@@ -2221,8 +2222,8 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 		if edge.Source == "" || edge.Target == "" {
 			return
 		}
-		addNode(GraphNode{ID: edge.Source, Label: edge.Source})
-		addNode(GraphNode{ID: edge.Target, Label: edge.Target})
+		addNode(graphNodeFromDocument(edge.Source, documents[edge.Source], 0))
+		addNode(graphNodeFromDocument(edge.Target, documents[edge.Target], 0))
 		key := edge.Source + "\x00" + edge.Target + "\x00" + edge.Type
 		if _, ok := edgeSeen[key]; ok {
 			return
@@ -2234,7 +2235,9 @@ func buildGraphVisualization(query string, resp *antfly.QueryResponses) GraphVis
 	switch result := graphValue.(type) {
 	case antfly.GraphNodesResult:
 		for _, resultNode := range result.Nodes {
-			addNode(graphNodeFromResult(resultNode))
+			node := graphNodeFromResult(resultNode)
+			addNode(node)
+			addNode(graphNodeFromDocument(node.ID, documents[node.ID], resultNode.Depth))
 			for _, edge := range resultNode.PathEdges {
 				addEdge(GraphEdge{
 					Source: graphEndpointID(edge.From),
@@ -2289,7 +2292,9 @@ func graphNodeFromDocument(id string, document map[string]any, depth int) GraphN
 		if value, ok := document["title"].(string); ok && strings.TrimSpace(value) != "" {
 			title = value
 		}
-		if value, ok := document["url"].(string); ok {
+		if value, ok := document["original_url"].(string); ok {
+			url = value
+		} else if value, ok := document["url"].(string); ok {
 			url = value
 		}
 		if metadata, ok := document["metadata"].(map[string]any); ok {
@@ -4594,6 +4599,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Epstein court documents and DOJ files using Antfly.\n\n")
 		fmt.Fprintf(os.Stderr, "Usage:\n")
 		fmt.Fprintf(os.Stderr, "  epstein download [flags]  - Download documents from archive.org\n")
+		fmt.Fprintf(os.Stderr, "  epstein corpus [command]  - Stream PDF/audio sources with native Apple OCR/transcription\n")
 		fmt.Fprintf(os.Stderr, "  epstein prepare [flags]   - Process PDFs and create JSON data\n")
 		fmt.Fprintf(os.Stderr, "  epstein load [flags]      - Load JSON data into Antfly\n")
 		fmt.Fprintf(os.Stderr, "  epstein sync [flags]      - Full pipeline (process + load)\n")
@@ -4633,6 +4639,8 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
+	case "corpus":
+		err = corpusCmd(os.Args[2:])
 	case "download":
 		err = downloadCmd(os.Args[2:])
 	case "prepare":
@@ -4651,7 +4659,7 @@ func main() {
 		err = entitiesCmd(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", os.Args[1])
-		fmt.Fprintf(os.Stderr, "Valid commands: download, prepare, load, sync, serve, audit, enrich, entities\n")
+		fmt.Fprintf(os.Stderr, "Valid commands: corpus, download, prepare, load, sync, serve, audit, enrich, entities\n")
 		os.Exit(1)
 	}
 

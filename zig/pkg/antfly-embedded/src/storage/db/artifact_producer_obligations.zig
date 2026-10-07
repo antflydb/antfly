@@ -154,6 +154,7 @@ pub fn mark(alloc: std.mem.Allocator, txn: anytype, authority: publication.Autho
     // Serialize the borrowed state before replacing any backend values.
     try store(alloc, txn, state);
     try txn.put(dirty, &record);
+    try @import("artifact_producer_readiness.zig").mark(alloc, txn, authority, document);
     return true;
 }
 
