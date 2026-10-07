@@ -511,9 +511,10 @@ jobs:
 
       - name: Restore ARC Zig cache dirs
         run: |
-          # Debug outputs exceeded the 49 GiB PVC. Use the measured 94 GiB
-          # runner scratch for disposable outputs, the PVC for dependencies.
-          local_cache="${RUNNER_TEMP}/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
@@ -966,9 +967,10 @@ jobs:
 
       - name: Restore ARC Zig cache dirs
         run: |
-          # Debug outputs exceeded the 49 GiB PVC. Use the measured 94 GiB
-          # runner scratch for disposable outputs, the PVC for dependencies.
-          local_cache="${RUNNER_TEMP}/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
+          # Compiler outputs belong on the PVC; runner temp counts toward
+          # the pod's 10 GiB ephemeral-storage limit. Retire completed phase
+          # caches below before starting the next phase.
+          local_cache="/mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local"
           global_cache="/mnt/cache/antfly/zig/zig-global"
           echo "ZIG_LOCAL_CACHE_DIR=$local_cache" >> "$GITHUB_ENV"
           echo "ZIG_GLOBAL_CACHE_DIR=$global_cache" >> "$GITHUB_ENV"
