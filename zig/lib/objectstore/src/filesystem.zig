@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const client_mod = @import("client.zig");
 const types = @import("types.zig");
@@ -231,10 +232,13 @@ pub const FilesystemClient = struct {
         while (try walker.next(self.io)) |entry| {
             if (entry.kind == .directory) continue;
             if (entry.kind != .file) return error.CorruptObjectNamespace;
+            const normalized = try windowsWalkKeyAlloc(alloc, entry.path);
+            defer if (normalized) |owned| alloc.free(owned);
+            const object_key = normalized orelse entry.path;
             const key = if (prefix.len == 0)
-                try alloc.dupe(u8, entry.path)
+                try alloc.dupe(u8, object_key)
             else
-                try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, entry.path });
+                try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, object_key });
             defer alloc.free(key);
             const destination = try std.fs.path.join(alloc, &.{ dest_path, entry.path });
             defer alloc.free(destination);
@@ -395,13 +399,16 @@ pub const FilesystemClient = struct {
         while (try walker.next(self.io)) |entry| {
             if (opts.cancellation) |token| try token.check();
             if (entry.kind != .file) continue;
-            if (!std.mem.startsWith(u8, entry.path, opts.prefix)) continue;
-            var candidate_name: []const u8 = entry.path;
+            const normalized = try windowsWalkKeyAlloc(alloc, entry.path);
+            defer if (normalized) |owned| alloc.free(owned);
+            const object_key = normalized orelse entry.path;
+            if (!std.mem.startsWith(u8, object_key, opts.prefix)) continue;
+            var candidate_name: []const u8 = object_key;
             var is_prefix = false;
-            if (!opts.recursive and opts.delimiter.len > 0 and entry.path.len > opts.prefix.len) {
-                if (std.mem.indexOf(u8, entry.path[opts.prefix.len..], opts.delimiter)) |delimiter_offset| {
+            if (!opts.recursive and opts.delimiter.len > 0 and object_key.len > opts.prefix.len) {
+                if (std.mem.indexOf(u8, object_key[opts.prefix.len..], opts.delimiter)) |delimiter_offset| {
                     const prefix_end = opts.prefix.len + delimiter_offset + opts.delimiter.len;
-                    candidate_name = entry.path[0..prefix_end];
+                    candidate_name = object_key[0..prefix_end];
                     is_prefix = true;
                 }
             }
@@ -1110,6 +1117,15 @@ fn validateBucket(bucket: []const u8) !void {
     if (bucket.len == 0 or std.mem.eql(u8, bucket, ".") or std.mem.eql(u8, bucket, ".."))
         return error.InvalidBucket;
     if (std.mem.indexOfAny(u8, bucket, "/\\\x00") != null) return error.InvalidBucket;
+}
+
+/// Object keys use '/', while Windows directory walkers return '\\'. Keep
+/// the walker's borrowed buffer intact and leave POSIX traversal unchanged.
+fn windowsWalkKeyAlloc(alloc: Allocator, path: []const u8) !?[]u8 {
+    if (comptime builtin.os.tag != .windows) return null;
+    const key = try alloc.dupe(u8, path);
+    std.mem.replaceScalar(u8, key, '\\', '/');
+    return key;
 }
 
 fn validateKey(key: []const u8) !void {
