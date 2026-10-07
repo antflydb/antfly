@@ -36,6 +36,8 @@ pub const Column = struct {
     untyped_null: bool = false,
     /// Symbolic lineage exists only during the pre-emission constraint pass.
     origin: ?*const ast.Scalar = null,
+    outer_level: u8 = 0,
+    outer_frame: ?usize = null,
 };
 
 /// Expand only authorized visible columns, before allocating expression
@@ -54,7 +56,7 @@ pub fn expandWildcards(alloc: Allocator, columns: []const Column, projections: [
         has_wildcard = true;
         const before = count;
         for (columns) |column| {
-            if (!wildcardMatches(column, projection, default_qualifier)) continue;
+            if (!wildcardMatches(columns, column, projection, default_qualifier)) continue;
             count += 1;
             if (count > max_output_columns) return error.SqlProgramLimitExceeded;
         }
@@ -70,7 +72,7 @@ pub fn expandWildcards(alloc: Allocator, columns: []const Column, projections: [
             continue;
         }
         for (columns, 0..) |column, ordinal| {
-            if (!wildcardMatches(column, projection, default_qualifier)) continue;
+            if (!wildcardMatches(columns, column, projection, default_qualifier)) continue;
             result[index] = .{ .bound_column = ordinal, .alias = column.name };
             index += 1;
         }
@@ -78,9 +80,10 @@ pub fn expandWildcards(alloc: Allocator, columns: []const Column, projections: [
     return result;
 }
 
-fn wildcardMatches(column: Column, projection: ast.Projection, default_qualifier: ?[]const u8) bool {
+fn wildcardMatches(columns: []const Column, column: Column, projection: ast.Projection, default_qualifier: ?[]const u8) bool {
     if (!column.visible) return false;
-    const qualifier = if (projection.field.len != 0) projection.field else default_qualifier orelse return true;
+    const qualifier = if (projection.field.len != 0) projection.field else default_qualifier orelse return column.outer_level == 0;
+    for (columns) |other| if (other.outer_level < column.outer_level and qualifierMatches(other, qualifier)) return false;
     return qualifierMatches(column, qualifier);
 }
 
@@ -100,10 +103,12 @@ pub const Node = struct {
     operation: union(enum) {
         singleton,
         recursive_ref: usize,
+        outer_ref: usize,
         recursive: struct { id: usize, seed: *const Node, step: *const Node, all: bool },
         materialized_ref: *const Node,
         scan: struct { index: usize, source_columns: []const []const u8 },
-        join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program },
+        join: struct { kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program, left_keys: []const scalar.Program, right_keys: []const scalar.Program, correlation: bool = false },
+        apply: struct { id: usize, kind: ast.JoinKind, left: *const Node, right: *const Node, condition: ?scalar.Program },
         query: struct { source: *const Node, statement: ast.Select, binding: describe.BoundStatement },
         set: struct { kind: ast.SetKind, all: bool, left: *const Node, right: *const Node },
         /// Compiler-generated INSERT VALUES arms in input order. Each arm
@@ -266,6 +271,10 @@ const Builder = struct {
     auto_materialized: std.AutoHashMapUnmanaged(*const ast.Select, void) = .empty,
     recursive_active: ?*const RecursiveFrame = null,
     recursive_next: usize = 0,
+    outer_scope: ?*const OuterScope = null,
+    outer_next: usize = 0,
+    outer_used: [32]bool = @splat(false),
+    const OuterScope = struct { id: usize, columns: []const Column, parent: ?*const OuterScope, cte_boundary: usize };
     const RecursiveFrame = struct { id: usize, query: *const ast.Select, columns: []const Column, parent: ?*const RecursiveFrame };
     const Constraint = struct { expression: *const ast.Scalar, expected: ?ast.ColumnType = null };
 
@@ -542,10 +551,18 @@ const Builder = struct {
                 const separator = name.len - column.name.len - 1;
                 if (name[separator] != 0 or !qualifierMatches(column, name[0..separator])) continue;
             }
-            if (found != null) return error.AmbiguousSqlColumn;
+            if (found) |prior| {
+                if (prior.outer_level < column.outer_level) continue;
+                if (prior.outer_level == column.outer_level) return error.AmbiguousSqlColumn;
+            }
             found = column;
         }
         return found orelse error.UndefinedColumn;
+    }
+    fn resolveField(self: *Builder, columns: []const Column, name: []const u8) !Column {
+        const column = try field(columns, name);
+        if (column.outer_frame) |id| self.outer_used[id] = true;
+        return column;
     }
     fn scalarNode(self: *Builder, value: ast.Scalar) !*const ast.Scalar {
         if (self.shape_only) {
@@ -578,7 +595,7 @@ const Builder = struct {
     fn expression(self: *Builder, columns: []const Column, input: *const ast.Scalar, aliases: []const ast.Projection) anyerror!*const ast.Scalar {
         return self.scalarNode(switch (input.*) {
             .column => |name| blk: {
-                const column = field(columns, name) catch |err| fallback: {
+                const column = self.resolveField(columns, name) catch |err| fallback: {
                     if (err == error.UndefinedColumn) for (aliases) |projection| if (projection.alias) |alias| if (std.mem.eql(u8, alias, name)) break :fallback Column{ .name = name, .internal = name, .qualifier = "", .type = .string, .nullable = true };
                     return err;
                 };
@@ -598,7 +615,7 @@ const Builder = struct {
                     spec.partition = partitions;
                     const order = try self.alloc.dupe(ast.Order, spec.order);
                     for (order) |*item| {
-                        if (item.expression) |expression_| item.expression = try self.expression(columns, expression_, &.{}) else item.field = (try field(columns, item.field)).internal;
+                        if (item.expression) |expression_| item.expression = try self.expression(columns, expression_, &.{}) else item.field = (try self.resolveField(columns, item.field)).internal;
                     }
                     spec.order = order;
                 }
@@ -619,8 +636,8 @@ const Builder = struct {
     fn predicate(self: *Builder, columns: []const Column, input: *const ast.Predicate) anyerror!*const ast.Predicate {
         const result = try self.alloc.create(ast.Predicate);
         result.* = switch (input.*) {
-            .comparison => |part| .{ .comparison = .{ .field = (try field(columns, part.field)).internal, .op = part.op, .value = part.value } },
-            .is_null => |part| .{ .is_null = .{ .field = (try field(columns, part.field)).internal, .negated = part.negated } },
+            .comparison => |part| .{ .comparison = .{ .field = (try self.resolveField(columns, part.field)).internal, .op = part.op, .value = part.value } },
+            .is_null => |part| .{ .is_null = .{ .field = (try self.resolveField(columns, part.field)).internal, .negated = part.negated } },
             .scalar => |part| .{ .scalar = try self.expression(columns, part, &.{}) },
             .negation => |part| .{ .negation = try self.predicate(columns, part) },
             .conjunction => |part| .{ .conjunction = .{ .left = try self.predicate(columns, part.left), .right = try self.predicate(columns, part.right) } },
@@ -642,7 +659,8 @@ const Builder = struct {
             if (projection.expression) |node_| {
                 try projections.append(self.alloc, .{ .expression = try self.expression(source.columns, node_, &.{}), .alias = projection.alias });
             } else {
-                const column = if (projection.bound_column) |ordinal| source.columns[ordinal] else try field(source.columns, projection.field);
+                const column = if (projection.bound_column) |ordinal| source.columns[ordinal] else try self.resolveField(source.columns, projection.field);
+                if (column.outer_frame) |id| self.outer_used[id] = true;
                 try projections.append(self.alloc, .{ .field = column.internal, .expression = if (column.untyped_null) try self.scalarNode(.{ .literal = .null }) else null, .alias = projection.alias orelse column.name });
             }
         }
@@ -665,7 +683,7 @@ const Builder = struct {
                     alias = true;
                     break;
                 };
-                if (!alias) out.field = (try field(source.columns, order.field)).internal;
+                if (!alias) out.field = (try self.resolveField(source.columns, order.field)).internal;
             }
         }
         result.order_by = orders;
@@ -715,6 +733,32 @@ const Builder = struct {
     }
 
     fn querySource(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
+        const source = try self.querySourceBody(statement, scope, depth);
+        const nearest = self.outer_scope orelse return source;
+        var outer: ?*const Node = null;
+        var frame: ?*const OuterScope = nearest;
+        var level: u8 = 1;
+        while (frame) |current| : ({
+            frame = current.parent;
+            level += 1;
+        }) {
+            const columns = try self.alloc.dupe(Column, current.columns);
+            for (columns) |*column| {
+                column.outer_level = level;
+                column.outer_frame = current.id;
+            }
+            const reference = try self.node(columns, .{ .outer_ref = current.id });
+            outer = if (outer) |left| try self.joinNode(left, reference, .cross, null, null) else reference;
+        }
+        const result = try self.joinNode(outer.?, source, .cross, null, null);
+        // Keep the binding domain intact until WHERE has been lowered. Its
+        // correlation keys then become a reusable hash build, not a Cartesian
+        // scan followed by a residual predicate for every parent.
+        if (!self.shape_only) @constCast(result).operation.join.correlation = true;
+        return result;
+    }
+
+    fn querySourceBody(self: *Builder, statement: ast.Select, scope: []const ast.Cte, depth: usize) anyerror!*const Node {
         if (depth > 32) return error.SqlProgramLimitExceeded;
         // Work backward through the WITH dependency DAG. An inlined later CTE
         // can multiply demand on its producer, while a materialized later CTE
@@ -834,7 +878,7 @@ const Builder = struct {
             return self.derived(rewritten, alias, names, scope, depth + 1);
         }
         const prepared: ?Prepared = if (self.prepared.fetchRemove(query)) |entry| entry.value else null;
-        const child = if (prepared) |entry| entry.source else try self.querySource(query.*, scope, depth + 1);
+        var child = if (prepared) |entry| entry.source else try self.querySource(query.*, scope, depth + 1);
         var lowered = if (prepared) |entry| entry.lowered else try self.lower(child, query.*);
         if (self.shape_only) {
             const expressions = try self.constrainSelect(child, lowered);
@@ -862,6 +906,12 @@ const Builder = struct {
             };
             lowered.columns = projections;
         };
+        if (child.operation == .join and child.operation.join.correlation and lowered.predicate != null) {
+            const join = child.operation.join;
+            const expression_ = lowered.predicate.?.scalar;
+            child = try self.joinNode(join.left, join.right, .inner, expression_, null);
+            lowered.predicate = null;
+        }
         const table = try self.virtualTable(child.columns);
         var adapter: ResolveAdapter = .{ .backend = self.backend, .table = table };
         const compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = lowered }, .parameter_count = @intCast(self.parameters.len) };
@@ -943,6 +993,12 @@ const Builder = struct {
                         i -= 1;
                         const cte = scope[i];
                         if (std.mem.eql(u8, cte.name, reference.name.table)) {
+                            const saved_scope = self.outer_scope;
+                            defer self.outer_scope = saved_scope;
+                            while (self.outer_scope) |frame| {
+                                if (i >= frame.cte_boundary) break;
+                                self.outer_scope = frame.parent;
+                            }
                             if (cte.recursive and try @import("recursive_shape.zig").references(cte.query.*, cte.name, 0) != 0)
                                 break :blk try self.recursiveCte(cte, reference.alias orelse cte.name, scope[0..i], depth + 1);
                             if (cte.materialization == .materialized or (cte.materialization == .automatic and self.auto_materialized.contains(cte.query))) {
@@ -997,32 +1053,88 @@ const Builder = struct {
             },
             .join => |join| blk: {
                 const left = try self.relation(join.left, scope, depth + 1);
-                const right = try self.relation(join.right, scope, depth + 1);
+                const lateral = join.right.* == .derived and join.right.derived.lateral;
+                var apply_id: ?usize = null;
+                const right = if (lateral) right: {
+                    if (self.outer_next == 32) return error.SqlProgramLimitExceeded;
+                    const id = self.outer_next;
+                    self.outer_next += 1;
+                    const frame: OuterScope = .{ .id = id, .columns = left.columns, .parent = self.outer_scope, .cte_boundary = scope.len };
+                    const saved_scope = self.outer_scope;
+                    defer self.outer_scope = saved_scope;
+                    self.outer_scope = &frame;
+                    const source = try self.relation(join.right, scope, depth + 1);
+                    if (join.kind == .right or join.kind == .full) {
+                        if (self.outer_used[id]) return error.InvalidLateralReference;
+                        try self.uncorrelated(source, id);
+                    } else apply_id = id;
+                    break :right source;
+                } else try self.relation(join.right, scope, depth + 1);
                 for (left.columns) |a| for (right.columns) |b| if (std.mem.eql(u8, a.qualifier, b.qualifier)) return error.AmbiguousSqlColumn;
-                const columns = try self.alloc.alloc(Column, left.columns.len + right.columns.len);
-                @memcpy(columns[0..left.columns.len], left.columns);
-                @memcpy(columns[left.columns.len..], right.columns);
-                if (join.kind == .right or join.kind == .full) for (columns[0..left.columns.len]) |*column| {
-                    column.nullable = true;
-                };
-                if (join.kind == .left or join.kind == .full) for (columns[left.columns.len..]) |*column| {
-                    column.nullable = true;
-                };
+                const columns = try self.joinColumns(left, right, join.kind);
                 const expression_ = if (join.condition) |condition| try self.expression(columns, condition, &.{}) else null;
-                if (self.shape_only) {
-                    if (expression_) |condition| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(condition, columns), .expected = .boolean });
-                    break :blk try self.node(columns, .singleton);
-                }
-                var left_keys: std.ArrayList(scalar.Program) = .empty;
-                var right_keys: std.ArrayList(scalar.Program) = .empty;
-                if (expression_) |condition| try self.joinKeys(condition, left, right, &left_keys, &right_keys);
-                const column_types = try self.scalarColumns(columns);
-                if (expression_) |condition| _ = try scalar.inferParameters(self.alloc, condition, column_types, self.parameters, .boolean, .{});
-                const program = if (expression_) |condition| try scalar.bindExpectedWithSettings(self.alloc, condition, column_types, self.parameters, .boolean, .{}, self.backend.settings_view) else null;
-                if (program) |bound| if (bound.output_type.kind != null and bound.output_type.kind != .boolean) return error.SqlTypeMismatch;
-                break :blk try self.node(columns, .{ .join = .{ .kind = join.kind, .left = left, .right = right, .condition = program, .left_keys = try left_keys.toOwnedSlice(self.alloc), .right_keys = try right_keys.toOwnedSlice(self.alloc) } });
+                break :blk try self.joinNode(left, right, join.kind, expression_, apply_id);
             },
         };
+    }
+    fn joinColumns(self: *Builder, left: *const Node, right: *const Node, kind: ast.JoinKind) ![]Column {
+        const columns = try self.alloc.alloc(Column, left.columns.len + right.columns.len);
+        @memcpy(columns[0..left.columns.len], left.columns);
+        @memcpy(columns[left.columns.len..], right.columns);
+        if (kind == .right or kind == .full) for (columns[0..left.columns.len]) |*column| {
+            column.nullable = true;
+        };
+        if (kind == .left or kind == .full) for (columns[left.columns.len..]) |*column| {
+            column.nullable = true;
+        };
+        return columns;
+    }
+
+    fn joinNode(self: *Builder, left: *const Node, right: *const Node, kind: ast.JoinKind, expression_: ?*const ast.Scalar, apply_id: ?usize) !*const Node {
+        const columns = try self.joinColumns(left, right, kind);
+        if (self.shape_only) {
+            if (expression_) |condition| try self.constraints.append(self.alloc, .{ .expression = try self.inferenceExpression(condition, columns), .expected = .boolean });
+            return self.node(columns, .singleton);
+        }
+        const column_types = try self.scalarColumns(columns);
+        if (expression_) |condition| _ = try scalar.inferParameters(self.alloc, condition, column_types, self.parameters, .boolean, .{});
+        const program = if (expression_) |condition| try scalar.bindExpectedWithSettings(self.alloc, condition, column_types, self.parameters, .boolean, .{}, self.backend.settings_view) else null;
+        if (program) |bound| if (bound.output_type.kind != null and bound.output_type.kind != .boolean) return error.SqlTypeMismatch;
+        if (apply_id) |id| return self.node(columns, .{ .apply = .{ .id = id, .kind = kind, .left = left, .right = right, .condition = program } });
+        var left_keys: std.ArrayList(scalar.Program) = .empty;
+        var right_keys: std.ArrayList(scalar.Program) = .empty;
+        if (expression_) |condition| try self.joinKeys(condition, left, right, &left_keys, &right_keys);
+        return self.node(columns, .{ .join = .{ .kind = kind, .left = left, .right = right, .condition = program, .left_keys = try left_keys.toOwnedSlice(self.alloc), .right_keys = try right_keys.toOwnedSlice(self.alloc) } });
+    }
+
+    fn uncorrelated(self: *Builder, source: *const Node, id: usize) anyerror!void {
+        switch (source.operation) {
+            .outer_ref => |reference| if (reference == id) {
+                const nulls = try self.alloc.alloc(scalar.Datum, source.columns.len);
+                @memset(nulls, .{});
+                @constCast(source).operation = .{ .literal_rows = try self.alloc.dupe([]const scalar.Datum, &.{nulls}) };
+            },
+            .query => |query| try self.uncorrelated(query.source, id),
+            .materialized_ref => |node_| try self.uncorrelated(node_, id),
+            .join => |join| {
+                try self.uncorrelated(join.left, id);
+                try self.uncorrelated(join.right, id);
+            },
+            .apply => |apply| {
+                try self.uncorrelated(apply.left, id);
+                try self.uncorrelated(apply.right, id);
+            },
+            .set => |set| {
+                try self.uncorrelated(set.left, id);
+                try self.uncorrelated(set.right, id);
+            },
+            .recursive => |part| {
+                try self.uncorrelated(part.seed, id);
+                try self.uncorrelated(part.step, id);
+            },
+            .values => |arms| for (arms) |arm| try self.uncorrelated(arm, id),
+            else => {},
+        }
     }
     fn joinKeys(self: *Builder, input: *const ast.Scalar, left: *const Node, right: *const Node, left_keys: *std.ArrayList(scalar.Program), right_keys: *std.ArrayList(scalar.Program)) anyerror!void {
         if (input.* != .binary) return;
@@ -1147,7 +1259,7 @@ fn markSelect(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), state
 }
 fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMapUnmanaged(void)) anyerror!void {
     switch (node.operation) {
-        .singleton, .recursive_ref, .literal_rows => {},
+        .singleton, .recursive_ref, .outer_ref, .literal_rows => {},
         .materialized_ref => |source| {
             // A materialized CTE stores its complete declared output once;
             // references can project different columns without changing its
@@ -1174,6 +1286,11 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             if (join.condition) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, node.columns[ordinal].internal, {});
             try projectScans(builder, join.left, needed);
             try projectScans(builder, join.right, needed);
+        },
+        .apply => |apply| {
+            if (apply.condition) |program| for (program.required_columns) |ordinal| try needed.put(builder.alloc, node.columns[ordinal].internal, {});
+            try projectScans(builder, apply.right, needed);
+            try projectScans(builder, apply.left, needed);
         },
         .query => |query| {
             try markSelect(builder.alloc, needed, query.statement);

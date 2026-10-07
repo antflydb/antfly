@@ -936,7 +936,7 @@ const Parser = struct {
             if (!self.take(.comma)) break;
         }
         const source = if (self.keyword(.from)) try self.relation() else null;
-        if (source == null) for (columns.items) |projection| if (projection.wildcard) return self.fail(error.InvalidSqlSyntax, "wildcard projection requires a FROM source");
+        if (source == null) for (columns.items) |projection| if (projection.wildcard and projection.field.len == 0) return self.fail(error.InvalidSqlSyntax, "wildcard projection requires a FROM source");
         // Preserve the established compact representation of a lone * only
         // after validating its source; an empty projection loses that marker.
         if (columns.items.len == 1 and columns.items[0].wildcard and columns.items[0].field.len == 0) columns.clearRetainingCapacity();
@@ -1068,6 +1068,7 @@ const Parser = struct {
     }
 
     fn relationAtom(self: *Parser) Error!*const ast.Relation {
+        const lateral = self.keyword(.lateral);
         if (self.take(.lparen)) {
             self.relation_depth += 1;
             defer self.relation_depth -= 1;
@@ -1087,8 +1088,9 @@ const Parser = struct {
             }
             const query = try self.alloc.create(ast.Select);
             query.* = statement_value.select;
-            return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc) } });
+            return self.relationNode(.{ .derived = .{ .query = query, .alias = alias, .columns = try names.toOwnedSlice(self.alloc), .lateral = lateral } });
         }
+        if (lateral) return self.fail(error.InvalidSqlSyntax, "LATERAL requires a derived query");
         const name_value = try self.tableReferenceName();
         return self.relationNode(.{ .table = .{ .name = name_value, .alias = try self.sourceAlias() } });
     }

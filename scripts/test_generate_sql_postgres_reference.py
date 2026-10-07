@@ -96,6 +96,46 @@ class PostgresReferenceTest(unittest.TestCase):
         self.assertGreaterEqual(self.db.info.server_version, 180000)
         self.assertEqual("", self.db.execute("SHOW listen_addresses").fetchone()[0])
 
+    def test_lateral_parent_scopes_materialization_and_recursion(self):
+        cases = [
+            (
+                "SELECT l.n FROM (SELECT 1 AS n UNION ALL SELECT 2) p "
+                "CROSS JOIN LATERAL (SELECT p.*) l ORDER BY l.n",
+                [(1,), (2,)],
+            ),
+            (
+                "SELECT p.n,l.x FROM (SELECT 1 AS n UNION ALL SELECT 2) p "
+                "CROSS JOIN LATERAL (WITH c AS MATERIALIZED (SELECT p.n AS x) "
+                "SELECT a.x+b.x AS x FROM c a CROSS JOIN c b) l ORDER BY p.n",
+                [(1, 2), (2, 4)],
+            ),
+            (
+                "SELECT p.n,l.x FROM (SELECT 1 AS n UNION ALL SELECT 2) p "
+                "CROSS JOIN LATERAL (WITH RECURSIVE r(n) AS (SELECT p.n "
+                "UNION ALL SELECT n+1 FROM r WHERE n<p.n+1) "
+                "SELECT sum(n) AS x FROM r) l ORDER BY p.n",
+                [(1, 3), (2, 5)],
+            ),
+        ]
+        for sql, expected in cases:
+            with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                self.assertEqual(expected, self.db.execute(sql).fetchall())
+
+    def test_lateral_limit_offset_is_per_parent(self):
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE edges(src bigint, dst bigint)")
+            self.db.execute(
+                "INSERT INTO edges SELECT n, n*10+k "
+                "FROM generate_series(1,128) n CROSS JOIN generate_series(0,1) k"
+            )
+            rows = self.db.execute(
+                "WITH RECURSIVE p(n) AS (SELECT 1 UNION ALL SELECT n+1 "
+                "FROM p WHERE n<128) SELECT p.n,l.x FROM p LEFT JOIN LATERAL "
+                "(SELECT e.dst AS x FROM edges e WHERE e.src=p.n "
+                "ORDER BY e.dst DESC LIMIT 1 OFFSET 1) l ON true ORDER BY p.n"
+            ).fetchall()
+            self.assertEqual([(n, n * 10) for n in range(1, 129)], rows)
+
     def test_typed_array_quantifiers_against_exact_postgres_sql(self):
         import json
         from pathlib import Path

@@ -56,6 +56,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlPreparedDurabilityUnavailable => .{ .code = "0A000", .message = "Durable SQL preparation requires a configured native session store.", .retryable = false },
         error.SqlPreparedAlreadyExists => .{ .code = "42P05", .message = "The prepared resource identifier already exists.", .retryable = false },
         error.ConflictArbiterNotFound => .{ .code = "42P10", .message = "No native unique constraint matches the conflict target.", .hint = "Use the complete column set of an active unique constraint.", .retryable = false },
+        error.InvalidLateralReference => .{ .code = "42P10", .message = "Invalid lateral reference in an outer join.", .hint = "Use an INNER, CROSS, or LEFT join for a correlated lateral query." },
         error.DeferrableConflictArbiter => .{ .code = "55000", .message = "ON CONFLICT does not support deferrable unique constraints as arbiters.", .retryable = false },
         error.RetainedReadRestartRequired, error.RetainedReadExpired, error.RetainedReadNotFound, error.RetainedReadScopeChanged, error.RetainedReadSequenceMismatch => .{ .code = "40001", .message = "The retained statement snapshot is no longer available.", .hint = "Restart the complete read statement; do not replay an individual page.", .retryable = true },
         error.SqlIndexAlreadyExists => .{ .code = "42P07", .message = "The index already exists.", .retryable = false },

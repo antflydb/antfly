@@ -18,6 +18,7 @@ test {
     _ = @import("window_test.zig");
     _ = @import("subquery_test.zig");
     _ = @import("recursive_test.zig");
+    _ = @import("lateral_test.zig");
     _ = @import("merge_test.zig");
     _ = @import("antfly_local_sources").sql_aggregate_binding;
     _ = @import("antfly_local_sources").sql_compiler;

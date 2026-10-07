@@ -266,9 +266,17 @@ references cannot invalidate one another's borrowed rows. Readers lease their
 sealed run, prohibiting append until they close; cleanup shares the existing
 statement spill quota and cancellation machinery. A 4,096-row materialized
 self-join verifies one source capture/read and complete output, independently
-checked against PostgreSQL. This also supplies the bounded replay prerequisite
-for parameterized LATERAL apply; correlated binding, per-parent inner execution
-and the original LATERAL cases are still unfinished, not credited by this work.
+checked against PostgreSQL. Parameterized LATERAL apply now binds lexical parent
+scopes and executes each inner query with its own LIMIT/OFFSET, null extension,
+materialized-CTE cache and recursive worklist lifetime. Statement-invariant
+inputs share bounded replay readers and hash builds rather than reopening the
+captured source for each parent. Supplemental tests check local-column shadowing,
+qualified parent wildcards, nested correlation, CTE visibility, parameter
+inference, allocation failures and cancellation cleanup. A captured 256-row child
+relation supplies 128 parents with per-parent ordered LIMIT/OFFSET under a linear
+checkpoint budget; its output is independently verified against PostgreSQL.
+These component contracts do not yet constitute exact-original public API and
+storage evidence for the LATERAL inventory cases, which remain unresolved.
 
 The mutation fixture verifies complete RETURNING rows and labels, SQL NULL
 provenance, affected rows, persisted state and untouched rows. A failed RETURNING
