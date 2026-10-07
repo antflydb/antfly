@@ -76,7 +76,7 @@ pub const EvalLimits = struct {
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", jsonb_exists, string_to_array, @"$like_escape", jsonb_set };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", jsonb_exists, string_to_array, @"$like_escape", jsonb_set, array_position, array_positions, array_remove, array_replace };
 
 pub const Instruction = struct {
     type: Type,
@@ -135,7 +135,9 @@ pub const Program = struct {
             if (value.array) |array| try self.constant_arrays.put(a, @intCast(index), array);
         }
         for (self.instructions) |instruction| {
-            if (instruction.operation != .call or instruction.operation.call.function != .@"$contains") continue;
+            if (instruction.operation != .call) continue;
+            const call = instruction.operation.call;
+            if (call.function != .@"$contains" and !(call.function == .array_position and call.args.len == 2)) continue;
             const source = instruction.operation.call.args[0];
             if (self.constant_memberships.contains(source)) continue;
             const array = self.constant_arrays.get(source) orelse continue;
@@ -937,8 +939,139 @@ fn functionId(name: []const u8) !Function {
     if (std.mem.eql(u8, name, "btrim")) return .trim;
     return error.UnsupportedSqlShape;
 }
+fn arraySearchFunction(function: Function) bool {
+    return switch (function) {
+        .array_position, .array_positions, .array_remove, .array_replace => true,
+        else => false,
+    };
+}
+
+test "SQL PostgreSQL array search and transform preserve typed NULLs bounds and promotion" {
+    const Case = struct { sql: []const u8 };
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            for ([_]Case{
+                .{ .sql = "array_position(ARRAY[1,NULL,2,NULL],NULL) = 2" },
+                .{ .sql = "array_position(ARRAY[1,NULL,2,NULL],NULL,3) = 4" },
+                .{ .sql = "array_position('[0:2]={4,5,4}'::int4[],4,-9) = 0" },
+                .{ .sql = "array_position('[0:2]={4,5,4}'::int4[],4,1) = 2" },
+                .{ .sql = "array_position(ARRAY[1,2],3) IS NULL" },
+                .{ .sql = "array_position(ARRAY[]::text[],NULL) IS NULL" },
+                .{ .sql = "array_position(NULL::int4[],1,NULL) IS NULL" },
+                .{ .sql = "array_position(ARRAY[]::int4[],1,NULL) IS NULL" },
+                .{ .sql = "array_position(ARRAY[1],1,'1') = 1" },
+                .{ .sql = "array_positions(NULL,NULL) IS NULL" },
+                .{ .sql = "array_positions('[0:3]={1,NULL,1,NULL}'::int4[],NULL) = ARRAY[1,3]" },
+                .{ .sql = "array_positions(ARRAY[1,2],3) = ARRAY[]::int4[]" },
+                .{ .sql = "array_positions(NULL::int4[],NULL) IS NULL" },
+                .{ .sql = "array_remove('[0:3]={1,NULL,1,2}'::int4[],1) = '[0:1]={NULL,2}'::int4[]" },
+                .{ .sql = "array_remove(ARRAY[1,1],1) = ARRAY[]::int4[]" },
+                .{ .sql = "array_remove(ARRAY[1,NULL,2],NULL) = ARRAY[1,2]" },
+                .{ .sql = "array_replace('[0:1][3:4]={{1,NULL},{1,2}}'::int4[],1,9) = '[0:1][3:4]={{9,NULL},{9,2}}'::int4[]" },
+                .{ .sql = "array_replace(ARRAY[1,NULL,2],NULL,9) = ARRAY[1,9,2]" },
+                .{ .sql = "array_replace(ARRAY[1,2],1,NULL) = ARRAY[NULL,2]" },
+                .{ .sql = "array_replace(ARRAY[1]::int2[],1::int8,9007199254740993::int8) = ARRAY[9007199254740993]::int8[]" },
+                .{ .sql = "array_remove(ARRAY['NaN'::float8,1::float8], 'NaN'::float8) = ARRAY[1::float8]" },
+                .{ .sql = "array_replace(ARRAY['null'::jsonb,NULL], 'null'::jsonb, '1'::jsonb) = ARRAY['1'::jsonb,NULL]" },
+                .{ .sql = "array_remove(ARRAY[1,2], '1') = ARRAY[2]" },
+            }) |case| {
+                var compiled = try @import("compiler.zig").compileScalar(a, case.sql, .{});
+                defer compiled.deinit();
+                var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+                defer program.deinit();
+                var arena = std.heap.ArenaAllocator.init(a);
+                defer arena.deinit();
+                const actual = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+                try std.testing.expect(!actual.sql_null and actual.value == .bool and actual.value.bool);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+}
+
+test "SQL PostgreSQL array search diagnoses dimensions initial position and signatures" {
+    for ([_]struct { sql: []const u8, err: anyerror }{
+        .{ .sql = "array_position(ARRAY[[1,2]],1)", .err = error.UnsupportedSqlShape },
+        .{ .sql = "array_positions(ARRAY[[1,2]],1)", .err = error.UnsupportedSqlShape },
+        .{ .sql = "array_remove(ARRAY[[1,2]],1)", .err = error.UnsupportedSqlShape },
+        .{ .sql = "array_position(ARRAY[1],1,NULL)", .err = error.SqlNullValueNotAllowed },
+        .{ .sql = "array_remove(ARRAY[1],true)", .err = error.SqlUndefinedFunction },
+        .{ .sql = "array_position(ARRAY[1],1,1.5::float8)", .err = error.SqlUndefinedFunction },
+        .{ .sql = "array_position(ARRAY[1],1,1::bigint)", .err = error.SqlUndefinedFunction },
+        .{ .sql = "array_position(ARRAY[[1,2]],1,NULL)", .err = error.UnsupportedSqlShape },
+        .{ .sql = "array_positions(ARRAY[1])", .err = error.SqlUndefinedFunction },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var program = bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqual(case.err, err);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        try std.testing.expectError(case.err, program.evaluate(arena.allocator(), &.{}, &.{}, .{}));
+    }
+}
+
+test "SQL PostgreSQL array search transforms unwind every allocation failure" {
+    const Fixture = struct {
+        fn run(a: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(a, "array_replace(array_remove(ARRAY['alpha',NULL,'alpha'],NULL), 'alpha','beta') = ARRAY['beta','beta'] AND array_positions(ARRAY[1,2,1],1) = ARRAY[1,3] AND array_position(ARRAY[1,NULL,2],NULL) = 2", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const actual = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+            try std.testing.expect(!actual.sql_null and actual.value.bool);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "SQL PostgreSQL array search prepared frames keep input widths and bounded hot lookup" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "array_replace($1,$2,$3)", .{});
+    defer compiled.deinit();
+    const hints: []const Type = &.{ .{ .kind = .array, .element_type = .int16 }, .{ .kind = .integer, .element_type = .int64 }, .{ .kind = .integer, .element_type = .int64 } };
+    var program = try bindTyped(a, compiled.expression, &.{}, hints, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(arrays.ElementType.int64, program.output_type.element_type.?);
+    for (hints, program.parameter_descriptors) |expected, actual| {
+        try std.testing.expectEqual(expected.kind, actual.kind);
+        try std.testing.expectEqual(expected.element_type, actual.element_type);
+    }
+    var frame = try @import("parameter_frame.zig").Frame.prepare(a, program.parameter_descriptors, &.{ .{ .text = "[0:2]={1,NULL,2}" }, .{ .text = "1" }, .{ .text = "9007199254740993" } }, .{});
+    defer frame.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const prepared = try program.bindParameters(&frame);
+    const result = try prepared.evaluate(arena.allocator(), &.{}, .{});
+    try std.testing.expectEqual(@as(i32, 0), result.array.?.dimensions[0].lower);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), result.array.?.elements[0].value.integer);
+    try std.testing.expect(result.array.?.elements[1].sql_null);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, prepared.evaluate(arena.allocator(), &.{}, .{ .output_bytes = 1 }));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, prepared.evaluate(arena.allocator(), &.{}, .{ .steps = 1 }));
+
+    var lookup_sql = try @import("compiler.zig").compileScalar(a, "array_position(ARRAY[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15], needle)", .{});
+    defer lookup_sql.deinit();
+    var lookup = try bind(a, lookup_sql.expression, &.{.{ .name = "needle", .type = .integer, .element_type = .int32 }}, &.{}, .{});
+    defer lookup.deinit();
+    try std.testing.expectEqual(@as(usize, 1), lookup.constant_memberships.count());
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |i| {
+        const value = try lookup.evaluate(none.allocator(), &.{Datum.json(.{ .integer = @intCast(i % 16) })}, &.{}, .{});
+        try std.testing.expectEqual(@as(i64, @intCast(i % 16 + 1)), value.value.integer);
+    }
+    std.debug.print("SQL array_position retained index: rows=10000 array_cells=16 evaluation_scratch_bytes=0 elapsed_ns={}\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started});
+}
 fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
+        .array_position => count == 2 or count == 3,
+        .array_positions, .array_remove => count == 2,
+        .array_replace => count == 3,
         .@"$like_escape" => count == 4,
         .@"$contains", .jsonb_exists => count == 2,
         .string_to_array => count == 2 or count == 3,
@@ -962,7 +1095,7 @@ fn arity(function: Function, count: usize) !void {
         .coalesce, .greatest, .least => count > 0,
         .concat => count > 0,
     };
-    if (!valid) return error.InvalidSqlParameters;
+    if (!valid) return if (arraySearchFunction(function)) error.SqlUndefinedFunction else error.InvalidSqlParameters;
 }
 
 const Binder = struct {
@@ -980,6 +1113,28 @@ const Binder = struct {
     parameter_count: usize = 0,
     allow_unresolved: bool = false,
     settings: ?*const setting_catalog.View = null,
+
+    /// PostgreSQL anycompatiblearray/anycompatible resolution is distinct
+    /// from the exact anyarray identity used by equality operators. Unknown
+    /// literal strings adopt the known domain; typed text never does so.
+    fn arraySearchElement(self: *Binder, call: anytype, function: Function, depth: usize) anyerror!arrays.ElementType {
+        var chosen: ?arrays.ElementType = null;
+        for (call.args, 0..) |arg, i| {
+            const actual = try self.infer(arg, depth + 1);
+            if (function == .array_position and i == 2) {
+                const unknown_text = arg.* == .literal and arg.literal == .string;
+                if (!unknown_text and actual.kind != null and (actual.kind != .integer or (actual.element_type orelse .int64) == .int64)) return error.SqlUndefinedFunction;
+                continue;
+            }
+            if (actual.kind == null or (arg.* == .literal and arg.literal == .string)) continue;
+            if ((i == 0) != (actual.kind == .array)) return error.SqlUndefinedFunction;
+            const element = actual.element_type orelse if (i == 0) return error.UnknownSqlArrayType else try arrayElementType(actual.kind.?);
+            if (chosen) |prior| {
+                if (prior != element) chosen = builtin_cast.commonNumeric(prior, element) catch return error.SqlUndefinedFunction;
+            } else chosen = element;
+        }
+        return chosen orelse .text;
+    }
 
     fn registerColumns(self: *Binder) !void {
         for (self.columns, 0..) |column, ordinal| {
@@ -1079,6 +1234,10 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (arraySearchFunction(function)) {
+                    const element = try self.arraySearchElement(call, function, depth);
+                    break :blk .{ .kind = if (function == .array_position) .integer else .array, .element_type = if (function == .array_position or function == .array_positions) .int32 else element, .nullable = true };
+                }
                 if (function == .@"$like_escape") {
                     for (call.args, 0..) |arg, i| {
                         const actual = try self.infer(arg, depth + 1);
@@ -1379,6 +1538,18 @@ const Binder = struct {
                     break :blk .{ .call = .{ .function = function, .args = &.{}, .setting_identity = resolved.identity } };
                 }
                 const args = try self.alloc.alloc(u32, call.args.len);
+                if (arraySearchFunction(function)) {
+                    const element = try self.arraySearchElement(call, function, depth);
+                    for (call.args, args, 0..) |arg, *out, i| {
+                        const start = function == .array_position and i == 2;
+                        const target: arrays.ElementType = if (start) .int32 else element;
+                        const desired: ast.ColumnType = if (i == 0) .array else arrayScalarType(target);
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired, .element_type = target } };
+                        out.* = try self.compileArrayContext(coercion, desired, target, depth + 1);
+                    }
+                    break :blk .{ .call = .{ .function = function, .args = args } };
+                }
                 const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
@@ -1657,6 +1828,33 @@ const Evaluator = struct {
                     } });
                 }
                 switch (call.function) {
+                    .array_position, .array_positions, .array_remove, .array_replace => {
+                        // These functions are deliberately non-strict in the
+                        // searched value/replacement: NULL is a matchable cell.
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        const needle = try self.runDatum(call.args[1], depth + 1);
+                        const third = if (call.args.len == 3) try self.runDatum(call.args[2], depth + 1) else Datum{};
+                        if (input.sql_null) break :blk .{};
+                        const array = input.array orelse return error.SqlTypeMismatch;
+                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
+                        const before = work.remaining;
+                        if (call.function == .array_position) {
+                            if (array.dimensions.len > 1) return error.UnsupportedSqlShape;
+                            if (array.elements.len == 0) break :blk .{};
+                            if (call.args.len == 3 and third.sql_null) return error.SqlNullValueNotAllowed;
+                            const start = if (call.args.len == 3) std.math.cast(i32, third.value.integer) orelse return error.SqlNumericOutOfRange else null;
+                            const answer = if (call.args.len == 2 and self.program.constant_memberships.contains(call.args[0])) try self.program.constant_memberships.get(call.args[0]).?.firstPosition(needle, &work) else try array.position(needle, start, &work);
+                            self.steps += before - work.remaining;
+                            break :blk if (answer) |value| Datum.json(.{ .integer = value }) else .{};
+                        }
+                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+                        const output = if (call.function == .array_positions) try array.positions(self.alloc, needle, limits, &work) else try array.transform(self.alloc, needle, if (call.function == .array_remove) null else third, limits, &work);
+                        self.steps += before - work.remaining;
+                        try self.charge(@sizeOf(arrays.Value) + output.dimensions.len * @sizeOf(arrays.Dimension) + output.elements.len * @sizeOf(arrays.Element));
+                        const owned = try self.alloc.create(arrays.Value);
+                        owned.* = output;
+                        break :blk Datum.typedArray(owned);
+                    },
                     .@"$like_escape" => {
                         const input = try self.runDatum(call.args[0], depth + 1);
                         const pattern = try self.runDatum(call.args[1], depth + 1);

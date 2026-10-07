@@ -181,11 +181,75 @@ pub const Value = struct {
         if (subscripts.len == 0 or subscripts.len != self.dimensions.len) return null;
         var offset: usize = 0;
         for (self.dimensions, subscripts) |dimension, subscript| {
-            const position = @as(i64, subscript) - dimension.lower;
-            if (position < 0 or position >= dimension.length) return null;
-            offset = offset * dimension.length + @as(usize, @intCast(position));
+            const relative = @as(i64, subscript) - dimension.lower;
+            if (relative < 0 or relative >= dimension.length) return null;
+            offset = offset * dimension.length + @as(usize, @intCast(relative));
         }
         return self.elements[offset];
+    }
+
+    /// PostgreSQL search uses IS NOT DISTINCT FROM, not strict equality:
+    /// SQL NULL matches SQL NULL, and NaN matches NaN. Subscripts, not flat
+    /// offsets, are returned. Only the one-dimensional search overload exists.
+    pub fn position(self: Value, needle: Element, start: ?i32, work: *Budget) !?i32 {
+        if (self.dimensions.len > 1) return error.UnsupportedSqlShape;
+        try validateElement(self.element_type, needle, work);
+        if (self.dimensions.len == 0) return null;
+        const lower_bound = self.dimensions[0].lower;
+        const offset: usize = @intCast(@max(@as(i64, 0), @as(i64, start orelse lower_bound) - lower_bound));
+        if (offset >= self.elements.len) return null;
+        for (self.elements[offset..], offset..) |element, i| {
+            if (try compareElement(self.element_type, element, needle, work) == .eq) return @intCast(@as(i64, lower_bound) + @as(i64, @intCast(i)));
+        }
+        return null;
+    }
+
+    /// Two bounded passes allocate the exact result vector rather than a
+    /// worst-case vector for every input row. The result always has int4 cells
+    /// and a one-based lower bound, independent of the searched array's bounds.
+    pub fn positions(self: Value, alloc: Allocator, needle: Element, limits: Limits, work: *Budget) !Value {
+        if (self.dimensions.len > 1) return error.UnsupportedSqlShape;
+        try validateElement(self.element_type, needle, work);
+        var count: usize = 0;
+        for (self.elements) |element| if (try compareElement(self.element_type, element, needle, work) == .eq) {
+            count += 1;
+        };
+        try resultAdmission(count, @intFromBool(count != 0), limits);
+        const dimensions = try alloc.alloc(Dimension, @intFromBool(count != 0));
+        if (count != 0) dimensions[0] = .{ .length = @intCast(count) };
+        const elements = try alloc.alloc(Element, count);
+        var output: usize = 0;
+        for (self.elements, 0..) |element, i| if (try compareElement(self.element_type, element, needle, work) == .eq) {
+            elements[output] = Element.json(.{ .integer = @as(i64, self.dimensions[0].lower) + @as(i64, @intCast(i)) });
+            output += 1;
+        };
+        return Value.initWithBudget(.int32, dimensions, elements, limits, work);
+    }
+
+    /// Result vectors/dimensions belong to alloc; cell payloads borrow the
+    /// pinned source/replacement owner, as scalar constructors do. Retained
+    /// operator boundaries must clone Datums before releasing those owners.
+    pub fn transform(self: Value, alloc: Allocator, needle: Element, replacement: ?Element, limits: Limits, work: *Budget) !Value {
+        if (replacement == null and self.dimensions.len > 1) return error.UnsupportedSqlShape;
+        try validateElement(self.element_type, needle, work);
+        if (replacement) |value| try validateElement(self.element_type, value, work);
+        var count = self.elements.len;
+        if (replacement == null) for (self.elements) |element| {
+            if (try compareElement(self.element_type, element, needle, work) == .eq) count -= 1;
+        };
+        const rank_: usize = if (count == 0) 0 else self.dimensions.len;
+        try resultAdmission(count, rank_, limits);
+        const dimensions = try alloc.dupe(Dimension, self.dimensions[0..rank_]);
+        if (replacement == null and count != 0) dimensions[0].length = @intCast(count);
+        const elements = try alloc.alloc(Element, count);
+        var output: usize = 0;
+        for (self.elements) |element| {
+            const matches = try compareElement(self.element_type, element, needle, work) == .eq;
+            if (matches and replacement == null) continue;
+            elements[output] = if (matches) replacement.? else element;
+            output += 1;
+        }
+        return Value.initWithBudget(self.element_type, dimensions, elements, limits, work);
     }
 
     pub fn compare(self: Value, other: Value, budget: *Budget) !std.math.Order {
@@ -232,6 +296,10 @@ pub const Value = struct {
         return hash.final();
     }
 };
+
+fn resultAdmission(elements: usize, rank_: usize, limits: Limits) !void {
+    if (elements > limits.elements or @sizeOf(Value) + rank_ * @sizeOf(Dimension) + elements * @sizeOf(Element) > limits.bytes) return error.SqlProgramLimitExceeded;
+}
 
 fn validateElement(kind: ElementType, element: Element, budget: *Budget) !void {
     try budget.consume(1);
@@ -610,7 +678,7 @@ pub const Membership = struct {
 
     pub fn firstPosition(self: *const Membership, element: Element, work: *Budget) !?i32 {
         try validateElement(self.value.element_type, element, work);
-        if (self.value.dimensions.len > 1) return error.InvalidSqlArrayShape;
+        if (self.value.dimensions.len > 1) return error.UnsupportedSqlShape;
         if (self.value.dimensions.len == 0) return null;
         const ordinal = if (element.sql_null) self.first_null else try self.find(element, try hashElement(self.value.element_type, element, work), work);
         return if (ordinal) |at| @intCast(@as(i64, self.value.dimensions[0].lower) + @as(i64, @intCast(at))) else null;

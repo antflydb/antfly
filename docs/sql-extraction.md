@@ -3757,3 +3757,43 @@ expressions, consistent arity diagnostics through complex derived projections,
 and broader mounted read/pgwire coverage. Retained-byte, row and work admission
 currently fail closed; this is not an unbounded fallback or a claim that the
 entire distributed SQL architecture is complete.
+
+### Typed array search and replacement execution
+
+`array_position`, `array_positions`, `array_remove` and `array_replace` now
+share the typed array boundary and follow [PostgreSQL's array-function
+contracts](https://www.postgresql.org/docs/18/functions-array.html). Binding
+resolves PostgreSQL's anycompatible
+element family separately from exact array-operator identity, inserts explicit
+operand coercions, and retains authoritative prepared-input widths. Unknown
+literal strings adopt a known element domain; typed incompatible arguments
+produce an undefined-function diagnostic rather than an implicit text cast.
+
+Search/removal use IS NOT DISTINCT FROM semantics, including SQL NULL and NaN.
+Search results are actual subscripts, not zero-based offsets. Positions results
+are one-based int4 arrays; removal preserves the input lower bound unless its
+result is empty. Replacement supports all admitted ranks and retains every
+dimension and lower bound. One-dimensional-only searches/removal return the
+PostgreSQL unsupported-feature diagnostic for multidimensional inputs. A NULL
+initial search position is diagnosed for a nonempty one-dimensional array;
+NULL and empty arrays return NULL. The start argument requires an int4-compatible
+input descriptor rather than an implicit narrowing cast from bigint.
+
+Dynamic lookup is a bounded scan. Constant arrays without a start-position
+argument reuse the program-owned typed membership index, including its first
+NULL ordinal. Exact-sized positions/removal output vectors use two bounded
+passes; replacement uses one pass before typed validation. Result cells borrow
+pinned input payloads, and retained operator boundaries continue to clone them
+before source retirement. Work and output-byte admission cover execution and
+result construction, and allocation-failure tests cover prepared indexes and
+transforms. A 10,000-probe debug workload over a retained 16-cell constant array
+used zero evaluation scratch bytes and took approximately 10 ms; this is an
+absolute measurement, not a before/after speedup claim.
+
+Independent PostgreSQL contracts check complete Boolean semantics, exact array
+OIDs, dimensions, bigint payloads, SQL NULL flags and diagnostic codes. Mounted
+HTTP checks array envelopes and prepared promotions. These are shared execution
+contracts, not original-corpus disposition credit: stored-array schema/read/
+mutation activation remains unfinished, as do concatenation and the broader
+array-function catalog. The original-case inventory remains 365 implemented,
+136 rejected, 73 superseded and 1,012 unresolved.

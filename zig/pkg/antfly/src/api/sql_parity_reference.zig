@@ -813,6 +813,12 @@ fn runArrayResults(alloc: std.mem.Allocator, handler: anytype) !void {
     const sources = @import("antfly_local_sources");
     const Case = struct { sql: []const u8, kind: sources.sql_array_value.ElementType, expected: ?[]const u8, params: []const u8 = "[]" };
     for ([_]Case{
+        .{ .sql = "SELECT array_positions('[0:3]={1,NULL,1,NULL}'::int4[],NULL)", .kind = .int32, .expected = "{1,3}" },
+        .{ .sql = "SELECT array_remove('[0:3]={1,NULL,1,2}'::int4[],1)", .kind = .int32, .expected = "[0:1]={NULL,2}" },
+        .{ .sql = "SELECT array_replace('[0:1][3:4]={{1,NULL},{1,2}}'::int4[],1,9)", .kind = .int32, .expected = "[0:1][3:4]={{9,NULL},{9,2}}" },
+        .{ .sql = "SELECT array_replace(ARRAY[1]::int2[],1::int8,9007199254740993::int8)", .kind = .int64, .expected = "{9007199254740993}" },
+        .{ .sql = "SELECT array_remove(NULL::int4[],NULL)", .kind = .int32, .expected = null },
+        .{ .sql = "SELECT array_replace($1::int2[],$2::int8,$3::int8)", .kind = .int64, .expected = "[0:2]={9007199254740993,NULL,2}", .params = "[{\"string\":\"[0:2]={1,NULL,2}\"},{\"integer\":1},{\"integer\":9007199254740993}]" },
         .{ .sql = "SELECT ARRAY[-9223372036854775808,NULL,9223372036854775807]::bigint[]", .kind = .int64, .expected = "{-9223372036854775808,NULL,9223372036854775807}" },
         .{ .sql = "SELECT '[0:1][3:4]={{1,NULL},{3,4}}'::int4[]", .kind = .int32, .expected = "[0:1][3:4]={{1,NULL},{3,4}}" },
         .{ .sql = "SELECT ARRAY[]::text[]", .kind = .text, .expected = "{}" },
