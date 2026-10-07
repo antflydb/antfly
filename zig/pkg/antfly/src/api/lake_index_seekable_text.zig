@@ -22,17 +22,28 @@ const stores = @import("../serverless/artifacts/store.zig");
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
 const Ref = artifacts.ChunkRef;
-const block_bytes = 64 * 1024;
-pub const Piece = struct { offset: usize, ref: Ref };
+const block_bytes = 256 * 1024;
+const pack_bytes = 1024 * 1024;
+pub const Piece = struct {
+    offset: usize,
+    // For packed ranges this is the authenticated range identity, not a
+    // separately uploaded object. GC retains pack, never this synthetic key.
+    ref: Ref,
+    pack: ?Ref = null,
+    pack_offset: u64 = 0,
+    pub fn retainedArtifact(self: Piece) Ref {
+        return self.pack orelse self.ref;
+    }
+};
 pub const Range = struct { offset: usize, len: usize };
 pub const Directory = struct {
-    version: u16 = 2,
+    version: u16 = 3,
     bytes: usize,
     metadata: []const Piece,
     blocks: []const Piece,
     terms: []const Range,
     pub fn validate(self: Directory) !void {
-        if ((self.version != 1 and self.version != 2) or self.bytes == 0 or self.bytes > 32 * 1024 * 1024 or self.metadata.len > 16384 or self.blocks.len > 16384 or self.terms.len > 200000) return error.InvalidNativeLakeTextCorpus;
+        if ((self.version != 1 and self.version != 2 and self.version != 3) or self.bytes == 0 or self.bytes > 32 * 1024 * 1024 or self.metadata.len > 16384 or self.blocks.len > 16384 or self.terms.len > 200000) return error.InvalidNativeLakeTextCorpus;
         // The two sorted streams must cover the original segment exactly.
         var position: usize = 0;
         var m: usize = 0;
@@ -42,6 +53,10 @@ pub const Directory = struct {
             const piece = if (meta) self.metadata[m] else self.blocks[b];
             if (piece.offset != position or piece.ref.byte_len == 0 or piece.ref.byte_len > self.bytes - position or (!meta and piece.ref.byte_len > block_bytes)) return error.InvalidNativeLakeTextCorpus;
             try stores.validateSha256ArtifactIdentity(piece.ref.artifact_id, piece.ref.checksum);
+            if (piece.pack) |pack| {
+                if (self.version < 3 or pack.byte_len == 0 or pack.byte_len > pack_bytes or piece.pack_offset > pack.byte_len or piece.ref.byte_len > pack.byte_len - piece.pack_offset) return error.InvalidNativeLakeTextCorpus;
+                try stores.validateSha256ArtifactIdentity(pack.artifact_id, pack.checksum);
+            } else if (piece.pack_offset != 0) return error.InvalidNativeLakeTextCorpus;
             position += @intCast(piece.ref.byte_len);
             if (meta) m += 1 else b += 1;
         }
@@ -58,6 +73,7 @@ pub const Read = struct {
     cache: ?artifacts.CachedRead,
     context: local.serverless_query_lake_read_context.Context,
     cancellation: Cancellation,
+    resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     fn check(self: Read) !void {
         try self.context.ensureActive();
         try self.cancellation.check();
@@ -73,15 +89,26 @@ pub fn publish(a: A, out: A, store: *stores.ArtifactStore, bytes: []const u8, ca
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const ca = arena.allocator();
-    // Native decoders address every section through bounded ranges. Fixed
-    // blocks authenticate metadata and payload alike, without reconstructing
-    // a virtual contiguous segment or special-casing postings wire versions.
+    // Upload large immutable packs, with independently authenticated bounded
+    // range units. Broad reads need four times fewer GETs than 64 KiB objects,
+    // while sparse queries never download an entire pack to authenticate it.
     var blocks: std.ArrayList(Piece) = .empty;
     var position: usize = 0;
     while (position < bytes.len) {
-        const end = @min(position + block_bytes, bytes.len);
-        try blocks.append(ca, .{ .offset = position, .ref = try upload(ca, store, bytes[position..end], cancellation) });
-        position = end;
+        const pack_end = @min(position + pack_bytes, bytes.len);
+        const pack = try upload(ca, store, bytes[position..pack_end], cancellation);
+        var offset = position;
+        while (offset < pack_end) {
+            const end = @min(offset + block_bytes, pack_end);
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes[offset..end], &digest, .{});
+            const checksum = try ca.dupe(u8, &std.fmt.bytesToHex(digest, .lower));
+            const scope = (try stores.uploadScopeFromArtifactId(pack.artifact_id)) orelse return error.InvalidArtifactUploadScope;
+            const id = try scope.artifactId(checksum);
+            try blocks.append(ca, .{ .offset = offset, .ref = .{ .artifact_id = try ca.dupe(u8, &id), .checksum = checksum, .byte_len = end - offset }, .pack = pack, .pack_offset = offset - position });
+            offset = end;
+        }
+        position = pack_end;
     }
     const directory: Directory = .{ .bytes = bytes.len, .metadata = &.{}, .blocks = blocks.items, .terms = &.{} };
     try directory.validate();
@@ -99,8 +126,36 @@ pub fn loadDirectory(a: A, read: Read, ref: Ref) !Directory {
     for ([_][]const Piece{ directory.metadata, directory.blocks }) |pieces| for (pieces) |piece| {
         const child = (try stores.uploadScopeFromArtifactId(piece.ref.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
         if (!std.mem.eql(u8, &child.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
+        if (piece.pack) |pack| {
+            const parent = (try stores.uploadScopeFromArtifactId(pack.artifact_id)) orelse return error.InvalidNativeLakeTextCorpus;
+            if (!std.mem.eql(u8, &parent.domain, &scope.domain)) return error.InvalidNativeLakeTextCorpus;
+        }
     };
     return directory;
+}
+fn readPieceLease(a: A, store: stores.ArtifactStore, piece: Piece, cancellation: Cancellation, cached: ?artifacts.CachedRead) !local.serverless_query_lake_serving_cache.Cache.ImmutableLease {
+    if (piece.pack == null) return artifacts.readArtifactLease(a, store, piece.ref, cancellation, cached);
+    const Loader = struct {
+        store: stores.ArtifactStore,
+        piece: Piece,
+        cancellation: Cancellation,
+        fn load(raw: *anyopaque, alloc: A) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var source = self.store;
+            const bytes = try source.getRangeAllocWithCancellationUsingAllocator(alloc, self.piece.pack.?.artifact_id, self.piece.pack_offset, @intCast(self.piece.ref.byte_len), self.cancellation);
+            errdefer alloc.free(bytes);
+            if (bytes.len != self.piece.ref.byte_len) return error.ArtifactIntegrityMismatch;
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+            if (!std.mem.eql(u8, &digest, &(try stores.sha256DigestFromChecksum(self.piece.ref.checksum)))) return error.ArtifactIntegrityMismatch;
+            try self.cancellation.check();
+            return bytes;
+        }
+    };
+    try cancellation.check();
+    var loader: Loader = .{ .store = store, .piece = piece, .cancellation = cancellation };
+    if (cached) |cache| return cache.cache.readImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, @intCast(piece.ref.byte_len), try stores.sha256DigestFromChecksum(piece.ref.checksum), cache.context, .{ .ptr = &loader, .load = Loader.load });
+    return .{ .heap = .{ .alloc = a, .bytes = try Loader.load(&loader, a) } };
 }
 const Owner = struct {
     a: A,
@@ -108,6 +163,7 @@ const Owner = struct {
     directory: Directory,
     fallback: ?Read,
     query_scoped: bool = false,
+    resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     // Diagnostics track touched payload blocks without retaining payloads.
     loaded: []bool,
     mutex: std.atomic.Mutex = .unlocked,
@@ -122,7 +178,7 @@ const Owner = struct {
         if (self.query_scoped) self.fallback = null;
     }
     fn source(self: *@This()) local.index.SegmentSource {
-        return .{ .ranges = .{ .ptr = self, .length = self.directory.bytes, .read_into = readInitial, .close = release, .bind_read_context = bind, .seal_read_context = seal } };
+        return .{ .ranges = .{ .ptr = self, .length = self.directory.bytes, .read_into = readInitial, .close = release, .bind_read_context = bind, .seal_read_context = seal, .resource_manager = self.resource_manager } };
     }
     fn readInitial(raw: *anyopaque, offset: u64, out: []u8) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -139,6 +195,11 @@ const Owner = struct {
         recent_cursor: usize = 0,
         cancelled: std.atomic.Value(bool) = .init(false),
         mutex: std.atomic.Mutex = .unlocked,
+        fn checkContext(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cancelled.load(.acquire)) return error.Canceled;
+            try self.capability.check();
+        }
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
             if (self.cancelled.load(.acquire)) return true;
@@ -151,7 +212,7 @@ const Owner = struct {
             const token: Cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
             var cached = self.capability.cache;
             if (cached) |*cache| cache.context.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
-            var lease = try artifacts.readArtifactLease(std.heap.page_allocator, self.capability.store, piece.ref, token, cached);
+            var lease = try readPieceLease(std.heap.page_allocator, self.capability.store, piece, token, cached);
             defer lease.deinit();
         }
         fn drain(self: *@This(), cancel: bool) void {
@@ -267,7 +328,7 @@ const Owner = struct {
         try capability.check();
         const query = try a.create(Query);
         query.* = .{ .a = a, .owner = owner, .capability = capability, .io = capability.context.io };
-        return .{ .ranges = .{ .ptr = query, .length = owner.directory.bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce } };
+        return .{ .ranges = .{ .ptr = query, .length = owner.directory.bytes, .read_into = Query.read, .close = Query.close, .prefetch = Query.prefetch, .quiesce_read_context = Query.quiesce, .resource_manager = capability.resource_manager orelse owner.resource_manager, .read_io = capability.context.io, .check_read_context = Query.checkContext } };
     }
     fn containing(pieces: []const Piece, offset: usize) ?usize {
         var low: usize = 0;
@@ -290,7 +351,7 @@ const Owner = struct {
             const metadata = containing(self.directory.metadata, offset);
             const block = if (metadata == null) containing(self.directory.blocks, offset) else null;
             const piece = if (metadata) |index| self.directory.metadata[index] else if (block) |index| self.directory.blocks[index] else return error.InvalidNativeLakeTextCorpus;
-            var lease = try artifacts.readArtifactLease(self.a, capability.store, piece.ref, capability.cancellation, capability.cache);
+            var lease = try readPieceLease(self.a, capability.store, piece, capability.cancellation, capability.cache);
             defer lease.deinit();
             const data = lease.bytes();
             try capability.check();
@@ -310,7 +371,7 @@ const Owner = struct {
 };
 pub fn load(a: A, read: Read, ref: Ref) !local.index.SegmentData {
     const owner = try a.create(Owner);
-    owner.* = .{ .a = a, .arena = .init(a), .directory = undefined, .loaded = &.{}, .fallback = read };
+    owner.* = .{ .a = a, .arena = .init(a), .directory = undefined, .loaded = &.{}, .fallback = read, .resource_manager = read.resource_manager };
     errdefer Owner.release(owner);
     owner.directory = try loadDirectory(owner.arena.allocator(), read, ref);
     owner.loaded = try owner.arena.allocator().alloc(bool, owner.directory.blocks.len);
@@ -376,10 +437,15 @@ test "external lake seekable text loads touched postings and keeps exact scoring
         fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
             return error.TestRemoteUnavailable;
         }
+        fn range(_: *anyopaque, _: A, _: []const u8, _: u64, _: usize) ![]u8 {
+            return error.TestRemoteUnavailable;
+        }
     };
     var vtable = store.vtable.*;
     vtable.stat = Denied.stat;
     vtable.stat_with_cancellation = null;
+    vtable.get_range_alloc = Denied.range;
+    vtable.get_range_alloc_with_cancellation = null;
     var denied = store;
     denied.vtable = &vtable;
     var failed: Read = .{ .store = denied, .cache = null, .context = .{}, .cancellation = .none };
@@ -416,10 +482,10 @@ test "external lake native text seeks a common term without reading its position
     const ca = arena.allocator();
     const text = try ca.alloc(u8, 6 * 128);
     for (0..128) |i| @memcpy(text[i * 6 ..][0..6], "alpha ");
-    const docs = try ca.alloc(local.introducer.TextDocument, 12000);
+    const docs = try ca.alloc(local.introducer.TextDocument, 48000);
     const fields: []const local.introducer.TextField = &.{.{ .field_name = "body", .text = text }};
     for (docs, 0..) |*doc, index| doc.* = .{ .id = try std.fmt.allocPrint(ca, "doc-{d:0>5}", .{index}), .stored_data = "{}", .text_fields = fields };
-    const encoded = try local.storage_db_document_mapper.buildTextSegmentsFromProjectionBatch(ca, .{ .docs = docs }, .{}, .{ .target_segment_bytes = 32 * 1024 * 1024, .target_build_memory_bytes = 64 * 1024 * 1024, .store_document_source = false });
+    const encoded = try local.storage_db_document_mapper.buildTextSegmentsFromProjectionBatch(ca, .{ .docs = docs }, .{}, .{ .target_segment_bytes = 128 * 1024 * 1024, .target_build_memory_bytes = 512 * 1024 * 1024, .store_document_source = false });
     try std.testing.expectEqual(@as(usize, 1), encoded.len);
     try std.testing.expect(encoded[0].len > block_bytes * 4);
     var directory = try local.common_test_directory.TestDirectory.init("seekable-text-large");
@@ -435,14 +501,14 @@ test "external lake native text seeks a common term without reading its position
     defer writer.deinit();
     try writer.addSegmentWithIdData(1, data);
     const snapshot = writer.snapshot();
-    try std.testing.expectEqual(@as(u32, 12000), try snapshot.termDocFreq(a, "body", "alpha"));
+    try std.testing.expectEqual(@as(u32, 48000), try snapshot.termDocFreq(a, "body", "alpha"));
     var inv = (try snapshot.segments[0].reader.invertedIndexScoped(a, "body")).?;
     defer inv.deinit();
     const lookup = (try inv.lookup("alpha")).?;
     var iterator = try lookup.iterator(a);
     defer iterator.deinit();
-    const hit = (try iterator.advanceTo(11999)).?;
-    try std.testing.expectEqual(@as(u32, 11999), hit.doc_id);
+    const hit = (try iterator.advanceTo(47999)).?;
+    try std.testing.expectEqual(@as(u32, 47999), hit.doc_id);
     var touched: usize = 0;
     for (owner.loaded) |loaded| touched += @intFromBool(loaded);
     try std.testing.expect(touched < owner.loaded.len);
@@ -457,7 +523,7 @@ test "external lake native text seeks a common term without reading its position
     var authorized: Read = .{ .store = store, .cache = null, .context = .{ .io = std.testing.io }, .cancellation = .none };
     const bound = try writer.acquireSnapshotWithReadContext(&authorized);
     defer bound.release();
-    try std.testing.expectEqual(@as(u32, 12000), try bound.termDocFreq(a, "body", "alpha"));
+    try std.testing.expectEqual(@as(u32, 48000), try bound.termDocFreq(a, "body", "alpha"));
 }
 
 test "external lake native text prefetch warms bounded authenticated blocks and joins speculative failures" {
@@ -504,10 +570,15 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
         fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
             return error.TestRemoteUnavailable;
         }
+        fn range(_: *anyopaque, _: A, _: []const u8, _: u64, _: usize) ![]u8 {
+            return error.TestRemoteUnavailable;
+        }
     };
     var vtable = store.vtable.*;
     vtable.stat = Denied.stat;
     vtable.stat_with_cancellation = null;
+    vtable.get_range_alloc = Denied.range;
+    vtable.get_range_alloc_with_cancellation = null;
     capability.store.vtable = &vtable;
     source.prefetch(block_bytes * 5, block_bytes);
     query.drain(false);
@@ -519,4 +590,99 @@ test "external lake native text prefetch warms bounded authenticated blocks and 
     open = false;
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().workers);
     try std.testing.expectEqual(@as(usize, 0), local.sql_parallel_scheduler.global().bytes);
+}
+
+test "external lake packed text ranges reduce requests and authenticate sparse reads" {
+    const a = std.testing.allocator;
+    const Fs = @import("../serverless/artifacts/fs_store.zig").FsStore;
+    var directory = try local.common_test_directory.TestDirectory.init("packed-text-ranges");
+    defer directory.cleanup();
+    var fs = try Fs.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(6), 1, std.testing.io);
+    const bytes = try a.alloc(u8, pack_bytes);
+    defer a.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i / 1024);
+    const ref = try publish(a, a, &store, bytes, .none);
+    defer a.free(ref.artifact_id);
+    defer a.free(ref.checksum);
+    const data = try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none }, ref);
+    var source = data.native;
+    defer source.close();
+    const owner: *Owner = @ptrCast(@alignCast(source.ranges.ptr));
+    try std.testing.expectEqual(@as(u16, 3), owner.directory.version);
+    try std.testing.expectEqual(@as(usize, 4), owner.directory.blocks.len);
+    for (owner.directory.blocks) |piece| try std.testing.expectEqualStrings(owner.directory.blocks[0].pack.?.artifact_id, piece.retainedArtifact().artifact_id);
+    const Observed = struct {
+        var reads: usize = 0;
+        var transferred: usize = 0;
+        var corrupt: bool = false;
+        fn range(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, cancellation: Cancellation) ![]u8 {
+            const provider: *Fs = @ptrCast(@alignCast(raw));
+            reads += 1;
+            transferred += len;
+            const result = try provider.getRangeAllocWithCancellation(alloc, id, offset, len, cancellation);
+            if (corrupt and result.len != 0) result[0] ^= 1;
+            return result;
+        }
+    };
+    Observed.reads = 0;
+    Observed.transferred = 0;
+    Observed.corrupt = false;
+    var vtable = store.vtable.*;
+    vtable.get_range_alloc_with_cancellation = Observed.range;
+    var observed = store;
+    observed.vtable = &vtable;
+    const output = try a.alloc(u8, bytes.len);
+    defer a.free(output);
+    try owner.read(.{ .store = observed, .cache = null, .context = .{}, .cancellation = .none }, 0, output);
+    try std.testing.expectEqualSlices(u8, bytes, output);
+    try std.testing.expectEqual(@as(usize, 4), Observed.reads);
+    try std.testing.expectEqual(bytes.len, Observed.transferred);
+    var sample: [1]u8 = undefined;
+    Observed.transferred = 0;
+    try owner.read(.{ .store = observed, .cache = null, .context = .{}, .cancellation = .none }, block_bytes + 17, &sample);
+    try std.testing.expectEqual(@as(usize, block_bytes), Observed.transferred);
+    Observed.corrupt = true;
+    defer Observed.corrupt = false;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, owner.read(.{ .store = observed, .cache = null, .context = .{}, .cancellation = .none }, 0, &sample));
+    var invalid = owner.directory.blocks[0];
+    invalid.pack_offset = pack_bytes;
+    const malformed: Directory = .{ .bytes = block_bytes, .metadata = &.{}, .blocks = &.{invalid}, .terms = &.{} };
+    try std.testing.expectError(error.InvalidNativeLakeTextCorpus, malformed.validate());
+}
+
+test "external lake packed readers retain legacy directory compatibility and resource pressure fallback" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("packed-text-legacy");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(5), 1, std.testing.io);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    const leaf = try upload(ca, &store, "legacy-native-bytes", .none);
+    const legacy: Directory = .{ .version = 2, .bytes = leaf.byte_len, .metadata = &.{}, .blocks = &.{.{ .offset = 0, .ref = leaf }}, .terms = &.{} };
+    const ref = try upload(ca, &store, try std.json.Stringify.valueAlloc(ca, legacy, .{}), .none);
+    const Resources = local.storage_resource_manager;
+    var budgets = Resources.Options.defaultBudgets();
+    budgets[@backingInt(Resources.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
+    var manager = Resources.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(a);
+    const data = try load(a, .{ .store = store, .cache = null, .context = .{}, .cancellation = .none, .resource_manager = &manager }, ref);
+    var physical = data.native;
+    defer physical.close();
+    var capability: Read = .{ .store = store, .cache = null, .context = .{ .io = std.testing.io }, .cancellation = .none };
+    var query = try physical.ranges.bind_read_context.?(physical.ranges.ptr, a, &capability);
+    defer query.close();
+    try std.testing.expect(query.resourceManager() == &manager);
+    var cache = try local.segment_source.ConcurrentBlockCache.init(a, query, 256 * 1024);
+    defer cache.deinit();
+    var sample: [6]u8 = undefined;
+    try cache.readInto(0, &sample);
+    try std.testing.expectEqualStrings("legacy", &sample);
+    try std.testing.expectEqual(@as(usize, 0), cache.retainedBytes());
 }

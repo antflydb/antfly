@@ -27,7 +27,7 @@ const Declared = local.serverless_segment_sidecar_manifest.DeclaredArtifact;
 const Ref = local.serverless_manifest_artifact_ref.ArtifactRef;
 const Cancellation = @import("antfly_cancellation").CancellationToken;
 const A = std.mem.Allocator;
-pub const metadata_version: u16 = 4;
+pub const metadata_version: u16 = 5;
 pub const max_root_bytes = 4 * 1024 * 1024;
 pub const max_segments = 8192;
 pub const FileGroup = struct { file: state.File, segments: []const artifacts.ChunkRef };
@@ -87,6 +87,7 @@ pub const CachedSegments = struct {
     cache: artifacts.CachedRead,
     seekable: bool = false,
     query_owned: bool = false,
+    resource_manager: ?*local.storage_resource_manager.ResourceManager = null,
     pub fn loader(self: *CachedSegments) SegmentLoader {
         return .{ .ptr = self, .load = load };
     }
@@ -112,7 +113,7 @@ pub const CachedSegments = struct {
         const self: *CachedSegments = @ptrCast(@alignCast(raw));
         try cancellation.check();
         if (self.seekable) {
-            const read: @import("lake_index_seekable_text.zig").Read = .{ .store = self.store, .cache = self.cache, .context = self.cache.context, .cancellation = cancellation };
+            const read: @import("lake_index_seekable_text.zig").Read = .{ .store = self.store, .cache = self.cache, .context = self.cache.context, .cancellation = cancellation, .resource_manager = self.resource_manager };
             return if (self.query_owned) @import("lake_index_seekable_text.zig").loadQueryScoped(a, read, ref) else @import("lake_index_seekable_text.zig").load(a, read, ref);
         }
         const Provider = struct {
