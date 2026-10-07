@@ -411,15 +411,24 @@ Conditional scalar reads now use compiler-generated masked Apply producers.
 CASE, COALESCE and boolean short-circuit operators retain SQL NULL truth rules,
 and a producer is not opened until its branch is demanded. Prerequisite values
 are materialized once; binding and authorization still cover every branch.
-The shared PostgreSQL/native fixture checks 22 result contracts and six error
+The shared PostgreSQL/native fixture checks 32 result contracts and nine error
 contracts, including demanded cardinality failures and invalid names in dead
 branches. Mutation tests additionally verify that an unused RETURNING producer
 reads no source rows, a demanded failure publishes no mutations, and unused
-branches do not bypass source authorization. This does not establish aggregate
-FILTER demand, projection demand after WHERE, or distributed concurrent
-snapshot correctness; those remain
-separate validation/implementation work. No original inventory disposition is
-changed by this shared-operator fixture.
+branches do not bypass source authorization. WHERE is lowered before downstream
+producers, with its result retained once for their selected-row demand. Aggregate
+FILTER similarly gates its argument producers, without bypassing validation of
+unused branches. Predicates without downstream subquery consumers retain their
+existing execution path rather than acquiring an unnecessary Apply.
+
+A mixed-demand correlation regression checks 128, 512 and 1,024 target rows:
+captured input rows are exactly twice the target count, with 8,023, 31,958 and
+63,863 execution checkpoints respectively. It checks cross-size linear growth,
+not just physical cursor reads, and allocation-fault injection covers both
+demanded and bypassed producers. These are native fixture work counters, not a
+production latency claim. Post-group HAVING/output and LIMIT demand, and
+distributed concurrent snapshot correctness still need separate work. No
+original inventory disposition is changed by these shared-operator fixtures.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

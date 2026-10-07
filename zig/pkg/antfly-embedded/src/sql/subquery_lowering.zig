@@ -767,6 +767,11 @@ const Builder = struct {
                 var copy = part;
                 const args = try self.alloc.alloc(*const ast.Scalar, part.args.len);
                 var remaining = demand;
+                // FILTER belongs to the aggregate's input-row domain. Its
+                // argument producers must remain unopened for rejected rows,
+                // while the filter itself is evaluated once and remains bound.
+                copy.filter = if (part.filter) |filter| try self.prerequisite(try self.rewriteDemand(filter, demand), demand) else null;
+                if (copy.filter) |filter| remaining = try self.mask(demand, try self.testValue(.is_true, filter));
                 for (part.args, args, 0..) |arg, *out, i| {
                     out.* = try self.rewriteDemand(arg, remaining);
                     if (std.mem.eql(u8, part.name, "coalesce") and i + 1 < args.len) {
@@ -775,7 +780,6 @@ const Builder = struct {
                     }
                 }
                 copy.args = args;
-                copy.filter = if (part.filter) |filter| try self.rewriteDemand(filter, demand) else null;
                 break :blk .{ .call = copy };
             },
             .unary => |part| .{ .unary = .{ .op = part.op, .operand = try self.rewriteDemand(part.operand, demand) } },
@@ -846,24 +850,34 @@ pub fn lower(alloc: Allocator, statement: ast.Select) !ast.Select {
     }
     try aliases(alloc, builder.source, &builder.outer);
     var result = statement;
+    // Resolve the row-selection domain before attaching downstream producers.
+    // Keep the predicate as a hidden, single-evaluation prerequisite: repeating
+    // it in each mask could duplicate expensive or volatile provider work.
+    var demand: ?*const ast.Scalar = null;
+    var consumers = statement;
+    consumers.predicate = null;
+    const needs_row_demand = accepts(consumers);
+    if (statement.predicate) |predicate| {
+        const rewritten = try builder.rewrite(try builder.predicateScalar(predicate));
+        const value = if (needs_row_demand) try builder.prerequisite(rewritten, null) else rewritten;
+        const out = try alloc.create(ast.Predicate);
+        out.* = .{ .scalar = value };
+        result.predicate = out;
+        if (needs_row_demand) demand = try builder.testValue(.is_true, value);
+    }
     const columns = try alloc.dupe(ast.Projection, statement.columns);
     for (columns) |*column| if (column.expression) |value| {
         if (column.alias == null and has(value)) column.alias = if (value.* == .call and value.call.subquery != null and std.mem.eql(u8, value.call.name, "$exists")) "exists" else "?column?";
-        column.expression = try builder.rewrite(value);
+        column.expression = try builder.rewriteDemand(value, demand);
     };
     result.columns = columns;
-    if (statement.predicate) |predicate| {
-        const out = try alloc.create(ast.Predicate);
-        out.* = .{ .scalar = try builder.rewrite(try builder.predicateScalar(predicate)) };
-        result.predicate = out;
-    }
     const groups = try alloc.alloc(*const ast.Scalar, statement.group_by.len);
-    for (statement.group_by, groups) |value, *out| out.* = try builder.rewrite(value);
+    for (statement.group_by, groups) |value, *out| out.* = try builder.rewriteDemand(value, demand);
     result.group_by = groups;
-    result.having = if (statement.having) |value| try builder.rewrite(value) else null;
+    result.having = if (statement.having) |value| try builder.rewriteDemand(value, demand) else null;
     const orders = try alloc.dupe(ast.Order, statement.order_by);
     for (orders) |*order| if (order.expression) |value| {
-        order.expression = try builder.rewrite(value);
+        order.expression = try builder.rewriteDemand(value, demand);
     };
     result.order_by = orders;
     result.source = builder.source;

@@ -378,6 +378,55 @@ test "SQL RETURNING relations unwind allocation faults across capture and prepar
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
+test "SQL masked Apply correlated producers reuse captured inputs under mixed demand" {
+    var previous_count: usize = 0;
+    var previous_work: usize = 0;
+    for ([_]usize{ 128, 512, 1024 }) |count| {
+        var backend: Backend = .{ .returning_mode = true, .row_count = count };
+        var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=n+9,cold='new' RETURNING n,CASE WHEN n%2=0 THEN (SELECT delta FROM source s WHERE s.delta=t.n) ELSE -1 END", .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .result_rows = count, .page_rows = 17 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, count), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 2 * count), backend.rows_read);
+        // Fixed iterator/query setup costs are included. Check multiple sizes so
+        // a source replay per demanded target cannot masquerade as one I/O scan.
+        try std.testing.expect(backend.checkpoints < 80 * count);
+        if (previous_count != 0) try std.testing.expect(backend.checkpoints <= previous_work * count / previous_count + 2 * count);
+        previous_count = count;
+        previous_work = backend.checkpoints;
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        for (result.output.rows, result.output.sql_nulls.?, 0..) |row, flags, i| {
+            const n: i64 = @intCast(i + 10);
+            try std.testing.expectEqual(n, try std.fmt.parseInt(i64, row[0].string, 10));
+            const demanded = @rem(n, 2) == 0;
+            try std.testing.expectEqual(demanded and @rem(n, 10) != 0, flags[1]);
+            if (!flags[1]) try std.testing.expectEqual(if (demanded) n else -1, try std.fmt.parseInt(i64, row[1].string, 10));
+        }
+        std.debug.print("SQL masked Apply: targets={} input_rows={} checkpoints={} peak_bytes={}\n", .{ count, backend.rows_read, backend.checkpoints, result.peakMemoryBytes() });
+    }
+}
+
+test "SQL masked Apply unwinds allocation faults across demanded and bypassed producers" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{ .returning_mode = true };
+            defer {
+                if (backend.captures != backend.closes) @panic("masked Apply capture leaked");
+            }
+            var compiled = try compiler.compile(a, "UPDATE target t SET n=n+9,cold='new' RETURNING n,CASE WHEN n=10 THEN (SELECT delta FROM source s WHERE s.delta=t.n) ELSE -1 END", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+            try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+}
+
 test "SQL target-only mutation subqueries share one captured relational plan" {
     // sql-0068: its EXPLAIN remains dry-run, while these ordinary mutations
     // prove the same source-aware plan executes under one snapshot and commit.
