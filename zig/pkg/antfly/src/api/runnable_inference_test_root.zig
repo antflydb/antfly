@@ -230,3 +230,98 @@ test "broker provider wait releases real capacity and fences swallowed reacquisi
         try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
     }
 }
+
+test "broker submissions park their parent before independent admission and clean rejected outputs" {
+    const controls = @import("inference_execution_control");
+    const Probe = struct {
+        state: *owner_module.State,
+        port: runtime.runnable_abi.Owner,
+        parent: *anyopaque,
+        reject: bool,
+        canceled: std.atomic.Value(bool) = .init(false),
+        calls: usize = 0,
+        fn now() u64 {
+            return 0;
+        }
+        fn requested(raw: ?*const anyopaque) callconv(.c) u8 {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return @intFromBool(self.canceled.load(.acquire));
+        }
+        fn checked(status: runtime.error_abi.Status) !void {
+            if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.checkpoint(self.parent));
+        }
+        fn park(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.park(self.parent, @backingInt(runtime.runnable_abi.Wait.resource)));
+        }
+        fn reenter(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.enter(self.parent, @backingInt(runtime.runnable_abi.Class.query)));
+        }
+        fn release(allocator: std.mem.Allocator, value: []u8) void {
+            allocator.free(value);
+        }
+        fn execute(raw: *anyopaque, items: []const inference.microbatch.ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const stats = self.state.owner.scheduler.stats();
+            std.debug.assert(stats.runnable_slots == 1 and stats.resource_blocked == 1 and stats.operations == 2);
+            (controls.InferenceExecutionControl{}).check() catch @panic("independent child checkpoint failed");
+            for (items) |item| {
+                const value = item.allocator.dupe(u8, "owned") catch |err| {
+                    item.slot.fail(err);
+                    continue;
+                };
+                item.slot.setOwnedValue([]u8, value, .native_batch, item.allocator, release);
+            }
+            self.canceled.store(self.reject, .release);
+        }
+    };
+    for ([_]bool{ false, true }) |reject| for ([_]bool{ false, true }) |native| {
+        var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 2 }), .native_now_ns = Probe.now };
+        defer state.owner.tryDeinit() catch @panic("owner leaked");
+        const port = state.port();
+        var lease = try runtime.runnable_abi.Lease.init(port);
+        defer lease.deinit();
+        const io = std.testing.io;
+        const borrow = runtime.native_abi.IoBorrow.init(&io);
+        var probe = Probe{ .state = &state, .port = port, .parent = undefined, .reject = reject };
+        var parent: ?*anyopaque = null;
+        try Probe.checked(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .retained_bytes = 71, .cancellation = .{ .context = &probe, .is_cancelled = Probe.requested }, .out_handle = &parent }));
+        defer port.finish(parent.?);
+        probe.parent = parent.?;
+        var scope = controls.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.park, .wait_end_fn = Probe.reenter });
+        defer scope.deinit();
+        var provider = try inference.Provider.init(std.testing.allocator, port);
+        var broker = inference.microbatch.Broker.initWithAdmission(std.testing.allocator, provider.admission());
+        defer broker.deinit();
+        const key = inference.microbatch.Key{ .model = "owned", .task = .embed, .resource_class = .cpu };
+        if (native) {
+            const values = [_]usize{ 1, 2 };
+            const results = try broker.submitBatchControlled(usize, []u8, io, std.testing.allocator, key, .{ .mode = .native, .preferred_items = 2, .max_items = 2 }, &.{ .{}, .{} }, &.{ .{}, .{} }, null, .{}, &values, &probe, Probe.execute);
+            defer std.testing.allocator.free(results);
+            for (results) |result| {
+                if (reject) try std.testing.expectEqual(error.Canceled, result.result.item_error.cause) else {
+                    try std.testing.expectEqualStrings("owned", result.result.value);
+                    std.testing.allocator.free(result.result.value);
+                }
+            }
+        } else {
+            const payload: usize = 1;
+            const result = try broker.submit(usize, []u8, io, std.testing.allocator, key, .{ .mode = .serial_compatibility, .preferred_items = 1, .max_items = 1 }, .{}, .{}, null, null, &payload, &probe, Probe.execute);
+            if (reject) try std.testing.expectEqual(error.Canceled, result.result.item_error.cause) else {
+                try std.testing.expectEqualStrings("owned", result.result.value);
+                std.testing.allocator.free(result.result.value);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        // Failed reacquisition retires the scheduler entry; the owning C
+        // capsule remains joined and is released by its original caller.
+        try std.testing.expectEqual(@as(usize, if (reject) 0 else 1), state.owner.scheduler.stats().operations);
+        try std.testing.expectEqual(@as(usize, if (reject) 0 else 1), state.owner.scheduler.stats().runnable_slots);
+    };
+}

@@ -413,6 +413,10 @@ pub const ExecutionAdmission = struct {
     /// Final owning-worker fence after the callback, before callers can take
     /// results. A rejected grant must dispose all owned published values.
     checkpoint: ?*const fn (*anyopaque, *anyopaque) anyerror!void = null,
+    /// Park each synchronous caller before enrollment or independent admission.
+    /// Resume only after all borrowed tickets have joined, outside shard locks.
+    caller_wait_begin: ?*const fn (*anyopaque) anyerror!*anyopaque = null,
+    caller_wait_end: ?*const fn (*anyopaque, *anyopaque) anyerror!void = null,
 };
 
 const TicketState = enum { queued, executing, complete };
@@ -625,6 +629,24 @@ pub const Broker = struct {
         return .{ .allocator = allocator, .admission = admission };
     }
 
+    const CallerWait = struct {
+        admission: ?ExecutionAdmission = null,
+        handle: ?*anyopaque = null,
+        fn finish(self: *CallerWait) !void {
+            const handle = self.handle orelse return;
+            self.handle = null;
+            const admission = self.admission.?;
+            try admission.caller_wait_end.?(admission.context, handle);
+        }
+    };
+
+    fn parkCaller(self: *Broker) !CallerWait {
+        const admission = self.admission orelse return .{};
+        const begin = admission.caller_wait_begin orelse return .{};
+        std.debug.assert(admission.caller_wait_end != null);
+        return .{ .admission = admission, .handle = try begin(admission.context) };
+    }
+
     fn execute(self: *Broker, io: std.Io, key: Key, retained_bytes: usize, items: []const ExecuteItem, context: *anyopaque, callback: ExecuteFn) void {
         const admission = self.admission orelse {
             self.executeAndFence(items, context, callback, null, null);
@@ -771,6 +793,9 @@ pub const Broker = struct {
             .cancel_requested = &ticket.cancel_requested,
         };
 
+        var caller_wait = self.parkCaller() catch |err| return resultError(Output, identity, err);
+        defer caller_wait.finish() catch {};
+
         // Serial compatibility is deliberately not queued: accepting a batch
         // envelope is not evidence that the underlying model fuses work.
         if (limits.mode != .native or limits.max_items == 1) {
@@ -780,6 +805,7 @@ pub const Broker = struct {
             shard.mutex.lockUncancelable(io);
             shard.stats.bypass_items +|= 1;
             shard.mutex.unlock(io);
+            caller_wait.finish() catch |err| slot.fail(err);
             return takeResult(Output, identity, &output, slot);
         }
 
@@ -795,6 +821,7 @@ pub const Broker = struct {
             self.executeGroup(io, shard, queued.group);
         } else waitForTicket(io, &ticket);
 
+        caller_wait.finish() catch |err| slot.fail(err);
         // Typed execution owns result disposal; never discard an owned Output
         // merely because cancellation raced completion.
         return takeResult(Output, identity, &output, slot);
@@ -950,6 +977,11 @@ pub const Broker = struct {
                     continue;
                 };
             }
+            var caller_wait = self.parkCaller() catch |err| {
+                for (results[start..], identities[start..]) |*result, identity| result.* = resultError(Output, identity, err);
+                return results;
+            };
+            defer caller_wait.finish() catch {};
             shard.mutex.lockUncancelable(io);
             for (0..count) |offset| {
                 const slot = &slots[offset];
@@ -971,9 +1003,18 @@ pub const Broker = struct {
             };
             for (0..count) |offset| {
                 if (enqueued[offset]) |queued| if (!queued.leader) waitForTicket(io, &tickets[offset]);
-                results[start + offset] = takeResult(Output, identities[start + offset], &outputs[offset], slots[offset]);
             }
+            var resume_error: ?anyerror = null;
+            caller_wait.finish() catch |err| {
+                resume_error = err;
+                for (slots[0..count]) |*slot| slot.fail(err);
+            };
+            for (0..count) |offset| results[start + offset] = takeResult(Output, identities[start + offset], &outputs[offset], slots[offset]);
             start += count;
+            if (resume_error) |err| {
+                for (results[start..], identities[start..]) |*result, identity| result.* = resultError(Output, identity, err);
+                return results;
+            }
         }
         return results;
     }

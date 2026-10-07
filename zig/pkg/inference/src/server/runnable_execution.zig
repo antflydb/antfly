@@ -21,7 +21,7 @@ pub const Provider = struct {
     }
 
     pub fn admission(self: *Provider) broker.ExecutionAdmission {
-        return .{ .context = self, .begin = begin, .finish = finish, .checkpoint = checkpoint };
+        return .{ .context = self, .begin = begin, .finish = finish, .checkpoint = checkpoint, .caller_wait_begin = beginCallerWait, .caller_wait_end = endCallerWait };
     }
 
     const Invocation = struct {
@@ -77,6 +77,21 @@ pub const Provider = struct {
             .wait_end_fn = enterInvocation,
         });
         return invocation;
+    }
+
+    fn beginCallerWait(raw: *anyopaque) !*anyopaque {
+        const self: *Provider = @ptrCast(@alignCast(raw));
+        const wait = try self.allocator.create(execution_control.ResourceWait);
+        errdefer self.allocator.destroy(wait);
+        wait.* = try execution_control.ResourceWait.init();
+        return wait;
+    }
+
+    fn endCallerWait(raw: *anyopaque, handle: *anyopaque) !void {
+        const self: *Provider = @ptrCast(@alignCast(raw));
+        const wait: *execution_control.ResourceWait = @ptrCast(@alignCast(handle));
+        defer self.allocator.destroy(wait);
+        try wait.finish();
     }
 
     fn checked(status: runtime.error_abi.Status) !void {
