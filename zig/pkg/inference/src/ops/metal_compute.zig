@@ -26507,7 +26507,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 // final norm and LM-head in the planned encoder, then let the
                 // resident nucleus tail own the remaining encoder sequence.
                 var logits_tail_contract = planned_tail_contract;
-                const terminal_argmax: u16 = @intFromEnum(metal_command_planner.OpKind.tail_argmax);
+                const terminal_argmax: u16 = @backingInt(metal_command_planner.OpKind.tail_argmax);
                 if (logits_tail_contract.ops.len == 0 or
                     logits_tail_contract.ops.len != logits_tail_contract.barriers.len or
                     logits_tail_contract.ops.len != logits_tail_contract.quant_dispatches.len or
