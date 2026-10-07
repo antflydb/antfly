@@ -551,6 +551,15 @@ pub fn runArrayExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
 
 pub fn runReference(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
     const discovery = try std.testing.environ.containsUnempty(alloc, "ANTFLY_SQL_READ_DISCOVERY");
+    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, discovery);
+}
+
+/// Evidence gates must fail closed even in a discovery-configured shell.
+pub fn runReferenceStrict(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {
+    return runReferenceWithDiscovery(alloc, handler, case_ids, reference_bytes, false);
+}
+
+fn runReferenceWithDiscovery(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8, discovery: bool) !void {
     var corpus = try fixtures.Corpus.init(alloc);
     defer corpus.deinit();
     const reference = try std.json.parseFromSlice(Reference, alloc, reference_bytes, .{ .ignore_unknown_fields = true });

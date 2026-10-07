@@ -82,6 +82,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlCannotCoerce => .{ .code = "42846", .message = "The source type cannot be cast to the requested type.", .hint = "Use compatible builtin types or an explicit intermediate conversion." },
         error.SqlUndefinedOperator => .{ .code = "42883", .message = "No operator matches the operand types.", .hint = "Use explicit casts to compatible operand types." },
         error.SqlInvalidEscapeSequence => .{ .code = "22025", .message = "A pattern ends with an escape character.", .hint = "Escape the final backslash or supply a complete pattern." },
+        error.SqlInvalidEscapeString => .{ .code = "22025", .message = "Escape string must be empty or one character." },
         error.SqlArraySubscriptError => .{ .code = "2202E", .message = "Array dimensions or bounds do not match.", .hint = "Use valid bounds and rectangular subarrays with matching dimensions." },
         error.SqlArrayConstructorTypeMismatch => .{ .code = "42804", .message = "Array constructor element types cannot be matched.", .hint = "Use compatible scalar elements or compatible subarrays." },
         error.SqlInvalidTextRepresentation => .{ .code = "22P02", .message = "A value has invalid input syntax for the requested type.", .hint = "Check the value and the target type." },

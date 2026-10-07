@@ -165,3 +165,47 @@ test "SQL LATERAL shares captured child scans and hash builds across parents" {
     try std.testing.expectError(error.QueryCanceled, runtime.execute(std.testing.allocator, canceled.backend(), &compiled, &.{}, .{}));
     try std.testing.expectEqual(canceled.captures, canceled.closes);
 }
+
+test "SQL LATERAL original campaign binds every source expression" {
+    const fixtures = @import("antfly_local_sources").sql_parity_fixtures;
+    const Schema = struct {
+        fn resolve(_: *anyopaque, _: A, name: @import("antfly_local_sources").sql_ast.Name, _: catalog.Action) !catalog.Table {
+            if (!std.mem.eql(u8, name.table, "usage_records") and !std.mem.eql(u8, name.table, "balance_records")) return error.TableNotFound;
+            return .{ .id = if (std.mem.eql(u8, name.table, "usage_records")) 7 else 8, .physical_name = name.table, .schema_version = 1, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .string },
+                .{ .name = "organization_id", .path = "organization_id", .type = .string },
+                .{ .name = "name", .path = "name", .type = .string },
+                .{ .name = "kind", .path = "kind", .type = .string },
+                .{ .name = "status", .path = "status", .type = .string },
+                .{ .name = "scope", .path = "scope", .type = .string },
+                .{ .name = "created_at", .path = "created_at", .type = .string },
+                .{ .name = "amount", .path = "amount", .type = .integer },
+                .{ .name = "enabled", .path = "enabled", .type = .boolean },
+                .{ .name = "metadata", .path = "metadata", .type = .json },
+            } };
+        }
+    };
+    const a = std.testing.allocator;
+    var corpus = try fixtures.Corpus.init(a);
+    defer corpus.deinit();
+    const reference = try std.json.parseFromSlice(struct { entries: []const struct { id: []const u8 } }, a, fixtures.lateral_campaign_reference, .{ .ignore_unknown_fields = true });
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(usize, 23), reference.value.entries.len);
+    const backend: catalog.Backend = .{ .ptr = undefined, .vtable = &.{ .resolve = Schema.resolve, .scan = Backend.scan, .mutate = Backend.mutate, .checkpoint = Backend.checkpoint } };
+    for (reference.value.entries) |entry| {
+        const case = try corpus.get(entry.id);
+        var compiled = compiler.compile(a, case.sql, .{}) catch |err| {
+            std.debug.print("LATERAL original {s}: compile {s}\n", .{ case.id, @errorName(err) });
+            return err;
+        };
+        defer compiled.deinit();
+        var description = @import("antfly_local_sources").sql_describe.describe(a, backend, &compiled, &.{}) catch |err| {
+            std.debug.print("LATERAL original {s}: bind {s}\n", .{ case.id, @errorName(err) });
+            return err;
+        };
+        defer description.deinit();
+    }
+    var invalid = try compiler.compile(a, (try corpus.get("sql-1357")).sql, .{});
+    defer invalid.deinit();
+    try std.testing.expectError(error.UndefinedColumn, @import("antfly_local_sources").sql_describe.describe(a, backend, &invalid, &.{}));
+}

@@ -2,6 +2,21 @@
   "ledger_format": 1,
   "inventory_sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
   "gates": {
+    "sql-lateral-original-public": {
+      "command": ["zig", "build", "public-api-parity-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=httpx SQL LATERAL original campaign"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
+    "sql-lateral-postgres-reference": {
+      "command": ["uv", "run", "--no-project", "--with", "psycopg[binary]==3.3.6", "python", "scripts/generate_sql_postgres_reference.py", "lateral", "--check", "zig/pkg/antfly-embedded/src/sql/fixtures/sql_lateral_campaign_reference.json"],
+      "cwd": ".",
+      "timeout_seconds": 120
+    },
+    "sql-lateral-native-contracts": {
+      "command": ["zig", "build", "sql-test", "--cache-dir", ".zig-cache/sql-parity-evidence", "-Dtest-filter=SQL LATERAL"],
+      "cwd": "zig",
+      "timeout_seconds": 600
+    },
     "sql-postgres-text-reference": {
       "command": [
         "uv",
@@ -5480,8 +5495,30 @@
     },
     {
       "id": "sql-0549",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-0550",
@@ -11022,13 +11059,57 @@
     },
     {
       "id": "sql-1217",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1218",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1219",
@@ -12005,108 +12086,565 @@
     },
     {
       "id": "sql-1345",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1346",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1347",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1348",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1349",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1350",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1351",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1352",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1353",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1354",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1355",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1356",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1357",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The historical positive contract is invalid under the PostgreSQL standard: output aliases cannot be referenced inside ORDER BY arithmetic expressions. PostgreSQL rejects the exact original with SQLSTATE 42703; the mounted native endpoint rejects it with the same code before capturing table rows. No successful execution is claimed.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        }
+      ]
     },
     {
       "id": "sql-1358",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1359",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1360",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1361",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1362",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1363",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1364",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1365",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original SQL and logical parameters execute through the strict mounted HTTP gate over captured native relational tables. PostgreSQL independently checks complete results, column labels/types and SQL NULL provenance; nonunique LIMIT ordering uses the complete eligible peer frontier. The fixture exercises matched and unmatched parents, per-parent ordering and row limits, residual predicates and nullable inputs without claiming distributed snapshot activation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-original-public"
+        },
+        {
+          "path": "zig/pkg/antfly/src/sql/lateral_test.zig",
+          "test": "SQL LATERAL original campaign binds every source expression",
+          "gate": "sql-lateral-native-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-postgres-oracle-contracts"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/httpx_handler.zig",
+          "test": "httpx SQL LATERAL original campaign executes captured native table relations",
+          "gate": "sql-lateral-postgres-reference"
+        }
+      ]
     },
     {
       "id": "sql-1366",

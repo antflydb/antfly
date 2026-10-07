@@ -69,6 +69,23 @@ class PostgresReferenceTest(unittest.TestCase):
     def case(self, sql, params=()):
         return {"id": "sql-0001", "sql": sql, "params": params}
 
+    def test_like_explicit_escape_contracts(self):
+        cases = [
+            ("'bot_agent' LIKE 'bot!_%' ESCAPE '!'", True),
+            ("'bot_agent' NOT LIKE 'bot!_%' ESCAPE '!'", False),
+            ("'BOT_agent' ILIKE 'bot!_%' ESCAPE '!'", True),
+            ("'a_b' LIKE 'aé_b' ESCAPE 'é'", True),
+            ("'a%b' LIKE 'a%%b' ESCAPE '%'", True),
+            ("'a_b' LIKE 'a__b' ESCAPE '_'", True),
+            ("'a!xb' LIKE 'a!_b' ESCAPE ''", True),
+            ("'a' LIKE 'a' ESCAPE NULL", None),
+        ]
+        for expression, expected in cases:
+            with self.subTest(expression=expression):
+                self.assertEqual(
+                    self.db.execute("SELECT " + expression).fetchone()[0], expected
+                )
+
     def profile(self):
         return {
             "schema": {
@@ -135,6 +152,74 @@ class PostgresReferenceTest(unittest.TestCase):
                 "ORDER BY e.dst DESC LIMIT 1 OFFSET 1) l ON true ORDER BY p.n"
             ).fetchall()
             self.assertEqual([(n, n * 10) for n in range(1, 129)], rows)
+
+    def test_original_lateral_campaign_and_postgres_alias_scope(self):
+        import json
+        from pathlib import Path
+        import psycopg
+        from generate_sql_postgres_reference import create_table, properties
+
+        fixtures = (
+            Path(__file__).resolve().parents[1]
+            / "zig/pkg/antfly-embedded/src/sql/fixtures"
+        )
+        profile = json.loads(
+            (fixtures / "sql_lateral_campaign_profile.json").read_text()
+        )
+        self.assertEqual(1, len(profile["additional_tables"]))
+        self.assertEqual("balance_records", profile["additional_tables"][0]["name"])
+        self.assertEqual(profile["schema"], profile["additional_tables"][0]["schema"])
+        inventory = json.loads((fixtures / "sql_parity_inventory.json").read_text())[
+            "entries"
+        ]
+        cases = [
+            case
+            for case in inventory
+            if "sql-1345" <= case["id"] <= "sql-1365"
+            or case["id"] in {"sql-0549", "sql-1217", "sql-1218"}
+        ]
+        self.assertEqual(24, len(cases))
+        result = read_reference(self.db, cases, profile)
+        self.assertEqual(23, len(result["entries"]))
+        self.assertEqual(["sql-1357"], [case["id"] for case in result["excluded"]])
+        self.assertTrue(all(case["rows"] for case in result["entries"]))
+        # LIMIT must not make an all-unmatched result a vacuous proof of the
+        # inner predicate. Every two-column original exposes a real match.
+        for case in result["entries"]:
+            if len(case["columns"]) == 2:
+                self.assertTrue(
+                    any(not flags[1] for flags in case["sql_nulls"]), case["id"]
+                )
+        with self.db.transaction(force_rollback=True):
+            create_table(
+                self.db, "usage_records", properties(profile["schema"]), profile["rows"]
+            )
+            invalid = next(case for case in cases if case["id"] == "sql-1357")
+            with self.assertRaises(psycopg.errors.UndefinedColumn) as error:
+                with self.db.transaction(force_rollback=True):
+                    self.db.execute(invalid["sql"])
+            self.assertEqual("42703", error.exception.sqlstate)
+
+    def test_json_and_typed_array_containment_reference(self):
+        import json
+        from pathlib import Path
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_containment_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(30, len(fixture["entries"]))
+        for case in fixture["entries"]:
+            with (
+                self.subTest(sql=case["sql"]),
+                self.db.transaction(force_rollback=True),
+            ):
+                self.assertEqual(
+                    case["value"],
+                    self.db.execute("SELECT " + case["sql"]).fetchone()[0],
+                )
 
     def test_typed_array_quantifiers_against_exact_postgres_sql(self):
         import json

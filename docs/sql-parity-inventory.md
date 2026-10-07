@@ -205,8 +205,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 331 implemented, 136 rejected and 67 superseded
-cases, with 1,052 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 354 implemented, 136 rejected and 68 superseded
+cases, with 1,028 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 117 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
@@ -219,16 +219,16 @@ positive contracts. Native execution checks full persisted state as well as
 public results. Five recorded gates verify mounted execution, both PostgreSQL
 references, oracle safety/ordering contracts and pipeline allocation-fault
 regressions. This is a validated batch, not completion of either entire campaign;
-getting below 800 now requires at least 253 additional resolved dispositions.
+getting below 800 now requires at least 229 additional resolved dispositions.
 
 Eight further original cases (`sql-0220`–`sql-0222`, `sql-0284`, `sql-0302`,
 `sql-1226`, `sql-1227` and `sql-1340`) now execute typed array predicates through
 reads, aggregate FILTER and a left join. The PostgreSQL read campaign contains
 68 exact contracts, with peer-frontier checks for the new non-unique aggregate
-and timestamp ordering. `sql-1363` remains an unresolved candidate: its LATERAL
-relation needs correlated derived-table binding and a parameterized apply
-operator with per-parent ORDER/LIMIT and left-null-extension semantics; scalar
-pattern support alone does not activate that relation shape.
+and timestamp ordering. The separate LATERAL campaign now activates `sql-1363`
+through correlated derived-table binding and a parameterized apply operator with
+per-parent ORDER/LIMIT and left-null-extension semantics; scalar pattern support
+alone would not activate that relation shape.
 
 Six additional read contracts exercise PostgreSQL text slicing and replacement
 through the native endpoint. The text oracle independently verifies 54 UTF-8,
@@ -275,8 +275,28 @@ qualified parent wildcards, nested correlation, CTE visibility, parameter
 inference, allocation failures and cancellation cleanup. A captured 256-row child
 relation supplies 128 parents with per-parent ordered LIMIT/OFFSET under a linear
 checkpoint budget; its output is independently verified against PostgreSQL.
-These component contracts do not yet constitute exact-original public API and
-storage evidence for the LATERAL inventory cases, which remain unresolved.
+The strict public API campaign additionally executes 23 unchanged originals
+(`sql-0549`, `sql-1217`, `sql-1218` and `sql-1345`–`sql-1365`, except `sql-1357`)
+against captured native tables. PostgreSQL checks complete results, types,
+labels, SQL NULL provenance and the full eligible ordering frontier where LIMIT
+can select peers. The fixture includes matched and unmatched parents, nullable
+filters, per-parent OFFSET and two separately captured native tables. It is
+not evidence of distributed snapshot coordination: both fixture databases stay
+immutable for each run. Original `sql-1357` is superseded, not implemented:
+PostgreSQL rejects its output-alias arithmetic in ORDER BY with SQLSTATE 42703,
+and the mounted native endpoint rejects the exact query before opening a read.
+
+Scalar JSONB existence and containment now operate directly on logical values,
+with bounded recursive work and no serialization. Typed-array containment uses
+the shared membership index; constant operands prepare immutable indexes once,
+while dynamic construction and probes share the statement work budget.
+`string_to_array` uses bounded linear-time delimiter matching, preserves empty
+fields and SQL NULL elements, and owns its typed result. Thirty additional
+PostgreSQL scalar contracts check these operations. Explicit LIKE/ILIKE ESCAPE
+supports empty and single-codepoint escape strings without allocating a rewritten
+pattern. A local debug containment probe evaluated 10,000 rows in approximately
+10 ms with zero row allocations; this is a microbenchmark, not a production
+latency claim or independent evidence of public array-column activation.
 
 The mutation fixture verifies complete RETURNING rows and labels, SQL NULL
 provenance, affected rows, persisted state and untouched rows. A failed RETURNING

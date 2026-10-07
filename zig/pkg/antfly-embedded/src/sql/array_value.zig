@@ -538,7 +538,12 @@ pub const Membership = struct {
     first_null: ?usize = null,
 
     pub fn init(backing: Allocator, value: Value, limits: Limits) !Membership {
-        const validated = try Value.init(value.element_type, value.dimensions, value.elements, limits);
+        var work: Budget = .{ .remaining = limits.work };
+        return initWithBudget(backing, value, limits, &work);
+    }
+
+    pub fn initWithBudget(backing: Allocator, value: Value, limits: Limits, work: *Budget) !Membership {
+        const validated = try Value.initWithBudget(value.element_type, value.dimensions, value.elements, limits, work);
         const budget = try backing.create(MemoryBudget);
         errdefer backing.destroy(budget);
         budget.* = .{ .backing = backing, .limit = limits.bytes };
@@ -549,14 +554,13 @@ pub const Membership = struct {
         const a = budget.allocator();
         errdefer index.heads.deinit(a);
         errdefer index.entries.deinit(a);
-        var work: Budget = .{ .remaining = limits.work };
         for (value.elements, 0..) |element, ordinal| {
             if (element.sql_null) {
                 if (index.first_null == null) index.first_null = ordinal;
                 continue;
             }
-            const hash = try hashElement(value.element_type, element, &work);
-            if (try index.find(element, hash, &work) != null) continue;
+            const hash = try hashElement(value.element_type, element, work);
+            if (try index.find(element, hash, work) != null) continue;
             const slot = index.entries.items.len;
             const entry: Entry = .{ .ordinal = ordinal, .next = index.heads.get(hash) };
             index.entries.append(a, entry) catch |err| return allocationError(budget, err);

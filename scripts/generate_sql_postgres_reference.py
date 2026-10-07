@@ -304,15 +304,30 @@ def read_reference(db, cases, profile):
         create_table(
             db, "usage_records", properties(profile["schema"]), profile["rows"]
         )
+        for table in profile.get("additional_tables", []):
+            create_table(db, table["name"], properties(table["schema"]), table["rows"])
         for case in cases:
             try:
                 with db.transaction(force_rollback=True):
                     db.execute("SET TRANSACTION READ ONLY")
                     entry = execute(db, case, read=True)
-                    if case["id"] in ORDER_OBSERVERS:
-                        observer = execute(
-                            db, {**case, "sql": ORDER_OBSERVERS[case["id"]]}, read=True
-                        )
+                    observer_sql = ORDER_OBSERVERS.get(case["id"])
+                    if "sql-1345" <= case["id"] <= "sql-1365":
+                        # These originals sort by their projected amount. The
+                        # observer exposes the full peer frontier, not a second
+                        # arbitrary LIMIT selection. Source execution above is
+                        # unchanged; OFFSET cases have unique fixture keys.
+                        if case["id"] in {"sql-1358", "sql-1359", "sql-1365"}:
+                            observer_sql, count = re.subn(r" LIMIT 5$", "", case["sql"])
+                            if count != 1:
+                                raise ValueError("lateral observer shape changed")
+                            observer_sql = observer_sql.replace(
+                                "latest.amount AS latest_amount FROM",
+                                "latest.amount AS latest_amount, latest.amount AS order_key FROM",
+                                1,
+                            )
+                    if observer_sql:
+                        observer = execute(db, {**case, "sql": observer_sql}, read=True)
                         groups = []
                         key = object()
                         for row, nulls in zip(
@@ -460,7 +475,7 @@ def document_reference(db, cases, schemas):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("campaign", choices=["read", "document"])
+    parser.add_argument("campaign", choices=["read", "document", "lateral"])
     parser.add_argument(
         "--check",
         type=Path,
@@ -486,9 +501,9 @@ def main():
     ]
     cases = [case for case in inventory if case["id"] in set(requested)]
     with postgres() as db:
-        if args.campaign == "read":
+        if args.campaign in {"read", "lateral"}:
             profile = json.loads(
-                (FIXTURES / "sql_read_campaign_profile.json").read_text()
+                (FIXTURES / f"sql_{args.campaign}_campaign_profile.json").read_text()
             )
             result = read_reference(db, cases, profile)
         else:

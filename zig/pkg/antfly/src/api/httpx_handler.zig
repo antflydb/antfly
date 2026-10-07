@@ -13081,6 +13081,151 @@ test "httpx SQL document campaign verifies exact native mutation and storage out
     try parity.runDocuments(alloc, &handler, &db, &source, reference.value);
 }
 
+test "httpx SQL LATERAL original campaign executes captured native table relations" {
+    // Also sql-0549 (set-operation apply), sql-1217 and sql-1218.
+    // Exact source IDs, not rewritten SQL: sql-1345, sql-1346, sql-1347,
+    // sql-1348, sql-1349, sql-1350, sql-1351, sql-1352, sql-1353, sql-1354,
+    // sql-1355, sql-1356, sql-1358, sql-1359, sql-1360, sql-1361, sql-1362,
+    // sql-1363, sql-1364, sql-1365. sql-1357 is invalid in PostgreSQL: output
+    // aliases are not input variables inside an ORDER BY arithmetic expression.
+    const alloc = std.testing.allocator;
+    const native = @import("antfly_local_sources").api_table_read_source;
+    const Row = struct { key: []const u8, value: std.json.Value };
+    const Table = struct { name: []const u8, schema: std.json.Value, rows: []const Row };
+    const reference_bytes = @import("antfly_local_sources").sql_parity_fixtures.lateral_campaign_reference;
+    const parsed = try std.json.parseFromSlice(struct {
+        profile: struct { schema: std.json.Value, rows: []const Row, additional_tables: []const Table },
+        entries: []const struct { id: []const u8 },
+    }, alloc, reference_bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 23), parsed.value.entries.len);
+    const schema = try std.json.Stringify.valueAlloc(alloc, parsed.value.profile.schema, .{});
+    defer alloc.free(schema);
+    const Source = struct {
+        schema: []const u8,
+        reads: [2]table_reads.BoundTableReadSource,
+        captures: usize = 0,
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{} };
+        }
+        fn catalog(ptr: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            if (input == .policy_publication_status) return a.dupe(u8, "null");
+            if (input != .resolve_many) return error.UnexpectedCatalogCall;
+            if (input.resolve_many.expected_revision) |revision| if (revision != 7) return error.CatalogGenerationChanged;
+            if (input.resolve_many.storage_names.len != 0) {
+                const names = try a.alloc(?[]const u8, input.resolve_many.storage_names.len);
+                @memset(names, null);
+                defer {
+                    for (names) |name| if (name) |value| a.free(value);
+                    a.free(names);
+                }
+                for (input.resolve_many.storage_names, names) |name, *logical| logical.* = try (system_catalog.Target{ .table = name }).resourceNameAlloc(a);
+                return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = &.{}, .logical_names = names }, .{});
+            }
+            const tables = try a.alloc(?system_catalog.ResolvedTable, input.resolve_many.targets.len);
+            defer a.free(tables);
+            for (input.resolve_many.targets, tables) |target, *table| {
+                const id: u64 = if (std.mem.eql(u8, target.table, "usage_records")) 7 else if (std.mem.eql(u8, target.table, "balance_records")) 8 else return error.TableNotFound;
+                table.* = .{ .table_id = id, .name = target.table, .query_definition = if (input.resolve_many.include_query_definitions) .{ .table_id = id, .schema_json = self.schema, .read_schema_json = "", .indexes_json = "{}" } else null };
+            }
+            return std.json.Stringify.valueAlloc(a, system_catalog.ResolvedMany{ .revision = 7, .tables = tables }, .{});
+        }
+        const Capture = struct {
+            alloc: std.mem.Allocator,
+            views: []native.RelationalReadView,
+            owners: [2]?native.RelationalStatementRead = @splat(null),
+            fn close(ptr: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                for (self.owners) |owner| if (owner) |read| read.deinit();
+                self.alloc.free(self.views);
+                self.alloc.destroy(self);
+            }
+        };
+        fn open(ptr: *anyopaque, a: std.mem.Allocator, scans: []const native.RelationalStatementScan, consistency: raft_mod.ReadConsistency) !native.RelationalStatementRead {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            for (scans) |request_scan| if (!std.mem.eql(u8, request_scan.table, "usage_records") and !std.mem.eql(u8, request_scan.table, "balance_records")) return error.TableNotFound;
+            const retained = try a.create(Capture);
+            errdefer a.destroy(retained);
+            const views = try a.alloc(native.RelationalReadView, scans.len);
+            errdefer a.free(views);
+            retained.* = .{ .alloc = a, .views = views };
+            errdefer for (retained.owners) |owner| if (owner) |read| read.deinit();
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (&self.reads, &retained.owners) |*read, *owner| {
+                var grouped: std.ArrayList(native.RelationalStatementScan) = .empty;
+                var ordinals: std.ArrayList(usize) = .empty;
+                for (scans, 0..) |request_scan, i| if (std.mem.eql(u8, request_scan.table, read.table_name)) {
+                    try grouped.append(scratch.allocator(), request_scan);
+                    try ordinals.append(scratch.allocator(), i);
+                };
+                if (grouped.items.len == 0) continue;
+                owner.* = try read.source().openRelationalStatement(a, grouped.items, consistency);
+                for (ordinals.items, owner.*.?.views) |i, view| views[i] = view;
+            }
+            self.captures += 1;
+            return .{ .ptr = retained, .views = views, .vtable = &.{ .close = Capture.close } };
+        }
+        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) !?table_reads.LookupResponse {
+            return error.UnexpectedFallbackRead;
+        }
+        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) !?table_reads.ScanResponse {
+            return error.UnexpectedFallbackRead;
+        }
+        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) !?query_api.QueryResponse {
+            return error.UnexpectedFallbackRead;
+        }
+    };
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("sql-lateral-originals");
+    defer directory.cleanup();
+    const secondary_path = try std.fmt.allocPrint(alloc, "{s}/balances", .{directory.path()});
+    defer alloc.free(secondary_path);
+    var db = try db_mod.DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    var secondary = try db_mod.DB.open(alloc, secondary_path, .{});
+    defer secondary.close();
+    for ([_]*db_mod.DB{ &db, &secondary }, [_][]const Row{ parsed.value.profile.rows, parsed.value.profile.additional_tables[0].rows }) |database, rows| {
+        try database.setSchemaJson(alloc, schema);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const writes = try arena.allocator().alloc(db_mod.types.BatchWrite, rows.len);
+        for (rows, writes) |row, *write| write.* = .{ .key = row.key, .value = try std.json.Stringify.valueAlloc(arena.allocator(), row.value, .{}) };
+        try database.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    }
+    // Both databases remain immutable throughout this fixture. This test-only
+    // router exercises grouped native capture, not distributed cut guarantees.
+    var source: Source = .{ .schema = schema, .reads = .{ table_reads.BoundTableReadSource.init("usage_records", 7, &db, raft_mod.read_gate.alreadyReadSafeBarrier()), table_reads.BoundTableReadSource.init("balance_records", 8, &secondary, raft_mod.read_gate.alreadyReadSafeBarrier()) } };
+    var backend_runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer backend_runtime.deinit();
+    var server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .supports_query_definitions = true } }, .{ .ptr = &source, .vtable = &.{ .lookup = Source.lookup, .scan = Source.scan, .query = Source.query, .open_relational_statement = Source.open } }, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    const ids = try alloc.alloc([]const u8, parsed.value.entries.len);
+    defer alloc.free(ids);
+    for (parsed.value.entries, ids) |entry, *id| id.* = entry.id;
+    try @import("sql_parity_reference.zig").runReferenceStrict(alloc, &handler, ids, reference_bytes);
+    try std.testing.expectEqual(ids.len, source.captures);
+    var corpus = try @import("antfly_local_sources").sql_parity_fixtures.Corpus.init(alloc);
+    defer corpus.deinit();
+    const invalid = try corpus.get("sql-1357");
+    const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = invalid.sql }, .{});
+    defer alloc.free(body);
+    var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try handler.executeSQL(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    const diagnostic = try std.json.parseFromSlice(sql_wire.SQLDiagnostic, alloc, response.body.?, .{});
+    defer diagnostic.deinit();
+    try std.testing.expectEqualStrings("42703", diagnostic.value.code);
+    try std.testing.expectEqual(ids.len, source.captures);
+}
+
 test "httpx SQL executes one relational page with exact integer parameters" {
     // Exact PostgreSQL-backed campaign IDs (source SQL is looked up, not copied):
     // sql-0166, sql-0169, sql-0182, sql-0191, sql-0192, sql-0193.

@@ -617,7 +617,8 @@ const Parser = struct {
                         } });
                         continue;
                     }
-                    left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.scalarNode(.{ .binary = .{ .op = if (insensitive) .ilike else .like, .left = left, .right = try self.scalar(depth + 1, 4) } }) } });
+                    const pattern = try self.scalar(depth + 1, 4);
+                    left = try self.scalarNode(.{ .unary = .{ .op = .not, .operand = try self.likeExpression(left, pattern, insensitive, depth) } });
                     continue;
                 }
             }
@@ -650,6 +651,12 @@ const Parser = struct {
                 continue;
             }
             const current = self.tokens[self.pos];
+            if ((current.kind == .at_contains or current.kind == .question) and minimum <= 4) {
+                self.pos += 1;
+                const right = try self.scalar(depth + 1, 5);
+                left = try self.scalarNode(.{ .call = .{ .name = if (current.kind == .at_contains) "$contains" else "jsonb_exists", .args = try self.alloc.dupe(*const ast.Scalar, &.{ left, right }) } });
+                continue;
+            }
             const op: ast.Scalar.Binary = switch (current.kind) {
                 .plus => .add,
                 .minus => .subtract,
@@ -720,9 +727,17 @@ const Parser = struct {
                     continue;
                 }
             }
-            left = try self.scalarNode(.{ .binary = .{ .op = op, .left = left, .right = try self.scalar(depth + 1, precedence + 1) } });
+            const right = try self.scalar(depth + 1, precedence + 1);
+            left = if (op == .like or op == .ilike) try self.likeExpression(left, right, op == .ilike, depth) else try self.scalarNode(.{ .binary = .{ .op = op, .left = left, .right = right } });
         }
         return left;
+    }
+
+    fn likeExpression(self: *Parser, operand: *const ast.Scalar, pattern: *const ast.Scalar, insensitive: bool, depth: usize) Error!*const ast.Scalar {
+        if (!self.keyword(.escape)) return self.scalarNode(.{ .binary = .{ .op = if (insensitive) .ilike else .like, .left = operand, .right = pattern } });
+        const escape = try self.scalar(depth + 1, 4);
+        const mode = try self.scalarNode(.{ .literal = .{ .boolean = insensitive } });
+        return self.scalarNode(.{ .call = .{ .name = "$like_escape", .args = try self.alloc.dupe(*const ast.Scalar, &.{ operand, pattern, escape, mode }) } });
     }
 
     /// Bare nested brackets are array grammar, not a new scalar expression.
@@ -1034,8 +1049,11 @@ const Parser = struct {
                 try self.node();
                 const expression = try self.scalar(0, 0);
                 try self.checkScalarDepth(expression, 0);
-                const descending = self.keyword(.desc);
-                if (!descending) _ = self.keyword(.asc);
+                var descending = self.keyword(.desc);
+                const explicit_direction = descending or self.keyword(.asc);
+                if (!explicit_direction and self.keyword(.using)) {
+                    if (self.take(.gt)) descending = true else if (!self.take(.lt)) return self.fail(error.UnsupportedSqlShape, "ORDER BY USING requires a supported ordering operator (< or >)");
+                }
                 var order: ast.Order = .{ .descending = descending };
                 if (expression.* == .column) order.field = expression.column else if (positions and expression.* == .literal and expression.literal == .integer) {
                     order.position = std.math.cast(u32, expression.literal.integer) orelse return self.fail(error.InvalidSqlSyntax, "ORDER BY position must be a positive integer");

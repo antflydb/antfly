@@ -71,7 +71,7 @@ pub const EvalLimits = struct {
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified" };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", jsonb_exists, string_to_array, @"$like_escape" };
 
 pub const Instruction = struct {
     type: Type,
@@ -105,13 +105,14 @@ pub const Program = struct {
     /// Derived execution caches are never part of serialized instructions.
     translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     constant_arrays: std.AutoHashMapUnmanaged(u32, *const arrays.Value) = .empty,
+    constant_memberships: std.AutoHashMapUnmanaged(u32, *arrays.Membership) = .empty,
 
     fn literalInstruction(self: *const Program, index: u32) bool {
         return switch (self.instructions[index].operation) {
             .literal => true,
             .cast => |cast| self.literalInstruction(cast.operand),
             .call => |call| blk: {
-                if (call.function != .@"$array") break :blk false;
+                if (call.function != .@"$array" and call.function != .string_to_array) break :blk false;
                 for (call.args) |arg| if (!self.literalInstruction(arg)) break :blk false;
                 break :blk true;
             },
@@ -125,9 +126,20 @@ pub const Program = struct {
             const value = try self.evaluateInstruction(a, @intCast(index), &.{});
             if (value.array) |array| try self.constant_arrays.put(a, @intCast(index), array);
         }
+        for (self.instructions) |instruction| {
+            if (instruction.operation != .call or instruction.operation.call.function != .@"$contains") continue;
+            const source = instruction.operation.call.args[0];
+            if (self.constant_memberships.contains(source)) continue;
+            const array = self.constant_arrays.get(source) orelse continue;
+            const index = try a.create(arrays.Membership);
+            index.* = try arrays.Membership.init(a, array.*, .{});
+            try self.constant_memberships.put(a, source, index);
+        }
     }
 
     pub fn deinit(self: *Program) void {
+        var memberships = self.constant_memberships.valueIterator();
+        while (memberships.next()) |index| index.*.deinit();
         const backing = self.arena.child_allocator;
         self.arena.deinit();
         backing.destroy(self.arena);
@@ -340,6 +352,55 @@ fn numeric(kind: ?ast.ColumnType) bool {
 // identity; unlike CASE/COALESCE, operator lookup does not promote the arrays.
 fn arrayOperator(left: Type, right: Type) !void {
     if (left.kind == .array and right.kind == .array and left.element_type != right.element_type) return error.SqlUndefinedOperator;
+}
+
+test "SQL JSON and typed array containment match PostgreSQL scalar contracts" {
+    const fixture = try std.json.parseFromSlice(struct {
+        reference: []const u8,
+        entries: []const struct { sql: []const u8, value: Json },
+    }, std.testing.allocator, @embedFile("fixtures/sql_containment_reference.json"), .{});
+    defer fixture.deinit();
+    try std.testing.expectEqual(@as(usize, 30), fixture.value.entries.len);
+    for (fixture.value.entries) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(entry.value == .null, result.sql_null);
+        try std.testing.expectEqual(std.math.Order.eq, try compare(result.value, entry.value));
+    }
+}
+
+test "SQL typed containment prepares immutable indexes and releases allocation failures" {
+    const Faults = struct {
+        fn run(a: Allocator) !void {
+            var compiled = try @import("compiler.zig").compileScalar(a, "string_to_array($1,$2,$3) @> ARRAY['read']", .{});
+            defer compiled.deinit();
+            var program = try bind(a, compiled.expression, &.{}, &.{}, .{});
+            defer program.deinit();
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const value = try program.evaluate(arena.allocator(), &.{}, &.{ .{ .string = "read,NULL,write" }, .{ .string = "," }, .{ .string = "NULL" } }, .{});
+            try std.testing.expectEqual(true, value.value.bool);
+            try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(arena.allocator(), &.{}, &.{ .{ .string = "read,NULL,write" }, .{ .string = "," }, .{ .string = "NULL" } }, .{ .steps = 5 }));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "string_to_array('read write',' ') @> ARRAY['read']", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+    defer program.deinit();
+    try std.testing.expectEqual(@as(usize, 1), program.constant_memberships.count());
+    var denied = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    for (0..10000) |_| {
+        const value = try program.evaluate(denied.allocator(), &.{}, &.{}, .{});
+        try std.testing.expect(value.value.bool);
+    }
+    std.debug.print("SQL prepared containment: rows=10000 elapsed_ns={} row_allocations=0\n", .{std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start});
 }
 
 test "SQL bound array expressions match PostgreSQL scalar contracts" {
@@ -748,6 +809,9 @@ fn functionId(name: []const u8) !Function {
 }
 fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
+        .@"$like_escape" => count == 4,
+        .@"$contains", .jsonb_exists => count == 2,
+        .string_to_array => count == 2 or count == 3,
         .@"$array" => true,
         .@"$array_quantified" => count == 4,
         .cardinality, .array_ndims => count == 1,
@@ -880,6 +944,32 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (function == .@"$like_escape") {
+                    for (call.args, 0..) |arg, i| {
+                        const actual = try self.infer(arg, depth + 1);
+                        if (actual.kind != null and actual.kind != (if (i == 3) ast.ColumnType.boolean else .string)) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = .boolean, .nullable = true };
+                }
+                if (function == .string_to_array) {
+                    for (call.args) |arg| {
+                        const actual = try self.infer(arg, depth + 1);
+                        if (actual.kind != null and actual.kind != .string) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = .array, .element_type = .text, .nullable = true };
+                }
+                if (function == .@"$contains" or function == .jsonb_exists) {
+                    const left = try self.infer(call.args[0], depth + 1);
+                    const right = try self.infer(call.args[1], depth + 1);
+                    if (function == .jsonb_exists) {
+                        if ((left.kind != null and left.kind != .json) or (right.kind != null and right.kind != .string)) return error.SqlTypeMismatch;
+                    } else {
+                        const merged = try common(left, right);
+                        if (merged.kind != .array and merged.kind != .json) return error.SqlTypeMismatch;
+                        if (merged.kind == .array) try arrayOperator(left, right);
+                    }
+                    break :blk .{ .kind = .boolean, .nullable = left.nullable or right.nullable };
+                }
                 if (function == .@"$array") {
                     if (call.args.len == 0) return error.UnknownSqlArrayType;
                     var element: Type = .{};
@@ -1132,6 +1222,10 @@ const Binder = struct {
                 const nested_constructor = function == .@"$array" and self.arrayChildren(call.args);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
+                        .@"$like_escape" => if (i == 3) .boolean else .string,
+                        .string_to_array => .string,
+                        .jsonb_exists => if (i == 0) .json else .string,
+                        .@"$contains" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).kind,
                         .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
                         .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) .array else .integer,
@@ -1172,6 +1266,7 @@ const Binder = struct {
                     }
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
                     const element_context: ?arrays.ElementType = if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
+                        .@"$contains" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
                         .@"$array_quantified" => if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
                         .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
                         .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
@@ -1390,6 +1485,52 @@ const Evaluator = struct {
                     } });
                 }
                 switch (call.function) {
+                    .@"$like_escape" => {
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        const pattern = try self.runDatum(call.args[1], depth + 1);
+                        const escape = try self.runDatum(call.args[2], depth + 1);
+                        const insensitive = try self.runDatum(call.args[3], depth + 1);
+                        if (input.sql_null or pattern.sql_null or escape.sql_null or insensitive.sql_null) break :blk .{};
+                        if (escape.value != .string or insensitive.value != .bool) return error.SqlTypeMismatch;
+                        var points = (std.unicode.Utf8View.init(escape.value.string) catch return error.SqlInvalidEscapeString).iterator();
+                        _ = points.nextCodepoint();
+                        if (points.nextCodepoint() != null) return error.SqlInvalidEscapeString;
+                        break :blk Datum.json(.{ .bool = try self.likeWithEscape(input.value, pattern.value, insensitive.value.bool, escape.value.string) });
+                    },
+                    .string_to_array => {
+                        if (self.program.constant_arrays.get(index)) |prepared| break :blk Datum.typedArray(prepared);
+                        const input = try self.runDatum(call.args[0], depth + 1);
+                        const delimiter = try self.runDatum(call.args[1], depth + 1);
+                        const null_text = if (call.args.len == 3) try self.runDatum(call.args[2], depth + 1) else Datum{};
+                        if (input.sql_null) break :blk .{};
+                        if (input.value != .string or (!delimiter.sql_null and delimiter.value != .string) or (!null_text.sql_null and null_text.value != .string)) return error.SqlTypeMismatch;
+                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
+                        const initial = work.remaining;
+                        const output = try @import("text_array.zig").split(self.alloc, input.value.string, if (delimiter.sql_null) null else delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.bytes, &work);
+                        self.steps += initial - work.remaining;
+                        try self.charge(output.bytes);
+                        break :blk Datum.typedArray(output.value);
+                    },
+                    .@"$contains", .jsonb_exists => {
+                        const left = try self.runDatum(call.args[0], depth + 1);
+                        const right = try self.runDatum(call.args[1], depth + 1);
+                        if (left.sql_null or right.sql_null) break :blk .{};
+                        var work: arrays.Budget = .{ .remaining = self.limits.steps -| self.steps };
+                        const initial = work.remaining;
+                        const accepted = if (call.function == .jsonb_exists) exists: {
+                            if (left.array != null or right.value != .string) return error.SqlTypeMismatch;
+                            break :exists try @import("json_containment.zig").exists(left.value, right.value.string, &work);
+                        } else if (left.array) |array| contains: {
+                            const other = right.array orelse return error.SqlTypeMismatch;
+                            if (self.program.constant_memberships.get(call.args[0])) |prepared| break :contains try prepared.contains(other.*, &work);
+                            var membership = try arrays.Membership.initWithBudget(self.alloc, array.*, .{ .bytes = self.limits.output_bytes -| self.bytes }, &work);
+                            defer membership.deinit();
+                            try self.charge(membership.budget.live + @sizeOf(arrays.Membership));
+                            break :contains try membership.contains(other.*, &work);
+                        } else try @import("json_containment.zig").contains(left.value, right.value, &work, 0);
+                        self.steps += initial - work.remaining;
+                        break :blk Datum.json(.{ .bool = accepted });
+                    },
                     .@"$array" => {
                         const kind = instruction.type.element_type orelse return error.InvalidSqlProgram;
                         if (self.program.constant_arrays.get(index)) |prepared| {
@@ -2257,6 +2398,10 @@ const Evaluator = struct {
     }
 
     fn like(self: *Evaluator, text_value: Json, pattern: Json, insensitive: bool) !bool {
+        return self.likeWithEscape(text_value, pattern, insensitive, "\\");
+    }
+
+    fn likeWithEscape(self: *Evaluator, text_value: Json, pattern: Json, insensitive: bool, escape: []const u8) !bool {
         if (text_value != .string or pattern != .string) return error.SqlTypeMismatch;
         const text = text_value.string;
         const glob = pattern.string;
@@ -2267,21 +2412,22 @@ const Evaluator = struct {
         while (i < text.len) {
             if (self.pattern_steps >= self.limits.pattern_steps) return error.SqlProgramLimitExceeded;
             self.pattern_steps += 1;
-            if (j < glob.len and glob[j] == '%') {
+            const is_escape = escape.len != 0 and j < glob.len and std.mem.startsWith(u8, glob[j..], escape);
+            if (!is_escape and j < glob.len and glob[j] == '%') {
                 if (j + 1 == glob.len) return true;
                 star = j + 1;
                 j += 1;
                 restart = i;
                 continue;
             }
-            if (j < glob.len and glob[j] == '_') {
+            if (!is_escape and j < glob.len and glob[j] == '_') {
                 i += std.unicode.utf8ByteSequenceLength(text[i]) catch return error.SqlTypeMismatch;
                 j += 1;
                 continue;
             }
             var escaped = false;
-            if (j < glob.len and glob[j] == '\\') {
-                j += 1;
+            if (is_escape) {
+                j += escape.len;
                 escaped = true;
                 if (j == glob.len) return error.SqlInvalidEscapeSequence;
             }
@@ -2290,14 +2436,14 @@ const Evaluator = struct {
                 j += 1;
                 continue;
             }
-            if (escaped) j -= 1;
+            if (escaped) j -= escape.len;
             if (star) |next| {
                 restart += std.unicode.utf8ByteSequenceLength(text[restart]) catch return error.SqlTypeMismatch;
                 i = restart;
                 j = next;
             } else return false;
         }
-        while (j < glob.len and glob[j] == '%') : (j += 1) {}
+        while (j < glob.len and glob[j] == '%' and !(escape.len != 0 and std.mem.startsWith(u8, glob[j..], escape))) : (j += 1) {}
         return j == glob.len;
     }
 };
@@ -2545,6 +2691,14 @@ test "SQL scalar bound programs preserve lazy truth exact integers and function 
         .{ .sql = "trim('éé', 'é')", .expected = "\"\"" },
         .{ .sql = "replace('abcabc','b','XY')", .expected = "\"aXYcaXYc\"" },
         .{ .sql = "'héllo' LIKE 'h_llo'", .expected = "true" },
+        .{ .sql = "'bot_agent' LIKE 'bot!_%' ESCAPE '!'", .expected = "true" },
+        .{ .sql = "'bot_agent' NOT LIKE 'bot!_%' ESCAPE '!'", .expected = "false" },
+        .{ .sql = "'BOT_agent' ILIKE 'bot!_%' ESCAPE '!'", .expected = "true" },
+        .{ .sql = "'a_b' LIKE 'aé_b' ESCAPE 'é'", .expected = "true" },
+        .{ .sql = "'a%b' LIKE 'a%%b' ESCAPE '%'", .expected = "true" },
+        .{ .sql = "'a_b' LIKE 'a__b' ESCAPE '_'", .expected = "true" },
+        .{ .sql = "'a!xb' LIKE 'a!_b' ESCAPE ''", .expected = "true" },
+        .{ .sql = "'a' LIKE 'a' ESCAPE NULL", .expected = "null" },
         .{ .sql = "7 BETWEEN 2 AND 9", .expected = "true" },
         .{ .sql = "7 NOT BETWEEN 2 AND 9", .expected = "false" },
         .{ .sql = "7 IN (1, 7, NULL)", .expected = "true" },
