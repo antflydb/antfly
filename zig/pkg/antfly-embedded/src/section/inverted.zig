@@ -5448,12 +5448,43 @@ fn writeMappedInvertedSection(
             var acc = PostingAccumulator.init();
             defer acc.deinit(alloc);
 
+            // Compact terms stay in memory. Cross over before appending a hit
+            // that would exceed the byte limit, including position payloads.
+            // Restarting reads only a bounded prefix and releases it before
+            // opening the external sorter. Norm maxima are idempotent; restore
+            // the frequency sum so the restarted stream counts each hit once.
+            const initial_field_len = total_field_len;
+            var spill = false;
+            const bounded = config.wireVersion() == wire_version_current and config.postings_layout == .posting_count_v35 and (stream_postings or file_maps);
             for (current_entries, 0..) |entry_opt, seg_idx| {
                 const entry = entry_opt orelse continue;
                 if (!std.mem.eql(u8, entry.term, merged_term.items)) continue;
-
-                try appendLookupResultToAccumulator(alloc, &acc, entry.result, effective_maps[seg_idx], merged_norms, &total_field_len);
-                current_entries[seg_idx] = try term_iters[seg_idx].next();
+                if (!try appendLookupResultToAccumulatorLimited(alloc, &acc, entry.result, effective_maps[seg_idx], merged_norms, &total_field_len, if (bounded) 256 * 1024 else null)) {
+                    spill = true;
+                    break;
+                }
+            }
+            if (spill) {
+                acc.deinit(alloc);
+                acc = PostingAccumulator.init();
+                total_field_len = initial_field_len;
+                const value = if (stream_postings)
+                    try appendStreamedMergedTermToSink(alloc, sink, section_start, current_entries, merged_term.items, stream_maps, merged_norms, &total_field_len, config)
+                else if (file_maps) blk: {
+                    var stream = try ExternalPostingStream.init(alloc, current_entries, merged_term.items, effective_maps);
+                    defer stream.deinit();
+                    break :blk try appendPostingStreamToSink(alloc, sink, section_start, &stream, stream.has_positions, merged_norms, &total_field_len, config);
+                } else return error.InvalidData;
+                for (current_entries, 0..) |entry_opt, i| {
+                    const entry = entry_opt orelse continue;
+                    if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
+                }
+                if (value) |dict_value| try dict_builder.add(merged_term.items, dict_value);
+                continue;
+            }
+            for (current_entries, 0..) |entry_opt, i| {
+                const entry = entry_opt orelse continue;
+                if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
             }
 
             if (acc.doc_ids.items.len == 0) continue;
@@ -5584,11 +5615,24 @@ fn appendLookupResultToAccumulator(
     doc_norms: anytype,
     total_field_len: *u64,
 ) !void {
+    _ = try appendLookupResultToAccumulatorLimited(alloc, acc, result, rmap, doc_norms, total_field_len, null);
+}
+
+fn appendLookupResultToAccumulatorLimited(
+    alloc: Allocator,
+    acc: *PostingAccumulator,
+    result: LookupResult,
+    rmap: anytype,
+    doc_norms: anytype,
+    total_field_len: *u64,
+    byte_limit: ?usize,
+) !bool {
     switch (result) {
         .one_hit => |hit| {
-            if (hit.doc_num >= mapLength(rmap)) return;
+            if (hit.doc_num >= mapLength(rmap)) return true;
             const remapped_doc = try mapDocument(rmap, hit.doc_num);
-            if (remapped_doc == std.math.maxInt(u32)) return;
+            if (remapped_doc == std.math.maxInt(u32)) return true;
+            if (postingAccumulatorWouldSpill(acc, 0, byte_limit)) return false;
             try updateMergedNorm(doc_norms, remapped_doc, hit.norm_bits);
             try acc.add(alloc, remapped_doc, 1, hit.norm_bits, &.{});
             total_field_len.* += 1;
@@ -5602,12 +5646,22 @@ fn appendLookupResultToAccumulator(
                 if (hit.doc_id >= mapLength(rmap)) continue;
                 const remapped_doc = try mapDocument(rmap, hit.doc_id);
                 if (remapped_doc == std.math.maxInt(u32)) continue;
+                if (postingAccumulatorWouldSpill(acc, hit.positions.len, byte_limit)) return false;
                 try updateMergedNorm(doc_norms, remapped_doc, hit.norm);
                 try acc.add(alloc, remapped_doc, hit.freq, hit.norm, hit.positions);
                 total_field_len.* += hit.freq;
             }
         },
     }
+    return true;
+}
+
+fn postingAccumulatorWouldSpill(acc: *const PostingAccumulator, positions: usize, byte_limit: ?usize) bool {
+    const limit = byte_limit orelse return false;
+    // Include the reorder copy and descriptors, not just compressed wire bytes.
+    const bytes = (acc.doc_ids.items.len +| 1) *| (@sizeOf(u32) + @sizeOf(PostingMeta) + @sizeOf(PostingSortEntry)) +|
+        (acc.all_positions.items.len +| positions) *| (2 * @sizeOf(u32));
+    return bytes > limit;
 }
 
 /// Historical nonmonotonic maps reorder bounded posting records on disk.

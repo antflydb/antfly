@@ -1407,7 +1407,7 @@ pub const SegmentReader = struct {
         allocator: Allocator,
         identities: SegmentReadScratch,
         byte_budget: usize,
-        entries: [4]Entry = undefined,
+        entries: std.ArrayListUnmanaged(Entry) = .empty,
         count: usize = 0,
         live_bytes: usize = 0,
         decode_count: usize = 0,
@@ -1418,13 +1418,14 @@ pub const SegmentReader = struct {
 
         fn evict(self: *StoredDocBlockCache) void {
             self.count -= 1;
-            const bytes = self.entries[self.count].decoded;
+            const bytes = self.entries.pop().?.decoded;
             self.live_bytes -= bytes.len;
             self.allocator.free(bytes);
         }
 
         pub fn deinit(self: *StoredDocBlockCache) void {
             while (self.count != 0) self.evict();
+            self.entries.deinit(self.allocator);
             self.identities.deinit();
             self.* = undefined;
         }
@@ -1433,16 +1434,16 @@ pub const SegmentReader = struct {
             self.identities.reset();
             const loc = (if (reader.native != null) try reader.nativeStoredLocation(doc, self.identities.allocator()) else try reader.v4StoredDocLocation(doc)) orelse return null;
             var found: ?usize = null;
-            for (self.entries[0..self.count], 0..) |entry, i| {
+            for (self.entries.items[0..self.count], 0..) |entry, i| {
                 if (entry.reader == reader and entry.block == loc.block_idx) {
                     found = i;
                     break;
                 }
             }
             if (found) |position| {
-                const hit = self.entries[position];
-                std.mem.copyBackwards(Entry, self.entries[1 .. position + 1], self.entries[0..position]);
-                self.entries[0] = hit;
+                const hit = self.entries.items[position];
+                std.mem.copyBackwards(Entry, self.entries.items[1 .. position + 1], self.entries.items[0..position]);
+                self.entries.items[0] = hit;
             } else {
                 var header: [5]u8 = undefined;
                 const needed = if (reader.native != null) blk: {
@@ -1450,16 +1451,20 @@ pub const SegmentReader = struct {
                     try reader.source().readInto(loc.block_start, header[0..take]);
                     break :blk try snappy.decodedLen(header[0..take]);
                 } else try snappy.decodedLen(reader.data[loc.block_start..loc.block_end]);
-                while (self.count != 0 and (self.count == self.entries.len or self.live_bytes > self.byte_budget -| needed or needed > self.byte_budget)) self.evict();
+                while (self.count != 0 and (self.count >= @max(1, @min(1024, self.byte_budget / @sizeOf(Entry))) or self.live_bytes > self.byte_budget -| needed or needed > self.byte_budget)) self.evict();
+                // Metadata grows lazily with fitting blocks. Cap descriptors
+                // independently to bound lookup work even for tiny blocks.
+                try self.entries.ensureUnusedCapacity(self.allocator, 1);
                 const decoded = try reader.decodeStoredBlock(self.allocator, loc);
-                while (self.count != 0 and (self.count == self.entries.len or self.live_bytes > self.byte_budget -| decoded.len or decoded.len > self.byte_budget)) self.evict();
-                std.mem.copyBackwards(Entry, self.entries[1 .. self.count + 1], self.entries[0..self.count]);
-                self.entries[0] = .{ .reader = reader, .block = loc.block_idx, .decoded = decoded };
+                while (self.count != 0 and (self.count >= @max(1, @min(1024, self.byte_budget / @sizeOf(Entry))) or self.live_bytes > self.byte_budget -| decoded.len or decoded.len > self.byte_budget)) self.evict();
+                self.entries.appendAssumeCapacity(undefined);
+                std.mem.copyBackwards(Entry, self.entries.items[1 .. self.count + 1], self.entries.items[0..self.count]);
+                self.entries.items[0] = .{ .reader = reader, .block = loc.block_idx, .decoded = decoded };
                 self.count += 1;
                 self.live_bytes += decoded.len;
                 self.decode_count += 1;
             }
-            const decoded = self.entries[0].decoded;
+            const decoded = self.entries.items[0].decoded;
             if (loc.doc_offset > decoded.len or decoded.len - loc.doc_offset < 4) return error.InvalidSegment;
             const length = std.mem.readInt(u32, decoded[loc.doc_offset..][0..4], .little);
             const body_start = loc.doc_offset + 4;
@@ -8546,4 +8551,100 @@ test "external key sidecars preserve mixed exact numerics bytes booleans and des
     const actual = try mergeSegmentInputsWithOptions(a, &inputs, .{ .index_sort = &sort, .scratch = .{ .io = std.testing.io, .directory = directory, .external_sort_chunk_documents = 2 } });
     defer a.free(actual);
     try std.testing.expectEqualSlices(u8, expected, actual);
+}
+
+test "medium frequency position heavy term spills within native budget" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    var text = inverted.InvertedIndexBuilder.init(a, inverted.productionIndexConfig());
+    defer text.deinit();
+    var positions: [2048]u32 = undefined;
+    for (&positions, 0..) |*position, i| position.* = @intCast(i);
+    for (0..1000) |doc| {
+        var name: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&name, "doc-{d:0>6}", .{(doc * 7919) % 1000}), "{}");
+        try text.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 2048, .norm = 2048, .positions = &positions }});
+    }
+    const postings = try text.build();
+    defer a.free(postings);
+    try writer.addSection(try writer.addField("body"), .inverted_text, postings);
+    const fields = [_]SegmentIndexSortField{.{ .field = "_id", .desc = false }};
+    try writer.addIndexSortMetadata(&fields);
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var source = try SegmentReader.init(a, bytes);
+    defer source.deinit();
+    var second = try SegmentReader.init(a, bytes);
+    defer second.deinit();
+    for ([_]bool{ false, true }) |sorted| {
+        const inputs = [_]MergeInput{ .{ .reader = &source }, .{ .reader = &second } };
+        const expected_docs: u32 = if (sorted) 1000 else 2000;
+        var output = MemorySegmentSink.init(a);
+        defer output.deinit();
+        var sink = output.sink();
+        var budget = @import("storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 10 * 1024 * 1024 };
+        try writeMergedSegmentToSinkWithOptions(budget.allocator(), &sink, inputs[0..if (sorted) 1 else 2], .{ .index_sort = if (sorted) &fields else &.{}, .scratch = .{ .io = std.testing.io, .directory = directory, .in_memory_plan_bytes = 0 } });
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        var merged = try SegmentReader.init(a, output.out.items);
+        defer merged.deinit();
+        const section = (try merged.getSection("body", .inverted_text)) orelse return error.TestExpectedEqual;
+        const index = try inverted.InvertedIndexReader.init(a, section);
+        const result = index.lookup("common") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqual(expected_docs, result.docFreq());
+        try std.testing.expectEqual(@as(u64, expected_docs) * 2048, index.total_field_len);
+        var iterator = try result.iterator(a);
+        defer iterator.deinit();
+        var count: u32 = 0;
+        while (try iterator.next()) |hit| {
+            try std.testing.expectEqual(count, hit.doc_id);
+            try std.testing.expectEqualSlices(u32, &positions, hit.positions);
+            count += 1;
+        }
+        try std.testing.expectEqual(expected_docs, count);
+        std.debug.print("LITE_MEDIUM_TERM documents={d} positions_per_doc=2048 result=success budget=10485760 sorted={} peak={d}\n", .{ expected_docs, sorted, budget.peak });
+    }
+}
+
+test "wide interleaved stored cache retains all fitting blocks" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    var body: [2048]u8 = @splat('x');
+    @memcpy(body[0..9], "{\"body\":\"");
+    @memcpy(body[2046..], "\"}");
+    for (0..32) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), &body);
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var readers: [8]SegmentReader = undefined;
+    var initialized: usize = 0;
+    defer for (readers[0..initialized]) |*reader| reader.deinit();
+    for (&readers) |*reader| {
+        reader.* = try SegmentReader.init(a, bytes);
+        initialized += 1;
+    }
+    var cache = SegmentReader.StoredDocBlockCache.init(a, 1024 * 1024);
+    defer cache.deinit();
+    for (0..32) |doc| for (&readers) |*reader| {
+        const stored = (try cache.get(reader, @intCast(doc))).?;
+        try std.testing.expectEqualSlices(u8, &body, stored.data);
+    };
+    try std.testing.expectEqual(@as(usize, 8), cache.decode_count);
+    try std.testing.expect(cache.live_bytes <= cache.byte_budget);
+    const Scenario = struct {
+        fn run(allocator: Allocator, inputs: []SegmentReader) !void {
+            var scope = SegmentReader.StoredDocBlockCache.init(allocator, 1024 * 1024);
+            defer scope.deinit();
+            for (inputs) |*reader| _ = try scope.get(reader, 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{readers[0..]});
+    std.debug.print("LITE_WIDE_CACHE sources=8 documents_per_source=32 decodes={d} distinct_blocks=8 cached_bytes={d} budget=1048576\n", .{ cache.decode_count, cache.live_bytes });
 }
