@@ -62,6 +62,12 @@ pub const Runtime = struct {
     parent_execution: ?struct {
         ptr: *anyopaque,
         checkpoint: *const fn (*anyopaque) anyerror!void,
+        /// Remote transport waits release CPU capacity. Resume must reacquire
+        /// the same operation and validate its authority before using results.
+        resource_wait: ?struct {
+            begin: *const fn (*anyopaque) anyerror!void,
+            end: *const fn (*anyopaque) anyerror!void,
+        } = null,
     } = null,
     context: ?execution.RequestContext = null,
     secret_store: ?*secrets.FileStore = null,
@@ -160,6 +166,9 @@ pub const Runtime = struct {
                 count += 1;
             }
             const ctx = self.runtime.context;
+            const timeout_ms = if (ctx) |context| try context.remainingTimeoutMs() else 30000;
+            const parent = self.runtime.parent_execution;
+            if (parent) |active| if (active.resource_wait) |wait| try wait.begin(active.ptr);
             var response = self.runtime.http.post(url, .{
                 .json = body,
                 .max_response_size = max_response_bytes,
@@ -167,10 +176,15 @@ pub const Runtime = struct {
                 .cookies_enabled = false,
                 .attempt_observer = observer,
                 .headers = headers[0..count],
-                .timeout_ms = if (ctx) |context| try context.remainingTimeoutMs() else 30000,
+                .timeout_ms = timeout_ms,
                 .cancellation = if (ctx) |context| if (context.cancellation) |token| httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn) else null else null,
-            }) catch |err| return operationalError(err);
+            }) catch |err| {
+                if (parent) |active| if (active.resource_wait) |wait| try wait.end(active.ptr);
+                return operationalError(err);
+            };
             defer response.deinit();
+            // Resume failure discards even a successful transport response.
+            if (parent) |active| if (active.resource_wait) |wait| try wait.end(active.ptr);
             if (!response.ok()) return switch (response.status.code) {
                 429, 529 => error.DecisionRateLimited,
                 401, 403 => error.DecisionUnauthorized,
@@ -370,6 +384,122 @@ test "decision functions HTTP ceiling rejects oversized advertised bodies before
         try group.await(io);
         try std.testing.expectEqual(@as(?anyerror, error.DecisionLimitExceeded), failure);
         try std.testing.expectEqual(@as(u64, 0), runtime.rows);
+    }
+}
+
+test "decision functions remote transport parks its parent and discards failed resumptions" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Runnable = admission_mod.runnable_scheduler;
+    const Parent = struct {
+        grant: *Runnable.Execution,
+        reject_result: bool,
+        thread: ?std.Thread.Id = null,
+        begins: usize = 0,
+        ends: usize = 0,
+        fn checkpoint(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.thread) |worker| try std.testing.expectEqual(worker, std.Thread.getCurrentId()) else self.thread = std.Thread.getCurrentId();
+            try self.grant.checkpoint();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.thread.?, std.Thread.getCurrentId());
+            try self.grant.park(.resource_blocked);
+            self.begins += 1;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(self.thread.?, std.Thread.getCurrentId());
+            self.ends += 1;
+            try self.grant.enter(.query);
+            if (self.reject_result) return error.Forbidden;
+        }
+    };
+    const Check = struct {
+        var owner: ?*Runnable.Scheduler = null;
+        var close_owner: bool = false;
+        fn request(_: httpx.testing_mod.RequestInfo) !void {
+            const scheduler = owner.?;
+            try std.testing.expectEqual(@as(usize, 1), scheduler.stats().resource_blocked);
+            try std.testing.expectEqual(@as(usize, 0), scheduler.stats().runnable_slots);
+            try std.testing.expectEqual(@as(u64, 17), scheduler.stats().retained_bytes);
+            var other: Runnable.Execution = .{};
+            try other.start(scheduler, .{ .io = std.testing.io }, .query);
+            defer other.finish();
+            var control: Runnable.Execution = .{};
+            try control.start(scheduler, .{ .io = std.testing.io }, .control);
+            defer control.finish();
+            try std.testing.expectEqual(@as(usize, 2), scheduler.stats().runnable_slots);
+            if (close_owner) scheduler.close();
+        }
+    };
+    defer Check.owner = null;
+    const Run = struct {
+        fn run(runtime: *Runtime, alloc: std.mem.Allocator, questions: decisions.Json, failure: *?anyerror) void {
+            _ = runtime.provider().evaluateBatch(alloc, &.{.{ .input = "refund", .decider = "remote", .questions = questions }}) catch |err| {
+                failure.* = err;
+                return;
+            };
+        }
+    };
+    const good = "{\"model\":\"test-model\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}";
+    for (0..5) |scenario| {
+        var scheduler = try Runnable.Scheduler.init(.{ .slots = 2 });
+        Check.owner = &scheduler;
+        Check.close_owner = scenario == 3;
+        var server = try httpx.TestServer.start(a, io, &.{.{
+            .method = .POST,
+            .path = "/decide",
+            .assert_request = Check.request,
+            .respond = .{
+                .status = if (scenario == 2) 429 else 200,
+                .body = if (scenario == 1) "invalid-json" else good,
+                .disconnect_before_response = scenario == 4,
+            },
+        }});
+        defer server.deinit();
+        var client = httpx.Client.initWithConfig(a, io, .{ .keep_alive = false });
+        defer client.deinit();
+        var registry = registry_mod.Registry.init(a);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("remote", .{ .provider = .antfly, .model = "test-model", .url = server.baseUrl(), .api_key = "decision-test" });
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const questions = try decisions.questionsFor(arena.allocator(), .ai_probability, &.{ .{ .string = "refund" }, .{ .string = "Refund?" }, .{ .string = "remote" } });
+        var grant: Runnable.Execution = .{};
+        try grant.start(&scheduler, .{ .io = io, .retained_bytes = 17 }, .query);
+        defer grant.finish();
+        var parent: Parent = .{ .grant = &grant, .reject_result = scenario == 1 };
+        var runtime: Runtime = .{
+            .registry = &registry,
+            .http = &client,
+            .io = io,
+            .parent_execution = .{ .ptr = &parent, .checkpoint = Parent.checkpoint, .resource_wait = .{ .begin = Parent.begin, .end = Parent.end } },
+        };
+        var failure: ?anyerror = null;
+        var group = std.Io.Group.init;
+        defer group.cancel(io);
+        try group.concurrent(io, Run.run, .{ &runtime, arena.allocator(), questions, &failure });
+        try server.handleOne();
+        try group.await(io);
+        try std.testing.expectEqual(@as(usize, 1), parent.begins);
+        try std.testing.expectEqual(@as(usize, 1), parent.ends);
+        const expected: ?anyerror = switch (scenario) {
+            0 => null,
+            1 => error.Forbidden,
+            2 => error.DecisionRateLimited,
+            3 => error.SchedulerClosed,
+            4 => error.DecisionUpstreamFailure,
+            else => unreachable,
+        };
+        try std.testing.expectEqual(expected, failure);
+        try std.testing.expectEqual(@as(u64, if (scenario == 0) 1 else 0), runtime.rows);
+        grant.finish();
+        try std.testing.expectEqual(@as(usize, 0), scheduler.stats().operations);
+        try std.testing.expectEqual(@as(u64, 0), scheduler.stats().retained_bytes);
     }
 }
 

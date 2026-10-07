@@ -1137,3 +1137,18 @@ records sources, flags, full logs, limits and the initial read-only fixture
 failure. Production invocations do not yet install scopes. Parent propagation,
 actual broker/worker grants, other backend teams, whole-production integration
 and automatic default qualification remain pending.
+### Remote provider resource waits (2026-10-07, native API gate passed)
+
+Decision provider remote HTTP calls now park a scheduled read parent's CPU grant
+while retaining operation/memory/deadline ownership. The SQL adapter reuses its
+read-fence resumption path; failed reacquisition or authority validation discards
+the response. Real HTTP tests verify another query and control work progress
+during the wait and successful, rejected, HTTP 429, shutdown and disconnected
+transport outcomes all retire charges. All 47 native steps and 25 focused tests
+pass; GNU also passes all 44 steps and 25 tests under two CPUs and 4 GiB
+without extra swap. The [resource wait receipt](qualification/workload-pooling/receipts/2026-10-07/provider-resource-waits/README.md)
+retains source hashes and full logs. The combined native API gate also passes
+all 50 steps and 85 tests (39 embedded, 46 coordinator), with no skips/leaks,
+including actual adapter callback wiring and the real transport fixture. Local inference grant transfer,
+backend CPU teams, background scheduling and default qualification are still
+required. Ordinary accepted writes do not attach the cancellable read callbacks.
