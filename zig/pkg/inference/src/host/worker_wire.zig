@@ -17,7 +17,7 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const http = @import("antfly_runtime_abi").http_abi;
 
-pub const version: u32 = 6;
+pub const version: u32 = 7;
 // Only options are JSON metadata. The application payload is carried raw.
 pub const Request = struct { operation: Operation, options: []const u8 = "" };
 pub const ResourceRequest = struct { operation: Operation, data: []const u8 };
@@ -177,9 +177,10 @@ pub const Provider = struct {
     numeric: bool,
     attachment_refs: []const AttachmentRef,
     admitted_cpu_slots: u32 = 0,
+    phase_handoff: bool = false,
 
     pub fn validate(self: Provider) !void {
-        if (self.admitted_cpu_slots > 65535) return error.InvalidRunnableDemand;
+        if (self.admitted_cpu_slots > 65535 or (self.phase_handoff and self.admitted_cpu_slots == 0)) return error.InvalidRunnableDemand;
     }
 };
 
@@ -214,6 +215,7 @@ test "inference worker CPU budget serializes demand without parent callback poin
     const decoded = try std.json.parseFromSliceLeaky(Provider, arena.allocator(), encoded, .{});
     try decoded.validate();
     try std.testing.expectEqual(@as(u32, 2), decoded.admitted_cpu_slots);
+    try std.testing.expect(decoded.phase_handoff);
     try std.testing.expectEqual(@as(?u64, 1234), decoded.deadline_ns);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "checkpoint") == null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "context") == null);
@@ -230,6 +232,12 @@ test "inference worker CPU budget serializes demand without parent callback poin
     var invalid = decoded;
     invalid.admitted_cpu_slots = 65536;
     try std.testing.expectError(error.InvalidRunnableDemand, invalid.validate());
+    invalid = decoded;
+    invalid.admitted_cpu_slots = 0;
+    try std.testing.expectError(error.InvalidRunnableDemand, invalid.validate());
+    context.admitted_cpu_slots = 1;
+    const scalar = try ProviderInput.init(arena.allocator(), &context);
+    try std.testing.expect(!scalar.options.phase_handoff);
     context.admitted_cpu_slots = 0;
     try std.testing.expectEqual(@as(u32, 0), try admittedCpuSlots(&context));
 }
@@ -262,7 +270,7 @@ pub const ProviderInput = struct {
         }
         if (try attachments.encodedSize(context.request_json.slice(), payloads) > @import("antfly_inference_worker_rpc").max_body_bytes) return error.BodyTooLarge;
         return .{
-            .options = .{ .operation = context.operation, .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null, .numeric = context.out_numeric_result != null, .attachment_refs = refs, .admitted_cpu_slots = cpu_slots },
+            .options = .{ .operation = context.operation, .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null, .numeric = context.out_numeric_result != null, .attachment_refs = refs, .admitted_cpu_slots = cpu_slots, .phase_handoff = context.runnable != null },
             .body = try attachments.encodeSegmentsAlloc(arena, context.request_json.slice(), payloads),
         };
     }

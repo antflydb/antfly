@@ -23,6 +23,7 @@ const http = @import("antfly_runtime_abi").http_abi;
 const host = @import("host.zig");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
+const execution_control = @import("inference_server").execution_control;
 pub const EnvironmentEntry = struct { name: []const u8, value: []const u8 };
 
 const ForwardControl = struct {
@@ -32,9 +33,40 @@ const ForwardControl = struct {
     progress: bridge.ProgressView = .{},
     stream: http.StreamSink = .{},
     stream_started: bool = false,
+    phase_handoff: bool = false,
+    resource_wait: ?execution_control.ResourceWait = null,
+
+    fn phase(raw: ?*anyopaque, value: rpc.Phase) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw.?));
+        if (!self.phase_handoff) return error.UnsupportedWorkerPhase;
+        switch (value) {
+            .resource_wait => {
+                if (self.resource_wait != null) return error.InvalidWorkerPhase;
+                try check(self);
+                const wait = try execution_control.ResourceWait.init();
+                if (wait.checkpoint == null) return error.UnsupportedWorkerPhase;
+                self.resource_wait = wait;
+            },
+            .runnable => {
+                if (self.resource_wait == null) return error.InvalidWorkerPhase;
+                try self.finishResourceWait();
+                try check(self);
+            },
+        }
+    }
+
+    fn finishResourceWait(self: *@This()) !void {
+        var wait = self.resource_wait orelse return;
+        self.resource_wait = null;
+        try wait.finish();
+    }
 
     fn check(raw: ?*anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
+        // This callback executes on the owning caller. Its current capsule
+        // authority must remain valid throughout delegated work; resource-wait
+        // scopes suppress runnable-only checks while the capsule is parked.
+        try (execution_control.InferenceExecutionControl{}).check();
         if (self.cancellation.requested()) return error.Cancelled;
         if (self.deadline_ns) |deadline| {
             if (platform.time.monotonicNs() >= deadline) return error.Timeout;
@@ -63,7 +95,7 @@ const ForwardControl = struct {
     }
 
     fn view(self: *@This()) rpc.Control {
-        return .{ .ptr = self, .check = check, .event = event };
+        return .{ .ptr = self, .check = check, .event = event, .phase = if (self.phase_handoff) phase else null };
     }
 };
 
@@ -92,12 +124,23 @@ pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeCont
         .cancellation = context.cancellation,
         .deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null,
         .progress = context.progress,
+        .phase_handoff = context.runnable != null,
     };
     try ForwardControl.check(&control);
     const input = try wire.ProviderInput.init(arena.allocator(), context);
     const data = try std.json.Stringify.valueAlloc(arena.allocator(), input.options, .{});
-    const response = try client.invokePayload(.provider, data, .{ .body_segments = input.body.segments }, control.view());
+    const response = client.invokePayload(.provider, data, .{ .body_segments = input.body.segments }, control.view()) catch |err| {
+        // A canceled or disconnected child can stop while parked. Reacquire
+        // (or preserve its authoritative rejection) before leaving the owning
+        // thread-local scope, even when no response was produced.
+        try control.finishResourceWait();
+        return err;
+    };
     defer response.deinit();
+    if (control.resource_wait != null) {
+        try control.finishResourceWait();
+        return error.InvalidWorkerPhase;
+    }
     try ForwardControl.check(&control);
     const reply_options = try std.json.parseFromSliceLeaky(wire.Reply, arena.allocator(), response.view().metadata, .{});
     const output = try std.json.parseFromSliceLeaky(wire.ProviderOutput, arena.allocator(), reply_options.options, .{});
@@ -274,7 +317,7 @@ pub const Client = struct {
         // Startup/replacement contention precedes this caller's physical RPC.
         // Park its borrowed grant while queued, then restore it before worker
         // startup or dispatch; retain that grant throughout active child work.
-        const execution = @import("inference_server").execution_control.InferenceExecutionControl{
+        const execution = execution_control.InferenceExecutionControl{
             .io = self.io,
             .ptr = control.ptr,
             .check_fn = control.check,
@@ -650,6 +693,12 @@ const Child = struct {
                 var response: bridge.String = undefined;
                 var numeric: bridge.NumericResult = .{};
                 defer if (response_handle) |handle| host.linkedInferenceDestroyProviderResponse(handle);
+                var child_phase = ChildPhase{ .request = request };
+                var phase_scope: ?execution_control.CheckpointScope = if (provider.phase_handoff)
+                    execution_control.CheckpointScope.init(.{ .context = &child_phase, .check_fn = ChildPhase.check, .wait_begin_fn = ChildPhase.park, .wait_end_fn = ChildPhase.reenter })
+                else
+                    null;
+                defer if (phase_scope) |*scope| scope.deinit();
                 try host.linkedInferenceInvokeProvider(&.{
                     .abi_version = bridge.abi_version,
                     .handle = state,
@@ -668,6 +717,9 @@ const Child = struct {
                     .cancellation = .{ .context = request, .is_cancelled = cancelled },
                     .progress = .{ .context = request, .update_progress = progress },
                 });
+                // A backend may catch a lock/resume error. It must never turn
+                // a denied physical grant into a successful published result.
+                if (child_phase.failure) |err| return err;
                 if (numeric.kind != .absent) {
                     const output = try wire.ProviderOutput.encode(arena, numeric);
                     return reply(&self.endpoint, .ok, try std.json.Stringify.valueAlloc(arena, output.options, .{}), output.body);
@@ -729,6 +781,30 @@ const Child = struct {
         const request: *const rpc.Request = @ptrCast(@alignCast(raw.?));
         return @intFromBool(request.cancelled.load(.acquire));
     }
+
+    const ChildPhase = struct {
+        request: *rpc.Request,
+        failure: ?anyerror = null,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.failure) |err| return err;
+            if (self.request.cancelled.load(.acquire)) return error.Cancelled;
+        }
+        fn transition(self: *@This(), value: rpc.Phase) !void {
+            self.request.transition(value) catch |err| {
+                self.failure = err;
+                return err;
+            };
+        }
+        fn park(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.transition(.resource_wait);
+        }
+        fn reenter(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.transition(.runnable);
+        }
+    };
 
     fn emit(request: *rpc.Request, event: wire.Event) !void {
         return emitBody(request, event, "");

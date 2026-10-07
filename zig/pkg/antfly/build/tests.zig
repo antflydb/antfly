@@ -454,6 +454,27 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     usermgr_storage_test_mod.addImport("antfly_platform", platform_mod);
     antfly_test_mod.addImport("usermgr_storage", usermgr_storage_test_mod);
 
+    const worker_rpc_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_rpc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    worker_rpc_test_mod.addImport("httpx", httpx_mod);
+    const worker_rpc_tests = b.addTest(.{
+        .name = "inference-worker-rpc-contract-tests",
+        .root_module = worker_rpc_test_mod,
+        .filters = &.{"inference worker"},
+        .max_rss = 1024 * 1024 * 1024,
+    });
+    const worker_rpc_step = b.step("antfly-inference-worker-rpc-test", "Run actual worker RPC transport and phase handoff contracts");
+    worker_rpc_step.dependOn(&b.addRunArtifact(worker_rpc_tests).step);
+    worker_rpc_step.dependOn(&b.addRunArtifact(b.addTest(.{
+        .root_module = test_imports.runtime.inference_worker_wire,
+        .filters = &.{"inference worker"},
+        .max_rss = 1024 * 1024 * 1024,
+    })).step);
+
     const common_http_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/common_http_test_root.zig"),
         .target = target,

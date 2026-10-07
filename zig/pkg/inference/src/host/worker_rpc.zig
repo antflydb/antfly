@@ -26,7 +26,7 @@ const max_retained_bytes = 256 * 1024 * 1024;
 const control_budget_bytes = 4 * 1024 * 1024;
 const max_requests = 128;
 const header_len = 17;
-const Kind = enum(u8) { offer = 1, accept, reject, chunk, finish, abort, cancel, failure, capacity, resource_request, resource_reply };
+const Kind = enum(u8) { offer = 1, accept, reject, chunk, finish, abort, cancel, failure, capacity, resource_request, resource_reply, phase_request, phase_reply };
 const MessageKind = enum(u8) { request = 1, response, event };
 const Failure = enum { failure, capacity };
 
@@ -95,10 +95,17 @@ pub const OwnedPayload = struct {
     }
 };
 
+/// A delegated worker must wait for the owning caller's acknowledgment before
+/// entering either a resource wait or a new runnable interval.
+pub const Phase = enum(u8) { resource_wait = 1, runnable = 2 };
+const PhaseStatus = enum(u8) { accepted = 0, canceled, timeout, denied };
+const PhaseRequest = struct { sequence: u64, phase: Phase };
+
 pub const Control = struct {
     ptr: ?*anyopaque = null,
     check: ?*const fn (?*anyopaque) anyerror!void = null,
     event: ?*const fn (?*anyopaque, Payload) anyerror!void = null,
+    phase: ?*const fn (?*anyopaque, Phase) anyerror!void = null,
 };
 
 pub const Request = struct {
@@ -106,11 +113,58 @@ pub const Request = struct {
     id: u64,
     payload: OwnedPayload,
     cancelled: std.atomic.Value(bool) = .init(false),
+    phase_sequence: u64 = 0,
+    phase_waiting: bool = false,
+    phase_reply: ?PhaseStatus = null,
+    phase_ready: std.Io.Event = .unset,
 
     fn check(raw: ?*anyopaque) !void {
         const self: *Request = @ptrCast(@alignCast(raw.?));
         if (self.cancelled.load(.acquire)) return error.Cancelled;
     }
+    pub fn transition(self: *Request, phase: Phase) !void {
+        try check(self);
+        const endpoint = self.endpoint;
+        endpoint.mutex.lockUncancelable(endpoint.io);
+        if (self.phase_waiting) {
+            endpoint.mutex.unlock(endpoint.io);
+            return error.InvalidWorkerPhase;
+        }
+        const sequence = std.math.add(u64, self.phase_sequence, 1) catch {
+            endpoint.mutex.unlock(endpoint.io);
+            return error.InvalidWorkerPhase;
+        };
+        self.phase_sequence = sequence;
+        self.phase_waiting = true;
+        self.phase_reply = null;
+        self.phase_ready.reset();
+        endpoint.mutex.unlock(endpoint.io);
+        defer {
+            endpoint.mutex.lockUncancelable(endpoint.io);
+            self.phase_waiting = false;
+            endpoint.mutex.unlock(endpoint.io);
+        }
+        var bytes: [9]u8 = undefined;
+        std.mem.writeInt(u64, bytes[0..8], sequence, .little);
+        bytes[8] = @backingInt(phase);
+        try endpoint.sendFrame(.phase_request, self.id, &bytes);
+        while (true) {
+            try check(self);
+            endpoint.mutex.lockUncancelable(endpoint.io);
+            const status = self.phase_reply;
+            const closed = endpoint.closed.load(.acquire);
+            endpoint.mutex.unlock(endpoint.io);
+            if (status) |value| return switch (value) {
+                .accepted => {},
+                .canceled => error.Cancelled,
+                .timeout => error.Timeout,
+                .denied => error.InferenceExecutionHandoffFailed,
+            };
+            if (closed) return error.InferenceWorkerUnavailable;
+            try endpoint.waitTick(&self.phase_ready);
+        }
+    }
+
     pub fn event(self: *Request, payload: Payload) !void {
         try self.endpoint.sendMessage(.event, self.id, payload, .{ .ptr = self, .check = check });
     }
@@ -120,6 +174,9 @@ const Message = struct { kind: MessageKind, payload: OwnedPayload };
 const Pending = struct {
     ready: std.Io.Event = .unset,
     terminal: ?Failure = null,
+    next_phase_sequence: u64 = 1,
+    phase: ?PhaseRequest = null,
+    phase_inflight: bool = false,
     messages: std.ArrayListUnmanaged(Message) = .empty,
 };
 const Offer = struct {
@@ -256,11 +313,37 @@ pub const Endpoint = struct {
         while (true) {
             if (control.check) |check| try check(control.ptr);
             self.mutex.lockUncancelable(self.io);
-            const message: ?Message = if (pending.messages.items.len > 0) pending.messages.orderedRemove(0) else null;
+            const phase = pending.phase;
+            if (phase != null) {
+                pending.phase = null;
+                pending.phase_inflight = true;
+            }
+            const message: ?Message = if (phase == null and pending.messages.items.len > 0) pending.messages.orderedRemove(0) else null;
             const closed = self.closed.load(.acquire);
             const terminal = pending.terminal;
-            if (message == null) pending.ready.reset();
+            if (message == null and phase == null) pending.ready.reset();
             self.mutex.unlock(self.io);
+            if (phase) |transition| {
+                // Execute on the original call's OS worker, never the reader
+                // or a reverse-RPC dispatch task that cannot own its capsule.
+                const result = if (control.phase) |callback|
+                    callback(control.ptr, transition.phase)
+                else
+                    @as(anyerror!void, error.UnsupportedWorkerPhase);
+                const status: PhaseStatus = if (result) |_| .accepted else |err| switch (err) {
+                    error.Cancelled, error.Canceled => .canceled,
+                    error.Timeout, error.DeadlineExceeded => .timeout,
+                    else => .denied,
+                };
+                var bytes: [9]u8 = undefined;
+                std.mem.writeInt(u64, bytes[0..8], transition.sequence, .little);
+                bytes[8] = @backingInt(status);
+                self.mutex.lockUncancelable(self.io);
+                pending.phase_inflight = false;
+                self.mutex.unlock(self.io);
+                try self.sendFrame(.phase_reply, id, &bytes);
+                try result;
+            }
             if (message) |item| {
                 switch (item.kind) {
                     .response => return item.payload,
@@ -464,6 +547,31 @@ pub const Endpoint = struct {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             switch (kind) {
+                .phase_request => {
+                    if (length != 9) return error.InvalidWorkerPhase;
+                    const sequence = std.mem.readInt(u64, bytes[0..8], .little);
+                    const phase = std.enums.fromInt(Phase, bytes[8]) orelse return error.InvalidWorkerPhase;
+                    // A retired caller may have already sent cancellation.
+                    // No ownership action can occur without its pending slot.
+                    if (self.pending.get(id)) |pending| {
+                        if (pending.phase != null or pending.phase_inflight or sequence != pending.next_phase_sequence)
+                            return error.InvalidWorkerPhase;
+                        pending.next_phase_sequence = try std.math.add(u64, sequence, 1);
+                        pending.phase = .{ .sequence = sequence, .phase = phase };
+                        pending.ready.set(self.io);
+                    }
+                },
+                .phase_reply => {
+                    if (length != 9) return error.InvalidWorkerPhase;
+                    const sequence = std.mem.readInt(u64, bytes[0..8], .little);
+                    const status = std.enums.fromInt(PhaseStatus, bytes[8]) orelse return error.InvalidWorkerPhase;
+                    if (self.active.get(id)) |request| {
+                        if (!request.phase_waiting or request.phase_reply != null or sequence != request.phase_sequence)
+                            return error.InvalidWorkerPhase;
+                        request.phase_reply = status;
+                        request.phase_ready.set(self.io);
+                    }
+                },
                 .resource_request => {
                     if (self.resource_handler == null or length == 0 or length > max_resource_bytes)
                         return error.InvalidResourceFrame;
@@ -605,6 +713,8 @@ const TestPair = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
     handled: std.atomic.Value(usize) = .init(0),
     cancel_seen: std.Io.Event = .unset,
+    phase_resumed: std.atomic.Value(bool) = .init(false),
+    phase_denied: std.Io.Event = .unset,
 
     fn init(self: *TestPair) !void {
         if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
@@ -646,6 +756,17 @@ const TestPair = struct {
     fn handle(raw: *anyopaque, request: *Request) !OwnedPayload {
         const self: *TestPair = @ptrCast(@alignCast(raw));
         _ = self.handled.fetchAdd(1, .monotonic);
+        if (std.mem.eql(u8, request.payload.view().body, "phase")) {
+            request.transition(.resource_wait) catch |err| {
+                self.phase_denied.set(std.testing.io);
+                return err;
+            };
+            request.transition(.runnable) catch |err| {
+                self.phase_denied.set(std.testing.io);
+                return err;
+            };
+            self.phase_resumed.store(true, .release);
+        }
         if (std.mem.eql(u8, request.payload.view().body, "nested"))
             return request.endpoint.call(.{ .body = "echo" }, .{});
         if (std.mem.eql(u8, request.payload.view().body, "cancel")) {
@@ -664,6 +785,77 @@ const TestPair = struct {
         self.cancelled.store(true, .release);
     }
 };
+
+test "inference worker phase acknowledgments run on the owner thread under saturated payload budgets" {
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    const Owner = struct {
+        pair: *TestPair,
+        thread: std.Thread.Id,
+        transitions: usize = 0,
+        fn phase(raw: ?*anyopaque, value: Phase) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(self.thread, std.Thread.getCurrentId());
+            try std.testing.expect(!self.pair.phase_resumed.load(.acquire));
+            try std.testing.expectEqual(if (self.transitions == 0) Phase.resource_wait else Phase.runnable, value);
+            self.transitions += 1;
+            const endpoint = &self.pair.parent;
+            endpoint.mutex.lockUncancelable(endpoint.io);
+            defer endpoint.mutex.unlock(endpoint.io);
+            // Phase frames bypass both allocation counters. Restore them only
+            // at reacquisition, before the final response can be offered.
+            endpoint.control_bytes = if (value == .resource_wait) control_budget_bytes else 0;
+            endpoint.retained_bytes = if (value == .resource_wait) endpoint.retained_limit else 0;
+        }
+    };
+    var owner = Owner{ .pair = &pair, .thread = std.Thread.getCurrentId() };
+    defer {
+        pair.parent.control_bytes = 0;
+        pair.parent.retained_bytes = 0;
+    }
+    const result = try pair.parent.call(.{ .body = "phase" }, .{ .ptr = &owner, .phase = Owner.phase });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("phase", result.view().body);
+    try std.testing.expectEqual(@as(usize, 2), owner.transitions);
+    try std.testing.expect(pair.phase_resumed.load(.acquire));
+    try std.testing.expect(!pair.parent.closed.load(.acquire));
+    try std.testing.expect(!pair.child.closed.load(.acquire));
+}
+
+test "inference worker rejected reacquisition preserves the owner's cause and prevents child computation" {
+    const Owner = struct {
+        failure: anyerror,
+        transitions: usize = 0,
+        fn phase(raw: ?*anyopaque, value: Phase) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.transitions += 1;
+            if (value == .runnable) return self.failure;
+        }
+    };
+    for ([_]anyerror{ error.Forbidden, error.Canceled, error.DeadlineExceeded }) |failure| {
+        var pair: TestPair = undefined;
+        try pair.init();
+        defer pair.deinit();
+        var owner = Owner{ .failure = failure };
+        try std.testing.expectError(failure, pair.parent.call(.{ .body = "phase" }, .{ .ptr = &owner, .phase = Owner.phase }));
+        try pair.phase_denied.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try std.testing.expectEqual(@as(usize, 2), owner.transitions);
+        try std.testing.expect(!pair.phase_resumed.load(.acquire));
+        const result = try pair.parent.call(.{ .body = "echo" }, .{});
+        defer result.deinit();
+        try std.testing.expectEqualStrings("echo", result.view().body);
+    }
+}
+
+test "inference worker missing phase owner rejects before delegated computation" {
+    var pair: TestPair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    try std.testing.expectError(error.UnsupportedWorkerPhase, pair.parent.call(.{ .body = "phase" }, .{}));
+    try pair.phase_denied.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try std.testing.expect(!pair.phase_resumed.load(.acquire));
+}
 
 test "inference worker RPC permits nested bidirectional callbacks" {
     var pair: TestPair = undefined;
