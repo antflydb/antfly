@@ -47,19 +47,40 @@ try {
     if ($mode -eq 'check') {
         $check = Start-Process -FilePath "$root\antfly.exe" -ArgumentList @('lite', 'check', "$root\data.aflite") `
             -Wait -PassThru -RedirectStandardOutput "$root\check-out.log" -RedirectStandardError "$root\check-err.log"
-        $result = @{exit_code = $check.ExitCode; output = (Get-Content "$root\check-out.log", "$root\check-err.log" | Out-String)}
+        $result = @{
+            sha256 = $expectedHash; boot = [guid]::NewGuid().ToString()
+            exit_code = $check.ExitCode; output = (Get-Content "$root\check-out.log", "$root\check-err.log" | Out-String)
+        }
         Invoke-RestMethod -Method Put -Uri "$metadata/guest-attributes/antfly/check" `
             -Headers $headers -Body ($result | ConvertTo-Json -Compress) | Out-Null
         return
     }
     if ($mode -ne 'serve') { throw "Unknown qualification mode: $mode" }
     $tests = @{}
-    foreach ($name in @('compat-test.exe', 'staged-test.exe', 'storage-test.exe', 'object-durability-test.exe')) {
+    $required = @('compat-test.exe', 'staged-test.exe', 'storage-test.exe', 'object-durability-test.exe', 'protected-future-test.exe', 'executor-bridge-test.exe')
+    $names = $required
+    foreach ($optional in @('io-pool-probe.exe', 'borrow-nested-test.exe', 'borrow-protected-test.exe')) {
+        if (Test-Path "$root\$optional") { $names += $optional }
+    }
+    foreach ($name in $names) {
         Write-Host "Running $name"
-        $test = Start-Process -FilePath "$root\$name" -Wait -PassThru `
+        $test = Start-Process -FilePath "$root\$name" -PassThru `
             -RedirectStandardOutput "$root\$name-out.log" -RedirectStandardError "$root\$name-err.log"
+        # Retain a process handle before a fast test exits; PowerShell otherwise
+        # may expose a null ExitCode after WaitForExit.
+        $null = $test.Handle
+        if (!$test.WaitForExit(60000)) {
+            Stop-Process -Id $test.Id -Force
+            $tests[$name] = 'timeout'
+            if ($required -contains $name) { throw "Required test timed out: $name" }
+            continue
+        }
+        $test.WaitForExit()
         $tests[$name] = $test.ExitCode
-        if ($test.ExitCode -ne 0) { throw "Test failed: $name; see its log" }
+        if ($test.ExitCode -ne 0 -and $required -contains $name) {
+            $detail = Get-Content "$root\$name-out.log", "$root\$name-err.log" | Out-String
+            throw "Test failed: $name; exit=$($test.ExitCode); $detail"
+        }
     }
     New-NetFirewallRule -DisplayName 'Antfly disposable IAP tests' -Direction Inbound `
         -Protocol TCP -LocalPort 8080,9090 -RemoteAddress 35.235.240.0/20 -Action Allow -ErrorAction SilentlyContinue | Out-Null
@@ -81,6 +102,7 @@ try {
     $listener.Start()
     while ($listener.IsListening) {
         $context = $listener.GetContext()
+        try {
         $result = $status
         if ($context.Request.HttpMethod -eq 'GET' -and $context.Request.Url.AbsolutePath -eq '/ntdll') {
             $stream = [IO.File]::OpenRead("$env:SystemRoot\System32\ntdll.dll")
@@ -101,6 +123,7 @@ try {
             $target.Dispose()
             $bytes = [Text.Encoding]::UTF8.GetBytes(($result | ConvertTo-Json -Depth 8 -Compress))
             $context.Response.ContentType = 'application/json'
+            $context.Response.ContentLength64 = $bytes.Length
             $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
             $context.Response.Close()
             continue
@@ -139,15 +162,21 @@ public static class AntflyTestDump {
             $check = Start-Process -FilePath "$root\antfly.exe" -ArgumentList @('lite', 'check', "$root\data.aflite") `
                 -Wait -PassThru -RedirectStandardOutput "$root\check-out.log" -RedirectStandardError "$root\check-err.log"
             $output = (Get-Content "$root\check-out.log", "$root\check-err.log" | Out-String)
-            $result = @{exit_code = $check.ExitCode; output = $output}
+            $result = @{sha256 = $expectedHash; exit_code = $check.ExitCode; output = $output}
         } elseif ($context.Request.HttpMethod -ne 'GET' -or $context.Request.Url.AbsolutePath -ne '/status') {
             $context.Response.StatusCode = 404
             $result = @{error = 'Unknown endpoint'}
         }
         $bytes = [Text.Encoding]::UTF8.GetBytes(($result | ConvertTo-Json -Depth 8 -Compress))
         $context.Response.ContentType = 'application/json'
+        $context.Response.ContentLength64 = $bytes.Length
         $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
         $context.Response.Close()
+        } catch {
+            # A controller timeout/disconnect must not kill the status runner.
+            Write-Host "Qualification request failed: $($_.Exception.Message)"
+            try { $context.Response.Abort() } catch {}
+        }
     }
 } catch {
     $failure = @{error = ($_ | Out-String)} | ConvertTo-Json -Compress

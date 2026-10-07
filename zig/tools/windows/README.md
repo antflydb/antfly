@@ -144,7 +144,9 @@ like `lib/generating` cannot import it today, or upstream them to Zig.
 - LSM atomic writes on Windows use `NativeStreamingAtomicWriteSink`: a sibling
   staging file, a fixed 64 KiB write buffer, and a 64 KiB checksum scratch buffer.
   Header patches and CRC ranges work across buffered and persisted bytes. The
-  sink retains the I/O runtime through finish/abort, closes the staging handle
+  writer covers both native storage and the runtime bridge's `IoStorage`.
+  Owned native sinks retain the I/O runtime through finish/abort; borrowed
+  executors must outlive their sinks. The writer closes the staging handle
   before rename, and removes staging on abort or pre-publication failure. Memory
   used by this writer no longer scales with compaction output size. Windows
   still lacks the POSIX cold-cache eviction hints and descriptor cache.
@@ -159,6 +161,13 @@ like `lib/generating` cannot import it today, or upstream them to Zig.
   timeouts are disabled (the `std.Io` select-based timeouts take over), and the
   HTTP/1 disconnect-cancellation observer is skipped. A client that disconnects
   no longer cancels its in-flight request on Windows.
+- HTTP batch offload completion uses a cancellation-protected future wait
+  instead of polling every millisecond. Caller I/O cancellation must not
+  interrupt mutation work before durability is known; the borrowed request
+  token still controls safe visibility waits.
+  Offload selects the imported durable executor at the API kernel boundary.
+  Reconstructing a `Threaded` vtable from a foreign runtime pointer can split
+  the owning archive's thread-local and Windows parked-worker wakeup state.
 - Lite virtual index paths: `std.fs.path.join` uses `\` on Windows, which Lite's
   in-file path validation rejects (`InvalidNativeIndexPath`). On Windows the
   vector-block paths now join with `/`. Other `std.fs.path.join` uses on virtual paths
@@ -172,7 +181,7 @@ like `lib/generating` cannot import it today, or upstream them to Zig.
 PR #987 (`ce319462af8b`) was merged with `origin/main` (`e6d4ce9bbc71`).
 On Apple Silicon macOS with Rosetta, CrossOver 26.2.0, and Zig 0.17.0:
 
-- The final Windows Debug application build passed all 46 build steps.
+- The final Windows Debug and ReleaseFast builds passed all 46 build steps.
 - The Windows argument round-trip test passed, including spaces, quotes,
   trailing backslashes, Unicode, and an unpaired surrogate.
 - All five compatibility tests passed under both Debug and ReleaseFast:
@@ -188,11 +197,11 @@ On Apple Silicon macOS with Rosetta, CrossOver 26.2.0, and Zig 0.17.0:
   Platform Python lifecycle suites (4 and 9 tests), overlay safety tests
   (2 tests), Ruff checks, and Zig formatting checks also passed.
 
-The full application also compiled in ReleaseFast before the Wine adapters
-were added. The final adapters were exercised in ReleaseFast by the focused
-compatibility tests; the final full HTTP/recovery workload ran in Debug.
-This does not qualify native NTFS power-loss behavior or a supported Windows
-release.
+The follow-up executor fix also passes a 1,000-write indexed workload in both
+Debug and ReleaseFast under CrossOver, including every body hash and full-text
+entry after hard-kill recovery and an offline integrity check with zero tail
+bytes. Native NTFS tests use hard VM resets; physical storage power-loss
+behavior and a supported Windows release remain unqualified.
 
 See [the follow-up qualification report](QUALIFICATION.md) for bounded-writer
 tests, native Windows Server/NTFS reset evidence, and sustained-write limits.
@@ -249,6 +258,31 @@ ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test \
   -femit-bin=/path/to/staged-test.exe
 ```
 
+The cancellation-protected batch wait has a standalone regression:
+
+```sh
+ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test \
+  pkg/antfly/src/api/protected_future.zig -target x86_64-windows-gnu \
+  -O ReleaseFast -lc --test-no-exec -femit-bin=/path/to/protected-future-test.exe
+```
+
+The parked-worker regression must compile its executor owner and borrower as
+separate archives. From `zig/`, using the overlay for both commands:
+
+```sh
+zig build-lib -lc -static -target x86_64-windows-gnu -O Debug \
+  -femit-bin=/path/to/executor-worker.lib --dep antfly_executor_abi \
+  -Mroot=tools/windows/executor_bridge_worker.zig \
+  -Mantfly_executor_abi=lib/runtime/src/runtime_io_abi.zig
+zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
+  -femit-bin=/path/to/executor-bridge-test.exe /path/to/executor-worker.lib \
+  --dep antfly_executor_abi -Mroot=tools/windows/executor_bridge_host.zig \
+  -Mantfly_executor_abi=lib/runtime/src/runtime_io_abi.zig
+```
+
+It parks the owning workers before each of 64 borrowed dispatches/completions.
+Busy background tasks can conceal a reconstructed vtable's missed wakeups.
+
 Run `staged-test.exe` directly on Windows or through the isolated CrossOver
 bottle. It exercises an 8 MiB output, boundary-crossing patches, checksums,
 range validation, and a read failure that must prevent later publication.
@@ -259,7 +293,7 @@ and runtime ownership after storage shutdown. From `zig/`:
 ```sh
 ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test -lc \
   -target x86_64-windows-gnu -O ReleaseFast --test-no-exec \
-  -femit-bin=/path/to/storage-test.exe --test-filter 'native streaming' \
+  -femit-bin=/path/to/storage-test.exe --test-filter 'storage_io.' \
   --dep antfly_hash --dep antfly_platform --dep antfly_runtime_fs \
   -Mroot=pkg/antfly-embedded/src/local/windows_storage_test.zig \
   -Mantfly_hash=lib/hash/src/mod.zig -Mantfly_platform=lib/platform/src/root.zig \
@@ -273,8 +307,9 @@ It downloads `tests.zip` from the private bucket named in instance metadata
 Set `antfly-mode=serve` to start the HTTP runner, or `antfly-mode=check`
 to publish an offline integrity result in the `antfly/check` guest attribute.
 The archive contains `antfly.exe`, `compat-test.exe`, `staged-test.exe`,
-`storage-test.exe`, and `object-durability-test.exe`. Give the VM identity object-viewer
-access only to that bucket. Enable guest attributes and allow ports 8080/9090
+`storage-test.exe`, `object-durability-test.exe`, `protected-future-test.exe`,
+and `executor-bridge-test.exe`. Give the VM identity object-viewer access only
+to that bucket. Enable guest attributes and allow ports 8080/9090
 only through authenticated IAP forwarding. The script records the NTFS volume,
 Windows version, binary hash, and unit-test results in `antfly/status` guest
 attributes and `/status` on port 9090. `POST /check` on that port stops only the
