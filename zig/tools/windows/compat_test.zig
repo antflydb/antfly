@@ -41,6 +41,91 @@ test "Windows loopback sockets listen connect accept and transfer bytes" {
     try std.testing.expectError(error.EndOfStream, reader.interface.readSliceAll(&eof));
 }
 
+fn idleRead(io: std.Io, peer: std.Io.net.Stream, started: *std.Io.Event) std.Io.net.Stream.Reader.Error!usize {
+    var byte: [1]u8 = undefined;
+    started.set(io);
+    var buffers = [_][]u8{&byte};
+    return (try peer.readWithControl(io, &buffers, &.{})).data_len;
+}
+
+test "Windows canceling idle socket reads drains the operation and preserves the socket" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = native_platform.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const peer = try server.accept(io);
+    defer peer.close(io);
+    for (0..16) |iteration| {
+        var started: std.Io.Event = .unset;
+        var future = try io.concurrent(idleRead, .{ io, peer, &started });
+        defer _ = future.cancel(io) catch {};
+        try started.wait(io);
+        // Exercise both cancellation at submission and an already pending read.
+        if (iteration % 2 == 0) try io.sleep(.fromMilliseconds(20), .awake);
+        try std.testing.expectError(error.Canceled, future.cancel(io));
+        // The canceled request must be drained: it cannot consume this byte or
+        // keep references to the worker's stack after future.cancel returns.
+        var writer = client.writer(io, &.{});
+        try writer.interface.writeAll("x");
+        try writer.interface.flush();
+        var byte: [1]u8 = undefined;
+        var buffers = [_][]u8{&byte};
+        try std.testing.expectEqual(@as(usize, 1), (try peer.readWithControl(io, &buffers, &.{})).data_len);
+        try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+    }
+}
+
+fn fillSocket(io: std.Io, client: std.Io.net.Stream, started: *std.Io.Event) std.Io.net.Stream.Writer.Error!void {
+    var bytes: [64 * 1024]u8 = @splat('x');
+    started.set(io);
+    while (true) {
+        _ = try (try io.operate(.{ .net_write = .{
+            .socket_handle = client.socket.handle,
+            .header = &.{},
+            .data = &.{&bytes},
+            .splat = 1,
+            .control = &.{},
+        } })).net_write;
+    }
+}
+
+test "Windows socket deadlines and backpressured write cancellation complete" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = native_platform.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const peer = try server.accept(io);
+    defer peer.close(io);
+    // Threaded implements deadlines at the task level; Windows Batch socket
+    // concurrency is not supported. The losing read must finish cancellation
+    // before the select and its stack storage are released.
+    const Result = union(enum) { read: std.Io.net.Stream.Reader.Error!usize, timeout: std.Io.Cancelable!void };
+    var results: [2]Result = undefined;
+    var selection: std.Io.Select(Result) = .init(io, &results);
+    defer selection.cancelDiscard();
+    var reading: std.Io.Event = .unset;
+    try selection.concurrent(.read, idleRead, .{ io, peer, &reading });
+    try reading.wait(io);
+    try selection.concurrent(.timeout, std.Io.sleep, .{ io, .fromMilliseconds(20), .awake });
+    switch (try selection.await()) {
+        .timeout => |result| try result,
+        .read => return error.ReadCompletedBeforeDeadline,
+    }
+    selection.cancelDiscard();
+    var started: std.Io.Event = .unset;
+    var future = try io.concurrent(fillSocket, .{ io, client, &started });
+    defer future.cancel(io) catch {};
+    try started.wait(io);
+    try io.sleep(.fromMilliseconds(100), .awake);
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+}
+
 test "Windows secure entropy fills independent buffers" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     var first: [64]u8 = @splat(0);
@@ -91,12 +176,80 @@ test "Windows shim positional reads do not depend on the current offset" {
     const file = try directory.dir.createFile(io, "read.bin", .{ .read = true });
     defer file.close(io);
     try file.writeStreamingAll(io, "abcdefgh");
+    try io.vtable.fileSeekTo(io.userdata, file, 6);
     var bytes: [3]u8 = undefined;
     try std.testing.expectEqual(@as(isize, 3), native_platform.c.pread(file.handle, &bytes, bytes.len, 2));
     try std.testing.expectEqualStrings("cde", &bytes);
     try std.testing.expectEqual(@as(isize, 3), native_platform.c.pread(file.handle, &bytes, bytes.len, 0));
     try std.testing.expectEqualStrings("abc", &bytes);
     try std.testing.expectEqual(@as(isize, 0), native_platform.c.pread(file.handle, &bytes, bytes.len, 8));
+    var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;
+    var position: std.os.windows.FILE.POSITION_INFORMATION = undefined;
+    try std.testing.expectEqual(std.os.windows.NTSTATUS.SUCCESS, std.os.windows.ntdll.NtQueryInformationFile(file.handle, &iosb, &position, @sizeOf(@TypeOf(position)), .Position));
+    try std.testing.expectEqual(@as(i64, 6), position.CurrentByteOffset);
+}
+
+test "Windows positional read failures replace stale errno and reject write-only handles" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = native_platform.testing.io;
+    var directory = native_platform.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const file = try directory.dir.createFile(io, "write-only.bin", .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, "abc");
+    var byte: [1]u8 = undefined;
+    for ([_]std.c.E{ .SUCCESS, .INTR }) |stale| {
+        std.c._errno().* = @backingInt(stale);
+        try std.testing.expectEqual(@as(isize, -1), native_platform.c.pread(file.handle, &byte, 1, 0));
+        try std.testing.expectEqual(std.c.E.BADF, std.posix.errno(@as(isize, -1)));
+    }
+    std.c._errno().* = @backingInt(std.c.E.INTR);
+    try std.testing.expectEqual(@as(isize, -1), native_platform.c.pread(file.handle, &byte, 1, -1));
+    try std.testing.expectEqual(std.c.E.INVAL, std.posix.errno(@as(isize, -1)));
+    std.c._errno().* = @backingInt(std.c.E.INTR);
+    try std.testing.expectEqual(@as(isize, -1), native_platform.c.pread(std.os.windows.INVALID_HANDLE_VALUE, &byte, 1, 0));
+    try std.testing.expectEqual(std.c.E.BADF, std.posix.errno(@as(isize, -1)));
+}
+
+fn positionalReads(fd: std.c.fd_t, offset: std.c.off_t, expected: []const u8) !void {
+    var bytes: [3]u8 = undefined;
+    for (0..32) |_| {
+        try std.testing.expectEqual(@as(isize, 3), native_platform.c.pread(fd, &bytes, bytes.len, offset));
+        try std.testing.expectEqualStrings(expected, &bytes);
+    }
+}
+
+test "Windows concurrent positional reads preserve synchronous offsets and support retained overlapped handles" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = native_platform.testing.io;
+    var directory = native_platform.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const writer = try directory.dir.createFile(io, "parallel.bin", .{ .read = true });
+    defer writer.close(io);
+    try writer.writeStreamingAll(io, "abcdefgh");
+    try io.vtable.fileSeekTo(io.userdata, writer, 6);
+    const positional = try native_platform.filesystem.openPositionalReadOnly(io, directory.dir, "parallel.bin");
+    defer positional.close(io);
+    try std.testing.expect(positional.flags.nonblocking);
+    for ([_]std.c.fd_t{ writer.handle, positional.handle }) |fd| {
+        var first = try io.concurrent(positionalReads, .{ fd, 0, "abc" });
+        defer _ = first.cancel(io) catch {};
+        var second = try io.concurrent(positionalReads, .{ fd, 2, "cde" });
+        defer _ = second.cancel(io) catch {};
+        try first.await(io);
+        try second.await(io);
+        var bytes: [3]u8 = undefined;
+        try std.testing.expectEqual(@as(isize, 0), native_platform.c.pread(fd, &bytes, bytes.len, 1 << 32));
+        try std.testing.expectEqual(@as(isize, 0), native_platform.c.pread(fd, &bytes, 0, 0));
+    }
+    var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;
+    var position: std.os.windows.FILE.POSITION_INFORMATION = undefined;
+    try std.testing.expectEqual(std.os.windows.NTSTATUS.SUCCESS, std.os.windows.ntdll.NtQueryInformationFile(writer.handle, &iosb, &position, @sizeOf(@TypeOf(position)), .Position));
+    try std.testing.expectEqual(@as(i64, 6), position.CurrentByteOffset);
+    // The same handle also works with the executor's typed positional API.
+    var bytes: [3]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), try positional.readPositional(io, &.{&bytes}, 2));
+    try std.testing.expectEqualStrings("cde", &bytes);
 }
 
 test "Windows shim clocks advance and condition timeout preserves the mutex" {

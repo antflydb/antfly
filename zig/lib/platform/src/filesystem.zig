@@ -16,6 +16,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Open a read-only file whose handle is retained by its caller. Windows uses
+/// overlapped I/O from the first open, so repeated c.pread calls do not reopen
+/// the file. Close with File.close using the same owning executor.
+pub fn openPositionalReadOnly(io: std.Io, dir: std.Io.Dir, path: []const u8) std.Io.File.OpenError!std.Io.File {
+    if (builtin.os.tag == .windows) return @import("threaded_windows.zig").openPositionalReadOnly(dir, path);
+    return dir.openFile(io, path, .{});
+}
+
 /// Temporary file root selected from the native host environment.
 pub fn temporaryDirectory() []const u8 {
     const env = @import("env.zig");

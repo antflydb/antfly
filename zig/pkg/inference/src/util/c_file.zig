@@ -738,7 +738,7 @@ fn unmap(data: []align(std.heap.page_size_min) u8) void {
 
 fn openReadOnlyZ(path_z: [:0]const u8) !std.posix.fd_t {
     if (comptime builtin.os.tag == .windows) {
-        const file = try std.Io.Dir.cwd().openFile(windowsIo(), path_z, .{});
+        const file = try native_platform.filesystem.openPositionalReadOnly(windowsIo(), .cwd(), path_z);
         return file.handle;
     }
     // std.posix.openatZ preserves actionable failures such as AccessDenied,

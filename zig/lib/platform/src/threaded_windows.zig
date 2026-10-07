@@ -866,6 +866,9 @@ const Thread = struct {
 
     id: std.Thread.Id,
     handle: Handle,
+    // Immutable after worker publication; closed only when the worker exits.
+    // Wine does not reliably implement NtAlertThread for socket event waits.
+    wine_cancel_event: ?windows.HANDLE = null,
 
     status: std.atomic.Value(Status),
 
@@ -1351,6 +1354,7 @@ const Thread = struct {
 
             .blocked_alertable_canceling => {
                 if (!is_windows) unreachable;
+                if (thread.wine_cancel_event) |event| @import("windows_native.zig").signalIoEvent(event);
                 return switch (windows.ntdll.NtAlertThread(thread.handle)) {
                     .SUCCESS => true,
                     else => false,
@@ -1814,7 +1818,12 @@ fn worker(t: *Threaded) void {
             &windows.teb().ClientId,
         ) == .SUCCESS);
     }
+    if (is_windows and @import("windows_native.zig").isWine()) {
+        thread.wine_cancel_event = @import("windows_native.zig").createIoEvent() catch
+            @panic("cannot create worker cancellation event");
+    }
     defer if (is_windows) {
+        if (thread.wine_cancel_event) |event| windows.CloseHandle(event);
         windows.CloseHandle(thread.handle);
     };
 
@@ -5163,6 +5172,19 @@ fn dirOpenFileWindows(
     const sub_path_w = sub_path_w_array.span();
     const dir_handle = if (Dir.path.isAbsoluteWindowsWtf16(sub_path_w)) null else dir.handle;
     return dirOpenFileWtf16(dir_handle, sub_path_w, flags);
+}
+
+/// Open an owned read-only file for repeated positional reads. Unlike ordinary
+/// streaming opens, this file object has no shared position for reads to move.
+pub fn openPositionalReadOnly(dir: Dir, path: []const u8) File.OpenError!File {
+    const path_w = try sliceToPrefixedFileW(dir.handle, path, .{});
+    const handle = try OpenFile(path_w.span(), .{
+        .dir = dir.handle,
+        .access_mask = .{ .STANDARD = .{ .SYNCHRONIZE = true }, .GENERIC = .{ .READ = true } },
+        .creation = .OPEN,
+        .io_mode = .ASYNCHRONOUS,
+    });
+    return .{ .handle = handle, .flags = .{ .nonblocking = true } };
 }
 
 pub fn dirOpenFileWtf16(
@@ -13054,6 +13076,23 @@ fn netReadPosix(fd: net.Socket.Handle, data: [][]u8, control: []u8) net.Stream.R
     }
 }
 
+/// Overlapped Winsock requests signal an event. Register the wait with the
+/// executor's alertable cancellation state, rather than treating Winsock as
+/// synchronous NT I/O. The request owner cancels and drains on any wait error.
+fn waitSocketEvent(event: windows.HANDLE) error{ Canceled, Unexpected }!void {
+    const compat = @import("windows_native.zig");
+    const cancellation = if (Thread.current) |thread| thread.wine_cancel_event else null;
+    while (true) {
+        // Clear stale signals before registering. If cancellation races this
+        // reset, start observes it; if it races start, the event wakes us.
+        if (cancellation) |wake| compat.resetIoEvent(wake);
+        const syscall: AlertableSyscall = try .start();
+        const completed = compat.waitIoEvent(event, cancellation) catch |err| return syscall.fail(err);
+        syscall.finish();
+        if (completed) return;
+    }
+}
+
 fn netReadWindows(socket_handle: net.Socket.Handle, data: [][]u8) net.Stream.Reader.Error!usize {
     var iovecs: [max_iovecs_len]windows.AFD.WSABUF(.@"var") = undefined;
     var len: u32 = 0;
@@ -13064,10 +13103,8 @@ fn netReadWindows(socket_handle: net.Socket.Handle, data: [][]u8) net.Stream.Rea
 
     const compat = @import("windows_native.zig");
     if (compat.isWine()) {
-        const syscall: Syscall = try .start();
-        const received = compat.receiveBuffers(socket_handle, iovecs[0..len]) catch |err| return syscall.fail(err);
-        syscall.finish();
-        return received;
+        try Thread.checkCancel();
+        return compat.receiveBuffers(socket_handle, iovecs[0..len], waitSocketEvent);
     }
     const iosb = try deviceIoControl(&.{
         .file = .{ .handle = socket_handle, .flags = .{ .nonblocking = true } },
@@ -13585,10 +13622,8 @@ fn netWriteWindows(
 
     const compat = @import("windows_native.zig");
     if (compat.isWine()) {
-        const syscall: Syscall = try .start();
-        const sent = compat.sendBuffers(handle, iovecs[0..len]) catch |err| return syscall.fail(err);
-        syscall.finish();
-        return sent;
+        try Thread.checkCancel();
+        return compat.sendBuffers(handle, iovecs[0..len], waitSocketEvent);
     }
     const iosb = try deviceIoControl(&.{
         .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
@@ -19924,6 +19959,7 @@ const OpenFileOptions = struct {
     sa: ?*const windows.SECURITY_ATTRIBUTES = null,
     share_access: windows.FILE.SHARE = .VALID_FLAGS,
     creation: windows.FILE.CREATE_DISPOSITION,
+    io_mode: @FieldType(windows.FILE.MODE, "IO") = .SYNCHRONOUS_NONALERT,
     filter: Filter = .non_directory_only,
     /// If false, tries to open path as a reparse point without dereferencing it.
     /// Defaults to true.
@@ -19973,7 +20009,7 @@ fn OpenFile(sub_path_w: []const u16, options: OpenFileOptions) OpenError!windows
             .{
                 .DIRECTORY_FILE = options.filter == .dir_only,
                 .NON_DIRECTORY_FILE = options.filter == .non_directory_only,
-                .IO = .SYNCHRONOUS_NONALERT,
+                .IO = options.io_mode,
                 .OPEN_REPARSE_POINT = !options.follow_symlinks,
             },
             null,

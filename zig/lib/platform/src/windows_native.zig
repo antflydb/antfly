@@ -38,6 +38,15 @@ extern "kernel32" fn FreeLibrary(module: *anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn UnmapViewOfFile(base: *const anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn ReadFile(file: std.os.windows.HANDLE, buffer: [*]u8, len: u32, read: ?*u32, overlapped: ?*Overlapped) callconv(.winapi) BOOL;
+extern "kernel32" fn SetEvent(event: windows.HANDLE) callconv(.winapi) BOOL;
+extern "kernel32" fn ResetEvent(event: windows.HANDLE) callconv(.winapi) BOOL;
+extern "kernel32" fn WaitForMultipleObjectsEx(count: u32, handles: [*]const windows.HANDLE, wait_all: BOOL, milliseconds: u32, alertable: BOOL) callconv(.winapi) u32;
+extern "kernel32" fn ReOpenFile(file: windows.HANDLE, access: u32, share: u32, flags: u32) callconv(.winapi) windows.HANDLE;
+extern "kernel32" fn CreateEventW(attributes: ?*anyopaque, manual_reset: BOOL, initial_state: BOOL, name: ?[*:0]const u16) callconv(.winapi) ?windows.HANDLE;
+extern "kernel32" fn GetOverlappedResult(file: windows.HANDLE, overlapped: *Overlapped, transferred: *u32, wait: BOOL) callconv(.winapi) BOOL;
+extern "kernel32" fn CancelIoEx(file: windows.HANDLE, overlapped: *Overlapped) callconv(.winapi) BOOL;
+extern "ntdll" fn RtlNtStatusToDosError(status: windows.NTSTATUS) callconv(.winapi) u32;
+extern "ws2_32" fn WSAGetOverlappedResult(socket: usize, overlapped: *Overlapped, transferred: *u32, wait: BOOL, flags: *u32) callconv(.winapi) BOOL;
 extern "bcrypt" fn BCryptGenRandom(algorithm: ?*anyopaque, buffer: [*]u8, len: u32, flags: u32) callconv(.winapi) windows.NTSTATUS;
 extern "ws2_32" fn setsockopt(socket: windows.HANDLE, level: i32, option: i32, value: [*]const u8, len: i32) callconv(.winapi) c_int;
 extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
@@ -53,8 +62,8 @@ extern "ws2_32" fn shutdown(socket: usize, how: i32) callconv(.winapi) c_int;
 const Overlapped = extern struct {
     internal: usize = 0,
     internal_high: usize = 0,
-    offset: u32,
-    offset_high: u32,
+    offset: u32 = 0,
+    offset_high: u32 = 0,
     event: ?std.os.windows.HANDLE = null,
 };
 
@@ -158,31 +167,78 @@ pub fn acceptSocket(socket: windows.HANDLE, address: []u8) std.Io.net.Server.Acc
     return @ptrFromInt(accepted);
 }
 
-pub fn sendBuffers(socket: windows.HANDLE, buffers: []const windows.AFD.WSABUF(.@"const")) std.Io.net.Stream.Writer.Error!usize {
+/// Each operation owns its event and OVERLAPPED until completion, including
+/// after cancellation. The owning executor supplies an alertable wait so a
+/// cancellation wakes the worker without closing a socket shared by other tasks.
+pub fn sendBuffers(socket: windows.HANDLE, buffers: []const windows.AFD.WSABUF(.@"const"), comptime wait: anytype) std.Io.net.Stream.Writer.Error!usize {
+    var operation: Overlapped = .{ .event = try createIoEvent() };
+    defer windows.CloseHandle(operation.event.?);
     var sent: u32 = 0;
-    if (WSASend(@intFromPtr(socket), buffers.ptr, @intCast(buffers.len), &sent, 0, null, null) != 0) {
-        return switch (WSAGetLastError()) {
-            10004 => error.Canceled,
-            10053, 10054, 10058 => error.ConnectionResetByPeer,
-            10060 => error.ConnectionTimedOut,
-            else => socketError(),
-        };
-    }
-    return sent;
+    if (WSASend(@intFromPtr(socket), buffers.ptr, @intCast(buffers.len), &sent, 0, &operation, null) == 0) return sent;
+    const code = WSAGetLastError();
+    if (code != 997) return streamSocketError(code); // WSA_IO_PENDING
+    return completeSocketOperation(socket, &operation, wait);
 }
 
-pub fn receiveBuffers(socket: windows.HANDLE, buffers: []const windows.AFD.WSABUF(.@"var")) std.Io.net.Stream.Reader.Error!usize {
+pub fn receiveBuffers(socket: windows.HANDLE, buffers: []const windows.AFD.WSABUF(.@"var"), comptime wait: anytype) std.Io.net.Stream.Reader.Error!usize {
+    var operation: Overlapped = .{ .event = try createIoEvent() };
+    defer windows.CloseHandle(operation.event.?);
     var received: u32 = 0;
     var flags: u32 = 0;
-    if (WSARecv(@intFromPtr(socket), buffers.ptr, @intCast(buffers.len), &received, &flags, null, null) != 0) {
-        return switch (WSAGetLastError()) {
-            10004 => error.Canceled,
-            10053, 10054, 10058 => error.ConnectionResetByPeer,
-            10060 => error.ConnectionTimedOut,
-            else => socketError(),
-        };
-    }
-    return received;
+    if (WSARecv(@intFromPtr(socket), buffers.ptr, @intCast(buffers.len), &received, &flags, &operation, null) == 0) return received;
+    const code = WSAGetLastError();
+    if (code != 997) return streamSocketError(code);
+    return completeSocketOperation(socket, &operation, wait);
+}
+
+pub fn createIoEvent() error{ SystemResources, Unexpected }!windows.HANDLE {
+    return CreateEventW(null, 1, 0, null) orelse switch (GetLastError()) {
+        8, 14, 1450 => error.SystemResources,
+        else => |code| windows.unexpectedError(@fromBackingInt(code)),
+    };
+}
+
+pub fn signalIoEvent(event: windows.HANDLE) void {
+    std.debug.assert(SetEvent(event) != 0);
+}
+
+pub fn resetIoEvent(event: windows.HANDLE) void {
+    std.debug.assert(ResetEvent(event) != 0);
+}
+
+/// True means the I/O completed; false means cancellation or an APC woke us.
+/// The caller rechecks its executor cancellation state after a wakeup.
+pub fn waitIoEvent(event: windows.HANDLE, cancellation: ?windows.HANDLE) error{Unexpected}!bool {
+    const handles = [_]windows.HANDLE{ event, cancellation orelse event };
+    return switch (WaitForMultipleObjectsEx(if (cancellation != null) 2 else 1, &handles, 0, 0xffffffff, 1)) {
+        0 => true,
+        1, 0xc0 => false, // cancellation event or WAIT_IO_COMPLETION
+        else => windows.unexpectedError(@fromBackingInt(GetLastError())),
+    };
+}
+
+fn completeSocketOperation(socket: windows.HANDLE, operation: *Overlapped, comptime wait: anytype) error{ Canceled, ConnectionResetByPeer, ConnectionTimedOut, SystemResources, Unexpected }!usize {
+    var transferred: u32 = 0;
+    var flags: u32 = 0;
+    wait(operation.event.?) catch |err| {
+        // Cancel only this request. A completion racing cancellation is valid;
+        // either way, drain before the event, buffers or OVERLAPPED go away.
+        _ = CancelIoEx(socket, operation);
+        _ = WSAGetOverlappedResult(@intFromPtr(socket), operation, &transferred, 1, &flags);
+        return err;
+    };
+    if (WSAGetOverlappedResult(@intFromPtr(socket), operation, &transferred, 0, &flags) == 0) return streamSocketError(WSAGetLastError());
+    return transferred;
+}
+
+fn streamSocketError(code: c_int) error{ Canceled, ConnectionResetByPeer, ConnectionTimedOut, SystemResources, Unexpected } {
+    return switch (code) {
+        995, 10004 => error.Canceled,
+        10053, 10054, 10058 => error.ConnectionResetByPeer,
+        10060 => error.ConnectionTimedOut,
+        10055 => error.SystemResources,
+        else => windows.unexpectedError(@fromBackingInt(@intCast(@as(u32, @intCast(code))))),
+    };
 }
 
 pub fn shutdownSocket(socket: windows.HANDLE, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
@@ -385,15 +441,65 @@ pub fn munmap(addr: *align(std.heap.page_size_min) const anyopaque, len: usize) 
     return if (UnmapViewOfFile(addr) != 0) 0 else -1;
 }
 
-/// Positional read on a Win32 file handle (std.posix.fd_t is HANDLE here).
+/// POSIX-style positional read. Synchronous Windows file objects update their
+/// shared position even with an explicit OVERLAPPED offset. Reopen that object
+/// asynchronously (never by pathname), leaving the caller's position alone.
+/// Already asynchronous handles need no reopen. There is deliberately no global
+/// handle cache: handle reuse and concurrent close would make it unsafe.
 pub fn pread(fd: c.fd_t, buf: [*]u8, nbyte: usize, offset: c.off_t) isize {
-    const position: u64 = @bitCast(@as(i64, offset));
-    var overlapped: Overlapped = .{ .offset = @truncate(position), .offset_high = @truncate(position >> 32) };
+    if (offset < 0) return failErrno(.INVAL);
+    var iosb: windows.IO_STATUS_BLOCK = undefined;
+    var access: windows.FILE.ACCESS_INFORMATION = undefined;
+    var status = windows.ntdll.NtQueryInformationFile(fd, &iosb, &access, @sizeOf(@TypeOf(access)), .Access);
+    if (status != .SUCCESS) return failWindowsError(RtlNtStatusToDosError(status));
+    // ReOpenFile must not grant a write-only caller new read access.
+    if (!access.AccessFlags.SPECIFIC.FILE.READ_DATA) return failErrno(.BADF);
+    if (nbyte == 0) return 0;
+    var mode: windows.FILE.MODE.INFORMATION = undefined;
+    status = windows.ntdll.NtQueryInformationFile(fd, &iosb, &mode, @sizeOf(@TypeOf(mode)), .Mode);
+    if (status != .SUCCESS) return failWindowsError(RtlNtStatusToDosError(status));
+    const reopened = mode.Mode.IO != .ASYNCHRONOUS;
+    const handle = if (reopened) ReOpenFile(fd, 1, 1 | 2 | 4, 0x40000000) else fd;
+    if (handle == windows.INVALID_HANDLE_VALUE) return failWindowsError(GetLastError());
+    defer if (reopened) windows.CloseHandle(handle);
+    const event = CreateEventW(null, 1, 0, null) orelse return failWindowsError(GetLastError());
+    defer windows.CloseHandle(event);
+    const position: u64 = @intCast(offset);
+    var operation: Overlapped = .{ .offset = @truncate(position), .offset_high = @truncate(position >> 32), .event = event };
     var read: u32 = 0;
-    const len: u32 = @intCast(@min(nbyte, std.math.maxInt(u32)));
-    if (ReadFile(fd, buf, len, &read, &overlapped) == 0) {
-        // ERROR_HANDLE_EOF (38) reports a read at or past end of file.
-        return if (GetLastError() == 38) 0 else -1;
+    const len: u32 = @intCast(@min(nbyte, std.math.maxInt(u32), std.math.maxInt(isize)));
+    if (ReadFile(handle, buf, len, &read, &operation) == 0) {
+        const code = GetLastError();
+        if (code == 38) return 0; // ERROR_HANDLE_EOF
+        if (code != 997) return failWindowsError(code); // ERROR_IO_PENDING
+        // Keep all request storage alive until completion, also on error.
+        if (GetOverlappedResult(handle, &operation, &read, 1) == 0) {
+            const completed_code = GetLastError();
+            if (completed_code == 38) return 0;
+            return failWindowsError(completed_code);
+        }
     }
-    return read;
+    return @intCast(read);
+}
+
+fn failErrno(value: c.E) isize {
+    c._errno().* = @backingInt(value);
+    return -1;
+}
+
+fn failWindowsError(code: u32) isize {
+    return failErrno(switch (code) {
+        2, 3 => .NOENT,
+        4 => .MFILE,
+        5, 32, 33 => .ACCES,
+        6 => .BADF,
+        8, 14, 1450 => .NOMEM,
+        19 => .ROFS,
+        50 => .NOSYS,
+        87, 131 => .INVAL,
+        109 => .PIPE,
+        112 => .NOSPC,
+        995 => .INTR,
+        else => .IO,
+    });
 }

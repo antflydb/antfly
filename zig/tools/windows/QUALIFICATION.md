@@ -645,3 +645,41 @@ Both disposable qualification environments have been deleted. No ingress
 firewall rules or tunnels were created. The stock Zig library remains unchanged;
 the historical physical-durability qualification and experimental Windows
 status retain the limits stated above.
+
+
+## Positional reads and stream cancellation (2026-10-07)
+
+This follow-up applies to PR head `1032869517` using the same unmodified
+Zig 0.17.0 library. The platform implementation now owns overlapped stream
+requests and Wine worker cancellation events, translates positional-read
+failures into CRT `errno`, and preserves shared file offsets. Model-file
+readers retain an overlapped handle instead of reopening on each read.
+
+Windows Server 2022 build `10.0.20348.0` on native NTFS passes all 14 Debug and
+ReleaseFast executables: **176 passed, 50 capability skips, zero failures and
+zero leaks**. Every executable hash matches `manifest.json`. The nine
+compatibility tests pass in each mode, including idle-read cancellation and
+socket reuse, task-level deadlines, backpressured write cancellation, stale
+`errno`, unchanged file offsets, concurrent reads and retained overlapped
+handles. Windows Threaded Batch socket concurrency remains unavailable;
+the deadline test uses task selection.
+
+CrossOver passes ten executables in both modes: **90 passed, 42 capability
+skips, zero failures and zero leaks**. The existing filesystem/Lite replacement
+cases are covered by the native NTFS run. macOS platform unit and process
+checks pass. The full Windows application build and native/browser module
+boundary audits pass **59/59 steps**.
+
+The rebuilt application SHA-256 is
+`ac60ad8ab6e5a985c76c930df30d94be6a35fec2b461f6a0a066e0965be3b097`.
+Its CrossOver HTTP smoke passes 64 queries across forced termination/reopen,
+verifies all 32 acknowledged documents and full-text entries, and reports
+`valid: true` with zero tail bytes. This run does not add native application
+VM-reset durability qualification.
+
+Evidence is retained in `/private/tmp/pr987-fix-review-tests` (hashed manifest,
+native and Wine results, source hashes and verified cleanup),
+`/private/tmp/pr987-io-fix-app-build.log`, and
+`/private/tmp/pr987-io-fix-app-smoke`. Both disposable VM environments and
+all temporary boot disks, buckets, service accounts, subnets and networks
+have been deleted; their absence was verified.

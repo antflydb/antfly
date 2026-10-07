@@ -99,6 +99,27 @@ Windows retains CNG. TCP uses Winsock under Wine and native AFD elsewhere.
 Hardlinks use `NtSetInformationFile(FileLinkInformation)`, preserve source
 identity, and refuse replacing an existing destination.
 
+Wine stream reads and writes use an event and `OVERLAPPED` request owned by the
+operation. Each Wine worker also owns a cancellation event; the wait observes
+both events. Cancellation calls `CancelIoEx` for that request and drains its
+completion before releasing buffers, the event or the worker's stack. It does
+not close a shared socket. Native Windows retains the AFD implementation.
+Compatibility tests cover pending-read cancellation, subsequent socket reuse,
+task-level deadlines, and backpressured write cancellation. Windows Threaded
+Batch socket concurrency remains unavailable; deadlines use task selection.
+
+The `platform.c.pread` contract preserves the caller's shared file position and
+sets CRT `errno` on every failure, including invalid offsets and write-only
+handles. Synchronous handles are reopened by object identity with overlapped
+I/O for the duration of the read; no pathname lookup or seek/restore is used.
+Completion is drained before releasing request storage. Existing overlapped
+handles read directly. Owners performing repeated reads should use
+`platform.filesystem.openPositionalReadOnly` and retain the returned file;
+model-file readers do this to avoid reopening on each read. Handle ownership
+stays with the caller, which closes it through its executor. There is no global
+cache keyed by reusable Windows handle values. Tests check unchanged offsets,
+concurrent reads, stale `errno`, EOF, and offsets beyond 4 GiB.
+
 ## Source changes and their limits
 
 - `runtime_process.zig`, `platform.process.argsIterator`: Windows `std.process.Args`
