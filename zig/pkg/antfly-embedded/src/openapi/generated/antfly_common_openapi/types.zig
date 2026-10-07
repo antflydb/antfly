@@ -697,9 +697,9 @@ pub const ConnectionKind = enum {
 
 pub const DeciderConfig = struct {
     provider: []const u8,
-    /// Required for Antfly; Jev defaults to jev-latest.
+    /// Required for Antfly and OpenAI; Jev defaults to jev-latest.
     model: ?[]const u8 = null,
-    /// Provider base URL; endpoint path is selected by provider.
+    /// Provider base URL; endpoint path is selected by provider. OpenAI defaults to https://api.openai.com/v1 and appends /decisions.
     url: ?[]const u8 = null,
     /// API key or secret reference. Defaults to the provider environment variable.
     api_key: ?[]const u8 = null,
