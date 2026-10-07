@@ -790,7 +790,7 @@ pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytyp
                 const output = try context.arena.alloc(Json, values.len);
                 const nulls = try context.arena.alloc(bool, values.len);
                 for (values, output, nulls, bound.outputs) |value, *cell, *is_null, program| {
-                    cell.* = try context.outputCell(value.value, program.output_type.kind);
+                    cell.* = try context.outputDatum(value, program.output_type.kind, program.output_type.element_type);
                     is_null.* = value.sql_null;
                 }
                 rows[index - offset] = output;
@@ -855,7 +855,7 @@ pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytyp
         const values = try context.arena.alloc(Json, row.values.len);
         const bits = try context.arena.alloc(bool, row.values.len);
         for (row.values, values, bits, bound.outputs) |value, *cell, *is_null, program| {
-            cell.* = try context.outputCell(value.value, program.output_type.kind);
+            cell.* = try context.outputDatum(value, program.output_type.kind, program.output_type.element_type);
             is_null.* = value.sql_null;
         }
         out.* = values;

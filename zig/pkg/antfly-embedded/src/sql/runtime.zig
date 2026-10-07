@@ -353,6 +353,18 @@ pub const Context = struct {
         return self.outputValue(value_);
     }
 
+    /// Preserve the complete typed value until the public result boundary.
+    /// Non-NULL arrays are owned envelopes, never their JSON-null placeholder.
+    pub fn outputDatum(self: Context, datum: Datum, kind: ?ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !Json {
+        if (kind == .array) {
+            const checked = try describe.coerceDatum(self.arena, datum, .array, element_type);
+            if (checked.sql_null) return .null;
+            return @import("array_wire.zig").toJsonLeaky(self.arena, checked.array.?.*, .{ .values = .{ .bytes = self.limits.retained_bytes }, .wire_bytes = self.limits.retained_bytes });
+        }
+        if (datum.array != null) return error.SqlTypeMismatch;
+        return self.outputCell(datum.value, kind);
+    }
+
     fn value(self: Context, input: ast.Value, column: catalog.Column) !Json {
         if (input == .string and column.type == .json)
             return self.binding.json_literals.get(input.string) orelse error.InvalidSqlBackendResponse;
@@ -671,12 +683,12 @@ pub const Context = struct {
                         const input_cell: catalog.Row.Cell = if (program) |expression| blk: {
                             _ = expression;
                             const evaluated = projection_values[index].?[selected_positions[row_index].?];
-                            break :blk .{ .value = evaluated.value, .sql_null = evaluated.sql_null };
+                            break :blk evaluated;
                         } else try row.cell(field);
-                        const typed = try coerce(self.arena, input_cell.value, column.type);
-                        is_null.* = input_cell.sql_null;
+                        const typed = try describe.coerceDatum(self.arena, input_cell, column.type, column.element_type);
+                        is_null.* = typed.sql_null;
                         // SQL bigint results are lossless even in JS SDKs.
-                        cell.* = try self.outputCell(typed, column.type);
+                        cell.* = try self.outputDatum(typed, column.type, column.element_type);
                         retained = std.math.add(usize, retained, jsonSize(cell.*)) catch return error.SqlProgramLimitExceeded;
                         if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
                     }
@@ -732,7 +744,7 @@ pub const Context = struct {
                         const cells = try self.arena.alloc(Json, values.len);
                         const nulls = try self.arena.alloc(bool, values.len);
                         for (values, cells, nulls, columns) |datum, *cell, *flag, column| {
-                            cell.* = try self.outputCell(datum.value, column.type);
+                            cell.* = try self.outputDatum(datum, column.type, column.element_type);
                             flag.* = datum.sql_null;
                         }
                         try rows.append(self.arena, cells);
@@ -746,7 +758,7 @@ pub const Context = struct {
                 const cells = try self.arena.alloc(Json, row.values.len);
                 const nulls = try self.arena.alloc(bool, row.values.len);
                 for (row.values, cells, nulls, columns) |value_, *cell, *is_null, column| {
-                    cell.* = try self.outputCell(value_.value, column.type);
+                    cell.* = try self.outputDatum(value_, column.type, column.element_type);
                     is_null.* = value_.sql_null;
                 }
                 try rows.append(self.arena, cells);
@@ -838,7 +850,7 @@ pub const Context = struct {
             const program = optional orelse return error.InvalidSqlBackendResponse;
             if (!evaluation.reset(.retain_capacity)) return error.OutOfMemory;
             const evaluated = try self.evaluate(evaluation.allocator(), program, &.{});
-            cell.* = try self.outputCell(evaluated.value, program.output_type.kind);
+            cell.* = try self.outputDatum(evaluated, program.output_type.kind, program.output_type.element_type);
             is_null.* = evaluated.sql_null;
         }
         rows[0] = cells;
@@ -1301,7 +1313,7 @@ pub const Context = struct {
                     const values = try self.arena.alloc(Json, projected.len);
                     const sql_nulls = try self.arena.alloc(bool, projected.len);
                     for (projected, values, sql_nulls, binding.columns) |value_, *cell_value, *is_null, column| {
-                        cell_value.* = try self.outputCell(value_.value, column.type);
+                        cell_value.* = try self.outputDatum(value_, column.type, column.element_type);
                         is_null.* = value_.sql_null;
                     }
                     cells.* = values;
@@ -1380,7 +1392,7 @@ pub const Context = struct {
                 const output = try self.arena.alloc(Json, values.len);
                 const nulls = try self.arena.alloc(bool, values.len);
                 for (values, output, nulls, self.binding.columns) |datum, *cell, *flag, column| {
-                    cell.* = try self.outputCell(datum.value, column.type);
+                    cell.* = try self.outputDatum(datum, column.type, column.element_type);
                     flag.* = datum.sql_null;
                 }
                 rows[index] = output;
@@ -1457,6 +1469,31 @@ fn jsonSize(value: Json) usize {
         },
         else => @sizeOf(Json),
     };
+}
+
+test "SQL result boundary preserves array ownership descriptors and NULL provenance" {
+    const a = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    var fixture: TestBackend = .{};
+    const context: Context = .{ .alloc = a, .arena = arena.allocator(), .backend = fixture.iface(), .binding = undefined, .parameters = &.{}, .limits = .{} };
+    var input = try @import("array_text.zig").decode(a, .jsonb, "[0:2]={\"null\",NULL,\"{\\\"a\\\":[1,2]}\"}", .{});
+    const output = try context.outputDatum(Datum.typedArray(&input.value), .array, .jsonb);
+    input.deinit();
+    const values = output.object.get("values").?.array.items;
+    const flags = output.object.get("sql_nulls").?.array.items;
+    try std.testing.expect(values[0] == .null and !flags[0].bool);
+    try std.testing.expect(values[1] == .null and flags[1].bool);
+    try std.testing.expectEqualStrings("2", values[2].object.get("a").?.array.items[1].number_string);
+    try std.testing.expectEqual(@as(i64, 0), output.object.get("dimensions").?.array.items[0].object.get("lower_bound").?.integer);
+    try std.testing.expect((try context.outputDatum(.{}, .array, .jsonb)) == .null);
+    try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.json(.null), .array, .jsonb));
+    var integers = try @import("array_text.zig").decode(a, .int64, "{9223372036854775807,NULL}", .{});
+    defer integers.deinit();
+    const big = try context.outputDatum(Datum.typedArray(&integers.value), .array, .int64);
+    try std.testing.expectEqualStrings("9223372036854775807", big.object.get("values").?.array.items[0].string);
+    try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.typedArray(&integers.value), .array, .int32));
+    try std.testing.expectError(error.SqlTypeMismatch, context.outputDatum(Datum.typedArray(&integers.value), .json, null));
 }
 
 const TestBackend = struct {

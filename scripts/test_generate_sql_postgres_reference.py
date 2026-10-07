@@ -1500,6 +1500,44 @@ class PostgresReferenceTest(unittest.TestCase):
                         )
                 self.assertEqual("22003", error.exception.sqlstate)
 
+    def test_typed_array_streamed_text_output_contracts(self):
+        # These exact byte strings are also asserted against the native
+        # streaming encoder. PostgreSQL independently decodes their escaping,
+        # bounds, numeric domains and distinction between JSON and SQL null.
+        cases = [
+            (
+                "text",
+                r'[0:1][3:4]={{NULL,"NULL"},{"a\"b","c\\d"}}',
+                r'[0:1][3:4]={{NULL,"NULL"},{"a\"b","c\\d"}}',
+            ),
+            (
+                "int8",
+                "{-9223372036854775808,9223372036854775807,NULL}",
+                "{-9223372036854775808,9223372036854775807,NULL}",
+            ),
+            (
+                "real",
+                "{NaN,Infinity,-Infinity,-0,1.5}",
+                "{NaN,Infinity,-Infinity,-0,1.5}",
+            ),
+            ("bool", "{true,false,NULL}", "{t,f,NULL}"),
+            (
+                "jsonb",
+                r'{"null",NULL,"[1,2]","{\"k\":\"a\\\\b\"}"}',
+                r'{"null",NULL,"[1,2]","{\"k\":\"a\\\\b\"}"}',
+            ),
+            ("text", "{}", "{}"),
+        ]
+        for kind, source, emitted in cases:
+            with self.subTest(kind=kind), self.db.transaction(force_rollback=True):
+                self.assertEqual(
+                    (True,),
+                    self.db.execute(
+                        f"SELECT %s::{kind}[] IS NOT DISTINCT FROM %s::{kind}[]",
+                        (source, emitted),
+                    ).fetchone(),
+                )
+
     def test_typed_array_text_input_contracts(self):
         import json
         from pathlib import Path

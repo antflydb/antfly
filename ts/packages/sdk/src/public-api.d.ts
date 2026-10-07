@@ -4490,11 +4490,37 @@ export interface components {
          * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
          * @enum {string}
          */
-        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "unknown";
+        SQLColumnType: "string" | "uuid" | "integer" | "number" | "boolean" | "datetime" | "json" | "array" | "unknown";
+        /**
+         * @description Bound SQL array element type, including numeric widths. Never inferred from JSON value shape.
+         * @enum {string}
+         */
+        SQLArrayElementType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb";
+        SQLArrayDimension: {
+            length: number;
+            lower_bound: number;
+        };
+        /**
+         * @description Non-NULL SQL array result. Elements are flat, row-major values using the
+         *     column's element_type. Their count equals the product of dimension
+         *     lengths. Empty arrays have no dimensions and no elements. Integer
+         *     elements are canonical decimal strings. Floating elements are JSON
+         *     numbers, or the strings NaN, Infinity and -Infinity. Element null flags
+         *     distinguish SQL NULL from the JSON literal null in jsonb arrays. A NULL
+         *     array is an outer null result cell, not an empty array or this envelope.
+         */
+        SQLArrayValue: {
+            dimensions: components["schemas"]["SQLArrayDimension"][];
+            values: unknown[];
+            /** @description Exactly one flag per value. True requires a null value; false permits a JSON null only for jsonb elements. */
+            sql_nulls: boolean[];
+        };
         SQLColumn: {
             /** @description Display label. Labels need not be unique; rows use matching ordinal positions. */
             name: string;
             type: components["schemas"]["SQLColumnType"];
+            /** @description Required for array columns; absent for other result types. The descriptor applies even to NULL or empty arrays. */
+            element_type?: components["schemas"]["SQLArrayElementType"];
         };
         SQLPrepareRequest: {
             statement: string;
@@ -4639,6 +4665,8 @@ export interface components {
          *     is JSON null; sql_nulls distinguishes it from a JSON column containing
          *     the JSON literal null. Integer-typed values are exact decimal strings; datetime
          *     values are strings. Objects and arrays in JSON columns remain JSON.
+         *     Array-typed columns contain SQLArrayValue envelopes, with their element
+         *     descriptor in the corresponding SQLColumn. They are not JSON columns.
          */
         SQLResponse: {
             columns: components["schemas"]["SQLColumn"][];

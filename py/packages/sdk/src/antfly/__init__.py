@@ -63,6 +63,9 @@ from .client_generated.models import (
     RelationalRowQueryRequest,
     RelationalScalarExpression,
     RelationalUniqueConstraint,
+    SQLArrayDimension,
+    SQLArrayElementType,
+    SQLArrayValue,
     SQLColumn,
     SQLColumnType,
     SQLDiagnostic,
@@ -115,6 +118,9 @@ __version__ = "0.2.0"
 
 __all__ = [
     "SQLExecutionError",
+    "SQLArrayDimension",
+    "SQLArrayElementType",
+    "SQLArrayValue",
     "SQLColumn",
     "SQLColumnType",
     "SQLDiagnostic",

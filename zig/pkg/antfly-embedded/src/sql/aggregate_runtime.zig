@@ -381,7 +381,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         for (row.values, patterns) |value, *pattern| pattern.* = value.patterns;
         pattern_row.* = patterns;
         for (row.values, values, sql_nulls, bound.outputs) |value, *out, *sql_null, program| {
-            out.* = try context.outputCell(value.value, program.output_type.kind);
+            out.* = try context.outputDatum(value, program.output_type.kind, program.output_type.element_type);
             sql_null.* = value.sql_null;
         }
         output.* = values;

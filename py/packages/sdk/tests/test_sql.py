@@ -23,12 +23,31 @@ import pytest
 from antfly import (
     AntflyClient,
     AntflyException,
+    SQLArrayElementType,
+    SQLArrayValue,
+    SQLColumn,
     SQLExecutionError,
     SQLPreparedExecutionRequest,
     SQLPrepareRequest,
     SQLRequest,
     SQLResponse,
 )
+
+
+def test_array_result_models_preserve_exact_values_dimensions_and_null_flags():
+    column = SQLColumn.from_dict({"name": "items", "type": "array", "element_type": "int64"})
+    assert column.element_type is SQLArrayElementType.INT64
+    assert column.to_dict() == {"name": "items", "type": "array", "element_type": "int64"}
+    envelope = {
+        "dimensions": [{"length": 3, "lower_bound": -2}],
+        "values": ["-9223372036854775808", "9223372036854775807", None],
+        "sql_nulls": [False, False, True],
+    }
+    assert SQLArrayValue.from_dict(envelope).to_dict() == envelope
+    jsonb = {"dimensions": [{"length": 2, "lower_bound": 1}], "values": [None, None], "sql_nulls": [False, True]}
+    assert SQLArrayValue.from_dict(jsonb).to_dict() == jsonb
+    empty = {"dimensions": [], "values": [], "sql_nulls": []}
+    assert SQLArrayValue.from_dict(empty).to_dict() == empty
 
 
 def test_prepared_sql_lifecycle_preserves_owner_and_execution_shape():

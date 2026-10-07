@@ -63,11 +63,12 @@ const View = struct {
 /// All validation/admission precedes destination writes. Counting and emission
 /// share one view, avoiding per-element JSON serialization/parse allocations.
 fn encodedSize(value: arrays.Value, options: Options) !usize {
-    const canonical = try arrays.Value.init(value.element_type, value.dimensions, value.elements, options.values);
+    var work: arrays.Budget = .{ .remaining = options.values.work };
+    const canonical = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
     if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
     var size: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(View{ .value = value }, .{}, &size.writer);
-    if (size.count > options.wire_bytes or size.count > options.values.work / 2) return error.SqlProgramLimitExceeded;
+    if (size.count > options.wire_bytes or size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
     return std.math.cast(usize, size.count) orelse error.SqlProgramLimitExceeded;
 }
 

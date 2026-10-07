@@ -25,6 +25,99 @@ const A = std.mem.Allocator;
 pub const Options = struct { values: arrays.Limits = .{}, wire_bytes: usize = 8 * 1024 * 1024 };
 pub const Decoded = struct { value: arrays.Value, allocated_bytes: usize, work: usize };
 
+/// An unbuffered escaping adapter lets JSONB serialization write directly to
+/// an array element. No per-cell JSON string or temporary allocator is needed.
+const QuotedWriter = struct {
+    writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+    target: *std.Io.Writer,
+
+    fn escaped(self: *QuotedWriter, bytes: []const u8) std.Io.Writer.Error!void {
+        var start: usize = 0;
+        for (bytes, 0..) |byte, index| if (byte == '"' or byte == '\\') {
+            try self.target.writeAll(bytes[start..index]);
+            try self.target.writeByte('\\');
+            try self.target.writeByte(byte);
+            start = index + 1;
+        };
+        try self.target.writeAll(bytes[start..]);
+    }
+
+    fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *QuotedWriter = @fieldParentPtr("writer", w);
+        std.debug.assert(w.end == 0);
+        var count: usize = 0;
+        for (data, 0..) |bytes, index| {
+            const repetitions = if (index + 1 == data.len) splat else 1;
+            for (0..repetitions) |_| {
+                try self.escaped(bytes);
+                count = std.math.add(usize, count, bytes.len) catch return error.WriteFailed;
+            }
+        }
+        return count;
+    }
+};
+
+fn writeElement(kind: arrays.ElementType, cell: arrays.Element, writer: *std.Io.Writer) !void {
+    if (cell.sql_null) return writer.writeAll("NULL");
+    switch (kind) {
+        .text, .uuid, .jsonb => {
+            try writer.writeByte('"');
+            var escaped: QuotedWriter = .{ .target = writer };
+            if (kind == .jsonb) {
+                try std.json.Stringify.value(cell.value, .{}, &escaped.writer);
+            } else try escaped.writer.writeAll(cell.value.string);
+            try writer.writeByte('"');
+        },
+        .int16, .int32, .int64 => try writer.print("{d}", .{cell.value.integer}),
+        .float32, .float64 => {
+            var buffer: [64]u8 = undefined;
+            const text = if (kind == .float32)
+                try builtin_cast.floatText(f32, @floatCast(cell.value.float), &buffer)
+            else
+                try builtin_cast.floatText(f64, cell.value.float, &buffer);
+            try writer.writeAll(text);
+        },
+        .boolean => try writer.writeAll(if (cell.value.bool) "t" else "f"),
+    }
+}
+
+fn writeAxis(value: arrays.Value, depth: usize, offset: *usize, writer: *std.Io.Writer) anyerror!void {
+    try writer.writeByte('{');
+    for (0..value.dimensions[depth].length) |index| {
+        if (index != 0) try writer.writeByte(',');
+        if (depth + 1 == value.dimensions.len) {
+            try writeElement(value.element_type, value.elements[offset.*], writer);
+            offset.* += 1;
+        } else try writeAxis(value, depth + 1, offset, writer);
+    }
+    try writer.writeByte('}');
+}
+
+fn writeValue(value: arrays.Value, writer: *std.Io.Writer) !void {
+    if (value.dimensions.len == 0) return writer.writeAll("{}");
+    for (value.dimensions) |dimension| if (dimension.lower != 1) {
+        for (value.dimensions) |axis| try writer.print("[{d}:{d}]", .{ axis.lower, @as(i64, axis.lower) + axis.length - 1 });
+        try writer.writeByte('=');
+        break;
+    };
+    var offset: usize = 0;
+    try writeAxis(value, 0, &offset, writer);
+    std.debug.assert(offset == value.elements.len);
+}
+
+/// Validate shape, payload domains and complete wire/work admission before
+/// touching the destination. Emission streams with bounded (rank <= 6) stack
+/// depth and zero allocations, including escaped JSONB and non-finite floats.
+pub fn encode(value: arrays.Value, writer: *std.Io.Writer, options: Options) !void {
+    var work: arrays.Budget = .{ .remaining = options.values.work };
+    const canonical = try arrays.Value.initWithBudget(value.element_type, value.dimensions, value.elements, options.values, &work);
+    if (canonical.dimensions.len != value.dimensions.len) return error.InvalidSqlArrayShape;
+    var size: std.Io.Writer.Discarding = .init(&.{});
+    try writeValue(value, &size.writer);
+    if (size.count > options.wire_bytes or size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
+    try writeValue(value, writer);
+}
+
 const Shape = struct {
     lengths: [6]u32 = @splat(0),
     rank: usize = 1,
@@ -288,6 +381,12 @@ test "SQL text arrays match PostgreSQL builtin values bounds escapes and diagnos
             try std.testing.expectEqualSlices(u8, wire, writer.written());
         }
         try std.testing.expect(actual.budget.peak <= actual.budget.limit);
+        var encoded: std.Io.Writer.Allocating = .init(a);
+        defer encoded.deinit();
+        try encode(actual.value, &encoded.writer, .{});
+        var roundtrip = try decode(a, entry.element_type, encoded.written(), .{});
+        defer roundtrip.deinit();
+        try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(roundtrip.value, &work));
     }
     for (fixture.value.errors) |entry| {
         if (decode(a, entry.element_type, entry.input, .{})) |result| {
@@ -296,6 +395,32 @@ test "SQL text arrays match PostgreSQL builtin values bounds escapes and diagnos
             std.debug.print("Unexpected array text admission: {s}\n", .{entry.input});
             return error.ExpectedPostgresRejection;
         } else |err| try std.testing.expectEqualStrings(entry.code, @import("errors.zig").describe(err).code);
+    }
+}
+
+test "SQL text array output streams escaping bounds nulls and quotas without allocation" {
+    const a = std.testing.allocator;
+    for ([_]struct { kind: arrays.ElementType, input: []const u8, output: []const u8 }{
+        .{ .kind = .text, .input = "[0:1][3:4]={{NULL,\"NULL\"},{\"a\\\"b\",\"c\\\\d\"}}", .output = "[0:1][3:4]={{NULL,\"NULL\"},{\"a\\\"b\",\"c\\\\d\"}}" },
+        .{ .kind = .int64, .input = "{-9223372036854775808,9223372036854775807,NULL}", .output = "{-9223372036854775808,9223372036854775807,NULL}" },
+        .{ .kind = .float32, .input = "{NaN,Infinity,-Infinity,-0,1.5}", .output = "{NaN,Infinity,-Infinity,-0,1.5}" },
+        .{ .kind = .boolean, .input = "{true,false,NULL}", .output = "{t,f,NULL}" },
+        .{ .kind = .jsonb, .input = "{\"null\",NULL,\"[1,2]\",\"{\\\"k\\\":\\\"a\\\\\\\\b\\\"}\"}", .output = "{\"null\",NULL,\"[1,2]\",\"{\\\"k\\\":\\\"a\\\\\\\\b\\\"}\"}" },
+        .{ .kind = .text, .input = "{}", .output = "{}" },
+    }) |entry| {
+        var owned = try decode(a, entry.kind, entry.input, .{});
+        defer owned.deinit();
+        var buffer: [512]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        try encode(owned.value, &writer, .{});
+        try std.testing.expectEqualStrings(entry.output, writer.buffered());
+        writer.end = 0;
+        try std.testing.expectError(error.SqlProgramLimitExceeded, encode(owned.value, &writer, .{ .wire_bytes = entry.output.len - 1 }));
+        try std.testing.expectEqual(@as(usize, 0), writer.end);
+        try std.testing.expectError(error.SqlProgramLimitExceeded, encode(owned.value, &writer, .{ .values = .{ .work = 1 } }));
+        try std.testing.expectEqual(@as(usize, 0), writer.end);
+        var short: std.Io.Writer = .fixed(buffer[0..1]);
+        try std.testing.expectError(error.WriteFailed, encode(owned.value, &short, .{}));
     }
 }
 

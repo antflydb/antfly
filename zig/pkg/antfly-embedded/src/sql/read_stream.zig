@@ -962,7 +962,8 @@ pub const Stream = struct {
                             projections[index].?[positions[row_index].?]
                         else typed: {
                             const stored = try row.cell(field);
-                            break :typed .{ .value = try describe.coerce(stored.value, self.context.binding.columns[index].type), .sql_null = stored.sql_null };
+                            const column = self.context.binding.columns[index];
+                            break :typed try describe.coerceDatum(eval.allocator(), stored, column.type, column.element_type);
                         };
                         break :blk fields;
                     } else try self.context.projectValues(eval.allocator(), row, self.fields, values);
@@ -971,7 +972,7 @@ pub const Stream = struct {
                     var output_context = self.context;
                     output_context.arena = out;
                     for (projected, cells, nulls, self.context.binding.columns) |value, *cell, *is_null, column| {
-                        cell.* = try output_context.outputCell(value.value, column.type);
+                        cell.* = try output_context.outputDatum(value, column.type, column.element_type);
                         is_null.* = value.sql_null;
                     }
                     try rows.append(out, cells);

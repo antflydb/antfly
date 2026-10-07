@@ -3599,3 +3599,38 @@ a before/after speedup claim. Public activation is still guarded: generated
 column/array OpenAPI contracts, final-output integration, PostgreSQL element OID
 and result-codec integration, and transport-level original-case proofs are the
 next dependencies. This codec alone earns no original-case disposition credit.
+
+### Array result descriptors and streaming text output (2026-10-07)
+
+OpenAPI now defines the bound array element enum, dimensions and lossless
+value envelope. Zig, Go, Python and TypeScript models are generated from that
+contract; the Rust SDK's input specification is synchronized. Python and
+TypeScript export these models through their public SDK entry points. The
+Python SQL tests and TypeScript type tests preserve exact integer strings,
+non-default bounds and JSON-null versus SQL-null flags.
+
+Final SELECT, grouped/window, sorted/deferred and mutation-returning paths now
+retain complete Datums until the result boundary rather than extracting an
+array's JSON-null placeholder. The boundary checks element descriptors and
+copies retained envelopes into the result owner. A native regression releases
+the source array before inspecting nested JSONB output; mismatched element
+descriptors and accidental JSON substitution are rejected.
+
+The PostgreSQL text-array encoder streams dimensions and flat cells through
+bounded-depth braces. A writer adapter escapes text and JSONB directly without
+per-element serialization buffers or encoder allocations. Whole-value domain,
+wire-byte and shared validation/emission work admission happen before output.
+Tests round-trip all 19 PostgreSQL reference vectors and independently check
+exact emitted escaping, bounds, integer extrema, NaN/infinities, empty arrays,
+SQL NULL and JSONB null. PostgreSQL independently decodes the exact emitted
+vectors. Byte/work quota rejection leaves the destination untouched; actual
+writer failures remain writer failures. The JSON-envelope encoder now also
+shares validation and emission work admission rather than budgeting each
+phase independently.
+
+Public array results remain deliberately guarded until PostgreSQL column/OID
+and result-codec integration and mounted HTTP/pgwire execution evidence are
+complete. Array parameters and native stored-array columns still need their
+typed ingress/storage contracts; this change does not reinterpret document
+JSON arrays as SQL arrays. No original inventory case is credited by these
+architecture-only changes.

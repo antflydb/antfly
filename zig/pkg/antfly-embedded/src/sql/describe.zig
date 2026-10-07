@@ -48,7 +48,9 @@ pub const Column = struct {
     untyped_null: bool = false,
 
     pub fn jsonStringify(self: Column, writer: anytype) !void {
-        try writer.write(.{ .name = self.name, .type = self.type });
+        if (self.type == .array) {
+            try writer.write(.{ .name = self.name, .type = self.type, .element_type = self.element_type });
+        } else try writer.write(.{ .name = self.name, .type = self.type });
     }
 };
 
@@ -68,6 +70,9 @@ test "SQL column JSON excludes internal unknown NULL provenance" {
     const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "value", .type = .integer, .untyped_null = true }, .{});
     defer std.testing.allocator.free(encoded);
     try std.testing.expectEqualStrings("{\"name\":\"value\",\"type\":\"integer\"}", encoded);
+    const array = try std.json.Stringify.valueAlloc(std.testing.allocator, Column{ .name = "items", .type = .array, .element_type = .int32 }, .{});
+    defer std.testing.allocator.free(array);
+    try std.testing.expectEqualStrings("{\"name\":\"items\",\"type\":\"array\",\"element_type\":\"int32\"}", array);
 }
 pub const OrderKey = struct {
     source: union(enum) { output: usize, column: catalog.Column, expression: usize },

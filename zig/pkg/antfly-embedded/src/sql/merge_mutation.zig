@@ -1067,7 +1067,7 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
             const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
             for (plan.programs, projected, projected_nulls, plan.columns) |program, *value, *is_null, column| {
                 const datum = try decision_eval.evaluate(context.arena, context.backend.decision_provider, &program, cells, context.parameters);
-                value.* = try context.outputCell(datum.value, column.type);
+                value.* = try context.outputDatum(datum, column.type, column.element_type);
                 is_null.* = datum.sql_null;
             }
             values.* = projected;
@@ -1095,7 +1095,7 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
                     const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
                     for (columns, projected, projected_nulls, plan.columns) |values, *value, *is_null, column| {
                         const datum = values[index - first];
-                        value.* = try context.outputCell(datum.value, column.type);
+                        value.* = try context.outputDatum(datum, column.type, column.element_type);
                         is_null.* = datum.sql_null;
                     }
                     output_rows[index] = projected;

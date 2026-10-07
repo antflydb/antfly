@@ -1234,6 +1234,9 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_array_dimension import SQLArrayDimension
+from .sql_array_element_type import SQLArrayElementType
+from .sql_array_value import SQLArrayValue
 from .sql_column import SQLColumn
 from .sql_column_type import SQLColumnType
 from .sql_connection_open_request import SQLConnectionOpenRequest
@@ -2644,6 +2647,9 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLArrayDimension",
+    "SQLArrayElementType",
+    "SQLArrayValue",
     "SQLColumn",
     "SQLColumnType",
     "SQLConnectionOpenRequest",
