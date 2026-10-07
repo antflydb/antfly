@@ -1,0 +1,39 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-inference-worker-owner-handoff-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "2147483648",
+    "--cache-dir",
+    "/private/tmp/antfly-parent-phase-focused-cache",
+    "--summary",
+    "all"
+  ],
+  "pid": 34787,
+  "state": "terminal",
+  "started": 1791411604.561991,
+  "source_sha256": {
+    "zig/pkg/inference/src/host/worker_wire.zig": "6eb1f701c2756e09785c12fa6966416aa959dcee403cd7f8b40a4811a70109ce",
+    "zig/pkg/inference/src/host/worker_rpc.zig": "a94b2e28532778a56b65a7843378c6671219bcdd4de359781ac23131f44f8a75",
+    "zig/pkg/inference/src/host/worker_execution_phase.zig": "62b910c8c857799770a199c83dbb6d66d9b8917cafefc261e126b851baf0fec5",
+    "zig/pkg/inference/src/host/worker.zig": "d70c9452e73cd4cf0a1c45a8ee120298867308a1c04ff70f70e038729f96938f",
+    "zig/pkg/inference/src/execution_control.zig": "ee3482994680aea52261ad29e979c3421c8e4427c8a5a2c44c435d789b56fdcc",
+    "zig/pkg/antfly/build/api_tests.zig": "4689df1fc18b0fd5bf5b9fbd5aaca089e2d13ac103f9446426178169fd7c03e2",
+    "zig/pkg/antfly/src/api/runnable_worker_test_root.zig": "11d332159ce46fe9c36a29c0e47d08cd6132c3a7e8f0957c3d65e5bb7f865fb2",
+    "zig/pkg/antfly/src/api/runnable_owner_execution.zig": "15ac1ce6f5a058dd57d5e99d636e67ebd1def48cfad2ed2eb12322606fc9f2d3"
+  },
+  "compiler_pid": 34806,
+  "exit_code": 0,
+  "finished": 1791411617.718654,
+  "compiled_source_sha256": {
+    "zig/pkg/inference/src/host/worker_rpc.zig": "a94b2e28532778a56b65a7843378c6671219bcdd4de359781ac23131f44f8a75",
+    "zig/pkg/inference/src/host/worker_execution_phase.zig": "62b910c8c857799770a199c83dbb6d66d9b8917cafefc261e126b851baf0fec5",
+    "zig/pkg/inference/src/execution_control.zig": "ee3482994680aea52261ad29e979c3421c8e4427c8a5a2c44c435d789b56fdcc",
+    "zig/pkg/antfly/build/api_tests.zig": "4689df1fc18b0fd5bf5b9fbd5aaca089e2d13ac103f9446426178169fd7c03e2",
+    "zig/pkg/antfly/src/api/runnable_worker_test_root.zig": "11d332159ce46fe9c36a29c0e47d08cd6132c3a7e8f0957c3d65e5bb7f865fb2",
+    "zig/pkg/antfly/src/api/runnable_owner_execution.zig": "15ac1ce6f5a058dd57d5e99d636e67ebd1def48cfad2ed2eb12322606fc9f2d3"
+  }
+}

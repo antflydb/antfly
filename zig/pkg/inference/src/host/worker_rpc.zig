@@ -97,7 +97,7 @@ pub const OwnedPayload = struct {
 
 /// A delegated worker must wait for the owning caller's acknowledgment before
 /// entering either a resource wait or a new runnable interval.
-pub const Phase = enum(u8) { resource_wait = 1, runnable = 2 };
+pub const Phase = enum(u8) { resource_wait = 1, runnable = 2, checkpoint = 3 };
 const PhaseStatus = enum(u8) { accepted = 0, canceled, timeout, denied };
 const PhaseRequest = struct { sequence: u64, phase: Phase };
 

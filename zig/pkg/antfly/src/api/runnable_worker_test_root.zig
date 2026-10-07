@@ -11,7 +11,7 @@ const rpc = @import("inference_worker_rpc");
 const phases = @import("inference_worker_phases").For(controls, rpc);
 
 test "inference worker physical handoff releases weighted real capacity and fences rejected resumes" {
-    const Mode = enum { success, canceled, deadline };
+    const Mode = enum { success, canceled, deadline, quantum };
     const Clock = struct {
         var current: std.atomic.Value(u64) = .init(0);
         fn now() u64 {
@@ -78,8 +78,7 @@ test "inference worker physical handoff releases weighted real capacity and fenc
         }
         fn rpcCheck(raw: ?*anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(raw.?));
-            try (controls.InferenceExecutionControl{}).check();
-            if (self.canceled.load(.acquire)) return error.Cancelled;
+            try self.parent_phase.poll(runtime.http_abi.CancellationView{ .context = self, .is_cancelled = requested }, null, Clock.now());
         }
         fn closed(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -97,6 +96,19 @@ test "inference worker physical handoff releases weighted real capacity and fenc
             defer scope.deinit();
             try (controls.InferenceExecutionControl{}).lock(&self.gate);
             defer self.gate.unlock();
+            if (self.mode == .quantum) {
+                // Model a native primitive which cannot yield midway. Advance
+                // past the scheduler quantum and let the caller poll repeatedly.
+                // Its capacity must stay charged until this child checkpoints.
+                Clock.current.store(3 * std.time.ns_per_ms, .release);
+                for (0..15) |_| {
+                    try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                    try std.testing.expectEqual(@as(u64, 0), self.state.owner.scheduler.stats().yields);
+                    try std.testing.expectEqual(@as(usize, 2), self.state.owner.scheduler.stats().runnable_slots);
+                }
+                try (controls.InferenceExecutionControl{}).check();
+                try std.testing.expectEqual(@as(u64, 1), self.state.owner.scheduler.stats().yields);
+            }
             if (child_phase.failure) |err| return err;
             self.computed.store(true, .release);
             return request.endpoint.copyPayload(.{ .body = "computed" });
@@ -114,7 +126,7 @@ test "inference worker physical handoff releases weighted real capacity and fenc
             return result;
         }
     };
-    for ([_]Mode{ .success, .canceled, .deadline }) |mode| {
+    for ([_]Mode{ .success, .canceled, .deadline, .quantum }) |mode| {
         Clock.current.store(0, .release);
         var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Clock.now };
         defer state.owner.tryDeinit() catch @panic("owner leaked");
@@ -137,7 +149,7 @@ test "inference worker physical handoff releases weighted real capacity and fenc
         pair.child.handler = Probe.handle;
         pair.child.mutex.unlock(io);
         var capsule: ?*anyopaque = null;
-        try Probe.checked(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .slots = 2, .retained_bytes = 123, .has_deadline = 1, .native_deadline = 1, .deadline_ns = 5, .cancellation = .{ .context = &probe, .is_cancelled = Probe.requested }, .out_handle = &capsule }));
+        try Probe.checked(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.inference), .slots = 2, .retained_bytes = 123, .has_deadline = 1, .native_deadline = 1, .deadline_ns = if (mode == .quantum) 10 * std.time.ns_per_ms else 5, .cancellation = .{ .context = &probe, .is_cancelled = Probe.requested }, .out_handle = &capsule }));
         probe.capsule = capsule.?;
         probe.retained_bytes = state.owner.scheduler.stats().retained_bytes;
         var finished = false;
@@ -145,7 +157,7 @@ test "inference worker physical handoff releases weighted real capacity and fenc
         var scope = controls.CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.park, .wait_end_fn = Probe.reenter });
         defer if (scope.active) scope.deinit();
         try std.testing.expect(probe.gate.tryLock());
-        if (mode == .success) {
+        if (mode == .success or mode == .quantum) {
             const response = try probe.call();
             defer response.deinit();
             try std.testing.expectEqualStrings("computed", response.view().body);

@@ -51,14 +51,10 @@ const ForwardControl = struct {
 
     fn check(raw: ?*anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
-        // This callback executes on the owning caller. Its current capsule
-        // authority must remain valid throughout delegated work; resource-wait
-        // scopes suppress runnable-only checks while the capsule is parked.
-        try (execution_control.InferenceExecutionControl{}).check();
-        if (self.cancellation.requested()) return error.Cancelled;
-        if (self.deadline_ns) |deadline| {
-            if (platform.time.monotonicNs() >= deadline) return error.Timeout;
-        }
+        // Poll original cancellation/deadline only. A scheduler checkpoint can
+        // yield this loan while the child is still computing. The child sends
+        // acknowledged checkpoints at its own safe boundaries instead.
+        try self.execution_phase.poll(self.cancellation, self.deadline_ns, platform.time.monotonicNs());
     }
 
     fn event(raw: ?*anyopaque, payload: rpc.Payload) !void {

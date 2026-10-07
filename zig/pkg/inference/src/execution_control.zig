@@ -32,6 +32,10 @@ threadlocal var checking_synchronous_checkpoint: bool = false;
 threadlocal var waiting_synchronous_resource: bool = false;
 
 pub const CheckpointScope = struct {
+    pub fn hasCurrent() bool {
+        return synchronous_checkpoint != null and !waiting_synchronous_resource;
+    }
+
     previous: ?SynchronousCheckpoint,
     previous_waiting: bool,
     depth: usize,

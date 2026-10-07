@@ -7,8 +7,21 @@ pub fn For(comptime controls: type, comptime rpc: type) type {
     return struct {
         pub const Parent = struct {
             wait: ?controls.ResourceWait = null,
+            /// The child may be computing. Polling must not invoke a scheduler
+            /// checkpoint; only original cancellation/deadline are safe here.
+            pub fn poll(_: *@This(), cancellation: anytype, deadline_ns: ?u64, now_ns: u64) !void {
+                if (cancellation.requested()) return error.Cancelled;
+                if (deadline_ns) |deadline| if (now_ns >= deadline) return error.Timeout;
+            }
             pub fn transition(self: *@This(), phase: rpc.Phase) !void {
                 switch (phase) {
+                    .checkpoint => {
+                        if (self.wait != null) return error.InvalidWorkerPhase;
+                        if (!controls.CheckpointScope.hasCurrent()) return error.UnsupportedWorkerPhase;
+                        // The child is stopped at a cooperative boundary until
+                        // this acknowledgment. Scheduler yields are safe here.
+                        try (controls.InferenceExecutionControl{}).check();
+                    },
                     .resource_wait => {
                         if (self.wait != null) return error.InvalidWorkerPhase;
                         const wait = try controls.ResourceWait.init();
@@ -34,6 +47,7 @@ pub fn For(comptime controls: type, comptime rpc: type) type {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 if (self.failure) |err| return err;
                 if (self.request.cancelled.load(.acquire)) return error.Cancelled;
+                try self.transition(.checkpoint);
             }
             fn transition(self: *@This(), phase: rpc.Phase) !void {
                 self.request.transition(phase) catch |err| {
