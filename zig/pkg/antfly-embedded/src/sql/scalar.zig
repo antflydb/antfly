@@ -92,11 +92,14 @@ pub const Instruction = struct {
 const TextTranslation = std.AutoHashMapUnmanaged(u21, []const u8);
 
 pub const Program = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
     instructions: []const Instruction,
     root: u32,
     output_type: Type,
     parameter_types: []const ?ast.ColumnType,
+    /// Authoritative binding identity. The coarse slice above is a derived
+    /// compatibility view for statement/protocol paths not yet migrated.
+    parameter_descriptors: []const Type,
     required_columns: []const u32,
     settings: ?*const setting_catalog.View = null,
     /// Derived execution caches are never part of serialized instructions.
@@ -125,7 +128,9 @@ pub const Program = struct {
     }
 
     pub fn deinit(self: *Program) void {
+        const backing = self.arena.child_allocator;
         self.arena.deinit();
+        backing.destroy(self.arena);
         self.* = undefined;
     }
 
@@ -140,6 +145,30 @@ pub const Program = struct {
     pub fn evaluate(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Datum {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .limits = limits };
         const result = try context.runDatum(self.root, 0);
+        _ = try context.validateJson(result.value, 0);
+        return result;
+    }
+
+    /// Bind once per program/execution, not per row. Multiple programs from a
+    /// statement share one frame after exact descriptor compatibility checks.
+    pub fn bindParameters(self: *const Program, frame: *const @import("parameter_frame.zig").Frame) !PreparedEvaluation {
+        if (frame.descriptors.len != self.parameter_descriptors.len) return error.InvalidSqlParameters;
+        for (frame.descriptors, self.parameter_descriptors) |actual, expected| {
+            if (actual.kind != expected.kind or actual.element_type != expected.element_type or actual.nullable != expected.nullable) return error.ConflictingSqlParameterTypes;
+        }
+        return .{ .program = self, .parameters = frame.values };
+    }
+};
+
+/// Borrows an immutable program and frame. Both owners outlive execution and
+/// returned borrowed values; computed results use the supplied row allocator.
+pub const PreparedEvaluation = struct {
+    program: *const Program,
+    parameters: []const Datum,
+
+    pub fn evaluate(self: PreparedEvaluation, alloc: Allocator, cells: []const Datum, limits: EvalLimits) !Datum {
+        var context: Evaluator = .{ .program = self.program, .alloc = alloc, .cells = cells, .parameters = &.{}, .typed_parameters = self.parameters, .limits = limits };
+        const result = try context.runDatum(self.program.root, 0);
         _ = try context.validateJson(result.value, 0);
         return result;
     }
@@ -169,11 +198,11 @@ pub fn inferParameters(alloc: Allocator, expression: *const ast.Scalar, columns:
     defer arena.deinit();
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .allow_unresolved = true };
     try binder.registerColumns();
-    @memcpy(binder.parameters[0..parameters.len], parameters);
+    for (parameters, binder.parameters[0..parameters.len]) |kind, *descriptor| descriptor.* = .{ .kind = kind };
     _ = try binder.compile(expression, expected, 0);
     if (binder.parameter_count > parameters.len) return error.InvalidSqlParameters;
     var changed = false;
-    for (parameters, binder.parameters[0..parameters.len]) |*output, inferred| if (inferred) |kind| {
+    for (parameters, binder.parameters[0..parameters.len]) |*output, inferred| if (inferred.kind) |kind| {
         if (output.* == null) changed = true;
         output.* = kind;
     };
@@ -187,7 +216,7 @@ pub fn inferOutput(alloc: Allocator, expression: *const ast.Scalar, columns: []c
     defer arena.deinit();
     var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = .{}, .allow_unresolved = true };
     if (parameters.len > binder.parameters.len) return error.SqlProgramLimitExceeded;
-    @memcpy(binder.parameters[0..parameters.len], parameters);
+    for (parameters, binder.parameters[0..parameters.len]) |kind, *descriptor| descriptor.* = .{ .kind = kind };
     try binder.registerColumns();
     return binder.infer(expression, 0);
 }
@@ -198,16 +227,79 @@ pub fn bindExpected(alloc: Allocator, expression: *const ast.Scalar, columns: []
 
 pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const ?ast.ColumnType, expected: ?ast.ColumnType, limits: BindLimits, settings: ?*const setting_catalog.View) !Program {
     if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
+    var descriptors: [1024]Type = undefined;
+    for (parameter_hints, descriptors[0..parameter_hints.len]) |kind, *descriptor| descriptor.* = .{ .kind = kind };
+    return bindDescriptors(alloc, expression, columns, descriptors[0..parameter_hints.len], expected, limits, settings, false);
+}
+
+/// Precise native parameter binding; ingress must prepare an owned frame once
+/// before row execution. JSON compatibility entry points remain guarded.
+pub fn bindTyped(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const Type, limits: BindLimits) !Program {
+    return bindDescriptors(alloc, expression, columns, parameter_hints, null, limits, null, true);
+}
+
+pub fn inferTypedParameters(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameters: []Type, limits: BindLimits) !bool {
+    if (limits.parameters > 1024 or parameters.len > limits.parameters) return error.SqlProgramLimitExceeded;
     var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .allow_unresolved = true, .typed_parameters = true };
+    try binder.registerColumns();
+    for (parameters) |descriptor| try validateParameterType(descriptor);
+    for (parameters, binder.parameters[0..parameters.len]) |descriptor, *output| output.* = try normalizeParameterType(descriptor);
+    _ = try binder.compile(expression, null, 0);
+    if (binder.parameter_count > parameters.len) return error.InvalidSqlParameters;
+    var changed = false;
+    for (parameters, binder.parameters[0..parameters.len]) |*output, inferred| {
+        if (output.kind != inferred.kind or output.element_type != inferred.element_type) changed = true;
+        output.* = inferred;
+    }
+    return changed;
+}
+
+pub fn validateParameterType(descriptor: Type) !void {
+    if (descriptor.kind == null) {
+        if (descriptor.element_type != null) return error.InvalidSqlParameters;
+        return;
+    }
+    if (descriptor.kind == .array) {
+        if (descriptor.element_type == null) return error.InvalidSqlParameters;
+    } else if (descriptor.element_type) |element| {
+        if (arrayScalarType(element) != descriptor.kind.?) return error.InvalidSqlParameters;
+    }
+}
+
+pub fn parameterElementType(descriptor: Type) !arrays.ElementType {
+    try validateParameterType(descriptor);
+    return descriptor.element_type orelse try arrayElementType(descriptor.kind orelse return error.UnknownSqlParameterType);
+}
+
+fn normalizeParameterType(descriptor: Type) !Type {
+    try validateParameterType(descriptor);
+    var result = descriptor;
+    if (result.kind != null and result.kind != .datetime and result.element_type == null) result.element_type = try parameterElementType(result);
+    return result;
+}
+
+fn bindDescriptors(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const Type, expected: ?ast.ColumnType, limits: BindLimits, settings: ?*const setting_catalog.View, typed_parameters: bool) !Program {
+    if (limits.parameters > 1024 or parameter_hints.len > limits.parameters or limits.nodes == 0) return error.SqlProgramLimitExceeded;
+    if (typed_parameters) for (parameter_hints) |descriptor| try validateParameterType(descriptor);
+    const arena = try alloc.create(std.heap.ArenaAllocator);
+    errdefer alloc.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
-    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .settings = settings };
+    var binder: Binder = .{ .alloc = arena.allocator(), .columns = columns, .limits = limits, .settings = settings, .typed_parameters = typed_parameters };
     try binder.registerColumns();
     @memcpy(binder.parameters[0..parameter_hints.len], parameter_hints);
+    if (typed_parameters) for (binder.parameters[0..parameter_hints.len]) |*descriptor| {
+        descriptor.* = try normalizeParameterType(descriptor.*);
+    };
     binder.parameter_count = parameter_hints.len;
     const root = try binder.compile(expression, expected, 0);
     const output_type = binder.instructions.items[root].type;
     const instructions = try binder.instructions.toOwnedSlice(binder.alloc);
-    const parameter_types = try binder.alloc.dupe(?ast.ColumnType, binder.parameters[0..binder.parameter_count]);
+    const parameter_descriptors = try binder.alloc.dupe(Type, binder.parameters[0..binder.parameter_count]);
+    const parameter_types = try binder.alloc.alloc(?ast.ColumnType, parameter_descriptors.len);
+    for (parameter_types, parameter_descriptors) |*kind, descriptor| kind.* = descriptor.kind;
     const required_columns = try binder.dependencies.toOwnedSlice(binder.alloc);
     var program: Program = .{
         .arena = arena,
@@ -215,6 +307,7 @@ pub fn bindExpectedWithSettings(alloc: Allocator, expression: *const ast.Scalar,
         .root = root,
         .output_type = output_type,
         .parameter_types = parameter_types,
+        .parameter_descriptors = parameter_descriptors,
         .required_columns = required_columns,
         .settings = settings,
         .translations = binder.translations,
@@ -672,7 +765,8 @@ const Binder = struct {
     instructions: std.ArrayList(Instruction) = .empty,
     translations: std.AutoHashMapUnmanaged(u32, *const TextTranslation) = .empty,
     dependencies: std.ArrayList(u32) = .empty,
-    parameters: [1024]?ast.ColumnType = @splat(null),
+    parameters: [1024]Type = @splat(.{}),
+    typed_parameters: bool = false,
     parameter_count: usize = 0,
     allow_unresolved: bool = false,
     settings: ?*const setting_catalog.View = null,
@@ -698,7 +792,10 @@ const Binder = struct {
         const result: Type = switch (expression.*) {
             .literal => |value| if (value == .parameter) blk: {
                 if (value.parameter == 0 or value.parameter > self.limits.parameters) return error.InvalidSqlParameters;
-                break :blk .{ .kind = self.parameters[value.parameter - 1] };
+                const descriptor = self.parameters[value.parameter - 1];
+                if (descriptor.kind == .array and !self.typed_parameters) return error.UnsupportedSqlShape;
+                if (descriptor.kind == .array and descriptor.element_type == null) return error.UnknownSqlParameterType;
+                break :blk descriptor;
             } else literalType(value),
             .column => |name| blk: {
                 const column = self.columns[self.names.get(name) orelse return error.UnknownColumn];
@@ -932,19 +1029,25 @@ const Binder = struct {
         if (depth >= self.limits.depth or self.instructions.items.len >= self.limits.nodes) return error.SqlProgramLimitExceeded;
         const empty_constructor = expression.* == .call and std.mem.eql(u8, expression.call.name, "$array") and expression.call.args.len == 0;
         var kind = if (empty_constructor and array_element != null) Type{ .kind = .array, .element_type = array_element, .nullable = false } else try self.infer(expression, depth);
+        if (expression.* == .literal and expression.literal == .parameter) kind = self.parameters[expression.literal.parameter - 1];
         if (kind.kind == null) kind.kind = expected;
+        if (self.typed_parameters and expression.* == .literal and expression.literal == .parameter and self.parameters[expression.literal.parameter - 1].kind == null) kind.element_type = array_element;
+        if (kind.kind == .array and kind.element_type == null) kind.element_type = array_element;
         if (expected == .uuid and expression.* == .literal and expression.literal == .string) kind.kind = .uuid;
         var instruction: Instruction = .{ .type = kind, .operation = undefined };
         instruction.operation = switch (expression.*) {
             .literal => |value| if (value == .parameter) blk: {
-                if (kind.kind == .array) return error.UnsupportedSqlShape; // Array parameter descriptors are not yet public.
+                if (kind.kind == .array and !self.typed_parameters) return error.UnsupportedSqlShape;
+                if (kind.kind == .array and kind.element_type == null) return error.UnknownSqlParameterType;
+                if (self.typed_parameters) kind = try normalizeParameterType(kind);
+                instruction.type = kind;
                 const resolved = kind.kind;
                 if (resolved == null and !self.allow_unresolved) return error.UnknownSqlParameterType;
                 const index = value.parameter - 1;
-                if (self.parameters[index]) |prior| {
+                if (self.parameters[index].kind) |prior| {
                     if (resolved != null and prior != resolved.?) return error.ConflictingSqlParameterTypes;
                 }
-                if (resolved != null) self.parameters[index] = resolved;
+                if (resolved != null) self.parameters[index] = kind;
                 self.parameter_count = @max(self.parameter_count, value.parameter);
                 break :blk .{ .parameter = index };
             } else .{ .literal = switch (value) {
@@ -963,7 +1066,7 @@ const Binder = struct {
                 if (std.mem.indexOfScalar(u32, self.dependencies.items, ordinal) == null) try self.dependencies.append(self.alloc, ordinal);
                 break :blk .{ .column = ordinal };
             },
-            .cast => |cast| .{ .cast = .{ .operand = if (cast.type == .array) try self.compileArrayContext(cast.operand, null, cast.element_type, depth + 1) else try self.compile(cast.operand, cast.type, depth + 1), .type = cast.type, .element_type = cast.element_type } },
+            .cast => |cast| .{ .cast = .{ .operand = if (cast.type == .array) try self.compileArrayContext(cast.operand, if (self.typed_parameters and cast.operand.* == .literal and cast.operand.literal == .parameter and self.parameters[cast.operand.literal.parameter - 1].kind == null) .array else null, cast.element_type, depth + 1) else try self.compileArrayContext(cast.operand, cast.type, if (self.typed_parameters) cast.element_type else null, depth + 1), .type = cast.type, .element_type = cast.element_type } },
             .unary => |unary| .{ .unary = .{ .op = unary.op, .operand = try self.compile(unary.operand, switch (unary.op) {
                 .not, .is_true, .is_not_true, .is_false, .is_not_false => .boolean,
                 .positive, .negative => kind.kind,
@@ -993,6 +1096,7 @@ const Binder = struct {
                         .limits = self.limits,
                         .names = self.names,
                         .parameters = self.parameters,
+                        .typed_parameters = self.typed_parameters,
                         .parameter_count = self.parameter_count,
                         .allow_unresolved = self.allow_unresolved,
                     };
@@ -1052,7 +1156,13 @@ const Binder = struct {
                         continue;
                     }
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
-                    out.* = try self.compileArrayContext(arg, desired, if (kind.kind == .array) kind.element_type else null, depth + 1);
+                    const element_context: ?arrays.ElementType = if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
+                        .@"$array_quantified" => if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
+                        .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
+                        .cardinality, .array_ndims, .array_length, .array_lower, .array_upper => if (i == 0) (try self.infer(arg, depth + 1)).element_type else .int32,
+                        else => if (kind.kind == .array or desired == kind.kind) kind.element_type else null,
+                    };
+                    out.* = try self.compileArrayContext(arg, desired, element_context, depth + 1);
                 }
                 if (function == .translate) {
                     const from = self.instructions.items[args[1]].operation;
@@ -1112,6 +1222,7 @@ const Evaluator = struct {
     alloc: Allocator,
     cells: []const Datum,
     parameters: []const Json,
+    typed_parameters: ?[]const Datum = null,
     limits: EvalLimits,
     steps: usize = 0,
     pattern_steps: usize = 0,
@@ -1134,6 +1245,11 @@ const Evaluator = struct {
         const instruction = self.program.instructions[index];
         var result: Datum = switch (instruction.operation) {
             .parameter => |slot| blk: {
+                if (self.typed_parameters) |parameters| {
+                    if (slot >= parameters.len) return error.InvalidSqlParameters;
+                    break :blk parameters[slot];
+                }
+                if (instruction.type.kind == .array) return error.UnsupportedSqlShape;
                 if (slot >= self.parameters.len) return error.InvalidSqlParameters;
                 const value = self.parameters[slot];
                 if (value == .null) break :blk .{};

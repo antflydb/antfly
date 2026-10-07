@@ -683,6 +683,7 @@ fn evaluatePredicate(predicate: *const Predicate, settings: *const setting_catal
         .root = predicate.root,
         .output_type = predicate.instructions[predicate.root].type,
         .parameter_types = &.{},
+        .parameter_descriptors = &.{},
         .required_columns = &.{},
         .settings = settings,
     };

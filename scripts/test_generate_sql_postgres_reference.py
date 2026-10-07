@@ -223,6 +223,93 @@ class PostgresReferenceTest(unittest.TestCase):
                                 ],
                             )
 
+    def test_prepared_parameter_descriptor_and_execution_contracts(self):
+        import json
+        from pathlib import Path
+
+        import psycopg
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_parameter_frame_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(len(fixture["entries"]), 24)
+        self.assertEqual(len(fixture["errors"]), 9)
+        supported = {
+            "smallint",
+            "integer",
+            "bigint",
+            "real",
+            "double precision",
+            "boolean",
+            "text",
+            "uuid",
+            "jsonb",
+            "timestamptz",
+        }
+        for case in fixture["entries"] + fixture["errors"]:
+            with self.subTest(sql=case["sql"]):
+                for name in case["types"]:
+                    self.assertIn(name.removesuffix("[]"), supported)
+                try:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(
+                            "PREPARE frame_contract("
+                            + ",".join(case["types"])
+                            + ") AS SELECT "
+                            + case["sql"]
+                        )
+                        if "oids" in case:
+                            self.assertEqual(
+                                self.db.execute(
+                                    "SELECT parameter_types::oid[] FROM pg_prepared_statements "
+                                    "WHERE name='frame_contract'"
+                                ).fetchone()[0],
+                                case["oids"],
+                            )
+                        arguments = psycopg.sql.SQL(",").join(
+                            psycopg.sql.Literal(value) for value in case["values"]
+                        )
+                        actual = self.db.execute(
+                            psycopg.sql.SQL("EXECUTE frame_contract({})").format(
+                                arguments
+                            )
+                        ).fetchone()[0]
+                        self.assertNotIn("code", case)
+                        self.assertEqual(actual, case["value"])
+                except psycopg.Error as error:
+                    self.assertIn("code", case)
+                    self.assertEqual(error.sqlstate, case["code"])
+                finally:
+                    self.db.execute("DEALLOCATE ALL")
+
+    def test_prepared_parameter_inference_retains_builtin_widths(self):
+        for expression, oids in (
+            ("$1::smallint", [21]),
+            ("$1 = ANY($2::smallint[])", [21, 1005]),
+            (
+                "ARRAY[cardinality($1::integer[]),cardinality($1::text[])]",
+                [1007],
+            ),
+        ):
+            with self.subTest(sql=expression):
+                try:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(
+                            "PREPARE inferred_frame AS SELECT " + expression
+                        )
+                        self.assertEqual(
+                            self.db.execute(
+                                "SELECT parameter_types::oid[] FROM pg_prepared_statements "
+                                "WHERE name='inferred_frame'"
+                            ).fetchone()[0],
+                            oids,
+                        )
+                finally:
+                    self.db.execute("DEALLOCATE ALL")
+
     def test_typed_array_scalar_expression_contracts(self):
         import json
         from pathlib import Path

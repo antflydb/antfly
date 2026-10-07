@@ -164,7 +164,25 @@ Allocation-fault and byte/work-limit tests cover dynamic scalar and typed-array
 column inputs. A 10,000-row debug probe used zero prepared scratch versus 792
 dynamic bytes (about 7 ms versus 21 ms locally, not a production latency claim).
 
-Array-valued public outputs, array parameters, catalog storage and overloads converting
+Native scalar programs now bind precise immutable parameter descriptors, with
+primitive widths and array element identities. `parameter_frame.zig` owns one
+quota-admitted arena for all execution inputs: text/binary codecs decode once,
+typed logical inputs clone once, and JSON arrays never masquerade as SQL arrays.
+Programs bind a shared frame once after exact descriptor checks; the row loop
+borrows prepared cells with no decoding, cloning or descriptor scans. Twenty-four
+PostgreSQL PREPARE contracts verify parameter OIDs and values; nine isolated
+SQLSTATE contracts cover invalid input, shape and arithmetic overflow. Binary
+fixtures and allocation-fault tests cover all nine builtin scalar/array codecs.
+A 10,000-row native probe decodes once, uses zero evaluation scratch bytes and
+retains a 976-byte frame (about 5 ms locally, not a production latency claim).
+Program, codec-owner and frame arenas have stable addresses; managed JSON array
+allocator references are rehomed before temporary quota wrappers expire.
+
+Statement-wide binding, public SDK/envelope descriptors and pgwire still need
+to adopt the precise frame contract; JSON compatibility ingress remains guarded
+against array parameters. Native datetime text inputs normalize to UTC, while
+datetime binary parameters remain guarded until their codec is bound.
+Array-valued public outputs, public array parameters, catalog storage and overloads converting
 whole arrays to text/JSON remain explicit activation gaps. Default decimal
 constructors still need an exact NUMERIC array representation; direct narrowing
 or text casts of these constructors remain guarded (explicit real/double casts

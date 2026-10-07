@@ -340,7 +340,7 @@ fn hashElement(kind: ElementType, element: Element, budget: *Budget) !u64 {
 }
 
 pub const Owned = struct {
-    arena: std.heap.ArenaAllocator,
+    arena: *std.heap.ArenaAllocator,
     budget: *MemoryBudget,
     value: Value,
 
@@ -349,7 +349,9 @@ pub const Owned = struct {
         const budget = try backing.create(MemoryBudget);
         errdefer backing.destroy(budget);
         budget.* = .{ .backing = backing, .limit = limits.bytes };
-        var arena = std.heap.ArenaAllocator.init(budget.allocator());
+        const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return allocationError(budget, err);
+        errdefer budget.allocator().destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(budget.allocator());
         errdefer arena.deinit();
         const owned = arena.allocator();
         const dimensions = owned.dupe(Dimension, validated.dimensions) catch |err| return allocationError(budget, err);
@@ -360,6 +362,7 @@ pub const Owned = struct {
 
     pub fn deinit(self: *Owned) void {
         self.arena.deinit();
+        self.budget.allocator().destroy(self.arena);
         const backing = self.budget.backing;
         std.debug.assert(self.budget.live == 0);
         backing.destroy(self.budget);

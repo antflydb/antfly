@@ -171,6 +171,14 @@ fn decodeElement(a: A, kind: arrays.ElementType, text: []const u8, work: *arrays
     });
 }
 
+/// Scalar text-protocol input uses the same builtin codecs as array cells,
+/// without array tokenization or SQL NULL inference from the string "NULL".
+pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, text: []const u8, work: *arrays.Budget) !arrays.Element {
+    try work.consume(text.len);
+    if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOfScalar(u8, text, 0) != null) return error.SqlInvalidTextEncoding;
+    return decodeElement(a, kind, text, work);
+}
+
 /// Allocate into the caller's statement/row arena; that arena owns cleanup on
 /// both success and error, like parseFromSliceLeaky. No allocator references
 /// escape: the local budget bounds all requested allocations, including JSONB.
@@ -221,6 +229,9 @@ fn decodeAdmitted(budget: *MemoryBudget, kind: arrays.ElementType, bytes: []cons
     var reader: Reader = .{ .bytes = bytes, .at = body, .limit = options.values.elements, .cells = cells, .scratch = scratch, .alloc = a, .kind = kind, .work = &validation };
     _ = try reader.array(0);
     const owned_dimensions = try a.dupe(arrays.Dimension, dimensions);
+    if (kind == .jsonb) for (cells) |*cell| if (!cell.sql_null) {
+        try @import("json_order.zig").rehomeArrayAllocators(&cell.value, budget.backing, &validation, 0);
+    };
     const value = try arrays.Value.initWithBudget(kind, owned_dimensions, cells, options.values, &validation);
     a.free(scratch);
     return .{ .value = value, .allocated_bytes = budget.live, .work = options.values.work - validation.remaining };
@@ -232,7 +243,9 @@ pub fn decode(backing: A, kind: arrays.ElementType, bytes: []const u8, options: 
     const budget = try backing.create(MemoryBudget);
     errdefer backing.destroy(budget);
     budget.* = .{ .backing = backing, .limit = options.values.bytes };
-    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return quotaError(budget, err);
+    errdefer budget.allocator().destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(budget.allocator());
     errdefer arena.deinit();
     const decoded = decodeLeaky(arena.allocator(), kind, bytes, options) catch |err| return quotaError(budget, err);
     return .{ .value = decoded.value, .arena = arena, .budget = budget };

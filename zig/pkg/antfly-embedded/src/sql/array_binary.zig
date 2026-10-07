@@ -107,7 +107,8 @@ const Reader = struct {
     }
 };
 
-fn decodeElement(a: A, kind: arrays.ElementType, bytes: []const u8, work: *arrays.Budget) !arrays.Element {
+pub fn decodeElementLeaky(a: A, kind: arrays.ElementType, bytes: []const u8, work: *arrays.Budget) !arrays.Element {
+    try work.consume(bytes.len);
     const width: ?usize = switch (kind) {
         .int16 => 2,
         .int32, .float32 => 4,
@@ -146,6 +147,28 @@ fn decodeElement(a: A, kind: arrays.ElementType, bytes: []const u8, work: *array
 /// failures unwind the entire unpublished arena; quota exhaustion is distinct
 /// from an injected or genuine backing-allocator failure.
 pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !arrays.Owned {
+    const budget = try backing.create(MemoryBudget);
+    errdefer backing.destroy(budget);
+    budget.* = .{ .backing = backing, .limit = options.values.bytes };
+    const arena = budget.allocator().create(std.heap.ArenaAllocator) catch |err| return quotaError(budget, err);
+    errdefer budget.allocator().destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(budget.allocator());
+    errdefer arena.deinit();
+    const decoded = decodeLeaky(arena.allocator(), expected, bytes, options) catch |err| return quotaError(budget, err);
+    return .{ .arena = arena, .budget = budget, .value = decoded.value };
+}
+
+pub const Decoded = struct { value: arrays.Value, work: usize };
+
+/// The caller owns an admitted allocation region and destroys it on failure.
+/// No temporary quota-allocator references escape; the enclosing region owns
+/// retained managed JSON arrays as well as the flat typed cells.
+pub fn decodeLeaky(backing: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
+    var budget: MemoryBudget = .{ .backing = backing, .limit = options.values.bytes };
+    return decodeAdmitted(budget.allocator(), backing, expected, bytes, options) catch |err| return quotaError(&budget, err);
+}
+
+fn decodeAdmitted(a: A, owner: A, expected: arrays.ElementType, bytes: []const u8, options: Options) !Decoded {
     if (bytes.len > options.wire_bytes) return error.SqlProgramLimitExceeded;
     var work: arrays.Budget = .{ .remaining = options.values.work };
     try work.consume(bytes.len);
@@ -170,13 +193,7 @@ pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, optio
     // Each cell requires at least its signed length prefix. Reject impossible
     // shapes before attempting a count-sized allocation.
     if (count > (bytes.len - reader.position) / 4) return error.InvalidSqlBinaryRepresentation;
-    const budget = try backing.create(MemoryBudget);
-    errdefer backing.destroy(budget);
-    budget.* = .{ .backing = backing, .limit = options.values.bytes };
-    var arena = std.heap.ArenaAllocator.init(budget.allocator());
-    errdefer arena.deinit();
-    const a = arena.allocator();
-    const cells = a.alloc(arrays.Element, count) catch |err| return quotaError(budget, err);
+    const cells = try a.alloc(arrays.Element, count);
     for (cells) |*cell| {
         const length = try reader.int(i32);
         if (length == -1) {
@@ -184,12 +201,15 @@ pub fn decode(backing: A, expected: arrays.ElementType, bytes: []const u8, optio
             continue;
         }
         if (length < -1) return error.InvalidSqlBinaryRepresentation;
-        cell.* = decodeElement(a, expected, try reader.take(@intCast(length)), &work) catch |err| return quotaError(budget, err);
+        cell.* = try decodeElementLeaky(a, expected, try reader.take(@intCast(length)), &work);
     }
     if (reader.position != bytes.len) return error.InvalidSqlBinaryRepresentation;
-    const owned_dimensions = a.dupe(arrays.Dimension, dimensions[0..@intCast(rank)]) catch |err| return quotaError(budget, err);
+    const owned_dimensions = try a.dupe(arrays.Dimension, dimensions[0..@intCast(rank)]);
+    if (expected == .jsonb) for (cells) |*cell| if (!cell.sql_null) {
+        try @import("json_order.zig").rehomeArrayAllocators(&cell.value, owner, &work, 0);
+    };
     const value = try arrays.Value.initWithBudget(expected, owned_dimensions, cells, options.values, &work);
-    return .{ .arena = arena, .budget = budget, .value = value };
+    return .{ .value = value, .work = options.values.work - work.remaining };
 }
 
 fn quotaError(budget: *MemoryBudget, err: anyerror) anyerror {

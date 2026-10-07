@@ -65,6 +65,21 @@ pub fn parseTextLeaky(a: std.mem.Allocator, text: []const u8, budget: *Budget) !
     };
 }
 
+/// A temporary quota allocator may own admission, but managed JSON arrays
+/// must retain the enclosing region's stable allocator, not its stack wrapper.
+pub fn rehomeArrayAllocators(value: *Json, owner: std.mem.Allocator, budget: *Budget, depth: usize) !void {
+    try budget.consume(1);
+    if (depth > 64) return error.SqlProgramLimitExceeded;
+    switch (value.*) {
+        .array => |*items| {
+            items.allocator = owner;
+            for (items.items) |*item| try rehomeArrayAllocators(item, owner, budget, depth + 1);
+        },
+        .object => |*items| for (items.values()) |*item| try rehomeArrayAllocators(item, owner, budget, depth + 1),
+        else => {},
+    }
+}
+
 test "JSON text admission bounds nesting before DOM allocation and unwinds faults" {
     const a = std.testing.allocator;
     var nested: [131]u8 = undefined;

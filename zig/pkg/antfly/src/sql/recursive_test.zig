@@ -197,7 +197,13 @@ test "SQL recursive INSERT SELECT validates the worklist before one atomic mutat
 
 test "SQL recursive worklist and cached hash allocation failures release ownership" {
     const Case = struct {
-        fn run(alloc: std.mem.Allocator) !void {
+        fn run(backing: std.mem.Allocator) !void {
+            // In-place arena growth depends on backing addresses. Enumerate
+            // every mandatory allocation deterministically via allocate/copy.
+            var vtable = backing.vtable.*;
+            vtable.resize = std.mem.Allocator.noResize;
+            vtable.remap = std.mem.Allocator.noRemap;
+            const alloc: std.mem.Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
             var fixture: Fixture = .{};
             var compiled = try compiler.compile(alloc, "WITH RECURSIVE r(n) AS (SELECT 1 UNION SELECT r.n+1 FROM (SELECT 1 AS x UNION ALL SELECT 2) b JOIN r ON b.x=r.n WHERE r.n<3) SELECT n FROM r", .{});
             defer compiled.deinit();
