@@ -42,6 +42,11 @@ Both complete logs contain all seven creation markers and the ten stalled
 positional read/write markers. The explicit production boundary audit covers
 737 sources with no server coordination imports. Whole native API qualification of
 these creation hooks also passes all 50 build steps and 75 selected tests
-without skips or leaks. Full Linux API qualification of creation hooks remains
-required. Adjacent logs and source hashes preserve the
+without skips or leaks. Full Linux API qualification also passes all 47 build steps and 75 selected
+tests. Both exact GNU AArch64 artifacts were then rerun without invoking a
+compiler in a two-CPU, 2 GiB container without extra swap; all 36 embedded and
+39 coordinator tests pass with explicit zero exit statuses and no skips or leaks.
+`linux-runtime-artifacts.json` records the exact paths, arguments, sizes and
+SHA-256 hashes. This API snapshot is detached commit `adbc2df496` and precedes
+the request-local read-index wait integration. Adjacent logs and source hashes preserve the
 current evidence; no automatic defaults are qualified by this slice.

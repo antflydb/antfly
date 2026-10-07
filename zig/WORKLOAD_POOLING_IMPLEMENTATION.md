@@ -890,8 +890,11 @@ whole API verification of those newer hooks is running separately on macOS.
 Whole native API qualification of private spill creation waits now passes all
 36 embedded and 39 coordinator pooling tests without skips or leaks, and all
 50 build steps. The exact-source [creation receipt](qualification/workload-pooling/receipts/2026-10-07/spill-creation-waits/README.md)
-preserves the complete output. Full Linux API verification of creation hooks
-remains a separate gate.
+preserves the complete output. Full Linux API verification also passes all
+47 build steps and 75 tests. Both exact GNU AArch64 artifacts pass again in a
+separate two-CPU, 2 GiB container without extra swap, with explicit zero exit
+statuses and no skips or leaks. The receipt records artifact hashes and exact
+arguments; this snapshot precedes request-local read-index wait integration.
 
 
 The checked native execution-wait interface is now qualified through a separately
