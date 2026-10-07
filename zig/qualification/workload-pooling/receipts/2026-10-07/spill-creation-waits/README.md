@@ -40,6 +40,8 @@ The full Linux SQL target also passes all nine build steps and all 387 named
 tests without skips or leaks in a two-CPU, 3 GiB container without extra swap.
 Both complete logs contain all seven creation markers and the ten stalled
 positional read/write markers. The explicit production boundary audit covers
-737 sources with no server coordination imports. Whole API qualification of
-these new creation hooks is still required. Adjacent logs and source hashes preserve the
+737 sources with no server coordination imports. Whole native API qualification of
+these creation hooks also passes all 50 build steps and 75 selected tests
+without skips or leaks. Full Linux API qualification of creation hooks remains
+required. Adjacent logs and source hashes preserve the
 current evidence; no automatic defaults are qualified by this slice.

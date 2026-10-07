@@ -885,3 +885,10 @@ schedules. The [read-resume receipt](qualification/workload-pooling/receipts/202
 preserves source/artifact hashes, complete logs and explicit zero runtime exit
 statuses. This qualification snapshot precedes private spill creation waits;
 whole API verification of those newer hooks is running separately on macOS.
+
+
+Whole native API qualification of private spill creation waits now passes all
+36 embedded and 39 coordinator pooling tests without skips or leaks, and all
+50 build steps. The exact-source [creation receipt](qualification/workload-pooling/receipts/2026-10-07/spill-creation-waits/README.md)
+preserves the complete output. Full Linux API verification of creation hooks
+remains a separate gate.

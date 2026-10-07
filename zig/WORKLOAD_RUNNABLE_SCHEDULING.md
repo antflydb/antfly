@@ -101,9 +101,9 @@ cancellation, expiry, shutdown and I/O errors. Private directory/file creation a
 results are discarded if capacity or authority cannot be reacquired, with cleanup
 independent of a new grant. The full SQL corpus passes all 387 tests on both
 platforms; the [creation receipt](qualification/workload-pooling/receipts/2026-10-07/spill-creation-waits/README.md)
-records seven handle-retirement schedules. Whole API qualification of creation
-hooks, general storage/RPC waits, cleanup execution ownership and parallel child
-owners remain outstanding.
+records seven handle-retirement schedules. The creation hooks also pass the full native API pooling target. Full Linux API
+qualification of creation hooks, general storage/RPC waits, cleanup execution
+ownership and parallel child owners remain outstanding.
 
 ## Read authority after resumption
 
