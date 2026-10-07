@@ -31,6 +31,7 @@ pub const Column = struct {
     /// Derived relations and aliases deliberately do not inherit this scope.
     scope: ?catalog.Table.Scope = null,
     type: ast.ColumnType,
+    element_type: ?@import("array_value.zig").ElementType = null,
     nullable: bool,
     visible: bool = true,
     untyped_null: bool = false,
@@ -561,12 +562,12 @@ const Builder = struct {
     }
     fn virtualTable(self: *Builder, columns: []const Column) !catalog.Table {
         const result = try self.alloc.alloc(catalog.Column, columns.len);
-        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .nullable = column.nullable };
+        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .path = column.internal, .type = column.type, .element_type = column.element_type, .nullable = column.nullable };
         return .{ .id = 0, .physical_name = virtual_table_name, .schema_version = 0, .columns = result };
     }
     fn scalarColumns(self: *Builder, columns: []const Column) ![]const scalar.Column {
         const result = try self.alloc.alloc(scalar.Column, columns.len);
-        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .nullable = column.nullable };
+        for (columns, result) |column, *out| out.* = .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .nullable = column.nullable };
         return result;
     }
     fn field(columns: []const Column, name: []const u8) !Column {
@@ -995,6 +996,7 @@ const Builder = struct {
                     .internal = try self.internal(),
                     .qualifier = alias,
                     .type = output.kind orelse .string,
+                    .element_type = output.element_type,
                     .nullable = true,
                     .origin = expression_,
                 };
@@ -1032,7 +1034,7 @@ const Builder = struct {
                     untyped = untyped or source_column.untyped_null;
                 };
             }
-            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .nullable = true, .untyped_null = untyped };
+            out.* = .{ .name = try self.alloc.dupe(u8, if (names.len == 0) column.name else names[index]), .internal = try self.internal(), .qualifier = alias, .type = column.type, .element_type = column.element_type, .nullable = true, .untyped_null = untyped };
         }
         const constants = try self.alloc.alloc(Node.ConstantRef, lowered.invocation_constants.len);
         for (lowered.invocation_constants, constants) |name, *reference| {
@@ -1139,7 +1141,7 @@ const Builder = struct {
                 const source_columns = try self.alloc.alloc([]const u8, columns.len);
                 const fields = try self.alloc.alloc([]const u8, table.columns.len);
                 for (table.columns, columns[0..table.columns.len], source_columns[0..table.columns.len], fields) |column, *out, *source_name, *field_name| {
-                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .nullable = column.nullable };
+                    out.* = .{ .name = try self.alloc.dupe(u8, column.name), .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .scope = physicalScope(table, reference.name, reference.alias != null), .type = column.type, .element_type = column.element_type, .nullable = column.nullable };
                     source_name.* = column.name;
                     field_name.* = column.path;
                 }
@@ -1148,7 +1150,7 @@ const Builder = struct {
                     columns[table.columns.len + 1 + i] = .{ .name = name, .internal = try self.internal(), .qualifier = reference.alias orelse reference.name.table, .type = if (i == 2) .json else .string, .nullable = i == 2, .visible = false };
                     source_columns[table.columns.len + 1 + i] = name;
                 }
-                if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .nullable = column.nullable });
+                if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .element_type = column.element_type, .nullable = column.nullable });
                 source_columns[table.columns.len] = "_id";
                 if (reference.prepared_rows) {
                     if (reference.mutation_target or reference.mutation_document or reference.mutation_presence) return error.InvalidSqlBackendResponse;
@@ -1537,7 +1539,7 @@ pub fn lowerBoundExpression(alloc: Allocator, columns: []const Column, expressio
 pub fn normalizeTargetProjection(alloc: Allocator, backend: catalog.Backend, table: catalog.Table, name: ast.Name, aliased: bool, projections: []const ast.Projection) ![]const ast.Projection {
     var builder: Builder = .{ .alloc = alloc, .backend = backend, .parameters = &.{} };
     const columns = try alloc.alloc(Column, table.columns.len + 1);
-    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .nullable = column.nullable };
+    for (table.columns, columns[0..table.columns.len]) |column, *out| out.* = .{ .name = column.name, .internal = column.name, .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = column.type, .element_type = column.element_type, .nullable = column.nullable };
     columns[table.columns.len] = .{ .name = "_id", .internal = "_id", .qualifier = name.table, .scope = physicalScope(table, name, aliased), .type = .string, .nullable = false, .visible = false };
     const source: Node = .{ .columns = columns, .operation = .singleton };
     return (try builder.lower(&source, .{ .table = name, .columns = projections })).columns;

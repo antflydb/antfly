@@ -81,6 +81,81 @@ const SetTestBackend = struct {
     }
 };
 
+test "SQL typed array rows survive scalar join and grouped relation adapters" {
+    const Fixture = struct {
+        const State = struct {
+            emitted: bool = false,
+            fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                if (self.emitted or limit == 0) return .{ .rows = &.{} };
+                self.emitted = true;
+                const rows = try a.alloc(catalog.Row, 1);
+                var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+                rows[0] = try catalog.Row.fromDatums(a, "row", try catalog.Row.TypedLayout.init(a, &.{"a"}), &.{Datum.typedArray(&array)});
+                return .{ .rows = rows };
+            }
+            fn close(_: *anyopaque) void {}
+        };
+        const Owner = struct {
+            arena: std.heap.ArenaAllocator,
+            backing: Allocator,
+            fn close(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const a = self.backing;
+                self.arena.deinit();
+                a.destroy(self);
+            }
+        };
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "a", .path = "a", .type = .array, .element_type = .int64 }} };
+        }
+        fn scan(_: *anyopaque, a: Allocator, _: catalog.Table, request: catalog.Scan) !catalog.Page {
+            var state: State = .{};
+            return State.next(&state, a, request.limit);
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn capture(_: *anyopaque, a: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const owner = try a.create(Owner);
+            owner.* = .{ .arena = .init(a), .backing = a };
+            errdefer Owner.close(owner);
+            const states = try owner.arena.allocator().alloc(State, scans.len);
+            const cursors = try owner.arena.allocator().alloc(catalog.Cursor, scans.len);
+            for (states, cursors) |*state, *cursor| {
+                state.* = .{};
+                cursor.* = .{ .ptr = state, .next = State.next, .close = State.close };
+            }
+            return .{ .ptr = owner, .cursors = cursors, .close = Owner.close };
+        }
+        fn run(a: Allocator) !void {
+            var dummy: u8 = 0;
+            const backend: catalog.Backend = .{ .ptr = &dummy, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = SetTestBackend.mutate, .checkpoint = checkpoint, .open_statement = capture } };
+            const Case = struct { sql: []const u8, expected: []const u8 };
+            for ([_]Case{
+                .{ .sql = "SELECT cardinality(a), array_lower(a, 1), array_upper(a, 1), 9007199254740993 = ANY(a), 9007199254740992 = ANY(a) FROM items", .expected = "[[\"2\",\"-3\",\"-2\",true,null]]" },
+                .{ .sql = "SELECT cardinality(t.a), array_lower(t.a, 1), 9007199254740993 = ANY(t.a) FROM items t CROSS JOIN items u", .expected = "[[\"2\",\"-3\",true]]" },
+                .{ .sql = "SELECT sum(cardinality(t.a)) FROM items t CROSS JOIN items u", .expected = "[[\"2\"]]" },
+            }) |case| {
+                var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+                defer compiled.deinit();
+                var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{});
+                defer result.deinit();
+                const encoded = try std.json.Stringify.valueAlloc(a, result.output.rows, .{});
+                defer a.free(encoded);
+                try std.testing.expectEqualStrings(case.expected, encoded);
+            }
+            var array_output = try @import("compiler.zig").compile(a, "SELECT a FROM items", .{});
+            defer array_output.deinit();
+            var unexpected = @import("runtime.zig").execute(a, backend, &array_output, &.{}, .{}) catch |err| {
+                if (err == error.UnsupportedSqlShape) return;
+                return err;
+            };
+            defer unexpected.deinit();
+            return error.TestExpectedError;
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
 test "SQL materialized relation replay spills once and shares a single statement capture" {
     const Fixture = struct {
         offset: usize = 0,
@@ -360,7 +435,7 @@ fn Engine(comptime Context: type) type {
         fn normalize(alloc: Allocator, columns: []const binding.Column, values: []const Datum) ![]const Datum {
             if (columns.len != values.len) return error.SqlTypeMismatch;
             const result = try alloc.alloc(Datum, values.len);
-            for (values, columns, result) |value, column, *out| out.* = .{ .value = try describe.coerceAlloc(alloc, value.value, column.type), .sql_null = value.sql_null };
+            for (values, columns, result) |value, column, *out| out.* = try describe.coerceDatum(alloc, value, column.type, column.element_type);
             return result;
         }
 
@@ -605,7 +680,7 @@ fn Engine(comptime Context: type) type {
                         const values = try alloc.alloc(Datum, self.node.columns.len);
                         for (names, self.node.columns, values) |name, column, *out| {
                             const cell = try row.cell(name);
-                            out.* = .{ .value = try describe.coerceAlloc(alloc, cell.value, column.type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+                            out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
                         }
                         break :blk values;
                     },
@@ -635,7 +710,7 @@ fn Engine(comptime Context: type) type {
                                 const cell = try page.cell(alloc, index, name);
                                 // Values borrow the current page until the next pull.
                                 // Retaining operators own typed copies at admission.
-                                out.* = .{ .value = try describe.coerceAlloc(alloc, cell.value, column.type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+                                out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
                             }
                             break :blk values;
                         }
@@ -659,7 +734,7 @@ fn Engine(comptime Context: type) type {
                         const values = try alloc.alloc(Datum, self.node.columns.len);
                         for (scan.source_columns, self.node.columns, values) |name, column, *out| {
                             const cell = try @import("joined_mutation.zig").cell(alloc, row, name);
-                            out.* = .{ .value = try describe.coerceAlloc(alloc, cell.value, column.type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+                            out.* = try describe.coerceDatum(alloc, cell, column.type, column.element_type);
                         }
                         break :blk values;
                     },
@@ -897,10 +972,10 @@ fn Engine(comptime Context: type) type {
                             for (selected.items, vector) |index, *value| value.* = try input.cell(a, index, ordinal);
                             values.* = vector;
                         }
-                        for (@constCast(values.*), output_errors) |*value, *err| value.value = describe.coerceAlloc(a, value.value, definition.type) catch |cause| blk: {
+                        for (@constCast(values.*), output_errors) |*value, *err| value.* = describe.coerceDatum(a, value.*, definition.type, definition.element_type) catch |cause| blk: {
                             if (cause == error.OutOfMemory) return cause;
                             err.* = err.* orelse cause;
-                            break :blk .null;
+                            break :blk .{};
                         };
                     }
                     var prefix = selected.items.len;
@@ -943,6 +1018,9 @@ fn Engine(comptime Context: type) type {
                     var page_bytes: usize = 0;
                     var rows: std.ArrayList(catalog.Row) = .empty;
                     var cells: std.ArrayList([]const Datum) = .empty;
+                    const names = try scratch.alloc([]const u8, query.source.columns.len);
+                    for (query.source.columns, names) |column, *name| name.* = column.internal;
+                    const layout = try catalog.Row.TypedLayout.init(scratch, names);
                     // Each nested stage leaves room for upstream pages, bindings and spill operators.
                     const wanted = @min(self.batch_demand orelse std.math.maxInt(usize), @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip));
                     while (rows.items.len < wanted) {
@@ -951,16 +1029,7 @@ fn Engine(comptime Context: type) type {
                         else
                             try self.left.?.next(scratch)) orelse break;
                         try self.engine.checkpoint();
-                        var object: std.json.ObjectMap = .empty;
-                        const nulls = try scratch.alloc(bool, input.len);
-                        const sources = try scratch.alloc(?*scalar.PatternSet, input.len);
-                        for (input, sources) |cell, *source| source.* = cell.patterns;
-                        for (input, query.source.columns, nulls) |cell, column, *is_null| {
-                            const owned = try operators.cloneDatum(scratch, cell);
-                            try object.put(scratch, column.internal, owned.value);
-                            is_null.* = cell.sql_null;
-                        }
-                        const row: catalog.Row = .{ .id = "", .version = 0, .value = .{ .object = object }, .sql_nulls = nulls, .pattern_sources = sources };
+                        const row = try catalog.Row.fromDatums(scratch, "", layout, input);
                         try rows.append(scratch, row);
                         try cells.append(scratch, try context.binding.scalars.cells(scratch, row));
                         for (input) |cell| page_bytes +|= try operators.datumBytes(cell);
@@ -1000,10 +1069,7 @@ fn Engine(comptime Context: type) type {
 
             fn setValues(self: *Iterator, alloc: Allocator, values: []const Datum) ![]const Datum {
                 const result = try alloc.alloc(Datum, values.len);
-                for (values, result, self.node.columns) |value, *out, column| out.* = .{
-                    .value = try describe.coerceAlloc(alloc, value.value, column.type),
-                    .sql_null = value.sql_null,
-                };
+                for (values, result, self.node.columns) |value, *out, column| out.* = try describe.coerceDatum(alloc, value, column.type, column.element_type);
                 return result;
             }
             fn nextValues(self: *Iterator, alloc: Allocator) anyerror!?[]const Datum {
@@ -1384,6 +1450,9 @@ fn Engine(comptime Context: type) type {
             }
             fn hasPatterns(node: *const binding.Node, depth: usize) bool {
                 if (depth == 64) return true;
+                // The primitive column-page codec cannot carry typed arrays.
+                // Use the lossless typed row adapter, never its JSON placeholder.
+                for (node.columns) |column| if (column.type == .array) return true;
                 return switch (node.operation) {
                     .query => |query| blk: {
                         if (query.binding.aggregate) |aggregate| for (aggregate.specs) |spec| if (spec.kind == .pattern_set) break :blk true;
@@ -1455,20 +1524,15 @@ fn Engine(comptime Context: type) type {
                 var rows: std.ArrayList(catalog.Row) = .empty;
                 var bytes: usize = 0;
                 var stopped_for_bytes = false;
+                const names = try alloc.alloc([]const u8, self.iterator.node.columns.len);
+                for (self.iterator.node.columns, names) |column, *name| name.* = column.internal;
+                const layout = try catalog.Row.TypedLayout.init(alloc, names);
                 while (rows.items.len < limit) {
                     const values = try self.iterator.nextDemand(alloc, limit - rows.items.len) orelse break;
                     for (values) |value| bytes +|= try operators.datumBytes(value);
-                    var object: std.json.ObjectMap = .empty;
-                    const nulls = try alloc.alloc(bool, values.len);
-                    const sources = try alloc.alloc(?*scalar.PatternSet, values.len);
-                    for (values, sources) |value, *source| source.* = value.patterns;
-                    for (values, self.iterator.node.columns, nulls) |value, column, *sql_null| {
-                        const owned = try operators.cloneDatum(alloc, value);
-                        try object.put(alloc, column.internal, owned.value);
-                        sql_null.* = owned.sql_null;
-                    }
                     self.ordinal += 1;
-                    try rows.append(alloc, .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal}), .version = 0, .value = .{ .object = object }, .sql_nulls = nulls, .pattern_sources = sources });
+                    const id = try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal});
+                    try rows.append(alloc, try catalog.Row.fromDatums(alloc, id, layout, values));
                     if (bytes >= self.engine.context.limits.page_bytes) {
                         stopped_for_bytes = true;
                         break;

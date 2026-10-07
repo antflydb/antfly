@@ -718,9 +718,9 @@ pub const Context = struct {
             const program = if (index < self.binding.scalars.projections.len) self.binding.scalars.projections[index] else null;
             const input = if (program) |expression| try self.evaluate(alloc, expression, expression_cells) else blk: {
                 const cell = try row.cell(field);
-                break :blk Datum{ .value = cell.value, .sql_null = cell.sql_null, .patterns = cell.patterns };
+                break :blk cell;
             };
-            out.* = .{ .value = try coerce(alloc, input.value, column.type), .sql_null = input.sql_null, .patterns = input.patterns };
+            out.* = try describe.coerceDatum(alloc, input, column.type, column.element_type);
         }
         return values;
     }
@@ -741,9 +741,9 @@ pub const Context = struct {
             for (fields, self.binding.columns, projected, 0..) |field, column, *out, index| {
                 const input = if (index < columns.len and columns[index] != null) columns[index].?[row_index] else blk: {
                     const cell = try row.cell(field);
-                    break :blk Datum{ .value = cell.value, .sql_null = cell.sql_null, .patterns = cell.patterns };
+                    break :blk cell;
                 };
-                out.* = .{ .value = try coerce(alloc, input.value, column.type), .sql_null = input.sql_null, .patterns = input.patterns };
+                out.* = try describe.coerceDatum(alloc, input, column.type, column.element_type);
             }
             values.* = projected;
         }
@@ -3331,7 +3331,7 @@ test "SQL nested blocking result ownership unwinds allocation failures" {
             try std.testing.expectEqualStrings("5", result.output.rows[0][0].string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }
 
 test "SQL joins consume native column batches without invoking the JSON cursor" {

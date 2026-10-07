@@ -3497,3 +3497,25 @@ profiles for typed arrays, temporal/regex functions, virtual document metadata,
 root replacements, generated fields and constraint/index ownership. SQL syntax
 or schemas that disagree with PostgreSQL must not gain positive parity credit
 through SQLite emulation or fixture-only authority.
+
+### Typed relation row boundary (2026-10-07)
+
+Internal relation pages now retain owned complete Datums and share one
+name-to-ordinal directory per page. They no longer build a JSON object plus
+SQL-null and pattern side channels for every row. Array dimensions, lower
+bounds, NULL elements, exact bigint values and pattern owners survive scalar,
+join and grouped row adapters. Internal coercion borrows already-owned array
+values without allocating or converting their JSON placeholder; incompatible
+element descriptors and JSON-null substitutes fail closed. Primitive column
+pages remain available, while relations containing arrays use the lossless
+typed-row path until the column-page codec can represent arrays.
+
+The executable boundary contracts cover scalar, cross-join and grouped reads,
+ownership after source mutation, allocation-failure cleanup, SQL/JSON NULL
+distinction and the public array-output guard. PostgreSQL independently checks
+the same scalar/join/grouped values. This is architectural progress, not an
+original-case activation: the inventory remains 358 implemented, 136 rejected,
+73 superseded and 1,019 unresolved. Array-valued derived-query outputs, blocking
+query/scalar result transport, common array element-type coercion across set
+arms and the generated public/pgwire array descriptors and codecs still need
+completion before the remaining array original cases can receive parity credit.

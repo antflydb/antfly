@@ -64,7 +64,7 @@ pub const Bound = struct {
         @memset(out, .{});
         for (self.required) |ordinal| {
             const cell = try row.cell(self.columns[ordinal].name);
-            out[ordinal] = .{ .value = try @import("describe.zig").coerceAlloc(alloc, cell.value, self.columns[ordinal].type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+            out[ordinal] = try @import("describe.zig").coerceDatum(alloc, cell, self.columns[ordinal].type, self.columns[ordinal].element_type);
         }
         return out;
     }
@@ -164,6 +164,32 @@ fn jsonColumn(table: ?catalog.Table, name: []const u8) bool {
     const definition = table orelse return false;
     const column = definition.column(name) catch return false;
     return column.type == .json;
+}
+
+test "SQL bound scalar cells preserve typed array descriptors and reject JSON substitutes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "items", .schema_version = 1, .columns = &.{.{ .name = "a", .path = "a", .type = .array, .element_type = .int64 }} };
+    var compiled = try @import("compiler.zig").compile(a, "SELECT cardinality(a), array_lower(a, 1), array_upper(a, 1), 9007199254740993 = ANY(a), 9007199254740992 = ANY(a) FROM items", .{});
+    defer compiled.deinit();
+    const bound = try bind(a, table, compiled.statement, &.{});
+    try std.testing.expectEqual(@as(?@import("array_value.zig").ElementType, .int64), bound.columns[0].element_type);
+    var array = try @import("array_value.zig").Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ scalar.Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+    const row = try catalog.Row.fromDatums(a, "", try catalog.Row.TypedLayout.init(a, &.{"a"}), &.{scalar.Datum.typedArray(&array)});
+    const values = try bound.cells(a, row);
+    for (bound.projections[0..3], [_]i64{ 2, -3, -2 }) |program, integer| try std.testing.expectEqual(integer, (try program.?.evaluate(a, values, &.{}, .{})).value.integer);
+    try std.testing.expect((try bound.projections[3].?.evaluate(a, values, &.{}, .{})).value.bool);
+    try std.testing.expect((try bound.projections[4].?.evaluate(a, values, &.{}, .{})).sql_null);
+    const describe = @import("describe.zig");
+    var none = std.heap.FixedBufferAllocator.init(&.{});
+    // Borrowing an already-owned typed value does not allocate per element.
+    const borrowed = try describe.coerceDatum(none.allocator(), values[0], .array, .int64);
+    try std.testing.expect(borrowed.array == values[0].array);
+    try std.testing.expectError(error.SqlTypeMismatch, describe.coerceDatum(a, values[0], .json, null));
+    try std.testing.expectError(error.SqlTypeMismatch, describe.coerceDatum(a, values[0], .array, .float64));
+    try std.testing.expectError(error.SqlTypeMismatch, describe.coerceDatum(a, scalar.Datum.json(.null), .array, .int64));
+    try std.testing.expect((try describe.coerceDatum(a, .{}, .array, .int64)).sql_null);
 }
 
 test "SQL statements converge typed descriptors before emission and share one owned frame" {
@@ -335,7 +361,7 @@ fn bindDescriptors(alloc: Allocator, table: ?catalog.Table, statement: ast.State
         else => false,
     };
     const columns = try alloc.alloc(scalar.Column, table_columns.len + @intFromBool(table != null));
-    for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
+    for (table_columns, columns[0..table_columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type, .nullable = column.nullable, .aliases = if (qualified_names) try table.?.columnAliases(alloc, column.name) else &.{} };
     if (table != null) columns[table_columns.len] = .{ .name = "_id", .type = .string, .nullable = false, .aliases = if (qualified_names) try table.?.columnAliases(alloc, "_id") else &.{} };
     var builder: Builder = .{ .alloc = alloc, .table = table, .columns = columns, .parameters = parameters, .settings = settings, .fallbacks = fallbacks, .typed_parameters = typed_parameters };
     var out: Bound = .{ .columns = columns, .typed_parameters = typed_parameters };

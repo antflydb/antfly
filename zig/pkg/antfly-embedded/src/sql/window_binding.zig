@@ -244,7 +244,7 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
     input.* = try describe.bind(alloc, pinned_backend, &input_compiled, inferred);
     const parameters = @constCast(input.parameter_types);
     const columns = try alloc.alloc(scalar.Column, input.columns.len + builder.specs.items.len);
-    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type };
+    for (input.columns, columns[0..input.columns.len]) |column, *out| out.* = .{ .name = column.name, .type = column.type, .element_type = column.element_type };
     const specs = try alloc.alloc(Spec, builder.specs.items.len);
     for (builder.specs.items, specs, columns[input.columns.len..], 0..) |pending, *spec, *column, index| {
         const call = pending.node.call;

@@ -42,6 +42,7 @@ test "SQL DDL description has no fabricated table or mutation side effects" {
 pub const Column = struct {
     name: []const u8,
     type: ast.ColumnType,
+    element_type: ?@import("array_value.zig").ElementType = null,
     /// NULL without a concrete SQL type can adopt an assignment/set context.
     /// It must not be confused with a typed string expression that is NULL.
     untyped_null: bool = false,
@@ -300,7 +301,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const window = try allocator.create(@import("window_binding.zig").Bound);
         window.* = try @import("window_binding.zig").bind(allocator, backend, compiled, explicit_parameter_types);
         const columns = try allocator.alloc(Column, window.outputs.len);
-        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = try publicKind(program.output_type.kind), .untyped_null = program.output_type.kind == null };
+        for (columns, window.names, window.outputs) |*column, name, program| column.* = .{ .name = name, .type = try publicKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
         return .{ .table = window.input.table, .action = .read, .columns = columns, .parameter_types = window.input.parameter_types, .json_literals = .empty, .window = window };
     }
     if (compiled.statement == .select and @import("aggregate_binding.zig").accepts(compiled.statement.select)) {
@@ -312,7 +313,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const aggregate = try allocator.create(@import("aggregate_binding.zig").Bound);
         aggregate.* = try @import("aggregate_binding.zig").bindWithSettings(allocator, table, compiled.statement.select, parameters, backend.settings_view);
         const columns = try allocator.alloc(Column, aggregate.outputs.len);
-        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = try publicKind(program.output_type.kind), .untyped_null = program.output_type.kind == null };
+        for (columns, aggregate.names, aggregate.outputs) |*column, name, program| column.* = .{ .name = name, .type = try publicKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
         var json_literals: std.StringHashMapUnmanaged(Json) = .empty;
         if (table) |definition| {
             const contexts = try allocator.alloc(?ast.ColumnType, parameters.len);
@@ -512,7 +513,7 @@ fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compil
         columns[0] = .{ .name = try alloc.dupe(u8, statement.count_alias orelse "count"), .type = .integer };
     } else for (statement.columns, scalars.projections, columns) |projection, program, *column| {
         const expression = program orelse return error.UndefinedColumn;
-        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = try publicKind(expression.output_type.kind), .untyped_null = expression.output_type.kind == null };
+        column.* = .{ .name = try alloc.dupe(u8, projection.alias orelse "?column?"), .type = try publicKind(expression.output_type.kind), .element_type = expression.output_type.element_type, .untyped_null = expression.output_type.kind == null };
     }
     // Ordering a singleton changes nothing, but names must still resolve.
     for (statement.order_by) |order| {
@@ -634,7 +635,7 @@ const Context = struct {
         if (statement.columns.len == 0) {
             if (self.table.columns.len > 256) return error.SqlProgramLimitExceeded;
             const columns = try self.allocator.alloc(Column, self.table.columns.len);
-            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = try publicKind(column.type) };
+            for (self.table.columns, columns) |column, *output| output.* = .{ .name = try self.allocator.dupe(u8, column.name), .type = try publicKind(column.type), .element_type = column.element_type };
             return columns;
         }
         const columns = try self.allocator.alloc(Column, statement.columns.len);
@@ -643,7 +644,7 @@ const Context = struct {
         for (statement.columns, columns, 0..) |projection, *output, index| {
             if (projection.expression != null) {
                 const program = self.scalars.projections[index] orelse return error.InvalidSqlBackendResponse;
-                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = try publicKind(program.output_type.kind), .untyped_null = program.output_type.kind == null };
+                output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse "?column?"), .type = try publicKind(program.output_type.kind), .element_type = program.output_type.element_type, .untyped_null = program.output_type.kind == null };
                 continue;
             }
             const column = try self.table.column(projection.field);
@@ -651,7 +652,7 @@ const Context = struct {
                 _ = try native_fields.getOrPut(self.allocator, column.path);
                 if (native_fields.count() > 256 and !statement.internal_projection) return error.SqlProgramLimitExceeded;
             }
-            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = try publicKind(column.type) };
+            output.* = .{ .name = try self.allocator.dupe(u8, projection.alias orelse column.name), .type = try publicKind(column.type), .element_type = column.element_type };
         }
         return columns;
     }
@@ -801,9 +802,23 @@ fn bindOrder(alloc: std.mem.Allocator, table: catalog.Table, statement: ast.Sele
 
 /// Shared literal/parameter coercion. Exact integer columns never pass through
 /// f64. Native number columns intentionally have IEEE-754 semantics.
+/// Typed internal boundaries must never coerce an array's JSON placeholder.
+/// Array element descriptors are part of the type, not inferred from values.
+pub fn coerceDatum(alloc: std.mem.Allocator, raw: @import("scalar.zig").Datum, kind: ast.ColumnType, element_type: ?@import("array_value.zig").ElementType) !@import("scalar.zig").Datum {
+    if (raw.sql_null and raw.value != .null) return error.SqlTypeMismatch;
+    if (raw.array) |array| {
+        if (kind != .array or element_type == null or element_type.? != array.element_type or raw.sql_null or raw.value != .null or raw.patterns != null) return error.SqlTypeMismatch;
+        return raw;
+    }
+    if (kind == .array and (!raw.sql_null or element_type == null)) return error.SqlTypeMismatch;
+    var result = raw;
+    result.value = try coerceAlloc(alloc, raw.value, kind);
+    return result;
+}
+
 /// Native storage uses unsigned epoch nanos; external lake timestamps can be
-/// signed. Convert both exactly at the SQL boundary so projection, ordering and scalar evaluation
-/// share the same canonical datetime representation.
+/// signed. Convert both exactly at the SQL boundary so projection, ordering and
+/// scalar evaluation share the same canonical datetime representation.
 pub fn coerceAlloc(alloc: std.mem.Allocator, raw: Json, kind: ast.ColumnType) !Json {
     if (kind == .datetime and raw != .null) {
         const datetime = @import("../datetime.zig");

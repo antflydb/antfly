@@ -1242,6 +1242,32 @@ class PostgresReferenceTest(unittest.TestCase):
                 (4096,),
             )
 
+    def test_typed_relation_array_scalar_and_grouped_contracts(self):
+        with self.db.transaction(force_rollback=True):
+            self.db.execute("CREATE TABLE items(a bigint[])")
+            self.db.execute(
+                "INSERT INTO items VALUES ('[-3:-2]={9007199254740993,NULL}')"
+            )
+            cases = [
+                (
+                    "SELECT cardinality(a), array_lower(a, 1), array_upper(a, 1), "
+                    "9007199254740993 = ANY(a), 9007199254740992 = ANY(a) FROM items",
+                    (2, -3, -2, True, None),
+                ),
+                (
+                    "SELECT cardinality(t.a), array_lower(t.a, 1), "
+                    "9007199254740993 = ANY(t.a) FROM items t CROSS JOIN items u",
+                    (2, -3, True),
+                ),
+                (
+                    "SELECT sum(cardinality(t.a)) FROM items t CROSS JOIN items u",
+                    (2,),
+                ),
+            ]
+            for sql, expected in cases:
+                with self.subTest(sql=sql):
+                    self.assertEqual(self.db.execute(sql).fetchall(), [expected])
+
     def test_typed_array_scalar_expression_contracts(self):
         import json
         from pathlib import Path

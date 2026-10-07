@@ -23,6 +23,7 @@ pub const Column = struct {
     name: []const u8,
     path: []const u8,
     type: ast.ColumnType,
+    element_type: ?@import("array_value.zig").ElementType = null,
     nullable: bool = true,
     /// Native stored generated columns are readable but never SQL assignable.
     generated: bool = false,
@@ -130,13 +131,51 @@ pub const Row = struct {
     /// order. Null means a legacy JSON-only backend without that distinction.
     sql_nulls: ?[]const bool = null,
     pattern_sources: ?[]const ?*@import("scalar.zig").PatternSet = null,
+    /// Internal relation rows retain complete, owned Datums and share a single
+    /// page-local name directory, without constructing per-row JSON objects.
+    /// Legacy backend rows continue to use JSON and the null/pattern channels.
+    typed_cells: ?struct { layout: TypedLayout, values: []const Cell } = null,
 
-    pub const Cell = struct { value: std.json.Value, sql_null: bool, patterns: ?*@import("scalar.zig").PatternSet = null };
+    pub const Cell = @import("scalar.zig").Datum;
+    pub const TypedLayout = struct {
+        ordinals: std.StringHashMapUnmanaged(usize) = .empty,
+
+        /// Names borrow the immutable relation binding; entries belong to the
+        /// page arena. Duplicate names must not silently overwrite an ordinal.
+        pub fn init(arena: std.mem.Allocator, names: []const []const u8) !TypedLayout {
+            var result: TypedLayout = .{};
+            for (names, 0..) |name, index| {
+                const entry = try result.ordinals.getOrPut(arena, name);
+                if (entry.found_existing) return error.InvalidSqlBackendResponse;
+                entry.value_ptr.* = index;
+            }
+            return result;
+        }
+    };
+
+    /// Clone once at the page ownership boundary; consumers borrow the typed
+    /// cells until that page is released. Layout and allocations must belong
+    /// to the same page owner (or a longer-lived immutable binding).
+    pub fn fromDatums(alloc: std.mem.Allocator, id: []const u8, layout: TypedLayout, values: []const Cell) !Row {
+        if (layout.ordinals.count() != values.len) return error.InvalidSqlBackendResponse;
+        const owned = try alloc.alloc(Cell, values.len);
+        for (values, owned) |value, *out| out.* = try @import("operators.zig").cloneDatum(alloc, value);
+        return .{ .id = try alloc.dupe(u8, id), .version = 0, .value = .null, .typed_cells = .{ .layout = layout, .values = owned } };
+    }
 
     /// Decoding is explicit about the SQL/JSON null boundary. The native
     /// projection's field names are literal names, never dotted JSON paths.
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
+        if (self.typed_cells) |cells| {
+            if (cells.values.len != cells.layout.ordinals.count() or self.value != .null or self.sql_nulls != null or self.pattern_sources != null) return error.InvalidSqlBackendResponse;
+            const index = cells.layout.ordinals.get(name) orelse return .{};
+            if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
+            const result = cells.values[index];
+            if (result.array != null and (result.sql_null or result.value != .null or result.patterns != null)) return error.InvalidSqlBackendResponse;
+            if (result.sql_null and result.value != .null) return error.InvalidSqlBackendResponse;
+            return result;
+        }
         if (self.value != .object) return error.InvalidSqlBackendResponse;
         if (self.sql_nulls) |flags| if (flags.len != self.value.object.count()) return error.InvalidSqlBackendResponse;
         const index = self.value.object.getIndex(name) orelse return .{ .value = .null, .sql_null = true };
@@ -364,4 +403,34 @@ test "SQL row cells distinguish absent SQL NULL and JSON null and reject invalid
     try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("j"));
     row.sql_nulls = &.{ false, true, true };
     try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("i"));
+}
+
+test "SQL typed rows own arrays without conflating JSON null or array null elements" {
+    const scalar = @import("scalar.zig");
+    const arrays = @import("array_value.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dimensions = [_]arrays.Dimension{.{ .length = 2, .lower = -3 }};
+    var elements = [_]scalar.Datum{ scalar.Datum.json(.{ .integer = 9007199254740993 }), .{} };
+    var array = try arrays.Value.init(.int64, &dimensions, &elements, .{});
+    const layout = try Row.TypedLayout.init(a, &.{ "array", "json", "null" });
+    var row = try Row.fromDatums(a, "row", layout, &.{ scalar.Datum.typedArray(&array), scalar.Datum.json(.null), .{} });
+    dimensions[0].lower = 1;
+    elements[0].value = .{ .integer = 0 };
+    const cell = try row.cell("array");
+    try std.testing.expect(!cell.sql_null);
+    try std.testing.expectEqual(@as(i32, -3), cell.array.?.dimensions[0].lower);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), cell.array.?.elements[0].value.integer);
+    try std.testing.expect(cell.array.?.elements[1].sql_null);
+    try std.testing.expect(!(try row.cell("json")).sql_null);
+    try std.testing.expect((try row.cell("null")).sql_null);
+    try std.testing.expect((try row.cell("missing")).sql_null);
+    try std.testing.expectError(error.InvalidSqlBackendResponse, Row.TypedLayout.init(a, &.{ "x", "x" }));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, Row.fromDatums(a, "", layout, &.{}));
+    row.sql_nulls = &.{ false, false, true };
+    try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("array"));
+    row.sql_nulls = null;
+    row.typed_cells.?.values = &.{};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("array"));
 }
