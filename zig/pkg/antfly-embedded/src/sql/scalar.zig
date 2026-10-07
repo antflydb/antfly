@@ -71,7 +71,7 @@ pub const EvalLimits = struct {
     decision_values: ?[]const ?Datum = null,
     decision_demand: ?*?DecisionDemand = null,
 };
-pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", jsonb_exists, string_to_array, @"$like_escape" };
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified", trunc, sign, to_jsonb, jsonb_build_object, jsonb_extract_path_text, concat_ws, bit_length, strpos, jsonb_typeof, lpad, rpad, repeat, reverse, left, right, split_part, translate, overlay, ascii, chr, @"$array", @"$array_quantified", cardinality, array_ndims, array_length, array_lower, array_upper, @"$array_pattern_quantified", @"$contains", jsonb_exists, string_to_array, @"$like_escape", jsonb_set };
 
 pub const Instruction = struct {
     type: Type,
@@ -352,6 +352,69 @@ fn numeric(kind: ?ast.ColumnType) bool {
 // identity; unlike CASE/COALESCE, operator lookup does not promote the arrays.
 fn arrayOperator(left: Type, right: Type) !void {
     if (left.kind == .array and right.kind == .array and left.element_type != right.element_type) return error.SqlUndefinedOperator;
+}
+
+test "SQL logical JSON parameters and identity casts never parse string payloads again" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "$1", "CAST($1 AS json)", "CAST($1 AS jsonb)" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{}, &.{.json}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        for ([_][]const u8{ "pro", "null", "true", "12", "[1,2]", "{\"x\":1}", "\"quoted\"" }) |text_value| {
+            const result = try program.evaluate(none.allocator(), &.{}, &.{.{ .string = text_value }}, .{});
+            try std.testing.expect(!result.sql_null);
+            try std.testing.expectEqualStrings(text_value, result.value.string);
+        }
+        try std.testing.expect((try program.evaluate(none.allocator(), &.{}, &.{.null}, .{})).sql_null);
+    }
+    for ([_][]const u8{ "CAST(j AS json)", "CAST(j AS jsonb)" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try bind(a, compiled.expression, &.{.{ .name = "j", .type = .json }}, &.{}, .{});
+        defer program.deinit();
+        var none = std.heap.FixedBufferAllocator.init(&.{});
+        const string = try program.evaluate(none.allocator(), &.{Datum.json(.{ .string = "null" })}, &.{}, .{});
+        try std.testing.expectEqualStrings("null", string.value.string);
+        const json_null = try program.evaluate(none.allocator(), &.{Datum.json(.null)}, &.{}, .{});
+        try std.testing.expect(!json_null.sql_null and json_null.value == .null);
+    }
+}
+
+test "SQL JSONB path replacement matches PostgreSQL values NULLs and errors" {
+    const fixture = try std.json.parseFromSlice(struct {
+        reference: []const u8,
+        entries: []const struct { sql: []const u8, value: Json, sql_null: bool = false },
+        errors: []const struct { sql: []const u8, code: []const u8 },
+    }, std.testing.allocator, @embedFile("fixtures/sql_json_path_update_reference.json"), .{});
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, entry.sql, .{});
+        defer compiled.deinit();
+        var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{});
+        defer program.deinit();
+        try std.testing.expectEqual(ast.ColumnType.json, program.output_type.kind.?);
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try program.evaluate(arena.allocator(), &.{}, &.{}, .{});
+        try std.testing.expectEqual(entry.sql_null, result.sql_null);
+        try std.testing.expectEqual(std.math.Order.eq, try compare(result.value, entry.value));
+    }
+    for (fixture.value.errors) |entry| {
+        var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, entry.sql, .{});
+        defer compiled.deinit();
+        var program = bind(std.testing.allocator, compiled.expression, &.{}, &.{}, .{}) catch |err| {
+            try std.testing.expectEqualStrings(entry.code, @import("errors.zig").describe(err).code);
+            continue;
+        };
+        defer program.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        if (program.evaluate(arena.allocator(), &.{}, &.{}, .{})) |_| return error.ExpectedJsonPathFailure else |err| {
+            try std.testing.expectEqualStrings(entry.code, @import("errors.zig").describe(err).code);
+        }
+    }
 }
 
 test "SQL JSONB concatenation matches PostgreSQL typed scalar contracts" {
@@ -833,6 +896,7 @@ fn arity(function: Function, count: usize) !void {
         .@"$like_escape" => count == 4,
         .@"$contains", .jsonb_exists => count == 2,
         .string_to_array => count == 2 or count == 3,
+        .jsonb_set => count == 3 or count == 4,
         .@"$array" => true,
         .@"$array_quantified" => count == 4,
         .cardinality, .array_ndims => count == 1,
@@ -1036,6 +1100,15 @@ const Binder = struct {
                         if (actual.kind != null and actual.kind != desired and !(numeric(actual.kind) and numeric(desired))) return error.SqlTypeMismatch;
                     }
                     break :blk .{ .kind = if (function == .@"$array_quantified") .boolean else .integer, .nullable = true };
+                }
+                if (function == .jsonb_set) {
+                    for (call.args, 0..) |arg, i| {
+                        const actual = try self.infer(arg, depth + 1);
+                        const desired: ast.ColumnType = if (i == 1) .array else if (i == 3) .boolean else .json;
+                        if (actual.kind != null and actual.kind != desired and !(i < 3 and arg.* == .literal and arg.literal == .string)) return error.SqlTypeMismatch;
+                        if (i == 1 and actual.kind == .array and actual.element_type != .text) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = .json, .nullable = true };
                 }
                 for (call.args) |arg| if ((try self.infer(arg, depth + 1)).kind == .array) {
                     switch (function) {
@@ -1251,6 +1324,7 @@ const Binder = struct {
                         .@"$like_escape" => if (i == 3) .boolean else .string,
                         .string_to_array => .string,
                         .jsonb_exists => if (i == 0) .json else .string,
+                        .jsonb_set => if (i == 1) .array else if (i == 3) .boolean else .json,
                         .@"$contains" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).kind,
                         .@"$array" => if (nested_constructor) .array else arrayScalarType(kind.element_type orelse return error.InvalidSqlProgram),
                         .@"$array_quantified" => if (i == 0) (if ((try self.infer(arg, depth + 1)).kind == .number) .number else arrayScalarType((try self.infer(call.args[1], depth + 1)).element_type.?)) else if (i == 1) .array else if (i == 2) .integer else .boolean,
@@ -1275,6 +1349,12 @@ const Binder = struct {
                         else => kind.kind,
                     };
                     const actual = try self.infer(arg, depth + 1);
+                    if (function == .jsonb_set and i < 3 and arg.* == .literal and arg.literal == .string) {
+                        const coercion = try self.alloc.create(ast.Scalar);
+                        coercion.* = .{ .cast = .{ .operand = arg, .type = desired.?, .element_type = if (i == 1) .text else null } };
+                        out.* = try self.compileArrayContext(coercion, desired, if (i == 1) .text else null, depth + 1);
+                        continue;
+                    }
                     if (function == .@"$array" and self.explicit_arrays.contains(expression) and actual.kind != null) {
                         const target = kind.element_type orelse return error.InvalidSqlProgram;
                         const coercion = try self.alloc.create(ast.Scalar);
@@ -1292,6 +1372,7 @@ const Binder = struct {
                     }
                     if (desired != null and actual.kind != null and desired != actual.kind and !(desired == .datetime and actual.kind == .string) and !(desired == .uuid and actual.kind == .string and uuidTextOperand(arg)) and !(numeric(desired) and numeric(actual.kind))) return error.SqlTypeMismatch;
                     const element_context: ?arrays.ElementType = if (!self.typed_parameters) (if (kind.kind == .array) kind.element_type else null) else switch (function) {
+                        .jsonb_set => if (i == 1) .text else null,
                         .@"$contains" => (try common(try self.infer(call.args[0], depth + 1), try self.infer(call.args[1], depth + 1))).element_type,
                         .@"$array_quantified" => if (i < 2) (try self.infer(call.args[1], depth + 1)).element_type else if (i == 2) .int32 else .boolean,
                         .@"$array_pattern_quantified" => if (i < 2) .text else .boolean,
@@ -1389,6 +1470,10 @@ const Evaluator = struct {
                 if (slot >= self.parameters.len) return error.InvalidSqlParameters;
                 const value = self.parameters[slot];
                 if (value == .null) break :blk .{};
+                // Compatibility ingress supplies decoded logical JSON values,
+                // not PostgreSQL text-format bytes. A JSON string stays a
+                // string even when its contents happen to be valid JSON text.
+                if (instruction.type.kind == .json) break :blk Datum.json(value);
                 break :blk Datum.json(try self.convert(value, instruction.type.kind.?));
             },
             .column => |ordinal| if (ordinal < self.cells.len) self.cells[ordinal] else return error.InvalidSqlBackendResponse,
@@ -1431,6 +1516,7 @@ const Evaluator = struct {
                     break :blk Datum.json(try self.castBuiltin(datum.value, source_element, target));
                 }
                 if (cast.type == .string and self.program.instructions[cast.operand].type.kind == .json) break :blk Datum.json(.{ .string = try self.jsonText(datum.value) });
+                if (cast.type == .json and self.program.instructions[cast.operand].type.kind == .json) break :blk datum;
                 if (datum.value == .null and cast.type == .string) break :blk Datum.json(.{ .string = "null" });
                 if (datum.value == .null and cast.type != .json) return error.SqlTypeMismatch;
                 break :blk Datum.json(try self.convert(datum.value, cast.type));
@@ -1630,6 +1716,22 @@ const Evaluator = struct {
                             else => unreachable,
                         };
                         break :blk if (answer) |value| Datum.json(.{ .integer = value }) else .{};
+                    },
+                    .jsonb_set => {
+                        // Strict SQL functions evaluate all arguments before
+                        // NULL propagation, unlike CASE and COALESCE.
+                        const target = try self.runDatum(call.args[0], depth + 1);
+                        const path = try self.runDatum(call.args[1], depth + 1);
+                        const replacement = try self.runDatum(call.args[2], depth + 1);
+                        const create = if (call.args.len == 4) try self.runDatum(call.args[3], depth + 1) else Datum.json(.{ .bool = true });
+                        if (target.sql_null or path.sql_null or replacement.sql_null or create.sql_null) break :blk .{};
+                        if (target.array != null or replacement.array != null or create.array != null or create.value != .bool) return error.SqlTypeMismatch;
+                        var work: @import("json_order.zig").Budget = .{ .remaining = self.limits.steps -| self.steps };
+                        const before = work.remaining;
+                        const changed = try @import("json_path_update.zig").set(self.alloc, target.value, path.array orelse return error.SqlTypeMismatch, replacement.value, create.value.bool, self.limits.output_bytes -| self.bytes, &work);
+                        self.steps += before - work.remaining;
+                        try self.charge(changed.allocated_bytes);
+                        break :blk Datum.json(changed.value);
                     },
                     .jsonb_typeof => {
                         const datum = try self.runDatum(call.args[0], depth + 1);

@@ -505,6 +505,48 @@ class PostgresReferenceTest(unittest.TestCase):
                     self.db.execute(invalid["sql"])
             self.assertEqual("42703", error.exception.sqlstate)
 
+    def test_logical_json_parameters_and_identity_casts_preserve_strings(self):
+        from psycopg.types.json import Jsonb
+
+        for value in ["pro", "null", "true", "12", "[1,2]", '{"x":1}', '"quoted"']:
+            for expression in [
+                "%s::jsonb",
+                "CAST(%s::jsonb AS json)",
+                "CAST(%s::jsonb AS jsonb)",
+            ]:
+                with self.subTest(value=value, expression=expression):
+                    row = self.db.execute(
+                        "SELECT " + expression, [Jsonb(value)]
+                    ).fetchone()
+                    self.assertEqual((value,), row)
+
+    def test_jsonb_path_update_reference(self):
+        import json
+        from pathlib import Path
+        import psycopg
+
+        fixture = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "zig/pkg/antfly-embedded/src/sql/fixtures/sql_json_path_update_reference.json"
+            ).read_text()
+        )
+        self.assertEqual(32, len(fixture["entries"]))
+        self.assertEqual(10, len(fixture["errors"]))
+        for case in fixture["entries"]:
+            with self.subTest(sql=case["sql"]):
+                value, sql_null = self.db.execute(
+                    "SELECT v,v IS NULL FROM (SELECT " + case["sql"] + " AS v) q"
+                ).fetchone()
+                self.assertEqual(case["value"], value)
+                self.assertEqual(case.get("sql_null", False), sql_null)
+        for case in fixture["errors"]:
+            with self.subTest(sql=case["sql"]):
+                with self.assertRaises(psycopg.Error) as error:
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute("SELECT " + case["sql"])
+                self.assertEqual(case["code"], error.exception.sqlstate)
+
     def test_jsonb_concatenation_reference(self):
         import json
         from pathlib import Path

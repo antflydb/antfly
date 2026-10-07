@@ -86,6 +86,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlArraySubscriptError => .{ .code = "2202E", .message = "Array dimensions or bounds do not match.", .hint = "Use valid bounds and rectangular subarrays with matching dimensions." },
         error.SqlArrayConstructorTypeMismatch => .{ .code = "42804", .message = "Array constructor element types cannot be matched.", .hint = "Use compatible scalar elements or compatible subarrays." },
         error.SqlInvalidTextRepresentation => .{ .code = "22P02", .message = "A value has invalid input syntax for the requested type.", .hint = "Check the value and the target type." },
+        error.SqlNullValueNotAllowed => .{ .code = "22004", .message = "A required SQL value or JSON path element is null.", .hint = "Supply non-null JSON path elements." },
         error.SqlTransactionAlreadyActive => .{ .code = "25001", .message = "A transaction is already active in this session.", .retryable = false },
         error.SqlTransactionNotActive => .{ .code = "25P01", .message = "This command requires an active transaction.", .retryable = false },
         error.SessionLeaseLost => .{ .code = "40003", .message = "SQL session ownership changed; reconcile the original transaction before continuing.", .hint = "Reconnect through the active session owner; do not replay staged mutations.", .retryable = false },

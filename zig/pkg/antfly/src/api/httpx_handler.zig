@@ -13231,7 +13231,7 @@ test "httpx SQL PostgreSQL mutations capture native source relations and complet
     // deliberately not claimed by this fixture: sql-0012, sql-0013,
     // sql-0571, sql-0572, sql-0598, sql-0599, sql-0606, sql-0607,
     // sql-0608, sql-0609, sql-0619, sql-0620, sql-0657, sql-0667,
-    // sql-1500, sql-1508, sql-1519, sql-1533, sql-1564.
+    // sql-1499, sql-1500, sql-1508, sql-1519, sql-1533, sql-1564.
     const alloc = std.testing.allocator;
     const parity = @import("sql_parity_reference.zig");
     const Source = @import("sql_parity_sources.zig").Tables(3);
@@ -13276,8 +13276,8 @@ test "httpx SQL PostgreSQL mutations capture native source relations and complet
     try parity.runPostgresMutations(alloc, &handler, &tables, parsed.value, &.{
         "sql-0012", "sql-0013", "sql-0571", "sql-0572", "sql-0598", "sql-0599",
         "sql-0606", "sql-0607", "sql-0608", "sql-0609", "sql-0619", "sql-0620",
-        "sql-0657", "sql-0667", "sql-1500", "sql-1508", "sql-1519", "sql-1533",
-        "sql-1564",
+        "sql-0657", "sql-0667", "sql-1499", "sql-1500", "sql-1508", "sql-1519",
+        "sql-1533", "sql-1564",
     });
     try std.testing.expect(source.captures != 0);
 }

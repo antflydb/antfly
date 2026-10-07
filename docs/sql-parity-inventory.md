@@ -361,10 +361,32 @@ covers actual container capacity, including the object-map index, and work
 admission covers copied slots and hashed key bytes. Twenty independent
 PostgreSQL contracts and allocation-fault tests cover this overload.
 
+JSONB path replacement now consumes the same typed text-array representation
+as scalar array expressions. It resolves the path before allocating and copies
+only the changed container spine; unchanged subtrees and keys remain immutable
+borrowed values. Missing intermediate parents are not synthesized. The shared
+scalar implementation handles default creation, negative/out-of-range array
+indexes, SQL NULL propagation and visited-null path errors. Allocation admission
+covers actual copied container capacity, and work admission covers path bytes,
+copied slots and key hashing. The independent PostgreSQL fixture contains 32
+value/provenance contracts and 10 SQLSTATE contracts; native fault injection
+checks cleanup without recursively freeing borrowed children. This is not yet
+evidence for activating public typed-array parameters or logical conflict owners.
+Logical JSON parameters and JSON identity casts also preserve string payloads
+without parsing them again. Text-format codecs own parsing at ingress, while
+explicit SQL text-to-JSON casts still parse normally. Regression checks include
+strings containing JSON-looking text, so `"null"` cannot silently become JSON
+null and an ordinary value such as `"pro"` cannot fail JSON syntax validation.
+The isolated copy regression uses a 4,096-element untouched subtree and 500
+updates: local debug scratch usage is 612 bytes for changed-spine copying versus
+344,816 bytes for the full-copy baseline. This measures the copy operation only;
+result-boundary validation, encoding and storage still process the output and
+are not included in a production throughput or latency claim.
+
 The PostgreSQL native mutation runner resets and reads back every fixture table,
 compares complete RETURNING labels/types/SQL NULL provenance and affected rows,
 and verifies complete stored values independently of SQL projections. The
-endpoint campaign executes 19 original cases, including recursive selectors,
+endpoint campaign executes 20 original cases, including recursive selectors,
 UPDATE FROM, DELETE USING, JSONB concatenation and source-aware RETURNING, over
 three independently routed native tables. It does not activate the PostgreSQL
 profile's logical primary-key owner in native storage. Key-changing and conflict
