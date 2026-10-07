@@ -1720,6 +1720,133 @@ class PostgresReferenceTest(unittest.TestCase):
             ).fetchall()
             self.assertEqual([(n, n * 10) for n in range(1, 129)], rows)
 
+    def test_quantified_correlated_boundaries_preserve_three_valued_truth(self):
+        for sql, expected in (
+            (
+                "SELECT o.x IN (SELECT i.y FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x ORDER BY i.y LIMIT 1) FROM (SELECT 1 AS x) o",
+                False,
+            ),
+            (
+                "SELECT o.x < ANY (SELECT SUM(i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x GROUP BY i.k) FROM (SELECT 1 AS x) o",
+                True,
+            ),
+            (
+                "SELECT o.x = ALL (SELECT ROW_NUMBER() OVER (ORDER BY i.y) FROM (SELECT 1 AS k, 2 AS y) i WHERE i.k=o.x) FROM (SELECT 1 AS x) o",
+                True,
+            ),
+            (
+                "SELECT o.x IN (SELECT i.y FROM (SELECT 1 AS k, CAST(NULL AS BIGINT) AS y) i WHERE i.k=o.x LIMIT 1) FROM (SELECT 1 AS x) o",
+                None,
+            ),
+            (
+                "SELECT o.x <> ALL (SELECT i.y FROM (SELECT 1 AS k, CAST(NULL AS BIGINT) AS y) i WHERE i.k=o.x LIMIT 0) FROM (SELECT 1 AS x) o",
+                True,
+            ),
+            (
+                "SELECT o.x = ANY (SELECT i.y FROM (SELECT 1 AS k, CAST(NULL AS BIGINT) AS y) i WHERE i.k=o.x LIMIT 0) FROM (SELECT 1 AS x) o",
+                False,
+            ),
+            (
+                "SELECT o.x < ALL (SELECT i.y FROM (SELECT 1 AS k, 2 AS y UNION ALL SELECT 1,NULL) i WHERE i.k=o.x ORDER BY i.y LIMIT 2) FROM (SELECT 1 AS x) o",
+                None,
+            ),
+            (
+                "SELECT o.x > ALL (SELECT i.y FROM (SELECT 1 AS k, 2 AS y UNION ALL SELECT 1,NULL) i WHERE i.k=o.x ORDER BY i.y LIMIT 2) FROM (SELECT 1 AS x) o",
+                False,
+            ),
+            (
+                "SELECT o.x < ANY (SELECT i.y FROM (SELECT 1 AS k, 2 AS y UNION ALL SELECT 1,NULL) i WHERE i.k=o.x ORDER BY i.y LIMIT 2) FROM (SELECT 1 AS x) o",
+                True,
+            ),
+            (
+                "SELECT o.x LIKE ANY (SELECT i.y FROM (SELECT 1 AS k, 'a%' AS y) i WHERE i.k=o.k LIMIT 1) FROM (SELECT 1 AS k, 'abc' AS x) o",
+                True,
+            ),
+            (
+                "SELECT o.x NOT ILIKE ALL (SELECT i.y FROM (SELECT 1 AS k, 'A%' AS y) i WHERE i.k=o.k LIMIT 1) FROM (SELECT 1 AS k, 'abc' AS x) o",
+                False,
+            ),
+            (
+                "SELECT o.x IN (SELECT x LIMIT 1) FROM (SELECT 9007199254740993 AS x) o",
+                True,
+            ),
+            (
+                "SELECT o.x <> ALL (SELECT i.y FROM (SELECT 9007199254740992 AS y) i WHERE i.y<o.x LIMIT 1) FROM (SELECT 9007199254740993 AS x) o",
+                True,
+            ),
+            (
+                "SELECT o.x IN (SELECT i.y FROM (SELECT CAST('null' AS JSONB) AS y) i WHERE o.k=1 LIMIT 1) FROM (SELECT 1 AS k,CAST('null' AS JSONB) AS x) o",
+                True,
+            ),
+            (
+                "SELECT o.x IN (SELECT i.y FROM (SELECT CAST(NULL AS JSONB) AS y) i WHERE o.k=1 LIMIT 1) FROM (SELECT 1 AS k,CAST('null' AS JSONB) AS x) o",
+                None,
+            ),
+            (
+                "SELECT CASE WHEN FALSE THEN o.x IN (SELECT 1/(i.y-2) FROM (SELECT 1 AS k,2 AS y) i WHERE i.k=o.x LIMIT 1) ELSE TRUE END FROM (SELECT 1 AS x) o",
+                True,
+            ),
+        ):
+            with self.subTest(sql=sql):
+                self.assertEqual([(expected,)], self.db.execute(sql).fetchall())
+
+    def test_quantified_boundary_comparison_matrix_and_parameter_inference(self):
+        import operator
+        import psycopg
+
+        sets = (
+            ("SELECT 1 AS y WHERE false", []),
+            ("SELECT CAST(NULL AS BIGINT) AS y", [None]),
+            ("SELECT 1 AS y", [1]),
+            ("SELECT 1 AS y UNION ALL SELECT 1", [1, 1]),
+            ("SELECT 1 AS y UNION ALL SELECT 2", [1, 2]),
+            ("SELECT 1 AS y UNION ALL SELECT NULL", [1, None]),
+            ("SELECT 1 AS y UNION ALL SELECT 2 UNION ALL SELECT NULL", [1, 2, None]),
+        )
+        for op, compare in (
+            ("=", operator.eq),
+            ("<>", operator.ne),
+            ("<", operator.lt),
+            ("<=", operator.le),
+            (">", operator.gt),
+            (">=", operator.ge),
+        ):
+            for every in (False, True):
+                for source, values in sets:
+                    query = f"SELECT x {op} {'ALL' if every else 'ANY'} (SELECT y FROM ({source}) i WHERE o.x IS NULL OR o.x IS NOT NULL ORDER BY i.y LIMIT 100) FROM (SELECT 0 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT NULL) o"
+                    expected = []
+                    for operand in (0, 1, 2, None):
+                        results = [
+                            None
+                            if operand is None or value is None
+                            else compare(operand, value)
+                            for value in values
+                        ]
+                        decisive = any(
+                            value is not None and value != every for value in results
+                        )
+                        truth = (
+                            not every
+                            if decisive
+                            else None
+                            if None in results
+                            else every
+                        )
+                        expected.append((truth,))
+                    with self.subTest(sql=query):
+                        self.assertEqual(expected, self.db.execute(query).fetchall())
+        query = "SELECT $1 < ANY (SELECT i.y FROM (SELECT 1 AS k,2 AS y) i WHERE i.k=o.x ORDER BY i.y LIMIT $2 OFFSET $3) FROM (SELECT 1 AS x) o"
+        with psycopg.RawCursor(self.db) as cursor:
+            self.assertEqual([(True,)], cursor.execute(query, (1, 1, 0)).fetchall())
+            self.assertEqual([(False,)], cursor.execute(query, (None, 0, 0)).fetchall())
+        for alias in (
+            "$quantified_input",
+            "$quantified_input_1",
+            "$quantified_demand_0",
+        ):
+            query = f'SELECT "{alias}".x IN (SELECT "{alias}".x LIMIT 1) FROM (SELECT 1 AS x) "{alias}"'
+            self.assertEqual([(True,)], self.db.execute(query).fetchall())
+
     def test_row_assignment_expands_schema_bound_width_before_execution(self):
         import psycopg
 

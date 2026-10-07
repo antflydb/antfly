@@ -869,6 +869,52 @@ test "SQL masked Apply correlated producers reuse captured inputs under mixed de
     }
 }
 
+test "SQL quantified Apply preserves keyed boundary work and one captured source" {
+    for ([_]usize{ 128, 1024 }) |count| {
+        var backend: Backend = .{ .returning_mode = true, .row_count = count };
+        var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=n,cold='new' RETURNING n,t.n < ANY (SELECT s.delta FROM source s WHERE s.id=t._id ORDER BY s.delta DESC LIMIT 1)", .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .result_rows = count, .page_rows = 17 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, count), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 2 * count), backend.rows_read);
+        try std.testing.expect(backend.checkpoints < 100 * count);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        for (result.output.rows) |row| try std.testing.expect(row[1].bool);
+        std.debug.print("SQL quantified Apply: targets={} native_rows={} checkpoints={} peak_bytes={}\n", .{ count, backend.rows_read, backend.checkpoints, result.peakMemoryBytes() });
+    }
+}
+
+test "SQL quantified Apply unwinds allocation faults and every cancellation before commit" {
+    const sql = "UPDATE target t SET n=n,cold='new' RETURNING t.n < ANY (SELECT s.delta FROM source s WHERE s.id=t._id ORDER BY s.delta DESC LIMIT 1)";
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{ .returning_mode = true };
+            defer std.debug.assert(backend.captures == backend.closes);
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            for (result.output.rows) |row| try std.testing.expect(row[0].bool);
+            try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
+    var backend: Backend = .{ .returning_mode = true };
+    var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+    defer compiled.deinit();
+    var baseline = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer baseline.deinit();
+    for (1..backend.checkpoints + 1) |point| {
+        var canceled: Backend = .{ .returning_mode = true, .cancel_at = point };
+        try std.testing.expectError(error.Canceled, runtime.execute(std.testing.allocator, canceled.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(canceled.captures, canceled.closes);
+        try std.testing.expectEqual(@as(usize, 0), canceled.commits);
+    }
+}
+
 test "SQL scalar cardinality stops before later value errors and never commits" {
     for ([_]struct { sql: []const u8, parameters: []const std.json.Value = &.{} }{
         .{ .sql = "UPDATE target SET cold='new' RETURNING (SELECT CASE WHEN delta=30 THEN 1/(delta-30) ELSE delta END FROM source LIMIT 1000)" },

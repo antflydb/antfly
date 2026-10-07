@@ -1209,6 +1209,26 @@ from current SQL extraction is not repaired by naming this inventory check a ful
 
 ## Concrete remaining reviews
 
+Quantified scalar children now retain correlated ORDER/LIMIT/OFFSET,
+group/aggregate, window and nested-derived boundaries in a typed Apply
+producer. Comparison results are projected once and reduced into separate
+decisive and unknown witnesses, preserving empty-set ANY=false/ALL=true and
+SQL NULL versus JSON null. Simple keyed children and provably independent
+ordered/grouped boundaries retain their grouped hash summary path. A
+conservative lexical closure proof leaves unresolved unqualified references
+in Apply until catalog binding; generated qualifiers avoid quoted-name
+collisions. The six comparison operators share 336 PostgreSQL/native
+truth-table results, and operand/LIMIT/OFFSET parameter inference is checked.
+Captured native mutation tests check linear work and two physical
+input scans at 128 and 1,024 targets, plus allocation-fault and every-checkpoint
+cancellation cleanup before publication. PostgreSQL and mounted HTTP contracts
+exercise correlated child paging, membership, ordered quantifiers and patterns.
+The keyed benchmark uses 8,872/70,802 checkpoints for 128/1,024 targets;
+this is a linear operator-work bound, not an indexed guarantee for arbitrary
+non-equality predicates or proof of early termination on decisive witnesses.
+This does not implement cross-level aggregate ownership lifting or add original
+inventory completion credit from component-only tests.
+
 Row-valued UPDATE subqueries now retain an exact compiler-owned output-width
 contract until the pinned source layout expands wildcards. Both shape inference
 and executable derived binding enforce that contract before capture; an empty

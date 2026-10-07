@@ -144,6 +144,9 @@ const Builder = struct {
         source: ?*const ast.Relation = null,
         table: ?ast.Name = null,
         local: ?*const Names = null,
+        /// A closure proof cannot assume that an unqualified name belongs to
+        /// a table whose layout has not been pinned yet.
+        conservative: bool = false,
     };
     fn relationDefines(value: *const ast.Relation, qualifier: []const u8) bool {
         return switch (value.*) {
@@ -162,9 +165,11 @@ const Builder = struct {
         return false;
     }
     fn nestedOuterField(self: *Builder, name: []const u8, scope: ?*const NestedScope) bool {
-        const separator = std.mem.indexOfScalar(u8, name, 0) orelse return false;
+        if (name.len == 0) return false;
+        const conservative = if (scope) |frame| frame.conservative else false;
+        const separator = std.mem.indexOfScalar(u8, name, 0) orelse return conservative;
         const qualifier = name[0..separator];
-        return !nestedScopeDefines(scope, qualifier) and self.outer.contains(qualifier);
+        return !nestedScopeDefines(scope, qualifier) and (conservative or self.outer.contains(qualifier));
     }
     /// A nested value relation is safe to leave inside a derived child only
     /// when it cannot reach past that child's lexical parent. The child will
@@ -220,7 +225,7 @@ const Builder = struct {
         };
     }
     fn nestedOuterSelect(self: *Builder, query: *const ast.Select, parent: ?*const NestedScope) bool {
-        const scope: NestedScope = .{ .parent = parent, .source = query.source, .table = query.table };
+        const scope: NestedScope = .{ .parent = parent, .source = query.source, .table = query.table, .conservative = if (parent) |frame| frame.conservative else false };
         for (query.values_arms) |arm| if (self.nestedOuterSelect(arm, &scope)) return true;
         if (query.set_operation) |set| if (self.nestedOuterSelect(set.left, &scope) or self.nestedOuterSelect(set.right, &scope)) return true;
         if (query.source) |source| if (self.nestedOuterRelation(source, &scope)) return true;
@@ -546,6 +551,7 @@ const Builder = struct {
         if (std.mem.eql(u8, suffix, "like") or std.mem.eql(u8, suffix, "ilike") or std.mem.eql(u8, suffix, "not_like") or std.mem.eql(u8, suffix, "not_ilike"))
             return self.patternQuantified(expression, every, std.mem.endsWith(u8, suffix, "ilike"), std.mem.startsWith(u8, suffix, "not_"));
         const op = std.meta.stringToEnum(ast.Scalar.Binary, suffix) orelse return error.UnsupportedSqlShape;
+        if (try self.quantifiedNeedsApply(expression.call.subquery.?)) return self.quantifiedProducer(expression, op, every, false);
         if ((!every and op == .eq) or (every and op == .neq)) {
             const result = try self.membership(expression);
             return if (every) self.scalar(.{ .unary = .{ .op = .not, .operand = result } }) else result;
@@ -613,6 +619,7 @@ const Builder = struct {
     }
 
     fn patternQuantified(self: *Builder, expression: *const ast.Scalar, every: bool, insensitive: bool, negated: bool) anyerror!*const ast.Scalar {
+        if (try self.quantifiedNeedsApply(expression.call.subquery.?)) return self.quantifiedProducer(expression, if (insensitive) .ilike else .like, every, negated);
         const original = try self.valueQuery(expression.call.subquery.?, true);
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
@@ -663,6 +670,7 @@ const Builder = struct {
     /// become UNKNOWN when the correlated inner set contains SQL NULL.
     fn membership(self: *Builder, expression: *const ast.Scalar) anyerror!*const ast.Scalar {
         if (expression.call.args.len == 1 and expression.call.args[0].* == .call and std.mem.eql(u8, expression.call.args[0].call.name, "$row")) return self.tupleMembership(expression);
+        if (try self.quantifiedNeedsApply(expression.call.subquery.?)) return self.quantifiedProducer(expression, .eq, false, false);
         const original = try self.valueQuery(expression.call.subquery.?, true);
         if (expression.call.args.len != 1 or original.columns.len != 1 or original.count_all) return error.InvalidSqlParameters;
         if (original.set_operation != null or original.ctes.len != 0 or original.order_by.len != 0 or original.limit != null or original.offset != null or original.group_by.len != 0 or original.having != null or @import("aggregate_binding.zig").accepts(original.*) or @import("window_binding.zig").accepts(original.*)) return error.UnsupportedSqlShape;
@@ -726,6 +734,86 @@ const Builder = struct {
         branches[2] = .{ .condition = try self.scalar(.{ .binary = .{ .op = .@"or", .left = try self.scalar(.{ .unary = .{ .op = .is_null, .operand = operand } }), .right = try self.scalar(.{ .binary = .{ .op = .gt, .left = total, .right = nonnull } }) } }), .value = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }) };
         return self.scalar(.{ .case_when = .{ .branches = branches, .otherwise = try self.scalar(.{ .literal = .{ .boolean = false } }) } });
     }
+    /// Keep keyed summaries for ordinary children, but never move a complete
+    /// query boundary or a non-keyed outer predicate into an independent scope.
+    fn quantifiedNeedsApply(self: *Builder, query: *const ast.Select) !bool {
+        if (scalarBoundary(query.*) or query.count_all or @import("aggregate_binding.zig").accepts(query.*)) {
+            // A provably closed boundary still belongs to the shared hash
+            // build. Unknown/unqualified references stay in Apply until the
+            // catalog binder resolves their lexical ownership.
+            const scope: NestedScope = .{ .conservative = true };
+            return self.nestedOuterSelect(query, &scope);
+        }
+        var local: Names = .empty;
+        if (query.source) |source| {
+            try aliases(self.alloc, source, &local);
+            const scope: NestedScope = .{ .source = source };
+            if (self.nestedOuterRelation(source, &scope)) return true;
+        } else if (query.table) |table| try local.put(self.alloc, table.table, {});
+        for (query.columns) |column| {
+            if (column.wildcard) return true;
+            const value = column.expression orelse try self.scalar(.{ .column = column.field });
+            if (self.referencesOuter(value, local)) return true;
+            if (query.source == null and query.table == null and value.* == .column) return true;
+        }
+        if (query.predicate) |predicate| {
+            var keys: std.ArrayList(Key) = .empty;
+            _ = self.extract(try self.predicateScalar(predicate), local, &keys, null) catch |err| switch (err) {
+                error.UnsupportedSqlShape => return true,
+                else => return err,
+            };
+        }
+        return false;
+    }
+
+    /// Compare actual child outputs after its sort/page/group/window boundary.
+    /// Materialize each comparison once; true/false and unknown witnesses have
+    /// separate states so empty input retains ANY=false and ALL=true.
+    fn quantifiedProducer(self: *Builder, expression: *const ast.Scalar, op: ast.Scalar.Binary, every: bool, negated: bool) anyerror!*const ast.Scalar {
+        if (expression.call.args.len != 1) return error.InvalidSqlParameters;
+        const operand = try self.prerequisite(try self.rewrite(expression.call.args[0]), null);
+        const alias = try self.quantifiedAlias("$quantified_demand");
+        const input_alias = try self.quantifiedAlias("$quantified_input");
+        const compared_alias = try self.quantifiedAlias("$quantified_compared");
+        var comparison = try self.scalar(.{ .binary = .{ .op = op, .left = operand, .right = try self.field(input_alias, "$value") } });
+        if (negated) comparison = try self.scalar(.{ .unary = .{ .op = .not, .operand = comparison } });
+        const compared = try self.alloc.create(ast.Select);
+        compared.* = .{
+            .source = try self.relation(.{ .derived = .{ .query = expression.call.subquery.?, .alias = input_alias, .columns = &.{"$value"} } }),
+            .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$comparison", .expression = comparison }}),
+        };
+        const value = try self.field(compared_alias, "$comparison");
+        const decisive = try self.call("bool_or", &.{try self.testValue(if (every) .is_false else .is_true, value)});
+        const unknown = try self.call("bool_or", &.{try self.testValue(.is_null, value)});
+        const truth = try self.scalar(.{ .case_when = .{
+            .branches = try self.alloc.dupe(ast.Scalar.Branch, &.{
+                .{ .condition = try self.testValue(.is_true, decisive), .value = try self.scalar(.{ .literal = .{ .boolean = !every } }) },
+                .{ .condition = try self.testValue(.is_true, unknown), .value = try self.scalar(.{ .cast = .{ .type = .boolean, .operand = try self.scalar(.{ .literal = .null }) } }) },
+            }),
+            .otherwise = try self.scalar(.{ .literal = .{ .boolean = every } }),
+        } });
+        const query = try self.alloc.create(ast.Select);
+        query.* = .{
+            .source = try self.relation(.{ .derived = .{ .query = compared, .alias = compared_alias } }),
+            .columns = try self.alloc.dupe(ast.Projection, &.{.{ .alias = "$value", .expression = truth }}),
+        };
+        self.source = try self.relation(.{ .join = .{ .kind = .left, .left = self.source, .right = try self.relation(.{ .derived = .{ .query = query, .alias = alias, .hidden = true, .lateral = true } }) } });
+        return self.field(alias, "$value");
+    }
+
+    fn quantifiedAlias(self: *Builder, prefix: []const u8) ![]const u8 {
+        while (self.serial < 64) {
+            const name = try std.fmt.allocPrint(self.alloc, "{s}_{d}", .{ prefix, self.serial });
+            self.serial += 1;
+            // Quoted SQL identifiers can spell our prefixes. Never shadow a
+            // target binding merely because it resembles an internal name.
+            if (self.outer.contains(name)) continue;
+            try self.outer.put(self.alloc, name, {});
+            return name;
+        }
+        return error.SqlProgramLimitExceeded;
+    }
+
     fn tupleMembership(self: *Builder, expression: *const ast.Scalar) anyerror!*const ast.Scalar {
         const original = expression.call.subquery.?;
         const operands = expression.call.args[0].call.args;

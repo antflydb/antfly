@@ -14738,6 +14738,36 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             }
             try text_db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"id\":\"u2\",\"status\":\"reset\",\"quantity\":3}" }}, .timestamp_ns = 44 });
         }
+        {
+            // Complete correlated children retain per-parent paging and NULL
+            // witnesses against the same native table used by row mutations.
+            for ([_]struct { sql: []const u8, expected: ?bool }{
+                .{ .sql = "SELECT t.id,t.quantity IN (SELECT u.quantity FROM usage_records u WHERE u._id=t._id ORDER BY u.quantity DESC LIMIT 1) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = true },
+                .{ .sql = "SELECT t.id,t.quantity < ANY (SELECT u.quantity+1 FROM usage_records u WHERE u._id=t._id ORDER BY u.quantity DESC LIMIT 1) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = true },
+                .{ .sql = "SELECT t.id,t.quantity <> ALL (SELECT u.quantity FROM usage_records u WHERE u._id=t._id LIMIT 0) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = true },
+                .{ .sql = "SELECT t.id,t.quantity = ANY (SELECT u.quantity FROM usage_records u WHERE u._id=t._id LIMIT 0) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = false },
+                .{ .sql = "SELECT t.id,t.quantity IN (SELECT CAST(NULL AS BIGINT) FROM usage_records u WHERE u._id=t._id LIMIT 1) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = null },
+                .{ .sql = "SELECT t.id,t.status LIKE ANY (SELECT u.status FROM usage_records u WHERE u._id=t._id LIMIT 1) FROM usage_records t WHERE t._id IN ('a','b') ORDER BY t.id", .expected = true },
+            }) |case| {
+                const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = case.sql }, .{});
+                defer alloc.free(body);
+                var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+                defer request.deinit();
+                request.body = body;
+                var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+                defer ctx.deinit();
+                var response = try text_handler.executeSQL(&ctx);
+                defer response.deinit();
+                try std.testing.expectEqual(@as(u16, 200), response.status.code);
+                const result = try std.json.parseFromSlice(sql_wire.SQLResponse, alloc, response.body.?, .{});
+                defer result.deinit();
+                try std.testing.expectEqual(@as(usize, 2), result.value.rows.len);
+                for (result.value.rows, 0..) |row, index| {
+                    try std.testing.expectEqualStrings(if (index == 0) "u1" else "u2", row[0].string);
+                    if (case.expected) |truth| try std.testing.expectEqual(truth, row[1].bool) else try std.testing.expect(result.value.sql_nulls.?[index][1]);
+                }
+            }
+        }
         for ([_]struct { body: []const u8, expected_id: ?[]const u8 }{
             .{ .body = "{\"statement\":\"INSERT INTO usage_records (id,status,quantity) VALUES ('u_default',DEFAULT,7) RETURNING id,status\"}", .expected_id = "u_default" },
             .{ .body = "{\"statement\":\"INSERT INTO usage_records DEFAULT VALUES RETURNING _id,status\"}", .expected_id = null },

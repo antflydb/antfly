@@ -318,8 +318,8 @@ test "SQL quantified subqueries match three valued comparison truth tables" {
     const operands = [_]?i64{ 0, 1, 2, null };
     var backend: Backend = .{};
     for ([_][]const u8{ "=", "<>", "<", "<=", ">", ">=" }, 0..) |op, op_index| {
-        for ([_]bool{ false, true }) |every| for (sets) |set| {
-            const query = try std.fmt.allocPrint(std.testing.allocator, "SELECT x {s} {s} (SELECT y FROM ({s}) i) FROM (SELECT 0 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT NULL) o", .{ op, if (every) "ALL" else "ANY", set.sql });
+        for ([_]bool{ false, true }) |every| for (sets) |set| for ([_]bool{ false, true }) |boundary| {
+            const query = try std.fmt.allocPrint(std.testing.allocator, "SELECT x {s} {s} (SELECT y FROM ({s}) i{s}) FROM (SELECT 0 AS x UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT NULL) o", .{ op, if (every) "ALL" else "ANY", set.sql, if (boundary) " WHERE o.x IS NULL OR o.x IS NOT NULL ORDER BY i.y LIMIT 100" else "" });
             defer std.testing.allocator.free(query);
             var compiled = try compiler.compile(std.testing.allocator, query, .{});
             defer compiled.deinit();
@@ -488,7 +488,7 @@ test "SQL correlated IN groups NULL evidence by lexical correlation keys" {
     try std.testing.expect(!result.output.rows[2][1].bool);
 }
 
-test "SQL membership unwinds allocations admits parameters and fails closed outside decorrelation" {
+test "SQL membership unwinds allocations admits parameters and preserves nonkeyed correlation" {
     const Case = struct {
         fn run(alloc: std.mem.Allocator) !void {
             var backend: Backend = .{};
@@ -504,9 +504,11 @@ test "SQL membership unwinds allocations admits parameters and fails closed outs
     var compiled = try compiler.compile(std.testing.allocator, "SELECT 1 IN (SELECT x FROM (SELECT 1 AS x) i)", .{});
     defer compiled.deinit();
     try std.testing.expectError(error.SqlProgramLimitExceeded, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .retained_bytes = 1 }));
-    var invalid = try compiler.compile(std.testing.allocator, "SELECT o.x IN (SELECT i.x FROM (SELECT 1 AS x) i WHERE i.x > o.x) FROM (SELECT 1 AS x) o", .{});
-    defer invalid.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &invalid, &.{}, .{}));
+    var correlated = try compiler.compile(std.testing.allocator, "SELECT o.x IN (SELECT i.x FROM (SELECT 1 AS x) i WHERE i.x > o.x) FROM (SELECT 1 AS x) o", .{});
+    defer correlated.deinit();
+    var correlated_result = try runtime.execute(std.testing.allocator, backend.backend(), &correlated, &.{}, .{});
+    defer correlated_result.deinit();
+    try std.testing.expect(!correlated_result.output.rows[0][0].bool);
     try std.testing.expectError(error.SqlLimitExceeded, compiler.compile(std.testing.allocator, "SELECT 1 IN (SELECT 1 IN (SELECT 1 IN (SELECT 1)))", .{ .max_depth = 2 }));
 }
 
@@ -592,6 +594,23 @@ test "SQL membership bounded hash projections share one capture instead of per r
     try std.testing.expectEqual(@as(usize, 1), fixture.captures);
     try std.testing.expectEqual(@as(usize, 1), fixture.closes);
     std.debug.print("SQL membership: outer_rows={d} inner_rows={d} native_scans=3 captures=1 peak_bytes={d} elapsed_ns={d}\n", .{ fixture.count, fixture.count, result.peakMemoryBytes(), elapsed });
+    {
+        // An independent ordered child must remain a hash build, not replay
+        // its comparison rows for every parent merely because it has LIMIT.
+        var independent: Fixture = .{ .count = fixture.count, .key_count = fixture.key_count };
+        var ordered = try compiler.compile(std.testing.allocator, "SELECT count(*) FROM outer_rows o WHERE o.x+1 IN (SELECT i.x+1 FROM inner_rows i ORDER BY i.x LIMIT 100000)", .{});
+        defer ordered.deinit();
+        var description = try @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, independent.backend(), &ordered, &.{});
+        defer description.deinit();
+        const join = description.binding.relation.?.root.operation.join;
+        try std.testing.expectEqual(@as(usize, 1), join.left_keys.len);
+        var output = try runtime.execute(execution_alloc, independent.backend(), &ordered, &.{}, .{ .retained_bytes = 32 * 1024 * 1024 });
+        defer output.deinit();
+        try std.testing.expectEqual(independent.count, try std.fmt.parseInt(usize, output.output.rows[0][0].string, 10));
+        try std.testing.expectEqual(independent.count * 3, independent.rows);
+        try std.testing.expectEqual(@as(usize, 1), independent.captures);
+        try std.testing.expectEqual(@as(usize, 1), independent.closes);
+    }
     fixture.canceled = true;
     try std.testing.expectError(error.QueryCanceled, runtime.execute(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{}));
     for ([_][]const u8{
