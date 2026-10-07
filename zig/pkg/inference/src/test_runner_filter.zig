@@ -83,7 +83,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     const runtime_offset = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_OFFSET") orelse 0;
     const runtime_limit = getenvUsize("ANTFLY_INFERENCE_TEST_RUNTIME_LIMIT") orelse std.math.maxInt(usize);
-    var progress_io = platform.Threaded.init(allocator, .{});
+    var progress_io = platform.Io.Threaded.init(allocator, .{});
     defer progress_io.deinit();
     const progress = RuntimeProgress.open(allocator, progress_io.io(), args);
     defer if (progress) |p| p.file.close(p.io);

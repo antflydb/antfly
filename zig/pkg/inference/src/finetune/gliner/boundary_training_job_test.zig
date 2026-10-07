@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const job = @import("boundary_training_job.zig");
@@ -33,13 +33,13 @@ fn pin(value: std.json.Value) !bundle.Digest {
 }
 
 test "boundary training job published small heads matches uninterrupted durable resume and portable source reload" {
-    const source_path = native_platform.env.getenv("ANTFLY_GLINER25_TRAINING_JOB_MODEL_DIR") orelse return error.SkipZigTest;
+    const source_path = platform.env.getenv("ANTFLY_GLINER25_TRAINING_JOB_MODEL_DIR") orelse return error.SkipZigTest;
     try publishedSmallHeads(source_path, .native);
 }
 
 test "boundary training job resident Metal published small heads matches uninterrupted durable resume and portable source reload" {
     if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
-    const source_path = native_platform.env.getenv("ANTFLY_GLINER25_TRAINING_JOB_METAL_MODEL_DIR") orelse return error.SkipZigTest;
+    const source_path = platform.env.getenv("ANTFLY_GLINER25_TRAINING_JOB_METAL_MODEL_DIR") orelse return error.SkipZigTest;
     try publishedSmallHeads(source_path, .resident_metal);
 }
 
@@ -62,7 +62,7 @@ fn publishedSmall(source_path: []const u8, execution: Execution, mode: @import("
     defer a.free(train_path);
     const validation_path = try compat.cwd().realPathFileAlloc(io, "testdata/gliner25/training_job_small_v1/validation.jsonl", a);
     defer a.free(validation_path);
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const relative = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer a.free(relative);
@@ -196,12 +196,12 @@ test "boundary training job regional numeric limits preserve semantics and enclo
 
 test "boundary training job CUDA published small heads durable resume and portable reload" {
     try @import("../../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
-    const source = native_platform.env.getenv("ANTFLY_GLINER25_TRAINING_JOB_CUDA_MODEL_DIR") orelse return error.SkipZigTest;
+    const source = platform.env.getenv("ANTFLY_GLINER25_TRAINING_JOB_CUDA_MODEL_DIR") orelse return error.SkipZigTest;
     try publishedSmallHeads(source, .resident_cuda);
 }
 
 test "boundary training job CUDA published full small durable resume and portable reload" {
     try @import("../../graph/resident_training_fixture.zig").CudaDevice.requireAvailable();
-    const source = native_platform.env.getenv("ANTFLY_GLINER25_TRAINING_JOB_CUDA_FULL_MODEL_DIR") orelse return error.SkipZigTest;
+    const source = platform.env.getenv("ANTFLY_GLINER25_TRAINING_JOB_CUDA_FULL_MODEL_DIR") orelse return error.SkipZigTest;
     try publishedSmall(source, .resident_cuda, .full);
 }

@@ -1051,7 +1051,7 @@ fn parseCliWithFirst(alloc: std.mem.Allocator, args: *std.process.Args.Iterator,
 }
 
 fn writeReadyFile(path: []const u8) void {
-    std.Io.Dir.cwd().writeFile(platform.Threaded.global_single_threaded.io(), .{
+    std.Io.Dir.cwd().writeFile(platform.Io.Threaded.global_single_threaded.io(), .{
         .sub_path = path,
         .data = "ready\n",
     }) catch {};
@@ -1975,7 +1975,7 @@ const FakeServiceMaintenanceClient = struct {
         self.captured_target = target;
         if (self.expect_ready_file_before_release) |ready_file| {
             if (std.mem.indexOf(u8, body, "\"action\":\"release\"") != null) {
-                try std.Io.Dir.cwd().access(platform.Threaded.global_single_threaded.io(), ready_file, .{});
+                try std.Io.Dir.cwd().access(platform.Io.Threaded.global_single_threaded.io(), ready_file, .{});
             }
         }
         const response_body = try alloc.dupe(u8, self.responses[self.calls]);
@@ -2422,8 +2422,8 @@ test "graph metric maintenance service test ready marker is written before clean
 
     var ready_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const ready_path = try std.fmt.bufPrint(&ready_path_buf, ".zig-cache/tmp/{s}/graph-metric-service-ready-before-release", .{tmp.sub_path});
-    std.Io.Dir.cwd().deleteFile(platform.Threaded.global_single_threaded.io(), ready_path) catch {};
-    defer std.Io.Dir.cwd().deleteFile(platform.Threaded.global_single_threaded.io(), ready_path) catch {};
+    std.Io.Dir.cwd().deleteFile(platform.Io.Threaded.global_single_threaded.io(), ready_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(platform.Io.Threaded.global_single_threaded.io(), ready_path) catch {};
 
     const responses = [_][]const u8{
         "{\"metrics_scanned\":1}",
@@ -3952,7 +3952,7 @@ test "graph metric maintenance supervisor restart policy is bounded" {
 
 test "graph metric maintenance supervisor loops until global idle" {
     const alloc = std.testing.allocator;
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const sequence = [_]ChildRunSummary{
         fakeChild(false, 0),
@@ -3992,7 +3992,7 @@ test "graph metric maintenance supervisor loops until global idle" {
 
 test "graph metric maintenance supervisor drives degree through child role argv" {
     const alloc = std.testing.allocator;
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4121,7 +4121,7 @@ test "graph metric maintenance supervisor drives degree through child role argv"
 
 test "graph metric maintenance supervisor stops at restart limit" {
     const alloc = std.testing.allocator;
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const sequence = [_]ChildRunSummary{
         fakeChild(null, 17),

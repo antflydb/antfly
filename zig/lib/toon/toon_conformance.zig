@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const toon = @import("antfly_toon");
@@ -110,7 +110,7 @@ fn ensureFixturesAvailable(alloc: Allocator, io: std.Io, root_dir: []const u8, a
 }
 
 fn fixturesPresent(alloc: Allocator, root_dir: []const u8) bool {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const fixtures_dir = std.fs.path.join(alloc, &.{ root_dir, "tests", "fixtures" }) catch return false;
     defer alloc.free(fixtures_dir);
@@ -121,7 +121,7 @@ fn fixturesPresent(alloc: Allocator, root_dir: []const u8) bool {
 
 fn runFixtures(alloc: Allocator, config: Config) !Summary {
     var summary = Summary{};
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const fixtures_dir = try std.fs.path.join(alloc, &.{ config.root_dir, "tests", "fixtures" });

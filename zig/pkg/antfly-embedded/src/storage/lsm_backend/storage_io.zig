@@ -349,7 +349,7 @@ pub const NativePathLockFileOptions = struct {
 };
 
 pub const NativePathLockFile = struct {
-    io_impl: if (supports_native_storage) platform.Threaded else void,
+    io_impl: if (supports_native_storage) platform.Io.Threaded else void,
     file: std.Io.File,
     fd_cache: *FdCache,
     locked: bool = false,
@@ -401,7 +401,7 @@ pub const NativePathLockFile = struct {
 };
 
 pub fn nativeRealPathAlloc(allocator: Allocator, path: []const u8) ![:0]u8 {
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     if (std.fs.path.isAbsolute(path)) {
@@ -424,7 +424,7 @@ fn nativeMissingRootIdentityAlloc(allocator: Allocator, root_dir: []const u8) ![
         return try std.fs.path.resolve(allocator, &.{root_dir});
     }
 
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", allocator);
     defer allocator.free(cwd);
@@ -1946,7 +1946,7 @@ const NativeStorageState = struct {
     allocator: Allocator,
     refs: std.atomic.Value(usize) = .init(1),
     closing: std.atomic.Value(bool) = .init(false),
-    threaded: platform.Threaded,
+    threaded: platform.Io.Threaded,
     fd_cache: *FdCache,
     cache_namespace: u64,
 
@@ -2253,7 +2253,7 @@ else blk: {
     if (supports_evented_runtime) {
         break :blk struct {
             runtime: union(RuntimeKind) {
-                threaded: platform.Threaded,
+                threaded: platform.Io.Threaded,
                 evented: std.Io.Evented,
             },
             state: *NativeStorageState,
@@ -4506,7 +4506,7 @@ test "native range reads progress without concurrency capacity" {
     if (!supports_native_storage) return error.SkipZigTest;
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     defer native.deinit();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
@@ -4778,7 +4778,7 @@ test "native fd cache retries an open that straddles a mutation fence" {
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -5048,7 +5048,7 @@ test "transient native writes wait before opening at descriptor capacity" {
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -5107,7 +5107,7 @@ test "persistent path locks use reserved headroom under transient saturation" {
 
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 8);
     defer pool.deinit();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -5141,7 +5141,7 @@ test "persistent path lock exhaustion fails without waiting" {
 
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 2);
     defer pool.deinit();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try pool.fd_cache.reservePersistentDescriptors(io, 2);
@@ -5166,7 +5166,7 @@ test "transient admission fails fast when only persistent descriptors prevent pr
 
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 4);
     defer pool.deinit();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -5228,7 +5228,7 @@ test "persistent locks consume reserved headroom without stranding transient cap
 
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 42);
     defer pool.deinit();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -5309,7 +5309,7 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     // cannot become the bottleneck before the >64 contention point is reached.
     // Keep the platform's default stack size: the linked test graph's static
     // TLS can exceed a hand-picked 512 KiB stack on glibc (pthread EINVAL).
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .limited(worker_count),
     });
     defer io_impl.deinit();
@@ -5360,7 +5360,7 @@ test "weighted native fd admission preserves FIFO progress" {
 
     var pool = NativeStoragePool.initWithCapacityForTest(std.testing.allocator, 3);
     defer pool.deinit();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try pool.fd_cache.reserveDescriptors(io, 3);
@@ -5464,7 +5464,7 @@ test "shared native fd admission wait is cancellation aware" {
     defer pool.deinit();
     var native = try NativeStorage.initWithPool(std.testing.allocator, .threaded, &pool);
     defer native.deinit();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const nonce = atomic_write_nonce.fetchAdd(1, .monotonic);
@@ -5648,7 +5648,7 @@ test "native streaming atomic abort removes staging despite pending cancellation
     if (!supports_native_storage or builtin.os.tag == .wasi) return error.SkipZigTest;
     var test_tmp = try TestDirectory.init("canceled_staging");
     defer test_tmp.cleanup();
-    var pool = platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    var pool = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
     defer pool.deinit();
     const io = pool.io();
     const State = struct {

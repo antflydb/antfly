@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 const secrets = @import("antfly_local_sources").common_secrets;
 const error_abi = @import("antfly_runtime_abi").error_abi;
@@ -194,7 +194,7 @@ test "secret store archive boundary transports common contracts and key-provider
     try std.testing.expectError(error.Conflict, writer.removeOverride("scope", "token", .{ .exact = 7 }));
     try std.testing.expect((try writer.removeOverride("scope", "token", .{ .exact = 8 })).changed);
     const identity = secret_contract.Identity{ .scope = "scope", .key = "token", .revision = 10 };
-    try std.testing.expectError(error.Unavailable, secret_record.seal(alloc, native_platform.debug_io, keys, identity, "new"));
+    try std.testing.expectError(error.Unavailable, secret_record.seal(alloc, platform.debug_io, keys, identity, "new"));
 }
 
 /// Server fixtures retain this compilation root's source and type identity.

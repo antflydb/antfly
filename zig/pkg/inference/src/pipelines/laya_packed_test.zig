@@ -16,7 +16,7 @@
 //! Tree-packing invariants on a seeded synthetic checkpoint (LAYA.md,
 //! "Verification"). These need no fixtures; PyTorch agreement for the same
 //! layout is `laya_packed_parity_test.zig`.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const model = @import("../models/laya.zig");
@@ -37,18 +37,18 @@ const questions = [_]pipeline.Question{
 };
 
 const Fixture = struct {
-    tmp: native_platform.testing.TmpDir,
+    tmp: platform.testing.TmpDir,
     path: [:0]const u8,
     session: Session,
     cfg: model.Config,
     encoder: modern.Config,
 
     fn init(a: std.mem.Allocator, packing: ?[]const u8) !Fixture {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        const path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
+        const path = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", a);
         errdefer a.free(path);
-        try synthetic.writeModel(a, native_platform.testing.io, path, packing, 128, 717);
+        try synthetic.writeModel(a, platform.testing.io, path, packing, 128, 717);
         // ANTFLY_LAYA_BACKEND=metal runs the same invariants on Metal.
         const session = try @import("../util/laya_test_support.zig").createSession(a, path);
         errdefer session.close();
@@ -378,7 +378,6 @@ test "laya packed multi-state rows reuse cached trunks and match the batched for
     }
     // Fully hot: per-tree cached vs one uncached batched call.
     const repeats = 5;
-    const platform = @import("antfly_platform");
     const began = platform.time.monotonicNs();
     for (0..repeats) |_| _ = try Run.once(a, &cb, &fixture, merged.row, null);
     const middle = platform.time.monotonicNs();
@@ -814,20 +813,19 @@ test "laya packed session rejects rows that break the tree contract" {
 // packing); only latency and processed tokens are measured. Set
 // ANTFLY_LAYA_PACKED_BENCH to a prepared Laya directory and build ReleaseFast.
 test "laya packed benchmark shared-state cost against unpacked" {
-    const platform = @import("antfly_platform");
     const source = platform.env.getenv("ANTFLY_LAYA_PACKED_BENCH") orelse return error.SkipZigTest;
     const hf = @import("inference_hf_tokenizer");
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const s = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const packed_dir = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", s);
-    var src = try std.Io.Dir.cwd().openDir(native_platform.testing.io, source, .{ .iterate = true });
-    defer src.close(native_platform.testing.io);
+    const packed_dir = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", s);
+    var src = try std.Io.Dir.cwd().openDir(platform.testing.io, source, .{ .iterate = true });
+    defer src.close(platform.testing.io);
     var it = src.iterate();
-    while (try it.next(native_platform.testing.io)) |entry| {
+    while (try it.next(platform.testing.io)) |entry| {
         if (entry.kind != .file) continue;
         const from = try std.fs.path.join(s, &.{ source, entry.name });
         if (std.mem.eql(u8, entry.name, "config.json")) {
@@ -837,8 +835,8 @@ test "laya packed benchmark shared-state cost against unpacked" {
             try object.put(s, "mode", .{ .string = "question" });
             try object.put(s, "max_packed_len", .{ .integer = 8192 });
             try parsed.value.object.getPtr("laya").?.object.put(s, "packing", .{ .object = object });
-            try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = entry.name, .data = try std.json.Stringify.valueAlloc(s, parsed.value, .{}) });
-        } else try src.copyFile(entry.name, tmp.dir, entry.name, native_platform.testing.io, .{});
+            try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = entry.name, .data = try std.json.Stringify.valueAlloc(s, parsed.value, .{}) });
+        } else try src.copyFile(entry.name, tmp.dir, entry.name, platform.testing.io, .{});
     }
     const tokenizer = try hf.HfTokenizer.loadFromBytes(a, try c_file.readFileFromDir(s, source, "tokenizer.json"));
     const tok = tokenizer.tokenizer();

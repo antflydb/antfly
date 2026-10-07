@@ -13,7 +13,6 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const server_document_child_range = @import("../storage/server_document_child_range.zig");
 const server_query_visibility = @import("../storage/server_query_visibility.zig");
@@ -1251,7 +1250,7 @@ const DroppedTableDeleteWork = struct {
     recovery_source: ?*ProvisionedTableWriteSource = null,
 
     fn deletePath(path: []const u8) !void {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         var attempt: u8 = 0;
         while (attempt < 6) : (attempt += 1) {
@@ -1335,7 +1334,7 @@ fn quarantineRecoveryIntent(
 fn countRecoveryQuarantineIntents(alloc: std.mem.Allocator, replica_root_dir: []const u8) !u64 {
     const quarantine_dir = try recoveryQuarantineDirPath(alloc, replica_root_dir);
     defer alloc.free(quarantine_dir);
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var dir = std.Io.Dir.cwd().openDir(io, quarantine_dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -1812,7 +1811,7 @@ fn persistReplicaRetirementIntent(
     const dir_path = try replicaRetirementDirPath(alloc, replica_root_dir);
     defer alloc.free(dir_path);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, dir_path);
@@ -1950,7 +1949,7 @@ fn persistDroppedTableRepairIntent(
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
     defer alloc.free(tmp_path);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, repair_dir);
@@ -2094,7 +2093,7 @@ fn moveRetiredReplicaPathToTrash(
     const trash_path = try retiredReplicaTrashPath(alloc, replica_root_dir, group_id);
     errdefer alloc.free(trash_path);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, trash_dir_path);
@@ -2126,7 +2125,7 @@ fn moveDroppedGroupPathToTrash(
     const trash_path = try droppedTableTrashPath(alloc, replica_root_dir, table_name, group_id);
     errdefer alloc.free(trash_path);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), trash_dir_path);
     std.Io.Dir.rename(std.Io.Dir.cwd(), path, std.Io.Dir.cwd(), trash_path, io_impl.io()) catch |err| switch (err) {
@@ -2150,7 +2149,7 @@ fn deleteGroupPathIfPresent(
     const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
     defer alloc.free(path);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -4909,7 +4908,7 @@ pub const ProvisionedTableWriteCache = struct {
 
     fn openMutexIo(self: *ProvisionedTableWriteCache) Io {
         if (self.backend_runtime) |runtime| if (runtime.io()) |io| return io;
-        return platform.Threaded.global_single_threaded.io();
+        return platform.Io.Threaded.global_single_threaded.io();
     }
 
     fn lockOpenMutex(self: *ProvisionedTableWriteCache) void {
@@ -4938,7 +4937,7 @@ const HostedManagedDbCache = struct {
             .write_cache = ProvisionedTableWriteCache.init(alloc),
             .remote_capability_cache = remote_capabilities.Cache.init(
                 alloc,
-                platform.Threaded.global_single_threaded.io(),
+                platform.Io.Threaded.global_single_threaded.io(),
             ),
             .runtime_status_cache = runtime_status.TableRuntimeSnapshotCache.init(alloc),
         };
@@ -6837,7 +6836,7 @@ pub const ProvisionedTableWriteSource = struct {
     replica_root_dir: []const u8,
     catalog: table_catalog.CatalogSource,
     local_db_mutex: SourceStateMutex = .{},
-    table_activity_threaded: ?platform.Threaded,
+    table_activity_threaded: ?platform.Io.Threaded,
     table_activity_mutex: Io.Mutex = .init,
     table_activity_ready: Io.Condition = .init,
     // Protected by table_activity_mutex. Seed capture closes only new
@@ -8349,7 +8348,7 @@ pub const ProvisionedTableWriteSource = struct {
     }
 
     fn removeDroppedTableRepairIntent(path: []const u8) !void {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try removeDroppedTableRepairIntentWithIo(io_impl.io(), path);
     }
@@ -8366,7 +8365,7 @@ pub const ProvisionedTableWriteSource = struct {
         var retry_required = false;
         const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
         defer alloc.free(trash_dir_path);
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, trash_dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -8395,7 +8394,7 @@ pub const ProvisionedTableWriteSource = struct {
         var retry_required = false;
         const repair_dir_path = try droppedTableRepairDirPath(alloc, self.replica_root_dir);
         defer alloc.free(repair_dir_path);
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, repair_dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -8696,7 +8695,7 @@ pub const ProvisionedTableWriteSource = struct {
         const ownership = self.replicaRetirementOwnershipSnapshot() orelse return false;
         const dir_path = try replicaRetirementDirPath(alloc, self.replica_root_dir);
         defer alloc.free(dir_path);
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -9143,7 +9142,7 @@ pub const ProvisionedTableWriteSource = struct {
     pub fn requireAbsentRestoreOwnerRoot(self: *ProvisionedTableWriteSource, alloc: std.mem.Allocator, group_id: u64) !void {
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
@@ -9288,7 +9287,7 @@ pub const ProvisionedTableWriteSource = struct {
                 const failure = work.source.dropped_table_recovery_retry_failures.fetchAdd(1, .acq_rel);
                 const shift: u5 = @intCast(@min(failure, 4));
                 const delay_ms: u64 = @as(u64, 100) << shift;
-                var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+                var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
                 defer io_impl.deinit();
                 io_impl.io().sleep(.fromNanoseconds(delay_ms * std.time.ns_per_ms), .awake) catch {};
                 work.source.dropped_table_recovery_retry_scheduled.store(false, .release);
@@ -13389,7 +13388,7 @@ pub const ProvisionedTableWriteSource = struct {
         const io = if (effective_backend_runtime) |runtime|
             runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable
         else
-            self.restore_open_options.filesystem_io orelse native_platform.debug_io;
+            self.restore_open_options.filesystem_io orelse platform.debug_io;
         const cache = self.write_cache orelse return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
             alloc,
             self.replica_root_dir,
@@ -13707,7 +13706,7 @@ pub const ProvisionedTableWriteSource = struct {
         const cache = self.write_cache orelse return error.RestoreStagingInProgress;
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         try fs_paths.createDirPathPortable(io, path);
         var cached = try self.getOrOpenCachedDbModeAtGeneration(alloc, cache, path, group_id, self.visibleRootGeneration(group_id), table.name, .restore_repair, null, null, .{
             .indexes_json = "{}",
@@ -15557,7 +15556,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         _ = try Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false });
         var locks = WriteCacheTransitionLocks.init(self, true, true);
         defer locks.deinit();
@@ -15601,7 +15600,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         _ = Io.Dir.cwd().statFile(io_impl.io(), path, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return error.HASeedSnapshotReplicaMissing,
@@ -20915,7 +20914,7 @@ pub const ProvisionedTableWriteSource = struct {
             if (moved_any_group) {
                 const trash_dir_path = try droppedTableTrashDirPath(alloc, self.replica_root_dir);
                 defer alloc.free(trash_dir_path);
-                var io_impl = platform.Threaded.init(alloc, .{});
+                var io_impl = platform.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
                 try fs_paths.syncDirPortable(io_impl.io(), trash_dir_path);
             }
@@ -23092,7 +23091,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
-        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const io = if (self.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         _ = Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -31562,7 +31561,7 @@ fn shouldDrainCachedManagedDbAfterBatch(sync_level: db_mod.types.SyncLevel) bool
 }
 
 fn prepareLocalTablePathForRestore(alloc: std.mem.Allocator, path: []const u8) !void {
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -31717,7 +31716,7 @@ const exportPortableBackupFileWithIo = physical_local_write.exportPortableBackup
 const exportPortableBackupFileWithSource = @import("antfly_local_sources").api_local_table_writes.exportPortableBackupFileWithSource;
 
 fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try std.Io.Dir.cwd().readFileAlloc(
         io_impl.io(),
@@ -31729,7 +31728,7 @@ fn readBackupFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 
 fn importPortableBackupFile(alloc: std.mem.Allocator, store: *db_mod.docstore.DocStore, path: []const u8, shared_io: ?std.Io) !void {
     if (shared_io) |io| return try importPortableBackupFileWithIo(alloc, store, path, io);
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try importPortableBackupFileWithIo(alloc, store, path, io_impl.io());
 }
@@ -35451,7 +35450,7 @@ fn consumerTests() type {
             var read_worker = ReadWorker{ .source = &source };
             var read_thread = try platform.testing.io.concurrent(ReadWorker.run, .{&read_worker});
 
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!worker.entered.load(.acquire));
@@ -35511,7 +35510,7 @@ fn consumerTests() type {
 
             var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-ha-seed-request-admission", NoCatalog.iface());
             defer source.deinit();
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
 
             // A held capture reservation keeps a later public writer outside the
@@ -35788,7 +35787,7 @@ fn consumerTests() type {
                 thread.await(platform.testing.io);
             }
 
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             while (!source.hasGroupActivityBestEffort("docs", 7001)) {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -37300,7 +37299,7 @@ fn consumerTests() type {
                 if (!thread_joined) thread.await(platform.testing.io);
             }
 
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             while (!source.hasGroupActivityBestEffort("docs", 7001)) {
                 io_impl.io().sleep(Io.Duration.fromMilliseconds(1), .awake) catch {};
@@ -37348,7 +37347,7 @@ fn consumerTests() type {
             var worker = WriteWorker{ .source = &source };
             var thread = try platform.testing.io.concurrent(WriteWorker.run, .{&worker});
 
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!worker.entered.load(.acquire));
@@ -37402,7 +37401,7 @@ fn consumerTests() type {
             var worker = ReadWorker{ .source = &source };
             var thread = try platform.testing.io.concurrent(ReadWorker.run, .{&worker});
 
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!worker.entered.load(.acquire));
@@ -38540,7 +38539,7 @@ fn consumerTests() type {
                 }
             };
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
 
@@ -38606,7 +38605,7 @@ fn consumerTests() type {
             defer alloc.free(repair_dir);
             const intent_path = try std.fmt.allocPrint(alloc, "{s}/invalid.bin", .{repair_dir});
             defer alloc.free(intent_path);
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
             try fs_paths.createDirPathPortable(io, repair_dir);
@@ -38646,7 +38645,7 @@ fn consumerTests() type {
                 .{ .table_id = 7, .expected_transition_generation = 1, .group_ids = &.{} },
             );
             defer alloc.free(intent_path);
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
             var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
@@ -38912,7 +38911,7 @@ fn consumerTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
 
@@ -38969,7 +38968,7 @@ fn consumerTests() type {
             defer alloc.free(db_path);
             const raft_path = try std.fmt.allocPrint(alloc, "{s}/group-7001/node-42/raft-log", .{replica_root_dir});
             defer alloc.free(raft_path);
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), raft_path);
@@ -39106,7 +39105,7 @@ fn consumerTests() type {
             var prepared = try source.prepareReplicaRetirements(alloc, &targets);
             defer prepared.deinit();
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.testing.expect(prepared.batch_created);
             var persisted_prepared = try loadReplicaRetirementBatch(alloc, io_impl.io(), prepared.batch_path.?);
@@ -39225,7 +39224,7 @@ fn consumerTests() type {
             defer alloc.free(replica_root_dir);
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
             defer alloc.free(db_path);
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
             var persisted = try persistReplicaRetirementIntent(alloc, replica_root_dir, 7001);
@@ -39353,7 +39352,7 @@ fn consumerTests() type {
                 }
             };
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), path);
             const marker_path = try std.fmt.allocPrint(alloc, "{s}/marker.txt", .{path});
@@ -40455,7 +40454,7 @@ fn implementationTests() type {
                 structural_reconcile_test_index_json,
             );
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             for (0..2_000) |_| {
                 if (activation_capture.calls.load(.acquire) != 0) break;
@@ -40481,7 +40480,7 @@ fn implementationTests() type {
             const db_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
             defer alloc.free(db_path);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), db_path);
             const intent_path = try persistDroppedTableRepairIntent(
@@ -41105,7 +41104,7 @@ fn implementationTests() type {
             defer alloc.free(replica_root_dir);
             const group_path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
             defer alloc.free(group_path);
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try std.Io.Dir.cwd().createDirPath(io_impl.io(), group_path);
             const trash_dir_path = try droppedTableTrashDirPath(alloc, replica_root_dir);
@@ -41199,7 +41198,7 @@ fn implementationTests() type {
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-managed-visibility-publish-status", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -41245,7 +41244,7 @@ fn implementationTests() type {
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-provisioned-write-runtime-status-cold-reopen", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42540,7 +42539,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42575,7 +42574,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42640,7 +42639,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42679,7 +42678,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -43124,7 +43123,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -43332,7 +43331,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -43443,7 +43442,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -43521,7 +43520,7 @@ fn implementationTests() type {
                 });
             }
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const stale_change_journal_dir = try std.fmt.allocPrint(alloc, "{s}/change_journal", .{db_path});
             defer alloc.free(stale_change_journal_dir);
@@ -44048,7 +44047,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44078,7 +44077,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44120,7 +44119,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44161,7 +44160,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44208,7 +44207,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -44256,7 +44255,7 @@ fn implementationTests() type {
             const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-backup-restore/backup", .{tmp.sub_path});
             defer alloc.free(backup_root);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -44342,7 +44341,7 @@ fn implementationTests() type {
             const backup_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/api-table-portable-backup-restore/backup", .{tmp.sub_path});
             defer alloc.free(backup_root);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -44451,7 +44450,7 @@ fn implementationTests() type {
             defer backup_root_tmp.cleanup();
             const backup_root = backup_root_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -44581,7 +44580,7 @@ fn implementationTests() type {
             var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
 
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
@@ -44735,7 +44734,7 @@ fn implementationTests() type {
             var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
 
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
@@ -44865,7 +44864,7 @@ fn implementationTests() type {
             var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
 
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
@@ -44975,7 +44974,7 @@ fn implementationTests() type {
             defer restore_path_tmp.cleanup();
             const restore_path = restore_path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -45071,7 +45070,7 @@ fn implementationTests() type {
             defer backup_root_tmp.cleanup();
             const backup_root = backup_root_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -45186,7 +45185,7 @@ fn implementationTests() type {
             defer backup_root_tmp.cleanup();
             const backup_root = backup_root_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -45371,7 +45370,7 @@ fn implementationTests() type {
             var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
 
             const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", alloc);
@@ -46033,7 +46032,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -46164,7 +46163,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -46303,7 +46302,7 @@ fn implementationTests() type {
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-auto-bulk-active-lease-skip", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -46641,7 +46640,7 @@ fn implementationTests() type {
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-provisioned-write-cache-publish-before-invalidate", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -46776,7 +46775,7 @@ fn implementationTests() type {
             defer replica_root_dir_tmp.cleanup();
             const replica_root_dir = replica_root_dir_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
@@ -46936,7 +46935,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -47027,7 +47026,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47074,7 +47073,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47112,7 +47111,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47153,7 +47152,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47191,7 +47190,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47232,7 +47231,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47276,7 +47275,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47317,7 +47316,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47355,7 +47354,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47393,7 +47392,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47434,7 +47433,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47472,7 +47471,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47519,7 +47518,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47569,7 +47568,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47610,7 +47609,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47654,7 +47653,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47689,7 +47688,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47733,7 +47732,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47780,7 +47779,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47827,7 +47826,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47874,7 +47873,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47921,7 +47920,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -47962,7 +47961,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48000,7 +47999,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48041,7 +48040,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48082,7 +48081,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48123,7 +48122,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48152,7 +48151,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48227,7 +48226,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48257,7 +48256,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48295,7 +48294,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48331,7 +48330,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48373,7 +48372,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48414,7 +48413,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48452,7 +48451,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
@@ -48495,7 +48494,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48689,7 +48688,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48759,7 +48758,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48833,7 +48832,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48899,7 +48898,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -48967,7 +48966,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -49033,7 +49032,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -49172,7 +49171,7 @@ fn implementationTests() type {
                 }
             };
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -49309,7 +49308,7 @@ fn implementationTests() type {
                 }
             };
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -49900,7 +49899,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50130,7 +50129,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50311,7 +50310,7 @@ fn implementationTests() type {
                 fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
             };
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50359,7 +50358,7 @@ fn implementationTests() type {
             const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-api-provisioned-write-runtime-status-managed", .{tmp.sub_path});
             defer alloc.free(path);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -50437,7 +50436,7 @@ fn implementationTests() type {
             );
             defer alloc.free(path);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -51020,7 +51019,7 @@ fn implementationTests() type {
             const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/provisioned-create-index-cached-writer", .{tmp.sub_path});
             defer alloc.free(replica_root_dir);
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
@@ -51288,7 +51287,7 @@ fn implementationTests() type {
             defer path_tmp.cleanup();
             const path = path_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -51713,7 +51712,7 @@ fn implementationTests() type {
             };
 
             var source = ProvisionedTableWriteSource.init("/tmp/unused-antfly-repair-status-admission", NoCatalog.iface());
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             const io = io_impl.io();
             const live_status = source.beginStatusRequest("docs");
@@ -51992,7 +51991,7 @@ fn implementationTests() type {
             var read_thread = try platform.testing.io.concurrent(ReadWorker.run, .{&read_worker});
             defer read_thread.await(platform.testing.io);
 
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
             io_impl.io().sleep(Io.Duration.fromMilliseconds(10), .awake) catch {};
             try std.testing.expect(!read_worker.entered.load(.acquire));
@@ -56861,7 +56860,7 @@ fn implementationTests() type {
             try std.testing.expect(try cached.db.hasPendingIndexRepairIntents(alloc));
             cached.deinit(alloc);
 
-            var status_io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var status_io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer status_io_impl.deinit();
             const status_io = status_io_impl.io();
             var status_poller = StatusPoller{ .source = &source };
@@ -58148,7 +58147,7 @@ fn implementationTests() type {
                 defer db.close();
             }
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
 
             var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
@@ -58286,7 +58285,7 @@ fn implementationTests() type {
                 defer db.close();
             }
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
 
             var lsm_cache = lsm_backend.Cache.init(alloc, lsm_backend.DefaultCacheSizeBytes);
@@ -58505,7 +58504,7 @@ fn implementationTests() type {
             const schema_json =
                 "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}";
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -59177,7 +59176,7 @@ fn implementationTests() type {
             defer backup_root_tmp.cleanup();
             const backup_root = backup_root_tmp.path();
 
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -61347,7 +61346,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 0), startup_write_cache.closing_entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
             try std.testing.expectEqual(@as(usize, 0), startup_write_cache.entries.items.len);
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const store_path = try std.fs.path.join(alloc, &.{ destination_root, "store.bin" });
             defer alloc.free(store_path);
@@ -61631,7 +61630,7 @@ fn implementationTests() type {
         test "resident DB retry preparation does not block a borrowed std.Io scheduler" {
             const alloc = std.testing.allocator;
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             var runtime = try db_mod.background_runtime.BackendRuntime.init(alloc, .{
                 .backend = .manual,

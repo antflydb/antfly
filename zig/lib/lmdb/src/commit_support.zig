@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const env_mod = @import("env.zig");
@@ -608,7 +608,7 @@ test "async positional publisher chunks large spans and propagates write failure
     // Reserve address space without touching pages: this exercises the actual
     // large-span boundary while keeping the test's physical memory bounded.
     const bytes = try std.posix.mmap(null, max_pwrite_chunk_len + 4096, .{ .READ = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0);
-    defer native_platform.filesystem.unmapMemory(bytes);
+    defer platform.filesystem.unmapMemory(bytes);
     const Recorder = struct {
         calls: usize = 0,
         offset: u64 = 17,
@@ -677,11 +677,11 @@ fn syncFileAsyncIo(file: std.Io.File, io: std.Io) Error!void {
 
 fn applyArtificialSyncDelay(delay_ns: u64) Error!void {
     if (delay_ns == 0) return;
-    var req = native_platform.c.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(delay_ns / std.time.ns_per_s),
         .nsec = @intCast(delay_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(native_platform.c.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return error.Unexpected,
@@ -709,8 +709,8 @@ fn writeSerializedSpanFd(
 }
 
 fn nowNs() u64 {
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => {},
         else => unreachable,
     }

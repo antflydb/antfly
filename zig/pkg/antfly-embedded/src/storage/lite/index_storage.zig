@@ -21,12 +21,12 @@
 //! rather than in the internal bridge container. Public Lite status reports the
 //! native catalog-page layout; this adapter is not a user-visible file format.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
 const Crc32 = @import("antfly_hash").Crc32;
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
@@ -713,7 +713,7 @@ const NativeAtomicWriteSink = struct {
         const file = try self.ensureFile();
         try self.flush();
         const mapped = try mapArtifact(file, self.persisted);
-        errdefer native_platform.filesystem.unmapMemory(mapped);
+        errdefer platform.filesystem.unmapMemory(mapped);
         try self.storage.docs.submitMutation(self, publish);
         const lease = self.artifact_lease.?;
         self.artifact_lease = null;
@@ -735,7 +735,7 @@ const NativeAtomicWriteSink = struct {
     }
 };
 
-fn testPath(allocator: Allocator, tmp: native_platform.testing.TmpDir, name: []const u8) ![]u8 {
+fn testPath(allocator: Allocator, tmp: platform.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
@@ -743,7 +743,7 @@ test "lite native repeated WAL reset does not publish unchanged control records"
     const wal = @import("../lsm_backend/wal.zig");
     const State = @import("../lsm_backend/state.zig").State;
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-wal-reset.aflite");
     defer allocator.free(path);
@@ -777,7 +777,7 @@ test "lite native repeated WAL reset does not publish unchanged control records"
 test "lite native index storage persists logical files across reopen" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage.aflite");
     defer allocator.free(path);
@@ -863,7 +863,7 @@ test "lite native index storage lists immediate live files within its namespace"
 
 test "lite native index storage root identity is physical and namespaced" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-identity.aflite");
     defer allocator.free(path);
@@ -901,7 +901,7 @@ test "lite native index storage root identity is physical and namespaced" {
 
 test "lite native index reads remain pinned while newer checkpoints publish" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/index-pinned-checkpoint.aflite", .{tmp.sub_path});
     defer allocator.free(path);
@@ -925,7 +925,7 @@ test "lite native index reads remain pinned while newer checkpoints publish" {
 test "lite native index storage can be scoped to the Lite index namespace" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-namespace.aflite");
     defer allocator.free(path);
@@ -957,7 +957,7 @@ test "lite native index storage can be scoped to the Lite index namespace" {
 test "lite native index storage handles large files rename and delete tree" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-large.aflite");
     defer allocator.free(path);
@@ -1012,7 +1012,7 @@ test "lite native index storage handles large files rename and delete tree" {
 test "lite native index storage aborts atomic writes without publishing partial files" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-atomic-abort.aflite");
     defer allocator.free(path);
@@ -1055,11 +1055,11 @@ test "lite native index storage aborts atomic writes without publishing partial 
 
 test "lite native staged abort removes staging despite pending cancellation" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{ .iterate = true });
+    var tmp = platform.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "canceled-staging.aflite");
     defer alloc.free(path);
-    var pool = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
+    var pool = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(4) });
     defer pool.deinit();
     const io = pool.io();
     var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = io });
@@ -1101,7 +1101,7 @@ test "lite native staged abort removes staging despite pending cancellation" {
 test "lite native index storage read-only open rejects mutations" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-readonly.aflite");
     defer allocator.free(path);
@@ -1151,7 +1151,7 @@ test "lite native index storage read-only open rejects mutations" {
 test "lite native index storage recovers previous checkpoint after interrupted update" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-crash-recovery.aflite");
     defer allocator.free(path);
@@ -1193,7 +1193,7 @@ test "lite native index storage recovers previous checkpoint after interrupted u
 test "lite native index storage serializes physical writes without taking document writer slot" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-index-storage-single-writer.aflite");
     defer allocator.free(path);
@@ -1217,7 +1217,7 @@ test "lite native index storage serializes physical writes without taking docume
 
 test "lite native directory operations seek bounded prefixes independent of catalog history" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "catalog-directory-seek.aflite");
     defer alloc.free(path);
@@ -1262,7 +1262,7 @@ test "lite native directory operations seek bounded prefixes independent of cata
 
 test "lite native staged atomic writes bound heap and survive concurrent commits and vacuum" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "staged-atomic.aflite");
     defer alloc.free(path);
@@ -1271,7 +1271,7 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
     for (expected, 0..) |*byte, i| byte.* = @intCast(i % 251);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = alloc, .limit = 512 * 1024 };
     {
-        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = platform.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
         var indexes = Store.init(budget.allocator(), &docs);
@@ -1339,11 +1339,11 @@ test "lite native staged atomic writes bound heap and survive concurrent commits
 
 test "lite native staged atomic writes discard failed imports and poisoned sources" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "failed-staging.aflite");
     defer alloc.free(path);
-    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
     defer docs.close();
     var indexes = Store.init(alloc, &docs);
     const storage = indexes.storage();
@@ -1354,7 +1354,7 @@ test "lite native staged atomic writes discard failed imports and poisoned sourc
         var writer = try storage.beginAtomicWrite(alloc, "/stable");
         try writer.appendSlice(&bytes);
         const impl: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
-        try impl.file.?.setLength(native_platform.testing.io, 65536);
+        try impl.file.?.setLength(platform.testing.io, 65536);
         if (checksum_first) {
             try std.testing.expectError(error.EndOfStream, writer.crc32Prefix(bytes.len));
             try std.testing.expectError(error.EndOfStream, writer.appendSlice("must not recover silently"));
@@ -1383,7 +1383,7 @@ test "lite native staged atomic writes discard failed imports and poisoned sourc
 
 test "lite native atomic writes spill with long database basenames" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     // Valid under NAME_MAX=255, including the writer lock's .lock suffix.
     // Appending the former 50-byte staging suffix would exceed that limit.
@@ -1392,7 +1392,7 @@ test "lite native atomic writes spill with long database basenames" {
     defer alloc.free(path);
     const bytes: [128 * 1024 + 17]u8 = @splat('s');
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
         defer docs.close();
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -1419,7 +1419,7 @@ test "lite native atomic writes spill with long database basenames" {
 
 test "lite native cold atomic writes preserve hot pages with bounded cache admission" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "cold-atomic.aflite");
     defer alloc.free(path);
@@ -1427,7 +1427,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
     defer alloc.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
         defer docs.close();
         docs.file.page_cache.limit_bytes = 256 * 1024;
         var indexes = Store.init(alloc, &docs);
@@ -1494,12 +1494,12 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
 
 test "lite native directory cursor skips large subtrees and preserves boundary files" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "directory-subtree-skip.aflite");
     defer alloc.free(path);
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
         defer docs.close();
         var indexes = Store.initWithNamespace(alloc, &docs, "/a");
         const storage = indexes.storage();
@@ -1554,7 +1554,7 @@ test "lite native directory cursor skips large subtrees and preserves boundary f
 
 test "lite native atomic imports batch writes and preserve publication on failed flush" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "batched-import.aflite");
     defer alloc.free(path);
@@ -1562,7 +1562,7 @@ test "lite native atomic imports batch writes and preserve publication on failed
     defer alloc.free(bytes);
     for (bytes, 0..) |*byte, i| byte.* = @intCast(i % 251);
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = platform.testing.io });
         defer docs.close();
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -1623,7 +1623,7 @@ test "lite native atomic imports batch writes and preserve publication on failed
 
 test "lite native unscoped listings preserve accepted non-normalized keys" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "unscoped-path-listing.aflite");
     defer alloc.free(path);
@@ -1641,7 +1641,7 @@ test "lite native unscoped listings preserve accepted non-normalized keys" {
     };
     const expected = [_][]const u8{ "file", "dir", "dir0", "file", "renamed" };
     {
-        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+        var docs = try docstore.Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
         defer docs.close();
         var indexes = Store.init(alloc, &docs);
         const storage = indexes.storage();
@@ -1685,11 +1685,11 @@ test "lite native unscoped listings preserve accepted non-normalized keys" {
 
 test "lite index read limits reject from pinned metadata before payload allocation" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/limited-read.aflite", .{tmp.sub_path});
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
     defer docs.close();
     // Isolate query I/O accounting from background reclamation; foreground reuse remains enabled.
     docs.maintenance_cancel.request();
@@ -1732,12 +1732,12 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
         .{ .count = 4096, .key_len = 1024 },
     }) |case| {
         const count = case.count;
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-delete.aflite", .{tmp.sub_path});
         defer a.free(path);
         var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
+        var docs = try docstore.Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = platform.testing.io });
         defer docs.close();
         docs.file.page_cache_enabled.store(false, .monotonic);
         var arena = std.heap.ArenaAllocator.init(a);
@@ -1778,11 +1778,11 @@ test "lite subtree deletion bounds heap across private batches and preserves sna
 
 test "lite subtree deletion rolls back earlier private batches on failure" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/delete-rollback.aflite", .{tmp.sub_path});
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = platform.testing.io });
     defer docs.close();
     docs.file.page_cache_enabled.store(false, .monotonic);
     var arena = std.heap.ArenaAllocator.init(a);
@@ -1794,7 +1794,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     };
     try docs.file.putIndexCatalogBatch(mutations);
     const pinned = docs.file.activeCheckpoint();
-    const size = (try docs.file.file.stat(native_platform.testing.io)).size;
+    const size = (try docs.file.file.stat(platform.testing.io)).size;
     var store = Store.initWithNamespace(a, &docs, "/scope");
     const before = docs.file.test_page_writes.load(.monotonic);
     docs.file.test_page_write_fail_after = 30;
@@ -1802,7 +1802,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     docs.file.test_page_write_fail_after = null;
     try std.testing.expect(docs.file.test_page_writes.load(.monotonic) > before);
     try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
-    try std.testing.expectEqual(size, (try docs.file.file.stat(native_platform.testing.io)).size);
+    try std.testing.expectEqual(size, (try docs.file.file.stat(platform.testing.io)).size);
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
     const retained = (try docs.file.getIndexCatalogRecordAlloc(a, mutations[0].key)).?;
     defer a.free(retained);
@@ -1817,7 +1817,7 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
         docs.file.allocator = a;
         try std.testing.expectError(error.OutOfMemory, result);
         try std.testing.expectEqual(pinned.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
-        try std.testing.expectEqual(size, (try docs.file.file.stat(native_platform.testing.io)).size);
+        try std.testing.expectEqual(size, (try docs.file.file.stat(platform.testing.io)).size);
         try std.testing.expect((try docs.checkWithCancel(null)).valid);
     }
     try store.storage().deleteTree("/scope");
@@ -1842,11 +1842,11 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
 test "lite immutable segment sources pin bytes through replacement and release reader memory" {
     const a = std.testing.allocator;
     const segment = @import("../../segment.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "range-segment.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false } });
     defer docs.close();
     var store = Store.init(a, &docs);
     const storage = store.storage();
@@ -1896,11 +1896,11 @@ test "lite immutable segment sources pin bytes through replacement and release r
 
 test "lite immutable segment sources preserve inline empty and missing values" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "range-inline.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false } });
     defer docs.close();
     var store = Store.init(a, &docs);
     const storage = store.storage();
@@ -1925,11 +1925,11 @@ test "lite immutable segment sources preserve inline empty and missing values" {
 test "lite mapped immutable artifacts bound heap and survive replacement vacuum and owner close" {
     if (!supports_mapped_artifacts) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "mapped-artifact.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
     var closed = false;
     defer if (!closed) docs.close();
     var store = Store.init(a, &docs);
@@ -1965,11 +1965,11 @@ test "lite mapped immutable artifacts bound heap and survive replacement vacuum 
 test "lite mapped publication failure consumes writer and preserves old artifact" {
     if (!supports_mapped_artifacts) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "mapped-failure.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false } });
     defer docs.close();
     var store = Store.init(a, &docs);
     const storage = store.storage();
@@ -1990,11 +1990,11 @@ test "lite mapped publication failure consumes writer and preserves old artifact
 test "lite mapped artifact capacity leases bound growth and release claims" {
     if (!supports_mapped_artifacts) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "mapped-capacity.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false } });
     defer docs.close();
     var store = Store.init(a, &docs);
     const storage = store.storage();
@@ -2034,12 +2034,12 @@ test "lite mapped artifact disk admission includes concurrent future claims" {
         }
     };
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "mapped-disk.aflite");
     defer a.free(path);
     var probe = Probe{};
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .disk_headroom_bytes = 0, .capacity_probe = .{ .context = &probe, .available = Probe.available } } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false, .disk_headroom_bytes = 0, .capacity_probe = .{ .context = &probe, .available = Probe.available } } });
     defer docs.close();
     probe.available_bytes = 8192;
     const first = try docs.reserveArtifactBytes(4096);
@@ -2057,21 +2057,21 @@ test "lite mapped artifact disk admission includes concurrent future claims" {
 test "lite mapped read only views report unavailable when directory cannot write" {
     if (!supports_mapped_artifacts) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "mapped-readonly.aflite");
     defer a.free(path);
     {
-        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
         defer docs.close();
         var store = Store.init(a, &docs);
         try store.storage().writeFileAbsolute("/mapped", "immutable");
     }
-    var docs = try docstore.Store.openWithOptions(a, path, .{ .read_only = true, .io = native_platform.testing.io });
+    var docs = try docstore.Store.openWithOptions(a, path, .{ .read_only = true, .io = platform.testing.io });
     defer docs.close();
     var store = Store.init(a, &docs);
-    try tmp.dir.setPermissions(native_platform.testing.io, .fromMode(0o555));
-    defer tmp.dir.setPermissions(native_platform.testing.io, .fromMode(0o700)) catch {};
+    try tmp.dir.setPermissions(platform.testing.io, .fromMode(0o555));
+    defer tmp.dir.setPermissions(platform.testing.io, .fromMode(0o700)) catch {};
     const result = store.storage().mapImmutableArtifact(a, "/mapped");
     if (result) |mapped| {
         // Privileged runners can still create files in a read-only directory.
@@ -2089,11 +2089,11 @@ test "lite mapped read only views report unavailable when directory cannot write
 
 test "lite artifact leases survive owner close and do not pin document retirement" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "owned-source.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
     var docs_open = true;
     defer if (docs_open) docs.close();
     docs.maintenance_start_suppressed = true;
@@ -2119,7 +2119,7 @@ test "lite artifact leases survive owner close and do not pin document retiremen
     docs.close();
     docs_open = false;
     // A new owner must keep a previous owner's still-locked lease alive.
-    var reopened = try docstore.Store.openWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var reopened = try docstore.Store.openWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
     defer reopened.close();
     reopened.maintenance_start_suppressed = true;
     try reopened.maintainOnce(false);
@@ -2137,11 +2137,11 @@ test "lite artifact leases survive owner close and do not pin document retiremen
 
 test "lite artifact leases transfer retired inode accounting between readers" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "source-account.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
     defer docs.close();
     docs.maintenance_start_suppressed = true;
     var store = Store.init(a, &docs);
@@ -2181,11 +2181,11 @@ test "lite artifact leases transfer retired inode accounting between readers" {
 test "lite artifact leases bounded range scope reduces source identity reads" {
     const a = std.testing.allocator;
     const segment = @import("../../segment.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "scope-reads.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
     defer docs.close();
     docs.maintenance_start_suppressed = true;
     var store = Store.init(a, &docs);
@@ -2248,16 +2248,16 @@ test "lite artifact leases bounded range scope reduces source identity reads" {
 
 test "lite artifact leases orphan service advances past live markers with bounded work" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "orphan-sweep.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
     defer docs.close();
     docs.maintenance_start_suppressed = true;
     var markers: [65]std.Io.File = undefined;
     var marker_count: usize = 0;
-    defer for (markers[0..marker_count]) |file| file.close(native_platform.testing.io);
+    defer for (markers[0..marker_count]) |file| file.close(platform.testing.io);
     const prefix = native.NativeFile.artifact_lease_key_prefix;
     for (0..66) |i| {
         var identity: [32]u8 = undefined;
@@ -2270,7 +2270,7 @@ test "lite artifact leases orphan service advances past live markers with bounde
             defer a.free(name);
             const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(path).?, name });
             defer a.free(marker_path);
-            markers[marker_count] = try std.Io.Dir.cwd().createFile(native_platform.testing.io, marker_path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true });
+            markers[marker_count] = try std.Io.Dir.cwd().createFile(platform.testing.io, marker_path, .{ .read = true, .exclusive = true, .lock = .exclusive, .lock_nonblocking = true });
             marker_count += 1;
         }
     }
@@ -2280,7 +2280,7 @@ test "lite artifact leases orphan service advances past live markers with bounde
     try std.testing.expect(sweep.valid);
     try std.testing.expectEqual(@as(usize, 1), try artifact.cleanupOrphans(&docs.file, &sweep));
     try std.testing.expect(!sweep.valid);
-    for (markers[0..marker_count]) |file| file.close(native_platform.testing.io);
+    for (markers[0..marker_count]) |file| file.close(platform.testing.io);
     marker_count = 0;
     try std.testing.expectEqual(@as(usize, 64), try artifact.cleanupOrphans(&docs.file, &sweep));
     try std.testing.expectEqual(@as(usize, 1), try artifact.cleanupOrphans(&docs.file, &sweep));
@@ -2289,11 +2289,11 @@ test "lite artifact leases orphan service advances past live markers with bounde
 
 test "lite atomic publication returns owned immutable source without requiring mapping" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "published-source.aflite");
     defer a.free(path);
-    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false } });
     var docs_open = true;
     defer if (docs_open) docs.close();
     var store = Store.init(a, &docs);

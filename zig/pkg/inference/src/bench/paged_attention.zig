@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const build_options = @import("build_options");
@@ -558,8 +558,8 @@ fn nsToMs(ns: u64) f64 {
 }
 
 fn nowNs() u64 {
-    var timespec: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &timespec))) {
+    var timespec: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &timespec))) {
         .SUCCESS => return @intCast(@as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec),
         else => return 0,
     }

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -120,7 +120,7 @@ fn printUsage(argv0: []const u8) void {
 /// Exercise one prepared, directly retained raster using the same estimated
 /// scratch admission and exact output allowance as the document planner.
 fn benchRenderWindow(alloc: std.mem.Allocator, path: []const u8, dimension: usize, scratch_override: usize, compare: bool) !void {
-    var threaded = native_platform.Threaded.init(alloc, .{});
+    var threaded = platform.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
     const bytes = try std.Io.Dir.cwd().readFileAlloc(threaded.io(), path, alloc, .limited(max_pdf_input_bytes));
     defer alloc.free(bytes);
@@ -170,7 +170,7 @@ fn parseIterations(maybe_value: ?[]const u8, default_value: usize) !usize {
 }
 
 fn benchSuite(alloc: std.mem.Allocator, path: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
@@ -184,7 +184,7 @@ fn benchSuite(alloc: std.mem.Allocator, path: []const u8, iterations: usize) !vo
 }
 
 fn benchExtractText(alloc: std.mem.Allocator, path: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
@@ -196,7 +196,7 @@ fn benchExtractText(alloc: std.mem.Allocator, path: []const u8, iterations: usiz
 }
 
 fn benchRenderFirstPage(alloc: std.mem.Allocator, path: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
@@ -208,7 +208,7 @@ fn benchRenderFirstPage(alloc: std.mem.Allocator, path: []const u8, iterations: 
 }
 
 fn renderAllPages(alloc: std.mem.Allocator, path: []const u8, dpi: u16) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
     defer alloc.free(bytes);
@@ -237,7 +237,7 @@ fn renderAllPages(alloc: std.mem.Allocator, path: []const u8, dpi: u16) !void {
 /// nonzero exit and no output file instead of silently missing text. Uses the
 /// production page-text/region API, with no OCR or raster rendering.
 fn dumpText(alloc: std.mem.Allocator, path: []const u8, output_path: []const u8) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_pdf_input_bytes));
@@ -335,12 +335,12 @@ fn ratePerSecond(units: usize, elapsed_ns: u64) u64 {
 }
 
 fn monotonicNowNs() u64 {
-    const clock_id: native_platform.c.clockid_t = switch (builtin.os.tag) {
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => native_platform.c.CLOCK.UPTIME_RAW,
-        else => native_platform.c.CLOCK.MONOTONIC,
+    const clock_id: platform.c.clockid_t = switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => platform.c.CLOCK.UPTIME_RAW,
+        else => platform.c.CLOCK.MONOTONIC,
     };
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(clock_id, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(clock_id, &ts))) {
         .SUCCESS => return @intCast(@as(u128, @intCast(ts.sec)) * std.time.ns_per_s + @as(u128, @intCast(ts.nsec))),
         else => return 0,
     }

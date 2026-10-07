@@ -13,14 +13,14 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const raft_engine = @import("raft_engine");
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const replica_catalog_header = "ANTFLY_REPLICA_CATALOG 2";
@@ -778,7 +778,7 @@ pub const MemoryReplicaCatalog = struct {
 
 pub const FileReplicaCatalog = struct {
     alloc: std.mem.Allocator,
-    io_impl: native_platform.Threaded,
+    io_impl: platform.Io.Threaded,
     path: []const u8,
     mutex: std.atomic.Mutex = .unlocked,
     current_revision: u64 = 1,
@@ -1719,7 +1719,7 @@ test "prepared memory catalog reclaims retired maps after publication" {
 }
 
 test "file replica catalog prepares durable images without publishing stale ownership" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(
@@ -1768,11 +1768,11 @@ test "file replica catalog prepares durable images without publishing stale owne
     );
     defer std.testing.allocator.free(crash_debris);
     {
-        var debris = try fs_paths.createFilePortable(native_platform.testing.io, crash_debris, .{
+        var debris = try fs_paths.createFilePortable(platform.testing.io, crash_debris, .{
             .truncate = true,
             .exclusive = true,
         });
-        debris.close(native_platform.testing.io);
+        debris.close(platform.testing.io);
     }
 
     var reopened = try FileReplicaCatalog.init(std.testing.allocator, path);
@@ -1783,12 +1783,12 @@ test "file replica catalog prepares durable images without publishing stale owne
     try std.testing.expect(reopened_iface.containsReplica(43));
     try std.testing.expectError(
         error.FileNotFound,
-        std.Io.Dir.cwd().openFile(native_platform.testing.io, crash_debris, .{}),
+        std.Io.Dir.cwd().openFile(platform.testing.io, crash_debris, .{}),
     );
 }
 
 test "file replica catalog never resurrects state after post-publication durability errors" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(
@@ -1855,7 +1855,7 @@ test "file replica catalog never resurrects state after post-publication durabil
 }
 
 test "file replica catalog persists records across reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog.json", .{tmp.sub_path});
@@ -1909,7 +1909,7 @@ test "file replica catalog persists records across reopen" {
 }
 
 test "file replica catalog persists the metadata-issued initial FK root generation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/initial-fk-replica-catalog.json", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -1952,7 +1952,7 @@ test "file replica catalog persists the metadata-issued initial FK root generati
 }
 
 test "file replica catalog reopens catalogs larger than one MiB" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-large", .{tmp.sub_path});
@@ -1993,7 +1993,7 @@ test "file replica catalog reopens catalogs larger than one MiB" {
 }
 
 test "file replica catalog round trips escaped bootstrap fields" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-escaped", .{tmp.sub_path});
@@ -2031,7 +2031,7 @@ test "file replica catalog round trips escaped bootstrap fields" {
 }
 
 test "file replica catalog rejects records its loader cannot reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-oversized", .{tmp.sub_path});
@@ -2070,7 +2070,7 @@ test "file replica catalog rejects records its loader cannot reopen" {
 }
 
 test "file replica catalog rejects duplicate groups without leaking loaded records" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-duplicate", .{tmp.sub_path});
@@ -2090,7 +2090,7 @@ test "file replica catalog rejects duplicate groups without leaking loaded recor
         .metadata_version = 10,
     };
     const records = [_]*const ReplicaRecord{ &first, &second };
-    try writeCatalogAtomicallyDurable(std.testing.allocator, native_platform.testing.io, path, &records);
+    try writeCatalogAtomicallyDurable(std.testing.allocator, platform.testing.io, path, &records);
 
     try std.testing.expectError(
         error.InvalidReplicaCatalog,
@@ -2099,7 +2099,7 @@ test "file replica catalog rejects duplicate groups without leaking loaded recor
 }
 
 test "file replica catalog rejects checksum mismatch and missing footer" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-integrity", .{tmp.sub_path});
@@ -2112,10 +2112,10 @@ test "file replica catalog rejects checksum mismatch and missing footer" {
         .metadata_version = 9,
     };
     const records = [_]*const ReplicaRecord{&record};
-    try writeCatalogAtomicallyDurable(std.testing.allocator, native_platform.testing.io, path, &records);
+    try writeCatalogAtomicallyDurable(std.testing.allocator, platform.testing.io, path, &records);
 
     var encoded = try std.Io.Dir.cwd().readFileAlloc(
-        native_platform.testing.io,
+        platform.testing.io,
         path,
         std.testing.allocator,
         .limited(max_replica_catalog_bytes),
@@ -2124,7 +2124,7 @@ test "file replica catalog rejects checksum mismatch and missing footer" {
     const replica_id = std.mem.indexOf(u8, encoded, "\"replica_id\":2") orelse
         return error.TestUnexpectedResult;
     encoded[replica_id + "\"replica_id\":".len] = '3';
-    try std.Io.Dir.cwd().writeFile(native_platform.testing.io, .{ .sub_path = path, .data = encoded });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = path, .data = encoded });
     try std.testing.expectError(
         error.InvalidReplicaCatalogChecksum,
         FileReplicaCatalog.init(std.testing.allocator, path),
@@ -2132,7 +2132,7 @@ test "file replica catalog rejects checksum mismatch and missing footer" {
 
     const footer = std.mem.indexOf(u8, encoded, replica_catalog_footer_prefix) orelse
         return error.TestUnexpectedResult;
-    try std.Io.Dir.cwd().writeFile(native_platform.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = path,
         .data = encoded[0..footer],
     });
@@ -2143,12 +2143,12 @@ test "file replica catalog rejects checksum mismatch and missing footer" {
 }
 
 test "file replica catalog rejects an existing truncated empty file" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-empty", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    try std.Io.Dir.cwd().writeFile(native_platform.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = path,
         .data = "",
     });
@@ -2160,7 +2160,7 @@ test "file replica catalog rejects an existing truncated empty file" {
 }
 
 test "file replica catalog persists backup restore bootstrap records across reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog-restore.json", .{tmp.sub_path});
@@ -2207,7 +2207,7 @@ test "file replica catalog persists backup restore bootstrap records across reop
 }
 
 test "file replica catalog rolls back failed durable upserts" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/replica-catalog.json", .{tmp.sub_path});

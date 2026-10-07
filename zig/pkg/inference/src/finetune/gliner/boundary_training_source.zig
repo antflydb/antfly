@@ -22,7 +22,7 @@
 //! a caller-selected snapshot. Neither one is a publisher signature or a model
 //! quality qualification. This initial format admits the published 334-tensor
 //! architecture, independently of the serving runtime's qualification gate.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -801,7 +801,7 @@ test "boundary training source immutable canonical views share aligned bytes wit
 }
 
 test "boundary training source allocation failures release tensor views metadata and stable budget" {
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseSourceParts, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseSourceParts, .{});
 }
 
 test "boundary training source rejects non-FP32 metadata invalid ranges nonfinite values and excessive JSON depth" {
@@ -848,7 +848,7 @@ test "boundary training source rejects non-FP32 metadata invalid ranges nonfinit
 test "boundary training source snapshot handles unpadded headers and survives same-path replacement" {
     const a = std.testing.allocator;
     const compat = @import("../../io/compat.zig");
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/source.safetensors", .{temporary.sub_path});
     defer a.free(path);
@@ -913,7 +913,7 @@ test "boundary training source rejects FIFO artifacts without waiting for a writ
         extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
     };
     const compat = @import("../../io/compat.zig");
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     var directory_buffer: [256]u8 = undefined;
     const directory = try std.fmt.bufPrint(&directory_buffer, ".zig-cache/tmp/{s}", .{temporary.sub_path});

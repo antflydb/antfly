@@ -14,7 +14,7 @@
 // limitations.
 
 //! DB integration with hot standby coordination. Engine-only tests stay with DB.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const engine = @import("antfly_local_sources").storage_db_db;
 const default_test_wait_attempts = engine.test_support.default_test_wait_attempts;
 const ConcurrentWriteProbe = engine.test_support.ConcurrentWriteProbe;
@@ -57,7 +57,7 @@ const graph_mod = @import("antfly_local_sources").graph_graph;
 const internal_keys = @import("antfly_local_sources").storage_internal_keys;
 const lockAtomic = engine.test_support.lockAtomic;
 const monotonicTimeNs = engine.test_support.monotonicTimeNs;
-const platform_clock = native_platform.clock;
+const platform_clock = platform.clock;
 const portable_backup = @import("antfly_local_sources").storage_portable_backup;
 const publishResolutionHandoffContext = engine.test_support.publishResolutionHandoffContext;
 const relational_columns = @import("antfly_local_sources").storage_db_relational_columns;
@@ -192,17 +192,17 @@ test "storage.hot_standby resolution handoff fence rejects completion after dura
     defer alloc.free(resolution_key);
     const marker_key = try resolution_handoff.keyAlloc(alloc, resolution_key);
     defer alloc.free(marker_key);
-    var pause = PauseBeforePublish{ .io = native_platform.testing.io };
+    var pause = PauseBeforePublish{ .io = platform.testing.io };
     var probe = WriteProbe{
         .ctx = db.resolution_append_context.?,
         .resolution_key = resolution_key,
         .pause = &pause,
     };
-    var thread = try native_platform.testing.io.concurrent(WriteProbe.run, .{&probe});
+    var thread = try platform.testing.io.concurrent(WriteProbe.run, .{&probe});
     var thread_joined = false;
     errdefer {
         pause.release.set(pause.io);
-        if (!thread_joined) thread.await(native_platform.testing.io);
+        if (!thread_joined) thread.await(platform.testing.io);
     }
 
     pause.reached.waitUncancelable(pause.io);
@@ -223,7 +223,7 @@ test "storage.hot_standby resolution handoff fence rejects completion after dura
     public_gate.publishPrimaryFence(true);
     pause.release.set(pause.io);
     transition_mutex.unlock();
-    thread.await(native_platform.testing.io);
+    thread.await(platform.testing.io);
     thread_joined = true;
 
     try std.testing.expectEqual(@as(u8, 1), probe.result.load(.acquire));
@@ -605,8 +605,8 @@ test "storage.hot_standby db mirrors appended derived replay records into HA str
     }, .{});
     defer primary.close();
 
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var failures = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var failures = platform.atomic.Value(u64).init(0);
     const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "graph_v1", "mentions", "doc:b");
     defer alloc.free(artifact_key);
     {
@@ -682,10 +682,10 @@ test "storage.hot_standby db waits for remote apply before completing derived en
     };
 
     var wait_state = SyncWait{};
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = native_platform.atomic.Value(u64).init(0);
+    var waits = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 3, .table_id = 9 },
@@ -770,8 +770,8 @@ test "storage.hot_standby db mirrors committed batch mutations into HA stream fo
     }, .{});
     defer standby.close();
 
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var failures = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var failures = platform.atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
             .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
@@ -867,17 +867,17 @@ test "storage.hot_standby seed capture barrier prevents local commit without mat
 
     var capture = barrier.acquireExclusive();
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    var write_thread = try native_platform.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try platform.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     errdefer {
         capture.release();
-        write_thread.await(native_platform.testing.io);
+        write_thread.await(platform.testing.io);
     }
 
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
     var attempts: usize = 0;
     while (attempts < 10_000) : (attempts += 1) {
         if (barrier.pendingSharedAcquisitions() > 0) break;
-        native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
 
     try std.testing.expect(barrier.pendingSharedAcquisitions() > 0);
@@ -887,7 +887,7 @@ test "storage.hot_standby seed capture barrier prevents local commit without mat
     try std.testing.expect((try db.get(alloc, "doc:b")) == null);
 
     capture.release();
-    write_thread.await(native_platform.testing.io);
+    write_thread.await(platform.testing.io);
     try std.testing.expectEqual(@as(u8, 0), write_probe.failed.load(.monotonic));
     try std.testing.expectEqual(@as(u8, 1), write_probe.done.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
@@ -907,7 +907,7 @@ test "storage.hot_standby seed snapshot predrains enrichment before exclusive ca
     defer {
         var snapshots_buf: [512]u8 = undefined;
         if (std.fmt.bufPrint(&snapshots_buf, "{s}.snapshots", .{std.mem.span(db_path)})) |snapshots| {
-            std.Io.Dir.cwd().deleteTree(native_platform.testing.io, snapshots) catch {};
+            std.Io.Dir.cwd().deleteTree(platform.testing.io, snapshots) catch {};
         } else |_| {}
     }
     var replication_log_path_tmp = try TestDirectory.init("db");
@@ -1038,11 +1038,11 @@ test "storage.hot_standby fence cannot strand a local commit beyond the HA tail"
     lockAtomic(&transition_mutex);
     var transition_locked = true;
     var write_probe = ConcurrentWriteProbe{ .db = &db };
-    var write_thread = try native_platform.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
+    var write_thread = try platform.testing.io.concurrent(ConcurrentWriteProbe.runBatch, .{&write_probe});
     var thread_joined = false;
     errdefer {
         if (transition_locked) transition_mutex.unlock();
-        if (!thread_joined) write_thread.await(native_platform.testing.io);
+        if (!thread_joined) write_thread.await(platform.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&write_probe.started, 1, 10_000));
     var local_commit_observed = false;
@@ -1052,7 +1052,7 @@ test "storage.hot_standby fence cannot strand a local commit beyond the HA tail"
             local_commit_observed = true;
             break;
         }
-        native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(local_commit_observed);
     try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
@@ -1060,7 +1060,7 @@ test "storage.hot_standby fence cannot strand a local commit beyond the HA tail"
     public_gate.publishPrimaryFence(true);
     transition_mutex.unlock();
     transition_locked = false;
-    write_thread.await(native_platform.testing.io);
+    write_thread.await(platform.testing.io);
     thread_joined = true;
 
     try std.testing.expectEqual(@as(u8, 1), write_probe.failed.load(.monotonic));
@@ -1096,8 +1096,8 @@ test "storage.hot_standby schema json mutation does not reacquire shared barrier
     }, .{});
     defer primary.close();
     var barrier: MutationBarrier = .{};
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var failures = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var failures = platform.atomic.Value(u64).init(0);
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 6, .table_id = 12 },
         .replication_async_metadata_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
@@ -1119,18 +1119,18 @@ test "storage.hot_standby schema json mutation does not reacquire shared barrier
             self.started.store(1, .release);
             var capture = self.barrier.acquireExclusive();
             self.acquired.store(1, .release);
-            while (self.release.load(.acquire) == 0) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (self.release.load(.acquire) == 0) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
             capture.release();
         }
     };
 
     var outer = barrier.acquireShared();
     var probe = CaptureProbe{ .barrier = &barrier };
-    var capture_thread = try native_platform.testing.io.concurrent(CaptureProbe.run, .{&probe});
+    var capture_thread = try platform.testing.io.concurrent(CaptureProbe.run, .{&probe});
     errdefer {
         outer.release();
         probe.release.store(1, .release);
-        capture_thread.await(native_platform.testing.io);
+        capture_thread.await(platform.testing.io);
     }
     try std.testing.expect(waitForAtomicFlag(&probe.started, 1, 10_000));
     var capture_queued = false;
@@ -1139,7 +1139,7 @@ test "storage.hot_standby schema json mutation does not reacquire shared barrier
             capture_queued = true;
             break;
         }
-        native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+        platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     }
     try std.testing.expect(capture_queued);
 
@@ -1150,7 +1150,7 @@ test "storage.hot_standby schema json mutation does not reacquire shared barrier
     outer.release();
     try std.testing.expect(waitForAtomicFlag(&probe.acquired, 1, 10_000));
     probe.release.store(1, .release);
-    capture_thread.await(native_platform.testing.io);
+    capture_thread.await(platform.testing.io);
 
     const stored = (try db.getSchemaJson(alloc)) orelse return error.TestExpectedEqual;
     defer alloc.free(stored);
@@ -1184,10 +1184,10 @@ test "storage.hot_standby db evaluates sync commit gate for mirrored batch mutat
     defer primary.close();
     try primary.createSlot("standby-a", 0);
 
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var degraded = native_platform.atomic.Value(u64).init(0);
+    var degraded = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     {
         var db = try DB.open(alloc, std.mem.span(db_path), .{
@@ -1259,10 +1259,10 @@ test "storage.hot_standby db block sync policy waits for standby acknowledgement
     };
 
     var wait_state = SyncWait{};
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = native_platform.atomic.Value(u64).init(0);
+    var waits = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
@@ -1323,7 +1323,7 @@ test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
     defer primary.close();
     try primary.createSlot("standby-a", 0);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
+    var io_impl = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1365,7 +1365,7 @@ test "storage.hot_standby synchronous waits pipeline later commits by lsn" {
     };
 
     var wait_state = SyncWait{ .io = io };
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
@@ -1445,7 +1445,7 @@ test "storage.hot_standby durable outbox recovery does not duplicate an appended
         }
     };
     var wait_state = SyncWait{};
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
@@ -1548,10 +1548,10 @@ test "storage.hot_standby db session sync wait satisfies remote apply through st
         .apply_ctx = &standby_db,
         .apply_fn = replication_ingress.applyCallback,
     };
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = native_platform.atomic.Value(u64).init(0);
+    var waits = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
@@ -1787,10 +1787,10 @@ test "storage.hot_standby db session sync wait remote write acknowledges durable
         .apply_ctx = &apply_failure,
         .apply_fn = ApplyFailure.apply,
     };
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = native_platform.atomic.Value(u64).init(0);
+    var waits = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var primary_db = try DB.open(alloc, std.mem.span(primary_db_path), .{
         .identity_namespace = .{ .shard_id = 4, .table_id = 10 },
@@ -1880,9 +1880,9 @@ test "storage.hot_standby db primary progress sync wait observes reported remote
         .poll_ctx = &remote_ack,
         .poll_fn = RemoteAck.poll,
     };
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = native_platform.atomic.Value(u64).init(0);
+    var waits = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
@@ -1992,9 +1992,9 @@ test "storage.hot_standby db primary progress sync wait returns would block with
     try primary.createSlot("standby-a", 0);
 
     var wait_state = HotStandbyPrimaryProgressSyncWait{ .max_rounds = 1 };
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = native_platform.atomic.Value(u64).init(0);
+    var waits = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
@@ -2063,8 +2063,8 @@ test "storage.hot_standby pending acknowledgement preserves batch and replay tai
         .sync_wait_ctx = &wait_state,
         .sync_wait_fn = HotStandbyPrimaryProgressSyncWait.wait,
     });
-    var batch_lsn = native_platform.atomic.Value(u64).init(0);
-    var replay_lsn = native_platform.atomic.Value(u64).init(0);
+    var batch_lsn = platform.atomic.Value(u64).init(0);
+    var replay_lsn = platform.atomic.Value(u64).init(0);
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = blk: {
             var configured = hot_standby_publisher_adapter.options(mirror);
@@ -2204,9 +2204,9 @@ test "storage.hot_standby db primary progress sync wait survives primary restart
         try primary.createSlot("standby-a", 0);
 
         var wait_state = HotStandbyPrimaryProgressSyncWait{ .max_rounds = 1 };
-        var gate_lsn = native_platform.atomic.Value(u64).init(0);
+        var gate_lsn = platform.atomic.Value(u64).init(0);
         var gate_action = std.atomic.Value(u8).init(255);
-        var waits = native_platform.atomic.Value(u64).init(0);
+        var waits = platform.atomic.Value(u64).init(0);
         var db = try DB.open(alloc, std.mem.span(db_path), .{
             .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
                 .sync_policy = policy,
@@ -2291,9 +2291,9 @@ test "storage.hot_standby db block sync policy surfaces wait provider errors" {
     };
 
     var wait_state = SyncWait{};
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var waits = native_platform.atomic.Value(u64).init(0);
+    var waits = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
@@ -2349,9 +2349,9 @@ test "storage.hot_standby db fail-closed sync policy rejects before local batch 
     defer primary.close();
     try primary.createSlot("standby-a", 0);
 
-    var gate_lsn = native_platform.atomic.Value(u64).init(0);
+    var gate_lsn = platform.atomic.Value(u64).init(0);
     var gate_action = std.atomic.Value(u8).init(255);
-    var rejected = native_platform.atomic.Value(u64).init(0);
+    var rejected = platform.atomic.Value(u64).init(0);
     const standby_names = [_][]const u8{"standby-a"};
     var db = try DB.open(alloc, std.mem.span(db_path), .{
         .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{
@@ -2505,8 +2505,8 @@ test "storage.hot_standby db mirrors and applies schema metadata mutation record
     var standby = try hot_standby_standby_mod.Standby.open(alloc, standby_log_path, standby_progress_path, identity, .{});
     defer standby.close();
 
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
-    var failures = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
+    var failures = platform.atomic.Value(u64).init(0);
     {
         var db = try DB.open(alloc, std.mem.span(primary_db_path), .{
             .identity_namespace = .{ .shard_id = 5, .table_id = 11 },
@@ -3085,7 +3085,7 @@ test "db graph ttl HA carries primary effects and duplicate receipt across reope
     };
     var wait = Wait{};
     const names = [_][]const u8{"standby-a"};
-    var last_lsn = native_platform.atomic.Value(u64).init(0);
+    var last_lsn = platform.atomic.Value(u64).init(0);
     const primary_opts: OpenOptions = .{
         .start_optional_runtimes = false,
         .replication_async_effect_mirror = hot_standby_publisher_adapter.bindMirror(&stream, .{
@@ -3177,7 +3177,7 @@ test "db graph ttl HA replicates direct expiration and document relational withd
         defer slots_tmp.cleanup();
         var stream = try hot_standby_primary_mod.Primary.open(alloc, log_tmp.path().ptr, slots_tmp.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
         defer stream.close();
-        var last_lsn = native_platform.atomic.Value(u64).init(0);
+        var last_lsn = platform.atomic.Value(u64).init(0);
         var primary = try DB.open(alloc, primary_tmp.path(), .{ .start_optional_runtimes = false, .replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&stream, .{}), .replication_async_effect_mirror = hot_standby_publisher_adapter.bindMirror(&stream, .{ .last_lsn = &last_lsn }) });
         defer primary.close();
         var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_optional_runtimes = false });
@@ -3259,7 +3259,7 @@ test "db graph ttl HA replicates direct expiration and document relational withd
 
 test "db ordered artifact inventory reconciles committed receiver catalog before atomic admission" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const reference_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifact-reference", .{tmp.sub_path});
     defer alloc.free(reference_path);
@@ -3466,7 +3466,7 @@ test "db graph ttl HA retirement preserves different replay progress" {
         defer slots_tmp.cleanup();
         var stream = try hot_standby_primary_mod.Primary.open(alloc, log_tmp.path().ptr, slots_tmp.path().ptr, .{ .cluster_id = 200, .shard_id = 3, .table_id = 9, .timeline_id = 1, .epoch = 1 }, .{});
         defer stream.close();
-        var last_lsn = native_platform.atomic.Value(u64).init(0);
+        var last_lsn = platform.atomic.Value(u64).init(0);
         var primary = try DB.open(alloc, primary_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false, .replication_async_effect_mirror = hot_standby_publisher_adapter.bindMirror(&stream, .{ .last_lsn = &last_lsn }) });
         defer primary.close();
         var replica = try DB.open(alloc, replica_tmp.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });

@@ -16,7 +16,7 @@
 //! Actual Transformers 4.55.4 projected-attention forward and five-leaf VJPs.
 //! The 40 MiB fixture stays external and is admitted by exact byte identities.
 //! No Python, checkpoint, source formula replica, or Torch RNG executes here.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const attention = @import("deberta_training_attention.zig");
@@ -108,7 +108,7 @@ fn expectPin(expected: Pin, actual: Pin) !void {
 fn readPinned(a: Allocator, directory: []const u8, name: []const u8, expected: Pin) ![]u8 {
     const path = try std.fs.path.join(a, &.{ directory, name });
     defer a.free(path);
-    const raw = try snapshot.read(a, native_platform.testing.io, .cwd(), path, expected.size_bytes, null);
+    const raw = try snapshot.read(a, platform.testing.io, .cwd(), path, expected.size_bytes, null);
     errdefer a.free(raw);
     var hashed: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(raw, &hashed, .{});
@@ -298,8 +298,8 @@ fn exercise(comptime backend: enum { native, metal, cuda }) !void {
         if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
         if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     }
-    const directory = native_platform.env.getenv("ANTFLY_GLINER25_TRAINING_ATTENTION_FIXTURE_DIR") orelse {
-        if (backend == .cuda and native_platform.env.getenvBoolDefault("TERMITE_REQUIRE_CUDA_TESTS", false)) return error.RequiredAttentionFixtureMissing;
+    const directory = platform.env.getenv("ANTFLY_GLINER25_TRAINING_ATTENTION_FIXTURE_DIR") orelse {
+        if (backend == .cuda and platform.env.getenvBoolDefault("TERMITE_REQUIRE_CUDA_TESTS", false)) return error.RequiredAttentionFixtureMissing;
         return error.SkipZigTest;
     };
     var owner = bounded{ .backing = std.testing.allocator, .limit = 64 * 1024 * 1024 };

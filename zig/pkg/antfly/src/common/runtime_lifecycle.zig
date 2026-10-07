@@ -19,13 +19,13 @@
 //! submit, publish failure through this state, and join before releasing their
 //! executor lease.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
 const httpx = @import("httpx");
-const platform_sync = native_platform.sync;
-const platform_time = native_platform.time;
+const platform_sync = platform.sync;
+const platform_time = platform.time;
 
 const shutdown_watchdog_poll_ns: u64 = 10 * std.time.ns_per_ms;
 
@@ -39,11 +39,11 @@ fn sleepWatchdog(ns: u64) void {
         WindowsSleep.Sleep(@intCast(@min(ms, @as(u64, std.math.maxInt(u32)))));
         return;
     }
-    var req = native_platform.c.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
         .nsec = @intCast(ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(native_platform.c.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -542,7 +542,7 @@ pub const HttpServerLifecycle = struct {
 };
 
 test "runtime lifecycle cancellation and shutdown deadline share state" {
-    var lifecycle = HttpServerLifecycle.init(native_platform.testing.io);
+    var lifecycle = HttpServerLifecycle.init(platform.testing.io);
     const token = lifecycle.token();
     try std.testing.expect(!token.isCancelled());
     lifecycle.stop();
@@ -560,12 +560,12 @@ test "runtime lifecycle cancellation and shutdown deadline share state" {
 }
 
 test "http lifecycle startup wait observes event cancellation and timeout" {
-    var ready = HttpServerLifecycle.init(native_platform.testing.io);
+    var ready = HttpServerLifecycle.init(platform.testing.io);
     try ready.publishReady();
     var inactive = CancellationSource{};
     try ready.waitForStartup(ShutdownDeadline.afterMilliseconds(100), inactive.token());
 
-    var canceled = HttpServerLifecycle.init(native_platform.testing.io);
+    var canceled = HttpServerLifecycle.init(platform.testing.io);
     var cancellation = CancellationSource{};
     cancellation.cancel();
     try std.testing.expectError(
@@ -574,7 +574,7 @@ test "http lifecycle startup wait observes event cancellation and timeout" {
     );
     try std.testing.expectEqual(HttpServerLifecycle.State.stopping, canceled.currentState());
 
-    var timed_out = HttpServerLifecycle.init(native_platform.testing.io);
+    var timed_out = HttpServerLifecycle.init(platform.testing.io);
     try std.testing.expectError(
         error.StartupTimeout,
         timed_out.waitForStartup(ShutdownDeadline.afterMilliseconds(0), inactive.token()),
@@ -583,7 +583,7 @@ test "http lifecycle startup wait observes event cancellation and timeout" {
 }
 
 test "http lifecycle startup wait parks until publication" {
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var lifecycle = HttpServerLifecycle.init(io);
@@ -601,7 +601,7 @@ test "http lifecycle startup wait parks until publication" {
 }
 
 test "http lifecycle stop cannot be overwritten by ready or failure" {
-    var lifecycle = HttpServerLifecycle.init(native_platform.testing.io);
+    var lifecycle = HttpServerLifecycle.init(platform.testing.io);
     lifecycle.stop();
     try std.testing.expectEqual(HttpServerLifecycle.State.stopping, lifecycle.currentState());
     try std.testing.expectError(error.ServerStopped, lifecycle.publishReady());
@@ -611,9 +611,9 @@ test "http lifecycle stop cannot be overwritten by ready or failure" {
 }
 
 test "http lifecycle rejects a listener that attaches after stop" {
-    var lifecycle = HttpServerLifecycle.init(native_platform.testing.io);
+    var lifecycle = HttpServerLifecycle.init(platform.testing.io);
     lifecycle.stop();
-    var server = httpx.Server.init(std.testing.allocator, native_platform.testing.io);
+    var server = httpx.Server.init(std.testing.allocator, platform.testing.io);
     defer server.deinit();
 
     try std.testing.expectError(error.ServerStopped, lifecycle.attach(&server));
@@ -621,7 +621,7 @@ test "http lifecycle rejects a listener that attaches after stop" {
 }
 
 test "http lifecycle retains its first terminal failure" {
-    var lifecycle = HttpServerLifecycle.init(native_platform.testing.io);
+    var lifecycle = HttpServerLifecycle.init(platform.testing.io);
     lifecycle.publishFailure(error.AddressInUse);
     lifecycle.publishFailure(error.ConnectionRefused);
     lifecycle.publishStopped();

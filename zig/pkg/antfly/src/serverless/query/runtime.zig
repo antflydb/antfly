@@ -13,10 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const Allocator = std.mem.Allocator;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const catalog_mod = @import("../catalog/mod.zig");
@@ -1490,7 +1490,7 @@ test "serverless query runtime metrics remain valid across every allocation fail
             }
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless query session validates content addresses and declared range bounds" {
@@ -1522,8 +1522,8 @@ test "serverless query session validates content addresses and declared range bo
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

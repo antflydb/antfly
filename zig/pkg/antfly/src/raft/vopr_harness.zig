@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const catalog = @import("storage/catalog.zig");
@@ -1317,11 +1317,11 @@ test "virtual http network delivers queued GET requests synchronously" {
 }
 
 fn sleepForNanos(delay_ns: u64) !void {
-    var req = native_platform.c.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(delay_ns / std.time.ns_per_s),
         .nsec = @intCast(delay_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(native_platform.c.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => |err| return std.posix.unexpectedErrno(err),
@@ -2663,7 +2663,7 @@ test "managed host simulation restores through both raft state backends" {
     };
 
     for (cases, 0..) |case_cfg, case_index| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
 
         const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/sim-{s}", .{ tmp.sub_path, case_cfg.label });
@@ -2780,7 +2780,7 @@ test "managed host simulation keeps WAL replay debt bounded across repeated prop
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/sim-wal-bounded-replay-debt", .{tmp.sub_path});
@@ -2905,7 +2905,7 @@ test "managed host simulation persists replica removal across restart for both r
     };
 
     for (cases) |case_cfg| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
 
         const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, case_cfg.label });
@@ -3023,7 +3023,7 @@ test "managed host simulation drops queued metadata updates across restart for b
     };
 
     for (cases) |case_cfg| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
 
         const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, case_cfg.label });
@@ -3140,7 +3140,7 @@ test "managed host simulation does not persist proposals before a runtime round 
     };
 
     for (cases) |case_cfg| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
 
         const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, case_cfg.label });
@@ -3262,7 +3262,7 @@ test "managed http host simulation starts listener and applies deterministic met
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-sim-snaps", .{tmp.sub_path});
@@ -3326,11 +3326,11 @@ test "managed http host simulation starts listener and applies deterministic met
 }
 
 test "managed http host simulations elect and replicate over real HTTP" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-a", .{tmp_a.sub_path});
@@ -3495,9 +3495,9 @@ test "managed http host simulations elect and replicate over real HTTP" {
 }
 
 test "managed http host simulation can remove and rejoin from HTTP snapshot fetch" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-rejoin-a", .{tmp_a.sub_path});
@@ -3696,11 +3696,11 @@ test "managed http host simulation can remove and rejoin from HTTP snapshot fetc
 }
 
 test "managed http cluster simulation drives three-node churn and admin workflows" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-cluster-a", .{tmp_a.sub_path});
@@ -3943,11 +3943,11 @@ test "managed http cluster simulation drives three-node churn and admin workflow
 }
 
 test "managed http cluster simulation restarts a node and catches it back up through metadata replay" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-restart-a", .{tmp_a.sub_path});
@@ -4069,11 +4069,11 @@ test "managed http cluster simulation restarts a node and catches it back up thr
 }
 
 test "managed http cluster simulation restarts a node with WAL-backed raft state" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-wal-a", .{tmp_a.sub_path});
@@ -4202,11 +4202,11 @@ test "managed http cluster simulation restarts a node with WAL-backed raft state
 }
 
 test "managed http cluster simulation catches up lagging follower from live HTTP snapshot" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-live-snap-a", .{tmp_a.sub_path});
@@ -4325,11 +4325,11 @@ test "managed http cluster simulation catches up lagging follower from live HTTP
 }
 
 test "managed http cluster simulation can remove and rejoin a node from HTTP snapshot fetch" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-snap-a", .{tmp_a.sub_path});
@@ -4482,11 +4482,11 @@ test "managed http cluster simulation restarts a rejoined node from persisted sn
     };
 
     for (cases) |case_cfg| {
-        var tmp_a = native_platform.testing.tmpDir(.{});
+        var tmp_a = platform.testing.tmpDir(.{});
         defer tmp_a.cleanup();
-        var tmp_b = native_platform.testing.tmpDir(.{});
+        var tmp_b = platform.testing.tmpDir(.{});
         defer tmp_b.cleanup();
-        var tmp_c = native_platform.testing.tmpDir(.{});
+        var tmp_c = platform.testing.tmpDir(.{});
         defer tmp_c.cleanup();
 
         const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-http-snap-{s}-a", .{ tmp_a.sub_path, case_cfg.label });
@@ -5020,7 +5020,7 @@ test "http host simulation drives queued split transitions through the service l
     var split = StatefulSplit{};
     defer split.deinit(std.testing.allocator);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-snapshots", .{tmp.sub_path});
@@ -5197,7 +5197,7 @@ test "http host simulation rolls back and retries queued split transitions throu
     var split = StatefulSplit{};
     defer split.deinit(std.testing.allocator);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-split-rollback", .{tmp.sub_path});
@@ -5340,7 +5340,7 @@ test "http host simulation removes queued split transition mid-flight" {
     var split = StatefulSplit{};
     defer split.deinit(std.testing.allocator);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-split-remove", .{tmp.sub_path});
@@ -5464,7 +5464,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
     var split = StatefulSplit{};
     defer split.deinit(std.testing.allocator);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-split-rollback-update", .{tmp.sub_path});
@@ -5517,7 +5517,7 @@ test "http host simulation updates split transition to rollback mid-flight" {
 }
 
 test "http host simulation drives queued split transitions through the service lane with real split coordinator" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-real-snapshots", .{tmp.sub_path});
@@ -5852,9 +5852,9 @@ test "cluster simulation drives queued split transitions through service-owned m
         }
     };
 
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
 
     const snapshot_root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-split-a", .{tmp_a.sub_path});
@@ -5919,11 +5919,11 @@ test "cluster simulation drives queued split transitions through service-owned m
 }
 
 test "cluster simulation drives queued split transitions through service-owned metadata updates with real split coordinator" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split = native_platform.testing.tmpDir(.{});
+    var tmp_split = platform.testing.tmpDir(.{});
     defer tmp_split.cleanup();
 
     const snapshot_root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-split-real-a", .{tmp_a.sub_path});
@@ -6025,11 +6025,11 @@ test "cluster simulation drives queued split transitions through service-owned m
 }
 
 test "cluster simulation resumes queued split transitions after node restart with real split coordinator" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split = native_platform.testing.tmpDir(.{});
+    var tmp_split = platform.testing.tmpDir(.{});
     defer tmp_split.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-split-restart-a", .{tmp_a.sub_path});
@@ -6210,11 +6210,11 @@ test "cluster simulation ignores active split removal and rolls back explicitly 
         }
     };
 
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split = native_platform.testing.tmpDir(.{});
+    var tmp_split = platform.testing.tmpDir(.{});
     defer tmp_split.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-split-remove-restart-a", .{tmp_a.sub_path});
@@ -6420,11 +6420,11 @@ test "cluster simulation ignores active split removal and rolls back explicitly 
 }
 
 test "cluster simulation rolls back queued split transition mid-flight across node restart" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split = native_platform.testing.tmpDir(.{});
+    var tmp_split = platform.testing.tmpDir(.{});
     defer tmp_split.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-split-rollback-restart-a", .{tmp_a.sub_path});
@@ -6645,11 +6645,11 @@ test "cluster simulation rolls back queued split transition mid-flight across no
 }
 
 test "cluster simulation survives repeated same-id split overwrites across restart" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split = native_platform.testing.tmpDir(.{});
+    var tmp_split = platform.testing.tmpDir(.{});
     defer tmp_split.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-split-overwrite-restart-a", .{tmp_a.sub_path});
@@ -6961,9 +6961,9 @@ test "cluster simulation drives queued merge transitions through service-owned m
         }
     };
 
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
 
     const snapshot_root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-merge-a", .{tmp_a.sub_path});
@@ -7031,7 +7031,7 @@ test "cluster simulation drives queued merge transitions through service-owned m
 }
 
 test "http host simulation drives queued merge transitions through the service lane with real merge coordinator" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-real-merge-snapshots", .{tmp.sub_path});
@@ -7256,7 +7256,7 @@ test "http host simulation rolls back and retries queued merge transitions throu
     var merge = StatefulMerge{};
     defer merge.deinit(std.testing.allocator);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-merge-rollback", .{tmp.sub_path});
@@ -7379,7 +7379,7 @@ test "http host simulation removes queued merge transition mid-flight" {
     var merge = StatefulMerge{};
     defer merge.deinit(std.testing.allocator);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-merge-remove", .{tmp.sub_path});
@@ -7487,7 +7487,7 @@ test "http host simulation updates merge transition to rollback mid-flight" {
     var merge = StatefulMerge{};
     defer merge.deinit(std.testing.allocator);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/service-lane-merge-rollback-update", .{tmp.sub_path});
@@ -7538,11 +7538,11 @@ test "http host simulation updates merge transition to rollback mid-flight" {
 }
 
 test "cluster simulation drives queued merge transitions through service-owned metadata updates with real merge coordinator" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const snapshot_root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-merge-real-a", .{tmp_a.sub_path});
@@ -7650,11 +7650,11 @@ test "cluster simulation drives queued merge transitions through service-owned m
 }
 
 test "cluster simulation resumes queued merge transitions after node restart with real merge coordinator" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-merge-restart-a", .{tmp_a.sub_path});
@@ -7818,11 +7818,11 @@ test "cluster simulation resumes queued merge transitions after node restart wit
 }
 
 test "cluster simulation rolls back queued merge transition mid-flight across node restart" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-merge-rollback-restart-a", .{tmp_a.sub_path});
@@ -8015,11 +8015,11 @@ test "cluster simulation rolls back queued merge transition mid-flight across no
 }
 
 test "cluster simulation survives repeated same-id merge overwrites across restart" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-merge-overwrite-restart-a", .{tmp_a.sub_path});
@@ -8215,13 +8215,13 @@ test "cluster simulation survives repeated same-id merge overwrites across resta
 }
 
 test "cluster simulation isolates concurrent split removal and merge retry across restart" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split = native_platform.testing.tmpDir(.{});
+    var tmp_split = platform.testing.tmpDir(.{});
     defer tmp_split.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-concurrent-a", .{tmp_a.sub_path});
@@ -8530,13 +8530,13 @@ test "cluster simulation isolates concurrent split removal and merge retry acros
 }
 
 test "cluster simulation isolates concurrent merge removal and split retry across restart" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split = native_platform.testing.tmpDir(.{});
+    var tmp_split = platform.testing.tmpDir(.{});
     defer tmp_split.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-concurrent-reverse-a", .{tmp_a.sub_path});
@@ -8843,15 +8843,15 @@ test "cluster simulation isolates concurrent merge removal and split retry acros
 }
 
 test "cluster simulation drives multiple concurrent real transition ids through multiplexed runtime" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split_a = native_platform.testing.tmpDir(.{});
+    var tmp_split_a = platform.testing.tmpDir(.{});
     defer tmp_split_a.cleanup();
-    var tmp_split_b = native_platform.testing.tmpDir(.{});
+    var tmp_split_b = platform.testing.tmpDir(.{});
     defer tmp_split_b.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-multi-concurrent-a", .{tmp_a.sub_path});
@@ -9194,15 +9194,15 @@ test "cluster simulation drives multiple concurrent real transition ids through 
 }
 
 test "cluster simulation isolates overlapping same-id split overwrites while other transitions complete" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_split_a = native_platform.testing.tmpDir(.{});
+    var tmp_split_a = platform.testing.tmpDir(.{});
     defer tmp_split_a.cleanup();
-    var tmp_split_b = native_platform.testing.tmpDir(.{});
+    var tmp_split_b = platform.testing.tmpDir(.{});
     defer tmp_split_b.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-overlap-a", .{tmp_a.sub_path});
@@ -9549,11 +9549,11 @@ test "cluster simulation isolates overlapping same-id split overwrites while oth
 }
 
 test "cluster simulation ignores active merge removal and rolls back explicitly across restart" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_merge = native_platform.testing.tmpDir(.{});
+    var tmp_merge = platform.testing.tmpDir(.{});
     defer tmp_merge.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/queued-merge-remove-restart-a", .{tmp_a.sub_path});
@@ -9736,11 +9736,11 @@ test "cluster simulation ignores active merge removal and rolls back explicitly 
 }
 
 test "managed http cluster simulation emits leadership gain and loss events across transfer" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/leader-transfer-a", .{tmp_a.sub_path});
@@ -9853,11 +9853,11 @@ test "managed http cluster simulation emits leadership gain and loss events acro
 }
 
 test "managed http cluster simulation gates enrichment on explicit readable lease" {
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/lease-gated-a", .{tmp_a.sub_path});
@@ -10043,11 +10043,11 @@ test "managed http cluster simulation gates real db enrichment runtimes on read 
         }
     };
 
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/lease-gated-db-a", .{tmp_a.sub_path});
@@ -10267,11 +10267,11 @@ test "managed http cluster simulation starts real db enrichment runtimes across 
         }
     };
 
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/leader-transfer-db-a", .{tmp_a.sub_path});
@@ -10478,11 +10478,11 @@ test "managed http cluster simulation fences real db enrichment runtimes across 
         }
     };
 
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/leader-restart-db-a", .{tmp_a.sub_path});
@@ -10710,11 +10710,11 @@ test "managed http cluster simulation fences real db enrichment runtimes across 
         }
     };
 
-    var tmp_a = native_platform.testing.tmpDir(.{});
+    var tmp_a = platform.testing.tmpDir(.{});
     defer tmp_a.cleanup();
-    var tmp_b = native_platform.testing.tmpDir(.{});
+    var tmp_b = platform.testing.tmpDir(.{});
     defer tmp_b.cleanup();
-    var tmp_c = native_platform.testing.tmpDir(.{});
+    var tmp_c = platform.testing.tmpDir(.{});
     defer tmp_c.cleanup();
 
     const root_a = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/leader-loss-db-a", .{tmp_a.sub_path});

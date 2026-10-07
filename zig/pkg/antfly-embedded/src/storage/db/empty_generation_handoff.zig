@@ -16,7 +16,7 @@
 //! Source-owner authority for an empty-generation relational rewrite. The
 //! fence closes admission before a read-indexed summary is taken. No scan of
 //! historical tombstones occurs in the deterministic Raft apply path.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const topology = @import("relational_integrity_topology_contract.zig");
@@ -549,7 +549,7 @@ test "empty generation install digest binds mapped active generations and empty 
 test "empty generation owner lookup streams a coherent summary from a read transaction" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/empty-generation-summary", .{tmp.sub_path});
     defer alloc.free(path);

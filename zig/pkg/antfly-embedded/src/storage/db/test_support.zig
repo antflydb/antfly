@@ -35,9 +35,9 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
     return platform.env.getenv(name);
 }
 
-fn threadedIo() if (builtin.os.tag == .freestanding) void else platform.Threaded {
+fn threadedIo() if (builtin.os.tag == .freestanding) void else platform.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
-    return platform.Threaded.init(std.heap.page_allocator, .{});
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn spinOrYield() void {

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -455,12 +455,12 @@ pub fn decompressZstd(alloc: Allocator, compressed: []const u8) ![]u8 {
 
 test "file reader detects same-size archive replacement between passes" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/generation.afb", .{tmp.sub_path});
     defer alloc.free(path);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });

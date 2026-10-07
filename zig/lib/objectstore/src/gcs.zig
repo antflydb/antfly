@@ -146,13 +146,13 @@ const RequestFn = *const fn (?*anyopaque, Allocator, HttpMethod, []const u8, []c
 
 const HttpxTransport = struct {
     alloc: Allocator,
-    io_impl: ?*platform.Threaded,
+    io_impl: ?*platform.Io.Threaded,
     client: httpx.Client,
 
     fn init(alloc: Allocator, request_timeout_ms: ?u64, shared_io: ?std.Io) !HttpxTransport {
-        const io_impl: ?*platform.Threaded = if (shared_io == null) blk: {
-            const owned = try alloc.create(platform.Threaded);
-            owned.* = platform.Threaded.init(alloc, .{});
+        const io_impl: ?*platform.Io.Threaded = if (shared_io == null) blk: {
+            const owned = try alloc.create(platform.Io.Threaded);
+            owned.* = platform.Io.Threaded.init(alloc, .{});
             break :blk owned;
         } else null;
         errdefer if (io_impl) |owned| {
@@ -249,7 +249,7 @@ fn transportResponseAlloc(
 
 test "gcs http transport borrows a shared io runtime" {
     const alloc = std.testing.allocator;
-    var shared = platform.Threaded.init(alloc, .{});
+    var shared = platform.Io.Threaded.init(alloc, .{});
     defer shared.deinit();
     var transport = try HttpxTransport.init(alloc, null, shared.io());
     defer transport.deinit();
@@ -1148,7 +1148,7 @@ pub fn localGrpcReferencePathAlloc(alloc: Allocator) !?[]u8 {
     }
 
     for (candidates) |root| {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
 

@@ -7,7 +7,7 @@
 //! full-duplex and a client may half-close its request direction while still
 //! waiting for the response (RFC 9112 section 9.6).
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const builtin = @import("builtin");
 const std = @import("std");
 
@@ -71,7 +71,7 @@ pub const Observer = struct {
     stopping: std.atomic.Value(bool) = .init(false),
     // One reserved worker for all registrations, independent of request Io.
     scheduling_io: ?std.Io = null,
-    control_io: ?native_platform.Threaded = null,
+    control_io: ?platform.Io.Threaded = null,
     future: ?std.Io.Future(void) = null,
     running: std.atomic.Value(bool) = .init(false),
     stop_event: std.Io.Event = .unset,
@@ -101,7 +101,7 @@ pub const Observer = struct {
     // The explicit limit also exercises partial-start rollback in tests.
     fn startWithControlLimit(self: *Observer, limit: std.Io.Limit) !void {
         if (comptime builtin.os.tag == .freestanding) return error.ObserverUnavailable;
-        const lifecycle_io = native_platform.Threaded.global_single_threaded.io();
+        const lifecycle_io = platform.Io.Threaded.global_single_threaded.io();
         self.lifecycle_mutex.lockUncancelable(lifecycle_io);
         defer self.lifecycle_mutex.unlock(lifecycle_io);
         if (self.future != null) return error.AlreadyStarted;
@@ -118,8 +118,8 @@ pub const Observer = struct {
         self.stopping.store(false, .release);
         self.healthy.store(true, .release);
         self.stop_event = .unset;
-        if (self.scheduling_io == null) self.control_io = native_platform.Threaded.init(self.alloc, .{
-            .stack_size = self.thread_stack_size orelse (native_platform.Threaded.InitOptions{}).stack_size,
+        if (self.scheduling_io == null) self.control_io = platform.Io.Threaded.init(self.alloc, .{
+            .stack_size = self.thread_stack_size orelse (platform.Io.Threaded.InitOptions{}).stack_size,
             .async_limit = .nothing,
             .concurrent_limit = limit,
         });
@@ -135,7 +135,7 @@ pub const Observer = struct {
 
     pub fn stop(self: *Observer) void {
         if (comptime builtin.os.tag == .freestanding) return;
-        const lifecycle_io = native_platform.Threaded.global_single_threaded.io();
+        const lifecycle_io = platform.Io.Threaded.global_single_threaded.io();
         self.lifecycle_mutex.lockUncancelable(lifecycle_io);
         defer self.lifecycle_mutex.unlock(lifecycle_io);
         self.stopping.store(true, .release);
@@ -503,9 +503,9 @@ test "cancellation observer rolls back refused control capacity and restarts" {
         try std.testing.expectError(error.AlreadyStarted, observer.start());
         try std.testing.expectError(error.ConcurrencyUnavailable, observer.control_io.?.io().concurrent(Noop.run, .{}));
         // Concurrent stops must serialize future consumption and Io destruction.
-        var stop = try native_platform.testing.io.concurrent(Observer.stop, .{&observer});
+        var stop = try platform.testing.io.concurrent(Observer.stop, .{&observer});
         observer.stop();
-        stop.await(native_platform.testing.io);
+        stop.await(platform.testing.io);
         try std.testing.expect(observer.control_io == null);
         try std.testing.expect(observer.future == null);
         try std.testing.expect(observer.kernel_fd == null);
@@ -515,9 +515,9 @@ test "cancellation observer rolls back refused control capacity and restarts" {
 
 test "observer borrows reserved capacity without owning its executor" {
     if (builtin.os.tag == .freestanding) return error.SkipZigTest;
-    var unavailable = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+    var unavailable = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
     defer unavailable.deinit();
-    var lane = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    var lane = platform.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
     defer lane.deinit();
     var observer = Observer.init(std.testing.allocator, 2, null);
     defer observer.deinit();

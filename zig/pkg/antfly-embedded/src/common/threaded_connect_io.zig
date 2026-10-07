@@ -19,7 +19,7 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -30,14 +30,14 @@ const posix = std.posix;
 /// Installs Antfly's cancellation-safe POSIX connector over a Threaded I/O
 /// runtime. The vtable is separately allocated so the returned I/O remains
 /// stable when its owning runtime moves and can be shared by runtime lanes.
-pub fn createVTable(alloc: std.mem.Allocator, threaded: *native_platform.Threaded) !*std.Io.VTable {
+pub fn createVTable(alloc: std.mem.Allocator, threaded: *platform.Io.Threaded) !*std.Io.VTable {
     const vtable = try alloc.create(std.Io.VTable);
     vtable.* = threaded.io().vtable.*;
     vtable.netConnectIp = netConnectIp;
     return vtable;
 }
 
-pub fn io(threaded: *native_platform.Threaded, vtable: *const std.Io.VTable) std.Io {
+pub fn io(threaded: *platform.Io.Threaded, vtable: *const std.Io.VTable) std.Io {
     return .{
         .userdata = threaded,
         .vtable = vtable,
@@ -62,7 +62,7 @@ fn netConnectIp(
     address: *const std.Io.net.IpAddress,
     options: std.Io.net.IpAddress.ConnectOptions,
 ) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
-    const threaded: *native_platform.Threaded = @ptrCast(@alignCast(userdata));
+    const threaded: *platform.Io.Threaded = @ptrCast(@alignCast(userdata));
     const original_io = threaded.io();
     if (native_os == .windows or native_os == .wasi) {
         return original_io.vtable.netConnectIp(original_io.userdata, address, options);
@@ -75,8 +75,8 @@ fn netConnectIpPosix(
     address: *const std.Io.net.IpAddress,
     options: std.Io.net.IpAddress.ConnectOptions,
 ) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
-    const family = native_platform.Threaded.posixAddressFamily(address);
-    const mode, const protocol = native_platform.Threaded.posixSocketModeProtocol(
+    const family = platform.Io.Threaded.posixAddressFamily(address);
+    const mode, const protocol = platform.Io.Threaded.posixSocketModeProtocol(
         family,
         options.mode,
         options.protocol,
@@ -92,8 +92,8 @@ fn netConnectIpPosix(
     try setDescriptorFlag(original_io, socket_fd, posix.F.SETFD, posix.FD_CLOEXEC);
     try setNonBlocking(original_io, socket_fd, true);
 
-    var storage: native_platform.Threaded.PosixAddress = undefined;
-    var addr_len = native_platform.Threaded.addressToPosix(address, &storage);
+    var storage: platform.Io.Threaded.PosixAddress = undefined;
+    var addr_len = platform.Io.Threaded.addressToPosix(address, &storage);
     const deadline = options.timeout.toTimestamp(original_io);
     while (true) {
         try original_io.vtable.checkCancel(original_io.userdata);
@@ -123,7 +123,7 @@ fn netConnectIpPosix(
     open = false;
     return .{
         .handle = socket_fd,
-        .address = native_platform.Threaded.addressFromPosix(&storage),
+        .address = platform.Io.Threaded.addressFromPosix(&storage),
     };
 }
 
@@ -268,7 +268,7 @@ fn boundedPollTimeout(
 fn getSocketName(
     original_io: std.Io,
     fd: posix.fd_t,
-    storage: *native_platform.Threaded.PosixAddress,
+    storage: *platform.Io.Threaded.PosixAddress,
     addr_len: *posix.socklen_t,
 ) std.Io.net.IpAddress.ConnectError!void {
     while (true) {

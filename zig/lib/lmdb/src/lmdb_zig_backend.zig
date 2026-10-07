@@ -53,7 +53,7 @@ pub fn bootstrapDataFile(path: [*:0]const u8, opts: anytype) !void {
     else
         try std.fmt.bufPrint(&path_buf, "{s}/data.mdb", .{path_span});
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

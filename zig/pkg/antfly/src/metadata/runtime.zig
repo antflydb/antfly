@@ -13,7 +13,6 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
 const std = @import("std");
 const antfly = @import("runtime_root.zig");
 const storage_source_options = @import("storage_source_options");
@@ -1041,7 +1040,7 @@ pub fn runFromIterator(
     }
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
-    var setup_io = platform.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
+    var setup_io = platform.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
@@ -1640,7 +1639,7 @@ fn resolveExtensionPackageStoreDirWithEnv(
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
-    const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(native_platform.debug_io, path, alloc) catch |err| switch (err) {
+    const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(platform.debug_io, path, alloc) catch |err| switch (err) {
         error.FileNotFound, error.NotDir => null,
         else => return err,
     };
@@ -2726,10 +2725,10 @@ fn awaitMetadataTestPrefix(server: *Server) !void {
     const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
     while (true) {
         try svc.runRaftRoundOnly();
-        svc.runtime_mutex.lockUncancelable(native_platform.debug_io);
+        svc.runtime_mutex.lockUncancelable(platform.debug_io);
         const pending = svc.raft.pending_updates.items.len;
         const status_value = svc.raft.host.http_host.host.raftStatus(svc.metadata_group_id);
-        svc.runtime_mutex.unlock(native_platform.debug_io);
+        svc.runtime_mutex.unlock(platform.debug_io);
         if (pending == 0) if (status_value) |value| {
             if (value.last_index != 0) {
                 try svc.waitForTransitionApplied(.{ .term = value.last_term, .index = value.last_index });

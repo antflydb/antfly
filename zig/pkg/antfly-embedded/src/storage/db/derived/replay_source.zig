@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -22,7 +22,7 @@ const change_journal_mod = @import("change_journal.zig");
 const docstore_mod = @import("../../docstore.zig");
 const internal_keys = @import("../../internal_keys.zig");
 const mem_backend_mod = @import("../../mem_backend.zig");
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 
 pub const TargetHint = change_journal_mod.TargetHint;
 
@@ -727,7 +727,7 @@ test "replay source collects changed documents from thin change journal" {
         break :blk @as([*:0]const u8, @ptrCast(path_fmt.ptr));
     };
     defer {
-        var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
     }
@@ -811,7 +811,7 @@ test "replay source stops after first matching record" {
         break :blk @as([*:0]const u8, @ptrCast(path_fmt.ptr));
     };
     defer {
-        var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
     }
@@ -929,7 +929,7 @@ test "replay source journal respects max matched entries" {
         break :blk @as([*:0]const u8, @ptrCast(path_fmt.ptr));
     };
     defer {
-        var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
     }

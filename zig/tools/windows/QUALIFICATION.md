@@ -784,3 +784,42 @@ source hashes, native/Wine results and cleanup records),
 `/private/tmp/pr987-connect-linux-clocks.log`,
 `/private/tmp/pr987-connect-fix-app-build.log`, and
 `/private/tmp/pr987-connect-fix-app-smoke`.
+
+## Platform I/O namespace (2026-10-07)
+
+`platform.Io` now owns backend exports: `Threaded` selects the repository-owned
+Windows executor and the stock executor elsewhere; `Evented` retains the existing
+qualified Linux/macOS selection. `Context` aliases `std.Io`, preserving borrowed
+vtable dispatch and compatibility with standard APIs. Repository imports use
+`platform`, including files that previously imported the same module twice.
+`lib/runtime` re-exports `Io` and keeps its existing `Threaded` compatibility alias.
+The benchmark uses its configured module import instead of importing the same
+platform root into a second module.
+
+The namespace regression checks assert context/backend type compatibility and
+execute a clock-reading task through an owning executor. They run in the platform
+build and the new `io-namespace` Windows suite. Validation evidence:
+
+- macOS platform tests and I/O benchmark compilation: 22/22 build steps passed;
+  the platform tests include the two new namespace checks and existing Python
+  process-lifecycle checks.
+- CrossOver Debug and ReleaseFast namespace, compatibility/cancellation, and
+  independent archive executor bridge suites: 28 passed, no skips, failures,
+  or leaks. Evidence: `/private/tmp/pr987-io-namespace-tests`.
+- ARM64 Linux namespace/task checks compiled without libc and executed in the
+  existing Alpine container: 2/2 passed.
+- macOS HTTP and objectstore suites: 675 passed, 11 integration/optional skips.
+  The initial sandbox run denied loopback listeners with EPERM; rerunning with
+  socket access passed.
+- Full Debug Windows application and native/browser module boundary audits:
+  59/59 build steps passed. The Windows executable SHA-256 is
+  `0ab7eb468763c3ac7712b7e77ba2315306cfc344824939c2a3dfa2128a7ad97b`.
+- CrossOver application smoke: 64 concurrent queries passed across two runs;
+  all 32 acknowledged documents and full-text entries survived forced termination
+  and reopen. Evidence: `/private/tmp/pr987-io-namespace-app-smoke`.
+- A normalized comparison of 575 mechanically migrated Zig files found no
+  unrelated edits. Explicit API, benchmark, and local-name changes were reviewed
+  separately; formatting and whitespace checks passed.
+
+This namespace refactor was exercised under CrossOver; it does not add a new
+native Windows VM run to the earlier NTFS qualification evidence.

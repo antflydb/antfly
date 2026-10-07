@@ -13,11 +13,11 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const builtin = @import("builtin");
 const std = @import("std");
 
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 const managed_host = @import("managed_host.zig");
 const metadata_view = @import("metadata_view.zig");
 const service = @import("service.zig");
@@ -87,7 +87,7 @@ pub const ManagedProgressDriver = struct {
     interval_ns: u64,
     // Progress must remain independent of capacity in the caller's executor.
     scheduling_io: ?std.Io = null,
-    progress_io: ?native_platform.Threaded = null,
+    progress_io: ?platform.Io.Threaded = null,
     future: ?std.Io.Future(void) = null,
     state: State = .initialized,
     stop_event: std.Io.Event = .unset,
@@ -140,7 +140,7 @@ pub const ManagedProgressDriver = struct {
         if (self.source.acquire_owner != null and self.source.run_progress_once == null)
             return error.InvalidProgressOwnership;
 
-        if (self.scheduling_io == null) self.progress_io = native_platform.Threaded.init(std.heap.page_allocator, .{
+        if (self.scheduling_io == null) self.progress_io = platform.Io.Threaded.init(std.heap.page_allocator, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(1),
         });
@@ -531,12 +531,12 @@ test "managed raft progress driver advances independently and joins on stop" {
         }
     };
 
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
     defer io_impl.deinit();
-    var reserved = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    var reserved = platform.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
     defer reserved.deinit();
     var counter = Counter{};
     var driver = ManagedProgressDriver.init(io_impl.io(), .{
@@ -571,7 +571,7 @@ test "managed raft progress driver wakes immediately when deferred apply owner o
             _ = self.count.fetchAdd(1, .release);
         }
     };
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var counter = Counter{};
@@ -603,7 +603,7 @@ test "managed raft progress driver publishes source failure" {
         }
     };
 
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var source = FailingSource{};
     var driver = ManagedProgressDriver.init(io_impl.io(), .{
@@ -625,7 +625,7 @@ test "managed raft progress driver publishes source failure" {
 }
 
 test "managed raft progress driver reports a wedged round unhealthy" {
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const Noop = struct {
         fn runOnce(_: *anyopaque) !void {}
@@ -656,7 +656,7 @@ test "managed raft progress driver recovers readiness after a slow successful ro
             try self.release.wait(self.io);
         }
     };
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var source = SlowSource{ .io = io };
@@ -688,7 +688,7 @@ test "managed raft progress driver recovers readiness after a slow successful ro
 }
 
 test "managed raft progress driver ignores a completed observed generation" {
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const Noop = struct {
         fn runOnce(_: *anyopaque) !void {}
@@ -717,7 +717,7 @@ test "managed raft progress driver stop interrupts a long cadence wait" {
         }
     };
 
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var counter = Counter{};
     var driver = ManagedProgressDriver.init(io_impl.io(), .{
@@ -901,7 +901,7 @@ const ProgressOwnershipProbe = struct {
 
 test "managed raft progress driver coalesces request wakes without accelerating ticks" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var probe = ProgressOwnershipProbe{};
@@ -932,7 +932,7 @@ test "managed raft progress driver coalesces request wakes without accelerating 
 
 test "managed raft progress driver releases source ownership after startup refusal" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
     defer io_impl.deinit();
     var probe = ProgressOwnershipProbe{};
     var driver = ManagedProgressDriver.init(io_impl.io(), probe.source(), std.time.ns_per_ms);
@@ -946,7 +946,7 @@ test "managed raft progress driver releases source ownership after startup refus
 }
 
 test "managed raft progress driver retains stop across wake reset" {
-    var driver = ManagedProgressDriver.init(native_platform.testing.io, undefined, 60 * std.time.ns_per_s);
+    var driver = ManagedProgressDriver.init(platform.testing.io, undefined, 60 * std.time.ns_per_s);
     // Reproduce stop after the previous turn's stop observation but before
     // reset. No clock advancement or watchdog is needed to prove the race.
     driver.stop_event.set(driver.io);

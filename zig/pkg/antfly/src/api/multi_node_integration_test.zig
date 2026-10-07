@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ant_json = @import("antfly-json");
@@ -795,7 +795,7 @@ fn startPublicApiServersWithOptionalSessions(
     cluster: *metadata_vopr.MetadataHttpClusterVopr,
     roots: *const [N][]const u8,
     forward_executor: http_common.RequestExecutor,
-    forward_io_impl: ?*native_platform.Threaded,
+    forward_io_impl: ?*platform.Io.Threaded,
     session_stores: ?*const [N]?*transactions_api.DurableSessionStore,
     listeners: *[N]api_http_test_runtime.Runtime,
     servers: *[N]api_http_server.ApiHttpServer,
@@ -1459,7 +1459,7 @@ fn startMetadataAdminServers(
 }
 
 test "public api multi-node integration routes CRUD from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -1713,7 +1713,7 @@ test "public api multi-node integration routes CRUD from a non-host node" {
 }
 
 test "public api multi-node integration routes transaction commit from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -1914,7 +1914,7 @@ test "public api multi-node integration routes transaction commit from a non-hos
 }
 
 test "public api multi-node integration commits cross-table transactions atomically" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -2169,7 +2169,7 @@ test "public api multi-node integration commits cross-table transactions atomica
 }
 
 test "public api multi-node integration supports long-lived transaction sessions from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -2503,7 +2503,7 @@ test "public api multi-node integration supports long-lived transaction sessions
 }
 
 test "public api multi-node integration supports cross-table transaction sessions" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -2739,7 +2739,7 @@ test "public api multi-node integration supports cross-table transaction session
 }
 
 test "public api multi-node integration reloads durable cross-table transaction sessions after coordinator restart" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -3008,7 +3008,7 @@ test "public api multi-node integration reloads durable cross-table transaction 
 }
 
 test "public api multi-node integration adopts durable cross-table transaction sessions after coordinator loss" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -3278,7 +3278,7 @@ test "public api multi-node integration adopts durable cross-table transaction s
 }
 
 test "public api multi-node integration reloads durable transaction sessions after coordinator restart" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -3505,7 +3505,7 @@ test "public api multi-node integration reloads durable transaction sessions aft
 }
 
 test "public api multi-node integration adopts durable transaction sessions after coordinator loss" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -3707,7 +3707,7 @@ test "public api multi-node integration adopts durable transaction sessions afte
 }
 
 test "public api multi-node integration retries transaction commit once after topology churn" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -3952,7 +3952,7 @@ test "public api multi-node integration retries transaction commit once after to
 }
 
 test "public api multi-node integration fails transaction commit after repeated topology churn beyond retry limit" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -4188,7 +4188,7 @@ test "public api multi-node integration fails transaction commit after repeated 
 }
 
 test "public api multi-node integration retries transaction session commit once after topology churn" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -4474,7 +4474,7 @@ test "public api multi-node integration retries transaction session commit once 
 }
 
 test "public api multi-node integration retries cross-table transaction session commit once after topology churn" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -4809,7 +4809,7 @@ test "public api multi-node integration retries cross-table transaction session 
 }
 
 test "public api multi-node integration fails transaction session commit after repeated topology churn beyond retry limit" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -5099,7 +5099,7 @@ test "public api multi-node integration fails transaction session commit after r
 }
 
 test "public api multi-node integration recovers unresolved distributed transaction after participant leader restart" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -5358,7 +5358,7 @@ test "public api multi-node integration recovers unresolved distributed transact
 }
 
 test "public api multi-node integration routes semantic and sparse queries from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -5717,7 +5717,7 @@ test "public api multi-node integration routes semantic and sparse queries from 
 }
 
 test "public api multi-node integration routes graph queries from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -5912,7 +5912,7 @@ test "public api multi-node integration routes graph queries from a non-host nod
 }
 
 test "public api multi-node integration routes split flow from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -6351,7 +6351,7 @@ test "public api multi-node integration routes split flow from a non-host node" 
 }
 
 test "public api multi-node integration routes merge flow from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -6664,7 +6664,7 @@ test "public api multi-node integration routes merge flow from a non-host node" 
 }
 
 test "public api multi-node integration retries distributed graph after merge churn" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -6942,7 +6942,7 @@ test "public api multi-node integration retries distributed graph after merge ch
 }
 
 test "public api multi-node integration fails distributed graph after repeated churn beyond retry limit" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -7209,7 +7209,7 @@ test "public api multi-node integration fails distributed graph after repeated c
 }
 
 test "public api multi-node integration routes semantic and sparse queries across split ranges from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);
@@ -7548,7 +7548,7 @@ test "public api multi-node integration routes semantic and sparse queries acros
 }
 
 test "public api multi-node integration routes semantic and sparse queries after merge from a non-host node" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var store_a = raft_engine.core.MemoryStorage.init(std.testing.allocator);

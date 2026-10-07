@@ -16,7 +16,7 @@
 //! Optional cache-owned disk retention. No request allocator, cancellation
 //! token, or executor outlives its request. One std.Io worker drains a bounded
 //! queue; pressure drops retention, never authenticated query results.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const cache_mod = @import("cache.zig");
@@ -27,7 +27,7 @@ pub const max_bytes = 16 * 1024 * 1024;
 
 pub const Worker = struct {
     owner: *cache_mod.QueryCache,
-    io_impl: native_platform.Threaded,
+    io_impl: platform.Io.Threaded,
     group: std.Io.Group = .init,
     mu: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
@@ -52,7 +52,7 @@ pub const Worker = struct {
     pub fn create(owner: *cache_mod.QueryCache) !*Worker {
         const self = try owner.alloc.create(Worker);
         errdefer owner.alloc.destroy(self);
-        self.* = .{ .owner = owner, .io_impl = native_platform.Threaded.init(owner.alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) }) };
+        self.* = .{ .owner = owner, .io_impl = platform.Io.Threaded.init(owner.alloc, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) }) };
         errdefer self.io_impl.deinit();
         // Unlike async, concurrent may not run the infinite worker inline.
         try self.group.concurrent(self.io_impl.io(), run, .{self});

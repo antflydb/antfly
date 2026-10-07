@@ -1555,7 +1555,7 @@ test "reader selection singleflights same keys while independent stripes discove
     };
 
     const allocator = std.testing.allocator;
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var discovery = Discovery{};

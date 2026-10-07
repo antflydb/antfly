@@ -37,7 +37,7 @@ pub fn sleepNs(ns: u64) void {
 
 pub fn yieldBriefly() void {
     if (comptime builtin.os.tag != .freestanding) {
-        const io = @import("root.zig").Threaded.global_single_threaded.io();
+        const io = @import("root.zig").Io.Threaded.global_single_threaded.io();
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
         io.sleep(.fromMicroseconds(100), .awake) catch unreachable;
@@ -51,7 +51,7 @@ pub fn yieldNow() void {
     if (comptime builtin.os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        const io = @import("root.zig").Threaded.global_single_threaded.io();
+        const io = @import("root.zig").Io.Threaded.global_single_threaded.io();
         const protection = io.swapCancelProtection(.blocked);
         defer _ = io.swapCancelProtection(protection);
         io.sleep(.zero, .awake) catch unreachable;

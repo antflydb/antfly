@@ -14,7 +14,7 @@
 // limitations.
 
 //! This adapter always executes in the archive that owns the HA Primary.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const hot_standby_publisher_adapter = @import("hot_standby/db_commit.zig");
 const std = @import("std");
 
@@ -24,7 +24,7 @@ const chunks = @import("hot_standby/metadata_effect_chunks.zig");
 
 pub const Adapter = struct {
     alloc: std.mem.Allocator,
-    io_impl: native_platform.Threaded,
+    io_impl: platform.Io.Threaded,
     gate: ?policy.WriteGate,
     mirror: ?policy.AsyncEffectMirror,
 
@@ -37,7 +37,7 @@ pub const Adapter = struct {
     fn lock(ptr: *anyopaque) !void {
         const self = cast(ptr);
         if (self.mirror) |mirror| if (mirror.transition_mutex) |mutex| {
-            native_platform.sync.lockYieldingIo(mutex, self.io_impl.io());
+            platform.sync.lockYieldingIo(mutex, self.io_impl.io());
         };
     }
     fn unlock(ptr: *anyopaque) void {

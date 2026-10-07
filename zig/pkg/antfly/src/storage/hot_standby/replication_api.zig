@@ -20,7 +20,7 @@
 //! directly: identify the primary, create a slot, start streaming from a slot
 //! LSN, and report standby progress.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -348,7 +348,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     const primary_slots = try allocPrintPath(alloc, name, "primary-slots", nonce);
     defer alloc.free(primary_slots);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};

@@ -96,7 +96,6 @@ const document_child_range_manifest = @import("document_child_range_manifest.zig
 const document_child_range_effects = @import("document_child_range_effects.zig");
 const document_child_range_outbox = @import("document_child_range_outbox.zig");
 const replicated_mutation = @import("replicated_mutation.zig");
-const native_platform = @import("antfly_platform");
 const std = @import("std");
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
 const replication_contract = @import("replication_contract.zig");
@@ -1909,9 +1908,9 @@ fn recoverIncompletePortableImport(alloc: Allocator, store: *docstore_mod.DocSto
     try store.sync(true);
 }
 
-fn threadedIo() if (builtin.os.tag == .freestanding) void else platform.Threaded {
+fn threadedIo() if (builtin.os.tag == .freestanding) void else platform.Io.Threaded {
     if (builtin.os.tag == .freestanding) return;
-    return platform.Threaded.init(std.heap.page_allocator, .{});
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 /// Generic directory-store imports are decoded into a bounded, durable scratch
@@ -3794,7 +3793,7 @@ pub const DB = struct {
 
             core_owner.* = try db_core.DBCore.fromOpened(
                 alloc,
-                backend_runtime.io() orelse backend_runtime.filesystemIo() orelse native_platform.debug_io,
+                backend_runtime.io() orelse backend_runtime.filesystemIo() orelse platform.debug_io,
                 core,
             );
             core_owned = false;
@@ -4917,9 +4916,9 @@ pub const DB = struct {
     pub fn close(self: *DB) void {
         if (self.closed) return;
         self.closed = true;
-        self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse native_platform.debug_io);
-        self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse native_platform.debug_io);
-        self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse native_platform.debug_io);
+        self.restore_decoder_cache.deinit(self.backend_runtime.filesystemIo() orelse platform.debug_io);
+        self.rewrite_program_cache.deinit(self.backend_runtime.io() orelse platform.debug_io);
+        self.rewrite_tail_cache.deinit(self.backend_runtime.io() orelse platform.debug_io);
         self.deinitWrapperState(true);
     }
 
@@ -5551,7 +5550,7 @@ pub const DB = struct {
     /// teardown drains TTL workers before releasing the owning service.
     pub fn setCoordinatedTtl(self: *DB, port: ?coordinated_ttl.Port) void {
         const context = self.ttl_cleanup_context orelse return;
-        const io = self.backend_runtime.io() orelse native_platform.debug_io;
+        const io = self.backend_runtime.io() orelse platform.debug_io;
         context.hook_mutex.lockUncancelable(io);
         defer context.hook_mutex.unlock(io);
         context.coordinated_port = port;
@@ -5582,7 +5581,7 @@ pub const DB = struct {
         };
         errdefer contexts.release();
         contexts.identity.resource_manager = self.core.index_manager.resource_manager;
-        contexts.identity.io = self.backend_runtime.io() orelse native_platform.debug_io;
+        contexts.identity.io = self.backend_runtime.io() orelse platform.debug_io;
         self.transaction_owner = try @TypeOf(self.transaction_owner).create(self.runtime_alloc, contexts, .{ self, cfg }, constructTransactionRuntime);
         self.transaction_recovery_identity_context = &self.transaction_owner.context.?.identity;
         self.transaction_recovery_local_context = &self.transaction_owner.context.?.local;
@@ -5782,9 +5781,9 @@ pub const DB = struct {
         self.stopGraphEndpointCleanupWorker();
         self.transaction_owner.deinitRuntime(self.runtime_alloc);
         self.transaction_runtime = null;
-        self.local_execution.source_publication.stop(self.backend_runtime.io() orelse native_platform.debug_io);
+        self.local_execution.source_publication.stop(self.backend_runtime.io() orelse platform.debug_io);
         self.local_execution.merge_artifact_layout.clear();
-        self.local_execution.online_merge_reader.retire(self.backend_runtime.io() orelse native_platform.debug_io, null);
+        self.local_execution.online_merge_reader.retire(self.backend_runtime.io() orelse platform.debug_io, null);
         self.transaction_owner.deinitContext(self.runtime_alloc);
         self.transaction_recovery_local_context = null;
         self.transaction_recovery_identity_context = null;
@@ -23651,7 +23650,7 @@ pub const DB = struct {
             }
         };
         const io = self.backend_runtime.io();
-        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .io = io orelse native_platform.debug_io };
+        var ctx = Context{ .alloc = alloc, .intents = intents, .view = view, .io = io orelse platform.debug_io };
         var input_bytes: usize = 0;
         for (intents) |intent| input_bytes +|= if (intent.value) |value| value.len else 0;
         const workers = @min(@as(usize, 8), @min(intents.len, @max(@as(usize, 1), input_bytes / (256 * 1024))));
@@ -24312,7 +24311,7 @@ pub const DB = struct {
             }
         }
         if (command == .release) {
-            const io = self.backend_runtime.io() orelse native_platform.debug_io;
+            const io = self.backend_runtime.io() orelse platform.debug_io;
             self.local_execution.source_publication.cancelScope(io, command.scope());
             self.local_execution.online_merge_reader.retire(io, command.scope());
         }
@@ -30224,7 +30223,7 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         if (test_pause_portable_activation_retry_probe_before_lifecycle_lock.load(.acquire)) {
             test_portable_activation_retry_probe_paused.store(true, .release);
-            const io = self.backend_runtime.io() orelse native_platform.debug_io;
+            const io = self.backend_runtime.io() orelse platform.debug_io;
             while (!test_release_portable_activation_retry_probe.load(.acquire))
                 io.sleep(.fromMilliseconds(1), .awake) catch {};
         }
@@ -35580,7 +35579,7 @@ pub const DB = struct {
         defer if (apply_locked) self.core.unlockApply();
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
         try self.core.store.beginPortableImportPublication(
-            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse native_platform.debug_io,
+            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse platform.debug_io,
         );
         var publication_fenced = true;
         defer if (publication_fenced) self.core.store.finishPortableImportPublication();
@@ -35630,7 +35629,7 @@ pub const DB = struct {
         defer if (apply_locked) self.core.unlockApply();
         if (!(try self.portableImportTargetEmptyLocked(alloc))) return error.LiteImportTargetNotEmpty;
         try self.core.store.beginPortableImportPublication(
-            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse native_platform.debug_io,
+            self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse platform.debug_io,
         );
         var publication_fenced = true;
         defer if (publication_fenced) self.core.store.finishPortableImportPublication();
@@ -47136,7 +47135,7 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
     var view = if (ctx.schema_registry) |registry| registry.acquire() else null;
     defer if (view) |*pinned| pinned.release();
     if (view) |pinned| if (pinned.hasCoordinatedConstraints()) {
-        const io = ctx.batch.io orelse native_platform.debug_io;
+        const io = ctx.batch.io orelse platform.debug_io;
         ctx.hook_mutex.lockUncancelable(io);
         const port = ctx.coordinated_port;
         ctx.hook_mutex.unlock(io);
@@ -48870,7 +48869,7 @@ test "native publication reports contention separately from an empty pass" {
 
 test "native publication finalization forwards raced source completion" {
     const alloc = std.testing.allocator;
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
@@ -52297,7 +52296,7 @@ const applyCommittedBatchToShadow = local_mutation.applyCommittedBatchToShadow;
 /// can therefore drain without a lock cycle.
 fn waitForSplitShadowDrainLocked(self: *DB, require_clean: bool) !void {
     const shadow = activeSplitShadow(self) orelse return;
-    const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse native_platform.debug_io;
+    const io = self.backend_runtime.io() orelse self.backend_runtime.filesystemIo() orelse platform.debug_io;
     shadow.apply_mutex.lockUncancelable(io);
     while (shadow.applied_ticket != shadow.next_ticket) {
         shadow.apply_advanced.waitUncancelable(io, &shadow.apply_mutex);
@@ -61364,7 +61363,7 @@ test "prepared relational batch uses bounded parallel workers safely" {
         std.testing.expectEqual(@as(u64, 0), budget.live_bytes) catch @panic("prepared row budget leak");
         budget.deinit();
     }
-    var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+    var io_impl = platform.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
     defer io_impl.deinit();
     var allocator_guard = PreparedRowAllocator{ .child = budget.allocator(), .io = io_impl.io() };
     var rows: [writes.len]?mapper.PreparedRelationalWrite = @splat(null);
@@ -65012,7 +65011,7 @@ test "db portable publication fence blocks lock-free point reads" {
 
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_optional_runtimes = false });
     defer db.close();
-    try db.core.store.beginPortableImportPublication(native_platform.debug_io);
+    try db.core.store.beginPortableImportPublication(platform.debug_io);
     var fenced = true;
     defer if (fenced) db.core.store.finishPortableImportPublication();
 
@@ -65090,7 +65089,7 @@ test "db portable publication waits for admitted readers and rejects new ones" {
             self.store.finishPortableImportPublication();
         }
     };
-    var publisher = Publisher{ .store = db.core.store, .io = native_platform.debug_io };
+    var publisher = Publisher{ .store = db.core.store, .io = platform.debug_io };
     const thread = try std.Thread.spawn(.{}, Publisher.run, .{&publisher});
     var joined = false;
     defer if (!joined) {
@@ -65247,7 +65246,7 @@ test "db portable activation gate revalidates profiled dense search after catalo
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var path_tmp = try TestDirectory.init("db");
@@ -65643,7 +65642,7 @@ test "db searches fail fast without joining portable activation recovery" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var path_tmp = try TestDirectory.init("db");
@@ -67671,7 +67670,7 @@ test "db published dense admission cannot overflow into catalog closure" {
 test "db dense fast path registers before catalog lookup during index deletion" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const wait_timeout_ns = 5 * std.time.ns_per_s;
@@ -94555,7 +94554,7 @@ test "enrichment worker bounds retries against a durable foreign lease" {
     const runtime = db.enrichment_runtime orelse return error.TestUnexpectedResult;
     runtime.notifySequence(1);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     io_impl.io().sleep(Io.Duration.fromMilliseconds(50), .awake) catch {};
 
@@ -103136,7 +103135,7 @@ test "db managed full text admission survives restart without in-place backfill"
     // Model a crash after the atomic catalog/outbox commit but before the
     // repair checkpoint becomes durable. Reopen must reconstruct the intent
     // from the primary-store marker without running an in-place backfill.
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try std.Io.Dir.cwd().deleteFile(io_impl.io(), repair_checkpoint_path.?);
 
@@ -106738,7 +106737,7 @@ test "db dense target coverage reads one immutable primary commit epoch" {
 
 test "db inline dense generation remains rebuilding until outcomes cover the live corpus" {
     const alloc = std.testing.allocator;
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
 

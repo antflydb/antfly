@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
@@ -21,7 +21,7 @@ const filter = @import("filter.zig");
 const foreign_source = @import("source.zig");
 const postgres_libpq = @import("postgres_libpq.zig");
 const sql = @import("sql.zig");
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 
 const Allocator = std.mem.Allocator;
 
@@ -1871,7 +1871,7 @@ fn testPsqlBin() ?[]const u8 {
 
 fn execPsqlCommand(alloc: Allocator, dsn: []const u8, sql_text: []const u8) !void {
     const psql_bin = testPsqlBin() orelse return error.FileNotFound;
-    const result = try std.process.run(alloc, native_platform.testing.io, .{
+    const result = try std.process.run(alloc, platform.testing.io, .{
         .argv = &.{ psql_bin, dsn, "-v", "ON_ERROR_STOP=1", "-c", sql_text },
     });
     defer alloc.free(result.stdout);
@@ -1884,7 +1884,7 @@ fn execPsqlCommand(alloc: Allocator, dsn: []const u8, sql_text: []const u8) !voi
 
 fn execPsqlScalarAlloc(alloc: Allocator, dsn: []const u8, sql_text: []const u8) ![]u8 {
     const psql_bin = testPsqlBin() orelse return error.FileNotFound;
-    const result = try std.process.run(alloc, native_platform.testing.io, .{
+    const result = try std.process.run(alloc, platform.testing.io, .{
         .argv = &.{ psql_bin, dsn, "-tAc", sql_text },
     });
     defer alloc.free(result.stderr);

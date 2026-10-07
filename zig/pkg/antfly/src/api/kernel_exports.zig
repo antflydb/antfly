@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ant_json = @import("antfly-json");
@@ -28,7 +28,7 @@ const managed_embedder = @import("antfly_local_sources").inference_managed_embed
 const backend_erased = @import("antfly_local_sources").storage_backend_erased;
 const hot_standby_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
@@ -807,7 +807,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
         .route_validator = httpx.Router.init(alloc),
     };
     defer state.route_validator.deinit();
-    const test_io = native_platform.testing.io;
+    const test_io = platform.testing.io;
 
     const internal_request = abi.HttpRequestView{
         .method = .post,
@@ -957,7 +957,7 @@ test "API kernel create rejects raw owner runtime without transferred capabiliti
     const background = @import("antfly_local_sources").storage_background_runtime;
     var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .manual,
-        .borrowed_io = .{ .general = native_platform.testing.io },
+        .borrowed_io = .{ .general = platform.testing.io },
     });
     defer runtime.deinit();
     const cfg: server_mod.ApiHttpServerConfig = .{ .backend_runtime = runtime.ptr() };
@@ -998,10 +998,10 @@ test "API kernel create rejects raw owner runtime without transferred capabiliti
 }
 
 test "API kernel failed fallible create releases unpublished state" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile(native_platform.testing.io, "not-a-directory", .{});
-    file.close(native_platform.testing.io);
+    const file = try tmp.dir.createFile(platform.testing.io, "not-a-directory", .{});
+    file.close(platform.testing.io);
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/not-a-directory/store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
     // Listener startup can fail after server initialization too. Both paths
@@ -1054,7 +1054,7 @@ test "API kernel failed fallible create releases unpublished state" {
 
 test "API kernel runtime I/O receivers validate capability layout and domains" {
     var receivers: RuntimeIoReceivers = .{};
-    var borrow = abi.native_abi.IoBorrow.init(&native_platform.testing.io);
+    var borrow = abi.native_abi.IoBorrow.init(&platform.testing.io);
     var borrows: abi.RuntimeIoBorrows = .{
         .api = &borrow,
         .api_network = &borrow,
@@ -1065,8 +1065,8 @@ test "API kernel runtime I/O receivers validate capability layout and domains" {
     const views = receivers.views();
     inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
         const io = @field(views, field).?;
-        try std.testing.expect(io.userdata == native_platform.testing.io.userdata);
-        try std.testing.expect(io.vtable == native_platform.testing.io.vtable);
+        try std.testing.expect(io.userdata == platform.testing.io.userdata);
+        try std.testing.expect(io.vtable == platform.testing.io.vtable);
     }
     borrows.version -= 1;
     try std.testing.expectError(error.UnsupportedVersion, receivers.init(&borrows));
@@ -1091,7 +1091,7 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
     const background = @import("antfly_local_sources").storage_background_runtime;
     var runtime = try background.BackendRuntimeHandle.init(std.testing.allocator, .{
         .backend = .manual,
-        .borrowed_io = .{ .general = native_platform.testing.io },
+        .borrowed_io = .{ .general = platform.testing.io },
     });
     defer runtime.deinit();
     const cfg: server_mod.ApiHttpServerConfig = .{ .backend_runtime = runtime.ptr() };
@@ -1128,7 +1128,7 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
     try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(result));
     try std.testing.expect(handle == null);
     try std.testing.expect(request_alloc == null);
-    var borrow = abi.native_abi.IoBorrow.init(&native_platform.testing.io);
+    var borrow = abi.native_abi.IoBorrow.init(&platform.testing.io);
     const borrows: abi.RuntimeIoBorrows = .{
         .api = &borrow,
         .api_network = &borrow,
@@ -1141,7 +1141,7 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
     try std.testing.expect(!malformed.isOk());
     try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(malformed));
     try std.testing.expect(handle == null);
-    borrow = abi.native_abi.IoBorrow.init(&native_platform.testing.io);
+    borrow = abi.native_abi.IoBorrow.init(&platform.testing.io);
     const Dispatch = @FieldType(abi.native_abi.IoBorrow, "dispatch");
     const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".param_types;
     const Forward = struct {
@@ -1174,13 +1174,13 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
         inline for (.{ "api", "api_network", "api_filesystem", "durable" }) |field| {
             const view = @field(views, field).?;
             try std.testing.expect(view.userdata == @as(?*anyopaque, &@field(state.runtime_io, field).?));
-            try std.testing.expect(view.vtable != native_platform.testing.io.vtable);
+            try std.testing.expect(view.vtable != platform.testing.io.vtable);
         }
         const imported = state.server.sharedApiFilesystemIo().?;
         var future = try state.server.sharedApiIo().?.concurrent(Probe.run, .{imported});
         try future.await(state.server.sharedApiIo().?);
         destroy(handle.?);
         handle = null;
-        try Probe.run(native_platform.testing.io);
+        try Probe.run(platform.testing.io);
     }
 }

@@ -19,7 +19,7 @@
 //! listener-task lifecycle as production. They must not revive
 //! `ApiHttpServer.executor()` merely to obtain an ephemeral test port.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const httpx = @import("httpx");
@@ -92,7 +92,7 @@ fn isRootRoute(uri: []const u8) bool {
 
 pub const Runtime = struct {
     alloc: std.mem.Allocator,
-    owned_io: ?*native_platform.Threaded,
+    owned_io: ?*platform.Io.Threaded,
     server: *httpx.Server,
     handler: *httpx_handler.AntflyApiHandler,
     listener_task: *httpx.ListenerTask,
@@ -110,9 +110,9 @@ pub const Runtime = struct {
     }
 
     pub fn startOwned(alloc: std.mem.Allocator, api: *http_server.ApiHttpServer) !Runtime {
-        const io_impl = try alloc.create(native_platform.Threaded);
+        const io_impl = try alloc.create(platform.Io.Threaded);
         errdefer alloc.destroy(io_impl);
-        io_impl.* = native_platform.Threaded.init(alloc, .{});
+        io_impl.* = platform.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
         var runtime = try startShared(alloc, io_impl.io(), api);
         runtime.owned_io = io_impl;

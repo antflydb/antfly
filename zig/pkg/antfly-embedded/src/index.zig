@@ -25,7 +25,7 @@
 //!   - Block-Max WAND acceleration when v4 inverted indexes are present
 //!   - Per-query arena allocation for zero-alloc iteration
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -37,8 +37,8 @@ const roaring = @import("encoding/roaring.zig");
 const scorer_mod = @import("search/scorer.zig");
 const query_mod = @import("search/query.zig");
 const distributed_stats_mod = @import("search/distributed_stats.zig");
-const AtomicU64 = native_platform.atomic.Value(u64);
-const platform_time = native_platform.time;
+const AtomicU64 = platform.atomic.Value(u64);
+const platform_time = platform.time;
 const resource_manager_mod = @import("storage/resource_manager.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
@@ -53,7 +53,7 @@ fn spinOrYield() void {
     if (@import("builtin").os.tag == .freestanding) {
         std.atomic.spinLoopHint();
     } else {
-        native_platform.time.yieldNow();
+        platform.time.yieldNow();
     }
 }
 
@@ -160,7 +160,7 @@ pub const SegmentData = union(enum) {
             .heap => |data| alloc.free(data),
             .artifact => |*artifact| artifact.deinit(),
             .mmap => |data| {
-                if (builtin.os.tag != .freestanding) native_platform.filesystem.unmapMemory(data);
+                if (builtin.os.tag != .freestanding) platform.filesystem.unmapMemory(data);
             },
             .owned_view => |view| view.release(view.owner),
         }
@@ -169,20 +169,20 @@ pub const SegmentData = union(enum) {
 
     fn adviseMappedRandom(data: []align(std.heap.page_size_min) u8) void {
         switch (builtin.os.tag) {
-            .linux, .emscripten, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => adviseMapped(data, native_platform.c.MADV.RANDOM),
+            .linux, .emscripten, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => adviseMapped(data, platform.c.MADV.RANDOM),
             else => {},
         }
     }
 
     fn adviseMappedDontNeed(data: []align(std.heap.page_size_min) u8) void {
         switch (builtin.os.tag) {
-            .linux, .emscripten, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => adviseMapped(data, native_platform.c.MADV.DONTNEED),
+            .linux, .emscripten, .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos, .freebsd => adviseMapped(data, platform.c.MADV.DONTNEED),
             else => {},
         }
     }
 
     fn adviseMapped(data: []align(std.heap.page_size_min) u8, advice: u32) void {
-        native_platform.filesystem.adviseMemory(data.ptr, data.len, advice) catch {};
+        platform.filesystem.adviseMemory(data.ptr, data.len, advice) catch {};
     }
 };
 
@@ -212,7 +212,7 @@ pub const SegmentShared = struct {
     /// intact when this transitions to cold; only clean file-backed pages are
     /// advised away. A subsequent query marks the segment resident again.
     mapped_residency_state: std.atomic.Value(u8) = .init(mapped_residency_cold),
-    last_mapped_access_ns: native_platform.atomic.Value(u64) = .init(0),
+    last_mapped_access_ns: platform.atomic.Value(u64) = .init(0),
     active_mapped_readers: std.atomic.Value(u32) = .init(0),
     /// Deletion bitmap shared by every snapshot referencing this segment.
     /// `deletion_lock` protects the bitmap's reallocatable containers. The
@@ -313,7 +313,7 @@ pub const TypedDocValuesFieldCoverage = struct {
         if (comptime builtin.os.tag == .freestanding) {
             self.initialization_mutex.lockUncancelable(.failing);
         } else {
-            native_platform.Threaded.mutexLockUncancelable(&self.initialization_mutex);
+            platform.Io.Threaded.mutexLockUncancelable(&self.initialization_mutex);
         }
     }
 
@@ -321,7 +321,7 @@ pub const TypedDocValuesFieldCoverage = struct {
         if (comptime builtin.os.tag == .freestanding) {
             self.initialization_mutex.unlock(.failing);
         } else {
-            native_platform.Threaded.mutexUnlock(&self.initialization_mutex);
+            platform.Io.Threaded.mutexUnlock(&self.initialization_mutex);
         }
     }
 
@@ -2762,15 +2762,15 @@ test "concurrent typed doc values coverage initialization publishes one stable s
     var failed = std.atomic.Value(bool).init(false);
     var reader_a = Reader{ .segment = segment, .start = &start, .failed = &failed };
     var reader_b = Reader{ .segment = segment, .start = &start, .failed = &failed };
-    var thread_a = try native_platform.testing.io.concurrent(Reader.run, .{&reader_a});
+    var thread_a = try platform.testing.io.concurrent(Reader.run, .{&reader_a});
     defer {
         start.store(true, .release);
-        thread_a.await(native_platform.testing.io);
+        thread_a.await(platform.testing.io);
     }
-    var thread_b = try native_platform.testing.io.concurrent(Reader.run, .{&reader_b});
+    var thread_b = try platform.testing.io.concurrent(Reader.run, .{&reader_b});
     start.store(true, .release);
-    thread_a.await(native_platform.testing.io);
-    thread_b.await(native_platform.testing.io);
+    thread_a.await(platform.testing.io);
+    thread_b.await(platform.testing.io);
 
     try std.testing.expect(!failed.load(.acquire));
     const cached = &segment.shared.typed_doc_values_coverage[0];
@@ -3288,20 +3288,20 @@ test "concurrent searches safely observe in-place deletion publication" {
     var failed = std.atomic.Value(bool).init(false);
     var reader_a = Reader{ .snapshot = writer.snapshot(), .start = &start, .failed = &failed, .initial_live_count = doc_count };
     var reader_b = Reader{ .snapshot = writer.snapshot(), .start = &start, .failed = &failed, .initial_live_count = doc_count };
-    var thread_a = try native_platform.testing.io.concurrent(Reader.run, .{&reader_a});
+    var thread_a = try platform.testing.io.concurrent(Reader.run, .{&reader_a});
     defer {
         start.store(true, .release);
-        thread_a.await(native_platform.testing.io);
+        thread_a.await(platform.testing.io);
     }
-    var thread_b = try native_platform.testing.io.concurrent(Reader.run, .{&reader_b});
+    var thread_b = try platform.testing.io.concurrent(Reader.run, .{&reader_b});
     defer {
         start.store(true, .release);
-        thread_b.await(native_platform.testing.io);
+        thread_b.await(platform.testing.io);
     }
     start.store(true, .release);
     for (docs[0..64]) |doc| try std.testing.expect(try writer.deleteById(doc.id));
-    thread_a.await(native_platform.testing.io);
-    thread_b.await(native_platform.testing.io);
+    thread_a.await(platform.testing.io);
+    thread_b.await(platform.testing.io);
 
     try std.testing.expect(!failed.load(.acquire));
     const results = try writer.snapshot().search(alloc, "body", &.{"common"}, doc_count);

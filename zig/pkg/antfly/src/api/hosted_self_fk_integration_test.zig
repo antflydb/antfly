@@ -402,7 +402,7 @@ test "self-FK retries only a proven durable precommit abort" {
             return .{ .status = response.status, .body = try alloc.dupe(u8, response.body) };
         }
     };
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     inline for (std.meta.tags(Mode)) |mode| {
         var fake: Fake = .{ .mode = mode };
@@ -1189,7 +1189,7 @@ fn mountedSelfFk(lost_replies: bool, restart_after_ack: bool, leader_transfer: b
     defer alloc.free(session_path);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var metadata = try metadata_runtime.Server.init(process_alloc, .{

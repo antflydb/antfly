@@ -24,10 +24,10 @@
 //! Prepared effects MUST join the primary rows in the existing durable 2PC
 //! prepare/decision. This module never commits independently. Raw effects are
 //! trusted-node internals, not a client-controlled public mutation API.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
-const time = native_platform.time;
+const time = platform.time;
 const transactions = @import("../transactions.zig");
 const generation_retirement = @import("relational_integrity_generation_retirement.zig");
 const Allocator = std.mem.Allocator;
@@ -781,7 +781,7 @@ test "relational integrity shared parent guards and fenced bounded action recove
     const alloc = std.testing.allocator;
     const DocStore = @import("../docstore.zig").DocStore;
     const lsm = @import("../lsm_backend.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -888,7 +888,7 @@ test "relational integrity shared parent guards and fenced bounded action recove
 
 test "distributed txn deferred unique swaps fence concurrent claims and survive prepared restart" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -935,7 +935,7 @@ test "distributed txn deferred unique swaps fence concurrent claims and survive 
 
 test "distributed txn deferred reference handoff commits atomically and rejects unseen children" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(path);

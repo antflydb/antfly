@@ -23,7 +23,7 @@ const platform = @import("antfly_platform");
 pub const Spool = struct {
     pub const Ref = struct { offset: u64, len: usize };
     alloc: std.mem.Allocator,
-    io_impl: ?*platform.Threaded = null,
+    io_impl: ?*platform.Io.Threaded = null,
     file: ?std.Io.File = null,
     path: ?[]u8 = null,
     size: u64 = 0,
@@ -45,9 +45,9 @@ pub const Spool = struct {
 
     fn ensureFile(self: *Spool) !void {
         if (self.file != null) return;
-        const impl = try self.alloc.create(platform.Threaded);
+        const impl = try self.alloc.create(platform.Io.Threaded);
         errdefer self.alloc.destroy(impl);
-        impl.* = platform.Threaded.init(self.alloc, .{});
+        impl.* = platform.Io.Threaded.init(self.alloc, .{});
         errdefer impl.deinit();
         const io = impl.io();
         var random: [16]u8 = undefined;

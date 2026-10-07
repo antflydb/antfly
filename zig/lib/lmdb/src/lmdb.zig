@@ -62,7 +62,7 @@ fn lockAtomic(mutex: *std.atomic.Mutex) void {
 }
 
 fn backoffWriterLockRetry() void {
-    platform.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_lock_retry_sleep_ns)), .awake) catch {};
+    platform.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_lock_retry_sleep_ns)), .awake) catch {};
 }
 
 fn lockWrapperEnvironment(env: *Environment) void {
@@ -2888,14 +2888,14 @@ fn tmpPath(buf: []u8) [*:0]const u8 {
     const ts = @as(u64, @intCast(tspec.sec)) * std.time.ns_per_s + @as(u64, @intCast(tspec.nsec));
     const pid: u32 = @intCast(std.posix.system.getpid());
     const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, pid, ts }) catch unreachable;
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

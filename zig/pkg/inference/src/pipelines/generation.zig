@@ -12245,7 +12245,7 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
     };
 
     var driver = StubDriver{ .coordinator = &coordinator };
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     try runStepLoop(allocator, &coordinator, &lease, @ptrCast(&work_byte), .decode, io_impl.io(), null, &driver);
@@ -12294,7 +12294,7 @@ test "runStepLoop cancellation removes idle stack work without executing it" {
     };
 
     var driver = StubDriver{};
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     try std.testing.expectError(
@@ -12355,7 +12355,7 @@ test "runStepLoop yields when no step is currently claimable" {
     };
 
     var driver = StubDriver{ .ready_after = 2 };
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     try runStepLoop(allocator, &coordinator, &lease, @ptrCast(&ghost_work), .decode, io_impl.io(), null, &driver);
@@ -12419,7 +12419,7 @@ test "runStepLoop drains a multi-item step from a stub driver" {
     };
 
     var driver = StubDriver{ .coordinator = &coordinator, .leader_ptr = @ptrCast(&work_a) };
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     try runStepLoop(allocator, &coordinator, &lease_a, @ptrCast(&work_a), .decode, io_impl.io(), null, &driver);

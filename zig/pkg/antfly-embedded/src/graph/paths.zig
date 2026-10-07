@@ -25,12 +25,12 @@
 //!   min_weight: Dijkstra sum — minimize sum of non-negative edge weights
 //!   max_weight: Dijkstra log — maximize product of edge weights in [0, 1]
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 const graph_mod = @import("graph.zig");
 const Edge = graph_mod.Edge;
 const EdgeDirection = graph_mod.EdgeDirection;
@@ -1649,14 +1649,14 @@ const docstore = @import("../storage/docstore.zig");
 fn tmpPath(buf: []u8, label: []const u8) [*:0]const u8 {
     const ns = platform_time.monotonicNs();
     const slice = std.fmt.bufPrint(buf, "/tmp/antfly-path-{s}-{d}\x00", .{ label, ns }) catch unreachable;
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

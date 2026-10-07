@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -353,7 +353,7 @@ pub const Builder = struct {
         plan: publication_plan.TablePublicationPlan,
         cancellation: CancellationToken,
     ) !BuildResult {
-        var fallback: ?native_platform.Threaded = if (self.io == null) threadedIo() else null;
+        var fallback: ?platform.Io.Threaded = if (self.io == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         return self.publishNamespaceWithMetricAndPlanGuardedUntil(namespace, vector_metric, plan, null, .{
             .io = self.io orelse fallback.?.io(),
@@ -369,7 +369,7 @@ pub const Builder = struct {
         publication_guard: ?work_lease.PublicationGuard,
         cancellation: ?maintenance_cancellation.Token,
     ) !BuildResult {
-        var fallback: ?native_platform.Threaded = if (self.io == null and cancellation == null) threadedIo() else null;
+        var fallback: ?platform.Io.Threaded = if (self.io == null and cancellation == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         const io = if (cancellation) |token| token.io else self.io orelse fallback.?.io();
         if (publication_guard == null) {
@@ -1159,7 +1159,7 @@ pub const Builder = struct {
         defer head.deinit(self.alloc);
         const current = head.manifest orelse return null;
 
-        var fallback: ?native_platform.Threaded = if (self.io == null and parent_cancellation == null) threadedIo() else null;
+        var fallback: ?platform.Io.Threaded = if (self.io == null and parent_cancellation == null) threadedIo() else null;
         defer if (fallback) |*value| value.deinit();
         const io = if (parent_cancellation) |token| token.io else self.io orelse fallback.?.io();
         var protection = try GraphSourceProtection.initAt(self.progress, namespace, current.version, parent_cancellation);
@@ -2930,13 +2930,13 @@ test "serverless builder graph impact admits scratch input and cancellation and 
     try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, graphProjectionChangedForMutationsAlloc(a, "docs", &before, &after, &mutations, null, .{ .max_working_set_bytes = 1 }));
     try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, graphProjectionChangedForMutationsAlloc(a, "docs", &before, &after, &mutations, null, .{ .max_input_bytes = 1 }));
     var canceled = std.atomic.Value(bool).init(true);
-    try std.testing.expectError(error.Canceled, graphProjectionChangedForMutationsAlloc(a, "docs", &before, &after, &mutations, .{ .io = native_platform.testing.io, .requested = &canceled }, .{}));
+    try std.testing.expectError(error.Canceled, graphProjectionChangedForMutationsAlloc(a, "docs", &before, &after, &mutations, .{ .io = platform.testing.io, .requested = &canceled }, .{}));
     const Check = struct {
         fn run(alloc: Allocator, old: []const query_mod.QueryMaterializedDocument, new: []const query_mod.QueryMaterializedDocument, wal: []const query_mod.QueryMaterializerMutation) !void {
             try std.testing.expect(!try graphProjectionChangedForMutationsAlloc(alloc, "docs", old, new, wal, null, .{}));
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(a, Check.run, .{ &before, &after, &mutations });
+    try platform.allocator.checkAllAllocationFailures(a, Check.run, .{ &before, &after, &mutations });
 }
 
 fn findMaterializedDocument(
@@ -4378,7 +4378,7 @@ pub const GraphSourceProtection = struct {
             // Renew only existing live rights, after validating the writer's
             // authority. A fenced owner cannot reacquire a retired source.
             try lease.check();
-            const now = native_platform.time.realtimeNs();
+            const now = platform.time.realtimeNs();
             if (lease.unix_deadline -| now < graph_read_lease.reuse_min_ns)
                 self.lease = try self.cache.acquire(self.progress, self.namespace, self.version);
         }
@@ -5195,7 +5195,7 @@ fn freeParsedGraphEdges(alloc: Allocator, edges: []ParsedGraphEdge) void {
 }
 
 test "serverless graph builder parser propagates allocation failure without losing edges" {
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, struct {
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, struct {
         fn run(alloc: Allocator) !void {
             const edges = try parseGraphEdgesAlloc(alloc, "{\"graph_edges\":[{\"target\":\"b\",\"edge_type\":\"link\",\"target_table\":\"other\"}]}");
             defer freeParsedGraphEdges(alloc, edges);
@@ -5220,7 +5220,7 @@ test "serverless graph builder admits input scratch identities and output before
     }) |limits| {
         try std.testing.expectError(error.LakeSidecarBuildBudgetExceeded, buildGraphSegmentWithLimitsAlloc(a, "docs", &docs, true, null, limits));
     }
-    try native_platform.allocator.checkAllAllocationFailures(a, struct {
+    try platform.allocator.checkAllAllocationFailures(a, struct {
         fn run(alloc: Allocator, input: []const query_mod.QueryMaterializedDocument) !void {
             const built = try buildGraphSegmentWithLimitsAlloc(alloc, "docs", input, true, null, .{});
             defer if (built.payload) |payload| alloc.free(payload);
@@ -6610,7 +6610,7 @@ test "serverless builder prediction admits allocations and reuses unchanged text
             defer prediction.deinit(failing);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(alloc, PredictionCheck.run, .{ &builder, prediction_plan });
+    try platform.allocator.checkAllAllocationFailures(alloc, PredictionCheck.run, .{ &builder, prediction_plan });
 
     var second_result = try builder.publishNamespace("docs");
     defer second_result.deinit(alloc);
@@ -7959,8 +7959,8 @@ test "serverless external selector transitions preserve resolved sidecars withou
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

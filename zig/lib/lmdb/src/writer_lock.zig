@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -141,7 +141,7 @@ fn clearOwner(fd: std.posix.fd_t) Error!void {
 fn readAllAtOffset(fd: std.posix.fd_t, bytes: []u8, offset: usize) Error!void {
     var read_len: usize = 0;
     while (read_len < bytes.len) {
-        const rc = native_platform.c.pread(fd, bytes.ptr + read_len, bytes.len - read_len, @intCast(offset + read_len));
+        const rc = platform.c.pread(fd, bytes.ptr + read_len, bytes.len - read_len, @intCast(offset + read_len));
         switch (std.posix.errno(rc)) {
             .SUCCESS => {
                 const n: usize = @intCast(rc);

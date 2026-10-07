@@ -13,14 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ant_json = @import("antfly-json");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const request_context = @import("antfly_inference_execution_context");
 pub const RequestContext = request_context.RequestContext;
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const builtin = @import("builtin");
 const httpx = @import("httpx");
 const hbs = @import("handlebars");
@@ -63,7 +63,7 @@ const remote_capabilities = @import("antfly_inference_remote_capabilities");
 const execution_context = @import("antfly_inference_execution_context");
 const shared_vector = @import("antfly_vector").vector;
 const antfly_image = @import("antfly_image");
-var traced_local_batches = native_platform.atomic.Value(u64).init(0);
+var traced_local_batches = platform.atomic.Value(u64).init(0);
 
 pub const SparseEmbedding = db_embedder.SparseEmbedding;
 
@@ -520,21 +520,21 @@ pub const InitOptions = struct {
 fn bindOwnedHttpIoIfNeeded(
     alloc: std.mem.Allocator,
     options: *InitOptions,
-) !?*native_platform.Threaded {
+) !?*platform.Io.Threaded {
     if (options.io != null) return null;
-    const io_impl = try alloc.create(native_platform.Threaded);
+    const io_impl = try alloc.create(platform.Io.Threaded);
     errdefer alloc.destroy(io_impl);
     // The caller allocator owns only this stable-lifetime shell. Threaded uses
     // its allocator from worker threads for futures, groups, and runtime
     // bookkeeping, so its internal allocator must be thread-safe regardless
     // of whether the public owner supplied an arena or another local allocator.
-    io_impl.* = native_platform.Threaded.init(std.heap.smp_allocator, .{});
+    io_impl.* = platform.Io.Threaded.init(std.heap.smp_allocator, .{});
     options.io = io_impl.io();
     options.bounded_http_request = true;
     return io_impl;
 }
 
-fn deinitOwnedHttpIo(alloc: std.mem.Allocator, owned: ?*native_platform.Threaded) void {
+fn deinitOwnedHttpIo(alloc: std.mem.Allocator, owned: ?*platform.Io.Threaded) void {
     const io_impl = owned orelse return;
     io_impl.deinit();
     alloc.destroy(io_impl);
@@ -559,8 +559,8 @@ const query_cache_secret_refresh_interval_ns: u64 = std.time.ns_per_s;
 const dimension_probe_text = "antfly embedding dimension probe";
 
 fn monotonicNowNs() u64 {
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -715,7 +715,7 @@ test "managed embedding request overlays borrow capability cache synchronization
         .dimensions = 8,
         .remote_capability_cache = remote_capabilities.Cache.init(
             std.testing.allocator,
-            native_platform.Threaded.global_single_threaded.io(),
+            platform.Io.Threaded.global_single_threaded.io(),
         ),
     };
     defer entry.remote_capability_cache.?.deinit();
@@ -1030,7 +1030,7 @@ fn attachManagedGoogleCredentialManager(
     if (owned_manager) |manager| {
         manager.* = google_auth.CredentialManager.init(
             alloc,
-            io orelse native_platform.Threaded.global_single_threaded.io(),
+            io orelse platform.Io.Threaded.global_single_threaded.io(),
         );
     }
     const manager = if (provider_runtime) |runtime|
@@ -1069,7 +1069,7 @@ pub const ManagedEmbedder = struct {
     /// lifetime-owned concurrent service across every entry and invocation.
     /// The heap allocation keeps std.Io's self pointer stable if this aggregate
     /// is moved after construction.
-    owned_http_io: ?*native_platform.Threaded = null,
+    owned_http_io: ?*platform.Io.Threaded = null,
     owned_http_client: ?*httpx.Client = null,
     owned_google_credentials: ?*google_auth.CredentialManager = null,
 
@@ -2110,7 +2110,7 @@ fn checkEntryDispatchDeadline(entry: *const ManagedEmbeddingEntry) !void {
 }
 
 fn embeddingIo(entry: *const ManagedEmbeddingEntry) std.Io {
-    return entry.io orelse native_platform.Threaded.global_single_threaded.io();
+    return entry.io orelse platform.Io.Threaded.global_single_threaded.io();
 }
 
 /// Managed constructors always bind remote transports to either the caller's
@@ -2233,7 +2233,7 @@ pub fn testManagedEmbedderConstructorAllocationFailureCleanup() !void {
         fn run(alloc: std.mem.Allocator) !void {
             const initialized = ManagedEmbedder.initFromIndexesJsonWithOptions(alloc,
                 \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"openai","model":"text-embedding-3-small"}}}
-            , .{ .io = native_platform.Threaded.global_single_threaded.io() });
+            , .{ .io = platform.Io.Threaded.global_single_threaded.io() });
             var managed = try initialized;
             managed.deinit();
         }
@@ -2377,7 +2377,7 @@ pub fn testManagedEmbeddingRequestContextProgress() !void {
 }
 
 pub fn testEmbeddingProviderDeadlines() !void {
-    const io = native_platform.Threaded.global_single_threaded.io();
+    const io = platform.Io.Threaded.global_single_threaded.io();
     try provider_limits.testCancellationAndDeadline();
 
     const indexes_json =
@@ -4682,7 +4682,7 @@ fn buildManagedEmbeddingEntry(
         else
             null,
         .remote_capability_cache = if (provider == .antfly and antfly_provider == null and options.remote_capability_cache == null)
-            remote_capabilities.Cache.init(alloc, options.io orelse native_platform.Threaded.global_single_threaded.io())
+            remote_capabilities.Cache.init(alloc, options.io orelse platform.Io.Threaded.global_single_threaded.io())
         else
             null,
     };
@@ -7079,7 +7079,7 @@ pub fn testManagedVertexCredentialManagerLifetime() !void {
     ;
     var provider_runtime = ProviderRuntime.init(
         std.testing.allocator,
-        native_platform.Threaded.global_single_threaded.io(),
+        platform.Io.Threaded.global_single_threaded.io(),
     );
     defer provider_runtime.deinit();
 
@@ -7121,7 +7121,7 @@ test "request-scoped managed Bedrock embedders borrow region-scoped credential c
     ;
     var provider_runtime = ProviderRuntime.init(
         std.testing.allocator,
-        native_platform.Threaded.global_single_threaded.io(),
+        platform.Io.Threaded.global_single_threaded.io(),
     );
     defer provider_runtime.deinit();
 
@@ -7346,7 +7346,7 @@ test "managed embedder owned numeric lease executes without cache residency and 
     try listener.start();
     const url = try listener.baseUri(alloc);
     defer alloc.free(url);
-    var cache = remote_capabilities.Cache.init(alloc, native_platform.testing.io);
+    var cache = remote_capabilities.Cache.init(alloc, platform.testing.io);
     defer cache.deinit();
     var entries = [_]ManagedEmbeddingEntry{.{
         .alloc = alloc,
@@ -7356,7 +7356,7 @@ test "managed embedder owned numeric lease executes without cache residency and 
         .base_url = url,
         .dimensions = 2,
         .declared_inputs = .{ .text = true, .image = true },
-        .io = native_platform.testing.io,
+        .io = platform.testing.io,
         .shared_remote_capability_cache = &cache,
     }};
     var managed = ManagedEmbedder{ .alloc = alloc, .entries = &entries };
@@ -7700,7 +7700,7 @@ test "managed embedder enforces multi-source producer and vector-space contracts
 
 pub fn testQueryEmbeddingCacheKeys() !void {
     var local = TestLocalDenseProvider{ .dimensions = 3 };
-    const test_io = native_platform.Threaded.global_single_threaded.io();
+    const test_io = platform.Io.Threaded.global_single_threaded.io();
     var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator,
         \\{
         \\  "first":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/clipclap"}},
@@ -8660,7 +8660,7 @@ pub fn testRemoteEmbeddingCancellation() !void {
     , .{base_uri});
     defer alloc.free(indexes_json);
 
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var cancellation = std.atomic.Value(bool).init(false);
     var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(alloc, indexes_json, .{
@@ -8680,12 +8680,12 @@ pub fn testRemoteEmbeddingCancellation() !void {
         }
     };
     var err_out: ?anyerror = null;
-    var worker = try native_platform.testing.io.concurrent(Worker.run, .{ &managed, &err_out });
+    var worker = try platform.testing.io.concurrent(Worker.run, .{ &managed, &err_out });
     while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     const started_ns = monotonicNowNs();
     cancellation.store(true, .release);
-    worker.await(native_platform.testing.io);
+    worker.await(platform.testing.io);
     const elapsed_ns = monotonicNowNs() - started_ns;
     app.release.store(true, .release);
     while (!app.completed.load(.acquire)) std.atomic.spinLoopHint();
@@ -8730,12 +8730,12 @@ pub fn testRemoteEmbeddingCancellation() !void {
         }
     };
     err_out = null;
-    var parts_worker = try native_platform.testing.io.concurrent(PartsWorker.run, .{ &multimodal, &err_out });
+    var parts_worker = try platform.testing.io.concurrent(PartsWorker.run, .{ &multimodal, &err_out });
     while (!app.entered.load(.acquire)) std.atomic.spinLoopHint();
 
     const parts_started_ns = monotonicNowNs();
     parts_cancellation.store(true, .release);
-    parts_worker.await(native_platform.testing.io);
+    parts_worker.await(platform.testing.io);
     const parts_elapsed_ns = monotonicNowNs() - parts_started_ns;
     app.release.store(true, .release);
     while (!app.completed.load(.acquire)) std.atomic.spinLoopHint();
@@ -8797,9 +8797,9 @@ pub fn testFileBackedApiKeyRotation() !void {
         }
     };
 
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const directory = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", alloc);
     defer alloc.free(directory);
@@ -9771,7 +9771,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     const resolved = try dense_interface.resolvePartLease(std.testing.allocator, "semantic_idx");
     const discoveries_after_planning = local.capability_calls;
     var planned = dense_interface.withPartLease(resolved);
-    planned.part_request_context = .{ .io = native_platform.testing.io, .deadline_ns = null };
+    planned.part_request_context = .{ .io = platform.testing.io, .deadline_ns = null };
     const planned_vectors = try planned.embedDensePartItems(std.testing.allocator, "semantic_idx", &parts, 3);
     defer db_embedder.freeDenseEmbeddingBatch(std.testing.allocator, planned_vectors);
     try std.testing.expectEqual(discoveries_after_planning, local.capability_calls);
@@ -9789,7 +9789,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
 
 pub fn testBedrockCredentialTrafficBypassesModelQuota() !void {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var registry = provider_limits.Registry.init(alloc);
     defer registry.deinit();
     var runtime = ProviderRuntime.init(alloc, io);
@@ -9813,7 +9813,7 @@ pub fn testBedrockCredentialTrafficBypassesModelQuota() !void {
     config.timeouts.request_ms = 500;
     var client = httpx.Client.initWithConfig(alloc, io, config);
     defer client.deinit();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "token", .data = "test-web-identity" });
     const token_path = try tmp.dir.realPathFileAlloc(io, "token", alloc);
@@ -10007,12 +10007,12 @@ fn testManagedBedrockDimensionProbeCache(validation: bool) !void {
     defer cfg.deinit();
     var registry = provider_limits.Registry.init(alloc);
     defer registry.deinit();
-    var runtime = ProviderRuntime.init(alloc, native_platform.testing.io);
+    var runtime = ProviderRuntime.init(alloc, platform.testing.io);
     runtime.limits = &registry;
     defer runtime.deinit();
     const cache = try runtime.bedrock_credentials.cacheForRegion("us-east-1");
     cache.deinit(alloc);
-    const options = InitOptions{ .io = native_platform.testing.io, .provider_runtime = &runtime };
+    const options = InitOptions{ .io = platform.testing.io, .provider_runtime = &runtime };
     const embedder = parsed.value.object.get("embedder").?;
     for (0..2) |attempt| {
         std.debug.print("BEDROCK_PROBE_CACHE validation={} attempt={d} expects CredentialCacheClosed\n", .{ validation, attempt });
@@ -10044,7 +10044,7 @@ fn testManagedBedrockCacheEntry(alloc: std.mem.Allocator, region: []const u8) !M
     errdefer alloc.free(base_url);
     return .{
         .alloc = alloc,
-        .io = native_platform.testing.io,
+        .io = platform.testing.io,
         .index_name = index_name,
         .provider = .bedrock,
         .model = model,
@@ -10064,7 +10064,7 @@ fn testManagedBedrockOwnedCacheCleanup(alloc: std.mem.Allocator) !void {
 }
 
 fn testManagedBedrockBorrowedCacheCleanup(alloc: std.mem.Allocator) !void {
-    var runtime = ProviderRuntime.init(alloc, native_platform.testing.io);
+    var runtime = ProviderRuntime.init(alloc, platform.testing.io);
     defer runtime.deinit();
     var east: ?*bedrock_provider.CredentialCache = null;
     for ([_][]const u8{ "us-east-1", "us-west-2", "us-east-1" }) |region| {
@@ -10095,7 +10095,7 @@ test "managed embedder probe cache borrowed allocation failures preserve region 
 
 test "managed embedder probe cache attachment leaves other providers unchanged" {
     const alloc = std.testing.allocator;
-    var runtime = ProviderRuntime.init(alloc, native_platform.testing.io);
+    var runtime = ProviderRuntime.init(alloc, platform.testing.io);
     defer runtime.deinit();
     var entries = [_]ManagedEmbeddingEntry{try testManagedBedrockCacheEntry(alloc, "us-east-1")};
     defer entries[0].deinit(alloc);
@@ -10115,14 +10115,14 @@ test "managed embedder declared dimensions skip temporary Bedrock cache construc
     defer parsed.deinit();
     var cfg = try parseEmbeddingsIndexConfigFromValue(alloc, parsed.value);
     defer cfg.deinit();
-    var runtime = ProviderRuntime.init(alloc, native_platform.testing.io);
+    var runtime = ProviderRuntime.init(alloc, platform.testing.io);
     defer runtime.deinit();
     const dimensions = try resolveEmbeddingDimensionsForManagedConfig(
         alloc,
         "probe",
         cfg.value,
         parsed.value.object.get("embedder").?,
-        .{ .io = native_platform.testing.io, .provider_runtime = &runtime },
+        .{ .io = platform.testing.io, .provider_runtime = &runtime },
     );
     try std.testing.expectEqual(@as(u32, 2), dimensions);
     try std.testing.expectEqual(@as(usize, 0), runtime.bedrock_credentials.by_region.count());

@@ -99,7 +99,7 @@ pub fn mountedInitialScenario(scenario: Scenario) !void {
     defer alloc.free(data_catalog);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

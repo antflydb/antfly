@@ -1233,7 +1233,7 @@ fn clampU64ToUsize(value: u64) usize {
 
 fn sleepNs(ns: u64) void {
     if (ns == 0) return;
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Clock.Duration.sleep(.{
         .clock = .awake,

@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const raft_engine = @import("raft_engine");
@@ -34,7 +34,7 @@ pub const HttpTransportStack = struct {
     driver: *http_driver.HttpFrameDriver,
     transport_host: raft_engine.runtime.CodecTransportHost,
     snapshot_transport: *http_snapshot.HttpSnapshotTransport,
-    owned_io_impl: ?*native_platform.Threaded = null,
+    owned_io_impl: ?*platform.Io.Threaded = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -44,13 +44,13 @@ pub const HttpTransportStack = struct {
         snapshot_resolver: ?http_snapshot.SnapshotTargetResolver,
     ) !HttpTransportStack {
         try http_snapshot.HttpSnapshotTransport.validateConfig(cfg.snapshot);
-        var owned_io_impl: ?*native_platform.Threaded = null;
+        var owned_io_impl: ?*platform.Io.Threaded = null;
         errdefer if (owned_io_impl) |io_impl| {
             io_impl.deinit();
             alloc.destroy(io_impl);
         };
         const driver_io = io orelse blk: {
-            const io_impl = try alloc.create(native_platform.Threaded);
+            const io_impl = try alloc.create(platform.Io.Threaded);
             errdefer alloc.destroy(io_impl);
             // Embedded hosts may omit a shared backend runtime. Keep that
             // process-lifetime fallback finite as well.

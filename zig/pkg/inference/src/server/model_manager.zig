@@ -18,7 +18,6 @@
 // Given a model directory path, loads the manifest, creates a tokenizer
 // and backend session, and returns a pipeline ready for inference.
 
-const native_platform = @import("antfly_platform");
 const std = @import("std");
 const execution_control_mod = @import("../execution_control.zig");
 const InferenceExecutionControl = execution_control_mod.InferenceExecutionControl;
@@ -3720,12 +3719,12 @@ pub const ResourceOwnership = enum {
 /// transfer. The manager and teardown domain therefore hold independent refs.
 const OwnedManagerIo = struct {
     allocator: std.mem.Allocator,
-    runtime: platform.Threaded,
+    runtime: platform.Io.Threaded,
     refs: std.atomic.Value(usize) = .init(1),
 
     fn create(allocator: std.mem.Allocator) !*OwnedManagerIo {
         const self = try allocator.create(OwnedManagerIo);
-        self.* = .{ .allocator = allocator, .runtime = platform.Threaded.init(allocator, .{}) };
+        self.* = .{ .allocator = allocator, .runtime = platform.Io.Threaded.init(allocator, .{}) };
         return self;
     }
 
@@ -4081,7 +4080,7 @@ pub const ModelManager = struct {
     load_io: ?std.Io = null,
     /// Lazily allocated at a stable address for offline/direct callers. Never
     /// borrow a request's Io: shared loads and resident sessions outlive it.
-    owned_load_runtime: ?*platform.Threaded = null,
+    owned_load_runtime: ?*platform.Io.Threaded = null,
     owned_load_io_owner: ?*OwnedManagerIo = null,
     teardown_domain: ?*TeardownDomain = null,
     owned_load_watchdog: ?*HardCancellationWatchdog = null,
@@ -7216,7 +7215,7 @@ pub const ModelManager = struct {
             if (sm.kernel_jit.qualified_profile_path) |path|
                 try kernel_jit_profile_output.loadQualifiedProfileBundleIfPresent(
                     self.allocator,
-                    sm.io orelse native_platform.debug_io,
+                    sm.io orelse platform.debug_io,
                     path,
                 )
             else
@@ -9466,7 +9465,7 @@ test "cold direct loads own a concurrent runtime beyond the request lifetime" {
     defer manager.deinit();
     manager.configureServingPolicy(.{ .allow_unknown = true });
     {
-        var request_io = platform.Threaded.init(allocator, .{});
+        var request_io = platform.Io.Threaded.init(allocator, .{});
         defer request_io.deinit();
         var handle = try manager.loadFromDirCoordinated(root, &.{.native}, true, .{}, .{ .io = request_io.io() });
         defer handle.release();
@@ -9490,7 +9489,7 @@ test "cold direct loads own a concurrent runtime beyond the request lifetime" {
 }
 
 test "model eviction attachment returns with zero async workers and cancels on teardown" {
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .limited(1),
     });
@@ -9506,12 +9505,12 @@ test "model eviction attachment returns with zero async workers and cancels on t
 }
 
 test "model eviction attachment failure leaves maintenance retryable" {
-    var unavailable_io = platform.Threaded.init(std.testing.allocator, .{
+    var unavailable_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
     defer unavailable_io.deinit();
-    var available_io = platform.Threaded.init(std.testing.allocator, .{
+    var available_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .limited(1),
     });

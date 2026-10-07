@@ -15,7 +15,7 @@
 
 //! Client for the HA HTTP admin adapter.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -1363,7 +1363,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     const backup_root = try allocPrintPath(alloc, name, "backup-root", nonce);
     defer alloc.free(backup_root);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
@@ -1385,7 +1385,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
 }
 
 fn allocPrintPath(alloc: Allocator, comptime name: []const u8, comptime part: []const u8, nonce: u64) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const rel = try std.fmt.allocPrint(
         alloc,
@@ -1503,7 +1503,7 @@ fn testRecord(identity: standby_mod.Identity, lsn: u64, payload: []const u8) rep
 fn noOpApply(_: *anyopaque, _: replication_record.RecordView) anyerror!void {}
 
 fn writeTestFile(path: []const u8, bytes: []const u8) !void {
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{

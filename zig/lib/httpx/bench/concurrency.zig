@@ -5,7 +5,7 @@
 //!
 //! Run with: zig build bench-concurrency
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const httpx = @import("httpx");
@@ -28,11 +28,11 @@ fn nowNs() u64 {
 }
 
 fn sleepMs(ms: u64) void {
-    const ts = native_platform.c.timespec{
+    const ts = platform.c.timespec{
         .sec = @intCast(ms / 1000),
         .nsec = @intCast((ms % 1000) * std.time.ns_per_ms),
     };
-    _ = native_platform.c.nanosleep(&ts, null);
+    _ = platform.c.nanosleep(&ts, null);
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ fn benchAll(allocator: Allocator, client: *httpx.Client, specs: []const httpx.Re
 
 /// Guaranteed-concurrent all() with a fresh, bounded Io owner per sample.
 fn benchAllConcurrent(allocator: Allocator, client: *httpx.Client, specs: []const httpx.RequestSpec) u64 {
-    var worker_io = native_platform.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(specs.len) });
+    var worker_io = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(specs.len) });
     defer worker_io.deinit();
     const scheduling_io = worker_io.io();
     const WorkerCtx = struct {
@@ -193,10 +193,10 @@ pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     // Capacity for the largest 50-request batch and its server-side work.
-    var io_backend = native_platform.Threaded.init(allocator, .{ .concurrent_limit = .limited(128) });
+    var io_backend = platform.Io.Threaded.init(allocator, .{ .concurrent_limit = .limited(128) });
     defer io_backend.deinit();
     const io = io_backend.io();
-    var server_io = native_platform.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    var server_io = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
     defer server_io.deinit();
 
     // -- Header --

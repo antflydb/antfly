@@ -19,7 +19,7 @@
 //! tasks acquire independent leases. Nested helpers explicitly retain their
 //! caller's lease, even when a waiting capture has closed reader admission.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -276,11 +276,11 @@ test "storage.db snapshot admission lease can be released by another Io worker" 
             lease.release();
         }
     };
-    var admission: SnapshotAdmission = .{ .lock = .{ .io = native_platform.testing.io } };
+    var admission: SnapshotAdmission = .{ .lock = .{ .io = platform.testing.io } };
     var lease = admission.acquireMutation();
     defer lease.release();
-    var task = try native_platform.testing.io.concurrent(Work.release, .{&lease});
-    task.await(native_platform.testing.io);
+    var task = try platform.testing.io.concurrent(Work.release, .{&lease});
+    task.await(platform.testing.io);
     try std.testing.expect(admission.lock.tryLockExclusive());
     admission.lock.unlockExclusive();
 }

@@ -17,7 +17,7 @@
 //! identities, column ordinals and parameter types once. Evaluation follows
 //! typed instruction indices with bounded work; lazy branches preserve SQL
 //! three-valued logic and do not evaluate unreachable errors.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ast = @import("ast.zig");
@@ -1327,12 +1327,12 @@ test "SQL scalar bound arithmetic hot loop does not allocate per row" {
     defer program.deinit();
     var no_memory = std.heap.FixedBufferAllocator.init(&.{});
     var checksum: i64 = 0;
-    const start = std.Io.Clock.now(.awake, native_platform.testing.io).nanoseconds;
+    const start = std.Io.Clock.now(.awake, platform.testing.io).nanoseconds;
     for (0..100000) |i| {
         const result = try program.evaluate(no_memory.allocator(), &.{Datum.json(.{ .integer = @intCast(i) })}, &.{.{ .integer = 100 }}, .{});
         checksum += result.value.integer;
     }
-    const elapsed = std.Io.Clock.now(.awake, native_platform.testing.io).nanoseconds - start;
+    const elapsed = std.Io.Clock.now(.awake, platform.testing.io).nanoseconds - start;
     try std.testing.expectEqual(@as(i64, 15000534143), checksum);
     std.debug.print("SQL scalar hot loop: rows=100000 instructions={} allocated_bytes=0 checksum={} elapsed_ns={}\n", .{ program.instructions.len, checksum, elapsed });
 }

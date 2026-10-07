@@ -19,13 +19,13 @@
 //! projection. A staged physical root creates this checkpoint before it is
 //! atomically published; ordinary opens only load the path-owned identity.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 
 const file_name = "root_identity.checkpoint";
 const creation_lock_name = "root_identity.checkpoint.lock";
@@ -173,11 +173,11 @@ test "root identity rejects corruption" {
 }
 
 test "root identity concurrent first opens publish one incarnation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/identity", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    try fs_paths.createDirPathPortable(native_platform.testing.io, path);
+    try fs_paths.createDirPathPortable(platform.testing.io, path);
 
     const Worker = struct {
         io: std.Io,
@@ -199,21 +199,21 @@ test "root identity concurrent first opens publish one incarnation" {
 
     var ready = std.atomic.Value(u32).init(0);
     var start = std.atomic.Value(bool).init(false);
-    var first = Worker{ .io = native_platform.testing.io, .path = path, .ready = &ready, .start = &start };
-    var second = Worker{ .io = native_platform.testing.io, .path = path, .ready = &ready, .start = &start };
-    var first_thread = try native_platform.testing.io.concurrent(Worker.run, .{&first});
+    var first = Worker{ .io = platform.testing.io, .path = path, .ready = &ready, .start = &start };
+    var second = Worker{ .io = platform.testing.io, .path = path, .ready = &ready, .start = &start };
+    var first_thread = try platform.testing.io.concurrent(Worker.run, .{&first});
     defer {
         start.store(true, .release);
-        first_thread.await(native_platform.testing.io);
+        first_thread.await(platform.testing.io);
     }
-    var second_thread = try native_platform.testing.io.concurrent(Worker.run, .{&second});
+    var second_thread = try platform.testing.io.concurrent(Worker.run, .{&second});
     while (ready.load(.acquire) != 2) platform_time.yieldBriefly();
     start.store(true, .release);
-    first_thread.await(native_platform.testing.io);
-    second_thread.await(native_platform.testing.io);
+    first_thread.await(platform.testing.io);
+    second_thread.await(platform.testing.io);
 
     if (first.err) |err| return err;
     if (second.err) |err| return err;
     try std.testing.expectEqual(first.state.?.incarnation, second.state.?.incarnation);
-    try std.testing.expectEqual(first.state.?.incarnation, (try load(std.testing.allocator, native_platform.testing.io, path)).incarnation);
+    try std.testing.expectEqual(first.state.?.incarnation, (try load(std.testing.allocator, platform.testing.io, path)).incarnation);
 }

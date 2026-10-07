@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const object_storage = @import("../storage/object_storage.zig");
@@ -134,7 +134,7 @@ pub const OpenedObjectStore = struct {
     s3_client: ?*object_storage.S3.Client = null,
     owns_client: bool = true,
     credential_context: ?*AwsCredentialContext = null,
-    credential_io: ?*native_platform.Threaded = null,
+    credential_io: ?*platform.Io.Threaded = null,
     bucket: []u8,
     prefix: []u8,
 
@@ -348,7 +348,7 @@ pub const OpenedObjectStore = struct {
         var cfg = try s3ConfigAlloc(alloc, config_options);
         var cfg_owned = true;
         errdefer if (cfg_owned) cfg.deinit(alloc);
-        var credential_io: ?*native_platform.Threaded = null;
+        var credential_io: ?*platform.Io.Threaded = null;
         errdefer if (credential_io) |io| {
             io.deinit();
             alloc.destroy(io);
@@ -359,7 +359,7 @@ pub const OpenedObjectStore = struct {
             alloc.destroy(context);
         };
         if (dynamic) {
-            const io = try alloc.create(native_platform.Threaded);
+            const io = try alloc.create(platform.Io.Threaded);
             io.* = @import("antfly_runtime_fs").threaded_io_limits.initServerlessObjectStore(alloc);
             credential_io = io;
             const context = try alloc.create(AwsCredentialContext);

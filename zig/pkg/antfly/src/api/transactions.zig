@@ -13,10 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const batch_api = @import("antfly_local_sources").api_batch;
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const distributed_txn = @import("distributed_txn.zig");
@@ -25,7 +25,7 @@ const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const mem_backend = @import("antfly_local_sources").storage_mem_backend;
 const lease_mod = @import("antfly_local_sources").storage_db_lease;
 const sql_connection_record = @import("sql_connection_record.zig");
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 
 const session_prefix = "\x00\x00__api_txn_sessions__:";
 const session_lease_prefix = "\x00\x00__api_txn_session_leases__:";
@@ -5614,7 +5614,7 @@ test "transaction session registry begins and removes sessions" {
 }
 
 test "durable transaction sessions preserve and enforce principal bindings" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-principal", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -5871,9 +5871,9 @@ test "transaction commit execution yields through caller io and preserves owners
             self.held = null;
         }
     };
-    var waiter = Wait{ .held = try registry.acquireCommitExecution(txn_id, native_platform.testing.io) };
+    var waiter = Wait{ .held = try registry.acquireCommitExecution(txn_id, platform.testing.io) };
     defer if (waiter.held) |held| held.release();
-    var vtable = native_platform.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.sleep = Wait.sleep;
     const io: std.Io = .{ .userdata = &waiter, .vtable = &vtable };
     try std.testing.expectError(error.Canceled, registry.acquireCommitExecution(txn_id, io));
@@ -5888,7 +5888,7 @@ test "transaction commit execution yields through caller io and preserves owners
 }
 
 test "durable transaction sessions retain terminal commit coordinator handoff" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-terminal", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -6202,7 +6202,7 @@ test "durable session limits bound count and encoded record size" {
 }
 
 test "transaction session registry adopts durable session ownership" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-store", .{tmp.sub_path});
@@ -6227,7 +6227,7 @@ test "transaction session registry adopts durable session ownership" {
 
 test "transaction session commit request is sealed across retries" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-commit-seal-store", .{tmp.sub_path});
@@ -6275,7 +6275,7 @@ test "transaction session commit request is sealed across retries" {
 
 test "durable recovery index tracks only validated commit execution and terminal handoff" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-recovery-index", .{tmp.sub_path});
     defer alloc.free(path);
@@ -6345,7 +6345,7 @@ test "durable recovery index tracks only validated commit execution and terminal
 
 test "durable recovery scan rotates fairly beyond one maintenance batch" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-recovery-fairness", .{tmp.sub_path});
     defer alloc.free(path);
@@ -6413,7 +6413,7 @@ test "in-memory recovery scan rotates fairly when the first page remains pending
 
 test "background recovery adopts an expired shared-store owner lease" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-recovery-adopt", .{tmp.sub_path});
     defer alloc.free(path);
@@ -6449,7 +6449,7 @@ test "background recovery adopts an expired shared-store owner lease" {
 }
 
 test "transaction session registry only adopts durable sessions after lease expiry" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-timeout-store", .{tmp.sub_path});
@@ -6481,7 +6481,7 @@ test "transaction session registry only adopts durable sessions after lease expi
 }
 
 test "transaction session adoption preserves newer durable state than a local cache" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-adopt-fresh-state", .{tmp.sub_path});
@@ -6520,7 +6520,7 @@ test "transaction session adoption preserves newer durable state than a local ca
 }
 
 test "transaction session ownership and lease transition atomically on failure" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-atomic-owner", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
@@ -6556,7 +6556,7 @@ test "transaction session ownership and lease transition atomically on failure" 
 }
 
 test "transaction session registry renews and releases separate lease records" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-lease-renew-store", .{tmp.sub_path});
@@ -6576,7 +6576,7 @@ test "transaction session registry renews and releases separate lease records" {
     const initial_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
     try std.testing.expect(initial_status.lease_expires_at > 0);
 
-    native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     _ = (try registry.createSavepoint(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
 
     const renewed_status = (try registry.getStatus(std.testing.allocator, session.txn_id)) orelse return error.TestExpectedEqual;
@@ -6587,7 +6587,7 @@ test "transaction session registry renews and releases separate lease records" {
 }
 
 test "transaction session registry reloads durable sessions from kv store" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-store", .{tmp.sub_path});
@@ -6622,7 +6622,7 @@ test "transaction session registry reloads durable sessions from kv store" {
 }
 
 test "transaction session registry reports status and cleans expired durable sessions" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-cleanup-store", .{tmp.sub_path});
@@ -6669,7 +6669,7 @@ test "transaction session registry reports status and cleans expired durable ses
 
 test "distributed txn constraint timing stage rollback and durable reload are atomic" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/timing", .{tmp.sub_path}, 0);
     defer alloc.free(path);
@@ -7032,7 +7032,7 @@ test "transaction session conflict responses include version details" {
 }
 
 test "transaction session registry can renew owned leases opportunistically" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/txn-session-opportunistic-renew-store", .{tmp.sub_path});

@@ -23,7 +23,7 @@
 //! unreachable are replaced with deterministic handlers that latch a harness
 //! violation instead.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const builtin = @import("builtin");
 const std = @import("std");
 
@@ -87,7 +87,7 @@ pub const CapabilitySet = struct {
 
 /// Capabilities whose semantics are implemented by this file. Adding a bit is
 /// an API promise and therefore requires conformance tests on both VoprIo and
-/// `native_platform.Threaded`.
+/// `platform.Io.Threaded`.
 pub const supported_capabilities = CapabilitySet.of(&.{
     .eager_async,
     .clock_read,
@@ -1735,11 +1735,11 @@ test "VoprIo unsupported operations latch a deterministic harness violation" {
     try std.testing.expectEqual(ViolationOperation.network_close, sim.firstCapabilityViolation().?.operation);
 }
 
-test "VoprIo vtable contains no native_platform.Threaded handlers" {
+test "VoprIo vtable contains no platform.Io.Threaded handlers" {
     var sim = try VoprIo.init(.{});
     defer sim.deinit();
     const io = sim.io();
-    var threaded = native_platform.Threaded.init(std.testing.allocator, .{});
+    var threaded = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer threaded.deinit();
     const host_io = threaded.io();
 

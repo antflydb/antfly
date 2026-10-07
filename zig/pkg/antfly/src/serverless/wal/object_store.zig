@@ -13,10 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const objectstore = @import("objectstore");
 const wal_types = @import("types.zig");
 const wal_store = @import("store.zig");
@@ -632,7 +632,7 @@ test "serverless objectstore WAL retained record cloning is allocation-failure s
             }
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "serverless objectstore-backed WAL conditionally appends and truncates over file uri" {
@@ -672,8 +672,8 @@ test "serverless objectstore-backed WAL conditionally appends and truncates over
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

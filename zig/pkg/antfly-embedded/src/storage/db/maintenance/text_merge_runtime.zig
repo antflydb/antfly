@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -22,7 +22,7 @@ const Allocator = std.mem.Allocator;
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const types = @import("../types.zig");
-const platform_clock = native_platform.clock;
+const platform_clock = platform.clock;
 const background_runtime_mod = @import("../../background_runtime.zig");
 const storage_io_mod = @import("../../lsm_backend/storage_io.zig");
 
@@ -429,7 +429,7 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
         if (builtin.is_test and test_block_after_task_begin.load(.acquire)) {
             test_task_begin_entered.store(true, .release);
-            while (!test_release_after_task_begin.load(.acquire)) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+            while (!test_release_after_task_begin.load(.acquire)) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
         }
 
         const execute_fd_epoch = self.native_storage_pool.admissionEpoch();
@@ -980,7 +980,7 @@ fn lockApplyExclusive(lock: *apply_rw_lock_mod.ApplyRwLock) void {
 }
 
 fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-    native_platform.sync.lockYielding(mutex);
+    platform.sync.lockYielding(mutex);
 }
 
 fn consumeTestStartFailure() bool {

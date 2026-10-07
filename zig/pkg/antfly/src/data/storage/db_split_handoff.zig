@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const data_store = @import("raft_apply_store.zig");
@@ -174,7 +174,7 @@ pub const SplitTransitionPhase = range_transition.TransitionPhase;
 
 pub const Destination = struct {
     alloc: std.mem.Allocator,
-    io_impl: native_platform.Threaded,
+    io_impl: platform.Io.Threaded,
     root_dir: []u8,
     db: *db_mod.DB,
     owned_db: ?*db_mod.DB,
@@ -1335,13 +1335,13 @@ fn receiverCoversDonor(receiver: db_types.ByteRange, donor: db_types.ByteRange) 
 }
 
 test "db split destination read-only open does not create missing root" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-handoff-readonly-missing", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_root);
 
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), dst_root, .{}));
 
@@ -1350,7 +1350,7 @@ test "db split destination read-only open does not create missing root" {
 }
 
 test "db split destination applies handoff and filtered split deltas" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-handoff-src", .{tmp.sub_path});
@@ -1416,7 +1416,7 @@ test "db split destination applies handoff and filtered split deltas" {
 }
 
 test "db split successor bootstrap atomically replaces stale destination generation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const dst_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-handoff-successor", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_root);
@@ -1484,7 +1484,7 @@ test "db split successor bootstrap atomically replaces stale destination generat
 }
 
 test "db split destination persists handoff state across reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-handoff-reopen-src", .{tmp.sub_path});
@@ -1552,7 +1552,7 @@ test "db split destination persists handoff state across reopen" {
 }
 
 test "db split sync coordinator resumes catch-up across source and destination reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-src", .{tmp.sub_path});
@@ -1669,7 +1669,7 @@ test "db split sync coordinator resumes catch-up across source and destination r
 }
 
 test "db split sync coordinator allocates destination identity namespace" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-identity-src", .{tmp.sub_path});
@@ -1725,7 +1725,7 @@ test "db split sync coordinator allocates destination identity namespace" {
 }
 
 test "db split status rejects stale destination identity namespace" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-stale-identity-src", .{tmp.sub_path});
@@ -1778,7 +1778,7 @@ test "db split status rejects stale destination identity namespace" {
 }
 
 test "db split status borrows the live raft apply store without a second writer" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-borrowed-src", .{tmp.sub_path});
@@ -1809,7 +1809,7 @@ test "db split status borrows the live raft apply store without a second writer"
 }
 
 test "db split status uses source acknowledgement without opening destination" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-status-source-ack-src", .{tmp.sub_path});
@@ -1849,7 +1849,7 @@ test "db split status uses source acknowledgement without opening destination" {
 }
 
 test "db split sync coordinator tracks explicit split transition phases" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-phase-src", .{tmp.sub_path});
@@ -1947,7 +1947,7 @@ test "db split sync coordinator tracks explicit split transition phases" {
 }
 
 test "db split sync coordinator can start source split from prepare" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-start-src", .{tmp.sub_path});
@@ -1988,7 +1988,7 @@ test "db split sync coordinator can start source split from prepare" {
 }
 
 test "db split sync coordinator can prepare source split again after rollback" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-sync-reprepare-src", .{tmp.sub_path});
@@ -2050,7 +2050,7 @@ test "db split sync coordinator can prepare source split again after rollback" {
 }
 
 test "db split coordinator rejects mismatched active transition destination" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const src_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-split-identity-src", .{tmp.sub_path});
@@ -2117,7 +2117,7 @@ test "db split coordinator rejects mismatched active transition destination" {
 }
 
 test "db split coordinator remains closed after failed reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-split-reopen-failure-source", .{tmp.sub_path});
@@ -2166,7 +2166,7 @@ test "db split coordinator remains closed after failed reopen" {
 
 test "db merge coordinator copies committed outcomes without replaying transforms or aborted intents" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const donor_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-outcomes-donor", .{tmp.sub_path});
     defer alloc.free(donor_root);
@@ -2261,7 +2261,7 @@ test "db merge coordinator copies committed outcomes without replaying transform
 
 test "db merge coordinator offline copy bounds memory and retries partial pages after reopen" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const donor_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-paged-donor", .{tmp.sub_path});
     defer alloc.free(donor_root);
@@ -2352,7 +2352,7 @@ test "db merge coordinator offline copy bounds memory and retries partial pages 
 
 test "db merge receiver cleanup retires orphan graph ttl artifacts" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/merge-orphan-graph", .{tmp.sub_path});
     defer alloc.free(root);
@@ -2383,7 +2383,7 @@ test "db merge receiver cleanup retires orphan graph ttl artifacts" {
 }
 
 test "db merge coordinator bootstraps receiver for donor range" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-donor", .{tmp.sub_path});
@@ -2492,7 +2492,7 @@ test "db merge coordinator bootstraps receiver for donor range" {
 }
 
 test "db merge coordinator requires durable bootstrap evidence for a pre-covering receiver" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-covered-donor", .{tmp.sub_path});
@@ -2545,7 +2545,7 @@ test "db merge coordinator requires durable bootstrap evidence for a pre-coverin
 }
 
 test "db merge coordinator finalize persists across reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-finalize-donor", .{tmp.sub_path});
@@ -2607,7 +2607,7 @@ test "db merge coordinator finalize persists across reopen" {
 
 test "db merge coordinator accepts successive donors and fences retired identities" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const receiver_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/successive-receiver", .{tmp.sub_path});
     defer alloc.free(receiver_root);
@@ -2663,7 +2663,7 @@ test "db merge coordinator accepts successive donors and fences retired identiti
 }
 
 test "db merge coordinator reassigns receiver identity namespace only after opt-in" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-reassign-donor", .{tmp.sub_path});
@@ -2731,7 +2731,7 @@ test "db merge coordinator reassigns receiver identity namespace only after opt-
 }
 
 test "db merge coordinator opt-in applies configured receiver identity namespace" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-reassign-target-donor", .{tmp.sub_path});
@@ -2860,7 +2860,7 @@ test "db merge coordinator opt-in applies configured receiver identity namespace
 }
 
 test "db merge coordinator allocates donor docs in receiver identity namespace" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-identity-donor", .{tmp.sub_path});
@@ -2958,7 +2958,7 @@ test "db merge coordinator allocates donor docs in receiver identity namespace" 
 }
 
 test "db merge coordinator rollback restores receiver base range" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-rollback-donor", .{tmp.sub_path});
@@ -3033,7 +3033,7 @@ test "db merge coordinator rollback restores receiver base range" {
 }
 
 test "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const donor_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/db-merge-rollback-reassign-donor", .{tmp.sub_path});

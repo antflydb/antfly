@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const inference_audio = @import("src/mod.zig");
@@ -288,7 +288,7 @@ fn printUsage(argv0: []const u8) void {
 
 fn runSweep(alloc: Allocator, config: Config) !Summary {
     var summary = Summary{};
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var dir = try std.Io.Dir.cwd().openDir(io_impl.io(), config.root_dir, .{ .iterate = true });
@@ -323,7 +323,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
         return try probeOneOpusRfcVector(alloc, root_dir, relative_path, print_success);
     }
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const full_path = try std.fs.path.join(alloc, &.{ root_dir, relative_path });
@@ -374,7 +374,7 @@ fn probeOneFile(alloc: Allocator, root_dir: []const u8, relative_path: []const u
 }
 
 fn probeOneOpusRfcVector(alloc: Allocator, root_dir: []const u8, relative_path: []const u8, print_success: bool) !Outcome {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const packet_stream_path = try std.fs.path.join(alloc, &.{ root_dir, relative_path });
@@ -483,7 +483,7 @@ fn allFinite(samples: []const f32) bool {
 }
 
 fn ensureSourcesAvailable(alloc: Allocator, io: std.Io, root_dir: []const u8, refresh: bool, allow_fetch: bool) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     try runChild(io, &.{ "mkdir", "-p", root_dir });
@@ -582,7 +582,7 @@ fn ensureSourcesAvailable(alloc: Allocator, io: std.Io, root_dir: []const u8, re
 }
 
 fn printStatus(alloc: Allocator, root_dir: []const u8) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     std.debug.print("status:\n  root_dir={s}\n", .{root_dir});

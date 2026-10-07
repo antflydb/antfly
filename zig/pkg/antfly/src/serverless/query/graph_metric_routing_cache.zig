@@ -16,7 +16,7 @@
 //! Bounded, process-local cache of authenticated immutable routing indexes.
 //! Leases keep borrowed node IDs alive. Eviction never invalidates a reader;
 //! pinned entries remain charged and admission bypasses a saturated cache.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const codec = @import("../graph_metric_segment/codec.zig");
@@ -156,7 +156,7 @@ pub const Cache = struct {
         self.retireFillLocked(index);
         _ = self.wake_epoch.fetchAdd(1, .release);
         self.mu.unlock();
-        (io orelse native_platform.debug_io).futexWake(u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+        (io orelse platform.debug_io).futexWake(u32, &self.wake_epoch.raw, std.math.maxInt(u32));
     }
 
     fn retireFillLocked(self: *Cache, index: usize) void {
@@ -195,7 +195,7 @@ pub const Cache = struct {
     pub fn awaitFill(self: *Cache, io: ?std.Io, cancellation: CancellationToken, observed_epoch: u32) !void {
         try cancellation.check();
         if (self.wake_epoch.load(.acquire) != observed_epoch) return;
-        try (io orelse native_platform.debug_io).futexWaitTimeout(u32, &self.wake_epoch.raw, observed_epoch, .{
+        try (io orelse platform.debug_io).futexWaitTimeout(u32, &self.wake_epoch.raw, observed_epoch, .{
             .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake },
         });
         try cancellation.check();
@@ -212,7 +212,7 @@ pub const Cache = struct {
     }
 
     fn lock(self: *Cache) void {
-        native_platform.sync.lockYielding(&self.mu);
+        platform.sync.lockYielding(&self.mu);
     }
 
     pub fn acquire(self: *Cache, key: [32]u8) ?Lease {
@@ -435,7 +435,7 @@ test "serverless graph metric routing cache coalesces misses and releases cancel
 }
 
 test "serverless graph metric routing cache wakes a concurrent waiter without duplicating a fill" {
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var cache = Cache{};

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const backend_erased = @import("../backend_erased.zig");
@@ -21,7 +21,7 @@ const docstore = @import("docstore.zig");
 
 const Allocator = std.mem.Allocator;
 
-fn testPath(allocator: Allocator, tmp: native_platform.testing.TmpDir, name: []const u8) ![]u8 {
+fn testPath(allocator: Allocator, tmp: platform.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
@@ -114,7 +114,7 @@ fn expectReopenedBoundState(runtime: *backend_erased.Store) !void {
 test "storage.lite native docstore conforms to bound backend contract" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-conformance.aflite");
@@ -131,7 +131,7 @@ test "storage.lite native docstore conforms to bound backend contract" {
 test "storage.lite native docstore conformance survives reopen" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-conformance-reopen.aflite");

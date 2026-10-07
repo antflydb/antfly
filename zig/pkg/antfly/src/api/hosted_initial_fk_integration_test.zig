@@ -14,7 +14,6 @@
 // limitations.
 
 //! Mounted metadata/data owner setup for hosted initial-FK publication.
-const native_platform = @import("antfly_platform");
 const std = @import("std");
 const platform = @import("antfly_platform");
 const metadata_runtime = @import("../metadata/runtime.zig");
@@ -93,7 +92,7 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
     defer alloc.free(data_catalog);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -340,7 +339,7 @@ test "mounted initial MATCH PARTIAL publication enforces constraints across rest
         if (!published) {
             placement_diagnostic: {
                 const svc = metadata.server.svc;
-                if (!svc.catalog_mutation_mutex.tryLock(native_platform.debug_io)) {
+                if (!svc.catalog_mutation_mutex.tryLock(platform.debug_io)) {
                     std.debug.print("linked hosted initial placement catalog lane is busy at deadline\n", .{});
                     break :placement_diagnostic;
                 }

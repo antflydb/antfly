@@ -16,7 +16,7 @@
 //! Embedded inference lifecycle and provider adapters. This module is compiled
 //! once in the inference archive and used directly only by non-linked tests.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const httpx = @import("httpx");
@@ -34,8 +34,8 @@ const runtime_paths = @import("antfly_inference_runtime_paths");
 const inference = @import("inference_server");
 const inference_bridge = @import("antfly_inference_bridge");
 const http_abi = @import("antfly_runtime_abi").http_abi;
-const platform_sync = native_platform.sync;
-const platform_time = native_platform.time;
+const platform_sync = platform.sync;
+const platform_time = platform.time;
 const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
 const inference_api = @import("inference_api");
 const inference_chunker = @import("inference_chunker");
@@ -1718,14 +1718,14 @@ test "standalone raster embedding control rejects cancellation before model reso
     };
     try std.testing.expectError(error.Cancelled, node.embedDenseRastersDirectWithExecutionControl(
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         .{ .cancellation = .{ .is_cancelled_fn = Canceled.requested } },
         "must-not-be-resolved",
         &.{},
     ));
     try std.testing.expectError(error.Timeout, node.embedDenseRastersDirectWithContext(
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         0,
         "must-not-be-resolved",
         &.{},
@@ -2806,26 +2806,26 @@ fn localModelCapabilities(
 
 test "encoded reader ABI enforces resolved model capabilities for Qwen3-VL generator bundles" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(native_platform.testing.io, "generators/owner/qwen");
-    try tmp.dir.writeFile(native_platform.testing.io, .{
+    try tmp.dir.createDirPath(platform.testing.io, "generators/owner/qwen");
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "generators/owner/qwen/config.json",
         .data = "{\"model_type\":\"qwen3_vl\"}",
     });
-    try tmp.dir.writeFile(native_platform.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "generators/owner/qwen/model_manifest.json",
         .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}",
     });
-    try tmp.dir.writeFile(native_platform.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "generators/owner/qwen/antfly_inference_bundle.json",
         .data = "{\"family\":\"qwen3_vl_gguf_bundle/v1\",\"decoder\":\"config.json\",\"projector\":\"model_manifest.json\"}",
     });
-    const models_root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", allocator);
+    const models_root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", allocator);
     defer allocator.free(models_root);
     var node = try inference.server.Node.init(allocator, .{ .models_dir = models_root });
     defer node.deinit();
-    const capabilities = try localModelCapabilities(&node, native_platform.testing.io, "owner/qwen", .read);
+    const capabilities = try localModelCapabilities(&node, platform.testing.io, "owner/qwen", .read);
     try std.testing.expect(capabilities.input_modalities.image);
     try std.testing.expectEqual(.serial_compatibility, capabilities.batch.mode);
     try std.testing.expectEqual(.read_result, capabilities.output);
@@ -3578,7 +3578,7 @@ fn pullModels(arena: std.mem.Allocator, io: std.Io, context: *const inference_br
     const models_dir = context.models_dir.slice() orelse
         try runtime_paths.defaultModelsDirForDataDirAlloc(arena, ".");
     const hub_config = download.HubConfig{
-        .token = request.token orelse native_platform.env.getenv("HF_TOKEN"),
+        .token = request.token orelse platform.env.getenv("HF_TOKEN"),
         .max_artifact_bytes = request.max_artifact_bytes orelse download.default_max_artifact_bytes,
         .max_model_bytes = request.max_model_bytes orelse download.default_max_model_bytes,
     };

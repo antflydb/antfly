@@ -13,10 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const objectstore = @import("objectstore");
 const catalog_types = @import("types.zig");
 const progress_store = @import("progress_store.zig");
@@ -1107,8 +1107,8 @@ test "serverless objectstore-backed progress store supports atomic stage CAS ove
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

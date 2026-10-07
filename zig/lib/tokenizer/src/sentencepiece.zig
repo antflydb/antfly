@@ -18,7 +18,7 @@
 // Supports BPE (Byte Pair Encoding) tokenization as used by Gemma, Gemini, etc.
 // Loads vocabulary from SentencePiece protobuf model files.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const proto = @import("proto.zig");
@@ -128,7 +128,7 @@ pub const Processor = struct {
     preserve_inline_specials_after_literal_bos: bool = false,
 
     pub fn initFromPath(allocator: std.mem.Allocator, path: []const u8) !Processor {
-        var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const data = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, allocator, .limited(256 * 1024 * 1024));
         defer allocator.free(data);

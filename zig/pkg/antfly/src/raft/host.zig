@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const build_options = @import("build_options");
@@ -128,7 +128,7 @@ pub const HostDeps = struct {
     data_proposal_admission: ?raft_engine.core.ProposalAdmission = null,
     /// Borrowed synchronization and monotonic clock authority; must outlive the host. The default
     /// supports blocking mutex waits without allocating a worker pool.
-    io: std.Io = native_platform.Threaded.global_single_threaded.io(),
+    io: std.Io = platform.Io.Threaded.global_single_threaded.io(),
     replica_catalog: ?catalog.ReplicaCatalog = null,
     peer_resolver: ?peer_resolver.PeerResolver = null,
     runtime_hooks: RuntimeHooks = .{},
@@ -476,7 +476,7 @@ pub const Host = struct {
                 self.calls += 1;
             }
         };
-        var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{ .io = native_platform.testing.io });
+        var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{ .io = platform.testing.io });
         defer host.deinit();
         var probe = Probe{};
         try host.registerProgressWake(.{ .ptr = &probe, .notify_fn = Probe.notify });
@@ -2703,7 +2703,7 @@ test "host does not perform path restore without a bootstrap authority owner" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/host-backup-failure-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -2834,7 +2834,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
     const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
     const backups_api = @import("../api/backups.zig");
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/host-backup-bootstrapper-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -2843,7 +2843,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
     const source_db_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/host-backup-bootstrapper-source", .{tmp.sub_path});
     defer std.testing.allocator.free(source_db_path);
 
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -2868,7 +2868,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
     const dest_root = try backups_api.shardSnapshotPath(std.testing.allocator, backup_root, "snap1", 91);
     defer std.testing.allocator.free(dest_root);
     try backups_api.copyDirectoryRecursive(std.testing.allocator, snapshot_root, dest_root);
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
     defer std.testing.allocator.free(backup_root_abs);
@@ -2876,7 +2876,7 @@ test "host restores through an explicitly authorized bootstrap owner" {
     defer std.testing.allocator.free(restore_location);
     var artifact_integrity = try backups_api.artifactIntegrityAlloc(
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         .native,
         dest_root,
     );
@@ -3002,7 +3002,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
     const backups_api = @import("../api/backups.zig");
     const storage_mod = @import("storage/catalog.zig");
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/host-backup-restart-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -3013,7 +3013,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
     const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/host-backup-restart-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
 
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -3040,7 +3040,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
     const dest_root = try backups_api.shardSnapshotPath(std.testing.allocator, backup_root, "snap1", 92);
     defer std.testing.allocator.free(dest_root);
     try backups_api.copyDirectoryRecursive(std.testing.allocator, snapshot_root, dest_root);
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const backup_root_abs = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, backup_root });
     defer std.testing.allocator.free(backup_root_abs);
@@ -3048,7 +3048,7 @@ test "host restores backup bootstrap replicas from file-backed catalog on restar
     defer std.testing.allocator.free(restore_location);
     var artifact_integrity = try backups_api.artifactIntegrityAlloc(
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         .native,
         dest_root,
     );

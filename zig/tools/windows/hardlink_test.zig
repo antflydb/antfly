@@ -13,12 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 test "Windows hardlinks preserve identity through relative directory handles and source removal" {
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "source");
     try tmp.dir.createDirPath(io, "destination");
@@ -67,10 +67,10 @@ test "Windows hardlinks preserve caller I/O authority" {
 }
 
 test "Windows hardlink cancellation prevents publication" {
-    var pool = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
+    var pool = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(2) });
     defer pool.deinit();
     const io = pool.io();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "source", .{});
     file.close(io);

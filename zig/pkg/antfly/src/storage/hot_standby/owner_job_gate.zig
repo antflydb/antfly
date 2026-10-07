@@ -21,7 +21,7 @@
 //! read-only observers alive, but owner-only mutation jobs stay disabled until
 //! a fenced promotion is handed off to the primary role.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const primary_mod = @import("primary.zig");
@@ -165,7 +165,7 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     const progress_raw = try allocPath(alloc, name, "progress", nonce);
     defer alloc.free(progress_raw);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), log_raw) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), slots_raw) catch {};

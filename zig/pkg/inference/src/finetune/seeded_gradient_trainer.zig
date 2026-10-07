@@ -16,7 +16,7 @@
 //! Host optimizer integration for explicit, independently computed VJPs.
 //! RealAutodiffTrainer remains the sole owner of parameter slots and Adam
 //! state. Every accumulation/update is staged and validated before publication.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ml = @import("ml").graph;
@@ -193,7 +193,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
     var requested = Probe{};
     const future = std.math.maxInt(u64);
     var base = Control{
-        .io = native_platform.testing.io,
+        .io = platform.testing.io,
         .deadline_ns = future - 2,
         .ptr = &original,
         .check_fn = Probe.check,
@@ -208,7 +208,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
     };
     var combined = CombinedControl{ .primary = base, .secondary = request };
     var active = combined.control();
-    try std.testing.expectEqual(native_platform.testing.io, active.io.?);
+    try std.testing.expectEqual(platform.testing.io, active.io.?);
     try std.testing.expectEqual(future - 2, active.deadline_ns.?);
     {
         // This exercises the real process-required guard/monitor contract
@@ -237,7 +237,7 @@ test "seeded gradient trainer binding control preserves worker carrier both canc
 
     // Explicit request carriers take precedence; a missing carrier above
     // inherited the original owner. Never discard the earlier deadline.
-    request.io = .{ .userdata = &requested, .vtable = native_platform.testing.io.vtable };
+    request.io = .{ .userdata = &requested, .vtable = platform.testing.io.vtable };
     request.hard_cancellation = .{ .ptr = &requested, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm };
     request.deadline_ns = future - 3;
     combined.secondary = request;
@@ -1101,7 +1101,7 @@ test "seeded gradient trainer native transaction admission bounds measured accum
 }
 
 test "seeded gradient trainer native transaction admission ownership survives every allocation failure" {
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseNativeAdmission, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseNativeAdmission, .{});
 }
 
 fn hashInteger(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
@@ -1191,7 +1191,7 @@ test "seeded gradient trainer preserves groups absent gradients and partial wind
 }
 
 test "seeded gradient trainer allocation failures preserve parameter and moment ownership" {
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseTrainer, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, exerciseTrainer, .{});
 }
 
 const restore_parameters = [_]Parameter{.{ .name = "restore.weight", .values = &.{ 1, 2 }, .dimensions = &.{2}, .group = 0 }};
@@ -1237,7 +1237,7 @@ test "seeded gradient trainer restore admits header heap and file before parsing
     var cb = compute.computeBackend();
     var trainer = try Trainer.init(a, &cb, &restore_parameters, .{ .groups = &restore_groups });
     defer trainer.deinit();
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/restore.safetensors", .{temporary.sub_path});
     defer a.free(path);
@@ -1281,7 +1281,7 @@ test "seeded gradient trainer restore admits header heap and file before parsing
     try std.testing.expectEqual(before, trainer.identity());
     try std.testing.expectEqualSlices(f32, &weights, trainer.owner.regular_params.items[0].weights);
     try exerciseRestore(a, path);
-    try native_platform.allocator.checkAllAllocationFailures(a, exerciseRestore, .{path});
+    try platform.allocator.checkAllAllocationFailures(a, exerciseRestore, .{path});
 }
 
 test "seeded gradient trainer matches pinned Torch AdamW groups clipping moments and partial flush" {
@@ -1316,7 +1316,7 @@ test "seeded gradient trainer matches pinned Torch AdamW groups clipping moments
     }
     var trainer = try Trainer.init(a, &cb, parameters, .{ .groups = groups, .grad_accum_steps = f.optimizer.gradient_accumulation_steps, .max_grad_norm = f.optimizer.max_grad_norm });
     defer trainer.deinit();
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/seeded.safetensors", .{temporary.sub_path});
     defer a.free(path);
@@ -1380,7 +1380,7 @@ test "seeded gradient trainer startup restore preserves partial accumulation and
     var trainer = try Trainer.init(a, &cb, &restore_parameters, config);
     defer trainer.deinit();
     for (0..3) |_| _ = try trainer.submit(trainer.identity(), 1, &.{.{ .name = "restore.weight", .values = &.{ 2, -1 } }}, null);
-    var temp = native_platform.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/startup.safetensors", .{temp.sub_path});
     defer a.free(path);
@@ -1414,7 +1414,7 @@ test "seeded gradient trainer checkpoint preserves all Adam counter bits beyond 
     const config = Config{ .groups = &.{.{ .schedule = .{ .constant = 0.001 } }} };
     var trainer = try Trainer.init(a, &cb, &parameters, config);
     defer trainer.deinit();
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/counter.safetensors", .{temporary.sub_path});
     defer a.free(path);
@@ -1455,7 +1455,7 @@ test "seeded gradient trainer cancelled checkpoint publication preserves the pre
     const parameters = [_]Parameter{.{ .name = "classifier.bias", .dimensions = &.{1}, .values = &.{0.5}, .group = 0 }};
     var trainer = try Trainer.init(a, &cb, &parameters, .{ .groups = &.{.{ .schedule = .{ .constant = 0.001 } }} });
     defer trainer.deinit();
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/checkpoint.safetensors", .{temporary.sub_path});
     defer a.free(path);

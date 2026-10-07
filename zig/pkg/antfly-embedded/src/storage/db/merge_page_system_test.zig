@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const server_test_adapter = if (builtin.is_test) @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter else struct {};
 const builtin = @import("builtin");
 const replication_ingress = @import("replication_ingress.zig");
@@ -795,7 +795,7 @@ test "relational index system merge pages commit effects and cursors with reopen
             } else return error.IndexBuildDidNotConverge;
             var reader = try db.beginRelationalRows(alloc, .{ .index = "by_id", .fields = &.{ "id", "doubled" } });
             defer reader.deinit();
-            var covered = try reader.nextPage(alloc, native_platform.testing.io, .{ .rows = 10, .records = 100, .time_ns = std.time.ns_per_s });
+            var covered = try reader.nextPage(alloc, platform.testing.io, .{ .rows = 10, .records = 100, .time_ns = std.time.ns_per_s });
             defer covered.deinit();
             try std.testing.expectEqual(@as(usize, 3), covered.rows.len);
             try std.testing.expectEqual(@as(usize, 0), covered.primary_lookups);

@@ -20,7 +20,7 @@
 //! One worker-owned batch retains a plan/epoch and uses flat reusable buffers;
 //! no row-local reference count, name lookup, or JSON parse is needed.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const schema_registry = @import("schema_registry.zig");
@@ -387,7 +387,7 @@ const test_definitions = [_]Definition{
 
 test "relational index plan retains epoch and definitions through prepared batch ownership" {
     const alloc = std.testing.allocator;
-    var registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, test_schema);
+    var registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     var schema_view = registry.acquire().?;
     const definition_name = try alloc.dupe(u8, "by_id");
     const definitions = [_]Definition{.{ .name = definition_name, .generation = 1, .keys = &.{.{ .column = "id" }} }};
@@ -416,11 +416,11 @@ test "relational index plan projects a current index onto a committed historical
         .storage_mode = .relational,
         .relational_columns = &.{.{ .name = "id", .path = "id", .column_type = .integer }},
     };
-    var old_registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, old_schema);
+    var old_registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, old_schema);
     defer old_registry.deinit();
     var old_view = old_registry.acquire().?;
     defer old_view.release();
-    var current_registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, test_schema);
+    var current_registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer current_registry.deinit();
     var current_view = current_registry.acquire().?;
     defer current_view.release();
@@ -450,7 +450,7 @@ test "relational index plan projects a current index onto a committed historical
 
 test "relational index plan identity binds generation and canonical index order" {
     const alloc = std.testing.allocator;
-    var registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, test_schema);
+    var registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer registry.deinit();
     var schema_view = registry.acquire().?;
     defer schema_view.release();
@@ -484,7 +484,7 @@ test "relational index plan identity binds generation and canonical index order"
 
 test "relational index plan batches prepared rows with reusable allocation free buffers" {
     const alloc = std.testing.allocator;
-    var registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, test_schema);
+    var registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer registry.deinit();
     var schema_view = registry.acquire().?;
     defer schema_view.release();
@@ -515,7 +515,7 @@ test "relational index plan batches prepared rows with reusable allocation free 
 }
 
 fn testPlanAllocations(alloc: Allocator) !void {
-    var registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, test_schema);
+    var registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer registry.deinit();
     var schema_view = registry.acquire().?;
     defer schema_view.release();
@@ -530,7 +530,7 @@ fn testPlanAllocations(alloc: Allocator) !void {
 
 test "relational index plan rejects foreign prepared epochs and rolls back late failures" {
     const alloc = std.testing.allocator;
-    var registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, test_schema);
+    var registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer registry.deinit();
     var schema_view = registry.acquire().?;
     defer schema_view.release();
@@ -548,7 +548,7 @@ test "relational index plan rejects foreign prepared epochs and rolls back late 
     defer alloc.free(original);
 
     // Same numeric version, even the same schema bytes, is not a shared epoch.
-    var foreign_registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, test_schema);
+    var foreign_registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, test_schema);
     defer foreign_registry.deinit();
     var foreign_view = foreign_registry.acquire().?;
     defer foreign_view.release();

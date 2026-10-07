@@ -21,7 +21,6 @@ const CT = ops.CT;
 const gpt_mod = @import("../models/gpt.zig");
 const qwen2vl = @import("qwen2vl_types.zig");
 const posix = std.posix;
-const native_platform = @import("antfly_platform");
 
 const vision_rope_theta: f32 = 10000.0;
 
@@ -643,8 +642,8 @@ fn visionTraceEnabled() bool {
 }
 
 fn nowNs() !u64 {
-    var ts: native_platform.c.timespec = undefined;
-    switch (posix.errno(native_platform.c.clock_gettime(.REALTIME, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (posix.errno(platform.c.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => {},
         else => return error.ClockGetTimeFailed,
     }

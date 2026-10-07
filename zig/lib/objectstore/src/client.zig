@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -227,8 +227,8 @@ pub const Client = struct {
     }
 };
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 /// Reads a stable file snapshot with bounded cancellation latency. Provider
@@ -253,7 +253,7 @@ pub fn readPositionalAllWithCancellation(
 
 test "objectstore file reads observe cancellation between bounded chunks" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const path = try std.fmt.allocPrint(alloc, "/tmp/antfly-objectstore-cancel-read-{d}", .{uniqueNs(io)});
     defer alloc.free(path);
     defer std.Io.Dir.deleteFileAbsolute(io, path) catch {};

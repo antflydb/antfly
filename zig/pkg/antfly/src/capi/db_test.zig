@@ -658,19 +658,19 @@ fn unregisterTestHandle(ptr: *anyopaque) void {
 }
 
 fn cleanupTestDir(path: []const u8) void {
-    var io_impl = @import("antfly_platform").Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = @import("antfly_platform").Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
 
 fn cleanupTestFile(path: []const u8) void {
-    var io_impl = @import("antfly_platform").Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = @import("antfly_platform").Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteFile(io_impl.io(), path) catch {};
 }
 
 fn testPathExists(path: []const u8) bool {
-    var io_impl = @import("antfly_platform").Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = @import("antfly_platform").Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().access(io_impl.io(), path, .{}) catch return false;
     return true;
@@ -2455,7 +2455,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, check_before.ptr.?[0..check_before.len], "\"valid\":true") != null);
 
     {
-        var io_impl = @import("antfly_platform").Threaded.init(alloc, .{});
+        var io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var file = try std.Io.Dir.cwd().openFile(io, src_path, .{ .mode = .read_write });
@@ -2722,7 +2722,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         try std.testing.expectEqual(@as(usize, 0), locked_restore_report.len);
     }
     {
-        var io_impl = @import("antfly_platform").Threaded.init(alloc, .{});
+        var io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         try std.testing.expect(!capiPathExists(io_impl.io(), locked_restore_path));
         try std.testing.expect(!capiPathExists(io_impl.io(), locked_restore_tmp_path));
@@ -2744,7 +2744,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(malformed_restore_report.ptr == null);
     try std.testing.expectEqual(@as(usize, 0), malformed_restore_report.len);
     {
-        var io_impl = @import("antfly_platform").Threaded.init(alloc, .{});
+        var io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         try std.testing.expect(!capiPathExists(io_impl.io(), restore_malformed_path));
     }

@@ -93,7 +93,7 @@ fn openPublicationLockWithIo(io: std.Io, alloc: Allocator, canonical_path: []con
 }
 
 fn openPublicationLock(alloc: Allocator, canonical_path: []const u8, lock: std.Io.File.Lock) !std.Io.File {
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try openPublicationLockWithIo(io_impl.io(), alloc, canonical_path, lock);
 }
@@ -112,7 +112,7 @@ fn closePublicationLock(file: std.Io.File) void {
     if (comptime builtin.os.tag == .freestanding) {
         unreachable;
     } else {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         file.close(io_impl.io());
     }
@@ -163,7 +163,7 @@ fn canonicalPathAllocWithIo(alloc: Allocator, io: std.Io, path: []const u8) ![]u
 }
 
 fn canonicalPathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try canonicalPathAllocWithIo(alloc, io_impl.io(), path);
 }
@@ -258,7 +258,7 @@ const Manager = struct {
     }
 
     pub fn beginExclusive(self: *Manager, path: []const u8) !ExclusiveTransition {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         var transition = try self.beginExclusiveWithIo(path, io_impl.io());
         transition.io = null;
@@ -310,7 +310,7 @@ const Manager = struct {
     }
 
     pub fn beginPreparation(self: *Manager, path: []const u8, cleanup_scheduler: ?CleanupScheduler) !PreparationTransition {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         var transition = try self.beginPreparationWithIo(path, cleanup_scheduler, io_impl.io());
         transition.io = null;
@@ -362,7 +362,7 @@ const Manager = struct {
     }
 
     fn beginReconciliation(self: *Manager, path: []const u8) !?ReconciliationLease {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.beginReconciliationWithIo(path, io_impl.io());
     }
@@ -469,7 +469,7 @@ const Manager = struct {
     }
 
     fn hasReaders(self: *Manager, path: []const u8) !bool {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.hasReadersWithIo(path, io_impl.io());
     }
@@ -707,11 +707,11 @@ pub const PreparationTransition = struct {
 
     pub fn promote(self: *PreparationTransition) !ExclusiveTransition {
         if (!self.active) return error.InvalidGenerationTransition;
-        var fallback_io_impl: platform.Threaded = undefined;
+        var fallback_io_impl: platform.Io.Threaded = undefined;
         var fallback_io_owned = false;
         defer if (fallback_io_owned) fallback_io_impl.deinit();
         const io = self.io orelse blk: {
-            fallback_io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            fallback_io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             fallback_io_owned = true;
             break :blk fallback_io_impl.io();
         };
@@ -806,7 +806,7 @@ pub const ExclusiveTransition = struct {
             _ = try reconcilePublishedGenerationExclusive(self.alloc, io, self.path, self.cleanup_scheduler);
             return;
         }
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         _ = try reconcilePublishedGenerationExclusive(self.alloc, io_impl.io(), self.path, self.cleanup_scheduler);
     }
@@ -911,7 +911,7 @@ fn beginStagingGeneration(
             reconcile,
         );
     }
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var staged = try beginStagingGenerationWithIo(
         alloc,
@@ -1014,7 +1014,7 @@ pub const StagedGeneration = struct {
     /// contract and require another seal before publication.
     pub fn seal(self: *StagedGeneration) !void {
         if (self.io) |io| return try self.sealWithIo(io);
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.sealWithIo(io_impl.io());
     }
@@ -1036,7 +1036,7 @@ pub const StagedGeneration = struct {
     /// or rollbackPublication.
     pub fn publishPrepared(self: *StagedGeneration) !PublicationOutcome {
         if (self.io) |io| return try self.publishPreparedWithIo(io);
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.publishPreparedWithIo(io_impl.io());
     }
@@ -1081,7 +1081,7 @@ pub const StagedGeneration = struct {
     /// Asynchronous cleanup scheduling failures remain reconciliation debt.
     pub fn commitPublication(self: *StagedGeneration) !void {
         if (self.io) |io| return try self.commitPublicationWithIo(io);
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.commitPublicationWithIo(io_impl.io());
     }
@@ -1156,7 +1156,7 @@ pub const StagedGeneration = struct {
     /// being admitted while this exchange is in flight.
     pub fn rollbackPublication(self: *StagedGeneration) !void {
         if (self.io) |io| return try self.rollbackPublicationWithIo(io);
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         return try self.rollbackPublicationWithIo(io_impl.io());
     }
@@ -1203,7 +1203,7 @@ pub const StagedGeneration = struct {
     pub fn deinit(self: *StagedGeneration) void {
         if (self.closed) return;
         if (self.io) |io| return self.deinitWithIo(io);
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         self.deinitWithIo(io_impl.io());
     }
@@ -1849,7 +1849,7 @@ fn acquirePublishedGenerationReadWithRuntimeAndIo(
     io_override: ?std.Io,
 ) !?ReadLease {
     if (comptime builtin.os.tag == .freestanding) return error.UnsupportedPlatform;
-    var fallback_io_impl: platform.Threaded = undefined;
+    var fallback_io_impl: platform.Io.Threaded = undefined;
     var fallback_io_owned = false;
     defer if (fallback_io_owned) fallback_io_impl.deinit();
     const io = if (runtime) |active|
@@ -1857,7 +1857,7 @@ fn acquirePublishedGenerationReadWithRuntimeAndIo(
     else if (io_override) |shared_io|
         shared_io
     else blk: {
-        fallback_io_impl = platform.Threaded.init(alloc, .{});
+        fallback_io_impl = platform.Io.Threaded.init(alloc, .{});
         fallback_io_owned = true;
         break :blk fallback_io_impl.io();
     };
@@ -2349,7 +2349,7 @@ test "staged generation preserves live root until publication" {
     const live_value_path = try std.fmt.allocPrint(alloc, "{s}/value", .{live_path});
     defer alloc.free(live_value_path);
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try fs_paths.createDirPathPortable(io, live_path);
@@ -2870,7 +2870,7 @@ test "retired generation cleanup is idempotent across concurrent workers" {
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             deleteRetiredGenerationPaths(std.heap.page_allocator, io_impl.io(), &.{self.path}, self.parent) catch |err| {
                 self.err = err;

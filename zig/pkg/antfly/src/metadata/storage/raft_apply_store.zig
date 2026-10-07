@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const hot_standby_write_gate_adapter = @import("../../storage/hot_standby/write_gate.zig");
 const hot_standby_publisher_adapter = @import("../../storage/hot_standby/db_commit.zig");
 const std = @import("std");
@@ -52,7 +52,7 @@ const raft_storage_mod = @import("../../raft/storage/mod.zig");
 const wal_replica_state_mod = @import("../../raft/storage/wal_replica_state.zig");
 const raft_state_machine = @import("../../raft/state_machine/mod.zig");
 pub const apply_contract = @import("raft_apply_contract.zig");
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 const restore_staging = @import("../restore_staging.zig");
 const fk_generation_publication = @import("../fk_generation_publication.zig");
 const fk_initial_retirement = @import("../fk_initial_retirement.zig");
@@ -77,7 +77,7 @@ fn encodeMetadataCheckpoint(value: AppliedMetadataCheckpoint) [checkpoint_encode
 
 test "initial child root receipt requires enrollment current reporter and exact live placement" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/root-receipt", .{tmp.sub_path});
     defer alloc.free(path);
@@ -158,7 +158,7 @@ test "initial child root receipt requires enrollment current reporter and exact 
 
 test "FK generation publication begins durably and rejects stale CAS and topology drift" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-generation-publication", .{tmp.sub_path});
     defer alloc.free(root);
@@ -364,7 +364,7 @@ test "FK generation publication begins durably and rejects stale CAS and topolog
 
 test "initial self FK reserves one hidden child owner and no duplicate parent route" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-self-fk", .{tmp.sub_path});
     defer alloc.free(root);
@@ -573,7 +573,7 @@ test "initial self FK reserves one hidden child owner and no duplicate parent ro
 
 test "initial self FK resumes the second hidden range after a durable owner receipt" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-self-multi", .{tmp.sub_path});
     defer alloc.free(root);
@@ -679,7 +679,7 @@ test "relational integrity metadata topology initial placement uses canonical ro
 
 test "canceled hidden reservation permits only exact tagged placement removal" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/canceled-hidden-removal", .{tmp.sub_path});
     defer alloc.free(root);
@@ -732,7 +732,7 @@ test "canceled hidden reservation permits only exact tagged placement removal" {
 
 test "FK generation publication initial create reserves hidden identity before any public route" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/initial-fk-create", .{tmp.sub_path});
     defer alloc.free(root);
@@ -1531,7 +1531,7 @@ test "FK generation publication initial create reserves hidden identity before a
 
 test "generation lock freezes the table cut while initial support permits exact schema retirement" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fk-read-schema-lock", .{tmp.sub_path});
     defer alloc.free(root);
@@ -1636,7 +1636,7 @@ test "generation lock freezes the table cut while initial support permits exact 
 
 test "native initial support finalization requires current bound root and durable owner progress" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-owner-schema", .{tmp.sub_path});
     defer alloc.free(root);
@@ -1704,7 +1704,7 @@ test "initial partial support begin survives restart and cancellation before chi
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/fk-pending-support", .{tmp.sub_path});
     const group_id = group_ids.main_metadata_group_id;
@@ -2885,7 +2885,7 @@ test "relational integrity metadata FK target validates ordered uniqueness types
 
 test "distributed txn owned witness cleanup metadata CAS fences both child admission race orders" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/witness-cleanup", .{tmp.sub_path});
     defer alloc.free(root);
@@ -2942,7 +2942,7 @@ test "distributed txn owned witness cleanup metadata CAS fences both child admis
 test "system catalog standalone retirement CAS is atomic and survives reopen" {
     const alloc = std.testing.allocator;
     const lifecycle = @import("../relational_retirement.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standalone-retirement", .{tmp.sub_path});
     defer alloc.free(root);
@@ -2991,7 +2991,7 @@ test "system catalog standalone retirement CAS is atomic and survives reopen" {
 test "distributed txn retirement metadata persists identity barriers and rejects phase skipping" {
     const lifecycle = @import("../relational_retirement.zig");
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/relational-retirement", .{tmp.sub_path});
     defer alloc.free(root);
@@ -3073,7 +3073,7 @@ test "distributed txn retirement metadata persists identity barriers and rejects
 }
 
 test "relational integrity metadata drop is fenced against coordinated ownership and incoming references" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/relational-drop", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -3152,7 +3152,7 @@ test "relational integrity metadata drop is fenced against coordinated ownership
 
 test "relational integrity metadata topology admission persists rollout floor and exact read schema" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/topology-admission", .{tmp.sub_path});
     defer alloc.free(root);
@@ -3237,7 +3237,7 @@ test "relational integrity metadata topology admission persists rollout floor an
 }
 
 test "table topology recreate is fenced by the durable transition generation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -3345,7 +3345,7 @@ test "table topology recreate is fenced by the durable transition generation" {
 }
 
 test "table topology create rejects ranges orphaned by an interrupted legacy drop" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -3432,7 +3432,7 @@ test "table topology create rejects ranges orphaned by an interrupted legacy dro
 }
 
 test "table topology mutation atomically creates and drops catalog ranges" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -3784,7 +3784,7 @@ test "table topology mutation atomically creates and drops catalog ranges" {
 test "metadata backup cohort atomically admits immutable plans and releases exact table locks" {
     const alloc = std.testing.allocator;
     const cohort = @import("antfly_local_sources").metadata_backup_cohort;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/backup-cohort", .{tmp.sub_path});
     defer alloc.free(root);
@@ -3922,7 +3922,7 @@ test "metadata raft apply store compound rewrite admission atomically reserves e
 
 fn testRewriteDraft(cancel: bool, compound: bool) !void {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/rewrite-draft", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4113,7 +4113,7 @@ fn testRewriteDraft(cancel: bool, compound: bool) !void {
 
 test "relational integrity restore staging authority survives retirement and snapshot with point reads" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authority", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4178,7 +4178,7 @@ test "relational integrity restore staging authority survives retirement and sna
 
 test "relational integrity restore staging cancellation tombstone defeats delayed reserve" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cancel-before-reserve", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4214,7 +4214,7 @@ test "relational integrity restore staging cancellation tombstone defeats delaye
 
 test "relational integrity restore staging publishes all targets only after exact owner validation" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/staging", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4313,7 +4313,7 @@ test "relational integrity restore staging publishes all targets only after exac
 
 test "relational integrity restore staging portable FK cannot publish before exact mapped parent admission receipt" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/portable-fk-admission", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4401,7 +4401,7 @@ test "relational integrity restore staging portable FK cannot publish before exa
 
 test "relational integrity restore staging cancellation survives snapshots without reopening identities" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cancel", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4475,7 +4475,7 @@ test "relational integrity restore staging cancellation survives snapshots witho
 
 test "relational integrity restore staging overwrite keeps old generation until fenced atomic cutover" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/overwrite", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4579,7 +4579,7 @@ test "relational integrity restore staging overwrite keeps old generation until 
 
 test "relational integrity restore staging graph empty-generation cutover replays old tombstone and fresh owner atomically" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-empty-cutover", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4686,7 +4686,7 @@ test "relational integrity restore staging graph empty-generation cutover replay
 
 test "relational integrity restore staging cancellation drains both old and new owners" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/overwrite-cancel", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4738,7 +4738,7 @@ test "relational integrity restore staging cancellation drains both old and new 
 
 test "relational integrity restore staging fences incoming dependency admission" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-dependencies", .{tmp.sub_path});
     defer alloc.free(root);
@@ -4790,7 +4790,7 @@ test "relational integrity restore staging fences incoming dependency admission"
 
 test "relational integrity restore staging reserves external parent and rejects unproven publication" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/external-parent-reserve", .{tmp.sub_path});
     defer alloc.free(root);
@@ -5013,7 +5013,7 @@ test "metadata transition decoders reject unknown enum values" {
 }
 
 test "metadata raft apply store replicates restore job records" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-restore-job-store", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -5062,7 +5062,7 @@ test "metadata raft apply store replicates restore job records" {
 }
 
 test "metadata raft apply store initializes one durable snapshotted cluster incarnation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-incarnation-source", .{tmp.sub_path});
     defer std.testing.allocator.free(source_root);
@@ -5210,7 +5210,7 @@ test "metadata raft apply store initializes one durable snapshotted cluster inca
 }
 
 test "metadata raft apply store snapshots and promotes the latest pending reallocation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-reallocation-source", .{tmp.sub_path});
     defer std.testing.allocator.free(source_root);
@@ -5293,7 +5293,7 @@ test "metadata raft apply store snapshots and promotes the latest pending reallo
 }
 
 test "metadata raft apply store snapshot replaces one complete projection and preserves other groups" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-snapshot-source", .{tmp.sub_path});
     defer std.testing.allocator.free(source_root);
@@ -5457,8 +5457,8 @@ fn lockLifecycleDetachApplyMutex(mutex: *std.Io.Mutex, io: std.Io) void {
         if (test_lifecycle_detach_lock_barrier) |barrier| {
             const acquired = mutex.tryLock();
             barrier.contended.store(!acquired, .release);
-            barrier.entered.set(native_platform.debug_io);
-            barrier.resume_event.waitUncancelable(native_platform.debug_io);
+            barrier.entered.set(platform.debug_io);
+            barrier.resume_event.waitUncancelable(platform.debug_io);
             if (acquired) return;
         }
     }
@@ -5597,7 +5597,7 @@ fn deinitCommittedTransitionDelta(alloc: std.mem.Allocator, delta: *CommittedTra
 
 test "standalone metadata released JSON replay is atomic exact and checkpoint durable" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -5650,10 +5650,10 @@ test "standalone metadata released JSON replay is atomic exact and checkpoint du
     }
     var reopened = try RaftApplyStore.init(alloc, .{ .root_dir = root });
     defer reopened.deinit();
-    const artifact = try reopened.exportHotStandbyCheckpoint(native_platform.testing.io, checkpoint);
+    const artifact = try reopened.exportHotStandbyCheckpoint(platform.testing.io, checkpoint);
     var restored = try RaftApplyStore.init(alloc, .{ .root_dir = restored_root });
     defer restored.deinit();
-    try restored.importHotStandbyCheckpoint(native_platform.testing.io, checkpoint, artifact.size_bytes);
+    try restored.importHotStandbyCheckpoint(platform.testing.io, checkpoint, artifact.size_bytes);
     try restored.applyHotStandbyRecord(record);
     try std.testing.expectEqual(@as(u64, 2), try restored.standaloneRevision());
     const receipt = try restored.store.get(alloc, RaftApplyStore.metadata_hot_standby.replay_key);
@@ -5666,7 +5666,7 @@ test "standalone metadata released JSON replay is atomic exact and checkpoint du
 
 test "standalone metadata released JSON replay verifies imported ranges and preserves auxiliary state" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy-import", .{tmp.sub_path});
     defer alloc.free(root);
@@ -5707,7 +5707,7 @@ test "standalone metadata released JSON replay verifies imported ranges and pres
 
 test "system catalog standalone rejected constraint drop preserves bindings ranges and revisions" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/guarded-drop", .{tmp.sub_path});
     defer alloc.free(root);
@@ -5754,7 +5754,7 @@ test "system catalog standalone rejected constraint drop preserves bindings rang
 
 test "standalone metadata migration and listeners are failure atomic" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-atomic", .{tmp.sub_path});
     defer alloc.free(root);
@@ -5798,8 +5798,8 @@ test "standalone metadata migration and listeners are failure atomic" {
 
 test "standalone metadata HA preserves incremental jobs outbox recovery and full checkpoint authority" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -5889,9 +5889,9 @@ test "standalone metadata HA preserves incremental jobs outbox recovery and full
 
 test "standalone metadata chunked HA resumes large effects through checkpoint without partial visibility" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const chunks = @import("../../storage/hot_standby/metadata_effect_chunks.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -6065,7 +6065,7 @@ pub const RaftApplyStore = struct {
     restore_cleanup_rows_visited: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     policy_full_owner_cut_validations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     alloc: std.mem.Allocator,
-    io_impl: native_platform.Threaded,
+    io_impl: platform.Io.Threaded,
     root_dir: []u8,
     path: []u8,
     backend: ?lsm_backend.BackendHandle,
@@ -6243,7 +6243,7 @@ pub const RaftApplyStore = struct {
     fn lockHotStandbyTransition(self: *RaftApplyStore) !void {
         if (self.hot_standby_port) |port| return port.lock();
         if (self.hot_standby_mirror) |mirror| if (mirror.transition_mutex) |mutex| {
-            native_platform.sync.lockYieldingIo(mutex, self.io_impl.io());
+            platform.sync.lockYieldingIo(mutex, self.io_impl.io());
         };
     }
     fn unlockHotStandbyTransition(self: *RaftApplyStore) void {
@@ -23124,7 +23124,7 @@ fn keyStrictlyInsideRange(key: []const u8, start_key: []const u8, end_key: ?[]co
 test "metadata raft apply store online admission rejects ordinary progress cancellation and contract races" {
     const alloc = std.testing.allocator;
     for (0..4) |race| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-admission", .{tmp.sub_path});
         defer alloc.free(root);
@@ -23177,7 +23177,7 @@ test "metadata raft apply store online admission rejects ordinary progress cance
 }
 
 test "metadata raft apply store online merge phases persist exact attempt and reject stale CAS after reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const alloc = std.testing.allocator;
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-merge", .{tmp.sub_path});
@@ -23380,7 +23380,7 @@ test "metadata raft apply store online merge phases persist exact attempt and re
 }
 
 test "metadata raft apply store persists compact checkpoints across reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-apply-store", .{tmp.sub_path});
@@ -23411,7 +23411,7 @@ test "metadata raft apply store persists compact checkpoints across reopen" {
 }
 
 test "metadata raft apply store fences transition identity and active removal" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-transition-store", .{tmp.sub_path});
@@ -23708,7 +23708,7 @@ test "metadata raft apply store fences transition identity and active removal" {
 }
 
 test "metadata raft apply store returns only durable transition deltas" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-committed-transition-deltas", .{tmp.sub_path});
@@ -23852,7 +23852,7 @@ test "metadata raft apply store returns only durable transition deltas" {
 }
 
 test "metadata raft apply store publishes listeners only after commit" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-post-commit-listeners", .{tmp.sub_path});
@@ -23919,7 +23919,7 @@ test "metadata raft apply store publishes listeners only after commit" {
 }
 
 test "metadata raft apply store catalog projection uses storage snapshot independently from apply mutex" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-catalog-projection-deadline", .{tmp.sub_path});
@@ -24033,7 +24033,7 @@ test "metadata raft apply store catalog projection uses storage snapshot indepen
 }
 
 test "metadata raft apply store resolves stale store drain intent at apply time" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-store-drain-apply", .{tmp.sub_path});
@@ -24080,7 +24080,7 @@ test "metadata raft apply store resolves stale store drain intent at apply time"
 }
 
 test "metadata raft apply store preserves node drain across store upsert" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-store-upsert-drain-apply", .{tmp.sub_path});
@@ -24124,7 +24124,7 @@ test "metadata raft apply store preserves node drain across store upsert" {
 }
 
 test "metadata raft apply store admits one split epoch atomically and retries idempotently" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-split-admission", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -24200,7 +24200,7 @@ test "metadata raft apply store admits one split epoch atomically and retries id
 }
 
 test "metadata raft apply store atomically fences table replacement during a range transition" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-table-transition-fence", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
@@ -24396,7 +24396,7 @@ test "metadata raft apply store atomically fences table replacement during a ran
 }
 
 test "metadata raft apply store table removal requires the observed inactive transition generation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -24542,7 +24542,7 @@ test "metadata raft apply store table removal requires the observed inactive tra
 }
 
 test "metadata raft apply store ignores stale drained first store registration after cancellation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-store-first-drain-apply", .{tmp.sub_path});
@@ -24584,7 +24584,7 @@ test "metadata raft apply store ignores stale drained first store registration a
 }
 
 test "metadata raft apply store fences stale placement plans across drain cancellation and finalization" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const source_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-draining-placement-fence-source", .{tmp.sub_path});
@@ -24777,7 +24777,7 @@ test "metadata raft apply store fences stale placement plans across drain cancel
 }
 
 test "metadata raft apply store ignores stale draining node registration after cancellation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-node-stale-drain-apply", .{tmp.sub_path});
@@ -24815,7 +24815,7 @@ test "metadata raft apply store ignores stale draining node registration after c
 }
 
 test "metadata raft apply store waits for termination debt before finalizing node shutdown" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-node-finalize-apply", .{tmp.sub_path});
@@ -24966,7 +24966,7 @@ test "metadata raft apply store waits for termination debt before finalizing nod
 }
 
 test "metadata raft apply store commits active node finalization as a no-op" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-node-finalize-active-reject", .{tmp.sub_path});
@@ -25019,7 +25019,7 @@ test "metadata raft apply store commits active node finalization as a no-op" {
 }
 
 test "metadata raft apply store commits active store-only finalization as a no-op" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-store-only-finalize-active-reject", .{tmp.sub_path});
@@ -25063,7 +25063,7 @@ test "metadata raft apply store commits active store-only finalization as a no-o
 }
 
 test "metadata raft apply store projects table and range records from committed entries" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-topology-store", .{tmp.sub_path});
@@ -25146,7 +25146,7 @@ test "metadata raft apply store projects table and range records from committed 
 }
 
 test "metadata raft apply store restore admission accepts ranges completed immediately after publication" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(
@@ -25253,7 +25253,7 @@ test "metadata raft apply store restore admission accepts ranges completed immed
 }
 
 test "metadata raft apply store completes only the matching restore intent and preserves topology" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-restore-cas-store", .{tmp.sub_path});
@@ -25399,7 +25399,7 @@ test "metadata raft apply store completes only the matching restore intent and p
 }
 
 test "metadata raft apply store rejects reserved data group ids in transition records" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-invalid-data-group-store", .{tmp.sub_path});
@@ -25470,7 +25470,7 @@ test "metadata raft apply store rejects reserved data group ids in transition re
 }
 
 test "metadata raft apply store notifies projection listeners for committed table and range changes" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-topology-listener-store", .{tmp.sub_path});
@@ -25547,7 +25547,7 @@ test "metadata raft apply store notifies projection listeners for committed tabl
 }
 
 test "lifecycle listener detach drains callbacks and preserves unrelated listeners" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(
@@ -25568,8 +25568,8 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
             const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = self.projection_calls.fetchAdd(1, .acq_rel);
             if (!self.block_projection.load(.acquire)) return;
-            self.entered.set(native_platform.debug_io);
-            self.release.waitUncancelable(native_platform.debug_io);
+            self.entered.set(platform.debug_io);
+            self.release.waitUncancelable(platform.debug_io);
         }
 
         fn matchesCommittedKey(_: *anyopaque, _: CommittedKeySignal) bool {
@@ -25604,7 +25604,7 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
         removed: bool = false,
 
         fn run(self: *@This()) void {
-            self.started.set(native_platform.debug_io);
+            self.started.set(platform.debug_io);
             self.removed = self.store.removeLifecycleListeners(self.registration);
             self.finished.store(true, .release);
         }
@@ -25636,12 +25636,12 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
     );
 
     var dispatch = Dispatch{ .store = &store };
-    var dispatch_thread = try native_platform.testing.io.concurrent(Dispatch.run, .{&dispatch});
+    var dispatch_thread = try platform.testing.io.concurrent(Dispatch.run, .{&dispatch});
     defer {
-        owned.release.set(native_platform.debug_io);
-        dispatch_thread.await(native_platform.testing.io);
+        owned.release.set(platform.debug_io);
+        dispatch_thread.await(platform.testing.io);
     }
-    owned.entered.waitUncancelable(native_platform.debug_io);
+    owned.entered.waitUncancelable(platform.debug_io);
 
     var detach = Detach{ .store = &store, .registration = registration };
     var detach_lock_entered: std.Io.Event = .unset;
@@ -25653,23 +25653,23 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
         .contended = &detach_lock_contended,
     };
     defer test_lifecycle_detach_lock_barrier = null;
-    var detach_thread = try native_platform.testing.io.concurrent(Detach.run, .{&detach});
+    var detach_thread = try platform.testing.io.concurrent(Detach.run, .{&detach});
     defer {
-        detach_lock_resume.set(native_platform.debug_io);
-        owned.release.set(native_platform.debug_io);
-        detach_thread.await(native_platform.testing.io);
+        detach_lock_resume.set(platform.debug_io);
+        owned.release.set(platform.debug_io);
+        detach_thread.await(platform.testing.io);
     }
-    detach.started.waitUncancelable(native_platform.debug_io);
-    detach_lock_entered.waitUncancelable(native_platform.debug_io);
+    detach.started.waitUncancelable(platform.debug_io);
+    detach_lock_entered.waitUncancelable(platform.debug_io);
     // The detach call reached the exact apply-lock boundary while the callback
     // owns that lock. Resume it, then release the callback; it cannot return
     // until synchronous dispatch has drained.
     const blocked_at_lock_boundary = !detach.finished.load(.acquire);
     const apply_lock_was_contended = detach_lock_contended.load(.acquire);
-    detach_lock_resume.set(native_platform.debug_io);
-    owned.release.set(native_platform.debug_io);
-    dispatch_thread.await(native_platform.testing.io);
-    detach_thread.await(native_platform.testing.io);
+    detach_lock_resume.set(platform.debug_io);
+    owned.release.set(platform.debug_io);
+    dispatch_thread.await(platform.testing.io);
+    detach_thread.await(platform.testing.io);
     try std.testing.expect(blocked_at_lock_boundary);
     try std.testing.expect(apply_lock_was_contended);
     try std.testing.expect(detach.removed);
@@ -25687,7 +25687,7 @@ test "lifecycle listener detach drains callbacks and preserves unrelated listene
 }
 
 test "placement projection commit barrier brackets durability and notification" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(
@@ -25789,7 +25789,7 @@ test "placement projection commit barrier brackets durability and notification" 
 }
 
 test "atomic table topology lifecycle notifications stay constant at the initial range limit" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(
@@ -25908,7 +25908,7 @@ test "atomic table topology lifecycle notifications stay constant at the initial
 }
 
 test "metadata raft apply store notifies projection listeners for shuffle join lease changes" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-shuffle-lease-listener-store", .{tmp.sub_path});
@@ -25964,7 +25964,7 @@ test "metadata raft apply store notifies projection listeners for shuffle join l
 }
 
 test "metadata raft apply store preserves projected tables and ranges across reopen" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-projection-reopen-store", .{tmp.sub_path});
@@ -26021,7 +26021,7 @@ test "metadata raft apply store preserves projected tables and ranges across reo
 }
 
 test "metadata raft apply store notifies committed key listeners for matched metadata prefixes" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-key-listener-store", .{tmp.sub_path});
@@ -26172,7 +26172,7 @@ test "metadata.table storage extension preserves ownership migration and legacy 
 
 test "standalone metadata storage migration survives reopen checkpoint and exact CAS" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/migration", .{tmp.sub_path});
     defer alloc.free(root);
@@ -26194,10 +26194,10 @@ test "standalone metadata storage migration survives reopen checkpoint and exact
     defer reopened.freeTables(alloc, records);
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(table, records[0]));
-    const artifact = try reopened.exportHotStandbyCheckpoint(native_platform.testing.io, checkpoint);
+    const artifact = try reopened.exportHotStandbyCheckpoint(platform.testing.io, checkpoint);
     var restored = try RaftApplyStore.init(alloc, .{ .root_dir = target });
     defer restored.deinit();
-    try restored.importHotStandbyCheckpoint(native_platform.testing.io, checkpoint, artifact.size_bytes);
+    try restored.importHotStandbyCheckpoint(platform.testing.io, checkpoint, artifact.size_bytes);
     var replacement = table;
     replacement.storage.dense_embeddings = .vector_store;
     replacement.storage_migration = null;
@@ -26480,7 +26480,7 @@ test "metadata extension lifecycle v2 requires a one-to-one table CAS contract" 
 }
 
 test "metadata extension lifecycle table precondition prevents stale replacement and partial rows" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -26567,7 +26567,7 @@ test "metadata extension lifecycle table precondition prevents stale replacement
 }
 
 test "metadata raft apply store projects schema progress records from committed entries" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-schema-progress-store", .{tmp.sub_path});
@@ -26761,7 +26761,7 @@ test "metadata shuffle join lease transition command round-trips" {
 }
 
 test "metadata raft apply store projects shuffle join lease records from committed entries" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-shuffle-lease-store", .{tmp.sub_path});
@@ -26806,7 +26806,7 @@ test "metadata raft apply store projects shuffle join lease records from committ
 
 test "metadata raft apply store restore completion retires progress and rejects delayed incarnation reports" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-progress-retirement", .{tmp.sub_path});
     defer alloc.free(root);
@@ -26887,7 +26887,7 @@ test "metadata raft apply store restore completion retires progress and rejects 
 
 test "metadata raft apply store restore cleanup rebuilds legacy indexes and visits only the completed range" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-range-index", .{tmp.sub_path});
     defer alloc.free(root);
@@ -26939,7 +26939,7 @@ test "metadata raft apply store restore cleanup rebuilds legacy indexes and visi
 
 test "metadata raft apply store restore admission never overwrites a previously claimed job" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/restore-admission", .{tmp.sub_path});
     defer alloc.free(root);
@@ -26998,7 +26998,7 @@ test "metadata raft apply store restore admission never overwrites a previously 
 }
 
 test "metadata raft apply store projects restore progress records from committed entries" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-restore-progress-store", .{tmp.sub_path});
@@ -27065,7 +27065,7 @@ test "metadata raft apply store projects restore progress records from committed
 }
 
 test "metadata raft apply store projects replication source status records from committed entries" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-replication-source-status-store", .{tmp.sub_path});
@@ -27199,7 +27199,7 @@ test "metadata raft apply store projects replication source status records from 
 
 test "metadata raft apply store fences exact cutover authority and retirement" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(
         alloc,
@@ -27493,7 +27493,7 @@ test "metadata raft apply store fences exact cutover authority and retirement" {
 
 test "metadata raft apply store transition codec keeps published secrets distinct from restore staging" {
     const alloc = std.testing.allocator;
-    const collection = try secret_collection.replace(alloc, native_platform.testing.io, "default", .{ .revision = 0, .entries = &.{} }, "removed", null);
+    const collection = try secret_collection.replace(alloc, platform.testing.io, "default", .{ .revision = 0, .entries = &.{} }, "removed", null);
     defer alloc.free(collection);
     const publication = try secret_store.encodePublication(alloc, 0, collection);
     defer alloc.free(publication);
@@ -27675,7 +27675,7 @@ test "metadata raft apply store transition codec rejects generation without inca
 }
 
 test "metadata raft apply store projects placement intents from committed entries" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-placement-store", .{tmp.sub_path});
@@ -27763,7 +27763,7 @@ test "metadata raft apply store projects placement intents from committed entrie
 }
 
 test "metadata raft apply store projects backup restore bootstrap source in placement intents" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-placement-backup-source-store", .{tmp.sub_path});
@@ -27863,7 +27863,7 @@ test "metadata raft apply store projects backup restore bootstrap source in plac
 }
 
 test "metadata state machine projects transitions through metadata apply store" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-sm-store", .{tmp.sub_path});
@@ -28609,7 +28609,7 @@ test "metadata raft apply store group status decoder accepts version one records
 
 test "SQL settings apply through Raft and survive catalog restart" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/setting-catalog", .{tmp.sub_path});
     defer alloc.free(root);
@@ -28661,7 +28661,7 @@ test "SQL settings apply through Raft and survive catalog restart" {
 
 test "inert SQL policy definitions survive standalone replay, snapshot, and restart" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/policy-catalog", .{tmp.sub_path});
     defer alloc.free(root);
@@ -28744,7 +28744,7 @@ test "row-policy ENABLE admits relational indexes but rejects search artifact mo
 
 test "row-policy publication persists exact owner ACKs and leader install cut" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/policy-publication", .{tmp.sub_path});
     defer alloc.free(root);
@@ -29053,7 +29053,7 @@ test "row-policy publication persists exact owner ACKs and leader install cut" {
 
 test "system catalog SQL settings load owns allocations from the final prefix scan" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/setting-scan-ownership", .{tmp.sub_path});
     defer alloc.free(root);
@@ -29069,7 +29069,7 @@ test "system catalog SQL settings load owns allocations from the final prefix sc
 }
 
 test "metadata apply store replay is idempotent when applied watermark lags WAL state" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-apply-replay-idempotent", .{tmp.sub_path});
@@ -29179,7 +29179,7 @@ fn applySystemCatalogTestCommand(store: *RaftApplyStore, index: u64, command: Sy
 
 test "system catalog qualified DROP removes topology atomically and rejects stale identity" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-drop", .{tmp.sub_path});
     defer alloc.free(root);
@@ -29213,7 +29213,7 @@ test "system catalog qualified DROP removes topology atomically and rejects stal
 
 test "system catalog publishes names and table topology atomically and fences stale mutations" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/antfly-system-catalog", .{tmp.sub_path});
     defer alloc.free(root);
@@ -29344,7 +29344,7 @@ test "system catalog publishes names and table topology atomically and fences st
 
 test "system catalog legacy and missing point reads have catalog-independent allocation" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-point-reads", .{tmp.sub_path});
     defer alloc.free(root);
@@ -29381,7 +29381,7 @@ test "system catalog legacy and missing point reads have catalog-independent all
 
 test "system catalog indexed management reads and mutation planning ignore unrelated inventory" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-management", .{tmp.sub_path});
     defer alloc.free(root);
@@ -29439,7 +29439,7 @@ test "system catalog indexed management reads and mutation planning ignore unrel
 test "system catalog listing indexes bound legacy pages and runtime reports across rebuild" {
     const alloc = std.testing.allocator;
     const projection = @import("../../system_catalog/projection.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-pages", .{tmp.sub_path});
     defer alloc.free(root);
@@ -29519,7 +29519,7 @@ test "system catalog normalized store reports preserve clocks duplicates migrati
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/normalized-reports", .{tmp.sub_path});
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
@@ -29621,7 +29621,7 @@ test "system catalog store report workload benchmark" {
     // regressions above still use the leak-checking test allocator.
     const alloc = std.heap.c_allocator;
     for ([_]usize{ 100, 1000, 10000 }) |count| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/report-bench", .{tmp.sub_path});
         defer alloc.free(root);
@@ -29742,7 +29742,7 @@ test "system catalog selected detail captures replication status without unrelat
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catalog-cdc-detail", .{tmp.sub_path});
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = root });
@@ -29771,7 +29771,7 @@ test "system catalog report pages keep stable slots and bound sparse rewrites ac
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/report-pages", .{tmp.sub_path});
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = root, .block_cache_bytes = 1024 });
@@ -29851,7 +29851,7 @@ test "metadata raft apply store checkpoints validate format and import legacy wa
     try std.testing.expectError(error.InvalidMetadataApplyBatch, decodeMetadataCheckpoint(encoded[0..25]));
     try std.testing.expectError(error.InvalidMetadataApplyBatch, decodeMetadataCheckpoint(encoded[0..7]));
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checkpoint-upgrade", .{tmp.sub_path});
     defer alloc.free(root);
@@ -29889,7 +29889,7 @@ test "system catalog manifest pages bound sparse writes and preserve pinned read
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/manifest-pages", .{tmp.sub_path}) });
     defer store.deinit();
@@ -29958,7 +29958,7 @@ test "system catalog runtime references preserve observations and reject stale g
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var store = try RaftApplyStore.init(alloc, .{ .root_dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/runtime-reference", .{tmp.sub_path}) });
     defer store.deinit();
@@ -30126,7 +30126,7 @@ test "system catalog sparse command codec bounds decoding and omits volatile tel
 
 test "system catalog sparse reports fence stale bases and recover across snapshot replacement" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sparse-reports", .{tmp.sub_path});
     defer alloc.free(root);
@@ -30201,7 +30201,7 @@ test "system catalog sparse reports fence stale bases and recover across snapsho
 
 test "system catalog sparse report cursor and payload reopen atomically" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sparse-reopen", .{tmp.sub_path});
     defer alloc.free(root);
@@ -30238,7 +30238,7 @@ test "system catalog sparse report cursor and payload reopen atomically" {
 
 test "system catalog snapshot plus identical committed suffix converges" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/review-leader", .{tmp.sub_path});
     defer alloc.free(root);
@@ -30302,7 +30302,7 @@ test "system catalog snapshot plus identical committed suffix converges" {
 
 test "system catalog sparse page allocation survives removal reuse and reopen" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sparse-churn", .{tmp.sub_path});
     defer alloc.free(root);
@@ -30351,7 +30351,7 @@ test "system catalog sparse page allocation survives removal reuse and reopen" {
 
 test "system catalog admission header and cursor fence concurrent full repairs" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/report-admission", .{tmp.sub_path});
     defer alloc.free(root);
@@ -30385,7 +30385,7 @@ test "system catalog admission header and cursor fence concurrent full repairs" 
 
 test "metadata raft apply store topology activation survives snapshots and fences membership" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/topology-activation", .{tmp.sub_path});
     defer a.free(root);
@@ -30451,7 +30451,7 @@ fn applyTestBaseline(store: *RaftApplyStore, alloc: std.mem.Allocator, request: 
 
 test "system catalog baseline resumes after snapshot and activates atomically before sparse updates" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/baseline", .{tmp.sub_path});
     defer a.free(root);
@@ -30537,7 +30537,7 @@ test "system catalog baseline resumes after snapshot and activates atomically be
 
 test "system catalog baseline activation rejects a header change during upload" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/baseline-fence", .{tmp.sub_path});
     defer a.free(root);
@@ -30608,7 +30608,7 @@ test "system catalog baseline binary envelope rejects corruption and preserves a
 
 test "system catalog baseline frames oversized groups across snapshot and batches ordinary groups" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/baseline-frames", .{tmp.sub_path});
     defer a.free(root);
@@ -30712,7 +30712,7 @@ test "system catalog baseline frames oversized groups across snapshot and batche
 
 test "system catalog schema progress batch is bounded atomic replayable and durable" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/schema-progress-batch", .{tmp.sub_path});
     defer a.free(root);
@@ -30756,7 +30756,7 @@ test "system catalog schema progress batch is bounded atomic replayable and dura
 
 test "system catalog write validation is indexed bounded and invalidates extension changes" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/validation", .{tmp.sub_path});
     defer alloc.free(root);
@@ -30881,7 +30881,7 @@ const MetadataReplayTest = struct {
 
 test "metadata replay skips durable stale and equal batches after reopen" {
     const T = MetadataReplayTest;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-durable-replay", .{tmp.sub_path});
     defer T.alloc.free(root);
@@ -30934,7 +30934,7 @@ test "metadata replay skips durable stale and equal batches after reopen" {
 
 test "metadata replay skips only the durable prefix of mixed batches" {
     const T = MetadataReplayTest;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-mixed-replay", .{tmp.sub_path});
     defer T.alloc.free(root);
@@ -30977,7 +30977,7 @@ test "metadata replay skips only the durable prefix of mixed batches" {
 
 test "metadata replay advances new noops without changing catalog authority or other groups" {
     const T = MetadataReplayTest;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(T.alloc, ".zig-cache/tmp/{s}/metadata-replay-noops", .{tmp.sub_path});
     defer T.alloc.free(root);
@@ -31026,7 +31026,7 @@ test "metadata replay advances new noops without changing catalog authority or o
 
 test "system catalog borrowed authority retains ownership and recovers a failed sync" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/borrowed", .{tmp.sub_path});
     defer alloc.free(root);

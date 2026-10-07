@@ -18,7 +18,7 @@
 //! The active-root pointer may select a shadow only after this checksummed,
 //! fsync+rename manifest exists. A directory alone is never publication proof.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Crc32 = @import("antfly_hash").Crc32;
@@ -103,7 +103,7 @@ pub fn writeReadyForPhysicalFormat(
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(tmp_path);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     {
@@ -125,7 +125,7 @@ pub fn writeReadyForPhysicalFormat(
 pub fn load(alloc: Allocator, index_path: []const u8) !Manifest {
     const path = try manifestPathAlloc(alloc, index_path);
     defer alloc.free(path);
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_manifest_bytes));
     defer alloc.free(raw);
@@ -282,7 +282,7 @@ fn readInt(raw: []const u8, pos: *usize, comptime T: type) !T {
 
 test "index generation manifest is durable and fenced by identity" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -295,20 +295,20 @@ test "index generation manifest is durable and fenced by identity" {
     try std.testing.expectEqual(ReadyCertification.identity_mismatch, std.meta.activeTag(mismatched));
     const manifest_path = try manifestPathAlloc(alloc, path);
     defer alloc.free(manifest_path);
-    try std.Io.Dir.cwd().writeFile(native_platform.testing.io, .{
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{
         .sub_path = manifest_path,
         .data = "invalid",
     });
     const invalid = try certifyReady(alloc, path, 91, "dense_idx", 44);
     try std.testing.expectEqual(ReadyCertification.invalid, std.meta.activeTag(invalid));
-    try std.Io.Dir.cwd().deleteFile(native_platform.testing.io, manifest_path);
+    try std.Io.Dir.cwd().deleteFile(platform.testing.io, manifest_path);
     const missing = try certifyReady(alloc, path, 91, "dense_idx", 44);
     try std.testing.expectEqual(ReadyCertification.missing, std.meta.activeTag(missing));
 }
 
 test "index generation manifest identifies native physical generations" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});

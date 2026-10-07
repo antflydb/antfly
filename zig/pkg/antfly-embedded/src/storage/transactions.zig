@@ -21,7 +21,7 @@
 //!   - Version predicates for conflict detection
 //!   - Commit resolves intents → real keys; abort deletes intents
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -33,7 +33,7 @@ const internal_keys = @import("internal_keys.zig");
 const range_protection = @import("range_protection.zig");
 const lsm_backend = @import("lsm_backend.zig");
 const mem_backend = @import("mem_backend.zig");
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 const build_options = @import("build_options");
 const tracing = @import("../tracing/antfly_trace_writer.zig");
 const stderr_writer = @import("../tracing/stderr_writer.zig");
@@ -3177,7 +3177,7 @@ fn readTimestampRuntime(store: *backend_erased.Store, alloc: Allocator, key: []c
 }
 
 fn cleanupTestDir(path: []const u8) void {
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
@@ -3979,7 +3979,7 @@ test "version predicate conflict" {
 
 test "transaction shared read guards fence writes and survive restart until resolution" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -4127,7 +4127,7 @@ test "transaction index span guards fence pending and later writers without bloc
 
 test "transaction activated range reader and writer reservations recover across LSM restart" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -4296,7 +4296,7 @@ test "concurrent intent conflict" {
 
 test "transaction point reads do not clone runtime lsm mutable state" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;

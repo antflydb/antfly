@@ -2,9 +2,9 @@
 //!
 //! `HttpRuntime` is independent of the executor injected into `Server` for
 //! nested operations. It owns bounded HTTP listener, connection, and request
-//! executors plus the HTTP/1 cancellation monitor needed by `native_platform.Threaded`.
+//! executors plus the HTTP/1 cancellation monitor needed by `platform.Io.Threaded`.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const CancellationObserver = @import("cancellation_observer.zig").Observer;
@@ -112,10 +112,10 @@ pub const HttpRuntime = struct {
     };
 
     observer: CancellationObserver,
-    owned_observer_io: ?native_platform.Threaded,
-    listener_io_impl: ?native_platform.Threaded,
-    connection_io_impl: ?native_platform.Threaded,
-    request_io_impl: ?native_platform.Threaded,
+    owned_observer_io: ?platform.Io.Threaded,
+    listener_io_impl: ?platform.Io.Threaded,
+    connection_io_impl: ?platform.Io.Threaded,
+    request_io_impl: ?platform.Io.Threaded,
     borrowed_io: ?BorrowedIo,
     h1_request_capacity: usize,
     connection_capacity: usize,
@@ -146,8 +146,8 @@ pub const HttpRuntime = struct {
             .observer = CancellationObserver.init(alloc, 0, config.observer_thread_stack_size),
         };
         return .{
-            .owned_observer_io = if (config.observer_io == null) native_platform.Threaded.init(alloc, .{
-                .stack_size = config.observer_thread_stack_size orelse (native_platform.Threaded.InitOptions{}).stack_size,
+            .owned_observer_io = if (config.observer_io == null) platform.Io.Threaded.init(alloc, .{
+                .stack_size = config.observer_thread_stack_size orelse (platform.Io.Threaded.InitOptions{}).stack_size,
                 .async_limit = .nothing,
                 .concurrent_limit = .limited(1),
             }) else null,
@@ -155,13 +155,13 @@ pub const HttpRuntime = struct {
             .connection_capacity = connection_capacity,
             .request_capacity = request_capacity,
             .listener_capacity = listener_capacity,
-            .listener_io_impl = native_platform.Threaded.init(alloc, .{
+            .listener_io_impl = platform.Io.Threaded.init(alloc, .{
                 .concurrent_limit = .limited(listener_capacity),
             }),
-            .connection_io_impl = native_platform.Threaded.init(alloc, .{
+            .connection_io_impl = platform.Io.Threaded.init(alloc, .{
                 .concurrent_limit = .limited(connection_capacity),
             }),
-            .request_io_impl = native_platform.Threaded.init(alloc, .{
+            .request_io_impl = platform.Io.Threaded.init(alloc, .{
                 .concurrent_limit = .limited(request_capacity),
             }),
             .observer = blk: {
@@ -341,7 +341,7 @@ test "HTTP runtime listener leases share one cancellation observer lifecycle" {
 
 test "HTTP runtime observer startup failure preserves control listener reservations" {
     if (@import("builtin").os.tag == .freestanding) return;
-    var observer_io = native_platform.Threaded.init(std.testing.allocator, .{
+    var observer_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
@@ -435,11 +435,11 @@ fn expectSameIo(expected: std.Io, actual: std.Io) !void {
 
 test "HTTP runtime borrows backend-neutral listener connection and request lanes" {
     if (@import("builtin").os.tag == .freestanding) return;
-    var listener_io_impl = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    var listener_io_impl = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
     defer listener_io_impl.deinit();
-    var connection_io_impl = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    var connection_io_impl = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
     defer connection_io_impl.deinit();
-    var request_io_impl = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
+    var request_io_impl = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(1) });
     defer request_io_impl.deinit();
 
     const listener_io = listener_io_impl.io();
@@ -471,7 +471,7 @@ test "HTTP runtime borrows backend-neutral listener connection and request lanes
 
 test "HTTP runtime borrowed lanes fail closed for native disconnect observation" {
     if (@import("builtin").os.tag == .freestanding) return;
-    const io = native_platform.Threaded.global_single_threaded.io();
+    const io = platform.Io.Threaded.global_single_threaded.io();
     var runtime = HttpRuntime.init(std.testing.allocator, .{
         .max_active_h1_requests = 1,
         .borrowed_io = .{ .listener = io },

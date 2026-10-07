@@ -24,12 +24,12 @@
 //! legacy command endpoint remains only for replication compatibility
 //! commands that do not yet have a typed admin route.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const admin_api = @import("../../admin/mod.zig");
 const http_common = @import("antfly_local_sources").common_http_http_common;
 const http_operation = @import("http_operation.zig");
@@ -1004,7 +1004,7 @@ pub const Server = struct {
                 .role = config.role,
                 .pod_uid = config.pod_uid,
                 .fenced = fenced,
-                .observed_at_unix_ns = native_platform.time.realtimeNs(),
+                .observed_at_unix_ns = platform.time.realtimeNs(),
             },
         }) catch |err| return try textResponse(self.alloc, 500, @errorName(err));
         defer page.deinit(self.alloc);
@@ -2724,7 +2724,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     const backup_root = try allocPrintPath(alloc, name, "backup-root", nonce);
     defer alloc.free(backup_root);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
@@ -2744,7 +2744,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
 }
 
 fn allocPrintPath(alloc: Allocator, comptime name: []const u8, comptime part: []const u8, nonce: u64) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, alloc);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, alloc);
     defer alloc.free(cwd);
     const rel = try std.fmt.allocPrint(
         alloc,
@@ -2797,7 +2797,7 @@ fn seedFiles() [2]backup_manifest.FileEntry {
 }
 
 fn writeTestFile(path: []const u8, bytes: []const u8) !void {
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{

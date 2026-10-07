@@ -95,7 +95,7 @@ pub const RaftApplyStoreConfig = struct {
 pub const RaftApplyStore = struct {
     alloc: std.mem.Allocator,
     borrowed_io: ?std.Io,
-    owned_io_impl: ?platform.Threaded,
+    owned_io_impl: ?platform.Io.Threaded,
     root_dir: []u8,
     path: []u8,
     groups_root: []u8,
@@ -190,7 +190,7 @@ pub const RaftApplyStore = struct {
     }
 
     pub fn init(alloc: std.mem.Allocator, cfg: RaftApplyStoreConfig) !RaftApplyStore {
-        var owned_io_impl: ?platform.Threaded = if (cfg.io == null)
+        var owned_io_impl: ?platform.Io.Threaded = if (cfg.io == null)
             threaded_io_limits.initService(alloc)
         else
             null;

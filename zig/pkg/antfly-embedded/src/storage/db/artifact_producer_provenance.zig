@@ -17,7 +17,7 @@
 //! output digests, never a second copy of large artifact bodies. Native apply
 //! constructs it from the validated command; transfer authenticates its bytes
 //! together with source receipts and the immutable source snapshot/tail.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const publication = @import("artifact_publication.zig");
@@ -1153,7 +1153,7 @@ fn collectObsoleteReferencePage(alloc: std.mem.Allocator, store_handle: anytype,
         defer cursor.close();
         var entry = try cursor.seekAtOrAfter(scoped);
         var bytes: usize = 0;
-        const deadline = native_platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        const deadline = platform.time.monotonicNs() +| 2 * std.time.ns_per_ms;
         while (entry) |item| {
             if (!std.mem.startsWith(u8, item.key, scoped)) {
                 entry = null;
@@ -1166,7 +1166,7 @@ fn collectObsoleteReferencePage(alloc: std.mem.Allocator, store_handle: anytype,
                 entry = null;
                 break;
             }
-            if (retired.items.len != 0 and (retired.items.len >= 128 or bytes >= 64 * 1024 or native_platform.time.monotonicNs() >= deadline)) break;
+            if (retired.items.len != 0 and (retired.items.len >= 128 or bytes >= 64 * 1024 or platform.time.monotonicNs() >= deadline)) break;
             const expected_len = 32 + @as(usize, if (std.mem.eql(u8, family, artifact_prefix)) publication.Position.encoded_len else 0);
             if (item.value.len != expected_len) return error.ArtifactCatalogCorrupt;
             const owned_key = try scratch.dupe(u8, item.key);
@@ -1558,7 +1558,7 @@ test "ordered artifact inventory document proof index tracks absence replacement
 test "ordered artifact inventory obsolete proof GC bounds pages and preserves current and pinned evidence" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/proof-gc", .{tmp.sub_path});
     defer alloc.free(path);
@@ -1632,7 +1632,7 @@ test "ordered artifact inventory obsolete proof GC bounds pages and preserves cu
 test "ordered artifact inventory document proof pages seek binary ranges and reject drift" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/proof-page", .{tmp.sub_path});
     defer alloc.free(path);
@@ -1691,7 +1691,7 @@ test "ordered artifact inventory document proof pages seek binary ranges and rej
             try std.testing.expectEqual(@as(usize, 2), page.entries.len);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned, active, range });
+    try platform.allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned, active, range });
     {
         var writer = try db.core.store.beginWriteTxn();
         errdefer writer.abort();

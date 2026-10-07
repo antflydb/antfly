@@ -13,7 +13,6 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
@@ -1492,7 +1491,7 @@ const RaftTableApplyStateMachine = struct {
     // Only live registrations and parked readers retain a signal. Heap-owned
     // addresses survive map growth and retirement while futex waits are parked.
     completion_groups: std.AutoHashMapUnmanaged(u64, *CompletionGroup) = .empty,
-    apply_outcome_io: std.Io = native_platform.debug_io,
+    apply_outcome_io: std.Io = platform.debug_io,
     // ReadIndex is asynchronous: enqueuing it is not a read barrier. This
     // shared tracker owns the request identity and waits until the matching
     // ReadState has crossed this exact replica's state-machine apply boundary.
@@ -1525,7 +1524,7 @@ const RaftTableApplyStateMachine = struct {
         catalog: antfly.public_api.table_catalog.CatalogSource,
         backend_runtime: ?*backend_runtime_mod.BackendRuntime,
     ) !RaftTableApplyStateMachine {
-        const io = if (backend_runtime) |runtime| runtime.io() orelse return error.ConcurrencyUnavailable else native_platform.debug_io;
+        const io = if (backend_runtime) |runtime| runtime.io() orelse return error.ConcurrencyUnavailable else platform.debug_io;
         var incarnation: u128 = undefined;
         try io.randomSecure(std.mem.asBytes(&incarnation));
         const write_source = antfly.public_api.ProvisionedTableWriteSource.initWithBackendRuntime(
@@ -1683,7 +1682,7 @@ const RaftTableApplyStateMachine = struct {
         const signal = self.completion_groups.get(group_id) orelse return;
         const epoch = if (writes) &signal.writes else &signal.reads;
         _ = epoch.fetchAdd(1, .release);
-        std.Io.futexWake(if (writes) self.apply_outcome_io else native_platform.debug_io, u32, &epoch.raw, std.math.maxInt(u32));
+        std.Io.futexWake(if (writes) self.apply_outcome_io else platform.debug_io, u32, &epoch.raw, std.math.maxInt(u32));
     }
 
     fn registerReadBarrier(self: *RaftTableApplyStateMachine, group_id: u64) !u64 {
@@ -1758,7 +1757,7 @@ const RaftTableApplyStateMachine = struct {
             const observed = signal.reads.load(.acquire);
             if (self.readBarrierState(request_id) != .pending) continue;
             std.Io.futexWaitTimeout(
-                native_platform.debug_io,
+                platform.debug_io,
                 u32,
                 &signal.reads.raw,
                 observed,
@@ -5808,7 +5807,7 @@ pub const DataServer = struct {
     owned_http_runtime: ?*httpx.HttpRuntime = null,
     listener_cfg: antfly.raft.transport.std_http_listener.StdHttpListenerConfig,
     listener: ?*DataPublicHttpRuntime = null,
-    query_io_impl: ?platform.Threaded = null,
+    query_io_impl: ?platform.Io.Threaded = null,
     distributed_read_http_executor: ?*antfly.common.http.IoHttpExecutor = null,
     lsm_maintenance_mutex: std.atomic.Mutex = .unlocked,
     lsm_maintenance_future: ?std.Io.Future(void) = null,
@@ -6706,7 +6705,7 @@ pub const DataServer = struct {
             const io = runtime.apiIo() orelse return error.HttpRuntimeUnavailable;
             _ = self.read_source.withIoInterface(io, self.query_async_limit);
         } else {
-            self.query_io_impl = platform.Threaded.init(self.alloc, .{
+            self.query_io_impl = platform.Io.Threaded.init(self.alloc, .{
                 .async_limit = self.query_async_limit,
                 .concurrent_limit = .limited(backend_runtime_mod.default_io_concurrent_limit),
             });
@@ -7307,7 +7306,7 @@ pub const DataServer = struct {
         }, descriptor.byte_range, descriptor.scope);
         const registry_root = try self.hotStandbyRestoreOwnerMetadataRoot(self.alloc);
         defer self.alloc.free(registry_root);
-        const registry_io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const registry_io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         // Persist discovery before acknowledging this record. Otherwise a
         // post-seed hidden owner disappears from an offline subsequent seed.
         try @import("../storage/hot_standby/restore_owner_registry.zig").record(self.alloc, registry_io, registry_root, descriptor);
@@ -7343,7 +7342,7 @@ pub const DataServer = struct {
                 try source.completePreparedReplicaRetirements(&prepared);
             } else try source.requireAbsentRestoreOwnerRoot(self.alloc, group_id);
         } else try source.retireCanceledRestoreOwner(self.alloc, group_id, terminal.table_id, scope, self.replicaRetirementOwnership());
-        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         const root = try self.hotStandbyRestoreOwnerMetadataRoot(self.alloc);
         defer self.alloc.free(root);
         try @import("../storage/hot_standby/restore_owner_registry.zig").retireTerminal(self.alloc, io, root, group_id, scope);
@@ -7382,7 +7381,7 @@ pub const DataServer = struct {
 
     fn hotStandbyRestoreTerminalLedger(self: *DataServer) !*@import("../storage/hot_standby/restore_terminal_ledger.zig").Ledger {
         const source = self.liveRuntimeWriteSource();
-        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         self.restore_terminal_mutex.lockUncancelable(io);
         defer self.restore_terminal_mutex.unlock(io);
         if (self.restore_terminal_ledger == null) {
@@ -7415,7 +7414,7 @@ pub const DataServer = struct {
         if (applied_lsn == 0) return;
         const floor: @import("../storage/hot_standby/replay_floor.zig").Floor = .{ .cluster_id = identity.cluster_id, .timeline_id = identity.timeline_id, .epoch = identity.epoch, .lsn = applied_lsn };
         const source = self.liveRuntimeWriteSource();
-        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const io = if (source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         const ledger = try self.hotStandbyRestoreTerminalLedger();
         var current = try ledger.snapshot();
         defer current.deinit();
@@ -8043,7 +8042,7 @@ pub const DataServer = struct {
         const published_root = try std.fs.path.join(alloc, &.{ snapshots_root, request.generation });
         errdefer alloc.free(published_root);
 
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         // Prepared roots are staging state only. A process stop can leave a
@@ -8340,7 +8339,7 @@ pub const DataServer = struct {
         const deadline_ns = now_ns +| hot_standby_seed_snapshot_preflight_timeout_ns;
         const registry_root = try self.hotStandbyRestoreOwnerMetadataRoot(self.alloc);
         defer self.alloc.free(registry_root);
-        const registry_io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const registry_io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         var terminal_snapshot = try (try self.hotStandbyRestoreTerminalLedger()).snapshot();
         defer terminal_snapshot.deinit();
         var native_inventory = try @import("../storage/hot_standby/restore_owner_registry.zig").loadWithTerminalSnapshot(self.alloc, registry_io, registry_root, metadata_snapshot.tables, &terminal_snapshot);
@@ -8410,7 +8409,7 @@ pub const DataServer = struct {
         defer alloc.free(metadata_root);
         const path = try std.fs.path.join(alloc, &.{ metadata_root, antfly.hot_standby.seed_materialization.private_provisioning_name });
         defer alloc.free(path);
-        const io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else native_platform.debug_io;
+        const io = if (self.write_source.backend_runtime) |runtime| runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable else platform.debug_io;
         const encoded = std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes)) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
@@ -8594,7 +8593,7 @@ pub const DataServer = struct {
         defer alloc.free(allowed_root);
         if (!antfly.hot_standby.validation.isAbsoluteNormalizedPathWithinRoot(prepared_root, allowed_root) or
             std.mem.eql(u8, prepared_root, allowed_root)) return error.InvalidHASeedSnapshotRoot;
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         const topology_path = try std.fs.path.join(alloc, &.{ prepared_root, hot_standby_seed_snapshot_topology_name });
@@ -8711,7 +8710,7 @@ pub const DataServer = struct {
         defer alloc.free(allowed_root);
         if (!antfly.hot_standby.validation.isAbsoluteNormalizedPathWithinRoot(prepared_root, allowed_root) or
             std.mem.eql(u8, prepared_root, allowed_root)) return;
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), prepared_root) catch |err| {
             std.log.warn("failed to remove prepared HA seed snapshot root={s} err={s}", .{ prepared_root, @errorName(err) });
@@ -9429,7 +9428,7 @@ pub const DataServer = struct {
         self.provisioned_storage.detachWriteSourceRuntimeHooks();
         if (comptime linked_storage) {
             if (self.kernel_owner_source) |owner_source|
-                try owner_source.quiesce(self.dataRaftIo() orelse platform.Threaded.global_single_threaded.io());
+                try owner_source.quiesce(self.dataRaftIo() orelse platform.Io.Threaded.global_single_threaded.io());
         }
         // Native owner close joins transaction-recovery callbacks. They may
         // still need the Raft listener and progress driver to finish a local
@@ -25092,7 +25091,7 @@ const RemoteMetadataSource = struct {
     fn init(
         alloc: std.mem.Allocator,
         base_uris: []const []const u8,
-        io_impl: *platform.Threaded,
+        io_impl: *platform.Io.Threaded,
     ) !RemoteMetadataSource {
         if (base_uris.len == 0) return error.MissingMetadataApi;
         const http_executors = try alloc.alloc(
@@ -29331,7 +29330,7 @@ fn collectLocalGroupStatuses(
         const db_path = try antfly.metadata.groupDbPathFromReplicaRoot(alloc, replica_root_dir, group_id);
         defer alloc.free(db_path);
 
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         _ = statFilePath(io_impl.io(), db_path) catch |err| switch (err) {
             error.FileNotFound => continue,
@@ -30695,7 +30694,7 @@ pub fn runFromIterator(
     }
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
-    var setup_io = platform.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
+    var setup_io = platform.Io.Threaded.init(alloc, .{ .stack_size = setup_io_thread_stack_size });
     defer setup_io.deinit();
     const runtime_cadence = antfly.raft.RuntimeCadence.fromMillis(
         cli.raft_tick_ms,
@@ -31396,7 +31395,7 @@ fn resolveExtensionPackageStoreDirWithEnv(
 fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (!std.fs.path.isAbsolute(path)) return try alloc.dupe(u8, path);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     var probe = path;
@@ -31860,7 +31859,7 @@ const TestHotStandbySeedSnapshotProvider = struct {
         self.calls += 1;
         if (self.unsupported) return error.HASeedSnapshotUnsupportedBackend;
 
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         const provider_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{request.capture_root});
@@ -37755,7 +37754,7 @@ fn consumerTests() type {
             defer alloc.free(catalog_path);
             const hidden_root = try std.fmt.allocPrint(alloc, "{s}/group-77", .{replica_root});
             defer alloc.free(hidden_root);
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try fs_paths.createDirPathPortable(io_impl.io(), hidden_root);
             {
@@ -38210,7 +38209,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?u64, 17), server.last_data_raft_reconciled_metadata_epoch);
 
             {
-                var io_impl = platform.Threaded.init(alloc, .{});
+                var io_impl = platform.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
                 var progress = antfly.raft.ManagedProgressDriver.init(
                     io_impl.io(),
@@ -38895,7 +38894,7 @@ fn consumerTests() type {
         test "data runtime reallocation request refreshes group status once per request" {
             var tmp = platform.testing.tmpDir(.{});
             defer tmp.cleanup();
-            var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
             defer io_impl.deinit();
 
             const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-reallocation-status-refresh", .{tmp.sub_path});
@@ -41983,7 +41982,7 @@ fn consumerTests() type {
             const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -42112,7 +42111,7 @@ fn consumerTests() type {
             const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -42269,7 +42268,7 @@ fn consumerTests() type {
             const fence_path = try std.fmt.allocPrintSentinel(alloc, "{s}-primary-fence", .{fixture.path()}, 0);
             defer alloc.free(fence_path);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
@@ -42424,7 +42423,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -42635,7 +42634,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -42850,7 +42849,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -43014,7 +43013,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -43227,7 +43226,7 @@ fn consumerTests() type {
             const standby_progress_alias = try std.fmt.allocPrint(alloc, "./{s}", .{standby_progress});
             defer alloc.free(standby_progress_alias);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -43429,7 +43428,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -43630,7 +43629,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -43861,7 +43860,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
@@ -44042,7 +44041,7 @@ fn consumerTests() type {
             const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -45877,7 +45876,7 @@ fn consumerTests() type {
                 std.testing.allocator,
                 &.{"http://metadata.invalid"},
                 &executors,
-                platform.Threaded.global_single_threaded.io(),
+                platform.Io.Threaded.global_single_threaded.io(),
             );
             defer source.deinit();
 
@@ -46927,7 +46926,7 @@ fn implementationTests() type {
             });
             defer prepared.deinit(alloc);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const topology_path = try std.fs.path.join(alloc, &.{ prepared.root, hot_standby_seed_snapshot_topology_name });
             defer alloc.free(topology_path);
@@ -54138,7 +54137,7 @@ fn implementationTests() type {
             });
             defer prepared.deinit(alloc);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const topology_path = try std.fs.path.join(alloc, &.{ prepared.root, hot_standby_seed_snapshot_topology_name });
             defer alloc.free(topology_path);
@@ -54281,7 +54280,7 @@ fn implementationTests() type {
             const restore_jobs_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restore-jobs" });
             defer alloc.free(restore_jobs_path);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             const replica_root = try std.fs.path.join(alloc, &.{ capture_fixture_root, "replicas" });
             defer alloc.free(replica_root);
@@ -54635,7 +54634,7 @@ fn implementationTests() type {
 
                 fn afterCopy(ptr: *anyopaque, hook_alloc: std.mem.Allocator) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    var hook_io_impl = platform.Threaded.init(hook_alloc, .{});
+                    var hook_io_impl = platform.Io.Threaded.init(hook_alloc, .{});
                     defer hook_io_impl.deinit();
                     var file = try std.Io.Dir.cwd().createFile(hook_io_impl.io(), self.runtime_path, .{ .truncate = true });
                     defer file.close(hook_io_impl.io());
@@ -55716,7 +55715,7 @@ fn implementationTests() type {
             const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
@@ -55843,7 +55842,7 @@ fn implementationTests() type {
             const standby_progress = try std.fmt.allocPrintSentinel(alloc, "{s}-standby-progress", .{fixture.path()}, 0);
             defer alloc.free(standby_progress);
 
-            var io_impl = platform.Threaded.init(alloc, .{});
+            var io_impl = platform.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_log) catch {};
             std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};

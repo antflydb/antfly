@@ -274,7 +274,7 @@ pub const WAL = struct {
     sync_io: std.Io = if (@import("builtin").os.tag == .freestanding)
         .failing
     else
-        platform.Threaded.global_single_threaded.io(),
+        platform.Io.Threaded.global_single_threaded.io(),
     mutex: std.Io.Mutex = .init,
     completed: std.Io.Condition = .init,
     coordinator_active: bool = false,
@@ -1119,7 +1119,7 @@ fn openStoreOwner(alloc: Allocator, path: [*:0]const u8, opts: WalOptions) !Stor
                 );
             }
             if (opts.storage == null and !opts.read_only) {
-                var io_impl = platform.Threaded.init(alloc, .{});
+                var io_impl = platform.Io.Threaded.init(alloc, .{});
                 defer io_impl.deinit();
                 try fs_paths.createDirPathPortable(io_impl.io(), path_owned);
                 if (debug_open) std.log.info("wal lsm open ensured dir path={s}", .{path_owned});
@@ -1193,7 +1193,7 @@ fn elapsedSince(started: u64) u64 {
 
 fn sleepNs(ns: u64) void {
     if (ns == 0) return;
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Clock.Duration.sleep(.{
         .clock = .awake,
@@ -1525,7 +1525,7 @@ fn runConcurrentAppends(io: std.Io, workers: []ConcurrentAppendWorker) !void {
 
 test "wal concurrent append startup failure drains workers without writing" {
     for (0..3) |capacity| {
-        var io_impl = platform.Threaded.init(std.testing.allocator, .{
+        var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(capacity),
         });
@@ -3628,7 +3628,7 @@ test "wal read-only lsm backend does not create missing root" {
     const path = try std.testing.allocator.dupeSentinel(u8, path_raw, 0);
     defer std.testing.allocator.free(path);
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io_impl.io(), path_raw, .{}));
     var wal = try WAL.open(path, .{
@@ -3681,7 +3681,7 @@ test "wal routes lsm profile options" {
 }
 
 fn cleanupWalDir(path: [*:0]const u8) void {
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

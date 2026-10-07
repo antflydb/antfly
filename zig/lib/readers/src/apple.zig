@@ -407,7 +407,7 @@ test "apple OCR recognizes encoded and borrowed raster inputs with page identity
 test "apple OCR registry reads bounded data URI images" {
     if (!enabled) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{});
     defer client.deinit();

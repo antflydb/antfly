@@ -1704,7 +1704,7 @@ test "awaitTurn propagates cancellation without stealing the active turn" {
             try target.awaitTurn(lease, .decode, io);
         }
     };
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var future = try io.concurrent(Waiter.run, .{ &coordinator, &second, io });
@@ -1735,7 +1735,7 @@ test "deferred turn cleanup releases ownership after post-acquire failure" {
             return error.InjectedFailure;
         }
     };
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     try std.testing.expectError(error.InjectedFailure, FailingStep.run(&coordinator, &first, io_impl.io()));
     try std.testing.expectEqual(@as(?RequestId, null), coordinator.in_turn);

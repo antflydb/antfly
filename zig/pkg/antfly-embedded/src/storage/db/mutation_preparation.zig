@@ -41,7 +41,7 @@ const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const relational_store = @import("relational_store.zig");
 const schema_mod = @import("../schema.zig");
 const schema_registry_mod = @import("schema_registry.zig");
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 const transactions_mod = @import("../transactions.zig");
 const transform_mod = @import("transform.zig");
@@ -574,7 +574,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             if (try pages.plan(progress.value, req) == .replay) return unchanged;
             const observed = try inventory.status(alloc, &txn, @import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace));
             if (!observed.ready or observed.ordered == null) return error.ArtifactCatalogDrift;
-            const io = self.backend_runtime.io() orelse native_platform.debug_io;
+            const io = self.backend_runtime.io() orelse platform.debug_io;
             try self.local_execution.merge_artifact_layout_mutex.lock(io);
             defer self.local_execution.merge_artifact_layout_mutex.unlock(io);
             const layout = try self.local_execution.merge_artifact_layout.get(self.alloc, &txn, progress.value, observed.ordered.?, try inventory.catalogs(&txn));
@@ -2013,7 +2013,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .durable_rows = durable_rows,
                 .restore_timestamps = restore_timestamps,
                 .preserve_logical_values = preserve_logical_values,
-                .io = io orelse native_platform.debug_io,
+                .io = io orelse platform.debug_io,
             };
             if (!parallel) {
                 ctx.run();

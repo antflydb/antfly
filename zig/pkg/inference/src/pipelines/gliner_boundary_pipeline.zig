@@ -17,7 +17,7 @@
 //! come from one prepared batch. Results own their strings and coordinates;
 //! source-free enum values are explicit and never receive invented offsets.
 //! This module does not register a serving capability or qualify a backend.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const compute = @import("../ops/ops.zig");
@@ -1397,7 +1397,7 @@ fn readPinnedFile(a: Allocator, directory: []const u8, name: []const u8, expecte
     return bytes;
 }
 fn publishedCheckpointParity(comptime variant: []const u8, comptime environment: [:0]const u8, comptime fixture_name: []const u8) !void {
-    const directory = native_platform.env.getenv(environment) orelse return error.SkipZigTest;
+    const directory = platform.env.getenv(environment) orelse return error.SkipZigTest;
     const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const safetensors = @import("../models/safetensors.zig");
     const native = @import("../ops/native_compute.zig");
@@ -1487,7 +1487,7 @@ fn convertedCheckpointParity(comptime variant: []const u8, comptime environment:
         if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
         if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
     }
-    const directory = native_platform.env.getenv(environment) orelse return error.SkipZigTest;
+    const directory = platform.env.getenv(environment) orelse return error.SkipZigTest;
     const fixtures = @import("../architectures/gliner/boundary_parity_test.zig");
     const factory = @import("../architectures/session_factory.zig");
     const manifest_mod = @import("../models/manifest.zig");
@@ -1552,7 +1552,7 @@ fn convertedCheckpointParity(comptime variant: []const u8, comptime environment:
 
     const watchdog: ?*Watchdog = if (device_backend == .metal) try Watchdog.create(a) else null;
     defer if (watchdog) |owner| owner.destroy();
-    if (watchdog) |owner| try owner.start(native_platform.testing.io);
+    if (watchdog) |owner| try owner.start(platform.testing.io);
     for (fixture.value.cases) |case| {
         errdefer std.debug.print(variant ++ " converted-bundle pipeline case: {s}\n", .{case.id});
         const schema_json = try std.json.Stringify.valueAlloc(a, case.schema, .{});
@@ -1561,7 +1561,7 @@ fn convertedCheckpointParity(comptime variant: []const u8, comptime environment:
         defer schema.deinit();
         var prepared = try processor.prepare(a, tokenizer.tokenizer(), &.{.{ .text = case.text, .schema = &schema }}, .{});
         defer prepared.deinit();
-        const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = native_platform.time.monotonicNs() + 120 * std.time.ns_per_s };
+        const control = Control{ .hard_cancellation = if (watchdog) |owner| owner.boundary() else null, .deadline_ns = platform.time.monotonicNs() + 120 * std.time.ns_per_s };
         var managed = try factory.getManagedComputeBackend(session, a, null, control);
         defer managed.deinit();
         var result = switch (device_backend) {
@@ -1808,7 +1808,7 @@ test "gliner boundary classification presentation shares temperature fallback pr
             try std.testing.expectEqual(@as(usize, 3), output.output_values);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(a, Check.run, .{ &ordinary, &raw });
+    try platform.allocator.checkAllAllocationFailures(a, Check.run, .{ &ordinary, &raw });
 }
 
 test "gliner boundary classification top_k preserves ordinary and structured presentation" {
@@ -1836,7 +1836,7 @@ test "gliner boundary classification top_k preserves ordinary and structured pre
             try std.testing.expectEqualStrings("right", output.classifications[2].labels[1].label);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(a, Ordinary.run, .{ &ordinary, &ordinary_raw });
+    try platform.allocator.checkAllAllocationFailures(a, Ordinary.run, .{ &ordinary, &ordinary_raw });
 
     // Omitting top_k lets the whole collection use declared cardinalities.
     var mixed = try schema_mod.compile(a,
@@ -1857,7 +1857,7 @@ test "gliner boundary classification top_k preserves ordinary and structured pre
             try std.testing.expectEqualStrings("y", output.classifications[1].labels[1].label);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(a, Structured.run, .{ &mixed, &mixed_raw });
+    try platform.allocator.checkAllAllocationFailures(a, Structured.run, .{ &mixed, &mixed_raw });
 
     // Independent callers cannot bypass compilation and silently discard a
     // non-default top_k. Reject before the first presentation allocation.

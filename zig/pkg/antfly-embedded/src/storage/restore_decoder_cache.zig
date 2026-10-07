@@ -17,7 +17,7 @@
 //! keeps the generation read lease pinned; a miss or terminal transition closes
 //! it before the source generation can be replaced or retired. The restore
 //! cursor is durable in the target, never in this disposable cache.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -280,13 +280,13 @@ test "restore decoder registered owner slots stay bounded across idle and termin
     for (&caches) |*cache| cache.* = .{};
     var registered: usize = 0;
     defer {
-        for (caches[0..registered]) |*cache| cache.retire(native_platform.testing.io);
+        for (caches[0..registered]) |*cache| cache.retire(platform.testing.io);
     }
     while (registered < available) : (registered += 1) {
         try std.testing.expect(reserveSlot());
         const cache = &caches[registered];
         cache.slot_owned = true;
-        cache.io = native_platform.testing.io;
+        cache.io = platform.testing.io;
         // Model a parked registration after its idle decoder was closed.
         // No callback context may be allocated for owner 17.
         cache.reclaimer = 1;
@@ -295,7 +295,7 @@ test "restore decoder registered owner slots stay bounded across idle and termin
     }
     try std.testing.expectEqual(max_resident_decoders, residentDecoderCount());
     try std.testing.expect(!reserveSlot());
-    for (caches[0..registered]) |*cache| cache.retire(native_platform.testing.io);
+    for (caches[0..registered]) |*cache| cache.retire(platform.testing.io);
     try std.testing.expectEqual(baseline, residentDecoderCount());
 }
 
@@ -311,7 +311,7 @@ test "restore decoder stable owner without resource manager uses no resident slo
         .namespace = .{ .table_id = 4, .shard_id = 5, .range_id = 6 },
         .path = "/published/source",
     };
-    try std.testing.expect(!(try cache.installLocked(std.testing.allocator, native_platform.testing.io, &runtime, null, key, &decoder, true)));
+    try std.testing.expect(!(try cache.installLocked(std.testing.allocator, platform.testing.io, &runtime, null, key, &decoder, true)));
     try std.testing.expectEqual(baseline, residentDecoderCount());
     try std.testing.expect(!cache.slot_owned);
     try std.testing.expect(cache.idle_handle == null);

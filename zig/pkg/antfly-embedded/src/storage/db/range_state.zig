@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -31,7 +31,7 @@ pub const InitialOwnerRange = struct {
 
     fn check(self: @This()) !void {
         try self.cancellation.check();
-        if (self.deadline_ns) |deadline| if (native_platform.time.monotonicNs() >= deadline) return error.DeadlineExceeded;
+        if (self.deadline_ns) |deadline| if (platform.time.monotonicNs() >= deadline) return error.DeadlineExceeded;
     }
 };
 
@@ -338,7 +338,7 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
 }
 
 test "range state saves and loads namespaced ranges" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/range-state", .{tmp.sub_path});
@@ -383,7 +383,7 @@ test "range state persists multi-kibibyte split boundaries" {
 }
 
 test "range state returns empty range for missing namespaced key" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/range-state-empty", .{tmp.sub_path});

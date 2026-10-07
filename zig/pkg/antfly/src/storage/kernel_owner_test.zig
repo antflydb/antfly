@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const hot_standby_write_gate_adapter = @import("hot_standby/write_gate.zig");
 const hot_standby_publisher_adapter = @import("hot_standby/db_commit.zig");
 const std = @import("std");
@@ -28,9 +28,9 @@ const metadata_apply_client = @import("metadata_raft_apply_client.zig");
 
 test "opaque owner retained relational read crosses checked archive boundary" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const path = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(path);
     var context: client.Context = .{};
     try context.ensure();
@@ -93,9 +93,9 @@ test "opaque owner retained relational read crosses checked archive boundary" {
 
 test "opaque owner retains newer durable schema when reopening a stale descriptor" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/stale-schema", .{root});
     defer alloc.free(path);
@@ -144,9 +144,9 @@ test "opaque owner retains newer durable schema when reopening a stale descripto
 
 test "opaque owner standalone rewrite authority is durable and cannot be selected by a request" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-72/table-db", .{root});
     defer alloc.free(path);
@@ -212,9 +212,9 @@ test "opaque owner cold reopen preserves frozen document and relational backup c
         }
     };
     inline for (.{ false, true }) |relational| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+        const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
         defer alloc.free(root);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-7117/table-db", .{root});
         defer alloc.free(path);
@@ -380,7 +380,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
             response.deinit();
         }
     };
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const donor_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/donor", .{tmp.sub_path});
     defer alloc.free(donor_path);
@@ -422,7 +422,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     target.deinit();
     const target_pin = try @import("antfly_local_sources").storage_db_source_pin.pathAlloc(alloc, target_path, scope);
     defer alloc.free(target_pin);
-    try std.Io.Dir.cwd().deleteTree(native_platform.testing.io, target_pin);
+    try std.Io.Dir.cwd().deleteTree(platform.testing.io, target_pin);
     target = try client.Owner.open(target_options);
     try std.testing.expectError(error.OnlineSourcePinMissing, target.prepareSourcePinPublicationJson(.{ .table_name = .fromSlice("docs"), .request_json = .fromSlice(pin_json) }));
     var described = try Call.run(transfer.Descriptor, &donor, .{ .describe = scope });
@@ -475,10 +475,10 @@ test "opaque owner source artifact transfer resumes across replicas without dono
             const spool_path = try std.fmt.allocPrint(alloc, "{s}/source.receiving", .{target_pin});
             defer alloc.free(spool_path);
             {
-                const spool = try std.Io.Dir.cwd().openFile(native_platform.testing.io, spool_path, .{ .mode = .read_write });
-                defer spool.close(native_platform.testing.io);
-                try spool.writePositionalAll(native_platform.testing.io, "unacknowledged physical tail", accepted.value.next_offset);
-                try spool.sync(native_platform.testing.io);
+                const spool = try std.Io.Dir.cwd().openFile(platform.testing.io, spool_path, .{ .mode = .read_write });
+                defer spool.close(platform.testing.io);
+                try spool.writePositionalAll(platform.testing.io, "unacknowledged physical tail", accepted.value.next_offset);
+                try spool.sync(platform.testing.io);
             }
             target = try client.Owner.open(target_options);
             var restarted = try Call.run(transfer.Status, &target, .{ .status = descriptor });
@@ -508,7 +508,7 @@ test "opaque owner source artifact transfer resumes across replicas without dono
     defer alloc.free(receiving_path);
     const artifact_path = try std.fmt.allocPrint(alloc, "{s}/source.afb2", .{target_pin});
     defer alloc.free(artifact_path);
-    try std.Io.Dir.rename(.cwd(), receiving_path, .cwd(), artifact_path, native_platform.testing.io);
+    try std.Io.Dir.rename(.cwd(), receiving_path, .cwd(), artifact_path, platform.testing.io);
     target = try client.Owner.open(target_options);
     var first_retry = try Call.run(transfer.ReadResponse, &donor, .{ .read = .{ .descriptor = descriptor, .offset = 0 } });
     defer first_retry.deinit();
@@ -554,7 +554,7 @@ test "opaque owner online source controls and status survive compiled boundary r
     const contract = @import("antfly_local_sources").api_local_query_contract;
     const batch = @import("antfly_local_sources").api_batch;
     const source = @import("antfly_local_sources").storage_db_online_source_contract;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-source-controls", .{tmp.sub_path});
     defer alloc.free(path);
@@ -632,9 +632,9 @@ test "opaque owner relational handoff preserves binary proofs across the compile
     // concurrent test run) that opens the same path, surfacing spurious
     // GenerationTransitionActive failures. Use a per-run unique directory
     // like the rest of this file's tests.
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/relational-handoff", .{root});
     defer alloc.free(path);
@@ -732,9 +732,9 @@ test "opaque owner exports exact backup seals and reclaims pins without opening 
     const transition = @import("antfly_local_sources").storage_db_relational_transition_contract;
     const seal = @import("antfly_local_sources").storage_db_native_backup_seal_contract;
     const backup = @import("antfly_local_sources").api_backup_contract;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/group-7105/table-db", .{root});
     defer alloc.free(path);
@@ -825,9 +825,9 @@ test "opaque owner exports exact backup seals and reclaims pins without opening 
 
 test "opaque ordinary owner range initialization preserves durable authority and rejects unsafe reconciliation" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     var context = client.Context{};
     try context.ensure();
@@ -964,9 +964,9 @@ test "opaque portable and native restore preserve bounded range through captured
             return prepared.value.response;
         }
     };
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1192,7 +1192,7 @@ test "opaque hidden restore prepares without mutation and reopens exact canceled
     var snapshot_output: abi.OwnedBytes = .{};
     try @import("kernel_error_identity").statusToError(abi.antfly_storage_owner_hidden_restore_json(owner.handle, &.{ .operation = .capture_snapshot, .table_name = .fromSlice("docs"), .table_id = 71, .scope = scope.digest(), .snapshot_token = .fromSlice("canceled-owner"), .destination_root = .fromSlice(snapshot_path) }, &snapshot_output));
     abi.antfly_storage_owner_buffer_destroy(&snapshot_output);
-    var snapshot_io = native_platform.Threaded.init(alloc, .{});
+    var snapshot_io = platform.Io.Threaded.init(alloc, .{});
     defer snapshot_io.deinit();
     _ = try std.Io.Dir.cwd().statFile(snapshot_io.io(), snapshot_path ++ "/store.bin", .{});
     owner.deinit();
@@ -1239,7 +1239,7 @@ test "HA seed storage-owner boundary preserves exact operational errors" {
 }
 
 fn cleanup(path: []const u8) void {
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
@@ -1406,7 +1406,7 @@ test "opaque storage context owns Lite system namespaces auth and table owners" 
     const auth_path = root ++ "/auth";
     cleanup(root);
     defer cleanup(root);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try std.Io.Dir.cwd().createDirPath(io_impl.io(), root);
 
@@ -1562,7 +1562,7 @@ test "opaque storage owner fences exact source targets before acknowledging writ
 
 test "opaque storage owner schedules source verification after reopen without traffic" {
     const alloc = std.testing.allocator;
-    const time = native_platform.time;
+    const time = platform.time;
     var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-source-maintenance");
     defer directory.cleanup();
     const path = std.mem.span(directory.path().ptr);
@@ -1604,19 +1604,19 @@ test "opaque storage owner schedules source verification after reopen without tr
                 return;
             }
         }
-        try native_platform.testing.io.sleep(.fromMilliseconds(20), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(20), .awake);
     }
     return error.SourceVerificationDidNotRun;
 }
 
 fn ownerStatusEventually(owner: *client.Owner) !client.Response {
-    const time = native_platform.time;
+    const time = platform.time;
     const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
     while (true) {
         return owner.runtimeStatusJson("docs") catch |err| switch (err) {
             error.StorageBusy => {
                 if (time.monotonicNs() >= deadline) return err;
-                try native_platform.testing.io.sleep(.fromMilliseconds(2), .awake);
+                try platform.testing.io.sleep(.fromMilliseconds(2), .awake);
                 continue;
             },
             else => return err,
@@ -1632,13 +1632,13 @@ fn ownerStatusEventually(owner: *client.Owner) !client.Response {
 // same category of contention ownerStatusEventually already retries for
 // runtimeStatusJson.
 fn ownerTextMemoryEventually(owner: *client.Owner, table_name: []const u8) !client.Response {
-    const time = native_platform.time;
+    const time = platform.time;
     const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
     while (true) {
         return owner.textMemoryJson(table_name) catch |err| switch (err) {
             error.StorageBusy => {
                 if (time.monotonicNs() >= deadline) return err;
-                try native_platform.testing.io.sleep(.fromMilliseconds(2), .awake);
+                try platform.testing.io.sleep(.fromMilliseconds(2), .awake);
                 continue;
             },
             else => return err,
@@ -1708,9 +1708,9 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     // owner's process-wide generation/lease lifecycle and surfacing spurious
     // StorageBusy/LsmRootWriterAlreadyOpen failures. Use a per-run unique
     // directory like the rest of this file's tests.
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", std.testing.allocator);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(root);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/batch-query", .{root});
     defer std.testing.allocator.free(path);
@@ -1810,9 +1810,9 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     // background writer. A full-index acknowledgement does not make the next
     // observational read uncontended, so retry this transient status here.
     var status_response = status: {
-        const time = native_platform.time;
+        const time = platform.time;
         const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
-        var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
         defer io_impl.deinit();
         while (true) {
             break :status owner.runtimeStatusJson("docs") catch |err| switch (err) {
@@ -2644,7 +2644,7 @@ test "opaque storage owner transaction recovery crosses callback ABI" {
     );
     resolve.deinit();
 
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     for (0..500) |_| {
         if (capture.calls.load(.acquire) > 0) break;
@@ -2670,7 +2670,7 @@ test "opaque storage context reports the configured process budget" {
     const services = @import("kernel_runtime_services.zig");
     // Borrowed I/O makes budget resolution deterministic instead of clamping
     // the explicit limit to whichever host/container runs this regression.
-    var executor = services.executor.Borrow.init(&native_platform.testing.io);
+    var executor = services.executor.Borrow.init(&platform.testing.io);
     var small = client.Context{};
     try small.ensureWithRuntime(.{ .memory_limit_bytes = 64 * 1024 * 1024, .io = &executor });
     defer small.deinit();
@@ -2746,9 +2746,9 @@ test "opaque storage context enforces owner lifetime and shares process storage 
 
 test "opaque rejected Raft entry advances through empty batch without effects across reopen" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const path = try std.fmt.allocPrint(alloc, "{s}/rejected-entry", .{root});
     defer alloc.free(path);
@@ -2787,9 +2787,9 @@ test "opaque rejected Raft entry advances through empty batch without effects ac
 
 test "opaque native Raft snapshot captures once and stages native plus logical projection" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const source_path = try std.fmt.allocPrint(alloc, "{s}/native-source", .{root});
     defer alloc.free(source_path);
@@ -2841,7 +2841,7 @@ test "opaque native Raft snapshot captures once and stages native plus logical p
     later.deinit();
     var artifact = try prepared.materializeFile(alloc);
     defer artifact.deinit(alloc);
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, artifact.path, alloc, .limited(artifact.size + 1));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, artifact.path, alloc, .limited(artifact.size + 1));
     defer alloc.free(bytes);
     var target = try data_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = raw_target_path, .context = context.handle });
     defer target.deinit();
@@ -3214,7 +3214,7 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
     var materialized = try prepared.materializeFile(std.testing.allocator);
     defer materialized.deinit(std.testing.allocator);
     const materialized_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        native_platform.debug_io,
+        platform.debug_io,
         materialized.path,
         std.testing.allocator,
         .limited(materialized.size + 1),
@@ -3246,7 +3246,7 @@ test "opaque data raft apply owner preserves batch snapshot and placement lifecy
 
 test "opaque metadata HA callback preserves lost ack replay and full checkpoint authority" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const root = "/tmp/antfly-storage-kernel-metadata-ha-port";
     cleanup(root);
     defer cleanup(root);
@@ -3330,7 +3330,7 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     const root = "/tmp/antfly-storage-kernel-metadata-promotion";
     cleanup(root);
     defer cleanup(root);
-    try std.Io.Dir.cwd().createDirPath(native_platform.testing.io, root);
+    try std.Io.Dir.cwd().createDirPath(platform.testing.io, root);
     const primary_mod = @import("hot_standby/primary.zig");
     const gate_mod = @import("hot_standby/public_gate_state.zig");
     var primary = try primary_mod.Primary.open(alloc, root ++ "/standby.log", root ++ "/slots", .{ .cluster_id = 7, .shard_id = 0, .table_id = 0, .timeline_id = 1, .epoch = 1 }, .{});
@@ -3368,23 +3368,23 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
         .key = "\x00\x00__api_restore_jobs__:000000000000002a",
         .value = "{\"job_id\":42,\"phase\":\"queued\"}",
     } }));
-    try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(native_platform.testing.io, root ++ "/checkpoint"));
+    try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(platform.testing.io, root ++ "/checkpoint"));
     try std.testing.expect(transition.tryLock());
     transition.unlock();
     const prior_lsn = primary.lastLsn();
     try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
     try source.flushHotStandbyOutbox();
     try std.testing.expectEqual(prior_lsn, primary.lastLsn());
-    _ = try source.exportHotStandbyCheckpoint(native_platform.testing.io, root ++ "/checkpoint");
+    _ = try source.exportHotStandbyCheckpoint(platform.testing.io, root ++ "/checkpoint");
 }
 
 test "opaque metadata initial FK reservation preserves placement authority across snapshot" {
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
     const catalog = @import("antfly_local_sources").system_catalog_domain;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const source_path = try std.fmt.allocPrint(alloc, "{s}/source", .{root});
     defer alloc.free(source_path);
@@ -3461,9 +3461,9 @@ test "opaque metadata staging authority and binary receipts survive compiled pro
             try store.applyStandaloneCommand(group, .{ .apply_restore_staging = encoded });
         }
     };
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(root);
     const source_path = try std.fmt.allocPrint(alloc, "{s}/source", .{root});
     defer alloc.free(source_path);
@@ -3529,12 +3529,12 @@ test "opaque metadata compound rewrite admission preserves job and source reserv
     const alloc = std.testing.allocator;
     const stages = @import("../metadata/restore_staging.zig");
     const group = @import("antfly_local_sources").common_group_ids.main_metadata_group_id;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", a);
     var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = try std.fmt.allocPrint(a, "{s}/source", .{root}), .no_sync = true });
     defer source.deinit();
     const original: @import("../metadata/table_manager.zig").TableRecord = .{ .table_id = 9, .name = "rows", .schema_json = "{\"version\":1,\"storage_mode\":\"document\"}" };
@@ -4053,10 +4053,10 @@ test "storage query contract preserves each vector candidate budget" {
 fn contextAllocationLifecycle(alloc: std.mem.Allocator) !void {
     const services = @import("kernel_runtime_services.zig");
     var bridge = services.memory.Allocator.fromStd(&alloc);
-    // Keep executor creation outside the allocation sweep. native_platform.Threaded
+    // Keep executor creation outside the allocation sweep. platform.Io.Threaded
     // reports thread admission failure as ConcurrencyUnavailable; this sweep
     // verifies the context's own fallible construction and unwind paths.
-    var executor = services.executor.Borrow.init(&native_platform.testing.io);
+    var executor = services.executor.Borrow.init(&platform.testing.io);
     var context = client.Context{};
     try context.ensureWithRuntime(.{ .allocator = &bridge, .io = &executor });
     defer context.deinit();
@@ -4173,12 +4173,12 @@ test "opaque owner lookup and typed scans preserve metadata scope digest and row
         .limit = 1,
     });
     defer alloc.free(indexed_request);
-    const deadline = native_platform.time.monotonicNs() + 15 * std.time.ns_per_s;
+    const deadline = platform.time.monotonicNs() + 15 * std.time.ns_per_s;
     var indexed = while (true) {
         break owner.scanNdjsonWithOptions("rows", indexed_request, .{ .execution_deadline_ns = deadline }) catch |err| switch (err) {
             error.RelationalIndexNotReady => {
-                if (native_platform.time.monotonicNs() >= deadline) return err;
-                try native_platform.testing.io.sleep(.fromMilliseconds(5), .awake);
+                if (platform.time.monotonicNs() >= deadline) return err;
+                try platform.testing.io.sleep(.fromMilliseconds(5), .awake);
                 continue;
             },
             else => return err,
@@ -4215,20 +4215,20 @@ test "opaque metadata secret collection preserves binary ciphertext across owner
     const alloc = std.testing.allocator;
     const records = @import("antfly_local_sources").common_secret_record;
     const collections = @import("../common/secret_collection.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "keyring.json", .data = "{\"active\":\"test\",\"keys\":[{\"id\":\"test\",\"key\":\"1111111111111111111111111111111111111111111111111111111111111111\"}]}" });
-    const keyring_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, "keyring.json", alloc);
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "keyring.json", .data = "{\"active\":\"test\",\"keys\":[{\"id\":\"test\",\"key\":\"1111111111111111111111111111111111111111111111111111111111111111\"}]}" });
+    const keyring_path = try tmp.dir.realPathFileAlloc(platform.testing.io, "keyring.json", alloc);
     defer alloc.free(keyring_path);
-    const path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+    const path = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
     defer alloc.free(path);
-    var keys = @import("../common/secret_keyring.zig").Keyring{ .alloc = alloc, .io = native_platform.testing.io, .path = keyring_path };
+    var keys = @import("../common/secret_keyring.zig").Keyring{ .alloc = alloc, .io = platform.testing.io, .path = keyring_path };
     const identity = records.Identity{ .scope = "scope", .key = "token", .revision = 1 };
-    const envelope = try records.seal(alloc, native_platform.testing.io, keys.provider(), identity, "\x00\xff\xfe\x01");
+    const envelope = try records.seal(alloc, platform.testing.io, keys.provider(), identity, "\x00\xff\xfe\x01");
     defer alloc.free(envelope);
     var before = try collections.decode(alloc, "scope", null);
     defer before.deinit(alloc);
-    const collection = try collections.replace(alloc, native_platform.testing.io, "scope", before, "token", envelope);
+    const collection = try collections.replace(alloc, platform.testing.io, "scope", before, "token", envelope);
     defer alloc.free(collection);
     // Transition tag 60 contains expected-revision (0) followed by AFSC.
     const transition = try alloc.alloc(u8, 6 + 4 + 8 + collection.len);

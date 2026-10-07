@@ -26,11 +26,15 @@ native clocks, synchronization, directory entries, positional reads and
 mapping hints; `DynLib` supplies Windows dynamic loading. Existing Unix
 implementations remain selected on their targets.
 
-`platform.Threaded` selects `threaded_windows.zig` on Windows and stock
+`platform.Io.Threaded` selects `threaded_windows.zig` on Windows and stock
 `std.Io.Threaded` elsewhere. The Windows backend is a checked-in adaptation
 of Zig 0.17's Threaded backend, with its MIT notice and upstream source hash.
 It owns its worker TLS, cancellation, path conversion and I/O vtable. Locks,
 hardlinks and Wine socket/entropy adapters execute inside this owner.
+`platform.Io.Evented` selects the qualified fiber backend, and
+`platform.Io.Context` aliases `std.Io` so borrowed contexts remain compatible
+with Zig APIs. Future backends belong in this namespace; backend selection
+happens when constructing an executor, not by converting a context.
 `lib/runtime` also exports this executor. Libraries accept borrowed `std.Io`
 values and dispatch through their caller's vtable.
 
@@ -72,7 +76,7 @@ or Windows Server compatibility; those still need a real Windows runner.
 
 ## Focused qualification with stock Zig
 
-From `zig/`, build all nine suites in Debug and ReleaseFast:
+From `zig/`, build all ten suites in Debug and ReleaseFast:
 
 ```sh
 python3 tools/windows/build_tests.py --zig zig --out /private/tmp/antfly-windows-tests
@@ -80,7 +84,7 @@ python3 tools/windows/build_tests.py --zig zig --out /private/tmp/antfly-windows
 
 The builder explicitly selects the installed Zig library, clears `ZIG_LIB_DIR`,
 and creates hashed executables, `manifest.json`, and `tests.zip`. It covers
-compatibility primitives and Winsock error translation, model-file
+I/O namespace selection and context interoperability, compatibility primitives and Winsock error translation, model-file
 reads/mapping/parallel prefetch, hardlinks, backup/staging cancellation,
 object-store filesystem publication, Lite index/vacuum, storage I/O, and a
 separately compiled archive borrower that dispatches 64 times after owning

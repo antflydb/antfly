@@ -15,7 +15,7 @@
 
 //! Runtime document-store adapter over native `.aflite` document pages.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const antfly_platform = @import("antfly_platform");
@@ -36,11 +36,11 @@ const bounded_cursor_test_documents: usize = 512;
 
 test "lite reclamation stale quota estimates expire after roots shrink" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "review-stale-quota.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const value = try a.alloc(u8, 128 * 1024);
@@ -48,7 +48,7 @@ test "lite reclamation stale quota estimates expire after roots shrink" {
     @memset(value, 'v');
     for (0..64) |_| try store.file.putDocument("large", value);
     try store.file.putDocument("keep", value);
-    const physical = (try store.file.file.stat(native_platform.testing.io)).size;
+    const physical = (try store.file.file.stat(platform.testing.io)).size;
     const old_compact = (try store.file.liveStats(null)).compact_size;
     const cap = physical + old_compact * 2 - 64 * 1024;
     store.maintenance_policy = try reclamation.Policy.init(.{ .page_reuse = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 128 * 1024, .max_storage_bytes = cap });
@@ -57,7 +57,7 @@ test "lite reclamation stale quota estimates expire after roots shrink" {
     var write = try store.beginWrite();
     try write.delete("large");
     try write.commit();
-    const after = (try store.file.file.stat(native_platform.testing.io)).size;
+    const after = (try store.file.file.stat(platform.testing.io)).size;
     const compact = (try store.file.liveStats(null)).compact_size;
     try std.testing.expect(after + compact * 2 < cap);
     try std.testing.expect(store.maintenance_policy.worthwhile(after, compact));
@@ -83,7 +83,7 @@ test "lite reclamation writer busy retries gate image copies until publication i
         var owner: ?*Store = null;
         var writes: u64 = 0;
         fn write(userdata: ?*anyopaque, file: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
-            const n = try native_platform.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            const n = try platform.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
             if (owner) |store| if (file.handle != store.file.file.handle) {
                 writes += 1;
             };
@@ -91,13 +91,13 @@ test "lite reclamation writer busy retries gate image copies until publication i
         }
     };
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "review-busy-copy.aflite");
     defer a.free(path);
-    var vtable = native_platform.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.fileWritePositional = Hook.write;
-    const io = std.Io{ .userdata = native_platform.testing.io.userdata, .vtable = &vtable };
+    const io = std.Io{ .userdata = platform.testing.io.userdata, .vtable = &vtable };
     var store = try Store.createWithOptions(a, path, .{ .io = io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = false } });
     defer store.close();
     store.maintenance_start_suppressed = true;
@@ -142,13 +142,13 @@ test "lite reclamation writer busy retries gate image copies until publication i
 
 test "lite reclamation prepared admission cancels cold reserve replay before publication" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "admission-live.aflite");
     defer a.free(path);
     const staged_path = try testPath(a, tmp, "admission-prepared.aflite");
     defer a.free(staged_path);
-    const options: CreateOptions = .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } };
+    const options: CreateOptions = .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } };
     var live = try Store.createWithOptions(a, path, options);
     defer live.close();
     live.maintenance_start_suppressed = true;
@@ -169,7 +169,7 @@ test "lite reclamation prepared admission cancels cold reserve replay before pub
     var cancel = maintenance.CancelToken{};
     staged.file.test_cancel_on_read = &cancel;
     defer staged.file.test_cancel_on_read = null;
-    const old_bytes = (try live.file.file.stat(native_platform.testing.io)).size;
+    const old_bytes = (try live.file.file.stat(platform.testing.io)).size;
     try std.testing.expectError(error.MaintenanceCanceled, live.admitPreparedGenerationAssumeLockedWithCancel(&staged.file, old_bytes, &cancel));
     try std.testing.expect(staged.file.test_page_reads.load(.monotonic) - reads <= 2);
     try std.testing.expectEqualDeep(live_checkpoint, live.file.activeCheckpoint());
@@ -190,12 +190,12 @@ test "lite reclamation retries reuse estimates and reassess changed roots when a
         }
     };
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "review-retry-scan.aflite");
     defer a.free(path);
     var probe = Probe{};
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     for (0..64) |_| try store.file.putDocument("doc", "value");
@@ -219,7 +219,7 @@ test "lite reclamation retries reuse estimates and reassess changed roots when a
     try std.testing.expectEqual(@as(u64, 1), store.maintenance_policy.status.assessment_count);
     try std.testing.expectEqual(baseline, store.maintenance_policy.assessed_retirement_bytes);
     store.maintenance_policy.options.max_storage_bytes = 0;
-    store.assessment_cache.?.revalidate_at = std.Io.Clock.awake.now(native_platform.testing.io).addDuration(std.Io.Duration.fromSeconds(30));
+    store.assessment_cache.?.revalidate_at = std.Io.Clock.awake.now(platform.testing.io).addDuration(std.Io.Duration.fromSeconds(30));
     // Changed checkpoints must not force repeated scans while resources remain
     // blocked and proportional activity has not exhausted the scan budget.
     for (0..5) |_| {
@@ -232,7 +232,7 @@ test "lite reclamation retries reuse estimates and reassess changed roots when a
     try store.maintainOnce(true);
     try std.testing.expectEqual(@as(u64, 2), store.maintenance_policy.status.assessment_count);
     try std.testing.expectEqual(reclamation.Reason.low_disk, store.maintenance_policy.status.reason);
-    try std.testing.expect(store.assessment_cache.?.revalidate_at.nanoseconds >= std.Io.Clock.awake.now(native_platform.testing.io).addDuration(std.Io.Duration.fromSeconds(29)).nanoseconds);
+    try std.testing.expect(store.assessment_cache.?.revalidate_at.nanoseconds >= std.Io.Clock.awake.now(platform.testing.io).addDuration(std.Io.Duration.fromSeconds(29)).nanoseconds);
     for (0..5) |_| {
         try store.file.putDocument("doc", "changed");
         try store.maintainOnce(true);
@@ -255,7 +255,7 @@ test "lite reclamation worker cancels post assessment status replay after foregr
         var owner_reads: u64 = 0;
         var checkpoint: native.CheckpointSlot = undefined;
         pub fn read(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
-            const n = try native_platform.testing.io.vtable.fileReadPositional(userdata, file, data, offset);
+            const n = try platform.testing.io.vtable.fileReadPositional(userdata, file, data, offset);
             if (owner) |store| {
                 if (file.handle == store.file.file.handle and store.maintenance_cancel.requested.load(.acquire)) owner_reads += 1;
                 if (file.handle != store.file.file.handle and store.maintenance_running and offset >= 4096 and store.file.test_cancel_on_read == null) {
@@ -275,13 +275,13 @@ test "lite reclamation worker cancels post assessment status replay after foregr
         }
     };
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "review-status-cancel.aflite");
     defer a.free(path);
-    var vtable = native_platform.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.fileReadPositional = Hook.read;
-    const io = std.Io{ .userdata = native_platform.testing.io.userdata, .vtable = &vtable };
+    const io = std.Io{ .userdata = platform.testing.io.userdata, .vtable = &vtable };
     var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = io, .reclamation = .{ .enabled = false } });
     defer store.close();
     store.maintenance_start_suppressed = true;
@@ -318,11 +318,11 @@ test "lite reclamation worker cancels post assessment status replay after foregr
 
 test "lite reclamation worker cancels cold debt replay after vacuum adoption" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "worker-cold-debt.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const value = try a.alloc(u8, 4 * 1024 * 1024);
@@ -355,11 +355,11 @@ test "lite reclamation worker cancels cold debt replay after vacuum adoption" {
 
 test "lite reclamation vacuum preserves collector capacity with retained readers" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "vacuum-collector-capacity.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 4096 } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const large = try a.alloc(u8, 400 * 1024);
@@ -376,7 +376,7 @@ test "lite reclamation vacuum preserves collector capacity with retained readers
     defer if (pin_active) pinned.abort();
     const before = store.file.activeCheckpoint();
     const before_handle = store.file.file.handle;
-    const size = (try store.file.file.stat(native_platform.testing.io)).size;
+    const size = (try store.file.file.stat(platform.testing.io)).size;
     const compact = (try store.file.liveStats(null)).compact_size;
     store.maintenance_policy.options.max_storage_bytes = size + compact * 2;
     const initial = try store.reclamationStatus();
@@ -403,12 +403,12 @@ test "lite reclamation vacuum rechecks disk headroom before adoption" {
         }
     };
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "vacuum-publication-disk.aflite");
     defer a.free(path);
     var probe = Probe{};
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &probe, .available = Probe.available } } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &probe, .available = Probe.available } } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     try store.putCatalogRecord("key", "value");
@@ -426,16 +426,16 @@ test "lite reclamation vacuum rechecks disk headroom before adoption" {
 
 test "lite reclamation restore adoption rejects oversized generations" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "restore-budget-live.aflite");
     defer a.free(path);
     const staged_path = try testPath(a, tmp, "restore-budget-staged.aflite");
     defer a.free(staged_path);
-    var live = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .max_storage_bytes = 128 * 4096 } });
+    var live = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .max_storage_bytes = 128 * 4096 } });
     defer live.close();
     live.maintenance_start_suppressed = true;
-    var staged = try Store.createWithOptions(a, staged_path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    var staged = try Store.createWithOptions(a, staged_path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
     defer staged.close();
     staged.maintenance_start_suppressed = true;
     const value = try a.alloc(u8, 600 * 1024);
@@ -450,14 +450,14 @@ test "lite reclamation restore adoption rejects oversized generations" {
 
 test "lite reclamation restore workspace bounds staging and releases admission" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "workspace-live.aflite");
     defer a.free(path);
     const staged_path = try testPath(a, tmp, "workspace-staged.aflite");
     defer a.free(staged_path);
     const limit = 256 * 4096;
-    var live = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .max_storage_bytes = limit } });
+    var live = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .max_storage_bytes = limit } });
     defer live.close();
     live.maintenance_start_suppressed = true;
     var workspace = try live.reserveGenerationWorkspace();
@@ -466,17 +466,17 @@ test "lite reclamation restore workspace bounds staging and releases admission" 
     try std.testing.expectEqual(limit, (try live.reclamationStatus()).totalBytes());
     try std.testing.expectError(error.FileBusy, live.reserveGenerationWorkspace());
     try std.testing.expectError(error.FileBusy, live.vacuum());
-    var staged = try Store.createWithOptions(a, staged_path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = workspace.options });
+    var staged = try Store.createWithOptions(a, staged_path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = workspace.options });
     defer staged.close();
     staged.maintenance_start_suppressed = true;
     const value = try a.alloc(u8, limit);
     defer a.free(value);
     @memset(value, 'v');
     const before = staged.file.activeCheckpoint();
-    const before_size = (try staged.file.file.stat(native_platform.testing.io)).size;
+    const before_size = (try staged.file.file.stat(platform.testing.io)).size;
     try std.testing.expectError(error.LiteStorageBudgetExceeded, staged.putCatalogRecord("oversized", value));
     try std.testing.expectEqualDeep(before, staged.file.activeCheckpoint());
-    try std.testing.expectEqual(before_size, (try staged.file.file.stat(native_platform.testing.io)).size);
+    try std.testing.expectEqual(before_size, (try staged.file.file.stat(platform.testing.io)).size);
     try staged.putCatalogRecord("small", "accepted");
     var pinned = try live.beginRead();
     defer pinned.abort();
@@ -500,19 +500,19 @@ test "lite reclamation restore rechecks disk capacity at publication" {
         }
     };
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "restore-disk-live.aflite");
     defer a.free(path);
     const staged_path = try testPath(a, tmp, "restore-disk-staged.aflite");
     defer a.free(staged_path);
     var available: u64 = 1024 * 1024;
-    var live = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &available, .available = Probe.available } } });
+    var live = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &available, .available = Probe.available } } });
     defer live.close();
     live.maintenance_start_suppressed = true;
     var workspace = try live.reserveGenerationWorkspace();
     defer workspace.deinit();
-    var staged = try Store.createWithOptions(a, staged_path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = workspace.options });
+    var staged = try Store.createWithOptions(a, staged_path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = workspace.options });
     defer staged.close();
     staged.maintenance_start_suppressed = true;
     try staged.putCatalogRecord("small", "value");
@@ -524,11 +524,11 @@ test "lite reclamation restore rechecks disk capacity at publication" {
 
 test "lite reclamation shrinking observes deletions without growth" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "shrink-activity.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .minimum_reclaim_bytes = 16 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .minimum_reclaim_bytes = 16 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const value = try a.alloc(u8, 128 * 1024);
@@ -554,11 +554,11 @@ test "lite reclamation shrinking observes deletions without growth" {
 
 test "lite reclamation shrinking observes partially live packed records" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "shrink-packed.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .minimum_reclaim_bytes = 32 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .minimum_reclaim_bytes = 32 * 1024, .assessment_bytes = 64 * 1024 * 1024 } });
     defer store.close();
     store.maintenance_start_suppressed = true;
     const value: [1536]u8 = @splat('v');
@@ -593,12 +593,12 @@ test "lite reclamation shrinking observes partially live packed records" {
 
 test "lite reclamation capacity reserve sustains bounded overwrites" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "retirement-capacity.aflite");
     defer a.free(path);
     const limit = 128 * 4096;
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     // Exercise cooperative service deterministically, including pressure that
     // arrives before the normal sparse-journal checkpoint threshold.
@@ -626,7 +626,7 @@ test "lite reclamation capacity reserve sustains bounded overwrites" {
             try store.maintainOnce(false);
         }
         try std.testing.expect(accepted);
-        try std.testing.expect((try store.file.file.stat(native_platform.testing.io)).size <= limit);
+        try std.testing.expect((try store.file.file.stat(platform.testing.io)).size <= limit);
     }
     try std.testing.expect((try store.file.allocatorStats()).?.reused_pages > 0);
     var read = try store.beginRead();
@@ -637,17 +637,17 @@ test "lite reclamation capacity reserve sustains bounded overwrites" {
 
 test "lite reclamation creation checks budget before replacement" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "creation-capacity.aflite");
     defer a.free(path);
     {
-        var file = try native.NativeFile.createWithIo(a, native_platform.testing.io, path, .{});
+        var file = try native.NativeFile.createWithIo(a, platform.testing.io, path, .{});
         defer file.close();
         try file.putCatalogRecord("stable", "original");
     }
-    try std.testing.expectError(error.LiteStorageBudgetExceeded, Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .max_storage_bytes = 4096 } }));
-    var file = try native.NativeFile.openWithIo(a, native_platform.testing.io, path, .{ .read_only = true });
+    try std.testing.expectError(error.LiteStorageBudgetExceeded, Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .max_storage_bytes = 4096 } }));
+    var file = try native.NativeFile.openWithIo(a, platform.testing.io, path, .{ .read_only = true });
     defer file.close();
     const value = (try file.getCatalogRecordAlloc(a, "stable")).?;
     defer a.free(value);
@@ -656,12 +656,12 @@ test "lite reclamation creation checks budget before replacement" {
 
 test "lite reclamation capacity reserve drains wide value graphs" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "wide-retirement-capacity.aflite");
     defer a.free(path);
     const limit = 256 * 4096;
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     store.maintenance_cancel.request();
     const value = try a.alloc(u8, 256 * 1024);
@@ -681,7 +681,7 @@ test "lite reclamation capacity reserve drains wide value graphs" {
             try store.maintainOnce(false);
         }
         try std.testing.expect(accepted);
-        try std.testing.expect((try store.file.file.stat(native_platform.testing.io)).size <= limit);
+        try std.testing.expect((try store.file.file.stat(platform.testing.io)).size <= limit);
     }
     const stored = (try store.getCatalogRecordAlloc(a, "meta")).?;
     defer a.free(stored);
@@ -691,16 +691,16 @@ test "lite reclamation capacity reserve drains wide value graphs" {
 
 test "lite reclamation owner vacuum reports final publication size" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "vacuum-final-size.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false } });
     defer store.close();
     store.maintenance_cancel.request();
     for (0..32) |_| try store.putCatalogRecord("meta", "value");
     const report = try store.vacuum();
-    const size = (try store.file.file.stat(native_platform.testing.io)).size;
+    const size = (try store.file.file.stat(platform.testing.io)).size;
     try std.testing.expectEqual(size, report.after_size);
     try std.testing.expectEqual(report.before_size -| size, report.reclaimed_bytes);
     try std.testing.expectEqual(report.reclaimed_bytes, (try store.reclamationStatus()).last_reclaimed_bytes);
@@ -713,22 +713,22 @@ test "lite reclamation creation checks disk before replacing an artifact" {
         }
     };
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "creation-disk.aflite");
     defer a.free(path);
     var context: u8 = 0;
-    try std.testing.expectError(error.LiteInsufficientDiskSpace, Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .reclamation = .{ .disk_headroom_bytes = 0, .capacity_probe = .{ .context = &context, .available = Probe.available } } }));
-    try std.testing.expectError(error.FileNotFound, native.NativeFile.openWithIo(a, native_platform.testing.io, path, .{}));
+    try std.testing.expectError(error.LiteInsufficientDiskSpace, Store.createWithOptions(a, path, .{ .io = platform.testing.io, .reclamation = .{ .disk_headroom_bytes = 0, .capacity_probe = .{ .context = &context, .available = Probe.available } } }));
+    try std.testing.expectError(error.FileNotFound, native.NativeFile.openWithIo(a, platform.testing.io, path, .{}));
 }
 
 test "lite reclamation counts retired inodes until pinned readers release" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reclamation-retained.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .enabled = false } });
     defer store.close();
     var write = try store.beginWrite();
     try write.put("doc", "old");
@@ -770,7 +770,7 @@ test "lite reclamation counts retired inodes until pinned readers release" {
 
 test "lite reclamation writable reopen services debt and read only reopen does not" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reclamation-reopen.aflite");
     defer alloc.free(path);
@@ -779,8 +779,8 @@ test "lite reclamation writable reopen services debt and read only reopen does n
     for (0..6) |cycle| {
         // Populate without a worker, representing a legacy/maintenance-disabled client.
         {
-            var store = Store.openWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } }) catch |err| switch (err) {
-                error.FileNotFound => try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } }),
+            var store = Store.openWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } }) catch |err| switch (err) {
+                error.FileNotFound => try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } }),
                 else => return err,
             };
             defer store.close();
@@ -795,11 +795,11 @@ test "lite reclamation writable reopen services debt and read only reopen does n
             peak = @max(peak, (try store.reclamationStatus()).current_file_bytes);
         }
         {
-            var reader = try Store.openWithOptions(alloc, path, .{ .read_only = true, .io = native_platform.testing.io, .reclamation = options });
+            var reader = try Store.openWithOptions(alloc, path, .{ .read_only = true, .io = platform.testing.io, .reclamation = options });
             defer reader.close();
             try std.testing.expectEqual(@as(u64, 0), (try reader.reclamationStatus()).rewrite_count);
         }
-        var owner = try Store.openWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = options });
+        var owner = try Store.openWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = options });
         defer owner.close();
         const status = try owner.reclamationStatus();
         try std.testing.expectEqual(@as(u64, 1), status.rewrite_count);
@@ -817,12 +817,12 @@ test "lite reclamation writable reopen services debt and read only reopen does n
 
 test "lite reclamation budget rejects a mutation before exhausting capacity" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reclamation-budget.aflite");
     defer alloc.free(path);
     const limit = 64 * 4096;
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false, .max_storage_bytes = limit } });
     defer store.close();
     var value: [8192]u8 = @splat('a');
     var accepted: usize = 0;
@@ -855,12 +855,12 @@ test "lite reclamation low disk defers rewriting and resumes when capacity retur
         }
     };
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reclamation-disk.aflite");
     defer alloc.free(path);
     var probe = Probe{};
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .page_reuse = false, .enabled = false } });
     defer store.close();
     for (0..64) |_| try store.file.putDocument("doc", "value");
     store.maintenance_policy = try reclamation.Policy.init(.{ .page_reuse = false, .assessment_bytes = 4096, .minimum_reclaim_bytes = 32 * 4096, .disk_headroom_bytes = 4096, .capacity_probe = .{ .context = &probe, .available = Probe.available } });
@@ -875,11 +875,11 @@ test "lite reclamation low disk defers rewriting and resumes when capacity retur
 
 test "lite reclamation automatic worker bounds sustained overwrite history" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reclamation-worker.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .page_reuse = false, .assessment_bytes = 8 * 4096, .minimum_reclaim_bytes = 32 * 4096, .retry_ms = 1 } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .page_reuse = false, .assessment_bytes = 8 * 4096, .minimum_reclaim_bytes = 32 * 4096, .retry_ms = 1 } });
     defer store.close();
     var peak: u64 = 0;
     for (0..4) |cycle| {
@@ -893,17 +893,17 @@ test "lite reclamation automatic worker bounds sustained overwrite history" {
             peak = @max(peak, (try store.reclamationStatus()).current_file_bytes);
         }
         // No manual maintenance call: wait only for the owner's automatic task.
-        const deadline = std.Io.Clock.awake.now(native_platform.testing.io).addDuration(std.Io.Duration.fromSeconds(5));
+        const deadline = std.Io.Clock.awake.now(platform.testing.io).addDuration(std.Io.Duration.fromSeconds(5));
         while (true) {
             const status = try store.reclamationStatus();
             // A successful online rewrite can retain bounded catch-up history;
             // the contract is an envelope, not a fully packed file per cycle.
             if (status.rewrite_count > before and status.state == .idle and status.current_file_bytes < 64 * 4096) break;
-            if (std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds >= deadline.nanoseconds) {
+            if (std.Io.Clock.awake.now(platform.testing.io).nanoseconds >= deadline.nanoseconds) {
                 std.debug.print("maintenance state={s} reason={s} error={?s} size={d}\n", .{ @tagName(status.state), @tagName(status.reason), status.last_error, status.current_file_bytes });
                 return error.TestUnexpectedResult;
             }
-            try native_platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+            try platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
         }
         var read = try store.beginRead();
         defer read.abort();
@@ -916,15 +916,15 @@ test "lite reclamation automatic worker bounds sustained overwrite history" {
 
 test "lite reclamation staged generation joins maintenance before owner adoption" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const live_path = try testPath(alloc, tmp, "reclamation-adopt-live.aflite");
     defer alloc.free(live_path);
     const staged_path = try testPath(alloc, tmp, "reclamation-adopt-stage.aflite");
     defer alloc.free(staged_path);
-    var live = try Store.createWithOptions(alloc, live_path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var live = try Store.createWithOptions(alloc, live_path, .{ .no_sync = true, .io = platform.testing.io });
     defer live.close();
-    var staged = try Store.createWithOptions(alloc, staged_path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{
+    var staged = try Store.createWithOptions(alloc, staged_path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{
         .assessment_bytes = 4096,
         .minimum_reclaim_bytes = 4 * 4096,
         .retry_ms = 1,
@@ -946,11 +946,11 @@ test "lite reclamation staged generation joins maintenance before owner adoption
 
 test "lite allocator v4 owner pins readers and reuses pages with shrinking disabled" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reuse-owner.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
     defer store.close();
     var write = try store.beginWrite();
     try write.put("doc", "old");
@@ -992,7 +992,7 @@ test "lite allocator v4 owner pins readers and reuses pages with shrinking disab
 
 test "lite allocator v4 migrates legacy owners and preserves read only files" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "allocator-migration.aflite");
     defer a.free(path);
@@ -1000,18 +1000,18 @@ test "lite allocator v4 migrates legacy owners and preserves read only files" {
     var key: [1024]u8 = @splat('k');
     key[0] = 'a';
     {
-        var legacy = try native.NativeFile.createWithIo(a, native_platform.testing.io, path, .{});
+        var legacy = try native.NativeFile.createWithIo(a, platform.testing.io, path, .{});
         defer legacy.close();
         try legacy.putDocument(&key, &value);
         try legacy.putCatalogRecord("metadata", &value);
         try legacy.putIndexCatalogRecord("index", &value);
     }
     {
-        var reader = try Store.openWithOptions(a, path, .{ .read_only = true, .io = native_platform.testing.io });
+        var reader = try Store.openWithOptions(a, path, .{ .read_only = true, .io = platform.testing.io });
         defer reader.close();
         try std.testing.expect(!reader.file.header.indexed_reclamation);
     }
-    var owner = try Store.openWithOptions(a, path, .{ .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var owner = try Store.openWithOptions(a, path, .{ .io = platform.testing.io, .reclamation = .{ .enabled = false } });
     defer owner.close();
     try std.testing.expect(owner.file.header.indexed_reclamation);
     var txn = try owner.beginRead();
@@ -1022,11 +1022,11 @@ test "lite allocator v4 migrates legacy owners and preserves read only files" {
 
 test "lite allocator v4 releasing the last old reader starts idle retirement" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "reuse-idle-retirement.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
     defer store.close();
     var oldest = try store.beginRead();
     var oldest_open = true;
@@ -1043,15 +1043,15 @@ test "lite allocator v4 releasing the last old reader starts idle retirement" {
     try std.testing.expect(store.maintenance_future == null);
     oldest.abort();
     oldest_open = false;
-    const deadline = std.Io.Clock.awake.now(native_platform.testing.io).addDuration(std.Io.Duration.fromSeconds(10));
+    const deadline = std.Io.Clock.awake.now(platform.testing.io).addDuration(std.Io.Duration.fromSeconds(10));
     while (true) {
         const status = try store.reclamationStatus();
         if (status.pending_data_retirement_objects == 0 and status.retired_objects_serviced > 1000) {
             try std.testing.expectEqual(@as(u64, 0), status.rewrite_count);
             break;
         }
-        if (std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
-        try native_platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
+        if (std.Io.Clock.awake.now(platform.testing.io).nanoseconds >= deadline.nanoseconds) return error.TestUnexpectedResult;
+        try platform.testing.io.sleep(std.Io.Duration.fromMilliseconds(1), .awake);
     }
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
@@ -3551,14 +3551,14 @@ fn lockStore(store: *Store) void {
     platform_sync.lockYielding(&store.mutex);
 }
 
-fn testPath(allocator: Allocator, tmp: native_platform.testing.TmpDir, name: []const u8) ![]u8 {
+fn testPath(allocator: Allocator, tmp: platform.testing.TmpDir, name: []const u8) ![]u8 {
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
 test "lite native docstore runtime persists atomic batch" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore.aflite");
@@ -3595,7 +3595,7 @@ test "lite native docstore runtime persists atomic batch" {
 
 test "lite native docstore prefixed runtimes isolate keys cursors and replay" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-docstore-prefixed.aflite");
     defer allocator.free(path);
@@ -3639,7 +3639,7 @@ test "lite native docstore prefixed runtimes isolate keys cursors and replay" {
 
 test "lite native docstore keeps disjoint namespace cursors isolated without snapshots" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-docstore-namespace-cache.aflite");
     defer allocator.free(path);
@@ -3677,7 +3677,7 @@ test "lite native docstore keeps disjoint namespace cursors isolated without sna
 test "lite native docstore runtime scans ordered snapshot" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-scan.aflite");
@@ -3712,7 +3712,7 @@ test "lite native docstore runtime scans ordered snapshot" {
 
 test "lite native write cursors merge pending writes and deletes in order" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-docstore-write-cursor.aflite");
     defer allocator.free(path);
@@ -3793,7 +3793,7 @@ test "lite native write cursors merge pending writes and deletes in order" {
 test "lite native docstore persists replay lanes across reopen and truncation" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-replay.aflite");
@@ -3894,7 +3894,7 @@ test "lite native docstore persists replay lanes across reopen and truncation" {
 test "lite native docstore reserves one writer until abort or commit" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-single-writer.aflite");
@@ -3945,7 +3945,7 @@ fn expectIndexCursorMatchesDiskRebuild(store: *Store) !void {
 test "lite native docstore disk index matches rebuild across mixed commits" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-applied-snapshot.aflite");
@@ -4014,7 +4014,7 @@ test "lite native docstore disk index matches rebuild across mixed commits" {
 
 test "lite native docstore disk cursor loads values lazily" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(allocator, tmp, "native-docstore-shared-payloads.aflite");
     defer allocator.free(path);
@@ -4052,7 +4052,7 @@ test "lite native docstore disk cursor loads values lazily" {
 test "lite native docstore read transactions pin their snapshot across commits" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-pinned-snapshot.aflite");
@@ -4092,7 +4092,7 @@ test "lite native docstore read transactions pin their snapshot across commits" 
 test "lite native docstore disk index survives out-of-band catalog commits and vacuum" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-cache-oob.aflite");
@@ -4139,7 +4139,7 @@ test "lite native docstore disk index survives out-of-band catalog commits and v
 test "lite native docstore cold writes and large disk-index cursors stay bounded" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const path = try testPath(allocator, tmp, "native-docstore-lazy-writes.aflite");
@@ -4199,11 +4199,11 @@ test "lite native docstore cold writes and large disk-index cursors stay bounded
 
 test "lite transaction indexed overlay preserves borrowed versions and sorted multi reads" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "indexed-overlay.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     var seed = try store.beginWrite();
     try seed.put("a", "disk-a");
@@ -4249,11 +4249,11 @@ test "lite transaction indexed overlay preserves borrowed versions and sorted mu
 
 test "lite online vacuum retires generations without waiting for pinned readers" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "reader-generation-vacuum.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     var write = try store.beginWrite();
     try write.put("doc", "old");
@@ -4274,11 +4274,11 @@ test "lite online vacuum retires generations without waiting for pinned readers"
 
 test "lite group commit hands leadership to a bounded queued group" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "queued-group-commit.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .page_reuse = false } });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io, .reclamation = .{ .page_reuse = false } });
     defer store.close();
     const Gate = struct {
         started: std.atomic.Value(bool) = .init(false),
@@ -4293,7 +4293,7 @@ test "lite group commit hands leadership to a bounded queued group" {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.id == 0) {
                 self.gate.started.store(true, .release);
-                while (!self.gate.proceed.load(.acquire)) native_platform.time.yieldNow();
+                while (!self.gate.proceed.load(.acquire)) platform.time.yieldNow();
             }
             var buf: [32]u8 = undefined;
             const key = try std.fmt.bufPrint(&buf, "queued-{d}", .{self.id});
@@ -4315,19 +4315,19 @@ test "lite group commit hands leadership to a bounded queued group" {
         worker.* = .{ .store = &store, .gate = &gate, .id = i };
         threads[i] = try std.Thread.spawn(.{}, Worker.run, .{worker});
         spawned += 1;
-        if (i == 0) while (!gate.started.load(.acquire)) native_platform.time.yieldNow();
+        if (i == 0) while (!gate.started.load(.acquire)) platform.time.yieldNow();
     }
     while (true) {
-        store.commit_mutex.lockUncancelable(native_platform.testing.io);
+        store.commit_mutex.lockUncancelable(platform.testing.io);
         var queued: usize = 0;
         var item = store.commit_head;
         while (item) |request| {
             queued += 1;
             item = request.next;
         }
-        store.commit_mutex.unlock(native_platform.testing.io);
+        store.commit_mutex.unlock(platform.testing.io);
         if (queued == 8) break;
-        native_platform.time.yieldNow();
+        platform.time.yieldNow();
     }
     gate.proceed.store(true, .release);
     for (threads[0..spawned]) |thread| thread.join();
@@ -4345,11 +4345,11 @@ test "lite group commit hands leadership to a bounded queued group" {
 
 test "lite failed commit group discards every root and allows a clean retry" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "failed-commit-group.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     const Context = struct {
         fail: bool,
@@ -4407,7 +4407,7 @@ test "lite online vacuum publishes while group-commit mutations keep landing" {
         }
     };
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "vacuum-under-group-commits.aflite");
     defer alloc.free(path);
@@ -4425,7 +4425,7 @@ test "lite online vacuum publishes while group-commit mutations keep landing" {
         hammer.stop.store(true, .release);
         if (!joined) thread.join();
     }
-    while (hammer.submitted.load(.acquire) < 4) native_platform.time.yieldNow();
+    while (hammer.submitted.load(.acquire) < 4) platform.time.yieldNow();
     _ = try store.vacuum();
     hammer.stop.store(true, .release);
     thread.join();
@@ -4454,9 +4454,9 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
         pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
             if (armed.load(.acquire) and file.handle != live_handle and armed.swap(false, .acq_rel)) {
                 started.store(true, .release);
-                while (!proceed.load(.acquire)) native_platform.time.yieldNow();
+                while (!proceed.load(.acquire)) platform.time.yieldNow();
             }
-            return native_platform.debug_io.vtable.fileSync(userdata, file);
+            return platform.debug_io.vtable.fileSync(userdata, file);
         }
     };
     const Worker = struct {
@@ -4470,13 +4470,13 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
         }
     };
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "foreground-vacuum.aflite");
     defer alloc.free(path);
-    var vtable = native_platform.debug_io.vtable.*;
+    var vtable = platform.debug_io.vtable.*;
     vtable.fileSync = Gate.sync;
-    const io = std.Io{ .userdata = native_platform.debug_io.userdata, .vtable = &vtable };
+    const io = std.Io{ .userdata = platform.debug_io.userdata, .vtable = &vtable };
     const storage_limit = 128 * 4096;
     var store = try Store.createWithOptions(alloc, path, .{ .io = io, .reclamation = .{
         .enabled = false,
@@ -4501,7 +4501,7 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
         if (!joined) thread.join();
         Gate.armed.store(false, .release);
     }
-    while (!Gate.started.load(.acquire)) native_platform.time.yieldNow();
+    while (!Gate.started.load(.acquire)) platform.time.yieldNow();
     // A paused rewrite reserves capacity before its first publication. A
     // large foreground mutation must leave that workspace available and
     // preserve the committed roots when admission rejects its tail pages.
@@ -4538,7 +4538,7 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
                 remaining -= 1;
                 if (remaining == 0) return error.InputOutput;
             }
-            return native_platform.debug_io.vtable.fileSync(userdata, file);
+            return platform.debug_io.vtable.fileSync(userdata, file);
         }
         fn apply(_: *anyopaque, file: *native.NativeFile) !void {
             try file.putDocument("doc", "after");
@@ -4547,11 +4547,11 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
         }
     };
     const alloc = std.testing.allocator;
-    var vtable = native_platform.debug_io.vtable.*;
+    var vtable = platform.debug_io.vtable.*;
     vtable.fileSync = Fault.sync;
-    const io = std.Io{ .userdata = native_platform.debug_io.userdata, .vtable = &vtable };
+    const io = std.Io{ .userdata = platform.debug_io.userdata, .vtable = &vtable };
     for (1..4) |barrier| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp, "group-sync-failure.aflite");
         defer alloc.free(path);
@@ -4585,11 +4585,11 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
 
 test "lite packed document cursors read each physical bundle once per scan" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "packed-cursor.aflite");
     defer alloc.free(path);
-    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(alloc, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     var write = try store.beginWrite();
     var buffer: [32]u8 = undefined;
@@ -4620,7 +4620,7 @@ test "lite packed document cursors read each physical bundle once per scan" {
 
 test "lite maintenance snapshots release shared cache accounting on cancellation and publication" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(alloc, tmp, "maintenance-budget.aflite");
     defer alloc.free(path);
@@ -4628,7 +4628,7 @@ test "lite maintenance snapshots release shared cache accounting on cancellation
     budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     {
-        var store = try Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io, .resource_manager = &manager });
+        var store = try Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = platform.testing.io, .resource_manager = &manager });
         defer store.close();
         var write = try store.beginWrite();
         var buffer: [32]u8 = undefined;
@@ -4649,11 +4649,11 @@ test "lite maintenance snapshots release shared cache accounting on cancellation
 
 test "lite key-only cursor preserves prefix overlay bounds and pinned snapshots" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "key-cursor.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     {
         var write = try store.beginWrite();
@@ -4698,11 +4698,11 @@ test "lite key-only cursor preserves prefix overlay bounds and pinned snapshots"
 test "lite replay cleanup avoids external values and propagates allocation errors" {
     const a = std.testing.allocator;
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "replay-key-only.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = platform.testing.io });
     defer store.close();
     store.file.page_cache_enabled.store(false, .monotonic);
     const value = try a.alloc(u8, 4 * 1024 * 1024);
@@ -4736,11 +4736,11 @@ test "lite replay cleanup avoids external values and propagates allocation error
 
 test "lite replay cleanup commits bounded chunks isolates namespaces and retries" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "replay-chunks.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     const count = replay_cleanup_max_keys * 2 + 3;
     const kind = internal_keys.replay_all_kind;
@@ -4823,11 +4823,11 @@ test "lite replay cleanup commits bounded chunks isolates namespaces and retries
 
 test "lite replay cleanup propagates record corruption without deleting a partial chunk" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "replay-corrupt.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = platform.testing.io });
     defer store.close();
     store.file.page_cache_enabled.store(false, .monotonic);
     const first = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
@@ -4839,14 +4839,14 @@ test "lite replay cleanup propagates record corruption without deleting a partia
     const checkpoint = store.file.activeCheckpoint();
     const offset = checkpoint.document_root_page * native.default_page_size + native.page_header_size;
     var original: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try store.file.file.readPositionalAll(native_platform.testing.io, &original, offset));
-    try store.file.file.writePositionalAll(native_platform.testing.io, &.{original[0] ^ 1}, offset);
+    try std.testing.expectEqual(@as(usize, 1), try store.file.file.readPositionalAll(platform.testing.io, &original, offset));
+    try store.file.file.writePositionalAll(platform.testing.io, &.{original[0] ^ 1}, offset);
     try std.testing.expectError(error.NativePageChecksumMismatch, store.truncateReplayUpTo(a, 3));
     try std.testing.expectEqual(checkpoint.commit_sequence, store.file.activeCheckpoint().commit_sequence);
     const retained = (try store.file.getDocumentAlloc(a, &first)).?;
     defer a.free(retained);
     try std.testing.expectEqualStrings("first", retained);
-    try store.file.file.writePositionalAll(native_platform.testing.io, &original, offset);
+    try store.file.file.writePositionalAll(platform.testing.io, &original, offset);
     try store.truncateReplayUpTo(a, 3);
     try std.testing.expect((try store.file.getDocumentAlloc(a, &first)) == null);
     try std.testing.expect((try store.file.getDocumentAlloc(a, &second)) == null);
@@ -4857,11 +4857,11 @@ test "lite replay readers propagate allocation errors before and after callbacks
     const a = std.testing.allocator;
     for ([_][]const u8{ "", "scope\x00" }) |prefix| {
         var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "replay-read-errors.aflite");
         defer a.free(path);
-        var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = native_platform.testing.io });
+        var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = platform.testing.io });
         defer store.close();
         const large = try a.alloc(u8, 4 * 1024 * 1024);
         defer a.free(large);
@@ -4904,11 +4904,11 @@ test "lite replay readers propagate allocation errors before and after callbacks
 
 test "lite replay collection owns every payload through allocation failures" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "replay-owned-results.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     for ([_][]const u8{ "", "scope\x00" }) |prefix| {
         var runtime = RuntimeStore{ .store = &store, .prefix = prefix };
@@ -4933,11 +4933,11 @@ test "lite replay collection owns every payload through allocation failures" {
 
 test "lite replay readers propagate corruption malformed keys and callback errors" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "replay-corrupt-read.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(a, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = platform.testing.io });
     defer store.close();
     const first = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
     const second = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
@@ -4946,8 +4946,8 @@ test "lite replay readers propagate corruption malformed keys and callback error
     try store.file.putDocument(&second, "second");
     const offset = store.file.activeCheckpoint().document_root_page * native.default_page_size + native.page_header_size;
     var byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try store.file.file.readPositionalAll(native_platform.testing.io, &byte, offset));
-    try store.file.file.writePositionalAll(native_platform.testing.io, &.{byte[0] ^ 1}, offset);
+    try std.testing.expectEqual(@as(usize, 1), try store.file.file.readPositionalAll(platform.testing.io, &byte, offset));
+    try store.file.file.writePositionalAll(platform.testing.io, &.{byte[0] ^ 1}, offset);
     const Context = struct {
         count: usize = 0,
         stop: bool = false,
@@ -4969,7 +4969,7 @@ test "lite replay readers propagate corruption malformed keys and callback error
     try std.testing.expectEqual(@as(usize, 1), limited.matched_entries);
     ctx.stop = true;
     try std.testing.expectError(error.ConsumerStopped, store.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
-    try store.file.file.writePositionalAll(native_platform.testing.io, &byte, offset);
+    try store.file.file.writePositionalAll(platform.testing.io, &byte, offset);
     try store.file.putDocument(second ++ "bad", "malformed");
     ctx.stop = false;
     try std.testing.expectError(error.InvalidReplayEntryKey, store.forEachReplayLaneFrom(internal_keys.replay_all_kind, 1, 0, &ctx, Context.handle));
@@ -4979,11 +4979,11 @@ test "lite transaction snapshot cache shares hits misses and sorted duplicate re
     const a = std.testing.allocator;
     for ([_][]const u8{ "", "scope\x00" }) |prefix| {
         var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "snapshot-read-cache.aflite");
         defer a.free(path);
-        var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = native_platform.testing.io });
+        var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = platform.testing.io });
         defer store.close();
         const value = try a.alloc(u8, 256 * 1024);
         defer a.free(value);
@@ -5030,11 +5030,11 @@ test "lite transaction snapshot cache shares hits misses and sorted duplicate re
 
 test "lite transaction snapshot cache preserves pending versions and pinned generations" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "snapshot-cache-generations.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     try store.file.putDocument("key", "old");
     try store.file.putDocument("uncached", "old-generation");
@@ -5076,11 +5076,11 @@ test "lite transaction snapshot cache preserves pending versions and pinned gene
 
 test "lite transaction snapshot cache allocation failures release ownership and retry" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "snapshot-cache-failures.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     {
         var setup = try Txn.openWriteWithPrefix(&store, "scope\x00");
@@ -5127,12 +5127,12 @@ test "lite transaction snapshot cache allocation failures release ownership and 
 
 test "lite pending overwrites retain only borrowed versions" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "pending-retention.aflite");
     defer a.free(path);
     var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
-    var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(budget.allocator(), path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     const value = try a.alloc(u8, 256 * 1024);
     defer a.free(value);
@@ -5167,11 +5167,11 @@ test "lite pending overwrites retain only borrowed versions" {
 
 test "lite pending replacement allocation failures preserve borrowed values" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "pending-failures.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io });
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = platform.testing.io });
     defer store.close();
     var exhausted = false;
     for (0..32) |fail_index| {
@@ -5200,11 +5200,11 @@ test "lite pending replacement allocation failures preserve borrowed values" {
 
 test "lite reclamation worker waits while online capture owns publication" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "worker-capture-wait.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
     defer store.close();
     store.file.retirement_work_pages = 0;
     try store.file.putDocument("key", "old");
@@ -5235,11 +5235,11 @@ test "lite reclamation worker waits while online capture owns publication" {
 
 test "lite reclamation worker backs off failed publication fences" {
     const a = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try testPath(a, tmp, "worker-error-backoff.aflite");
     defer a.free(path);
-    var store = try Store.createWithOptions(a, path, .{ .io = native_platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .retry_ms = 500 } });
+    var store = try Store.createWithOptions(a, path, .{ .io = platform.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .retry_ms = 500 } });
     defer store.close();
     store.file.retirement_work_pages = 0;
     try store.file.putDocument("key", "old");

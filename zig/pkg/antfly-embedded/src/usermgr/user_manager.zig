@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const catalog_names = @import("../system_catalog/domain.zig");
@@ -550,7 +550,7 @@ pub const UserManager = struct {
     }
 
     pub fn init(alloc: Allocator, store: UserStore, enforcer: casbin.Enforcer) !UserManager {
-        return initWithIo(alloc, native_platform.debug_io, store, enforcer);
+        return initWithIo(alloc, platform.debug_io, store, enforcer);
     }
 
     pub fn initWithIo(alloc: Allocator, io: std.Io, store: UserStore, enforcer: casbin.Enforcer) !UserManager {
@@ -2037,21 +2037,21 @@ test "usermgr HA seed lease excludes auth mutations until capture completes" {
     var lease = manager.acquireSeedCaptureLease();
     var lease_active = true;
     defer if (lease_active) lease.release();
-    var thread = try native_platform.testing.io.concurrent(Context.run, .{&ctx});
+    var thread = try platform.testing.io.concurrent(Context.run, .{&ctx});
     defer {
         if (lease_active) {
             lease.release();
             lease_active = false;
         }
-        thread.await(native_platform.testing.io);
+        thread.await(platform.testing.io);
     }
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     var attempts: usize = 0;
-    while (attempts < 1024) : (attempts += 1) native_platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
+    while (attempts < 1024) : (attempts += 1) platform.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
     try std.testing.expect(!finished.load(.acquire));
     lease.release();
     lease_active = false;
-    thread.await(native_platform.testing.io);
+    thread.await(platform.testing.io);
     try std.testing.expect(finished.load(.acquire));
     var authenticated = try manager.authenticateUser("alice", "after");
     defer authenticated.deinit(alloc);
@@ -2402,7 +2402,7 @@ test "usermgr upgrades legacy user identities durably before serving" {
     defer store.deinit();
     var policies = casbin.MemoryAdapter.init(a);
     defer policies.deinit();
-    const hash = try hashPassword(a, native_platform.testing.io, "secret");
+    const hash = try hashPassword(a, platform.testing.io, "secret");
     defer a.free(hash);
     const legacy: User = .{ .username = @constCast("alice"), .password_hash = hash };
     try store.iface().saveUser(a, &legacy);

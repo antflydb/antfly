@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Shared local handles and helpers. Server lifetimes are opaque callbacks.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 pub const antfly = @import("../capi_embedded_root.zig");
 pub const std = @import("std");
 
@@ -71,7 +71,7 @@ pub const Handle = struct {
     // libantfly and Lite handles opened without the flag leave these null,
     // which keeps today's behavior unchanged.
     lite_inference_lifetime: ?inference_provider.EmbeddedInferenceProviderLifetime = null,
-    lite_inference_io: ?*native_platform.Threaded = null,
+    lite_inference_io: ?*platform.Io.Threaded = null,
     // Mirrors `LiteResolvedOpenOptions.generated_enrichment_replay` from this
     // handle's open call. `refreshLiteManagedEmbeddingRuntime` must not lose
     // this caller intent across its own reconfigure passes -- see its doc
@@ -277,7 +277,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
         pub const Slot = struct {
             /// `generation << 1 | closing`. The slot is open for `generation`
             /// exactly when the closing bit is clear.
-            state: native_platform.atomic.Value(u64) = .init(0),
+            state: platform.atomic.Value(u64) = .init(0),
             /// Calls that have entered, or are trying to, for any generation.
             active: std.atomic.Value(u32) = .init(0),
             handle: std.atomic.Value(?*T) = .init(null),
@@ -395,7 +395,7 @@ pub fn HandleRegistryOf(comptime T: type) type {
             var spins: u32 = 0;
             while (slot.active.load(.seq_cst) != 0) : (spins +|= 1) {
                 if (spins < 64) {
-                    native_platform.time.yieldNow();
+                    platform.time.yieldNow();
                 } else {
                     handleLockIo().sleep(.fromMicroseconds(500), .awake) catch {};
                 }
@@ -466,7 +466,7 @@ pub fn closeHandleId(ptr: ?*anyopaque) void {
 /// The handle locks are called from arbitrary foreign threads, so they use
 /// the process-wide threaded Io, whose waits block the calling OS thread.
 pub fn handleLockIo() std.Io {
-    return native_platform.debug_io;
+    return platform.debug_io;
 }
 
 pub fn dupBytes(bytes: []const u8) !capi.Buffer {

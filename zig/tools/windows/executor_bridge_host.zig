@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const abi = @import("antfly_executor_abi");
@@ -23,7 +23,7 @@ extern fn exerciseBorrowedExecutor(borrow: *const abi.Borrow) callconv(.c) bool;
 fn warmWorker() void {}
 
 test "borrowed executor wakes idle owning workers across archives" {
-    var pool = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    var pool = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
     defer pool.deinit();
     const io = pool.io();
     var warm = try io.concurrent(warmWorker, .{});

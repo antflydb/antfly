@@ -62,7 +62,7 @@ pub fn runtimeEntry(
 const RuntimeProcess = struct {
     alloc: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
-    io_impl: platform.Threaded,
+    io_impl: platform.Io.Threaded,
     process_environ: std.process.Environ,
     environ_map: std.process.Environ.Map,
     argument_storage: [][:0]u8,
@@ -112,7 +112,7 @@ const RuntimeProcess = struct {
             try platform.process.windowsCommandLine(alloc, argument_storage[0], argument_ptrs[1..])
         else {};
         errdefer if (builtin.os.tag == .windows) alloc.free(windows_command_line);
-        const io_impl = platform.Threaded.init(alloc, .{ .environ = process_environ });
+        const io_impl = platform.Io.Threaded.init(alloc, .{ .environ = process_environ });
 
         return .{
             .alloc = alloc,

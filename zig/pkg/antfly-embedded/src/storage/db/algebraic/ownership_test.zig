@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Violation = struct {
@@ -31,7 +31,7 @@ const default_roots = [_][]const u8{
 
 test "algebraic planner owns production tensor construction" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var violations = std.ArrayListUnmanaged(Violation).empty;
     defer {
         for (violations.items) |violation| {

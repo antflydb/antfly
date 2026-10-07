@@ -19,7 +19,7 @@
 //! owner; the reference policy retains request-owned weights. Timing includes the full
 //! decode and cleanup. Wire I/O, observations and returned-output destruction
 //! are outside timing. This is a direct-core benchmark, not serving evidence.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -142,8 +142,8 @@ fn diagnosticNow(enabled: bool) !u64 {
 }
 
 fn nowNs() !u64 {
-    var ts: native_platform.c.timespec = undefined;
-    if (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return error.MonotonicClockUnavailable;
+    var ts: platform.c.timespec = undefined;
+    if (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return error.MonotonicClockUnavailable;
     return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec);
 }
 

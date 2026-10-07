@@ -16,7 +16,7 @@
 //! Scheduling slices of the existing restore job, not a second job system.
 //! Source receipts, target progress and final cuts are durable independently
 //! of this scheduling cursor. Every step performs bounded owner work.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const stages = @import("../metadata/restore_staging.zig");
@@ -31,10 +31,10 @@ const artifact = @import("antfly_local_sources").storage_db_source_artifact_tran
 var owner_timing_gate: @import("antfly_local_sources").api_bounded_diagnostic_gate.Gate = .{};
 
 fn readSource(host: anytype, comptime T: type, alloc: std.mem.Allocator, table: []const u8, request: wire.Request, context: operation.RequestContext) !T {
-    const started = native_platform.time.monotonicNs();
+    const started = platform.time.monotonicNs();
     defer {
-        const elapsed = native_platform.time.monotonicNs() -| started;
-        if (elapsed >= 500 * std.time.ns_per_ms and owner_timing_gate.admit(native_platform.time.monotonicNs()))
+        const elapsed = platform.time.monotonicNs() -| started;
+        if (elapsed >= 500 * std.time.ns_per_ms and owner_timing_gate.admit(platform.time.monotonicNs()))
             std.log.info("rewrite source RPC operation={s} group={d} elapsed_ms={d}", .{ @tagName(request.operation), request.scope.fence.owner_group_id, elapsed / std.time.ns_per_ms });
     }
     const encoded = try host.executeRewriteSource(alloc, table, request, context);
@@ -176,13 +176,13 @@ pub fn step(host: anytype, job: *std.json.Parsed(stages.Job), worker: *jobs.JobS
     }
     if (job.value.state != .importing) return error.InvalidRestoreStagingCommand;
     const progress = worker.rewrite_progress;
-    const started = native_platform.time.monotonicNs();
+    const started = platform.time.monotonicNs();
     var rpc_ns: u64 = 0;
     var receipt_ns: u64 = 0;
     var checkpoint_ns: u64 = 0;
     defer {
-        const elapsed = native_platform.time.monotonicNs() -| started;
-        if (elapsed >= 500 * std.time.ns_per_ms and owner_timing_gate.admit(native_platform.time.monotonicNs()))
+        const elapsed = platform.time.monotonicNs() -| started;
+        if (elapsed >= 500 * std.time.ns_per_ms and owner_timing_gate.admit(platform.time.monotonicNs()))
             std.log.info("rewrite owner wave phase={s} owner={d} elapsed_ms={d} rpc_ms={d} receipt_ms={d} cursor_ms={d}", .{ @tagName(progress.phase), progress.owner, elapsed / std.time.ns_per_ms, rpc_ns / std.time.ns_per_ms, receipt_ns / std.time.ns_per_ms, checkpoint_ns / std.time.ns_per_ms });
     }
     var count: u32 = 0;
@@ -221,21 +221,21 @@ pub fn step(host: anytype, job: *std.json.Parsed(stages.Job), worker: *jobs.JobS
         for (slots[0..wave], 0..) |*slot, i| tasks.async(io, Slot.run, .{ slot, host, job.value.plan, job.value.plan_digest, progress.owner + @as(u32, @intCast(i)), progress.phase, context });
         tasks.await(io) catch return error.Cancelled;
     } else Slot.run(&slots[0], host, job.value.plan, job.value.plan_digest, progress.owner, progress.phase, context);
-    rpc_ns = native_platform.time.monotonicNs() -| started;
+    rpc_ns = platform.time.monotonicNs() -| started;
     try context.ensureActive();
-    const receipts_started = native_platform.time.monotonicNs();
+    const receipts_started = platform.time.monotonicNs();
     // A successful owner has durable evidence even when a sibling loses its
     // reply. Record those receipts first; replay the same fenced wave on error.
     for (slots[0..wave]) |slot| if (slot.result) |result| if (result.receipt) |receipt| {
         try host.applyRewriteStagingCommand(job, .{ .id = job.value.plan.id, .expected_revision = job.value.revision, .action = .imported, .receipt = receipt }, context);
     };
-    receipt_ns = native_platform.time.monotonicNs() -| receipts_started;
+    receipt_ns = platform.time.monotonicNs() -| receipts_started;
     for (slots[0..wave]) |slot| if (slot.failure) |err| return err;
     if (job.value.state == .importing) {
         var next = progress;
         for (slots[0..wave]) |slot| next = try checkpointAfter(next, slot.result.?.pending, count);
-        const checkpoint_started = native_platform.time.monotonicNs();
-        defer checkpoint_ns = native_platform.time.monotonicNs() -| checkpoint_started;
+        const checkpoint_started = platform.time.monotonicNs();
+        defer checkpoint_ns = platform.time.monotonicNs() -| checkpoint_started;
         const saved = try host.restore_job_store.recordRewriteProgress(host.alloc, worker.job_id, worker.attempt_id, next);
         host.alloc.free(saved);
         worker.rewrite_progress = next;
@@ -469,7 +469,7 @@ fn testOwnerWaves(concurrent: bool) !void {
     var worker = std.mem.zeroes(jobs.JobState);
     worker.job_id = 1;
     worker.attempt_id = 1;
-    var threaded: native_platform.Threaded = .init(fixture.alloc, .{ .async_limit = .limited(4) });
+    var threaded: platform.Io.Threaded = .init(fixture.alloc, .{ .async_limit = .limited(4) });
     defer threaded.deinit();
     const io = threaded.io();
     const control: operation.RequestContext = if (concurrent) .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } else .{};

@@ -19,7 +19,7 @@
 //! pulls records from a primary slot, durably receives them on a standby, applies
 //! available records, and reports standby progress back to the primary.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -121,7 +121,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     const standby_progress = try allocPrintPath(alloc, name, "standby-progress", nonce);
     defer alloc.free(standby_progress);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};

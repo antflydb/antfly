@@ -904,7 +904,7 @@ fn requestGeneratedTextBatchPolicy(alloc: Allocator, request: enrichment_types.G
 
 fn backoffWriterLockRetry() void {
     if (comptime builtin.os.tag == .freestanding) return;
-    platform.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
+    platform.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
 }
 
 fn sleepRetryBackoff(runtime: *EnrichmentRuntime, sleep_ns: u64) void {
@@ -934,7 +934,7 @@ fn sleepRetryBackoff(runtime: *EnrichmentRuntime, sleep_ns: u64) void {
         }
         return;
     }
-    platform.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
+    platform.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(sleep_ns)), .awake) catch {};
 }
 
 fn transientEmbedRetrySleepNs(attempt: u32) u64 {
@@ -4836,7 +4836,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     backend_runtime: ?*background_runtime_mod.BackendRuntime = null,
     /// Backend-neutral executor retained from BackendRuntime. The small value
     /// wrapper preserves the existing `io()` call sites while removing the
-    /// production dependency on `platform.Threaded` and enabling VoprIo.
+    /// production dependency on `platform.Io.Threaded` and enabling VoprIo.
     io_impl: ?IoBackend,
     store: backend_erased.Store,
     owns_store: bool,
@@ -5773,7 +5773,7 @@ test "enrichment runtime status reports worker lifecycle diagnostics" {
 
 test "enrichment inline backoff wakes for teardown before and during wait admission" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const Waiter = struct {
@@ -5826,7 +5826,7 @@ test "enrichment inline backoff wakes for teardown before and during wait admiss
 test "enrichment visibility wait wakes immediately on applied state" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
@@ -5866,7 +5866,7 @@ test "enrichment visibility wait wakes immediately on applied state" {
 test "enrichment visibility wait has a hard liveness timeout" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,
@@ -5891,7 +5891,7 @@ test "enrichment visibility wait has a hard liveness timeout" {
 test "enrichment visibility wait is cancelable" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
@@ -5926,7 +5926,7 @@ test "enrichment visibility wait is cancelable" {
 test "enrichment visibility wait observes borrowed request cancellation" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var signal = std.atomic.Value(bool).init(true);
     var runtime = EnrichmentRuntime{
@@ -5955,7 +5955,7 @@ test "enrichment visibility wait observes borrowed request cancellation" {
 test "foreground enrichment catch-up treats cancellation as a waiter outcome" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var signal = std.atomic.Value(bool).init(true);
     var runtime = EnrichmentRuntime{
@@ -7028,7 +7028,7 @@ fn endReplayPass(runtime: *EnrichmentRuntime, io: Io) void {
 test "enrichment replay passes are single flight" {
     if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var runtime = EnrichmentRuntime{
@@ -10504,7 +10504,7 @@ const PreparedDocumentSourceCache = struct {
             .io = runtime.config.io orelse if (comptime builtin.os.tag == .freestanding)
                 .failing
             else
-                platform.Threaded.global_single_threaded.io(),
+                platform.Io.Threaded.global_single_threaded.io(),
             .budgeted = if (manager) |value|
                 resource_manager_mod.BudgetedAllocator.init(
                     value,
@@ -11730,7 +11730,7 @@ fn concurrencyIo(runtime: *EnrichmentRuntime) Io {
     if (comptime builtin.os.tag == .freestanding) {
         return .failing;
     } else {
-        return if (runtime.io_impl) |impl| impl.io() else platform.Threaded.global_single_threaded.io();
+        return if (runtime.io_impl) |impl| impl.io() else platform.Io.Threaded.global_single_threaded.io();
     }
 }
 
@@ -30901,7 +30901,7 @@ test "enrichment remote render config preserves runtime execution context" {
     const config = remoteRenderConfig(
         null,
         null,
-        platform.Threaded.global_single_threaded.io(),
+        platform.Io.Threaded.global_single_threaded.io(),
         CancellationToken.fromAtomic(&canceled),
         null,
     );
@@ -34421,7 +34421,7 @@ test "graph projection preserves numeric literals in enrichment metadata and tem
 }
 
 test "enrichment terminal failure envelope is preserved by unbounded drains" {
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var runtime = EnrichmentRuntime{
         .alloc = std.testing.allocator,

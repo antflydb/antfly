@@ -19,7 +19,7 @@
 // into usable f32 slices for the termite constant pool, and maps
 // ONNX data types to termite DType.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const data = @import("onnx_data").tensor;
@@ -351,14 +351,14 @@ test "extractFloat32 from varint-encoded int32_data" {
 
 // Small helper: write bytes to an absolute path using std.Io.
 fn writeTestFile(path: []const u8, bytes: []const u8) !void {
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
 }
 
 fn removeTestFile(path: []const u8) void {
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     std.Io.Dir.cwd().deleteFile(io, path) catch {};

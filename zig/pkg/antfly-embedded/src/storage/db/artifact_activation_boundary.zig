@@ -16,7 +16,7 @@
 //! Immutable receiver-local replay boundary for an artifact authority epoch.
 //! This identifies the historic baseline; it does NOT certify any projection.
 //! Only a complete snapshot/replay adoption proof can cover historic rows.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const publication = @import("artifact_publication.zig");
@@ -115,7 +115,7 @@ test "ordered artifact inventory activation boundary authenticates its entire sc
 test "ordered artifact inventory activation boundary is atomic immutable local and survives reopen" {
     const alloc = std.testing.allocator;
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/activation-boundary", .{tmp.sub_path});
     defer alloc.free(path);

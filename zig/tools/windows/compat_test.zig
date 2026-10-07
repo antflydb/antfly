@@ -14,14 +14,14 @@
 // limitations under the License.
 
 //! Run with stock Zig, the antfly_platform module, and a Windows target.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
 
 test "Windows loopback sockets listen connect accept and transfer bytes" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
@@ -50,7 +50,7 @@ fn idleRead(io: std.Io, peer: std.Io.net.Stream, started: *std.Io.Event) std.Io.
 
 test "Windows canceling idle socket reads drains the operation and preserves the socket" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(io, .{});
     defer server.deinit(io);
@@ -94,7 +94,7 @@ fn fillSocket(io: std.Io, client: std.Io.net.Stream, started: *std.Io.Event) std
 
 test "Windows socket deadlines and backpressured write cancellation complete" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(io, .{});
     defer server.deinit(io);
@@ -130,17 +130,17 @@ test "Windows secure entropy fills independent buffers" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     var first: [64]u8 = @splat(0);
     var second: [64]u8 = @splat(0);
-    try native_platform.testing.io.randomSecure(&first);
-    try native_platform.testing.io.randomSecure(&second);
+    try platform.testing.io.randomSecure(&first);
+    try platform.testing.io.randomSecure(&second);
     try std.testing.expect(!std.mem.eql(u8, &first, &second));
     try std.testing.expect(!std.mem.allEqual(u8, &first, 0));
-    try native_platform.testing.io.randomSecure(&.{});
+    try platform.testing.io.randomSecure(&.{});
 }
 
 test "Windows file locks exclude competing handles and allow header reads" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
-    var directory = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var directory = platform.testing.tmpDir(.{});
     defer directory.cleanup();
     const options: std.Io.Dir.CreateFileOptions = .{ .read = true, .truncate = false, .lock = .exclusive, .lock_nonblocking = true };
     const writer = try directory.dir.createFile(io, "locked.bin", options);
@@ -151,7 +151,7 @@ test "Windows file locks exclude competing handles and allow header reads" {
     const reader = try directory.dir.openFile(io, "locked.bin", .{});
     defer reader.close(io);
     var bytes: [6]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 6), native_platform.c.pread(reader.handle, &bytes, bytes.len, 0));
+    try std.testing.expectEqual(@as(isize, 6), platform.c.pread(reader.handle, &bytes, bytes.len, 0));
     try std.testing.expectEqualStrings("header", &bytes);
     writer.unlock(io);
     const next = try directory.dir.createFile(io, "locked.bin", options);
@@ -170,19 +170,19 @@ test "Windows file locks exclude competing handles and allow header reads" {
 
 test "Windows shim positional reads do not depend on the current offset" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
-    var directory = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var directory = platform.testing.tmpDir(.{});
     defer directory.cleanup();
     const file = try directory.dir.createFile(io, "read.bin", .{ .read = true });
     defer file.close(io);
     try file.writeStreamingAll(io, "abcdefgh");
     try io.vtable.fileSeekTo(io.userdata, file, 6);
     var bytes: [3]u8 = undefined;
-    try std.testing.expectEqual(@as(isize, 3), native_platform.c.pread(file.handle, &bytes, bytes.len, 2));
+    try std.testing.expectEqual(@as(isize, 3), platform.c.pread(file.handle, &bytes, bytes.len, 2));
     try std.testing.expectEqualStrings("cde", &bytes);
-    try std.testing.expectEqual(@as(isize, 3), native_platform.c.pread(file.handle, &bytes, bytes.len, 0));
+    try std.testing.expectEqual(@as(isize, 3), platform.c.pread(file.handle, &bytes, bytes.len, 0));
     try std.testing.expectEqualStrings("abc", &bytes);
-    try std.testing.expectEqual(@as(isize, 0), native_platform.c.pread(file.handle, &bytes, bytes.len, 8));
+    try std.testing.expectEqual(@as(isize, 0), platform.c.pread(file.handle, &bytes, bytes.len, 8));
     var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;
     var position: std.os.windows.FILE.POSITION_INFORMATION = undefined;
     try std.testing.expectEqual(std.os.windows.NTSTATUS.SUCCESS, std.os.windows.ntdll.NtQueryInformationFile(file.handle, &iosb, &position, @sizeOf(@TypeOf(position)), .Position));
@@ -191,8 +191,8 @@ test "Windows shim positional reads do not depend on the current offset" {
 
 test "Windows positional read failures replace stale errno and reject write-only handles" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
-    var directory = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var directory = platform.testing.tmpDir(.{});
     defer directory.cleanup();
     const file = try directory.dir.createFile(io, "write-only.bin", .{});
     defer file.close(io);
@@ -200,35 +200,35 @@ test "Windows positional read failures replace stale errno and reject write-only
     var byte: [1]u8 = undefined;
     for ([_]std.c.E{ .SUCCESS, .INTR }) |stale| {
         std.c._errno().* = @backingInt(stale);
-        try std.testing.expectEqual(@as(isize, -1), native_platform.c.pread(file.handle, &byte, 1, 0));
+        try std.testing.expectEqual(@as(isize, -1), platform.c.pread(file.handle, &byte, 1, 0));
         try std.testing.expectEqual(std.c.E.BADF, std.posix.errno(@as(isize, -1)));
     }
     std.c._errno().* = @backingInt(std.c.E.INTR);
-    try std.testing.expectEqual(@as(isize, -1), native_platform.c.pread(file.handle, &byte, 1, -1));
+    try std.testing.expectEqual(@as(isize, -1), platform.c.pread(file.handle, &byte, 1, -1));
     try std.testing.expectEqual(std.c.E.INVAL, std.posix.errno(@as(isize, -1)));
     std.c._errno().* = @backingInt(std.c.E.INTR);
-    try std.testing.expectEqual(@as(isize, -1), native_platform.c.pread(std.os.windows.INVALID_HANDLE_VALUE, &byte, 1, 0));
+    try std.testing.expectEqual(@as(isize, -1), platform.c.pread(std.os.windows.INVALID_HANDLE_VALUE, &byte, 1, 0));
     try std.testing.expectEqual(std.c.E.BADF, std.posix.errno(@as(isize, -1)));
 }
 
 fn positionalReads(fd: std.c.fd_t, offset: std.c.off_t, expected: []const u8) !void {
     var bytes: [3]u8 = undefined;
     for (0..32) |_| {
-        try std.testing.expectEqual(@as(isize, 3), native_platform.c.pread(fd, &bytes, bytes.len, offset));
+        try std.testing.expectEqual(@as(isize, 3), platform.c.pread(fd, &bytes, bytes.len, offset));
         try std.testing.expectEqualStrings(expected, &bytes);
     }
 }
 
 test "Windows concurrent positional reads preserve synchronous offsets and support retained overlapped handles" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
-    var directory = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var directory = platform.testing.tmpDir(.{});
     defer directory.cleanup();
     const writer = try directory.dir.createFile(io, "parallel.bin", .{ .read = true });
     defer writer.close(io);
     try writer.writeStreamingAll(io, "abcdefgh");
     try io.vtable.fileSeekTo(io.userdata, writer, 6);
-    const positional = try native_platform.filesystem.openPositionalReadOnly(io, directory.dir, "parallel.bin");
+    const positional = try platform.filesystem.openPositionalReadOnly(io, directory.dir, "parallel.bin");
     defer positional.close(io);
     try std.testing.expect(positional.flags.nonblocking);
     for ([_]std.c.fd_t{ writer.handle, positional.handle }) |fd| {
@@ -239,8 +239,8 @@ test "Windows concurrent positional reads preserve synchronous offsets and suppo
         try first.await(io);
         try second.await(io);
         var bytes: [3]u8 = undefined;
-        try std.testing.expectEqual(@as(isize, 0), native_platform.c.pread(fd, &bytes, bytes.len, 1 << 32));
-        try std.testing.expectEqual(@as(isize, 0), native_platform.c.pread(fd, &bytes, 0, 0));
+        try std.testing.expectEqual(@as(isize, 0), platform.c.pread(fd, &bytes, bytes.len, 1 << 32));
+        try std.testing.expectEqual(@as(isize, 0), platform.c.pread(fd, &bytes, 0, 0));
     }
     var iosb: std.os.windows.IO_STATUS_BLOCK = undefined;
     var position: std.os.windows.FILE.POSITION_INFORMATION = undefined;
@@ -254,25 +254,25 @@ test "Windows concurrent positional reads preserve synchronous offsets and suppo
 
 test "Windows shim clocks advance and condition timeout preserves the mutex" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    var before: native_platform.c.timespec = undefined;
-    var after: native_platform.c.timespec = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), native_platform.c.clock_gettime(.MONOTONIC, &before));
-    const sleep: native_platform.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
-    try std.testing.expectEqual(@as(c_int, 0), native_platform.c.nanosleep(&sleep, null));
-    try std.testing.expectEqual(@as(c_int, 0), native_platform.c.clock_gettime(.MONOTONIC, &after));
+    var before: platform.c.timespec = undefined;
+    var after: platform.c.timespec = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.clock_gettime(.MONOTONIC, &before));
+    const sleep: platform.c.timespec = .{ .sec = 0, .nsec = 2 * std.time.ns_per_ms };
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.nanosleep(&sleep, null));
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.clock_gettime(.MONOTONIC, &after));
     try std.testing.expect(after.sec > before.sec or (after.sec == before.sec and after.nsec > before.nsec));
-    var mutex: native_platform.c.pthread_mutex_t = .{};
-    var condition: native_platform.c.pthread_cond_t = .{};
-    try std.testing.expectEqual(std.c.E.SUCCESS, native_platform.c.pthread_mutex_lock(&mutex));
-    try std.testing.expectEqual(std.c.E.BUSY, native_platform.c.pthread_mutex_trylock(&mutex));
-    var deadline: native_platform.c.timespec = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), native_platform.c.clock_gettime(.REALTIME, &deadline));
+    var mutex: platform.c.pthread_mutex_t = .{};
+    var condition: platform.c.pthread_cond_t = .{};
+    try std.testing.expectEqual(std.c.E.SUCCESS, platform.c.pthread_mutex_lock(&mutex));
+    try std.testing.expectEqual(std.c.E.BUSY, platform.c.pthread_mutex_trylock(&mutex));
+    var deadline: platform.c.timespec = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.clock_gettime(.REALTIME, &deadline));
     deadline.sec += 1;
-    try std.testing.expectEqual(std.c.E.TIMEDOUT, native_platform.c.pthread_cond_timedwait(&condition, &mutex, &deadline));
-    try std.testing.expectEqual(std.c.E.BUSY, native_platform.c.pthread_mutex_trylock(&mutex));
-    try std.testing.expectEqual(std.c.E.SUCCESS, native_platform.c.pthread_mutex_unlock(&mutex));
-    try std.testing.expectEqual(std.c.E.SUCCESS, native_platform.c.pthread_mutex_trylock(&mutex));
-    try std.testing.expectEqual(std.c.E.SUCCESS, native_platform.c.pthread_mutex_unlock(&mutex));
+    try std.testing.expectEqual(std.c.E.TIMEDOUT, platform.c.pthread_cond_timedwait(&condition, &mutex, &deadline));
+    try std.testing.expectEqual(std.c.E.BUSY, platform.c.pthread_mutex_trylock(&mutex));
+    try std.testing.expectEqual(std.c.E.SUCCESS, platform.c.pthread_mutex_unlock(&mutex));
+    try std.testing.expectEqual(std.c.E.SUCCESS, platform.c.pthread_mutex_trylock(&mutex));
+    try std.testing.expectEqual(std.c.E.SUCCESS, platform.c.pthread_mutex_unlock(&mutex));
 }
 
 fn idleAccept(io: std.Io, server: *std.Io.net.Server, started: *std.Io.Event) std.Io.net.Server.AcceptError!void {
@@ -283,7 +283,7 @@ fn idleAccept(io: std.Io, server: *std.Io.net.Server, started: *std.Io.Event) st
 
 test "Windows canceling idle accepts drains requests and preserves the listener" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
     var server = try address.listen(io, .{});
     defer server.deinit(io);
@@ -335,7 +335,7 @@ fn outboundConnect(io: std.Io, address: std.Io.net.IpAddress, started: *std.Io.E
 
 test "Windows outbound connect deadlines cancel and join stalled requests" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     // RFC 5737 documentation address: normally leaves the TCP handshake
     // pending. Environments rejecting it immediately skip the pending case.
     const address = try std.Io.net.IpAddress.parse("192.0.2.1", 443);

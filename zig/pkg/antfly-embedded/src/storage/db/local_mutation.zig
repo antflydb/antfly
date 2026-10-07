@@ -49,7 +49,7 @@ else
 
 const sparse_compaction_runtime_mod = @import("maintenance/sparse_compaction_runtime.zig");
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const text_merge_runtime_mod = @import("maintenance/text_merge_runtime.zig");
@@ -868,7 +868,7 @@ pub fn ImplementationFor(comptime D: type) type {
             }
 
             pub fn deinitScratch(self: *@This()) void {
-                const filesystem_io = self.backend_runtime.filesystemIo() orelse native_platform.debug_io;
+                const filesystem_io = self.backend_runtime.filesystemIo() orelse platform.debug_io;
                 self.restore_decoder_cache.deinit(filesystem_io);
                 self.rewrite_program_cache.deinit(filesystem_io);
                 self.rewrite_tail_cache.deinit(filesystem_io);

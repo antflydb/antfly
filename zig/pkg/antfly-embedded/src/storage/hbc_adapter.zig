@@ -687,7 +687,7 @@ fn hbcCacheStablePathAlloc(alloc: Allocator, path: []const u8) ![]u8 {
     if (comptime builtin.os.tag == .freestanding) {
         return try alloc.dupe(u8, path);
     } else {
-        var io_impl = platform.Threaded.init(alloc, .{});
+        var io_impl = platform.Io.Threaded.init(alloc, .{});
         defer io_impl.deinit();
 
         const absolute_path = if (std.fs.path.isAbsolute(path))
@@ -4839,7 +4839,7 @@ const ExperimentalPostingCheckpointBuild = struct {
     staging_store: posting_segment_store_mod.Store,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     io: std.Io,
-    owned_io: ?(if (builtin.os.tag == .freestanding) void else platform.Threaded) = null,
+    owned_io: ?(if (builtin.os.tag == .freestanding) void else platform.Io.Threaded) = null,
     projection_source: ?vectorindex_hbc_runtime.NativeProjectionBuildSource = null,
     projection_revision: u64 = 0,
     /// Hard recovery-debt enforcement and graceful close can promote an
@@ -6911,7 +6911,7 @@ pub const HBCIndex = struct {
         return self.runtime_io orelse if (comptime builtin.os.tag == .freestanding)
             .failing
         else
-            platform.Threaded.global_single_threaded.io();
+            platform.Io.Threaded.global_single_threaded.io();
     }
 
     fn releaseCompleteCoverageFlightRef(self: *HBCIndex, flight: *CompleteCoverageFlight) void {
@@ -9663,7 +9663,7 @@ pub const HBCIndex = struct {
                 // Embedded/single-threaded callers may provide an I/O runtime
                 // without a concurrent lane. Keep ownership in std.Io by creating
                 // one bounded task runtime instead of an unmanaged OS thread.
-                build.owned_io = platform.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(1) });
+                build.owned_io = platform.Io.Threaded.init(self.alloc, .{ .concurrent_limit = .limited(1) });
                 build.io = build.owned_io.?.io();
                 break :fallback build.io.concurrent(ExperimentalPostingCheckpointBuild.run, .{build}) catch |fallback_err| {
                     build.deinit();
@@ -20349,7 +20349,7 @@ test "complete coverage validation waiter honors cancellation without canceling 
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20421,7 +20421,7 @@ test "complete coverage flight shares a deterministic producer failure" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20545,7 +20545,7 @@ test "flat centroid build single flight waits on backend runtime" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20590,7 +20590,7 @@ test "flat centroid build flight shares a completed stale generation result" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20640,7 +20640,7 @@ test "flat centroid build flight shares a deterministic producer failure" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20791,7 +20791,7 @@ test "search publication wait uses runtime wakeups and honors cancellation" {
     const path = tp.init();
     defer tp.cleanup();
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -20912,7 +20912,7 @@ test "complete snapshot retry releases publication fence after durable txn captu
     try idx.insert(1, &.{ 0, 0 });
     try idx.insert(2, &.{ 1, 0 });
     try idx.insert(3, &.{ 0, 1 });
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -20995,7 +20995,7 @@ test "durable snapshot captures a publisher immediately before its fence" {
     try idx.insert(1, &.{ 0, 0 });
     try idx.insert(2, &.{ 1, 0 });
     try idx.insert(3, &.{ 0, 1 });
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const HookContext = struct {
@@ -21078,7 +21078,7 @@ test "durable incomplete snapshot terminates when publication advances during tr
     }
     idx.invalidateVectorCache(1);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const HookContext = struct {
@@ -22912,7 +22912,7 @@ test "hbc shared cache lock reports striped reader wait" {
     var release_writer = std.atomic.Value(bool).init(false);
     var writer = try platform.testing.io.concurrent(Writer.run, .{ &lock, &writer_acquired, &release_writer });
     while (!lock.vector_fence_pending.load(.acquire)) std.atomic.spinLoopHint();
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try io_impl.io().sleep(std.Io.Duration.fromMilliseconds(10), .awake);
     lock.unlockVectorShared(read_stripe);
@@ -23027,7 +23027,7 @@ test "hbc shared cache writer progresses under continuous striped reads" {
         stop.store(true, .release);
         writer.await(platform.testing.io);
     }
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var attempts: usize = 0;
     while (!writer_acquired.load(.acquire) and attempts < 1_000) : (attempts += 1) {
@@ -23051,7 +23051,7 @@ test "hbc stable cache namespace canonicalizes equivalent path spellings" {
     const root_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hbc-cache-namespace", .{tmp.sub_path});
     defer alloc.free(root_rel);
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -23880,7 +23880,7 @@ test "progressive scan growth releases old permits before FIFO reacquisition" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var tp: TestPath = .{};
@@ -23943,7 +23943,7 @@ test "progressive scan growth cancellation releases the old reservation and queu
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var tp: TestPath = .{};
@@ -24115,7 +24115,7 @@ test "hbc queued admission rebinds topology and reservation to the current gener
         .dense_search_bandwidth_capacity_bytes = capacity,
     });
     defer resource_manager.deinit(alloc);
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{
@@ -24234,7 +24234,7 @@ test "hbc empty search bypasses saturated dense bandwidth" {
         .dense_search_bandwidth_capacity_bytes = capacity,
     });
     defer resource_manager.deinit(alloc);
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2 });
@@ -25567,7 +25567,7 @@ test "compact subgroup concurrent staging preserves resource accounting" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -25616,7 +25616,7 @@ fn testNativeSubgroupLifecycleMode(directory_mode: HBCConfig.CentroidDirectoryMo
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -25763,7 +25763,7 @@ test "quantized native routing serves exact complete coverage across delta and r
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -26027,7 +26027,7 @@ test "native suffix checkpoint preserves pinned readers tombstones and a concurr
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const Fixture = struct {
         const vectors = [_][2]f32{ .{ 1, 0 }, .{ 0, 1 }, .{ 0.8, 0.2 }, .{ 0.2, 0.8 }, .{ 0.5, 0.5 } };
@@ -26158,7 +26158,7 @@ test "prepared posting activation rejects incompatible metadata before CURRENT a
     var tp: TestPath = .{};
     const path = tp.init();
     defer tp.cleanup();
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var idx = try HBCIndex.open(alloc, path, .{ .dims = 2, .leaf_size = 8, .storage_backend = .lsm });
     defer idx.close();
@@ -30463,7 +30463,7 @@ test "native posting row integration survives mutation checkpoint and reopen" {
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{});
     defer manager.deinit(alloc);
@@ -35250,7 +35250,7 @@ fn testQuerySnapshotPublication(directory_mode: HBCConfig.CentroidDirectoryMode)
     var allocator_state: @import("test_allocator.zig").TestAllocator = .{};
     defer allocator_state.deinit();
     const alloc = allocator_state.allocator();
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var tp: TestPath = .{};
     const path = tp.init();

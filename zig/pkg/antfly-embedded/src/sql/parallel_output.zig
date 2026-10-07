@@ -16,7 +16,7 @@
 //! Bounded typed output between partition workers and a pull consumer.
 //! Backpressure prevents eager join fan-out or aggregate delivery from adding
 //! spill I/O. A terminal error follows the successfully produced prefix.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const spill = @import("spill.zig");
@@ -208,7 +208,7 @@ fn allocationScenario(a: A) !void {
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     const pipe = try Pipe.create(&manager, 8192);
     defer pipe.close();

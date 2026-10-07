@@ -15,7 +15,7 @@
 
 //! One hidden parent-owner transaction remaps sealed source FK admission proof
 //! to the target incarnation. Imported proof keys are evidence, not authority.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const contract = @import("restore_staging_contract.zig");
@@ -208,7 +208,7 @@ pub fn stageInstall(
 test "mapped restore admission install requires exact imported proof and persists atomically" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/mapped-admission", .{tmp.sub_path});
     defer alloc.free(path);

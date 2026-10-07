@@ -1032,7 +1032,7 @@ fn runServerChat(allocator: std.mem.Allocator, io: std.Io, opts: Options, server
     const resolved_ref = registry_mod.resolveFriendlyRef(opts.model) orelse opts.model;
     const model_name = resolved_ref;
 
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var http = httpx.Client.init(allocator, io_impl.io());
     defer http.deinit();

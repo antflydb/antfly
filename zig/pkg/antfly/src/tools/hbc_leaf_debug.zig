@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const antfly = @import("antfly-zig");
@@ -369,14 +369,14 @@ const TestPath = struct {
     fn init(self: *TestPath) [*:0]const u8 {
         const ts = tempPathId();
         const slice = std.fmt.bufPrint(&self.buf, "/tmp/antfly-hbc-leaf-debug-{d}\x00", .{ts}) catch unreachable;
-        var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch unreachable;
         return @ptrCast(slice.ptr);
     }
 
     fn cleanup(self: *TestPath) void {
-        var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(&self.buf)))) catch {};
     }

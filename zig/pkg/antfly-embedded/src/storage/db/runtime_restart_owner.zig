@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const admission = @import("coalesced_job_admission.zig");
@@ -190,7 +190,7 @@ test "runtime restart owner bounds inline retries with borrowed io" {
             return true;
         }
         fn port(self: *@This()) Owner.Port {
-            return .{ .ptr = self, .lane = .{ .ptr = self, .vtable = &.{ .submit = submit, .drain_owner = noop, .close_owner = noop, .poll = poll, .executes_inline = true } }, .owner_id = 1, .io = native_platform.testing.io, .closing = &self.closing, .wanted = wanted, .attempt = attempt, .name = "inline-test" };
+            return .{ .ptr = self, .lane = .{ .ptr = self, .vtable = &.{ .submit = submit, .drain_owner = noop, .close_owner = noop, .poll = poll, .executes_inline = true } }, .owner_id = 1, .io = platform.testing.io, .closing = &self.closing, .wanted = wanted, .attempt = attempt, .name = "inline-test" };
         }
     };
     var f: F = .{};

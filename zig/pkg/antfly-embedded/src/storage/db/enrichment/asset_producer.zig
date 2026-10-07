@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const antfly_image = @import("antfly_image");
@@ -38,7 +38,7 @@ pub const InvocationContext = struct {
     pub fn check(self: InvocationContext) !void {
         try self.cancellation.check();
         if (self.deadline_ns) |deadline| {
-            if (native_platform.time.monotonicNs() >= deadline) return error.Timeout;
+            if (platform.time.monotonicNs() >= deadline) return error.Timeout;
         }
     }
 
@@ -1303,7 +1303,7 @@ test "asset producer enforces invocation contracts with immutable planning and e
     };
     var canceled = std.atomic.Value(bool).init(false);
     const scoped = producer.withInvocationContext(.{
-        .io = native_platform.Threaded.global_single_threaded.io(),
+        .io = platform.Io.Threaded.global_single_threaded.io(),
         .deadline_ns = 1234,
         .cancellation = CancellationToken.fromAtomic(&canceled),
         .max_response_bytes = 2048,
@@ -1347,7 +1347,7 @@ test "asset producer forwards request context to cancellable implementations" {
         .producer_type = .copy,
         .config_json = "",
         .source_text = "input",
-    }, .{ .io = native_platform.testing.io, .deadline_ns = null });
+    }, .{ .io = platform.testing.io, .deadline_ns = null });
     defer std.testing.allocator.free(output);
     try std.testing.expectEqualStrings("controlled", output);
     try std.testing.expectEqual(@as(usize, 1), probe.context_calls);
@@ -1390,7 +1390,7 @@ test "asset producer preserves legacy native batch under request context" {
     const output = try producer.produceBatchWithContext(
         std.testing.allocator,
         &requests,
-        .{ .io = native_platform.testing.io, .deadline_ns = null },
+        .{ .io = platform.testing.io, .deadline_ns = null },
     );
     defer {
         for (output) |item| std.testing.allocator.free(item);
@@ -1406,7 +1406,7 @@ test "asset producer preserves legacy native batch under request context" {
         std.testing.allocator,
         &requests,
         .{
-            .io = native_platform.testing.io,
+            .io = platform.testing.io,
             .deadline_ns = null,
             .cancellation = @import("antfly_cancellation").CancellationToken.fromAtomic(&cancelled),
         },

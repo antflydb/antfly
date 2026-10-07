@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const trainer = @import("boundary_native_trainer.zig");
@@ -93,7 +93,7 @@ fn exercise(a: std.mem.Allocator, execution: controller.Execution) !void {
         try parameters.append(scratch, .{ .name = name, .canonical_name = canonical, .dimensions = dims, .values = tensor.asFloat32(), .kind = .original });
     }
     const source = bundle.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = bundle.Digest.of("immutable inactive-classifier test weights"), .sidecars = .{ bundle.Digest.of("model"), bundle.Digest.of("encoder"), bundle.Digest.of("tokenizer"), bundle.Digest.of("tokenizer config") } };
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const checkpoint = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/inactive.safetensors", .{temporary.sub_path});
     defer a.free(checkpoint);
@@ -173,7 +173,7 @@ test "boundary inactive adapter CPU classifier LoRA DoRA mixed accumulation zero
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const test_allocator = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const test_allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     try exercise(test_allocator, .native);
 }
 

@@ -43,7 +43,7 @@
 //!     DECODE_ERR:<ErrorName> <path>
 //! followed by a totals line.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const antfly_image = @import("antfly_image");
@@ -82,7 +82,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn sweepCorpus(alloc: std.mem.Allocator, corpus_dir: []const u8, summary: *Summary) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

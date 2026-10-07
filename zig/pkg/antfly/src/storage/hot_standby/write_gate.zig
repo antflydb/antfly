@@ -20,7 +20,7 @@
 //! has been explicitly promoted, callers must open the promoted-primary handoff
 //! instead of writing through the standby receive/apply object.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const storage_contract = @import("antfly_local_sources").storage_db_replication_contract;
@@ -189,7 +189,7 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     const progress_raw = try allocPath(alloc, name, "progress", nonce);
     defer alloc.free(progress_raw);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), log_raw) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), slots_raw) catch {};

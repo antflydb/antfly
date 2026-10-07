@@ -16,7 +16,7 @@
 //! Test I/O for the repository-owned Windows executor. Other targets retain std.testing.
 const std = @import("std");
 const builtin = @import("builtin");
-const Threaded = @import("root.zig").Threaded;
+const Threaded = @import("root.zig").Io.Threaded;
 var windows_instance: Threaded = instance: {
     var result = Threaded.init_single_threaded;
     result.allocator = std.heap.page_allocator;

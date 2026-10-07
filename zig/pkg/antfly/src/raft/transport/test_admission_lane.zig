@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Self = @This();
@@ -21,7 +21,7 @@ const Self = @This();
 /// Test-only admission fault injection backed by real std.Io tasks. The test's
 /// owning task performs all admission and await calls, so counters need no
 /// synchronization. Worker retirement never controls the injected refusal.
-runtime: native_platform.Threaded,
+runtime: platform.Io.Threaded,
 vtable: std.Io.VTable,
 refuse_after: ?usize,
 admitted: usize = 0,
@@ -56,7 +56,7 @@ fn concurrent(
     context_alignment: std.mem.Alignment,
     start: *const fn (*const anyopaque, *anyopaque) void,
 ) std.Io.ConcurrentError!*std.Io.AnyFuture {
-    const runtime: *native_platform.Threaded = @ptrCast(@alignCast(userdata.?));
+    const runtime: *platform.Io.Threaded = @ptrCast(@alignCast(userdata.?));
     const self: *Self = @fieldParentPtr("runtime", runtime);
     if (self.refuse_after) |limit| if (self.admitted >= limit)
         return error.ConcurrencyUnavailable;
@@ -67,7 +67,7 @@ fn concurrent(
 }
 
 fn awaitTask(userdata: ?*anyopaque, future: *std.Io.AnyFuture, result: []u8, alignment: std.mem.Alignment) void {
-    const runtime: *native_platform.Threaded = @ptrCast(@alignCast(userdata.?));
+    const runtime: *platform.Io.Threaded = @ptrCast(@alignCast(userdata.?));
     const self: *Self = @fieldParentPtr("runtime", runtime);
     const inner = runtime.io();
     inner.vtable.await(inner.userdata, future, result, alignment);

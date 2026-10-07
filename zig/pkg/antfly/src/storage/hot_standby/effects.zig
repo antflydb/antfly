@@ -19,7 +19,7 @@
 //! effect encodings, such as the derived/change journal payload, are nested as
 //! payloads instead of becoming the HA record header itself.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const codecs = @import("antfly_local_sources").storage_db_replication_effects;
@@ -193,7 +193,7 @@ fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
         .{ std.testing.random_seed, nonce },
     );
     defer alloc.free(raw);
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
     return try alloc.dupeSentinel(u8, raw, 0);

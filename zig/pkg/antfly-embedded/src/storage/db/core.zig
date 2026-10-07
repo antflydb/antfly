@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -465,7 +465,7 @@ pub const IdentityVisibilityState = struct {
     nonvisible_generation: ?u64 = null,
     nonvisible_set: ?doc_set.ResolvedDocSet = null,
     nonvisible_overflow: bool = false,
-    nonvisible_entries: native_platform.atomic.Value(u64) = .init(0),
+    nonvisible_entries: platform.atomic.Value(u64) = .init(0),
 
     pub fn clearLive(self: *@This()) void {
         while (!self.live_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -2497,7 +2497,7 @@ pub const TransactionRecoveryIdentityContext = struct {
     identity_namespace: doc_identity.Namespace,
     alloc: Allocator,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
-    io: std.Io = native_platform.debug_io,
+    io: std.Io = platform.debug_io,
     mutex: std.Io.Mutex = .init,
     relational_base_rows: bool = false,
     relational_schema_version: u32 = 0,
@@ -3584,9 +3584,9 @@ fn storeSnapshotHasV2Magic(io: std.Io, path: []const u8) !bool {
     return std.mem.eql(u8, &magic, store_snapshot_v2_magic);
 }
 
-fn threadedIo() if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) void else native_platform.Threaded {
+fn threadedIo() if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) void else platform.Io.Threaded {
     if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return;
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn writeFileAbsolute(path: []const u8, data: []const u8) !void {

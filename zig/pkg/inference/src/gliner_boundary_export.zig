@@ -15,7 +15,7 @@
 
 //! Atomic precision-only conversion of a complete boundary checkpoint. Output
 //! is a new directory; publication never overwrites an existing destination.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const bundle = @import("models/gliner_boundary_bundle.zig");
@@ -337,8 +337,8 @@ pub fn exportBundle(allocator: Allocator, io: std.Io, source_dir: []const u8, ou
 
 test "gliner boundary private publication cleanup preserves pending cancellation and published files" {
     const a = std.testing.allocator;
-    const test_io = native_platform.testing.io;
-    var temporary = native_platform.testing.tmpDir(.{});
+    const test_io = platform.testing.io;
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const parent = try temporary.dir.realPathFileAlloc(test_io, ".", a);
     defer a.free(parent);
@@ -356,7 +356,7 @@ test "gliner boundary private publication cleanup preserves pending cancellation
     try temporary.dir.writeFile(test_io, .{ .sub_path = "private-receipt.tmp", .data = "partial receipt" });
     try publishDirectory(a, test_io, payload, published);
 
-    var threaded = native_platform.Threaded.init(a, .{});
+    var threaded = platform.Io.Threaded.init(a, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const Context = struct {
@@ -405,41 +405,41 @@ test "gliner boundary private publication cleanup preserves pending cancellation
 
 test "gliner boundary conversion rejects invalid destination and cancellation before files" {
     const a = std.testing.allocator;
-    try std.testing.expectError(error.InvalidOutputPath, exportBundle(a, native_platform.testing.io, "/unused", "", .{}));
+    try std.testing.expectError(error.InvalidOutputPath, exportBundle(a, platform.testing.io, "/unused", "", .{}));
     const Cancel = struct {
         fn check(_: ?*anyopaque) !void {
             return error.Cancelled;
         }
     };
-    try std.testing.expectError(error.Cancelled, exportBundle(a, native_platform.testing.io, "/unused", "/unused", .{ .control = .{ .check_fn = Cancel.check } }));
+    try std.testing.expectError(error.Cancelled, exportBundle(a, platform.testing.io, "/unused", "/unused", .{ .control = .{ .check_fn = Cancel.check } }));
 }
 
 test "gliner boundary conversion pinned small FP32 roundtrip and same size substitution" {
     const a = std.testing.allocator;
-    const source = native_platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const source = platform.env.getenv("ANTFLY_GLINER25_SMALL_MODEL_DIR") orelse return error.SkipZigTest;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const parent = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
+    const parent = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", a);
     defer a.free(parent);
     const target = try std.fs.path.join(a, &.{ parent, "bundle" });
     defer a.free(target);
-    var result = try exportBundle(a, native_platform.testing.io, source, target, .{});
+    var result = try exportBundle(a, platform.testing.io, source, target, .{});
     defer result.deinit();
     const summary = try verifyDirectory(a, target, null);
     try std.testing.expectEqual(@as(usize, 334), summary.tensors);
-    try std.testing.expectError(error.PathAlreadyExists, exportBundle(a, native_platform.testing.io, source, target, .{}));
+    try std.testing.expectError(error.PathAlreadyExists, exportBundle(a, platform.testing.io, source, target, .{}));
     // Change one payload byte without changing file length or receipt. The
     // real session loader must reject the opened artifact before weights load.
     const path = try std.fs.path.join(a, &.{ target, bundle.model_name });
     defer a.free(path);
-    var weight = try std.Io.Dir.cwd().openFile(native_platform.testing.io, path, .{ .mode = .read_write });
-    defer weight.close(native_platform.testing.io);
-    const stat = try weight.stat(native_platform.testing.io);
+    var weight = try std.Io.Dir.cwd().openFile(platform.testing.io, path, .{ .mode = .read_write });
+    defer weight.close(platform.testing.io);
+    const stat = try weight.stat(platform.testing.io);
     var byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try weight.readPositional(native_platform.testing.io, &.{&byte}, stat.size - 1));
+    try std.testing.expectEqual(@as(usize, 1), try weight.readPositional(platform.testing.io, &.{&byte}, stat.size - 1));
     byte[0] ^= 1;
-    try weight.writePositionalAll(native_platform.testing.io, &byte, stat.size - 1);
-    try weight.sync(native_platform.testing.io);
+    try weight.writePositionalAll(platform.testing.io, &byte, stat.size - 1);
+    try weight.sync(platform.testing.io);
     try std.testing.expectError(error.GlinerBoundaryArtifactMismatch, @import("architectures/session_factory.zig").createNativeSession(a, target));
 }
 
@@ -456,15 +456,15 @@ test "gliner boundary conversion pinned small FP32 roundtrip and same size subst
 // execution permission either way; only the production table does.
 test "gliner boundary conversion synthesizes a manifest gated on reviewed qualification, never a mutation after publish" {
     const a = std.testing.allocator;
-    const source = native_platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const source = platform.env.getenv("ANTFLY_GLINER25_BASE_MODEL_DIR") orelse return error.SkipZigTest;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const parent = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
+    const parent = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", a);
     defer a.free(parent);
 
     const qualified_target = try std.fs.path.join(a, &.{ parent, "fp16" });
     defer a.free(qualified_target);
-    var qualified_result = try exportBundle(a, native_platform.testing.io, source, qualified_target, .{ .precision = .fp16_encoder });
+    var qualified_result = try exportBundle(a, platform.testing.io, source, qualified_target, .{ .precision = .fp16_encoder });
     defer qualified_result.deinit();
     const qualified_manifest_path = try std.fs.path.join(a, &.{ qualified_target, "model_manifest.json" });
     defer a.free(qualified_manifest_path);
@@ -475,7 +475,7 @@ test "gliner boundary conversion synthesizes a manifest gated on reviewed qualif
 
     const unqualified_target = try std.fs.path.join(a, &.{ parent, "q8_0" });
     defer a.free(unqualified_target);
-    var unqualified_result = try exportBundle(a, native_platform.testing.io, source, unqualified_target, .{ .precision = .q8_0 });
+    var unqualified_result = try exportBundle(a, platform.testing.io, source, unqualified_target, .{ .precision = .q8_0 });
     defer unqualified_result.deinit();
     const unqualified_manifest_path = try std.fs.path.join(a, &.{ unqualified_target, "model_manifest.json" });
     defer a.free(unqualified_manifest_path);

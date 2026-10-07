@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const buffer_mod = @import("buffer.zig");
@@ -215,7 +215,7 @@ const maximum_tensor_core_plans = 256;
 
 pub const CublasLt = struct {
     allocator: ?std.mem.Allocator = null,
-    lib: native_platform.DynLib,
+    lib: platform.DynLib,
     handle: Handle,
     owner_context: driver_mod.CUcontext,
     owner_device: driver_mod.CUdevice,
@@ -1031,13 +1031,13 @@ pub const CublasLt = struct {
     }
 };
 
-fn openLibrary() !native_platform.DynLib {
-    return native_platform.DynLib.open("libcublasLt.so") catch
-        native_platform.DynLib.open("libcublasLt.so.11") catch
-        native_platform.DynLib.open("libcublasLt.so.12");
+fn openLibrary() !platform.DynLib {
+    return platform.DynLib.open("libcublasLt.so") catch
+        platform.DynLib.open("libcublasLt.so.11") catch
+        platform.DynLib.open("libcublasLt.so.12");
 }
 
-fn lookup(lib: *native_platform.DynLib, comptime T: type, name: [:0]const u8) Error!T {
+fn lookup(lib: *platform.DynLib, comptime T: type, name: [:0]const u8) Error!T {
     return lib.lookup(T, name) orelse error.CublasLtSymbolMissing;
 }
 
@@ -1115,7 +1115,7 @@ fn lockYielding(mutex: *std.atomic.Mutex) void {
             std.atomic.spinLoopHint();
             spins += 1;
         } else {
-            native_platform.time.yieldNow();
+            platform.time.yieldNow();
         }
     }
 }

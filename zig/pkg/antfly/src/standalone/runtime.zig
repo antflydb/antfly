@@ -16,7 +16,6 @@
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
 const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
-const native_platform = @import("antfly_platform");
 const std = @import("std");
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const hot_standby_wal = @import("../storage/wal_runtime.zig");
@@ -989,7 +988,7 @@ const LocalStandaloneMetadata = struct {
             };
             self.lifecycle_store = lifecycle;
             if (try lifecycle.getMetadataIncarnation(group_ids.main_metadata_group_id) == null) {
-                const incarnation = try @import("antfly_local_sources").metadata_incarnation.generate(backend_runtime.io() orelse native_platform.debug_io);
+                const incarnation = try @import("antfly_local_sources").metadata_incarnation.generate(backend_runtime.io() orelse platform.debug_io);
                 try lifecycle.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .initialize_metadata_incarnation = incarnation });
             }
             self.metadata_incarnation = try lifecycle.getMetadataIncarnation(group_ids.main_metadata_group_id);
@@ -3988,7 +3987,7 @@ const LocalStandaloneMetadata = struct {
             break :blk try self.alloc.dupe(u8, value);
         } else readFileAlloc(
             self.alloc,
-            self.backend_runtime.io() orelse native_platform.debug_io,
+            self.backend_runtime.io() orelse platform.debug_io,
             self.catalog_path,
             64 * 1024 * 1024,
         ) catch |err| switch (err) {
@@ -4480,7 +4479,7 @@ pub fn runFromIterator(
     defer termination_signals.deinit();
     var supervisor = antfly.common.runtime_lifecycle.RuntimeSupervisor.init(30_000);
     defer supervisor.markStopped();
-    var setup_io = platform.Threaded.init(alloc, .{});
+    var setup_io = platform.Io.Threaded.init(alloc, .{});
     defer setup_io.deinit();
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
@@ -7058,7 +7057,7 @@ fn configLocalBaseDirHintFromRaw(alloc: std.mem.Allocator, raw: []const u8) !?[]
 }
 
 fn configLocalBaseDirHintFromPath(alloc: std.mem.Allocator, path: []const u8) !?[]u8 {
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const raw = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(16 * 1024 * 1024));
     defer alloc.free(raw);
@@ -7202,7 +7201,7 @@ fn normalizeResolvedPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 
 
     var probe = path;
     while (true) {
-        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(native_platform.debug_io, probe, alloc) catch |err| switch (err) {
+        const resolved_z = std.Io.Dir.realPathFileAbsoluteAlloc(platform.debug_io, probe, alloc) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -11338,7 +11337,7 @@ test "standalone runtime resolves extension package store env before local defau
 test "standalone default secret store follows projected symlink rotation" {
     const projection_test = @import("../common/secret_projection_test_support.zig");
     const alloc = std.testing.allocator;
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     // Cover both a symlinked secrets.json and a symlink in the base directory.
     for ([_]bool{ false, true }) |from_config| {
@@ -11524,7 +11523,7 @@ test "standalone initial external MATCH PARTIAL FK cancellation retires private 
 fn exerciseStandaloneInitialExternal(cancel_before_activation: bool) !void {
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var tmp = platform.testing.tmpDir(.{});
@@ -11882,7 +11881,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
     const alloc = std.testing.allocator;
     const publication = @import("../metadata/fk_generation_publication.zig");
     const control = antfly.public_api.relational_fk_generation_publication;
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var tmp = platform.testing.tmpDir(.{});
@@ -12977,7 +12976,7 @@ test "standalone metadata rolls back an undurable catalog mutation" {
     defer tmp.cleanup();
     const catalog_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/catalog-directory", .{tmp.sub_path});
     defer alloc.free(catalog_dir);
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     try ensureDirPath(io_impl.io(), catalog_dir);
 
@@ -13291,7 +13290,7 @@ test "standalone metadata rejects corrupt catalog without double-freeing owned p
     defer tmp.cleanup();
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/corrupt-catalog.json", .{tmp.sub_path});
     defer alloc.free(catalog_path);
-    try writeFileAtomically(alloc, native_platform.debug_io, catalog_path, "{not-json");
+    try writeFileAtomically(alloc, platform.debug_io, catalog_path, "{not-json");
 
     var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
     defer backend_runtime.deinit();

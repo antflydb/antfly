@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const antfly = @import("cli_root.zig");
@@ -93,7 +93,7 @@ pub fn runFromIterator(
     // ProcessInit's compatibility executor may not run detached concurrent
     // work eagerly. Serverless maintenance and request handling must share a
     // process-owned executor so full-index waits can make forward progress.
-    var runtime_io_impl = native_platform.Threaded.init(alloc, .{});
+    var runtime_io_impl = platform.Io.Threaded.init(alloc, .{});
     defer runtime_io_impl.deinit();
     const runtime_io = runtime_io_impl.io();
 
@@ -964,7 +964,7 @@ test "serverless main derives multi-bucket lanes and per-connection credentials"
     const alloc = std.testing.allocator;
     const store_path = ".zig-cache/test-serverless-storage-secrets.json";
     defer {
-        var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
     }

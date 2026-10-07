@@ -17,7 +17,7 @@
 //! logical message before any payload allocation or transmission. Raw metadata
 //! and body bytes travel in bounded, interleavable frames. Capacity rejection
 //! affects one transfer; malformed framing closes the connection.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const max_frame_bytes = 64 * 1024;
@@ -609,13 +609,13 @@ const TestPair = struct {
 
     fn init(self: *TestPair) !void {
         if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
-        const up = try native_platform.Threaded.pipe2(.{ .CLOEXEC = true });
-        const down = try native_platform.Threaded.pipe2(.{ .CLOEXEC = true });
+        const up = try platform.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+        const down = try platform.Io.Threaded.pipe2(.{ .CLOEXEC = true });
         self.* = .{ .parent = undefined, .child = undefined, .files = undefined };
         for (up ++ down, &self.files) |fd, *file| file.* = .{ .handle = fd, .flags = .{ .nonblocking = false } };
         self.parent = .{
             .alloc = std.testing.allocator,
-            .io = native_platform.testing.io,
+            .io = platform.testing.io,
             .input = self.files[0],
             .output = self.files[3],
             .context = self,
@@ -625,7 +625,7 @@ const TestPair = struct {
         };
         self.child = .{
             .alloc = std.testing.allocator,
-            .io = native_platform.testing.io,
+            .io = platform.testing.io,
             .input = self.files[2],
             .output = self.files[1],
             .context = self,
@@ -640,7 +640,7 @@ const TestPair = struct {
     pub fn deinit(self: *TestPair) void {
         self.parent.deinit();
         self.child.deinit();
-        for (self.files) |file| file.close(native_platform.testing.io);
+        for (self.files) |file| file.close(platform.testing.io);
     }
 
     fn closed(_: *anyopaque) void {}
@@ -651,8 +651,8 @@ const TestPair = struct {
             return request.endpoint.call(.{ .body = "echo" }, .{});
         if (std.mem.eql(u8, request.payload.view().body, "cancel")) {
             try request.event(.{ .body = "started" });
-            while (!request.cancelled.load(.acquire)) try native_platform.testing.io.sleep(.fromMilliseconds(1), .awake);
-            self.cancel_seen.set(native_platform.testing.io);
+            while (!request.cancelled.load(.acquire)) try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
+            self.cancel_seen.set(platform.testing.io);
         }
         return request.endpoint.copyPayload(request.payload.view());
     }
@@ -704,7 +704,7 @@ test "inference worker RPC cancellation reaches the active child request" {
         .check = TestPair.check,
         .event = TestPair.event,
     }));
-    try pair.cancel_seen.waitTimeout(native_platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try pair.cancel_seen.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
 }
 
 test "inference worker RPC rejects malformed cancellation frames" {
@@ -714,7 +714,7 @@ test "inference worker RPC rejects malformed cancellation frames" {
     try pair.parent.sendFrame(.cancel, 1, "invalid payload");
     var elapsed: usize = 0;
     while (!pair.child.closed.load(.acquire) and elapsed < 5000) : (elapsed += 1)
-        try native_platform.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     try std.testing.expect(pair.child.closed.load(.acquire));
 }
 
@@ -830,12 +830,12 @@ test "inference worker concurrent bulk transfers preserve message boundaries" {
     defer std.testing.allocator.free(body_b);
     @memset(body_a, 0xa3);
     @memset(body_b, 0xb4);
-    var a = try native_platform.testing.io.concurrent(Probe.run, .{Probe{ .endpoint = &pair.parent, .body = body_a }});
-    defer _ = a.cancel(native_platform.testing.io) catch {};
-    var b = try native_platform.testing.io.concurrent(Probe.run, .{Probe{ .endpoint = &pair.parent, .body = body_b }});
-    defer _ = b.cancel(native_platform.testing.io) catch {};
-    try a.await(native_platform.testing.io);
-    try b.await(native_platform.testing.io);
+    var a = try platform.testing.io.concurrent(Probe.run, .{Probe{ .endpoint = &pair.parent, .body = body_a }});
+    defer _ = a.cancel(platform.testing.io) catch {};
+    var b = try platform.testing.io.concurrent(Probe.run, .{Probe{ .endpoint = &pair.parent, .body = body_b }});
+    defer _ = b.cancel(platform.testing.io) catch {};
+    try a.await(platform.testing.io);
+    try b.await(platform.testing.io);
 }
 
 test "inference worker truncated logical messages close transport and release receive credits" {
@@ -851,7 +851,7 @@ test "inference worker truncated logical messages close transport and release re
     try pair.parent.sendFrame(.finish, 99, "");
     var elapsed: usize = 0;
     while (!pair.child.closed.load(.acquire) and elapsed < 5000) : (elapsed += 1)
-        try native_platform.testing.io.sleep(.fromMilliseconds(1), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(1), .awake);
     try std.testing.expect(pair.child.closed.load(.acquire));
     pair.child.mutex.lockUncancelable(pair.child.io);
     defer pair.child.mutex.unlock(pair.child.io);
@@ -967,12 +967,12 @@ test "inference worker uncertain resource replies fence cleanup and wake callers
         }
         fn closed(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.reaping.set(native_platform.testing.io);
-            self.reaped.wait(native_platform.testing.io) catch unreachable;
+            self.reaping.set(platform.testing.io);
+            self.reaped.wait(platform.testing.io) catch unreachable;
             self.leased.store(false, .release);
             self.cleanups += 1;
             self.pair.parent.fail(); // Models the worker's pipe EOF.
-            self.cleaned.set(native_platform.testing.io);
+            self.cleaned.set(platform.testing.io);
         }
         fn call(self: *@This()) !void {
             try std.testing.expectError(error.InferenceWorkerUnavailable, self.pair.parent.callResource("reserve"));
@@ -987,16 +987,16 @@ test "inference worker uncertain resource replies fence cleanup and wake callers
     pair.child.resource_handler = Probe.resource;
     pair.child.on_closed = Probe.closed;
     pair.child.mutex.unlock(pair.child.io);
-    var call = try native_platform.testing.io.concurrent(Probe.call, .{&probe});
-    defer _ = call.cancel(native_platform.testing.io) catch {};
+    var call = try platform.testing.io.concurrent(Probe.call, .{&probe});
+    defer _ = call.cancel(platform.testing.io) catch {};
     // Always unblock lifecycle cleanup even if an assertion fails.
-    defer probe.reaped.set(native_platform.testing.io);
-    try probe.reaping.waitTimeout(native_platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    defer probe.reaped.set(platform.testing.io);
+    try probe.reaping.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
     try std.testing.expect(probe.leased.load(.acquire));
     pair.child.fail(); // Repeated faults must not run cleanup twice.
-    probe.reaped.set(native_platform.testing.io);
-    try probe.cleaned.waitTimeout(native_platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
-    try call.await(native_platform.testing.io);
+    probe.reaped.set(platform.testing.io);
+    try probe.cleaned.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    try call.await(platform.testing.io);
     try std.testing.expect(!probe.leased.load(.acquire));
     try std.testing.expectEqual(@as(usize, 1), probe.cleanups);
 }
@@ -1083,8 +1083,8 @@ test "inference worker concurrent resource callbacks route replies by ID" {
         entered: std.atomic.Value(usize) = .init(0),
         fn resource(raw: *anyopaque, bytes: []const u8) !ResourceReply {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both.set(native_platform.testing.io);
-            try self.both.waitTimeout(native_platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+            if (self.entered.fetchAdd(1, .acq_rel) == 1) self.both.set(platform.testing.io);
+            try self.both.waitTimeout(platform.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
             return .{ .value = bytes[0] };
         }
         fn call(self: *@This(), bytes: []const u8) !void {
@@ -1100,10 +1100,10 @@ test "inference worker concurrent resource callbacks route replies by ID" {
     pair.child.context = &probe;
     pair.child.resource_handler = Probe.resource;
     pair.child.mutex.unlock(pair.child.io);
-    var first = try native_platform.testing.io.concurrent(Probe.call, .{ &probe, "first" });
-    defer _ = first.cancel(native_platform.testing.io) catch {};
-    var second = try native_platform.testing.io.concurrent(Probe.call, .{ &probe, "second" });
-    defer _ = second.cancel(native_platform.testing.io) catch {};
-    try first.await(native_platform.testing.io);
-    try second.await(native_platform.testing.io);
+    var first = try platform.testing.io.concurrent(Probe.call, .{ &probe, "first" });
+    defer _ = first.cancel(platform.testing.io) catch {};
+    var second = try platform.testing.io.concurrent(Probe.call, .{ &probe, "second" });
+    defer _ = second.cancel(platform.testing.io) catch {};
+    try first.await(platform.testing.io);
+    try second.await(platform.testing.io);
 }

@@ -19,7 +19,7 @@
 ///
 /// Each handler method extracts wire parameters from the httpx Context, calls
 /// a typed operation, and adapts its owned result to an httpx.Response.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ant_json = @import("antfly-json");
@@ -102,7 +102,7 @@ const metadata_table_topology_mutations = @import("../metadata/table_topology_mu
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const metadata_shard_db_adapter = @import("../metadata/shard_db_adapter.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 const usermgr = @import("../usermgr/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
@@ -288,7 +288,7 @@ test "gzip request bodies reserve expanded capacity from the shared server budge
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
     defer request.deinit();
     request.body_budget = &budget;
-    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     try std.testing.expectError(
@@ -305,7 +305,7 @@ test "invalid gzip releases partially expanded body capacity" {
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
     defer request.deinit();
     request.body_budget = &budget;
-    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer ctx.deinit();
 
     try std.testing.expectError(
@@ -320,7 +320,7 @@ test "gzip request body reservation follows the owned decoded buffer lifetime" {
     var budget = httpx.SharedBodyBudget.init(32 * 1024);
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
     request.body_budget = &budget;
-    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
 
     const decoded = try gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2);
     try request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
@@ -338,7 +338,7 @@ test "gzip request completes with combined encoded and decoded budget" {
 
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/");
     request.body_budget = &budget;
-    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
 
     const decoded = try gunzipRequestBodyAlloc(&ctx, std.testing.allocator, &encoded, 2);
     try request.replaceOwnedBodyAllocation(decoded.body, decoded.allocation);
@@ -434,7 +434,7 @@ test "FK publication upgrade response excludes unknown mutation outcomes" {
 test "FK publication reports missing setting authority as service unavailable" {
     var request = try httpx.Request.init(std.testing.allocator, .POST, "/tables/docs/schema");
     defer request.deinit();
-    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try witnessDDLError(&ctx, error.SettingAuthorityUnavailable);
     defer response.deinit();
@@ -657,7 +657,7 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
         defer state.bytes.deinit(alloc);
         var request = try httpx.Request.init(alloc, .POST, "http://localhost/db/v1/agents/retrieval");
         defer request.deinit();
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         ctx.stream_delegate = .{ .ptr = &state, .start = State.start, .write = State.write, .close = State.close };
         ctx.cancellation_probe = .{ .ptr = &state, .is_cancelled = State.isCancelled };
@@ -9493,11 +9493,11 @@ pub const AntflyApiHandler = struct {
 };
 
 fn sleepNs(duration_ns: u64) void {
-    var req = native_platform.c.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
         .nsec = @intCast(duration_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(native_platform.c.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -9569,7 +9569,7 @@ fn encodeBasicAuthorization(alloc: std.mem.Allocator, username: []const u8, pass
 
 const HttpxE2eServer = struct {
     allocator: std.mem.Allocator,
-    io_impl: native_platform.Threaded,
+    io_impl: platform.Io.Threaded,
     server: httpx.Server,
     handler: AntflyApiHandler,
     thread: ?std.Io.Future(void) = null,
@@ -9588,7 +9588,7 @@ const HttpxE2eServer = struct {
         api_server.query_admission = RequestAdmission.init(query_capacity);
         self.* = .{
             .allocator = allocator,
-            .io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{}),
+            .io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{}),
             .server = undefined,
             .handler = .{
                 .api_server = api_server,
@@ -9614,13 +9614,13 @@ const HttpxE2eServer = struct {
         try self.handler.registerRoutes(&self.server);
 
         try self.server.bind();
-        self.thread = try native_platform.testing.io.concurrent(listenHttpxE2eServer, .{&self.server});
+        self.thread = try platform.testing.io.concurrent(listenHttpxE2eServer, .{&self.server});
     }
 
     pub fn deinit(self: *HttpxE2eServer) void {
         if (self.thread) |*thread| {
             self.server.stop();
-            thread.await(native_platform.testing.io);
+            thread.await(platform.testing.io);
         }
         self.handler.deinitRuntime();
         self.server.deinit();
@@ -9734,7 +9734,7 @@ test "system catalog SQL setting publication requires cluster admin and forwards
     var e2e: HttpxE2eServer = undefined;
     try e2e.init(alloc, &api_server);
     defer e2e.deinit();
-    var io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io.deinit();
     var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -9810,7 +9810,7 @@ test "store-root enrollment requires cluster admin and forwards only valid posse
     var e2e: HttpxE2eServer = undefined;
     try e2e.init(alloc, &api_server);
     defer e2e.deinit();
-    var io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io.deinit();
     var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -9897,7 +9897,7 @@ test "compressed requests authenticate before decompression and reuse the identi
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -10190,7 +10190,7 @@ test "internal routed batch preserves typed validation across the HTTP forwardin
         try request.setHeader(internal_batch_forwarding.remaining_ms_header, "1000");
         try request.setHeader(internal_batch_forwarding.forwards_remaining_header, "1");
         try request.setHeader(internal_batch_forwarding.campaign_allowed_header, "false");
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         ctx.params = &params;
         var response = try handler.internalGroupRoutedBatch(&ctx);
@@ -10216,7 +10216,7 @@ test "internal routed batch preserves typed validation across the HTTP forwardin
 test "public transaction preparation generation transition is retryable without outcome claims" {
     var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/transactions/commit");
     defer request.deinit();
-    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var handler: AntflyApiHandler = .{ .api_server = undefined };
     var response = try handler.transactionPreparationError(&ctx, error.GenerationTransitionActive);
@@ -10231,7 +10231,7 @@ test "public transaction preparation generation transition is retryable without 
 test "internal transaction HTTP size rejection is actionable without claiming not proposed" {
     var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/prepare");
     defer request.deinit();
-    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.TransactionTooLarge, .prepare);
     defer response.deinit();
@@ -10283,7 +10283,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
     var begin_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/begin");
     defer begin_request.deinit();
     begin_request.body = begin_body;
-    var begin_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &begin_request);
+    var begin_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &begin_request);
     defer begin_ctx.deinit();
     begin_ctx.params = &params;
     var begin_response = try handler.internalTxnBegin(&begin_ctx);
@@ -10302,7 +10302,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
     var prepare_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn/prepare");
     defer prepare_request.deinit();
     prepare_request.body = prepare_body;
-    var prepare_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &prepare_request);
+    var prepare_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &prepare_request);
     defer prepare_ctx.deinit();
     prepare_ctx.params = &params;
     var prepare_response = try handler.internalTxnPrepare(&prepare_ctx);
@@ -10320,7 +10320,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
     }) |phase| {
         var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
         defer request.deinit();
-        var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, error.GroupLeaderUnavailable, phase);
         defer response.deinit();
@@ -10330,7 +10330,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
 
     var unavailable_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
     defer unavailable_request.deinit();
-    var unavailable_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &unavailable_request);
+    var unavailable_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &unavailable_request);
     defer unavailable_ctx.deinit();
     var unavailable_response = try AntflyApiHandler.internalTxnErrorResponse(&unavailable_ctx, error.Unavailable, .begin);
     defer unavailable_response.deinit();
@@ -10339,7 +10339,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
 
     var ambiguous_deadline_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
     defer ambiguous_deadline_request.deinit();
-    var ambiguous_deadline_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &ambiguous_deadline_request);
+    var ambiguous_deadline_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &ambiguous_deadline_request);
     defer ambiguous_deadline_ctx.deinit();
     var ambiguous_deadline_response = try AntflyApiHandler.internalTxnErrorResponse(
         &ambiguous_deadline_ctx,
@@ -10352,7 +10352,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
 
     var generic_deadline_request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
     defer generic_deadline_request.deinit();
-    var generic_deadline_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &generic_deadline_request);
+    var generic_deadline_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &generic_deadline_request);
     defer generic_deadline_ctx.deinit();
     var generic_deadline_response = try AntflyApiHandler.internalTxnErrorResponse(
         &generic_deadline_ctx,
@@ -10369,7 +10369,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
     }) |case| {
         var request = try httpx.Request.init(std.testing.allocator, .POST, "http://127.0.0.1/internal/txn");
         defer request.deinit();
-        var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try AntflyApiHandler.internalTxnErrorResponse(&ctx, case[0], .begin);
         defer response.deinit();
@@ -10388,7 +10388,7 @@ test "internal read-index absence response requires typed native proof" {
         // Reflected request headers must not manufacture a successful read.
         try request.setHeader(metadata_api.read_index_absence_header, metadata_api.read_index_absence_value);
         try request.setHeader(metadata_api.catalog_route_fence_ack_header, metadata_api.catalog_route_fence_ack_value);
-        var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try AntflyApiHandler.internalLookupErrorResponse(&ctx, failure);
         defer response.deinit();
@@ -10431,7 +10431,7 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     );
     defer request.deinit();
     try request.setHeader(distributed_txn_contract.pre_decision_remaining_ms_header, "250");
-    var ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &request);
     defer ctx.deinit();
     const before_ns = @as(u64, @intCast(std.Io.Clock.now(.awake, ctx.io).nanoseconds));
     AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&ctx);
@@ -10448,7 +10448,7 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     );
     defer invalid_request.deinit();
     try invalid_request.setHeader(distributed_txn_contract.pre_decision_remaining_ms_header, "5001");
-    var invalid_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &invalid_request);
+    var invalid_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &invalid_request);
     defer invalid_ctx.deinit();
     AntflyApiHandler.establishInternalTxnPreDecisionDeadline(&invalid_ctx);
     try std.testing.expect(invalid_ctx.application_deadline_ns == null);
@@ -10461,7 +10461,7 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     );
     defer status_request.deinit();
     try status_request.setHeader(distributed_txn_contract.status_remaining_ms_header, "250");
-    var status_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &status_request);
+    var status_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &status_request);
     defer status_ctx.deinit();
     const status_before_ns = platform_time.monotonicNs();
     AntflyApiHandler.establishInternalTxnStatusDeadline(&status_ctx);
@@ -10477,7 +10477,7 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     );
     defer invalid_status_request.deinit();
     try invalid_status_request.setHeader(distributed_txn_contract.status_remaining_ms_header, "5001");
-    var invalid_status_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &invalid_status_request);
+    var invalid_status_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &invalid_status_request);
     defer invalid_status_ctx.deinit();
     AntflyApiHandler.establishInternalTxnStatusDeadline(&invalid_status_ctx);
     try std.testing.expect(invalid_status_ctx.application_deadline_ns == null);
@@ -10490,7 +10490,7 @@ test "internal transaction ingress establishes and validates pre-decision deadli
     );
     defer backup_request.deinit();
     try backup_request.setHeader(backups_api.backup_remaining_ms_header, "250");
-    var backup_ctx = httpx.Context.init(std.testing.allocator, native_platform.testing.io, &backup_request);
+    var backup_ctx = httpx.Context.init(std.testing.allocator, platform.testing.io, &backup_request);
     defer backup_ctx.deinit();
     const backup_before_ns = platform_time.monotonicNs();
     AntflyApiHandler.establishInternalBackupDeadline(&backup_ctx);
@@ -10639,7 +10639,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     };
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -10884,7 +10884,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     };
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -10990,7 +10990,7 @@ test "httpx MCP route preserves protocol session headers" {
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -11029,7 +11029,7 @@ test "httpx shared registrar keeps root probes and rejects removed data aliases"
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -11171,7 +11171,7 @@ test "httpx internal control routes call typed operations directly" {
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -11360,7 +11360,7 @@ test "httpx ARD routes call typed contextual operations directly" {
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -11454,7 +11454,7 @@ test "httpx storage maintenance routes call typed operations directly" {
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -11591,7 +11591,7 @@ test "httpx raft quarantine administration is authenticated and incident fenced"
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -11718,7 +11718,7 @@ test "httpx request lifecycle hook suspends after admission without leaking capa
 
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
     defer request.deinit();
-    var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
     defer ctx.deinit();
 
     try std.testing.expect((try handler.acquirePublicOperation(&ctx, "queryTable")) == null);
@@ -11777,9 +11777,9 @@ test "httpx query admission rejects saturated queries without blocking control r
     var h1_query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
     defer h1_query_request.deinit();
     h1_query_request.body = "{}";
-    var h1_query_ctx = httpx.Context.init(alloc, native_platform.testing.io, &h1_query_request);
+    var h1_query_ctx = httpx.Context.init(alloc, platform.testing.io, &h1_query_request);
     defer h1_query_ctx.deinit();
-    var h1_socket = httpx.Socket{ .handle = 0, .io = native_platform.testing.io };
+    var h1_socket = httpx.Socket{ .handle = 0, .io = platform.testing.io };
     h1_query_ctx.h1_sock = &h1_socket;
     var h1_rejected = try handler.queryTable(&h1_query_ctx, "docs");
     defer h1_rejected.deinit();
@@ -11792,7 +11792,7 @@ test "httpx query admission rejects saturated queries without blocking control r
     defer handler.query_body_admission.release();
     var h2_query_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/query");
     defer h2_query_request.deinit();
-    var h2_query_ctx = httpx.Context.init(alloc, native_platform.testing.io, &h2_query_request);
+    var h2_query_ctx = httpx.Context.init(alloc, platform.testing.io, &h2_query_request);
     defer h2_query_ctx.deinit();
     const UnusedStreamingBody = struct {
         fn readAll(_: ?*anyopaque) !?[]const u8 {
@@ -11875,7 +11875,7 @@ test "httpx inference connection uses the configured shared admission owner" {
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/remote/inference/embed");
     defer request.deinit();
     request.body = "{}";
-    var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
     defer ctx.deinit();
 
     var rejected = try handler.invokeInferenceConnection(&ctx, "remote", "embed");
@@ -11965,7 +11965,7 @@ test "local inference connection admission is owned exactly once by its target" 
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/local-inference/inference/embed");
     defer request.deinit();
     request.body = "{}";
-    var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
     defer ctx.deinit();
 
     var response = try handler.invokeInferenceConnection(&ctx, common_config.local_inference_connection_id, "embed");
@@ -12027,7 +12027,7 @@ test "httpx inference connection requires inference write permission" {
     defer denied_request.deinit();
     try denied_request.headers.append("authorization", authorization);
     denied_request.body = "{}";
-    var denied_ctx = httpx.Context.init(alloc, native_platform.testing.io, &denied_request);
+    var denied_ctx = httpx.Context.init(alloc, platform.testing.io, &denied_request);
     defer denied_ctx.deinit();
     var denied = try handler.invokeInferenceConnection(&denied_ctx, common_config.local_inference_connection_id, "embed");
     defer denied.deinit();
@@ -12042,7 +12042,7 @@ test "httpx inference connection requires inference write permission" {
     defer allowed_request.deinit();
     try allowed_request.headers.append("authorization", authorization);
     allowed_request.body = "{}";
-    var allowed_ctx = httpx.Context.init(alloc, native_platform.testing.io, &allowed_request);
+    var allowed_ctx = httpx.Context.init(alloc, platform.testing.io, &allowed_request);
     defer allowed_ctx.deinit();
     var allowed = try handler.invokeInferenceConnection(&allowed_ctx, common_config.local_inference_connection_id, "embed");
     defer allowed.deinit();
@@ -12098,7 +12098,7 @@ test "httpx inference connection propagates failures after stream commit" {
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/local-inference/inference/generate");
     defer request.deinit();
     request.body = "{\"stream\":true}";
-    var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
     defer ctx.deinit();
     var stream = Stream{};
     ctx.stream_delegate = .{
@@ -12120,7 +12120,7 @@ test "httpx inference connection preserves upstream retry guidance" {
     const alloc = std.testing.allocator;
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/connections/remote/inference/embed");
     defer request.deinit();
-    var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
     defer ctx.deinit();
     var result = connections_api.InvokeResult{
         .status = 503,
@@ -12162,7 +12162,7 @@ test "httpx write admission rejects saturated table mutations" {
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/tables/docs/batch");
     defer request.deinit();
     request.body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}}}";
-    var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
     defer ctx.deinit();
 
     var rejected = try handler.batchWrite(&ctx, "docs");
@@ -12246,8 +12246,8 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
                         return error.Cancelled;
                     }
                 }
-                var delay = native_platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = native_platform.c.nanosleep(&delay, &delay);
+                var delay = platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+                _ = platform.c.nanosleep(&delay, &delay);
             }
             return .{ .json = try alloc.dupe(u8, "{\"responses\":[]}") };
         }
@@ -12267,7 +12267,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     defer e2e_server.deinit();
 
     const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
-    const client_io = native_platform.Threaded.global_single_threaded.io();
+    const client_io = platform.Io.Threaded.global_single_threaded.io();
     var clients = @as([128]?httpx.Socket, @splat(null));
     defer for (&clients) |*slot| {
         if (slot.*) |*client| client.close();
@@ -12308,8 +12308,8 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
             {
                 break;
             }
-            var delay = native_platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-            _ = native_platform.c.nanosleep(&delay, &delay);
+            var delay = platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+            _ = platform.c.nanosleep(&delay, &delay);
         }
         const wave_stats = api_server.queryAdmissionStats();
         try std.testing.expectEqual(@as(usize, 8), wave_stats.in_flight);
@@ -12333,14 +12333,14 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     // until only the eight deliberately blocked requests remain.
     for (0..convergence_poll_attempts) |_| {
         if (e2e_server.server.httpRuntimeStats().active_h1_cancellation_observers == 8) break;
-        var delay = native_platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = native_platform.c.nanosleep(&delay, &delay);
+        var delay = platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = platform.c.nanosleep(&delay, &delay);
     }
     try std.testing.expectEqual(@as(usize, 8), e2e_server.server.httpRuntimeStats().active_h1_cancellation_observers);
 
     // Rejected keep-alive clients must not retain all connection permits. The
     // real status route remains reachable while every expensive slot is held.
-    var control_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var control_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer control_io.deinit();
     var control_client = httpx.Client.initWithConfig(alloc, control_io.io(), .{ .keep_alive = false });
     defer control_client.deinit();
@@ -12381,8 +12381,8 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
             runtime.active_h1_cancellation_observers == 0 and
             started >= 8 and
             cancelled == started) break;
-        var delay = native_platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
-        _ = native_platform.c.nanosleep(&delay, &delay);
+        var delay = platform.c.timespec{ .sec = 0, .nsec = std.time.ns_per_ms };
+        _ = platform.c.nanosleep(&delay, &delay);
     }
     try std.testing.expectEqual(@as(usize, 0), api_server.queryAdmissionStats().in_flight);
     try std.testing.expectEqual(@as(usize, 0), e2e_server.server.httpRuntimeStats().active_h1_cancellation_observers);
@@ -12428,7 +12428,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
 
     const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/test-httpx-handler-secrets-{d}.json", .{platform_time.monotonicNs()});
     defer alloc.free(store_path);
-    var cleanup_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var cleanup_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer cleanup_io.deinit();
     defer std.Io.Dir.cwd().deleteFile(cleanup_io.io(), store_path) catch {};
 
@@ -12448,7 +12448,7 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -12554,7 +12554,7 @@ test "httpx SQL dispatch preserves imported executor authority including unavail
     var source = AuthStatusSource{};
     var server = ApiHttpServer.init(alloc, .{
         .backend_runtime = runtime.ptr(),
-        .imported_runtime_io = .{ .api = native_platform.testing.io },
+        .imported_runtime_io = .{ .api = platform.testing.io },
     }, source.iface(), null, null);
     defer server.deinit();
     var handler = AntflyApiHandler{ .api_server = &server };
@@ -12563,7 +12563,7 @@ test "httpx SQL dispatch preserves imported executor authority including unavail
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
         defer request.deinit();
         request.body = "{\"statement\":\"SELECT id FROM docs\"}";
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executeSQL(&ctx);
         defer response.deinit();
@@ -12591,7 +12591,7 @@ test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
         var preparation = server.sql_preparation_admission.tryAcquireLease().?;
         preparation.release();
     }
-    var transport = httpx.Server.init(alloc, native_platform.testing.io);
+    var transport = httpx.Server.init(alloc, platform.testing.io);
     defer transport.deinit();
     var prefixed = PrefixedServer("/db/v1", httpx.Server){ .inner = &transport };
     try prefixed.post("/sql", httpx.Handler.bind(&handler, AntflyApiHandler.executeSQL));
@@ -12610,7 +12610,7 @@ test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
         defer request.deinit();
         request.body = case.body;
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executeSQL(&ctx);
         defer response.deinit();
@@ -12629,7 +12629,7 @@ test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
     defer request.deinit();
     request.body = "{\"statement\":\"SELECT id FROM docs\"}";
-    var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try handler.executeSQL(&ctx);
     defer response.deinit();
@@ -12748,7 +12748,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         defer request.deinit();
         try request.headers.append("authorization", if (case.other_user) other_authorization else authorization);
         request.body = body;
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executeSQL(&ctx);
         defer response.deinit();
@@ -12779,7 +12779,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         try request.headers.append("authorization", if (case.other_user) other_authorization else authorization);
         request.body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT current_setting('app.limit')", .session_id = @as([]const u8, &session_id), .database = case.database }, .{ .emit_null_optional_fields = false });
         defer alloc.free(request.body.?);
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.prepareSQL(&ctx);
         defer response.deinit();
@@ -12796,7 +12796,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         try request.headers.append("authorization", authorization);
         request.body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SELECT current_setting('app.limit')", .session_id = @as([]const u8, &session_id) }, .{});
         defer alloc.free(request.body.?);
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.prepareSQL(&ctx);
         defer response.deinit();
@@ -12819,7 +12819,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         try request.headers.append("authorization", if (case.other_user) other_authorization else authorization);
         request.body = try std.json.Stringify.valueAlloc(alloc, .{ .session_id = case.session }, .{ .emit_null_optional_fields = false });
         defer alloc.free(request.body.?);
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executePreparedSQL(&ctx, attached_prepared_id);
         defer response.deinit();
@@ -12837,7 +12837,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         try request.headers.append("authorization", authorization);
         request.body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = "SET app.limit = 12", .session_id = @as([]const u8, &session_id) }, .{});
         defer alloc.free(request.body.?);
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executeSQL(&ctx);
         defer response.deinit();
@@ -12849,7 +12849,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         try request.headers.append("authorization", authorization);
         request.body = try std.json.Stringify.valueAlloc(alloc, .{ .session_id = @as([]const u8, &session_id) }, .{});
         defer alloc.free(request.body.?);
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executePreparedSQL(&ctx, attached_prepared_id);
         defer response.deinit();
@@ -12864,7 +12864,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         defer request.deinit();
         try request.headers.append("authorization", authorization);
         request.body = "{\"statement\":\"SELECT current_setting('app.limit')\"}";
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.prepareSQL(&ctx);
         defer response.deinit();
@@ -12880,7 +12880,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         try request.headers.append("authorization", authorization);
         request.body = try std.json.Stringify.valueAlloc(alloc, .{ .session_id = @as([]const u8, &session_id) }, .{});
         defer alloc.free(request.body.?);
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executePreparedSQL(&ctx, prepared_id);
         defer response.deinit();
@@ -12902,7 +12902,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         try request.headers.append("authorization", authorization);
         request.body = try std.json.Stringify.valueAlloc(alloc, .{ .session_id = @as([]const u8, &session_id) }, .{});
         defer alloc.free(request.body.?);
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try restarted_handler.executePreparedSQL(&ctx, attached_prepared_id);
         defer response.deinit();
@@ -12919,7 +12919,7 @@ test "httpx SQL durable session settings enforce scoped typed authority" {
         try request.headers.append("authorization", authorization);
         request.body = try std.json.Stringify.valueAlloc(alloc, .{ .session_id = @as([]const u8, &session_id) }, .{});
         defer alloc.free(request.body.?);
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executePreparedSQL(&ctx, attached_prepared_id);
         defer response.deinit();
@@ -12985,7 +12985,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
             defer request.deinit();
             try request.headers.append("authorization", authorization);
             request.body = body;
-            var ctx = httpx.Context.init(allocator, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(allocator, platform.testing.io, &request);
             defer ctx.deinit();
             var response = switch (kind) {
                 .open => try api.openSQLConnection(&ctx),
@@ -13168,7 +13168,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
         defer request.deinit();
         request.body = body;
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executeSQL(&ctx);
         defer response.deinit();
@@ -13209,7 +13209,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13245,7 +13245,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
         defer request.deinit();
         request.body = body;
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executeSQL(&ctx);
         defer response.deinit();
@@ -13269,7 +13269,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13309,7 +13309,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13340,7 +13340,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13413,7 +13413,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13453,7 +13453,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer server.cfg.session_router = null;
         defer prepare_request.deinit();
         prepare_request.body = "{\"statement\":\"SELECT id FROM usage_records WHERE _id = $1\"}";
-        var prepare_context = httpx.Context.init(alloc, native_platform.testing.io, &prepare_request);
+        var prepare_context = httpx.Context.init(alloc, platform.testing.io, &prepare_request);
         defer prepare_context.deinit();
         var response = try handler.prepareSQL(&prepare_context);
         defer response.deinit();
@@ -13473,7 +13473,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             const control_body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = statement, .session_id = if (index == 0) @as(?[]const u8, null) else &transaction_id }, .{ .emit_null_optional_fields = false });
             defer alloc.free(control_body);
             control_request.body = control_body;
-            var control_context = httpx.Context.init(alloc, native_platform.testing.io, &control_request);
+            var control_context = httpx.Context.init(alloc, platform.testing.io, &control_request);
             defer control_context.deinit();
             var controlled = try handler.executeSQL(&control_context);
             defer controlled.deinit();
@@ -13486,7 +13486,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var execute_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql/prepared/id/execute");
             defer execute_request.deinit();
             execute_request.body = "{\"parameters\":[\"a\"]}";
-            var execute_context = httpx.Context.init(alloc, native_platform.testing.io, &execute_request);
+            var execute_context = httpx.Context.init(alloc, platform.testing.io, &execute_request);
             defer execute_context.deinit();
             execute_context.params = &params;
             var executed = try handler.executePreparedSQL(&execute_context, id);
@@ -13498,7 +13498,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
                 try std.testing.expectEqualStrings("9007199254740993", result.value.rows[0][0].string);
                 var close_request = try httpx.Request.init(alloc, .DELETE, "http://127.0.0.1/db/v1/sql/prepared/id");
                 defer close_request.deinit();
-                var close_context = httpx.Context.init(alloc, native_platform.testing.io, &close_request);
+                var close_context = httpx.Context.init(alloc, platform.testing.io, &close_request);
                 defer close_context.deinit();
                 close_context.params = &params;
                 var closed_response = try handler.closePreparedSQL(&close_context, id);
@@ -13535,7 +13535,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13610,7 +13610,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
         defer request.deinit();
         request.body = body;
-        var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+        var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
         defer ctx.deinit();
         var response = try handler.executeSQL(&ctx);
         defer response.deinit();
@@ -13658,7 +13658,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13672,7 +13672,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var count_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer count_request.deinit();
             count_request.body = "{\"statement\":\"SELECT count(*) FROM usage_records\"}";
-            var count_ctx = httpx.Context.init(alloc, native_platform.testing.io, &count_request);
+            var count_ctx = httpx.Context.init(alloc, platform.testing.io, &count_request);
             defer count_ctx.deinit();
             var count_response = try text_handler.executeSQL(&count_ctx);
             defer count_response.deinit();
@@ -13690,7 +13690,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13713,7 +13713,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var absent_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
         defer absent_request.deinit();
         absent_request.body = "{\"statement\":\"SELECT (SELECT status FROM usage_records WHERE id = 'missing') FROM usage_records\"}";
-        var absent_context = httpx.Context.init(alloc, native_platform.testing.io, &absent_request);
+        var absent_context = httpx.Context.init(alloc, platform.testing.io, &absent_request);
         defer absent_context.deinit();
         var absent_response = try text_handler.executeSQL(&absent_context);
         defer absent_response.deinit();
@@ -13736,7 +13736,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13750,7 +13750,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var verify_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer verify_request.deinit();
             verify_request.body = "{\"statement\":\"SELECT quantity, status FROM usage_records WHERE id = 'u2'\"}";
-            var verify_ctx = httpx.Context.init(alloc, native_platform.testing.io, &verify_request);
+            var verify_ctx = httpx.Context.init(alloc, platform.testing.io, &verify_request);
             defer verify_ctx.deinit();
             var verified_response = try text_handler.executeSQL(&verify_ctx);
             defer verified_response.deinit();
@@ -13782,7 +13782,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13796,7 +13796,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var verify_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer verify_request.deinit();
             verify_request.body = "{\"statement\":\"SELECT quantity FROM usage_records WHERE id = 'u2'\"}";
-            var verify_ctx = httpx.Context.init(alloc, native_platform.testing.io, &verify_request);
+            var verify_ctx = httpx.Context.init(alloc, platform.testing.io, &verify_request);
             defer verify_ctx.deinit();
             var verified_response = try text_handler.executeSQL(&verify_ctx);
             defer verified_response.deinit();
@@ -13818,7 +13818,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13832,7 +13832,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var verify_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer verify_request.deinit();
             verify_request.body = "{\"statement\":\"SELECT status, quantity FROM usage_records WHERE id = 'u1' AND quantity = 1\"}";
-            var verify_context = httpx.Context.init(alloc, native_platform.testing.io, &verify_request);
+            var verify_context = httpx.Context.init(alloc, platform.testing.io, &verify_request);
             defer verify_context.deinit();
             var verify_response = try text_handler.executeSQL(&verify_context);
             defer verify_response.deinit();
@@ -13854,7 +13854,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13874,7 +13874,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = "{\"statement\":\"UPDATE usage_records SET (quantity,status)=ROW(quantity+1,DEFAULT) WHERE id='u2' RETURNING status,quantity\"}";
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13894,7 +13894,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = case.body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13919,7 +13919,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13944,7 +13944,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try text_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -13983,7 +13983,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
             defer request.deinit();
             request.body = body;
-            var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+            var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
             defer ctx.deinit();
             var response = try timestamp_handler.executeSQL(&ctx);
             defer response.deinit();
@@ -14022,8 +14022,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .database = "default",
             .namespace = "public",
             .limit = 4096,
-            .io = native_platform.testing.io,
-            .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
+            .io = platform.testing.io,
+            .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(platform.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
             .cancel_requested = &canceled,
         };
         {
@@ -14081,7 +14081,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var wire_reader = std.Io.Reader.fixed(wire_input.written());
         var wire_output = std.Io.Writer.Allocating.init(alloc);
         defer wire_output.deinit();
-        var wire_session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = native_platform.testing.io, .source = wire_backend, .reader = &wire_reader, .writer = &wire_output.writer };
+        var wire_session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = platform.testing.io, .source = wire_backend, .reader = &wire_reader, .writer = &wire_output.writer };
         defer wire_session.deinit();
         try wire_session.run();
         var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = wire_output.written() };
@@ -14199,7 +14199,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var reader = std.Io.Reader.fixed(input.written());
         var output = std.Io.Writer.Allocating.init(alloc);
         defer output.deinit();
-        var session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = native_platform.testing.io, .source = pg_adapter.backend(), .reader = &reader, .writer = &output.writer };
+        var session: @import("../pgwire/protocol.zig").Session = .{ .alloc = alloc, .io = platform.testing.io, .source = pg_adapter.backend(), .reader = &reader, .writer = &output.writer };
         defer session.deinit();
         try session.run();
         var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = output.written() };
@@ -14386,7 +14386,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
     var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
     defer request.deinit();
     request.body = body;
-    var ctx = httpx.Context.init(alloc, native_platform.testing.io, &request);
+    var ctx = httpx.Context.init(alloc, platform.testing.io, &request);
     defer ctx.deinit();
     var response = try handler.executeSQL(&ctx);
     defer response.deinit();
@@ -14427,7 +14427,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
     var conflict_request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
     defer conflict_request.deinit();
     conflict_request.body = conflict_body;
-    var conflict_ctx = httpx.Context.init(alloc, native_platform.testing.io, &conflict_request);
+    var conflict_ctx = httpx.Context.init(alloc, platform.testing.io, &conflict_request);
     defer conflict_ctx.deinit();
     var conflict_response = try handler.executeSQL(&conflict_ctx);
     defer conflict_response.deinit();
@@ -14471,7 +14471,7 @@ test "httpx relational row query mutation endpoints enforce exact versions and s
     var e2e: HttpxE2eServer = undefined;
     try e2e.init(alloc, &server);
     defer e2e.deinit();
-    var io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io.deinit();
     var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -14511,7 +14511,7 @@ test "httpx antfly lookup route preserves projection and headers" {
     const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-lookup-{d}", .{platform_time.monotonicNs()});
     defer alloc.free(db_path);
 
-    var fs_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var fs_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer fs_io.deinit();
     std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
 
@@ -14538,7 +14538,7 @@ test "httpx antfly lookup route preserves projection and headers" {
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -14811,7 +14811,7 @@ test "httpx antfly scan honors optional body and documented bad requests" {
     const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-scan-{d}", .{platform_time.monotonicNs()});
     defer alloc.free(db_path);
 
-    var fs_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var fs_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer fs_io.deinit();
     std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
 
@@ -14843,7 +14843,7 @@ test "httpx antfly scan honors optional body and documented bad requests" {
     };
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -14882,7 +14882,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
     const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-lookup-encoded-{d}", .{platform_time.monotonicNs()});
     defer alloc.free(db_path);
 
-    var fs_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var fs_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer fs_io.deinit();
     std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
 
@@ -14909,7 +14909,7 @@ test "httpx antfly lookup decodes percent-encoded path keys" {
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -14942,7 +14942,7 @@ test "httpx antfly schema update returns full table status after projection" {
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -14987,7 +14987,7 @@ test "httpx antfly schema update owns self partial support and requires coordina
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15038,7 +15038,7 @@ test "httpx retained read refuses unsigned migration requests and requires catal
     var server: HttpxE2eServer = undefined;
     try server.init(alloc, &api_server);
     defer server.deinit();
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15167,7 +15167,7 @@ test "httpx restore owner accepts bounded rewrite source chunks above legacy con
     var server: HttpxE2eServer = undefined;
     try server.init(alloc, &api_server);
     defer server.deinit();
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15327,7 +15327,7 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
     var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.readFacts } }, source.iface(), null, writes.iface());
     defer api_server.deinit();
     api_server.restore_job_store.deinit();
-    api_server.restore_job_store = restore_jobs.Store.initWithIo(alloc, native_platform.testing.io);
+    api_server.restore_job_store = restore_jobs.Store.initWithIo(alloc, platform.testing.io);
     try api_server.restore_job_store.attachReplicated(restore_jobs.ReplicatedPersistence.fromLocal(&fixture, .{
         .create_with_staging = Fixture.create,
         .load = Fixture.load,
@@ -15340,7 +15340,7 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
     var server: HttpxE2eServer = undefined;
     try server.init(alloc, &api_server);
     defer server.deinit();
-    var io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io.deinit();
     var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15397,7 +15397,7 @@ test "httpx schema rewrite authorizes incoming dependencies before source admiss
     var server: HttpxE2eServer = undefined;
     try server.init(alloc, &api_server);
     defer server.deinit();
-    var io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io.deinit();
     var client = httpx.Client.initWithConfig(alloc, io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15430,7 +15430,7 @@ test "httpx schema patch merges at the authority and accepts version zero ETag" 
     var e2e_server: HttpxE2eServer = undefined;
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15521,7 +15521,7 @@ test "httpx query endpoints accept ndjson multiquery bodies" {
     const db_path = try std.fmt.allocPrint(alloc, "/tmp/antfly-httpx-handler-ndjson-query-{d}", .{platform_time.monotonicNs()});
     defer alloc.free(db_path);
 
-    var fs_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var fs_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer fs_io.deinit();
     std.Io.Dir.cwd().deleteTree(fs_io.io(), db_path) catch {};
 
@@ -15548,7 +15548,7 @@ test "httpx query endpoints accept ndjson multiquery bodies" {
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15594,7 +15594,7 @@ test "httpx antfly cluster restore preserves backup location validation" {
     try e2e_server.init(alloc, &api_server);
     defer e2e_server.deinit();
 
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(alloc, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15633,7 +15633,7 @@ test "httpx antfly ChatGPT connector policy rejects management before touching c
     defer server.deinit();
     const base = try server.baseUrl(a);
     defer a.free(base);
-    var client_io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var client_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer client_io.deinit();
     var client = httpx.Client.initWithConfig(a, client_io.io(), .{ .keep_alive = false });
     defer client.deinit();
@@ -15658,9 +15658,9 @@ test "httpx antfly ChatGPT connector policy rejects management before touching c
 
 test "httpx antfly ChatGPT connector policy pending login matches generated client" {
     const a = std.testing.allocator;
-    var io = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io.deinit();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io.io(), ".", a);
     defer a.free(root);

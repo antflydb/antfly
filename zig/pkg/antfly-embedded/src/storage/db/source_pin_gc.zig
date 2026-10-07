@@ -17,7 +17,7 @@
 //! entries are the recovery cursor; the persisted deepest directory avoids
 //! repeatedly walking ancestors after restart. No file payload is read or
 //! truncated (SSTs may still be hard-linked by a live owner).
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const fs = @import("antfly_runtime_fs").fs_paths;
@@ -217,24 +217,24 @@ fn syncExistingParent(io: std.Io, path: []const u8) !void {
 
 test "relational index system source pin GC bounds a ten thousand file directory without reading payloads" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/gc", .{tmp.sub_path});
     defer alloc.free(root);
-    try fs.createDirPathPortable(native_platform.testing.io, root);
-    var dir = try std.Io.Dir.cwd().openDir(native_platform.testing.io, root, .{});
+    try fs.createDirPathPortable(platform.testing.io, root);
+    var dir = try std.Io.Dir.cwd().openDir(platform.testing.io, root, .{});
     for (0..10_000) |i| {
         var name: [32]u8 = undefined;
-        const file = try dir.createFile(native_platform.testing.io, try std.fmt.bufPrint(&name, "{d}.sst", .{i}), .{});
-        file.close(native_platform.testing.io);
+        const file = try dir.createFile(platform.testing.io, try std.fmt.bufPrint(&name, "{d}.sst", .{i}), .{});
+        file.close(platform.testing.io);
     }
-    dir.close(native_platform.testing.io);
+    dir.close(platform.testing.io);
     var cursor: Cursor = .{};
     var files: usize = 0;
     var passes: usize = 0;
     while (true) {
-        var work = Work.init(native_platform.testing.io, .{ .max_entries = 127, .max_metadata_bytes = 32 * 1024, .max_duration_ns = std.time.ns_per_s });
-        const done = try advance(alloc, native_platform.testing.io, root, &cursor, &work);
+        var work = Work.init(platform.testing.io, .{ .max_entries = 127, .max_metadata_bytes = 32 * 1024, .max_duration_ns = std.time.ns_per_s });
+        const done = try advance(alloc, platform.testing.io, root, &cursor, &work);
         try std.testing.expect(work.entries <= 127);
         try std.testing.expect(work.metadata_bytes <= 32 * 1024);
         files += work.files;
@@ -249,31 +249,31 @@ test "relational index system source pin GC bounds a ten thousand file directory
 
 test "relational index system source pin GC resumes lost unlink progress and never follows symlinks" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/root", .{tmp.sub_path});
     defer alloc.free(root);
     const nested = try std.fmt.allocPrint(alloc, "{s}/a/b", .{root});
     defer alloc.free(nested);
-    try fs.createDirPathPortable(native_platform.testing.io, nested);
+    try fs.createDirPathPortable(platform.testing.io, nested);
     var cursor: Cursor = .{};
     try cursor.push("a");
     try cursor.push("b");
     // The unlink reached disk but its cursor update did not.
-    try std.Io.Dir.cwd().deleteDir(native_platform.testing.io, nested);
+    try std.Io.Dir.cwd().deleteDir(platform.testing.io, nested);
     const outside = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/outside", .{tmp.sub_path});
     defer alloc.free(outside);
-    try fs.createDirPathPortable(native_platform.testing.io, outside);
+    try fs.createDirPathPortable(platform.testing.io, outside);
     const sentinel = try std.fmt.allocPrint(alloc, "{s}/keep", .{outside});
     defer alloc.free(sentinel);
-    const file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, sentinel, .{});
-    file.close(native_platform.testing.io);
+    const file = try std.Io.Dir.cwd().createFile(platform.testing.io, sentinel, .{});
+    file.close(platform.testing.io);
     const link = try std.fmt.allocPrint(alloc, "{s}/outside-link", .{root});
     defer alloc.free(link);
-    try std.Io.Dir.cwd().symLink(native_platform.testing.io, "../outside", link, .{ .is_directory = true });
-    var work = Work.init(native_platform.testing.io, .{ .max_entries = 128, .max_metadata_bytes = 64 * 1024, .max_duration_ns = std.time.ns_per_s });
-    try std.testing.expect(try advance(alloc, native_platform.testing.io, root, &cursor, &work));
-    try std.Io.Dir.cwd().access(native_platform.testing.io, sentinel, .{});
+    try std.Io.Dir.cwd().symLink(platform.testing.io, "../outside", link, .{ .is_directory = true });
+    var work = Work.init(platform.testing.io, .{ .max_entries = 128, .max_metadata_bytes = 64 * 1024, .max_duration_ns = std.time.ns_per_s });
+    try std.testing.expect(try advance(alloc, platform.testing.io, root, &cursor, &work));
+    try std.Io.Dir.cwd().access(platform.testing.io, sentinel, .{});
     try std.testing.expectError(error.OnlineSourceCorrupt, Cursor.validate("../outside"));
     try std.testing.expectError(error.OnlineSourceCorrupt, Cursor.validate("a//b"));
     try std.testing.expectError(error.OnlineSourceCorrupt, Cursor.validate("a/./b"));
@@ -281,26 +281,26 @@ test "relational index system source pin GC resumes lost unlink progress and nev
 
 test "relational index system source pin GC allocation failure and zero budgets leave retryable ownership" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/root", .{tmp.sub_path});
     defer alloc.free(root);
-    try fs.createDirPathPortable(native_platform.testing.io, root);
+    try fs.createDirPathPortable(platform.testing.io, root);
     var cursor: Cursor = .{};
-    var zero = Work.init(native_platform.testing.io, .{ .max_entries = 0 });
-    try std.testing.expect(!try advance(alloc, native_platform.testing.io, root, &cursor, &zero));
+    var zero = Work.init(platform.testing.io, .{ .max_entries = 0 });
+    try std.testing.expect(!try advance(alloc, platform.testing.io, root, &cursor, &zero));
     try std.testing.expectEqual(@as(usize, 0), zero.entries);
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
-    var work = Work.init(native_platform.testing.io, .{ .max_duration_ns = std.time.ns_per_s });
-    try std.testing.expectError(error.OutOfMemory, advance(failing.allocator(), native_platform.testing.io, root, &cursor, &work));
-    try std.Io.Dir.cwd().access(native_platform.testing.io, root, .{});
-    work = Work.init(native_platform.testing.io, .{ .max_duration_ns = std.time.ns_per_s });
-    try std.testing.expect(try advance(alloc, native_platform.testing.io, root, &cursor, &work));
+    var work = Work.init(platform.testing.io, .{ .max_duration_ns = std.time.ns_per_s });
+    try std.testing.expectError(error.OutOfMemory, advance(failing.allocator(), platform.testing.io, root, &cursor, &work));
+    try std.Io.Dir.cwd().access(platform.testing.io, root, .{});
+    work = Work.init(platform.testing.io, .{ .max_duration_ns = std.time.ns_per_s });
+    try std.testing.expect(try advance(alloc, platform.testing.io, root, &cursor, &work));
 }
 
 test "relational index system source pin GC default page makes progress at maximum legal cursor depth" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/deep", .{tmp.sub_path});
     defer alloc.free(root);
@@ -308,11 +308,11 @@ test "relational index system source pin GC default page makes progress at maxim
     for (0..max_depth) |_| try cursor.push("d");
     const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, cursor.bytes() });
     defer alloc.free(path);
-    try fs.createDirPathPortable(native_platform.testing.io, path);
-    var work = Work.init(native_platform.testing.io, .{});
+    try fs.createDirPathPortable(platform.testing.io, path);
+    var work = Work.init(platform.testing.io, .{});
     // Model slow lock/receipt I/O before entering the tree page.
     work.started.nanoseconds -= std.time.ns_per_s;
-    _ = try advance(alloc, native_platform.testing.io, root, &cursor, &work);
+    _ = try advance(alloc, platform.testing.io, root, &cursor, &work);
     try std.testing.expect(work.completed_units >= 1);
     try std.testing.expect(work.entries <= work.budget.max_entries);
     try std.testing.expect(cursor.len < max_depth * 2 - 1);

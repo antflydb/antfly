@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -773,7 +773,7 @@ fn requireCaptureReceiptDigest(raw_digest: ?[]const u8) ![]const u8 {
 }
 
 fn readArtifactFileAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     return try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), path, alloc, .limited(max_bytes));
 }
@@ -2733,7 +2733,7 @@ test "standby cmd remote commands prefer typed admin routes" {
     var recorder = RecordingExecutor.init(alloc, server.executor());
     defer recorder.deinit();
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "slot",
         "create",
         "standby-json",
@@ -2743,7 +2743,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_replication_slots);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "--table",
         "slot",
         "create",
@@ -2754,7 +2754,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_replication_slots);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "slot",
         "pause",
         "standby-table",
@@ -2762,7 +2762,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .PUT, admin_api.routes.hot_standby_replication_slot_prefix ++ "standby-table" ++ admin_api.routes.hot_standby_replication_slot_pause_suffix);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "slot",
         "resume",
         "standby-table",
@@ -2770,7 +2770,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .PUT, admin_api.routes.hot_standby_replication_slot_prefix ++ "standby-table" ++ admin_api.routes.hot_standby_replication_slot_resume_suffix);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "slot",
         "drop",
         "standby-table",
@@ -2778,7 +2778,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .DELETE, admin_api.routes.hot_standby_replication_slot_prefix ++ "standby-table");
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "seed",
         "begin",
         "--slot",
@@ -2793,7 +2793,7 @@ test "standby cmd remote commands prefer typed admin routes" {
     const manifest_path = try writeSeedManifestFiles(alloc, paths.backup_root, testIdentity(), "base-standby-json-1", 1, 2);
     defer alloc.free(manifest_path);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "seed",
         "finish",
         "--manifest",
@@ -2802,7 +2802,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_base_backups_finish);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "seed",
         "bootstrap",
         "--manifest",
@@ -2817,7 +2817,7 @@ test "standby cmd remote commands prefer typed admin routes" {
     // explicit transition before asking the standby to consume later WAL.
     try primary.activateSeededSlot("standby-seed", testIdentity().timeline_id, 2, 2, 2);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "status",
         "primary",
         "--max-lag-lsn",
@@ -2833,7 +2833,7 @@ test "standby cmd remote commands prefer typed admin routes" {
     try expectContains(recorder.last_uri.?, "max_retained_bytes=4096");
     try expectContains(recorder.last_uri.?, "max_retained_age_ns=1000000");
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
         "status",
         "primary",
@@ -2843,7 +2843,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_primary_status);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "slot",
         "list",
         "--max-retained-bytes",
@@ -2856,7 +2856,7 @@ test "standby cmd remote commands prefer typed admin routes" {
     try expectContains(recorder.last_uri.?, "max_retained_bytes=8192");
     try expectContains(recorder.last_uri.?, "max_retained_age_ns=2000000");
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "status",
         "standby",
         "--upstream-lsn",
@@ -2865,7 +2865,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_standby_status);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
         "status",
         "standby",
@@ -2877,7 +2877,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_standby_status);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "commit",
         "append",
         "--payload",
@@ -2891,14 +2891,14 @@ test "standby cmd remote commands prefer typed admin routes" {
     // Fence acquisition upgrades the caller's stale observation to the former
     // primary's live durable tail. Catch the standby up before promotion so the
     // integration test proves that stronger boundary is honored end to end.
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "stream",
         "once",
         "--slot",
         "standby-seed",
     }, recorder.executor());
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "commit",
         "check",
         "--target-lsn",
@@ -2909,7 +2909,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_commit_check);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "read",
         "check",
         "--at-least-lsn",
@@ -2918,7 +2918,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_read_check);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "write",
         "check",
         "--role",
@@ -2927,7 +2927,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_write_check);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "owner-job",
         "check",
         "--role",
@@ -2938,7 +2938,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_owner_job_check);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "fence",
         "acquire",
         "--cluster-id",
@@ -2971,14 +2971,14 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_fence);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "fence",
         "current",
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_fence_current);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "promote",
         "assess",
         "--required-lsn",
@@ -2988,14 +2988,14 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_promotion_assess);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "promote",
         "--current-fence",
     }, recorder.executor());
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_promotion_current_fence);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
         "promote",
         "assess",
@@ -3006,7 +3006,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_promotion_assess);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "rejoin",              "assess",
         "--node-id",           "primary-a",
         "--cluster-id",        "10",
@@ -3021,7 +3021,7 @@ test "standby cmd remote commands prefer typed admin routes" {
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_rejoin_assess);
 
     // Route selection is under test; this server has no matching former-primary log.
-    try std.testing.expectError(error.HaCommandConflict, runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try std.testing.expectError(error.HaCommandConflict, runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "rejoin",                     "rewind",
         "--node-id",                  "primary-a",
         "--cluster-id",               "10",
@@ -3045,7 +3045,7 @@ test "standby cmd remote commands prefer typed admin routes" {
 
     try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_rejoin_rewind);
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "slot",
         "create",
         "primary-a",
@@ -3053,7 +3053,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "0",
     }, recorder.executor());
 
-    try std.testing.expectError(error.HaCommandConflict, runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try std.testing.expectError(error.HaCommandConflict, runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "rejoin",                     "reseed",
         "--node-id",                  "primary-a",
         "--cluster-id",               "10",
@@ -3096,14 +3096,14 @@ test "standby cmd remote sends bearer token to authenticated admin route" {
     var recorder = RecordingExecutor.init(alloc, server.executor());
     defer recorder.deinit();
 
-    try std.testing.expectError(error.HaAdminUnauthorized, runRemoteArgvWithOptions(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try std.testing.expectError(error.HaAdminUnauthorized, runRemoteArgvWithOptions(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "status",
         "primary",
     }, recorder.executor(), .{}));
     try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_primary_status);
     try std.testing.expect(recorder.last_authorization == null);
 
-    try runRemoteArgvWithOptions(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgvWithOptions(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "status",
         "primary",
     }, recorder.executor(), .{
@@ -3133,7 +3133,7 @@ test "standby cmd remote direct promotion uses typed admin route" {
     var recorder = RecordingExecutor.init(alloc, server.executor());
     defer recorder.deinit();
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "promote",
         "--cluster-id",
         "10",
@@ -3171,7 +3171,7 @@ test "standby cmd remote rejects legacy command fallback for production admin op
     const alloc = std.testing.allocator;
     var executor = RejectingExecutor{};
 
-    try std.testing.expectError(error.HaRemoteTypedAdminRequired, runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try std.testing.expectError(error.HaRemoteTypedAdminRequired, runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "operator",
         "plan",
         "--standby",
@@ -3179,7 +3179,7 @@ test "standby cmd remote rejects legacy command fallback for production admin op
     }, executor.executor()));
     try std.testing.expect(!executor.called);
 
-    try std.testing.expectError(error.HaRemoteTypedAdminRequired, runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try std.testing.expectError(error.HaRemoteTypedAdminRequired, runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
         "slot",
         "create",
@@ -3203,7 +3203,7 @@ test "standby cmd remote keeps command endpoint for replication compatibility op
     var recorder = RecordingExecutor.init(alloc, server.executor());
     defer recorder.deinit();
 
-    try runRemoteArgv(alloc, native_platform.testing.io, "http://ha-admin.test", &.{
+    try runRemoteArgv(alloc, platform.testing.io, "http://ha-admin.test", &.{
         "identify",
     }, recorder.executor());
 
@@ -3246,7 +3246,7 @@ test "standby cmd streams local primary WAL into durable standby state" {
     const paths = try testPaths(alloc, "stream-command");
     defer paths.deinit(alloc);
 
-    try runArgv(alloc, native_platform.testing.io, &.{
+    try runArgv(alloc, platform.testing.io, &.{
         "--primary-log",    paths.primary_log,
         "--primary-slots",  paths.primary_slots,
         "--ha-cluster-id",  "10",
@@ -3260,7 +3260,7 @@ test "standby cmd streams local primary WAL into durable standby state" {
         "0",
     });
 
-    try runArgv(alloc, native_platform.testing.io, &.{
+    try runArgv(alloc, platform.testing.io, &.{
         "--primary-log",    paths.primary_log,
         "--primary-slots",  paths.primary_slots,
         "--ha-cluster-id",  "10",
@@ -3274,7 +3274,7 @@ test "standby cmd streams local primary WAL into durable standby state" {
         "--sync-mode",      "async",
     });
 
-    try runArgv(alloc, native_platform.testing.io, &.{
+    try runArgv(alloc, platform.testing.io, &.{
         "--primary-log",      paths.primary_log,
         "--primary-slots",    paths.primary_slots,
         "--standby-log",      paths.standby_log,
@@ -3464,7 +3464,7 @@ test "standby cmd defaults admin url and token env from the environment" {
 
 test "standby cmd applies the config file ha section as a target" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
     const remote_path = try allocPrintPath(alloc, "config", "remote.json", nonce);
     defer alloc.free(remote_path);
@@ -3535,7 +3535,7 @@ test "standby cmd applies the config file ha section as a target" {
 
 test "standby cmd derives local handles and identity from the data dir" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const nonce = @atomicRmw(u64, &test_path_counter, .Add, 1, .seq_cst);
     const data_dir = try allocPrintPath(alloc, "data-dir", "root", nonce);
     defer alloc.free(data_dir);
@@ -3739,7 +3739,7 @@ test "standby cmd parses switchover options" {
 
 test "standby cmd switchover requires a remote target" {
     const alloc = std.testing.allocator;
-    try std.testing.expectError(error.SwitchoverRequiresAdminApi, runArgv(alloc, native_platform.testing.io, &.{
+    try std.testing.expectError(error.SwitchoverRequiresAdminApi, runArgv(alloc, platform.testing.io, &.{
         "--fence-wal", "/tmp/fence.wal", "switchover", "--to", "http://standby:8080",
     }));
 }
@@ -3789,7 +3789,7 @@ const FakeFollowerHook = struct {
 
 test "standby cmd switchover fences promotes rejoins and repoints followers" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const primary_paths = try testPaths(alloc, "switchover-primary");
     defer primary_paths.deinit(alloc);
     const standby_paths = try testPaths(alloc, "switchover-standby");
@@ -3959,7 +3959,7 @@ fn testPaths(alloc: std.mem.Allocator, comptime name: []const u8) !TestPaths {
     const backup_root = try allocPrintPath(alloc, name, "backup-root", nonce);
     defer alloc.free(backup_root);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_log) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
@@ -4035,7 +4035,7 @@ fn writeSeedManifestFiles(
 }
 
 fn writeTestFile(path: []const u8, bytes: []const u8) !void {
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     if (std.fs.path.dirname(path)) |parent| try std.Io.Dir.cwd().createDirPath(io_impl.io(), parent);
     try std.Io.Dir.cwd().writeFile(io_impl.io(), .{

@@ -8230,7 +8230,7 @@ pub const Backend = struct {
         }
         // Manifest-set inventory requires the native exclusive writer lease.
         if (builtin.os.tag != .freestanding) {
-            var io_impl = platform.Threaded.init(self.allocator, .{});
+            var io_impl = platform.Io.Threaded.init(self.allocator, .{});
             defer io_impl.deinit();
             const manifest_stats = try self.cleanupOrphanedManifestFilesForSet(io_impl.io());
             stats.files_deleted +|= manifest_stats.files_deleted;
@@ -8600,7 +8600,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
     borrowed_io: ?std.Io,
     mutex: std.Io.Mutex = .init,
     wake_event: std.Io.Event = .unset,
-    owned_io: ?platform.Threaded = null,
+    owned_io: ?platform.Io.Threaded = null,
     future: ?std.Io.Future(void) = null,
     stop_requested: bool = false,
     drain_on_stop: bool = false,
@@ -8629,7 +8629,7 @@ const InternalFlushWorker = if (builtin.os.tag == .freestanding or builtin.singl
 
     fn start(self: *InternalFlushWorker) !void {
         if (self.borrowed_io == null) {
-            self.owned_io = platform.Threaded.init(self.backend.allocator, .{
+            self.owned_io = platform.Io.Threaded.init(self.backend.allocator, .{
                 .async_limit = .nothing,
                 .concurrent_limit = .limited(1),
             });
@@ -21856,7 +21856,7 @@ fn implementationTests() type {
             if (builtin.os.tag == .freestanding or builtin.single_threaded) return error.SkipZigTest;
             var storage = storage_io.MemoryStorage.init(std.testing.allocator);
             defer storage.deinit();
-            var unavailable = platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
+            var unavailable = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .nothing });
             defer unavailable.deinit();
             try std.testing.expectError(error.ConcurrencyUnavailable, BackendHandle.openWithConfig(
                 std.testing.allocator,
@@ -24005,7 +24005,7 @@ fn implementationTests() type {
             const allocator = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(allocator);
             defer storage.deinit();
-            var io_impl = platform.Threaded.init(allocator, .{});
+            var io_impl = platform.Io.Threaded.init(allocator, .{});
             defer io_impl.deinit();
             const root = "/unknown-tombstone-manifest-failure";
             try writeUnknownTombstoneFixture(allocator, storage.storage(), root, 10, 3);
@@ -24148,7 +24148,7 @@ fn implementationTests() type {
         test "lsm split waits for publication before detaching live run ownership" {
             if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             const alloc = std.testing.allocator;
-            var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+            var io_impl = platform.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
             defer io_impl.deinit();
             const io = io_impl.io();
             var storage = storage_io.MemoryStorage.init(alloc);
@@ -24244,7 +24244,7 @@ fn implementationTests() type {
             if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             for ([_]bool{ false, true }) |fail_first| {
                 const alloc = std.testing.allocator;
-                var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(4) });
+                var io_impl = platform.Io.Threaded.init(alloc, .{ .async_limit = .limited(4) });
                 defer io_impl.deinit();
                 const io = io_impl.io();
                 var storage = storage_io.MemoryStorage.init(alloc);
@@ -24345,7 +24345,7 @@ fn implementationTests() type {
         test "lsm concurrent first readers pin epochs without projecting runs" {
             if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             const alloc = std.testing.allocator;
-            var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(8) });
+            var io_impl = platform.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
             defer io_impl.deinit();
             const io = io_impl.io();
             var storage = storage_io.MemoryStorage.init(alloc);
@@ -24566,7 +24566,7 @@ fn implementationTests() type {
         test "lsm native durability lane contention benchmark" {
             if (builtin.mode != .fast or builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             const alloc = std.heap.smp_allocator;
-            var io_impl = platform.Threaded.init(alloc, .{ .async_limit = .limited(8) });
+            var io_impl = platform.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
             defer io_impl.deinit();
             const io = io_impl.io();
             const Worker = struct {

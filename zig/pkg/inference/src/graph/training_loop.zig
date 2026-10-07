@@ -20,7 +20,7 @@
 // TrainingLoop: forward → loss → gradient → clip → optimize → upload.
 // Checkpoint: binary save/load of parameters + optimizer state.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ml = @import("ml");
@@ -650,8 +650,8 @@ fn elapsedNs(start_ns: u64) u64 {
 }
 
 fn nowNs() u64 {
-    var timespec: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &timespec))) {
+    var timespec: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &timespec))) {
         .SUCCESS => return @intCast(@as(i128, timespec.sec) * std.time.ns_per_s + timespec.nsec),
         else => return 0,
     }

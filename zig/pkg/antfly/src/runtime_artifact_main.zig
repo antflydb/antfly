@@ -33,7 +33,7 @@ pub const std_options: std.Options = .{
 
 pub fn main(init: std.process.Init) void {
     if (@import("builtin").os.tag == .windows) {
-        var executor = @import("antfly_platform").Threaded.init(init.gpa, .{
+        var executor = @import("antfly_platform").Io.Threaded.init(init.gpa, .{
             .argv0 = .init(init.minimal.args),
             .environ = init.minimal.environ,
         });

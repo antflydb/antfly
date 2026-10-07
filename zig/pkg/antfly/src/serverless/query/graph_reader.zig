@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -1133,7 +1133,7 @@ test "serverless graph cursor queries stop early retain top k and share authenti
     const id = try (@import("../artifacts/store.zig").UploadScope{ .domain = tree_store.domain, .attempt = tree_store.attempt }).artifactId(&checksum);
     const ref = manifest_mod.ArtifactRef{ .kind = .graph_segment, .name = "g", .artifact_id = &id, .checksum = &checksum, .byte_len = root_bytes.len, .metadata_version = pages_mod.Root.metadata_version };
     const fixture = Fixture{ .root = &root_bytes, .pages = &memory_pages };
-    try native_platform.allocator.checkAllAllocationFailures(alloc, Run.allocationFailure, .{ &fixture, ref });
+    try platform.allocator.checkAllAllocationFailures(alloc, Run.allocationFailure, .{ &fixture, ref });
     var foreign_root = root;
     foreign_root.domain = page_store.PageStore.namespaceDomain("other-namespace");
     var foreign_bytes = foreign_root.encode();
@@ -1146,7 +1146,7 @@ test "serverless graph cursor queries stop early retain top k and share authenti
     foreign_ref.checksum = &foreign_checksum;
     const foreign_fixture = Fixture{ .root = &foreign_bytes, .pages = &memory_pages };
     try std.testing.expectError(error.GraphPageDomainMismatch, Run.run(alloc, &foreign_fixture, foreign_ref, null));
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-cursor", .{tmp.sub_path});
     defer alloc.free(cache_root);
@@ -1163,7 +1163,7 @@ test "serverless graph cursor queries stop early retain top k and share authenti
     _ = try Run.run(alloc, &fixture, ref, &cache);
     cache.graph_metric_blocks.deinit();
     cache.graph_metric_blocks = .{};
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     var group: std.Io.Group = .init;
     defer group.cancel(io_impl.io());
@@ -1367,7 +1367,7 @@ test "serverless graph traversal result materialization is allocation-failure sa
             defer node.deinit(a);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{&parents});
+    try platform.allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{&parents});
 }
 
 test "serverless graph reader traverses breadth-first with parent metadata" {

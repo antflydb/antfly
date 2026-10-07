@@ -10,7 +10,7 @@
 //! - WINDOW_UPDATE frame handling
 //! - RST_STREAM handling
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const mem = std.mem;
@@ -628,7 +628,7 @@ test "completion event wait is cancelable and stream-owned" {
     var stream = Stream.init(1);
     defer stream.deinit(allocator);
 
-    var io_impl = native_platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

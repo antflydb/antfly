@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -21,7 +21,7 @@ const builtin = @import("builtin");
 // The platform io_uring/Dispatch backends support fibers, timers, cancellation, and file I/O.
 // Network operations remain incomplete upstream; production transports use Threaded.
 const supports_evented_executor = (builtin.os.tag == .linux or builtin.os.tag == .macos) and std.Io.fiber.supported;
-const Evented = native_platform.Evented;
+const Evented = platform.Io.Evented;
 
 pub const ExecutorBackend = enum {
     simulated,
@@ -205,7 +205,7 @@ pub fn testEventedExecutor(require_available: bool) !void {
         }
     }
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "evented-replay", .{ .read = true });
     defer file.close(io);

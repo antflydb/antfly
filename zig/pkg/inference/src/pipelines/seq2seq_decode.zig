@@ -15,7 +15,7 @@
 
 //! Request-owned incremental execution for the explicit merged seq2seq ABI.
 //! Reuses the graph KV owner, never a process-global prompt/context cache.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const backends = @import("../backends/backends.zig");
@@ -330,7 +330,7 @@ test "incremental seq2seq fuses prefill and cached steps with broadcast branch a
         broker: micro.Broker,
         fn dispatch(raw: *anyopaque, task: micro.Task, alloc: std.mem.Allocator, session: backends.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends.Tensor, control: ?Control) ![]backends.Tensor {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return tensors.run(&self.broker, alloc, native_platform.testing.io, task, session, permit, gate.?, inputs, control, null, 500_000);
+            return tensors.run(&self.broker, alloc, platform.testing.io, task, session, permit, gate.?, inputs, control, null, 500_000);
         }
     };
     const Job = struct {
@@ -371,9 +371,9 @@ test "incremental seq2seq fuses prefill and cached steps with broadcast branch a
         };
         defer for (&jobs) |*job| if (job.result) |*value| value.deinit();
         var group = std.Io.Group.init;
-        defer group.cancel(native_platform.testing.io);
-        for (&jobs) |*job| group.async(native_platform.testing.io, Job.run, .{job});
-        try group.await(native_platform.testing.io);
+        defer group.cancel(platform.testing.io);
+        for (&jobs) |*job| group.async(platform.testing.io, Job.run, .{job});
+        try group.await(platform.testing.io);
         for (&jobs, 1..) |*job, context| {
             if (job.err) |err| return err;
             var sum = context;
@@ -386,7 +386,7 @@ test "incremental seq2seq fuses prefill and cached steps with broadcast branch a
 }
 
 test "incremental seq2seq cache ownership unwinds allocation failures" {
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, checkIncremental, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, checkIncremental, .{});
 }
 
 test "incremental seq2seq requires explicit merged ABI" {

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -356,8 +356,8 @@ fn monotonicNs() u64 {
         fallback_counter_ns +%= 1;
         return fallback_counter_ns;
     }
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => {},
         else => unreachable,
     }

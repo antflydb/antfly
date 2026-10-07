@@ -452,9 +452,9 @@ test "gliner boundary socket pinned small Metal admits concurrent extracts and s
     defer a.free(url);
     var second_budget = BoundedAlloc{ .backing = a, .limit = 4 * 1024 * 1024 };
     defer std.debug.assert(second_budget.live == 0);
-    var driver = platform.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
+    var driver = platform.Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
     defer driver.deinit();
-    var second_io = platform.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
+    var second_io = platform.Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
     defer second_io.deinit();
     var second = httpx.Client.initWithConfig(second_budget.allocator(), second_io.io(), .{
         .timeouts = .{ .connect_ms = 5_000, .read_ms = 180_000, .write_ms = 5_000, .request_ms = 180_000 },

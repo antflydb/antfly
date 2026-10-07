@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ant_json = @import("antfly-json");
@@ -1785,7 +1785,7 @@ test "serverless http client round-trips semantic search with embedding_template
         alloc,
         indexes_json,
         .{
-            .io = native_platform.testing.io,
+            .io = platform.testing.io,
             .bounded_http_request = true,
         },
     );
@@ -2048,8 +2048,8 @@ test "serverless http client round-trips semantic search with embedding_template
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const build_options = @import("build_options");
@@ -1382,8 +1382,8 @@ pub const PreparedCompressedAttentionGatedDecoderBlockPlan = struct {
 };
 
 fn monotonicNowNs() u64 {
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -12413,7 +12413,7 @@ pub const RawRuntimeMemoryStats = extern struct {
 };
 
 test "metal generated attention and RMS opt-ins are fail-closed and execution-counted" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "BOOL missing_requested_generated_pipeline"));
@@ -12428,7 +12428,7 @@ test "metal generated attention and RMS opt-ins are fail-closed and execution-co
 }
 
 test "metal Q6_K high-row matrix route is shape-gated, rollback-gated, and counted" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "kernel void termite_q6_k_high_row_mm_matrix_m64_n64"));
@@ -12439,7 +12439,7 @@ test "metal Q6_K high-row matrix route is shape-gated, rollback-gated, and count
 }
 
 test "metal top-p sampling retains the crossing token and cutoff ties" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     // Both the bounded serial sampler and the parallel top-k reducer identify
@@ -12452,9 +12452,9 @@ test "metal top-p sampling retains the crossing token and cutoff ties" {
 }
 
 test "metal prefill direct KV is selected-only, bounded, rollback-safe, and counted" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
-    const generated = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/ops/metal/generated/attention_prefill_flash.metal", std.testing.allocator, .limited(1024 * 1024));
+    const generated = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/ops/metal/generated/attention_prefill_flash.metal", std.testing.allocator, .limited(1024 * 1024));
     defer std.testing.allocator.free(generated);
 
     // The checked-in renderer output and embedded hd256 source both start at
@@ -12496,7 +12496,7 @@ test "metal prefill direct KV is selected-only, bounded, rollback-safe, and coun
 }
 
 test "metal prepared frame fast path is qualified, diagnosable, and shares lifecycle" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_FAST_PREPARED_FRAME"));
@@ -12513,7 +12513,7 @@ test "metal prepared frame fast path is qualified, diagnosable, and shares lifec
 }
 
 test "metal DeBERTa flash4 eligibility dispatches the flash4 pipeline" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     const function_start = std.mem.indexOf(u8, source, "int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(").?;
@@ -12530,7 +12530,7 @@ test "metal DeBERTa flash4 eligibility dispatches the flash4 pipeline" {
 }
 
 test "metal DeBERTa MPS attention is budgeted before the flash4 fallback" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     const function_start = std.mem.indexOf(u8, source, "int termite_metal_decode_runtime_disentangled_relative_attention_f32_device(").?;
@@ -12549,7 +12549,7 @@ test "metal DeBERTa MPS attention is budgeted before the flash4 fallback" {
 }
 
 test "metal paged attention masks value rows without divergent branching" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     const masked_accumulation = "value += weight * select(float(v_col[as_type<uint>(phys_tokens[ki]) * p.v_row_stride]), 0.0f, weight == 0.0f)";
@@ -12558,7 +12558,7 @@ test "metal paged attention masks value rows without divergent branching" {
 }
 
 test "Metal stage timing preserves the prepared frame topology" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     const diagnostics_start = std.mem.indexOf(u8, source, "static bool termite_metal_prepared_frame_diagnostics_enabled(void)").?;
@@ -12573,7 +12573,7 @@ test "Metal stage timing preserves the prepared frame topology" {
 }
 
 test "A4B stage detail isolates one real routed layer and folds into FFN" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_STAGE_TIMING_A4B_DETAIL"));
@@ -12589,7 +12589,7 @@ test "A4B stage detail isolates one real routed layer and folds into FFN" {
 }
 
 test "A4B exact-shape expert kernels have an umbrella gate and rollback" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "termite_q4_0_linear_id_a4b_gate_up"));
@@ -12603,7 +12603,7 @@ test "A4B exact-shape expert kernels have an umbrella gate and rollback" {
 }
 
 test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host dispatch" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_Q4_0_MMV_PORTFOLIO"));
@@ -12632,7 +12632,7 @@ test "metal Q4_0 MMV portfolio is M4-qualified, observable, and cloned into host
 }
 
 test "metal Q4_0 pair activation portfolios are exact gated and observable" {
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_Q4_0_PAIR_ACTIVATION_FUSION"));
@@ -12678,7 +12678,7 @@ test "concurrent planned dispatch policy is fail closed and hazards share produc
 
 test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_ENABLE_A4B_DECODE_GQA_SPLIT"));
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "TERMITE_METAL_DISABLE_A4B_DECODE_GQA_SPLIT"));
@@ -12895,7 +12895,7 @@ test "decode GQA split policy keeps AUTO stable and bounds compact schedules" {
 
 test "A4B local HD256 flash prefill has exact geometry admission and rollback" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    const source = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
+    const source = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, "src/backends/metal_kernels.m", std.testing.allocator, .limited(8 * 1024 * 1024));
     defer std.testing.allocator.free(source);
 
     try std.testing.expect(std.mem.containsAtLeast(u8, source, 1, "num_heads == 16u && num_kv_heads == 8u"));
@@ -13857,8 +13857,8 @@ pub fn destroyMetalJitSession(session: ?*MetalJitSession) void {
 }
 
 fn metalJitMonotonicNowNs() u128 {
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -16919,8 +16919,8 @@ test "metal runtime JIT negative memo is exact bounded and expires" {
     const first: kernel_jit.ArtifactKey = @splat(0x11);
     var other = first;
     other[0] = 0x22;
-    metal_jit_process_gpu_mutex.lockUncancelable(native_platform.testing.io);
-    defer metal_jit_process_gpu_mutex.unlock(native_platform.testing.io);
+    metal_jit_process_gpu_mutex.lockUncancelable(platform.testing.io);
+    defer metal_jit_process_gpu_mutex.unlock(platform.testing.io);
     metalJitRejectionMemoClear(first);
     metalJitRejectionMemoClear(other);
     defer metalJitRejectionMemoClear(first);
@@ -17179,8 +17179,8 @@ test "metal exact Q4_0 tuning bridge qualifies against the bundled baseline" {
             device,
         );
         defer termite_metal_generated_pipeline_destroy(generated);
-        metal_jit_process_gpu_mutex.lockUncancelable(native_platform.testing.io);
-        defer metal_jit_process_gpu_mutex.unlock(native_platform.testing.io);
+        metal_jit_process_gpu_mutex.lockUncancelable(platform.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(platform.testing.io);
         for (live_shapes, 0..) |shape, shape_index| {
             const measure_timing = candidate_index == 0 and shape_index == 0;
             const measurements = try runMetalJitObservedShape(
@@ -17258,8 +17258,8 @@ test "metal exact Q4_0 tuning bridge qualifies against the bundled baseline" {
         .{ .rows = 2, .in_dim = 32, .out_dim = 1 },
     };
     {
-        metal_jit_process_gpu_mutex.lockUncancelable(native_platform.testing.io);
-        defer metal_jit_process_gpu_mutex.unlock(native_platform.testing.io);
+        metal_jit_process_gpu_mutex.lockUncancelable(platform.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(platform.testing.io);
         for (narrow_live_shapes, 0..) |shape, shape_index| {
             const measurements = try runMetalJitObservedShape(
                 .{
@@ -17324,8 +17324,8 @@ test "metal exact Q4_0 tuning bridge qualifies against the bundled baseline" {
     @memset(provider_baseline, 0);
     @memset(provider_output, 0);
     {
-        metal_jit_process_gpu_mutex.lockUncancelable(native_platform.testing.io);
-        defer metal_jit_process_gpu_mutex.unlock(native_platform.testing.io);
+        metal_jit_process_gpu_mutex.lockUncancelable(platform.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(platform.testing.io);
         _ = try runMetalJitQuantFixture(
             .{
                 .allocator = std.testing.allocator,
@@ -17369,11 +17369,11 @@ test "metal exact Q4_0 tuning bridge qualifies against the bundled baseline" {
         try std.testing.expect(@abs(@as(f64, actual) - baseline) <= provider_tolerance);
     }
 
-    var tmp = native_platform.testing.tmpDir(.{ .iterate = true });
+    var tmp = platform.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var cache = try kernel_jit.ArtifactCache.initDir(
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         tmp.dir,
         1024 * 1024,
     );
@@ -17461,8 +17461,8 @@ test "metal exact Q4_K and Q6_K matrix candidates match the bundled baseline" {
         defer termite_metal_generated_pipeline_destroy(generated);
         var scope = MetalJitRouteScope.none();
         try std.testing.expect(scope.includeQuantShape(format, out_dim, in_dim));
-        metal_jit_process_gpu_mutex.lockUncancelable(native_platform.testing.io);
-        defer metal_jit_process_gpu_mutex.unlock(native_platform.testing.io);
+        metal_jit_process_gpu_mutex.lockUncancelable(platform.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(platform.testing.io);
         const measurements = try runMetalJitObservedShape(
             .{
                 .allocator = std.testing.allocator,
@@ -17584,8 +17584,8 @@ test "metal exact Q4_K provider fallback activates installed route" {
     @memset(baseline, 0);
     @memset(actual, 0);
     {
-        metal_jit_process_gpu_mutex.lockUncancelable(native_platform.testing.io);
-        defer metal_jit_process_gpu_mutex.unlock(native_platform.testing.io);
+        metal_jit_process_gpu_mutex.lockUncancelable(platform.testing.io);
+        defer metal_jit_process_gpu_mutex.unlock(platform.testing.io);
         _ = try runMetalJitQuantFixture(
             .{
                 .allocator = std.testing.allocator,
@@ -17762,8 +17762,8 @@ test "metal exact Q4_K QKV companion matches three qualified projections" {
     }
     var scope = MetalJitRouteScope.none();
     try std.testing.expect(scope.includeQuantShape(.q4_k, out_dim, in_dim));
-    metal_jit_process_gpu_mutex.lockUncancelable(native_platform.testing.io);
-    defer metal_jit_process_gpu_mutex.unlock(native_platform.testing.io);
+    metal_jit_process_gpu_mutex.lockUncancelable(platform.testing.io);
+    defer metal_jit_process_gpu_mutex.unlock(platform.testing.io);
     inline for (0..3) |index| {
         _ = try runMetalJitQuantFixture(
             .{ .allocator = std.testing.allocator, .artifact = artifact, .scope = &scope, .provider = provider.raw_provider, .runtime = runtime, .generated = generated },
@@ -17812,11 +17812,11 @@ test "Metal exact qualification must survive persistent cache storage" {
         .max_relative_error = 0.001,
     };
 
-    var disabled_tmp = native_platform.testing.tmpDir(.{ .iterate = true });
+    var disabled_tmp = platform.testing.tmpDir(.{ .iterate = true });
     defer disabled_tmp.cleanup();
     var disabled = try kernel_jit.ArtifactCache.initDir(
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         disabled_tmp.dir,
         0,
     );
@@ -17827,11 +17827,11 @@ test "Metal exact qualification must survive persistent cache storage" {
     );
     try std.testing.expectEqual(@as(usize, 0), disabled.snapshotStats().stores);
 
-    var persisted_tmp = native_platform.testing.tmpDir(.{ .iterate = true });
+    var persisted_tmp = platform.testing.tmpDir(.{ .iterate = true });
     defer persisted_tmp.cleanup();
     var persisted = try kernel_jit.ArtifactCache.initDir(
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         persisted_tmp.dir,
         1024 * 1024,
     );
@@ -17848,9 +17848,9 @@ test "Metal exact qualification must survive persistent cache storage" {
 }
 
 test "metal runtime JIT accepts only eligible qualification at the exact artifact key" {
-    var tmp = native_platform.testing.tmpDir(.{ .iterate = true });
+    var tmp = platform.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    var cache = try kernel_jit.ArtifactCache.initDir(std.testing.allocator, native_platform.testing.io, tmp.dir, 1024 * 1024);
+    var cache = try kernel_jit.ArtifactCache.initDir(std.testing.allocator, platform.testing.io, tmp.dir, 1024 * 1024);
     defer cache.deinit();
     const key = kernel_jit.artifactKey(.{
         .backend = .metal,
@@ -18057,8 +18057,8 @@ fn metalDeviceProbeTraceEnabled() bool {
 }
 
 fn sleepMetalProbeRetry() void {
-    var ts = native_platform.c.timespec{ .sec = 0, .nsec = 100_000_000 };
-    _ = native_platform.c.nanosleep(&ts, &ts);
+    var ts = platform.c.timespec{ .sec = 0, .nsec = 100_000_000 };
+    _ = platform.c.nanosleep(&ts, &ts);
 }
 
 // 0 = unprobed, 1 = last probe unavailable, 2 = available. A positive result
@@ -38493,13 +38493,13 @@ test "metal native q8_0 mapped linear slot supports page-offset mmap slice" {
     file_weight_raw[35] = 0x3C;
     for (0..32) |i| file_weight_raw[36 + i] = @bitCast(@as(i8, -2));
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile(native_platform.testing.io, "mapped-q8.bin", .{ .read = true, .truncate = true });
-    defer file.close(native_platform.testing.io);
-    try file.writePositionalAll(native_platform.testing.io, file_bytes, 0);
+    const file = try tmp.dir.createFile(platform.testing.io, "mapped-q8.bin", .{ .read = true, .truncate = true });
+    defer file.close(platform.testing.io);
+    try file.writePositionalAll(platform.testing.io, file_bytes, 0);
     const mapped = try std.posix.mmap(null, file_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
-    defer native_platform.filesystem.unmapMemory(mapped);
+    defer platform.filesystem.unmapMemory(mapped);
     const weight_raw = mapped[raw_offset..][0..68];
 
     const shape = [_]i64{ @intCast(out_dim), @intCast(hidden_size) };
@@ -38596,13 +38596,13 @@ test "metal native q4_0 mapped linear slot supports page-offset mmap slice" {
         quant_codec.quantizeQ4_0Block(&seed_dense, file_weight_raw[row * row_bytes ..][0..row_bytes]);
     }
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile(native_platform.testing.io, "mapped-q4-0.bin", .{ .read = true, .truncate = true });
-    defer file.close(native_platform.testing.io);
-    try file.writePositionalAll(native_platform.testing.io, file_bytes, 0);
+    const file = try tmp.dir.createFile(platform.testing.io, "mapped-q4-0.bin", .{ .read = true, .truncate = true });
+    defer file.close(platform.testing.io);
+    try file.writePositionalAll(platform.testing.io, file_bytes, 0);
     const mapped = try std.posix.mmap(null, file_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
-    defer native_platform.filesystem.unmapMemory(mapped);
+    defer platform.filesystem.unmapMemory(mapped);
     const weight_raw = mapped[raw_offset..][0..weight_len];
 
     const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
@@ -38716,13 +38716,13 @@ test "metal native q4_k mapped linear slot supports page-offset mmap slice" {
         quant_codec.quantizeQ4_KBlock(&seed_dense, file_weight_raw[row * row_bytes ..][0..row_bytes]);
     }
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile(native_platform.testing.io, "mapped-q4-k.bin", .{ .read = true, .truncate = true });
-    defer file.close(native_platform.testing.io);
-    try file.writePositionalAll(native_platform.testing.io, file_bytes, 0);
+    const file = try tmp.dir.createFile(platform.testing.io, "mapped-q4-k.bin", .{ .read = true, .truncate = true });
+    defer file.close(platform.testing.io);
+    try file.writePositionalAll(platform.testing.io, file_bytes, 0);
     const mapped = try std.posix.mmap(null, file_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
-    defer native_platform.filesystem.unmapMemory(mapped);
+    defer platform.filesystem.unmapMemory(mapped);
     const weight_raw = mapped[raw_offset..][0..weight_len];
 
     const shape = [_]i64{ @intCast(out_dim), @intCast(in_dim) };
@@ -38830,13 +38830,13 @@ test "metal native q4_k mapped rms norm linear slot honors page offset" {
         quant_codec.quantizeQ4_KBlock(&seed_dense, file_weight_raw[row * row_bytes ..][0..row_bytes]);
     }
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile(native_platform.testing.io, "mapped-q4-k-rms.bin", .{ .read = true, .truncate = true });
-    defer file.close(native_platform.testing.io);
-    try file.writePositionalAll(native_platform.testing.io, file_bytes, 0);
+    const file = try tmp.dir.createFile(platform.testing.io, "mapped-q4-k-rms.bin", .{ .read = true, .truncate = true });
+    defer file.close(platform.testing.io);
+    try file.writePositionalAll(platform.testing.io, file_bytes, 0);
     const mapped = try std.posix.mmap(null, file_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0);
-    defer native_platform.filesystem.unmapMemory(mapped);
+    defer platform.filesystem.unmapMemory(mapped);
     const weight_raw = mapped[raw_offset..][0..weight_len];
 
     const shape = [_]i64{ @intCast(out_dim), @intCast(hidden_size) };

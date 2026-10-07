@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const zig_lmdb = @import("lmdb_engine");
@@ -27,7 +27,7 @@ fn nextLmdbSimTmpNonce() u64 {
 }
 
 fn nowNs() u64 {
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const now = std.Io.Timestamp.now(io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());
@@ -595,11 +595,11 @@ pub fn namespace(comptime Api: type) type {
         }
 
         pub fn runReplayFixtures(allocator: std.mem.Allocator) !void {
-            var fixtures_dir = std.Io.Dir.cwd().openDir(native_platform.testing.io, "lib/lmdb/fixtures", .{ .iterate = true }) catch |err| switch (err) {
+            var fixtures_dir = std.Io.Dir.cwd().openDir(platform.testing.io, "lib/lmdb/fixtures", .{ .iterate = true }) catch |err| switch (err) {
                 error.FileNotFound => return,
                 else => return err,
             };
-            defer fixtures_dir.close(native_platform.testing.io);
+            defer fixtures_dir.close(platform.testing.io);
 
             var fixture_names: std.ArrayListUnmanaged([]u8) = .empty;
             defer {
@@ -610,7 +610,7 @@ pub fn namespace(comptime Api: type) type {
             var walker = try fixtures_dir.walk(allocator);
             defer walker.deinit();
 
-            while (try walker.next(native_platform.testing.io)) |entry| {
+            while (try walker.next(platform.testing.io)) |entry| {
                 if (entry.kind != .file) continue;
                 if (!std.mem.endsWith(u8, entry.path, ".fixture")) continue;
                 try fixture_names.append(allocator, try allocator.dupe(u8, entry.path));
@@ -1165,7 +1165,7 @@ pub fn namespace(comptime Api: type) type {
             const path = try std.fmt.allocPrint(allocator, "lib/lmdb/fixtures/{s}", .{name});
             defer allocator.free(path);
 
-            const contents = try std.Io.Dir.cwd().readFileAlloc(native_platform.testing.io, path, allocator, .limited(64 * 1024));
+            const contents = try std.Io.Dir.cwd().readFileAlloc(platform.testing.io, path, allocator, .limited(64 * 1024));
             defer allocator.free(contents);
 
             var fixture = try lmdb_sim_fixture.parseFixture(allocator, contents);
@@ -1351,11 +1351,11 @@ pub fn namespace(comptime Api: type) type {
             path: []const u8,
             normalized: []const u8,
         ) !void {
-            var file = try std.Io.Dir.createFileAbsolute(native_platform.testing.io, path, .{});
-            defer file.close(native_platform.testing.io);
+            var file = try std.Io.Dir.createFileAbsolute(platform.testing.io, path, .{});
+            defer file.close(platform.testing.io);
 
             var file_buf: [4096]u8 = undefined;
-            var writer = file.writer(native_platform.testing.io, &file_buf);
+            var writer = file.writer(platform.testing.io, &file_buf);
             try writer.interface.writeAll(normalized);
             try writer.end();
         }
@@ -1770,7 +1770,7 @@ pub fn namespace(comptime Api: type) type {
             const ts = nowNs();
             const nonce = nextLmdbSimTmpNonce();
             const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}-{s}\x00", .{ base, ts, nonce, suffix }) catch unreachable;
-            var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().createDirPath(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch {};
             return @ptrCast(slice.ptr);
@@ -1784,7 +1784,7 @@ pub fn namespace(comptime Api: type) type {
         }
 
         fn cleanupTmp(path: [*:0]const u8) void {
-            var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
         }

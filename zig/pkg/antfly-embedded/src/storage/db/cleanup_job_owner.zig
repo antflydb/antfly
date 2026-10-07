@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const admission = @import("coalesced_job_admission.zig");
@@ -146,7 +146,7 @@ test "cleanup job owner bounds inline error contention and progress slices" {
             return self.outcome orelse error.InjectedCleanupFailure;
         }
         fn port(self: *@This()) Port {
-            return .{ .ptr = self, .state = &self.state, .lane = .{ .ptr = self, .vtable = &.{ .submit = submit, .drain_owner = noop, .close_owner = noop, .poll = poll, .executes_inline = true } }, .owner_id = 1, .io = native_platform.testing.io, .advance = advance, .name = "inline-test" };
+            return .{ .ptr = self, .state = &self.state, .lane = .{ .ptr = self, .vtable = &.{ .submit = submit, .drain_owner = noop, .close_owner = noop, .poll = poll, .executes_inline = true } }, .owner_id = 1, .io = platform.testing.io, .advance = advance, .name = "inline-test" };
         }
     };
     var f: F = .{};

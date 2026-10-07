@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -34,7 +34,7 @@ pub const FilesystemClient = struct {
     alloc: Allocator,
     root_dir: []u8,
     io: std.Io,
-    io_impl: ?*native_platform.Threaded,
+    io_impl: ?*platform.Io.Threaded,
     durable_dirs: durable_directory.Cache = .{},
     next_staging_cleanup_seconds: std.atomic.Value(i64) = .init(0),
 
@@ -48,9 +48,9 @@ pub const FilesystemClient = struct {
     }
 
     pub fn init(alloc: Allocator, root_dir: []const u8) !FilesystemClient {
-        const io_impl = try alloc.create(native_platform.Threaded);
+        const io_impl = try alloc.create(platform.Io.Threaded);
         errdefer alloc.destroy(io_impl);
-        io_impl.* = native_platform.Threaded.init(alloc, .{});
+        io_impl.* = platform.Io.Threaded.init(alloc, .{});
         errdefer io_impl.deinit();
         return try initWithIoOwned(alloc, root_dir, io_impl.io(), io_impl);
     }
@@ -59,7 +59,7 @@ pub const FilesystemClient = struct {
         return try initWithIoOwned(alloc, root_dir, io, null);
     }
 
-    fn initWithIoOwned(alloc: Allocator, root_dir: []const u8, io: std.Io, io_impl: ?*native_platform.Threaded) !FilesystemClient {
+    fn initWithIoOwned(alloc: Allocator, root_dir: []const u8, io: std.Io, io_impl: ?*platform.Io.Threaded) !FilesystemClient {
         var durable_dirs: durable_directory.Cache = .{};
         errdefer durable_dirs.deinit(alloc);
         try durable_dirs.ensure(alloc, io, root_dir);
@@ -556,8 +556,8 @@ pub const FilesystemClient = struct {
     }
 };
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn fileExists(io: std.Io, path: []const u8) bool {

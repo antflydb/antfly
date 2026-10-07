@@ -16,7 +16,7 @@
 //! Restart-stable, owner/attempt-bound backup pin inventories. Seals contain
 //! hardlinks to immutable files and bounded copied committed WAL prefixes;
 //! they never retain pointers, live paths or process-local descriptor leases.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const backup = @import("native_backup.zig");
@@ -216,8 +216,8 @@ pub fn finish(alloc: Allocator, io: std.Io, root: []const u8, fence: topology.Fe
 
 test "backup seal inventories nested files with portable relative paths" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "primary-lsm/nested");
     {

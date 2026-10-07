@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const antfly_client = @import("antfly-client");
@@ -306,36 +306,36 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
 
 test "query parser fails closed for missing malformed duplicate and incompatible options" {
     var valid_argv = [_][*:0]const u8{ "--table", "docs", "--semantic-search", "alpha", "--limit", "5", "--indexes", "dense" };
-    const valid = parseQueryOptions(native_platform.process.argsIterator(valid_argv[0..]));
+    const valid = parseQueryOptions(platform.process.argsIterator(valid_argv[0..]));
     try std.testing.expectEqualStrings("alpha", valid.value.semantic_search.?);
     try std.testing.expectEqual(@as(?i64, 5), valid.value.limit);
 
     var missing_argv = [_][*:0]const u8{"--semantic-search"};
-    const missing = parseQueryOptions(native_platform.process.argsIterator(missing_argv[0..]));
+    const missing = parseQueryOptions(platform.process.argsIterator(missing_argv[0..]));
     try std.testing.expectEqualStrings("--semantic-search", missing.issue.missing_value);
 
     var malformed_argv = [_][*:0]const u8{ "--limit", "many" };
-    const malformed = parseQueryOptions(native_platform.process.argsIterator(malformed_argv[0..]));
+    const malformed = parseQueryOptions(platform.process.argsIterator(malformed_argv[0..]));
     try std.testing.expectEqualStrings("many", malformed.issue.invalid_integer.value);
 
     var duplicate_argv = [_][*:0]const u8{ "--table", "docs", "-t", "other" };
-    const duplicate = parseQueryOptions(native_platform.process.argsIterator(duplicate_argv[0..]));
+    const duplicate = parseQueryOptions(platform.process.argsIterator(duplicate_argv[0..]));
     try std.testing.expectEqualStrings("-t", duplicate.issue.duplicate);
 
     var offset_argv = [_][*:0]const u8{ "--semantic-search", "alpha", "--offset", "1" };
-    const offset = parseQueryOptions(native_platform.process.argsIterator(offset_argv[0..]));
+    const offset = parseQueryOptions(platform.process.argsIterator(offset_argv[0..]));
     try std.testing.expect(offset.issue == .semantic_offset);
 
     var typo_argv = [_][*:0]const u8{ "--semantic-serach", "alpha" };
-    const typo = parseQueryOptions(native_platform.process.argsIterator(typo_argv[0..]));
+    const typo = parseQueryOptions(platform.process.argsIterator(typo_argv[0..]));
     try std.testing.expectEqualStrings("--semantic-serach", typo.issue.unknown);
 
     var tableless_argv = [_][*:0]const u8{ "--semantic-search", "alpha" };
-    const tableless = parseQueryOptions(native_platform.process.argsIterator(tableless_argv[0..]));
+    const tableless = parseQueryOptions(platform.process.argsIterator(tableless_argv[0..]));
     try std.testing.expect(tableless.issue == .missing_table);
 
     var global_full_text_argv = [_][*:0]const u8{ "--full-text-search", "alpha" };
-    const global_full_text = parseQueryOptions(native_platform.process.argsIterator(global_full_text_argv[0..]));
+    const global_full_text = parseQueryOptions(platform.process.argsIterator(global_full_text_argv[0..]));
     try std.testing.expect(global_full_text == .value);
     try std.testing.expect(global_full_text.value.table_name == null);
 }
@@ -349,7 +349,7 @@ test "semantic readiness advisory only observes explicitly selected indexes" {
 
 test "successful semantic query cancels a slow readiness advisory" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const State = struct {
         var test_io: std.Io = undefined;
         var status_entered = std.atomic.Value(bool).init(false);
@@ -426,7 +426,7 @@ test "successful semantic query cancels a slow readiness advisory" {
                 "--indexes",
                 "dense",
             };
-            var args = native_platform.process.argsIterator(argv[0..]);
+            var args = platform.process.argsIterator(argv[0..]);
             run(std.testing.allocator, test_io, test_client, &args) catch {
                 failed.store(true, .release);
                 return;
@@ -585,24 +585,24 @@ pub fn lookup(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.A
 
 test "lookup parser accepts read consistency and rejects invalid options" {
     var valid_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--read-consistency", "stale" };
-    const valid = parseLookupOptions(native_platform.process.argsIterator(valid_argv[0..]));
+    const valid = parseLookupOptions(platform.process.argsIterator(valid_argv[0..]));
     try std.testing.expectEqualStrings("doc:a", valid.value.key.?);
     try std.testing.expectEqualStrings("stale", valid.value.read_consistency.?);
 
     var unknown_argv = [_][*:0]const u8{ "--table", "docs", "--key", "doc:a", "--typo" };
-    const unknown = parseLookupOptions(native_platform.process.argsIterator(unknown_argv[0..]));
+    const unknown = parseLookupOptions(platform.process.argsIterator(unknown_argv[0..]));
     try std.testing.expectEqualStrings("--typo", unknown.issue.unknown);
 
     var duplicate_argv = [_][*:0]const u8{ "--key", "a", "-k", "b" };
-    const duplicate = parseLookupOptions(native_platform.process.argsIterator(duplicate_argv[0..]));
+    const duplicate = parseLookupOptions(platform.process.argsIterator(duplicate_argv[0..]));
     try std.testing.expectEqualStrings("-k", duplicate.issue.duplicate);
 
     var missing_argv = [_][*:0]const u8{"--key"};
-    const missing = parseLookupOptions(native_platform.process.argsIterator(missing_argv[0..]));
+    const missing = parseLookupOptions(platform.process.argsIterator(missing_argv[0..]));
     try std.testing.expectEqualStrings("--key", missing.issue.missing_value);
 
     var invalid_consistency_argv = [_][*:0]const u8{ "--read-consistency", "eventual" };
-    const invalid_consistency = parseLookupOptions(native_platform.process.argsIterator(invalid_consistency_argv[0..]));
+    const invalid_consistency = parseLookupOptions(platform.process.argsIterator(invalid_consistency_argv[0..]));
     try std.testing.expectEqualStrings("eventual", invalid_consistency.issue.invalid_read_consistency);
 }
 
@@ -631,16 +631,16 @@ fn parseJsonArg(comptime T: type, allocator: std.mem.Allocator, flag: []const u8
 
 test "query wake parser requires a table and a bounded positive deadline" {
     const valid_argv = [_][*:0]const u8{ "--table", "wiki", "--wait-ready-ms", "20000" };
-    const valid = parseQueryOptions(native_platform.process.argsIterator(&valid_argv));
+    const valid = parseQueryOptions(platform.process.argsIterator(&valid_argv));
     try std.testing.expectEqual(@as(?u64, 20000), valid.value.wait_ready_ms);
     const tableless_argv = [_][*:0]const u8{ "--wait-ready-ms", "20000" };
-    try std.testing.expect(parseQueryOptions(native_platform.process.argsIterator(&tableless_argv)).issue == .missing_table);
+    try std.testing.expect(parseQueryOptions(platform.process.argsIterator(&tableless_argv)).issue == .missing_table);
     const missing_argv = [_][*:0]const u8{"--wait-ready-ms"};
-    try std.testing.expect(parseQueryOptions(native_platform.process.argsIterator(&missing_argv)).issue == .missing_value);
+    try std.testing.expect(parseQueryOptions(platform.process.argsIterator(&missing_argv)).issue == .missing_value);
     const zero_argv = [_][*:0]const u8{ "--wait-ready-ms", "0" };
-    try std.testing.expect(parseQueryOptions(native_platform.process.argsIterator(&zero_argv)).issue == .non_positive);
+    try std.testing.expect(parseQueryOptions(platform.process.argsIterator(&zero_argv)).issue == .non_positive);
     const large_argv = [_][*:0]const u8{ "--wait-ready-ms", "4294967296" };
-    try std.testing.expect(parseQueryOptions(native_platform.process.argsIterator(&large_argv)).issue == .too_large);
+    try std.testing.expect(parseQueryOptions(platform.process.argsIterator(&large_argv)).issue == .too_large);
     const duplicate_argv = [_][*:0]const u8{ "--wait-ready-ms", "1", "--wait-ready-ms", "2" };
-    try std.testing.expect(parseQueryOptions(native_platform.process.argsIterator(&duplicate_argv)).issue == .duplicate);
+    try std.testing.expect(parseQueryOptions(platform.process.argsIterator(&duplicate_argv)).issue == .duplicate);
 }

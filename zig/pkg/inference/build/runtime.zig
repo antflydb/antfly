@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Translator = @import("translate_c").Translator;
@@ -485,7 +485,7 @@ fn createCBindings(
 
     const include_dir = b.fmt("{s}/include", .{backend.onnx_root});
     const onnx = Translator.init(b.dependency("translate_c", .{}), .{
-        .libc_file = native_platform.macosSdkLibCFile(b, target),
+        .libc_file = platform.macosSdkLibCFile(b, target),
         .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
         .target = target,
         .optimize = .debug,
@@ -493,7 +493,7 @@ fn createCBindings(
     });
     onnx.addIncludePath(b.graph.cwdRelativePath(include_dir));
     const ortgenai = Translator.init(b.dependency("translate_c", .{}), .{
-        .libc_file = native_platform.macosSdkLibCFile(b, target),
+        .libc_file = platform.macosSdkLibCFile(b, target),
         .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
         .target = target,
         .optimize = .debug,
@@ -841,7 +841,7 @@ pub fn configureMetal(
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    native_platform.addMacosSdkPaths(b, module, target);
+    platform.addMacosSdkPaths(b, module, target);
 }
 
 fn pathJoin(b: *std.Build, root: []const u8, relative_path: []const u8) []const u8 {

@@ -16,7 +16,7 @@
 //! Disposable, bounded retained-frame assembly beneath the existing restore
 //! source generation. Its receipt is not target progress: only the shared
 //! restore page's replicated CAS can acknowledge transformed effects.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const contract = @import("db/relational_rewrite_contract.zig");
@@ -345,8 +345,8 @@ pub fn receive(alloc: std.mem.Allocator, io: std.Io, root: []const u8, scope: st
 
 test "relational index system rewrite tail verifies once resumes exact boundaries and reclaims under pressure" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root);
@@ -484,8 +484,8 @@ test "relational index system rewrite tail verifies once resumes exact boundarie
 
 test "relational index system rewrite tail chunked spool resumes with bounded memory and authenticates cold reads" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try tmp.dir.realPathFileAlloc(io, ".", alloc);
     defer alloc.free(root);

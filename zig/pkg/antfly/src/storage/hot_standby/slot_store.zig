@@ -21,7 +21,7 @@
 //! primary restart preserves retention state before the streaming transport and
 //! base-backup layers exist.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -701,7 +701,7 @@ fn testPath(alloc: Allocator, comptime name: []const u8) ![:0]u8 {
         .{ std.posix.system.getpid(), std.testing.random_seed },
     );
     defer alloc.free(raw);
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), raw) catch {};
     return try alloc.dupeSentinel(u8, raw, 0);

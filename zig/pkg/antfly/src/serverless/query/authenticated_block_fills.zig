@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const CancellationToken = @import("antfly_local_sources").api_operation.CancellationToken;
@@ -119,11 +119,11 @@ pub const Cache = struct {
     }
     fn wake(self: *Cache, io: ?std.Io) void {
         _ = self.epoch.fetchAdd(1, .release);
-        (io orelse native_platform.debug_io).futexWake(u32, &self.epoch.raw, std.math.maxInt(u32));
+        (io orelse platform.debug_io).futexWake(u32, &self.epoch.raw, std.math.maxInt(u32));
     }
     pub fn wait(self: *Cache, io: ?std.Io, cancellation: CancellationToken, epoch: u32) !void {
         try cancellation.check();
-        try (io orelse native_platform.debug_io).futexWaitTimeout(u32, &self.epoch.raw, epoch, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } });
+        try (io orelse platform.debug_io).futexWaitTimeout(u32, &self.epoch.raw, epoch, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } });
         try cancellation.check();
     }
     fn destroyLocked(self: *Cache, entry: *Entry) void {

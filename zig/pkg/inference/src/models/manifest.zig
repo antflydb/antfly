@@ -18,7 +18,7 @@
 // Auto-detects model layout from a directory: ONNX files, tokenizer type,
 // config.json, tokenizer_config.json, and optional model_manifest.json.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Dir = std.Io.Dir;
@@ -840,7 +840,7 @@ const ArtifactCatalog = struct {
             .model_dir_path = model_dir_path,
             .receipt = try managed_receipt.loadValidated(
                 allocator,
-                native_platform.debug_io,
+                platform.debug_io,
                 model_dir_path,
             ),
         };
@@ -855,7 +855,7 @@ const ArtifactCatalog = struct {
             .model_dir_path = model_dir_path,
             .receipt = try managed_receipt.loadValidatedPlan(
                 allocator,
-                native_platform.debug_io,
+                platform.debug_io,
                 model_dir_path,
             ),
         };
@@ -920,7 +920,7 @@ const ArtifactCatalog = struct {
         }
         return managed_receipt.resolveContainedArtifactPath(
             self.allocator,
-            native_platform.debug_io,
+            platform.debug_io,
             self.model_dir_path,
             relative_path,
         ) catch |err| switch (err) {
@@ -943,13 +943,13 @@ const DirectGgufArtifact = struct {
     fn init(allocator: std.mem.Allocator, requested_path: []const u8) !DirectGgufArtifact {
         const resolved_requested_path = try managed_receipt.resolveRequestedFilePath(
             allocator,
-            native_platform.debug_io,
+            platform.debug_io,
             requested_path,
         );
         errdefer allocator.free(resolved_requested_path);
         const canonical_path = try managed_receipt.resolveRegularFilePath(
             allocator,
-            native_platform.debug_io,
+            platform.debug_io,
             resolved_requested_path,
         );
         errdefer allocator.free(canonical_path);
@@ -958,7 +958,7 @@ const DirectGgufArtifact = struct {
         while (true) {
             if (try managed_receipt.loadValidated(
                 allocator,
-                native_platform.debug_io,
+                platform.debug_io,
                 ancestor,
             )) |receipt| {
                 var catalog = ArtifactCatalog{
@@ -1033,9 +1033,9 @@ fn readOptionalMetadataFile(
 
 test "optional metadata preserves non-missing open failures" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "not-a-directory", .data = "file" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "not-a-directory", .data = "file" });
 
     const model_path = try std.fs.path.join(allocator, &.{
         ".zig-cache",
@@ -1092,8 +1092,8 @@ pub fn hasDeclaredCapability(allocator: std.mem.Allocator, model_dir_path: []con
 
 test "declared capability probe does not parse architecture or tokenizer sidecars" {
     const a = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(path);
@@ -2119,10 +2119,10 @@ fn findFileInSubdirs(
 
 fn findFirstExtensionInDir(allocator: std.mem.Allocator, base_dir: []const u8, extension: []const u8) !?[]const u8 {
     if (!c_file.link_libc) {
-        var dir = Dir.cwd().openDir(native_platform.debug_io, base_dir, .{ .iterate = true }) catch return null;
-        defer dir.close(native_platform.debug_io);
+        var dir = Dir.cwd().openDir(platform.debug_io, base_dir, .{ .iterate = true }) catch return null;
+        defer dir.close(platform.debug_io);
         var iter = dir.iterate();
-        while (iter.next(native_platform.debug_io) catch null) |entry| {
+        while (iter.next(platform.debug_io) catch null) |entry| {
             if (entry.name.len == 0 or entry.name[0] == '.') continue;
             if (!std.mem.endsWith(u8, entry.name, extension)) continue;
             return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, entry.name });
@@ -2292,7 +2292,7 @@ fn resolvedWalkerEntryKind(io: std.Io, entry: Dir.Walker.Entry) !?std.Io.File.Ki
 }
 
 fn discoverGgufPathsWithCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog) !DiscoveredGgufPaths {
-    const io = native_platform.debug_io;
+    const io = platform.debug_io;
     const base_dir = catalog.model_dir_path;
     var selection: GgufSelection = .{};
     defer selection.deinit(allocator);
@@ -3693,7 +3693,7 @@ fn resolveArtifact(
     const resolved = if (catalog) |value|
         try value.resolve(path)
     else
-        managed_receipt.resolveContainedArtifactPath(allocator, native_platform.debug_io, model_dir_path, path) catch |err| switch (err) {
+        managed_receipt.resolveContainedArtifactPath(allocator, platform.debug_io, model_dir_path, path) catch |err| switch (err) {
             error.FileNotFound, error.NotDir => null,
             else => return err,
         };
@@ -4039,8 +4039,8 @@ test "Qwen3 reranker path overrides its conditional-generation base role" {
 
 test "Qwen3 sentence-transformers LogitScore sidecar selects generative reranking" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model");
@@ -4074,19 +4074,19 @@ test "Qwen3 sentence-transformers LogitScore sidecar selects generative rerankin
 
 test "Qwen3 LogitScore sidecar preserves an explicit serving role in full and listing manifests" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "config.json",
         .data = "{\"architectures\":[\"Qwen3ForCausalLM\"],\"model_type\":\"qwen3\"}",
     });
-    try tmp.dir.writeFile(native_platform.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "modules.json",
         .data = "[{\"type\":\"sentence_transformers.cross_encoder.modules.logit_score.LogitScore\"}]",
     });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "model.safetensors", .data = "" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\"}" });
-    const model_dir = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", allocator);
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.safetensors", .data = "" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\"}" });
+    const model_dir = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", allocator);
     defer allocator.free(model_dir);
     var full = try loadFromDir(allocator, model_dir);
     defer full.deinit();
@@ -4181,8 +4181,8 @@ test "explicit GLiNER label-marker decision head supports typed decisions" {
 
 test "Decide listing reads small marker sidecar for declared classification head" {
     const a = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"extractor\",\"tasks\":[\"extract\"],\"capabilities\":[\"classification\"],\"inputs\":[\"text\"],\"gliner_classification_head\":\"label_marker_mlp\"}" });
@@ -4626,7 +4626,7 @@ test "model manifest recognized execution fields reject invalid values" {
 
 test "loadFromDir fails closed on invalid explicit embedding metadata" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
     inline for (.{
         \\{"type":"embedder","embedding_task_contract":"requred"}
@@ -4646,7 +4646,7 @@ test "loadFromDir fails closed on invalid explicit embedding metadata" {
         error.InvalidModelManifest,
         error.InvalidEmbeddingTaskProfile,
     }) |manifest_json, expected_error| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
 
         try tmp.dir.createDirPath(io, "model");
@@ -4666,7 +4666,7 @@ test "loadFromDir fails closed on invalid explicit embedding metadata" {
 
 test "loadListingFromDir fails closed on invalid explicit model manifests" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
     inline for (.{
         \\{"type":"embedder","embedding_task_contract":"requred"}
@@ -4686,7 +4686,7 @@ test "loadListingFromDir fails closed on invalid explicit model manifests" {
         error.MissingEmbeddingTaskProfile,
         error.InvalidEmbeddingTaskProfile,
     }) |manifest_json, expected_error| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
 
         try tmp.dir.createDirPath(io, "model");
@@ -4706,13 +4706,13 @@ test "loadListingFromDir fails closed on invalid explicit model manifests" {
 
 test "loaders reject conflicting Antfly manifest and bundle contracts" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
     inline for (.{
         "{\"type\":\"generator\"}",
         "{\"type\":\"embedder\",\"inputs\":[\"text\"]}",
     }) |manifest_json| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
 
         try tmp.dir.createDirPath(io, "model");
@@ -4770,8 +4770,8 @@ test "explicit embedding profiles reject malformed fields without family fallbac
 
 test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model/1_Pooling");
@@ -4836,8 +4836,8 @@ test "loadFromDir detects qwen3-embedding sentence-transformers sidecars" {
 
 test "model manifest execution fields override qwen sentence-transformers sidecars" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model/1_Pooling");
@@ -4906,8 +4906,8 @@ test "model manifest execution fields override qwen sentence-transformers sideca
 
 test "GLiNER sidecars preserve explicit model type provenance and accept the legacy recognizer alias" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model");
@@ -4940,8 +4940,8 @@ test "GLiNER sidecars preserve explicit model type provenance and accept the leg
 
 test "span GLiNER native config uses nested encoder geometry without breaking ONNX-only bundles" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "model");
     try tmp.dir.writeFile(io, .{ .sub_path = "model/config.json", .data = "{\"model_type\":\"extractor\",\"max_width\":8}" });
@@ -4987,8 +4987,8 @@ test "listing candidate rejection classification fails operational errors visibl
 
 test "bare qwen3 config without sidecars stays generative" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model");
@@ -5041,7 +5041,7 @@ test "model_manifest.json embedding overrides configure a gguf qwen3 embedder" {
 
 test "load sparse fixture preserves max position embeddings" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const models_dir = if (std.c.getenv("ANTFLY_INFERENCE_MODELS_DIR")) |value|
         std.mem.span(value)
     else blk: {
@@ -5064,8 +5064,8 @@ test "load sparse fixture preserves max position embeddings" {
 
 test "loadFromDir infers SPLADE sparse output layout from pooling sidecar" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model/1_SpladePooling");
@@ -5083,8 +5083,8 @@ test "loadFromDir infers SPLADE sparse output layout from pooling sidecar" {
 
 test "loadFromDir honors SentenceTransformers pooling metadata" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model/1_Pooling");
@@ -5167,8 +5167,8 @@ test "Qwen3 embedder tokenizer scan policy preserves wrappers and undeclared mod
 
 test "Qwen3 embedder unused tokenizer scan preserves fresh manifests GGUF and file errors" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const declaration = "{\"type\":\"embedder\",\"embedding_style\":\"qwen3_embedding\",\"pooling\":\"mean\",\"normalize\":false,\"inputs\":[\"text\"]}";
     try tmp.dir.writeFile(io, .{ .sub_path = "model_manifest.json", .data = declaration });
@@ -5339,10 +5339,10 @@ test "manifest detects incomplete colqwen bundle" {
 
 test "manifest parses Antfly inference bundle marker" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "encoder.gguf", .data = "encoder" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "head.gguf", .data = "head" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "encoder.gguf", .data = "encoder" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "head.gguf", .data = "head" });
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
     var manifest = ModelManifest{ .allocator = allocator };
@@ -5358,10 +5358,10 @@ test "manifest parses Antfly inference bundle marker" {
 
 test "Antfly bundles must agree with explicit manifest contracts" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "encoder.gguf", .data = "encoder" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "head.gguf", .data = "head" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "encoder.gguf", .data = "encoder" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "head.gguf", .data = "head" });
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
     const gliner_bundle =
@@ -5419,8 +5419,8 @@ test "Antfly bundles must agree with explicit manifest contracts" {
 
 test "manifest parses clipclap gguf bundle marker" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "clipclap-q4_k");
     try tmp.dir.writeFile(io, .{ .sub_path = "clipclap-q4_k/clip.gguf", .data = "clip" });
@@ -5449,8 +5449,8 @@ test "manifest parses clipclap gguf bundle marker" {
 
 test "manifest parses florence2 gguf bundle marker" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "florence2-q4_k");
     try tmp.dir.writeFile(io, .{ .sub_path = "florence2-q4_k/florence-2-base.Q4_K.gguf", .data = "model" });
@@ -5481,8 +5481,8 @@ test "manifest parses florence2 gguf bundle marker" {
 
 test "manifest parses fail-closed Qwen3-VL decoder projector bundles" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "qwen3-vl");
     try tmp.dir.writeFile(io, .{ .sub_path = "qwen3-vl/decoder.gguf", .data = "decoder" });
@@ -6208,7 +6208,7 @@ fn expectCanonicalPath(
     expected_path: []const u8,
     actual_path: []const u8,
 ) !void {
-    const expected_canonical = try Dir.cwd().realPathFileAlloc(native_platform.testing.io, expected_path, allocator);
+    const expected_canonical = try Dir.cwd().realPathFileAlloc(platform.testing.io, expected_path, allocator);
     defer allocator.free(expected_canonical);
     try std.testing.expectEqualStrings(expected_canonical, actual_path);
 }
@@ -6216,11 +6216,11 @@ fn expectCanonicalPath(
 test "manifest gguf discovery separates decoder and projector files" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-f16.gguf", .data = "projector" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "gemma-4-e2b-it-Q8_0.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-f16.gguf", .data = "projector" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "gemma-4-e2b-it-Q8_0.gguf", .data = "decoder" });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6237,15 +6237,15 @@ test "manifest gguf discovery separates decoder and projector files" {
 test "manifest gguf discovery prefers q8 projector over stale dense sidecars" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // Write dense projectors first to ensure filesystem iteration order cannot
     // override the bounded-residency preference used by managed downloads.
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-BF16.gguf", .data = "bf16" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-F16.gguf", .data = "f16" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-Q8_0.gguf", .data = "q8" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "gemma-4-e2b-it-Q4_0.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-BF16.gguf", .data = "bf16" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-F16.gguf", .data = "f16" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "mmproj-gemma-4-e2b-it-Q8_0.gguf", .data = "q8" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "gemma-4-e2b-it-Q4_0.gguf", .data = "decoder" });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6257,9 +6257,9 @@ test "manifest gguf discovery prefers q8 projector over stale dense sidecars" {
 
 test "manifest gguf discovery loads nested managed projector layouts" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "artifacts/projectors");
@@ -6280,9 +6280,9 @@ test "manifest gguf discovery loads nested managed projector layouts" {
 
 test "bundle artifact paths stay within the canonical model root" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "model/artifacts");
     try tmp.dir.writeFile(io, .{ .sub_path = "model/artifacts/model.gguf", .data = "inside" });
@@ -6315,9 +6315,9 @@ test "bundle artifact paths stay within the canonical model root" {
 
 test "managed receipt is authoritative for gguf discovery" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "artifacts/current");
@@ -6347,9 +6347,9 @@ test "managed receipt is authoritative for gguf discovery" {
 
 test "managed manifest loading ignores unreceipted metadata and payloads" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "artifacts/current");
@@ -6381,10 +6381,10 @@ test "managed manifest loading ignores unreceipted metadata and payloads" {
 
 test "managed bundle metadata cannot reference unreceipted artifacts" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const bundle_json = "{\"family\":\"clipclap_gguf_bundle/v1\",\"clip\":\"stale.gguf\",\"clap\":\"stale-clap.gguf\"}";
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "decoder" });
     try tmp.dir.writeFile(io, .{ .sub_path = "antfly_inference_bundle.json", .data = bundle_json });
@@ -6404,10 +6404,10 @@ test "managed bundle metadata cannot reference unreceipted artifacts" {
 
 test "managed explicit bundles retain their receipted artifact route" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const bundle_json = "{\"family\":\"clipclap_gguf_bundle/v1\",\"clip\":\"clip.gguf\",\"clap\":\"clap.gguf\"}";
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "clip.gguf", .data = "clip" });
     try tmp.dir.writeFile(io, .{ .sub_path = "clap.gguf", .data = "clap" });
@@ -6431,9 +6431,9 @@ test "managed explicit bundles retain their receipted artifact route" {
 
 test "private staging manifests load only through the validated plan API" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "decoder" });
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"hidden_size\":42}" });
@@ -6457,9 +6457,9 @@ test "private staging manifests load only through the validated plan API" {
 
 test "direct gguf paths honor the nearest managed publication receipt" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "model/aliases");
     try tmp.dir.createDirPath(io, "model/artifacts");
@@ -6506,8 +6506,8 @@ test "direct gguf paths honor the nearest managed publication receipt" {
 
 test "direct unmanaged gguf paths must resolve to regular files" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const missing_path = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "missing.gguf" });
@@ -6524,8 +6524,8 @@ test "direct unmanaged gguf paths must resolve to regular files" {
 
 test "direct managed gguf loading cleans up every allocation failure" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "model/artifacts");
@@ -6550,12 +6550,12 @@ test "direct managed gguf loading cleans up every allocation failure" {
             defer manifest.deinit();
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_path});
+    try platform.allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_path});
 }
 
 test "gguf discovery resolves unknown filesystem entry kinds" {
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, "nested");
@@ -6587,9 +6587,9 @@ test "gguf discovery resolves unknown filesystem entry kinds" {
 
 test "manifest gguf discovery skips hidden artifact trees" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.createDirPath(io, ".stale");
@@ -6607,11 +6607,11 @@ test "manifest gguf discovery skips hidden artifact trees" {
 test "manifest gguf discovery handles google gemma4 e4b qat layout" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "gemma-4-E4B-it-mmproj.gguf", .data = "projector" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "gemma-4-E4B_q4_0-it.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "gemma-4-E4B-it-mmproj.gguf", .data = "projector" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "gemma-4-E4B_q4_0-it.gguf", .data = "decoder" });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6628,10 +6628,10 @@ test "manifest gguf discovery handles google gemma4 e4b qat layout" {
 test "manifest does not treat projector-only gguf as decoder weights" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "mmproj.gguf", .data = "projector" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "mmproj.gguf", .data = "projector" });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6647,10 +6647,10 @@ test "manifest does not treat projector-only gguf as decoder weights" {
 test "manifest does not treat trailing mmproj gguf as decoder weights" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "gemma-4-E4B-it-mmproj.gguf", .data = "projector" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "gemma-4-E4B-it-mmproj.gguf", .data = "projector" });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6665,9 +6665,9 @@ test "manifest does not treat trailing mmproj gguf as decoder weights" {
 
 test "listing manifest detects gguf assets without gguf metadata parse" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(io, .{
@@ -6694,9 +6694,9 @@ test "listing manifest detects gguf assets without gguf metadata parse" {
 
 test "listing manifest separates google gemma4 e4b qat decoder and projector" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(io, .{
@@ -6726,9 +6726,9 @@ test "listing manifest separates google gemma4 e4b qat decoder and projector" {
 
 test "manifest treats gemma4 unified config as generator" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     try tmp.dir.writeFile(io, .{
@@ -6797,12 +6797,12 @@ test "built-in gemma4 chat template renders explicit thinking modes" {
 test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithGpt2Tokenizer(allocator);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "ggml-model-i2_s.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "ggml-model-i2_s.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6819,12 +6819,12 @@ test "manifest infers huggingface tokenizer from gguf gpt2 metadata" {
 test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithGemma4Tokenizer(allocator);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "gemma4-q4_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "gemma4-q4_0.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6843,12 +6843,12 @@ test "manifest prefers huggingface tokenizer from gemma4 gguf bpe metadata" {
 test "manifest applies BERT and T5 tokenizer metadata from GGUF" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithBertT5Tokenizer(allocator);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "bge-m3-q4_k_m.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "bge-m3-q4_k_m.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6869,12 +6869,12 @@ test "manifest applies BERT and T5 tokenizer metadata from GGUF" {
 test "qwen3 embedding GGUF metadata configures last pooling and full context" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 3);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6896,13 +6896,13 @@ test "qwen3 embedding GGUF metadata configures last pooling and full context" {
 test "model manifest execution fields override qwen GGUF metadata" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 3);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
-    try tmp.dir.writeFile(native_platform.testing.io, .{
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "qwen3-embedding-q8_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "model_manifest.json",
         .data =
         \\{"type":"embedder","pooling":"mean","normalize":false,"embedding_style":"none"}
@@ -6925,12 +6925,12 @@ test "model manifest execution fields override qwen GGUF metadata" {
 
 test "qwen3 rank pooling GGUF metadata configures generative reranking" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 4);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "qwen3-reranker-q8_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "qwen3-reranker-q8_0.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -6945,13 +6945,13 @@ test "qwen3 rank pooling GGUF metadata configures generative reranking" {
 
 test "qwen3 rank pooling preserves an explicit model manifest serving role" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const gguf_bytes = try buildTestGgufWithQwen3Pooling(allocator, 4);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "qwen3-reranker-q8_0.gguf", .data = gguf_bytes });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\"}" });
-    const model_dir = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", allocator);
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "qwen3-reranker-q8_0.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\"}" });
+    const model_dir = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", allocator);
     defer allocator.free(model_dir);
     var manifest = try loadFromDir(allocator, model_dir);
     defer manifest.deinit();
@@ -6963,17 +6963,17 @@ test "qwen3 rank pooling preserves an explicit model manifest serving role" {
 test "colocated GGUF does not overwrite selected safetensors BERT config" {
     const allocator = std.testing.allocator;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const config_json =
         \\{"model_type":"xlm-roberta","hidden_size":777,"intermediate_size":1554,"max_position_embeddings":8194,"num_hidden_layers":7,"num_attention_heads":7,"vocab_size":250002,"type_vocab_size":1,"pad_token_id":1}
     ;
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "config.json", .data = config_json });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "model.safetensors", .data = "" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "config.json", .data = config_json });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model.safetensors", .data = "" });
     const gguf_bytes = try buildTestGgufWithBertT5Tokenizer(allocator);
     defer allocator.free(gguf_bytes);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "quantized.gguf", .data = gguf_bytes });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "quantized.gguf", .data = gguf_bytes });
 
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
@@ -7178,17 +7178,17 @@ test "gliner boundary manifest loading and listing preserve versioned architectu
     // Keep exhaustive failure coverage; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const allocator = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     const config = try loadGlinerBoundaryTestFixture(allocator, "config.json");
     defer allocator.free(config);
     const encoder = try loadGlinerBoundaryTestFixture(allocator, "encoder_config.json");
     defer allocator.free(encoder);
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.createDirPath(native_platform.testing.io, "encoder_config");
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "config.json", .data = config });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "encoder_config/config.json", .data = encoder });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"extractor\",\"tasks\":[\"extract\"],\"capabilities\":[\"extraction\",\"classification\",\"relations\"]}" });
+    try tmp.dir.createDirPath(platform.testing.io, "encoder_config");
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "encoder_config/config.json", .data = encoder });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"extractor\",\"tasks\":[\"extract\"],\"capabilities\":[\"extraction\",\"classification\",\"relations\"]}" });
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
     const Check = struct {
@@ -7205,8 +7205,8 @@ test "gliner boundary manifest loading and listing preserve versioned architectu
             try std.testing.expectError(error.UnsupportedGlinerBoundaryRuntime, manifest.requireSupportedGlinerRuntime());
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
-    try native_platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
+    try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
+    try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
 }
 
 test "gliner boundary manifests reject missing invalid and legacy conflicting metadata" {
@@ -7215,39 +7215,39 @@ test "gliner boundary manifests reject missing invalid and legacy conflicting me
     defer allocator.free(config);
     const encoder = try loadGlinerBoundaryTestFixture(allocator, "encoder_config.json");
     defer allocator.free(encoder);
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "config.json", .data = config });
     try std.testing.expectError(error.MissingGlinerBoundaryEncoderConfig, loadFromDir(allocator, model_dir));
     try std.testing.expectError(error.MissingGlinerBoundaryEncoderConfig, loadListingFromDir(allocator, model_dir));
     try std.testing.expect((try loadListingCandidateFromDir(allocator, model_dir)) == null);
-    try tmp.dir.createDirPath(native_platform.testing.io, "encoder_config");
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "encoder_config/config.json", .data = encoder });
+    try tmp.dir.createDirPath(platform.testing.io, "encoder_config");
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "encoder_config/config.json", .data = encoder });
 
     const future = try std.mem.replaceOwned(u8, allocator, config, "\"architecture_version\": 1", "\"architecture_version\": 2");
     defer allocator.free(future);
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "config.json", .data = future });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "config.json", .data = future });
     try std.testing.expectError(error.UnsupportedGlinerBoundaryVersion, loadFromDir(allocator, model_dir));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryVersion, loadListingFromDir(allocator, model_dir));
     try std.testing.expect((try loadListingCandidateFromDir(allocator, model_dir)) == null);
 
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "config.json", .data = config });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "gliner_config.json", .data = "{\"model_type\":\"gliner2\",\"max_width\":12}" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "gliner_config.json", .data = "{\"model_type\":\"gliner2\",\"max_width\":12}" });
     try std.testing.expectError(error.UnsupportedGlinerBoundaryConfiguration, loadFromDir(allocator, model_dir));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryConfiguration, loadListingFromDir(allocator, model_dir));
-    try tmp.dir.deleteFile(native_platform.testing.io, "gliner_config.json");
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "antfly_inference_bundle.json", .data = "{\"family\":\"gliner2_split_bundle/v1\",\"encoder\":\"model.gguf\",\"head\":\"gliner_head.gguf\"}" });
+    try tmp.dir.deleteFile(platform.testing.io, "gliner_config.json");
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "antfly_inference_bundle.json", .data = "{\"family\":\"gliner2_split_bundle/v1\",\"encoder\":\"model.gguf\",\"head\":\"gliner_head.gguf\"}" });
     try std.testing.expectError(error.UnsupportedGlinerBoundaryBundle, loadFromDir(allocator, model_dir));
     try std.testing.expectError(error.UnsupportedGlinerBoundaryBundle, loadListingFromDir(allocator, model_dir));
 }
 
 test "gliner boundary detection keeps legacy extractor manifest behavior" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"extractor\"}" });
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
     var manifest = try loadFromDir(allocator, model_dir);
@@ -7280,9 +7280,9 @@ test "bundle contracts reject malformed known metadata but ignore unknown famili
 
 test "optional bundle variants preserve failures and clean up partially resolved pairs" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "clip.gguf", .data = "clip" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "clip.gguf", .data = "clip" });
     const model_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(model_dir);
     const Check = struct {
@@ -7293,9 +7293,9 @@ test "optional bundle variants preserve failures and clean up partially resolved
             try std.testing.expectEqual(complete, man.isClipclapGgufBundle());
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "clap.gguf", .data = "clap" });
-    try native_platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
+    try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, false });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "clap.gguf", .data = "clap" });
+    try platform.allocator.checkAllAllocationFailures(allocator, Check.run, .{ model_dir, true });
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
     try std.testing.expectError(error.InvalidInferenceBundle, parseInferenceVariantsJson(&manifest, allocator, model_dir, "{\"family\":\"clipclap_variants/v1\",\"variants\":[{\"target\":\"gguf\",\"clip\":\"clip.gguf\"}]}"));
@@ -7342,8 +7342,8 @@ test "boundary qualification listings cannot substitute for consumed identity an
 
 test "managed ONNX export uses its own configuration and tokenizer" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "onnx");
     const paths = [_][]const u8{ "config.json", "tokenizer.json", "onnx/model.onnx", "onnx/config.json", "onnx/tokenizer.json", "onnx/tokenizer_config.json" };
@@ -7374,9 +7374,9 @@ test "managed ONNX export uses its own configuration and tokenizer" {
 
 test "span wrapper manifest takes encoder geometry from encoder_config" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
         \\{"model_type":"extractor","architecture":"span","architecture_version":1,"architectures":["SpanExtractor"],"config_version":3,"span_head":{"span_mode":"markerV0"},"counting_layer":"count_lstm","model_name":"microsoft/deberta-v3-large","token_pooling":"first"}
     });

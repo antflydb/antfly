@@ -14,7 +14,7 @@
 // limitations.
 
 //! Private server storage-provider operations, separate from public C exports.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const server_document_child_range = @import("../storage/server_document_child_range.zig");
 pub const storage_root = @import("antfly_source_root");
@@ -3133,7 +3133,7 @@ pub fn storageOwnerOpen(
     // imported this replica. Do not create an empty DB and retain its reader
     // lease: that would prevent bootstrap from ever publishing the import.
     // Pin the validated generation until DB.open acquires its own read lease.
-    var restore_io_impl: @import("antfly_platform").Threaded = undefined;
+    var restore_io_impl: @import("antfly_platform").Io.Threaded = undefined;
     var owns_restore_io = false;
     defer if (owns_restore_io) restore_io_impl.deinit();
     var restore_lease: ?db_mod.generation_lifecycle.ReadLease = null;
@@ -3142,7 +3142,7 @@ pub fn storageOwnerOpen(
         const io = if (owner_context) |context|
             context.backend_runtime.ptr().filesystemIo() orelse return storageOwnerStatusFromError(error.BackendRuntimeIoUnavailable)
         else io: {
-            restore_io_impl = @import("antfly_platform").Threaded.init(alloc, .{});
+            restore_io_impl = @import("antfly_platform").Io.Threaded.init(alloc, .{});
             owns_restore_io = true;
             break :io restore_io_impl.io();
         };
@@ -4559,7 +4559,7 @@ pub fn prepareNativeStorageSnapshot(request: *const kernel_owner_abi.SnapshotPre
     var staged = try preparation.beginStaging();
     var staged_owned = true;
     errdefer if (staged_owned) staged.deinit();
-    const io = native_platform.debug_io;
+    const io = platform.debug_io;
     try snapshot_mod.extract(alloc, io, native, staged.path(), expected, .none);
     {
         var primary = try db_mod.DB.open(alloc, staged.path(), .{ .open_mode = .query_readonly, .primary_only_readonly = true, .start_index_workers = false, .start_optional_runtimes = false });
@@ -4699,7 +4699,7 @@ pub fn storageSnapshotCommit(snapshot_handle: ?*anyopaque) callconv(.c) kernel_o
     if (!snapshot.published or snapshot.finalized) return .invalid_argument;
     snapshot.staged.commitPublication() catch |err| return storageOwnerStatusFromError(err);
     if (snapshot.restore_live_path) |path| {
-        var io_impl = @import("antfly_platform").Threaded.init(snapshot.alloc, .{});
+        var io_impl = @import("antfly_platform").Io.Threaded.init(snapshot.alloc, .{});
         defer io_impl.deinit();
         backup_restore.cleanupSnapshotsForPublishedRestore(snapshot.alloc, snapshot.staged.io orelse io_impl.io(), path);
     }

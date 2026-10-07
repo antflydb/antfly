@@ -16,7 +16,7 @@
 //! Authenticate complete chunk sets before entering serialized apply. A small
 //! inventory fence at commit prevents a truncated replacement retiring only a
 //! prefix of the old output. Provider payloads are never parsed under apply.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const publication = @import("artifact_publication.zig");
@@ -767,7 +767,7 @@ fn requireString(object: std.json.ObjectMap, field: []const u8, expected: []cons
 test "ordered artifact inventory unit chunk replacement binds its exact parent and never closes document coverage" {
     const alloc = std.testing.allocator;
     const keys = @import("../internal_keys.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unit-chunk-receiver", .{tmp.sub_path});
     defer alloc.free(path);
@@ -946,8 +946,8 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
                 _ = (try unitSession(a, txn, parent_request, "chunks", snapshot)).?;
             }
         };
-        try native_platform.allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ session, unit_key });
-        try native_platform.allocator.checkAllAllocationFailures(alloc, AllocationCheck.authorize, .{ &current, request, plan.plan() });
+        try platform.allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ session, unit_key });
+        try platform.allocator.checkAllAllocationFailures(alloc, AllocationCheck.authorize, .{ &current, request, plan.plan() });
     }
     {
         var current = try db.core.store.beginReadTxn();
@@ -1322,7 +1322,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             for (admission.jobs) |job| _ = try unit_jobs.Job.decode(job.key, job.value);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(alloc, JobAllocationCheck.run, .{ &txn, db.root_incarnation, &dispatch_missing });
+    try platform.allocator.checkAllAllocationFailures(alloc, JobAllocationCheck.run, .{ &txn, db.root_incarnation, &dispatch_missing });
     var missing_admission = try unit_jobs.prepare(alloc, &txn, db.root_incarnation, &dispatch_missing, .{});
     defer missing_admission.deinit();
     try std.testing.expectEqual(.admitted, try missing_admission.stage(&txn, db.root_incarnation));

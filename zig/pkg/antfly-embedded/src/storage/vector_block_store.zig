@@ -20,7 +20,7 @@
 //! batches. A handle is poisoned after an ambiguous append failure and must be
 //! reopened, preventing duplicate commits after a failed fsync.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -63,8 +63,8 @@ const wal_checkpoint_bytes: usize = 64 * 1024 * 1024;
 // publication/collection performs the full streaming consolidation.
 const checkpoint_merge_input_bytes: u64 = 4 * wal_checkpoint_bytes;
 const max_block_bytes: usize = if (@sizeOf(usize) >= 8) 8 * 1024 * 1024 * 1024 else std.math.maxInt(usize);
-var positional_read_test_nonce: native_platform.atomic.Value(u64) = .init(0);
-var retained_block_identity: native_platform.atomic.Value(u64) = .init(1);
+var positional_read_test_nonce: platform.atomic.Value(u64) = .init(0);
+var retained_block_identity: platform.atomic.Value(u64) = .init(1);
 
 pub fn checkpointBlockPathAlloc(alloc: Allocator, root_dir: []const u8, generation: u64, shard_id: u32) ![]u8 {
     const name = try std.fmt.allocPrint(alloc, "block-{d}-{d}.afvb", .{ generation, shard_id });
@@ -110,7 +110,7 @@ pub const RetainedBlock = struct {
 
     const Shared = struct {
         alloc: Allocator,
-        refs: native_platform.atomic.Value(u64) = .init(1),
+        refs: platform.atomic.Value(u64) = .init(1),
         identity: u64,
         payload: Payload,
     };
@@ -147,7 +147,7 @@ pub const RetainedBlock = struct {
                 } else {
                     var read_len: usize = 0;
                     while (read_len < out.len) {
-                        const rc = native_platform.c.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
+                        const rc = platform.c.pread(value.fd, out.ptr + read_len, out.len - read_len, @intCast(offset + read_len));
                         switch (std.posix.errno(rc)) {
                             .SUCCESS => {
                                 const n: usize = @intCast(rc);
@@ -170,7 +170,7 @@ pub const RetainedBlock = struct {
     fn discardResidentPages(self: RetainedBlock) void {
         if (comptime builtin.os.tag != .freestanding) {
             switch (self.shared.payload) {
-                .mapped => |mapped| native_platform.filesystem.adviseMemory(mapped.bytes.ptr, mapped.bytes.len, native_platform.c.MADV.DONTNEED) catch {},
+                .mapped => |mapped| platform.filesystem.adviseMemory(mapped.bytes.ptr, mapped.bytes.len, platform.c.MADV.DONTNEED) catch {},
                 .heap => {},
             }
         }
@@ -185,7 +185,7 @@ pub const RetainedBlock = struct {
                 if (comptime builtin.os.tag == .freestanding) {
                     unreachable;
                 } else {
-                    native_platform.filesystem.unmapMemory(mapped.bytes);
+                    platform.filesystem.unmapMemory(mapped.bytes);
                     _ = std.posix.system.close(mapped.fd);
                 }
             },
@@ -1886,10 +1886,10 @@ pub const ReferenceLocationCache = struct {
     stripes: [16]Stripe = @splat(.{}),
     manager: ?*resources.ResourceManager = null,
     reclaimer: u64 = 0,
-    resident_bytes: native_platform.atomic.Value(u64) = .init(0),
-    reclaimed_bytes: native_platform.atomic.Value(u64) = .init(0),
-    hits: native_platform.atomic.Value(u64) = .init(0),
-    misses: native_platform.atomic.Value(u64) = .init(0),
+    resident_bytes: platform.atomic.Value(u64) = .init(0),
+    reclaimed_bytes: platform.atomic.Value(u64) = .init(0),
+    hits: platform.atomic.Value(u64) = .init(0),
+    misses: platform.atomic.Value(u64) = .init(0),
 
     pub fn create(alloc: Allocator, count: usize) !*ReferenceLocationCache {
         return createWithPolicy(alloc, count, false);
@@ -3959,7 +3959,7 @@ fn runPositionalReadBatchProfiled(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     stats: ?*ReadDispatchStats,
 ) !void {
-    const time = native_platform.time;
+    const time = platform.time;
     if (stats) |p| {
         p.batches += @intFromBool(requests.len != 0);
         p.requests += requests.len;
@@ -4024,8 +4024,8 @@ fn runPositionalReadBatchProfiled(
         next: std.atomic.Value(usize) = .init(0),
         manager: ?*resource_manager_mod.ResourceManager,
         profiled: bool,
-        worker_wall_ns: native_platform.atomic.Value(u64) = .init(0),
-        worker_start_delay_ns: native_platform.atomic.Value(u64) = .init(0),
+        worker_wall_ns: platform.atomic.Value(u64) = .init(0),
+        worker_start_delay_ns: platform.atomic.Value(u64) = .init(0),
 
         fn worker(work: *@This(), submitted: u64) std.Io.Cancelable!void {
             defer if (work.manager) |manager| manager.releaseDenseReadTask();
@@ -4128,7 +4128,7 @@ test "storage.vector_block_store read dispatch profiling preserves request owner
             request.visits += 1;
         }
     };
-    var runtime = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
     defer runtime.deinit();
     var manager = resource_manager_mod.ResourceManager.init(.{ .dense_read_extra_task_limit = 4 });
     defer manager.deinit(std.testing.allocator);
@@ -4157,7 +4157,7 @@ test "storage.vector_block_store bounded read workers process every request once
         }
     };
     for ([_]usize{ 0, 1, 8 }) |limit| {
-        var runtime = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(limit) });
+        var runtime = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(limit) });
         defer runtime.deinit();
         var requests: [257]Request = @splat(.{});
         try runPositionalReadBatch(Request, {}, runtime.io(), &requests, Runner.run, null);
@@ -4169,7 +4169,7 @@ test "storage.vector_block_store bounded read workers process every request once
 }
 
 test "storage.vector_block_store governed read workers release permits on completion and cancellation" {
-    var runtime = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    var runtime = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
     defer runtime.deinit();
     const Request = struct { visits: u32 = 0, cancel: bool = false };
     const Runner = struct {
@@ -4943,7 +4943,7 @@ fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) 
                         reader.covered_source_sequence == descriptor.covered_source_sequence and reader.admissionChecksum() == descriptor.admission_checksum)
                     {
                         const retained = RetainedBlock.init(store.alloc, .{ .mapped = mapped }) catch |err| {
-                            native_platform.filesystem.unmapMemory(mapped.bytes);
+                            platform.filesystem.unmapMemory(mapped.bytes);
                             _ = std.posix.system.close(mapped.fd);
                             return err;
                         };
@@ -4951,7 +4951,7 @@ fn readBlockValidated(store: *const Store, descriptor: vector_manifest.Segment) 
                     }
                 } else |_| {}
             }
-            native_platform.filesystem.unmapMemory(mapped.bytes);
+            platform.filesystem.unmapMemory(mapped.bytes);
             _ = std.posix.system.close(mapped.fd);
         } else |_| {}
     }
@@ -4983,7 +4983,7 @@ fn mapBlockFile(path: []const u8) !RetainedBlock.MappedPayload {
         // Vector point reads are physically sorted within a request but sparse
         // across the corpus. Disable broad kernel read-ahead so a recall-parity
         // workload does not pull the complete multi-GiB projection into RSS.
-        native_platform.filesystem.adviseMemory(mapped.ptr, mapped.len, native_platform.c.MADV.RANDOM) catch {};
+        platform.filesystem.adviseMemory(mapped.ptr, mapped.len, platform.c.MADV.RANDOM) catch {};
         return .{ .bytes = mapped, .fd = fd };
     }
 }
@@ -5140,7 +5140,7 @@ test "cold projection workers drain multiple shards under admission and reuse th
         };
     }
     for ([_]usize{ 0, 2, 8 }) |limit| {
-        var runtime = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(limit) });
+        var runtime = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(limit) });
         defer runtime.deinit();
         for (0..2) |_| {
             const stats = try session.readProjectionsIntoBatch(runtime.io(), &requests);
@@ -5188,7 +5188,7 @@ test "cold projection workers drain multiple shards under admission and reuse th
 test "grouped projection queue includes oversized fallbacks and unavailable helpers" {
     if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var runtime = native_platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var native = try lsm_backend.NativeStorage.init(alloc, .threaded);
     defer native.deinit();
@@ -5304,7 +5304,7 @@ test "vector block positional lookup reads mmap payload through retained descrip
     var exact_decoded: [3]f32 = undefined;
     try std.testing.expectEqualSlices(f32, &.{ 1.25, -2.5, 3.75 }, try exact.decodeExactInto(&exact_decoded));
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const keys = [_][]const u8{ "artifact-a", "artifact-b", "artifact-c" };
     const revisions = [_]u64{ 7, 8, 9 };

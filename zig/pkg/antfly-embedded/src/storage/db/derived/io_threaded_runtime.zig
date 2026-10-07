@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -30,7 +30,7 @@ const runtime_types = @import("runtime_types.zig");
 const change_journal_mod = @import("change_journal.zig");
 const derived_types = @import("derived_types.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 const Scheduler = @import("../../../common/maintenance_scheduler.zig").Scheduler;
 
 pub const RuntimeError = runtime_types.RuntimeError;
@@ -244,7 +244,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
     };
 
     alloc: Allocator,
-    threaded: *native_platform.Threaded,
+    threaded: *platform.Io.Threaded,
     threaded_owner: IoOwner,
     scheduler: ?*Scheduler = null,
     owns_scheduler: bool = false,
@@ -282,7 +282,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
         applied_sequence_advanced_fn: ?AppliedSequenceAdvancedFn,
         resource_manager: ?*resource_manager_mod.ResourceManager,
     ) !DerivedRuntime {
-        const threaded = try alloc.create(native_platform.Threaded);
+        const threaded = try alloc.create(platform.Io.Threaded);
         errdefer alloc.destroy(threaded);
         // Standalone users own a bounded I/O lane and lazily create a shared
         // scheduler. Database-backed runtimes borrow both from BackendRuntime.
@@ -306,7 +306,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn initBorrowed(
         alloc: Allocator,
-        threaded: *native_platform.Threaded,
+        threaded: *platform.Io.Threaded,
         replay_source: replay_source_mod.Source,
         ctx: *anyopaque,
         apply_fn: ApplyFn,
@@ -337,7 +337,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
 
     fn initWithIo(
         alloc: Allocator,
-        threaded: *native_platform.Threaded,
+        threaded: *platform.Io.Threaded,
         threaded_owner: IoOwner,
         replay_source: replay_source_mod.Source,
         ctx: *anyopaque,
@@ -903,7 +903,7 @@ test "derived enrichment visibility guard observes cancellation and deadline" {
         error.EnrichmentWaitTimeout,
         (runtime_types.VisibilityWait{ .deadline_ns = platform_time.monotonicNs() }).check(),
     );
-    var clock = native_platform.clock.ManualClock{};
+    var clock = platform.clock.ManualClock{};
     clock.setRealtimeNs(100);
     const wait = runtime_types.VisibilityWait{ .clock = clock.clock(), .deadline_ns = 200 };
     try wait.check();
@@ -1536,19 +1536,19 @@ fn stopAndJoinWorker(runtime: *DerivedRuntime, worker: *Worker, io: Io) void {
 const TestThreadedRuntimeCapture = struct {
     require_capture_worker: ?*Worker = null,
     fail_next_begin: bool = false,
-    empty_coverage_checks: native_platform.atomic.Value(u64) = .init(0),
+    empty_coverage_checks: platform.atomic.Value(u64) = .init(0),
     runtime: ?*DerivedRuntime = null,
-    apply_calls: native_platform.atomic.Value(u64) = .init(0),
-    begin_calls: native_platform.atomic.Value(u64) = .init(0),
-    finish_calls: native_platform.atomic.Value(u64) = .init(0),
-    publish_failures: native_platform.atomic.Value(u64) = .init(0),
-    apply_not_found_failures: native_platform.atomic.Value(u64) = .init(0),
-    resource_budget_failures: native_platform.atomic.Value(u64) = .init(0),
-    persisted_sequence: native_platform.atomic.Value(u64) = .init(0),
-    truncate_calls: native_platform.atomic.Value(u64) = .init(0),
-    truncated_sequence: native_platform.atomic.Value(u64) = .init(0),
-    advanced_sequence: native_platform.atomic.Value(u64) = .init(0),
-    callback_observed_applied_sequence: native_platform.atomic.Value(u64) = .init(0),
+    apply_calls: platform.atomic.Value(u64) = .init(0),
+    begin_calls: platform.atomic.Value(u64) = .init(0),
+    finish_calls: platform.atomic.Value(u64) = .init(0),
+    publish_failures: platform.atomic.Value(u64) = .init(0),
+    apply_not_found_failures: platform.atomic.Value(u64) = .init(0),
+    resource_budget_failures: platform.atomic.Value(u64) = .init(0),
+    persisted_sequence: platform.atomic.Value(u64) = .init(0),
+    truncate_calls: platform.atomic.Value(u64) = .init(0),
+    truncated_sequence: platform.atomic.Value(u64) = .init(0),
+    advanced_sequence: platform.atomic.Value(u64) = .init(0),
+    callback_observed_applied_sequence: platform.atomic.Value(u64) = .init(0),
     fail_next_forced_persist: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_apply_resource_budget: std.atomic.Value(bool) = .init(false),
@@ -1655,7 +1655,7 @@ fn appendTestThreadedRuntimeRecord(log: *change_journal_mod.Journal, alloc: Allo
 
 test "io threaded deferred source capture excludes preparation and preserves failure ownership" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/late-capture", .{tmp.sub_path}, 0);
     defer alloc.free(path);
@@ -1725,7 +1725,7 @@ test "io threaded deferred source capture excludes preparation and preserves fai
 
 test "io threaded deferred source capture advances empty targets only through coverage guard" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/empty-late-capture", .{tmp.sub_path}, 0);
     defer alloc.free(path);
@@ -1762,7 +1762,7 @@ test "io threaded deferred source capture advances empty targets only through co
 
 test "io threaded worker keeps the dense replay working-set factor" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/working-set-factor", .{tmp.sub_path}, 0);
     defer alloc.free(path);
@@ -1823,7 +1823,7 @@ test "io threaded scheduled terminal pass releases its retained session" {
 
 test "io threaded forced persist errors unwind snapshot ownership safely" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-forced-persist-error-journal", .{tmp.sub_path});
@@ -1861,7 +1861,7 @@ test "io threaded forced persist errors unwind snapshot ownership safely" {
 
 test "io threaded applied callback observes published watermark outside runtime lock" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-applied-callback-journal", .{tmp.sub_path});
@@ -1910,7 +1910,7 @@ test "io threaded applied callback observes published watermark outside runtime 
 
 test "io threaded wait observes worker-owned catch-up close" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-worker-lifetime-journal", .{tmp.sub_path});
@@ -1961,11 +1961,11 @@ test "io threaded wait observes worker-owned catch-up close" {
         }
     };
     var race = Race{ .runtime = &runtime };
-    var wait_thread = try native_platform.testing.io.concurrent(Race.wait, .{&race});
+    var wait_thread = try platform.testing.io.concurrent(Race.wait, .{&race});
     var wait_joined = false;
     defer if (!wait_joined) {
         capture.release_finish.store(true, .release);
-        wait_thread.await(native_platform.testing.io);
+        wait_thread.await(platform.testing.io);
     };
 
     for (0..5_000) |_| {
@@ -1991,7 +1991,7 @@ test "io threaded wait observes worker-owned catch-up close" {
     }
 
     capture.release_finish.store(true, .release);
-    wait_thread.await(native_platform.testing.io);
+    wait_thread.await(platform.testing.io);
     wait_joined = true;
 
     try std.testing.expect(!race.wait_failed.load(.acquire));
@@ -2006,7 +2006,7 @@ test "io threaded wait observes worker-owned catch-up close" {
 
 test "io threaded wait requests prompt worker catch-up close" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-worker-close-request-journal", .{tmp.sub_path});
@@ -2054,11 +2054,11 @@ test "io threaded wait requests prompt worker catch-up close" {
         }
     };
     var wait = Wait{ .runtime = &runtime };
-    var wait_thread = try native_platform.testing.io.concurrent(Wait.run, .{&wait});
+    var wait_thread = try platform.testing.io.concurrent(Wait.run, .{&wait});
     var wait_joined = false;
     defer if (!wait_joined) {
         capture.release_finish.store(true, .release);
-        wait_thread.await(native_platform.testing.io);
+        wait_thread.await(platform.testing.io);
     };
 
     // Dense workers normally retain an idle session for reuse. A synchronous
@@ -2071,7 +2071,7 @@ test "io threaded wait requests prompt worker catch-up close" {
     try std.testing.expect(!wait.done.load(.acquire));
 
     capture.release_finish.store(true, .release);
-    wait_thread.await(native_platform.testing.io);
+    wait_thread.await(platform.testing.io);
     wait_joined = true;
     try std.testing.expect(!wait.failed.load(.acquire));
     try std.testing.expect(wait.done.load(.acquire));
@@ -2079,7 +2079,7 @@ test "io threaded wait requests prompt worker catch-up close" {
 
 test "io threaded wait observes failed worker-owned catch-up close" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-worker-close-failure-journal", .{tmp.sub_path});
@@ -2143,18 +2143,18 @@ test "io threaded wait observes failed worker-owned catch-up close" {
         }
     };
     var wait = Wait{ .runtime = &runtime };
-    var wait_thread = try native_platform.testing.io.concurrent(Wait.run, .{&wait});
+    var wait_thread = try platform.testing.io.concurrent(Wait.run, .{&wait});
     var wait_joined = false;
     defer if (!wait_joined) {
         wait.failRuntime();
-        wait_thread.await(native_platform.testing.io);
+        wait_thread.await(platform.testing.io);
     };
 
     io.sleep(Io.Duration.fromMilliseconds(25), .awake) catch {};
     try std.testing.expect(!wait.done.load(.acquire));
 
     wait.failRuntime();
-    wait_thread.await(native_platform.testing.io);
+    wait_thread.await(platform.testing.io);
     wait_joined = true;
     try std.testing.expect(wait.done.load(.acquire));
     try std.testing.expect(wait.saw_expected_error.load(.acquire));
@@ -2162,7 +2162,7 @@ test "io threaded wait observes failed worker-owned catch-up close" {
 
 test "io threaded worker backoffs and retries replay truncation writer lock" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-truncate-writer-lock-retry-journal", .{tmp.sub_path});
@@ -2214,7 +2214,7 @@ test "io threaded worker backoffs and retries replay truncation writer lock" {
 
 test "io threaded dense catch-up NotFound closes session before retry" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-dense-catch-up-retry-journal", .{tmp.sub_path});
@@ -2262,7 +2262,7 @@ test "io threaded dense catch-up NotFound closes session before retry" {
 
 test "io threaded dense publish NotFound retries with a fresh session" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-dense-publish-retry-journal", .{tmp.sub_path});
@@ -2310,7 +2310,7 @@ test "io threaded dense publish NotFound retries with a fresh session" {
 
 test "io threaded full-text resource pressure retries without poisoning runtime" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/io-threaded-full-text-resource-retry-journal", .{tmp.sub_path});

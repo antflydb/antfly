@@ -78,7 +78,7 @@ pub const EmbeddedInferenceProviderLifetime = struct {
 
         pub fn deinit(self: *@This()) void {
             if (!self.active) return;
-            const io = platform.Threaded.global_single_threaded.io();
+            const io = platform.Io.Threaded.global_single_threaded.io();
             self.owner.drain_mutex.lockUncancelable(io);
             const previous = self.owner.state.fetchSub(1, .acq_rel);
             std.debug.assert(previous & count_mask > 0);
@@ -106,7 +106,7 @@ pub const EmbeddedInferenceProviderLifetime = struct {
 
     pub fn quiesce(self: *EmbeddedInferenceProviderLifetime) void {
         _ = self.state.fetchOr(closed_bit, .acq_rel);
-        const io = platform.Threaded.global_single_threaded.io();
+        const io = platform.Io.Threaded.global_single_threaded.io();
         self.drain_mutex.lockUncancelable(io);
         defer self.drain_mutex.unlock(io);
         while (self.activeCallCount() != 0) self.drained.waitUncancelable(io, &self.drain_mutex);
@@ -621,7 +621,7 @@ pub fn invokeInferenceProviderWithBinaryControlled(
 pub fn requestContextFromControls(deadline_ns: ?u64, cancellation: CancellationToken) ?inference.RequestContext {
     if (deadline_ns == null and cancellation.ptr == null) return null;
     return .{
-        .io = platform.Threaded.global_single_threaded.io(),
+        .io = platform.Io.Threaded.global_single_threaded.io(),
         .deadline_ns = deadline_ns,
         .cancellation = if (cancellation.ptr != null) cancellation else null,
     };

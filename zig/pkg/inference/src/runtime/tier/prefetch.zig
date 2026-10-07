@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -38,7 +38,7 @@ pub fn Queue(comptime Item: type) type {
 
         allocator: std.mem.Allocator,
         items: std.ArrayListUnmanaged(Item) = .empty,
-        io_impl: if (builtin.os.tag == .freestanding) void else native_platform.Threaded,
+        io_impl: if (builtin.os.tag == .freestanding) void else platform.Io.Threaded,
         mutex: std.Io.Mutex = .init,
         lifecycle_mutex: std.Io.Mutex = .init,
         wake: std.Io.Event = .unset,
@@ -69,7 +69,7 @@ pub fn Queue(comptime Item: type) type {
             } else {
                 return .{
                     .allocator = allocator,
-                    .io_impl = native_platform.Threaded.init(allocator, .{
+                    .io_impl = platform.Io.Threaded.init(allocator, .{
                         .async_limit = .nothing,
                         .concurrent_limit = .limited(1),
                     }),
@@ -284,7 +284,7 @@ test "prefetch queue background wake stop and restart preserve lock policy" {
                 self.queue.unlock();
             }
             _ = self.total.fetchAdd(item, .monotonic);
-            self.done.set(native_platform.testing.io);
+            self.done.set(platform.testing.io);
         }
     };
     for ([_]bool{ false, true }) |unlocked| {
@@ -306,7 +306,7 @@ test "prefetch queue background wake stop and restart preserve lock policy" {
             };
             queue.signal();
             queue.unlock();
-            try ctx.done.waitTimeout(native_platform.testing.io, .{ .duration = .{
+            try ctx.done.waitTimeout(platform.testing.io, .{ .duration = .{
                 .raw = .fromSeconds(5),
                 .clock = .awake,
             } });
@@ -329,8 +329,8 @@ test "prefetch queue stop quiesces unlocked processing and preserves pending wor
 
         fn process(ptr: *anyopaque, item: u32) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.entered.set(native_platform.testing.io);
-            self.release.waitUncancelable(native_platform.testing.io);
+            self.entered.set(platform.testing.io);
+            self.release.waitUncancelable(platform.testing.io);
             self.total += item;
         }
 
@@ -343,27 +343,27 @@ test "prefetch queue stop quiesces unlocked processing and preserves pending wor
     var queue = QueueU32.init(std.testing.allocator, &ctx, Context.process);
     defer queue.deinit();
     // Also release on an assertion failure before waiting for queue teardown.
-    defer ctx.release.set(native_platform.testing.io);
+    defer ctx.release.set(platform.testing.io);
     ctx.queue = &queue;
     queue.process_with_lock = false;
     try queue.appendLocked(3);
     try queue.startWorker();
-    try ctx.entered.waitTimeout(native_platform.testing.io, .{ .duration = .{
+    try ctx.entered.waitTimeout(platform.testing.io, .{ .duration = .{
         .raw = .fromSeconds(5),
         .clock = .awake,
     } });
     const stopper = try std.Thread.spawn(.{}, Context.stop, .{&ctx});
     defer {
-        ctx.release.set(native_platform.testing.io);
+        ctx.release.set(platform.testing.io);
         stopper.join();
     }
-    const started = std.Io.Clock.awake.now(native_platform.testing.io);
+    const started = std.Io.Clock.awake.now(platform.testing.io);
     while (true) {
         queue.lock();
         const enabled = queue.worker_enabled;
         queue.unlock();
         if (!enabled) break;
-        try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(native_platform.testing.io)).toNanoseconds() < 5 * std.time.ns_per_s);
+        try std.testing.expect(started.durationTo(std.Io.Clock.awake.now(platform.testing.io)).toNanoseconds() < 5 * std.time.ns_per_s);
         try std.Thread.yield();
     }
     // stop has withdrawn admission but cannot return while the callback still
@@ -376,7 +376,7 @@ test "prefetch queue stop quiesces unlocked processing and preserves pending wor
     };
     queue.signal();
     queue.unlock();
-    ctx.release.set(native_platform.testing.io);
+    ctx.release.set(platform.testing.io);
     // A second stop serializes behind the first and observes its quiescence.
     queue.stop();
     try std.testing.expectEqual(@as(u32, 3), ctx.total);

@@ -16,7 +16,7 @@
 //! Windows share one sort per partition/order specification. Arbitrary moving
 //! aggregate frames use a segment tree, never a quadratic per-row rescan.
 //! All input, sort, frame and output state uses the statement memory budget.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ast = @import("ast.zig");
@@ -498,7 +498,7 @@ test "SQL window wide moving frames retain bounded indexed aggregate state" {
         row.* = &value;
         index.* = i;
     }
-    const started = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds;
+    const started = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
     const tree = try Tree.create(Context{}, budget.allocator(), cells, indices, .{ .kind = .sum, .arguments = &.{0}, .filter = null, .sort = 0, .frame = null, .type = .integer, .star = false });
     defer budget.allocator().free(tree.nodes);
     for (0..count) |index| {
@@ -506,7 +506,7 @@ test "SQL window wide moving frames retain bounded indexed aggregate state" {
         try std.testing.expectEqual(@as(i64, @intCast(bounds.end - bounds.start)), (try tree.query(bounds)).value.integer);
     }
     try std.testing.expect(budget.peak < 4 * 1024 * 1024);
-    std.debug.print("SQL window frames: rows={d} frame_width=8193 peak_bytes={d} elapsed_ns={d}\n", .{ count, budget.peak, std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds - started });
+    std.debug.print("SQL window frames: rows={d} frame_width=8193 peak_bytes={d} elapsed_ns={d}\n", .{ count, budget.peak, std.Io.Clock.awake.now(platform.testing.io).nanoseconds - started });
 }
 
 // Removable exact state gives running and sliding count/integer/boolean

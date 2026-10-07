@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const webp = @import("webp.zig");
@@ -31,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next();
     const out_root = args.next() orelse "testdata/image/webp";
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

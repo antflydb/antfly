@@ -24,7 +24,7 @@
 //! entry is lost. Tuple updates and unchanged rows do not rewrite ownership.
 //! Neither this module nor a write plan establishes query readiness.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const internal = @import("../internal_keys.zig");
@@ -727,7 +727,7 @@ fn testPlan(alloc: Allocator) !plans.View {
         .{ .name = "tenant", .path = "tenant", .column_type = .integer },
         .{ .name = "label", .path = "label", .column_type = .string, .allows_null = true },
     };
-    var registry = try schema_registry.Registry.initCloned(alloc, native_platform.testing.io, .{ .version = 7, .storage_mode = .relational, .relational_columns = &columns });
+    var registry = try schema_registry.Registry.initCloned(alloc, platform.testing.io, .{ .version = 7, .storage_mode = .relational, .relational_columns = &columns });
     defer registry.deinit();
     var view = registry.acquire().?;
     defer view.release();
@@ -1071,7 +1071,7 @@ fn testStagedMutations(comptime Backend: type) !void {
         .{ .key = outbox_key, .value = "pending" },
     } });
     defer alloc.free(writes);
-    try store.putBatchWithReplay(native_platform.testing.io, writes, effects.deletes, null);
+    try store.putBatchWithReplay(platform.testing.io, writes, effects.deletes, null);
     var committed = try store.beginReadTxn();
     defer committed.abort();
     try std.testing.expectEqualSlices(u8, updated.packed_row, try committed.get(primary_key));
@@ -1162,7 +1162,7 @@ test "relational index records staging releases and poisons every allocation fai
 test "relational index records preserve primary and index pairs across LSM reopen update and delete" {
     const alloc = std.testing.allocator;
     const Backend = @import("../lsm_backend.zig").Backend;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});

@@ -15,7 +15,7 @@
 
 //! Production worker integration fixture: real metadata Raft/apply store,
 //! immutable native seals, scoped owners, and distributed integrity activation.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const http = @import("http_server.zig");
@@ -291,10 +291,10 @@ const Fixture = struct {
             var mutation = request;
             mutation.restore_staging_scope = self.fixture.scopes[self.index].digest();
             const is_import_page = if (request.restore_staging) |command| command == .import_page else false;
-            const apply_started_ns = if (is_import_page) native_platform.time.monotonicNs() else 0;
+            const apply_started_ns = if (is_import_page) platform.time.monotonicNs() else 0;
             if (self.fixture.non_raft) try self.fixture.dbs[self.index].batchWithVisibilityCancellation(mutation, context.cancellation) else try @import("../storage/server_db_adapter.zig").applyOrdered(&self.fixture.dbs[self.index], mutation, .{ .index = self.fixture.indices[self.index], .term = 1 });
             if (is_import_page) {
-                const elapsed_ns = native_platform.time.monotonicNs() - apply_started_ns;
+                const elapsed_ns = platform.time.monotonicNs() - apply_started_ns;
                 self.fixture.import_apply_elapsed_ns +|= elapsed_ns;
                 self.fixture.import_apply_max_ns = @max(self.fixture.import_apply_max_ns, elapsed_ns);
                 const page = request.restore_staging.?.import_page;
@@ -338,16 +338,16 @@ const Fixture = struct {
             break :blk before.value.phase == .reserved;
         };
         var apply: Apply = .{ .fixture = self, .index = i };
-        const owner_started_ns = native_platform.time.monotonicNs();
+        const owner_started_ns = platform.time.monotonicNs();
         const applied_before = self.import_page_kinds[0] + self.import_page_kinds[1] + self.import_page_kinds[2] + self.import_page_kinds[3];
-        const result = try @import("../storage/restore_owner.zig").executeResident(alloc, self.dbs[i], .{ .io = native_platform.testing.io, .runtime = self.runtime, .location_options = .{ .filesystem_io = native_platform.testing.io, .node_config = self.node_config }, .cache_path = self.cache_paths[i], .proposer = .{ .ptr = &apply, .propose = Apply.propose } }, request, context);
+        const result = try @import("../storage/restore_owner.zig").executeResident(alloc, self.dbs[i], .{ .io = platform.testing.io, .runtime = self.runtime, .location_options = .{ .filesystem_io = platform.testing.io, .node_config = self.node_config }, .cache_path = self.cache_paths[i], .proposer = .{ .ptr = &apply, .propose = Apply.propose } }, request, context);
         if (self.rewrite_mode and !self.tail_injected and result.rewrite != null and result.rewrite.?.snapshot_complete) {
             self.tail_injected = true;
             _ = try sourceBatch(self, alloc, "parent", .{ .timestamp_ns = 987, .writes = &.{ .{ .key = "row", .value = "{\"id\":1,\"x\":7}" }, .{ .key = "new", .value = "{\"id\":2,\"x\":9}" } }, .deletes = &.{"removed"} });
         }
         if (request.action == .import_page) {
             self.imports += 1;
-            const elapsed_ns = native_platform.time.monotonicNs() - owner_started_ns;
+            const elapsed_ns = platform.time.monotonicNs() - owner_started_ns;
             self.import_elapsed_ns +|= elapsed_ns;
             self.import_max_ns = @max(self.import_max_ns, elapsed_ns);
             const applied_after = self.import_page_kinds[0] + self.import_page_kinds[1] + self.import_page_kinds[2] + self.import_page_kinds[3];
@@ -359,13 +359,13 @@ const Fixture = struct {
         }
         if (request.action == .validate or request.action == .install_generation_admissions) {
             self.validation_owner_calls += 1;
-            const elapsed_ns = native_platform.time.monotonicNs() - owner_started_ns;
+            const elapsed_ns = platform.time.monotonicNs() - owner_started_ns;
             self.validation_owner_elapsed_ns +|= elapsed_ns;
             self.validation_owner_max_ns = @max(self.validation_owner_max_ns, elapsed_ns);
         }
         if (request.action == .status) {
             self.status_owner_calls += 1;
-            const elapsed_ns = native_platform.time.monotonicNs() - owner_started_ns;
+            const elapsed_ns = platform.time.monotonicNs() - owner_started_ns;
             self.status_owner_elapsed_ns +|= elapsed_ns;
             self.status_owner_max_ns = @max(self.status_owner_max_ns, elapsed_ns);
         }
@@ -531,12 +531,12 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
-    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = native_platform.testing.io });
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", a);
+    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = platform.testing.io });
     defer runtime.deinit();
-    var api_runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = native_platform.testing.io, .borrowed_io = .{ .general = native_platform.testing.io, .api = native_platform.testing.io } });
+    var api_runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = platform.testing.io, .borrowed_io = .{ .general = platform.testing.io, .api = platform.testing.io } });
     defer api_runtime.deinit();
     var raft = raft_engine.core.MemoryStorage.init(alloc);
     defer raft.deinit();
@@ -566,7 +566,7 @@ fn runRewriteWithFailure(comptime Driver: type, invalid_tail: bool, non_raft: bo
     var server = http.ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone, .backend_runtime = &api_runtime, .node_config = &node_config, .online_merge_io = .{ .ptr = &fixture, .execute_fn = Fixture.sourceIo }, .restore_owner = .{ .ptr = &fixture, .execute_fn = Fixture.owner }, .restore_validation = .{ .status = source, .factory = .{ .ptr = &fixture, .bind = Fixture.bind } } }, source, .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.sourceLookup, .lookup_group_local = Fixture.destinationLookup, .scan = Fixture.scan, .query = Fixture.query } }, .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.sourceBatch } });
     defer server.deinit();
     server.restore_job_store.deinit();
-    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, native_platform.testing.io);
+    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, platform.testing.io);
     try server.restore_job_store.attachReplicated(restore_jobs.ReplicatedPersistence.fromLocal(&svc, .{ .load = RewritePersistence.load, .get = RewritePersistence.get, .put = RewritePersistence.put, .delete = RewritePersistence.delete, .delete_many = RewritePersistence.deleteMany, .create_with_staging = RewritePersistence.createWithStaging }));
     try server.restore_job_store.prepareReplicatedLeadership(alloc, 1);
     server.restore_leadership_term.store(1, .release);
@@ -902,12 +902,12 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
-    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = native_platform.testing.io });
+    const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", a);
+    var runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = platform.testing.io });
     defer runtime.deinit();
-    var api_runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = native_platform.testing.io, .borrowed_io = .{ .general = native_platform.testing.io, .api = native_platform.testing.io } });
+    var api_runtime = try db.background_runtime.BackendRuntime.init(alloc, .{ .backend = .manual, .filesystem_io = platform.testing.io, .borrowed_io = .{ .general = platform.testing.io, .api = platform.testing.io } });
     defer api_runtime.deinit();
     var raft = raft_engine.core.MemoryStorage.init(alloc);
     defer raft.deinit();
@@ -946,7 +946,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     server.cfg.restore_execution_guard = policy.guard;
     server.restore_leadership_term.store(policy.term, .release);
     server.restore_job_store.deinit();
-    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, native_platform.testing.io);
+    server.restore_job_store = restore_jobs.Store.initWithIo(alloc, platform.testing.io);
     if (persistence) |store| {
         try server.restore_job_store.attachReplicated(store);
         try server.restore_job_store.prepareReplicatedLeadership(alloc, policy.term);
@@ -1025,16 +1025,16 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         const artifact_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ root, relative });
         var source_summary: ?[]portable_backup.SourceGenerationAdmissionSummaryEntry = null;
         if (policy.portable) {
-            var file = try std.Io.Dir.cwd().createFile(native_platform.testing.io, artifact_path, .{});
-            defer file.close(native_platform.testing.io);
+            var file = try std.Io.Dir.cwd().createFile(platform.testing.io, artifact_path, .{});
+            defer file.close(platform.testing.io);
             var buffer: [65536]u8 = undefined;
-            var writer = file.writer(native_platform.testing.io, &buffer);
+            var writer = file.writer(platform.testing.io, &buffer);
             try original.exportBackupCohortPortable(seal, &writer.interface, .{ .source_generation_summary_output = .{ .alloc = a, .output = &source_summary } }, .none);
             try writer.end();
-            try file.sync(native_platform.testing.io);
+            try file.sync(platform.testing.io);
         } else _ = try original.exportBackupCohort(seal, "snapshot", .none);
-        const integrity = try backups.artifactIntegrityAlloc(a, native_platform.testing.io, format, artifact_path);
-        const inventory = if (!policy.portable) try backups.nativeGenerationManifestIntegrityAllocWithCancellation(a, native_platform.testing.io, artifact_path, .none) else null;
+        const integrity = try backups.artifactIntegrityAlloc(a, platform.testing.io, format, artifact_path);
+        const inventory = if (!policy.portable) try backups.nativeGenerationManifestIntegrityAllocWithCancellation(a, platform.testing.io, artifact_path, .none) else null;
         // This descriptor came from the same pinned read transaction as the
         // AFB blocks, even though the live source resumed after its seal.
         const accepted_summary: []const portable_backup.SourceGenerationAdmissionSummaryEntry = if (policy.portable) source_summary orelse return error.BackupIntegrityFailure else &.{};
@@ -1093,7 +1093,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     try std.testing.expectEqual(@as(usize, 0), hidden.tables.len);
     source.freeAdminSnapshot(&hidden);
     _ = try server.restore_job_store.retryRunning(a, worker.value, "RestoreStagingYield", 0);
-    const started_ns = native_platform.time.monotonicNs();
+    const started_ns = platform.time.monotonicNs();
     // Debug and contended runs can admit one row per cooperative slice. Scale
     // the fixture's work bound with its corpus instead of assuming that every
     // owner imports hundreds of rows within the same CPU quantum.
@@ -1141,7 +1141,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
             try std.testing.expectEqualStrings("ConstraintActivationFailed", state.value.staging_failure);
             break;
         }
-        if (policy.benchmark_rows > 1 and native_platform.time.monotonicNs() - started_ns > @as(u64, policy.benchmark_deadline_ms) * std.time.ns_per_ms) {
+        if (policy.benchmark_rows > 1 and platform.time.monotonicNs() - started_ns > @as(u64, policy.benchmark_deadline_ms) * std.time.ns_per_ms) {
             const live_staging_bytes = (try source.getRestoreStaging(a, plan_id, .{})) orelse return error.RestoreStagingScopeChanged;
             var live_staging = try std.json.parseFromSlice(stages.Job, a, live_staging_bytes, .{});
             defer live_staging.deinit();
@@ -1188,7 +1188,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
             }
             return error.RestoreBenchmarkDeadlineExceeded;
         }
-        try native_platform.testing.io.sleep(.fromMilliseconds(12), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(12), .awake);
     } else {
         const state = try std.json.parseFromSlice(restore_jobs.JobState, a, (try server.restore_job_store.load(a, worker.value.job_id)).?, .{});
         std.debug.print("restore worker did not converge: phase={s} attempt={d} staging_attempt={d} owner_phase={d} owner_cursor={d} validation_phase={d} validation_owner={d} error={s}\n", .{
@@ -1210,7 +1210,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         for (manifests[0..fixture.owner_count]) |manifest| for (manifest.shards) |shard| {
             artifact_bytes += shard.artifact_size_bytes;
         };
-        std.debug.print("restore benchmark format={s} rows={d} artifact_bytes={d} owner_import_calls={d} validation_calls={d} integrity_transactions={d} elapsed_ms={d}\n", .{ if (policy.portable) "portable" else "native", policy.benchmark_rows * fixture.owner_count, artifact_bytes, fixture.imports, fixture.validations, fixture.sequence, (native_platform.time.monotonicNs() - started_ns) / std.time.ns_per_ms });
+        std.debug.print("restore benchmark format={s} rows={d} artifact_bytes={d} owner_import_calls={d} validation_calls={d} integrity_transactions={d} elapsed_ms={d}\n", .{ if (policy.portable) "portable" else "native", policy.benchmark_rows * fixture.owner_count, artifact_bytes, fixture.imports, fixture.validations, fixture.sequence, (platform.time.monotonicNs() - started_ns) / std.time.ns_per_ms });
         fixture.printValidationTimings();
         std.debug.print("restore activation pages={d} rows={d} row_bins={any}\n", .{ fixture.activation_pages, fixture.activation_rows, fixture.activation_row_bins });
         std.debug.print("restore source materialization calls={d} elapsed_ms={d} max_ms={d}\n", .{ fixture.materialization_calls, fixture.materialization_elapsed_ns / std.time.ns_per_ms, fixture.materialization_max_ns / std.time.ns_per_ms });
@@ -1256,7 +1256,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         try std.testing.expectEqual(@as(u64, 123), try target.getTimestamp(alloc, "row"));
         var reader = try target.beginRelationalRows(alloc, .{ .index = "generated_cover", .fields = &.{ "id", "doubled" }, .conditions = &.{.{ .column = "id", .op = .gt, .value = .{ .integer = 0 } }} });
         defer reader.deinit();
-        var page = try reader.nextPage(alloc, native_platform.testing.io, .{ .time_ns = std.time.ns_per_s });
+        var page = try reader.nextPage(alloc, platform.testing.io, .{ .time_ns = std.time.ns_per_s });
         defer page.deinit();
         try std.testing.expectEqual(@as(usize, 1), page.rows.len);
         try std.testing.expectEqual(@as(usize, 0), page.primary_lookups);

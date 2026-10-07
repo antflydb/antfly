@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
@@ -22,7 +22,7 @@ const feature_reads = @import("feature_reads.zig");
 const read_gate = @import("read_gate.zig");
 
 fn cleanupTestDir(path: []const u8) void {
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }

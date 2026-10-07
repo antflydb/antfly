@@ -41,8 +41,8 @@ const request_timeout_ms = 180_000;
 pub const Loopback = struct {
     allocator: Allocator,
     budget: BoundedAllocator,
-    server_io: platform.Threaded,
-    client_io: platform.Threaded,
+    server_io: platform.Io.Threaded,
+    client_io: platform.Io.Threaded,
     server: httpx.Server,
     client: httpx.Client,
     listener: httpx.Server.ListenerTask,
@@ -58,9 +58,9 @@ pub const Loopback = struct {
         self.allocator = a;
         self.budget = .{ .backing = a, .limit = 16 * 1024 * 1024 };
         const transport_allocator = self.budget.allocator();
-        self.server_io = platform.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
+        self.server_io = platform.Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
         errdefer self.server_io.deinit();
-        self.client_io = platform.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
+        self.client_io = platform.Io.Threaded.init(transport_allocator, .{ .concurrent_limit = .limited(4) });
         errdefer self.client_io.deinit();
         self.server = httpx.Server.initWithConfig(transport_allocator, self.server_io.io(), .{
             .host = "127.0.0.1",

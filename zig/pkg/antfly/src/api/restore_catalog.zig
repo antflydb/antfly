@@ -16,7 +16,7 @@
 //! A private, immutable routing projection for one unpublished restore cohort.
 //! It has no fallback to the live catalog. Normal hosted readers, durable 2PC,
 //! identity fences and caches consume this capability unchanged.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const metadata = @import("../metadata/api.zig");
@@ -192,11 +192,11 @@ pub const ValidationPort = struct {
     };
 
     fn timingStart(self: @This()) u64 {
-        return if (self.timings != null) native_platform.time.monotonicNs() else 0;
+        return if (self.timings != null) platform.time.monotonicNs() else 0;
     }
 
     fn timingRecord(self: @This(), comptime field: []const u8, started_ns: u64) void {
-        if (self.timings) |timings| timings.add(field, native_platform.time.monotonicNs() - started_ns);
+        if (self.timings) |timings| timings.add(field, platform.time.monotonicNs() - started_ns);
     }
 
     pub const SourcePair = struct {
@@ -450,7 +450,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
     const contract = @import("antfly_local_sources").api_distributed_txn_contract;
     const read_gate = @import("../raft/read_gate.zig");
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const row_schema =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"integer"}},"additionalProperties":false}}}}
@@ -581,7 +581,7 @@ test "distributed txn staged mixed restore rebuilds fresh FK claims with durable
         private_catalog = try Catalog.init(alloc, .{ .status = .{ .metadata_group_id = 1, .metadata_incarnation = @splat(1), .metrics = .{} }, .tables = &table_records, .ranges = &range_records, .stores = &.{}, .placement_intents = &.{}, .split_transitions = &.{}, .merge_transitions = &.{} }, &scopes, .{ .ptr = &fixture, .verify = Fixture.verify });
         const reader: reads.TableReadSource = .{ .ptr = &fixture, .vtable = &.{ .lookup = Fixture.lookup, .scan = Fixture.scan, .query = Fixture.query } };
         const writer: writes.TableWriteSource = .{ .ptr = &fixture, .vtable = &.{ .batch = Fixture.batch, .commit_batch_with_cancellation = Fixture.commit } };
-        var threaded: native_platform.Threaded = .init(alloc, .{ .async_limit = .limited(4) });
+        var threaded: platform.Io.Threaded = .init(alloc, .{ .async_limit = .limited(4) });
         defer threaded.deinit();
         const io = threaded.io();
         const control: @import("antfly_local_sources").api_operation.RequestContext = if (concurrent) .{ .fanout_io = @import("antfly_runtime_abi").io_abi.Borrow.init(&io) } else .{};

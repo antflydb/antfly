@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const build_options = @import("build_options");
@@ -131,14 +131,14 @@ pub const CublasLtTable = struct {
 };
 
 const CublasLibrary = struct {
-    lib: native_platform.DynLib,
+    lib: platform.DynLib,
     fns: CublasTable,
 
     fn open(configured_path: ?[]const u8) !CublasLibrary {
         // An explicit training runtime is authoritative: never silently fall
         // back to another major version after a path or symbol failure.
         if (configured_path) |path| try validateTrainingLibraryPath(path);
-        var lib = if (configured_path) |path| try native_platform.DynLib.open(path) else try openAny(&cublas_names);
+        var lib = if (configured_path) |path| try platform.DynLib.open(path) else try openAny(&cublas_names);
         errdefer lib.close();
         return .{
             .lib = lib,
@@ -172,7 +172,7 @@ pub const CublasF32 = struct {
     version: u32,
 
     pub fn init(stream: ?*anyopaque) !CublasF32 {
-        return initWithLibrary(stream, native_platform.env.getenv("ANTFLY_INFERENCE_CUDA_TRAINING_CUBLAS_LIBRARY"));
+        return initWithLibrary(stream, platform.env.getenv("ANTFLY_INFERENCE_CUDA_TRAINING_CUBLAS_LIBRARY"));
     }
 
     pub fn initWithLibrary(stream: ?*anyopaque, configured_path: ?[]const u8) !CublasF32 {
@@ -261,7 +261,7 @@ pub const CublasF32 = struct {
 };
 
 const CublasLtLibrary = struct {
-    lib: native_platform.DynLib,
+    lib: platform.DynLib,
     fns: CublasLtTable,
     handle: CublasLtHandle,
 
@@ -383,13 +383,13 @@ const cublaslt_names = [_][]const u8{
     "/usr/local/cuda-13.2/targets/x86_64-linux/lib/libcublasLt.so.13.4.0.1",
 };
 
-fn openAny(names: []const []const u8) !native_platform.DynLib {
+fn openAny(names: []const []const u8) !platform.DynLib {
     for (names) |name| {
-        if (native_platform.DynLib.open(name)) |lib| return lib else |_| {}
+        if (platform.DynLib.open(name)) |lib| return lib else |_| {}
     }
     return error.CudaLibrariesUnavailable;
 }
 
-fn lookup(lib: *native_platform.DynLib, comptime T: type, name: [:0]const u8) !T {
+fn lookup(lib: *platform.DynLib, comptime T: type, name: [:0]const u8) !T {
     return lib.lookup(T, name) orelse error.CudaLibrariesUnavailable;
 }

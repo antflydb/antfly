@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const backend = @import("backend.zig");
@@ -209,7 +209,7 @@ test "lite connection write modes sync on close" {
 
 test "lite connection propagates fsync policy to native file" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/fsync.aflite", .{tmp.sub_path});
     defer allocator.free(path);
@@ -224,7 +224,7 @@ test "lite connection propagates fsync policy to native file" {
 
 test "lite connection create provisions the default full text index" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/default-index.aflite", .{tmp.sub_path});
     defer allocator.free(path);
@@ -240,7 +240,7 @@ test "lite connection create provisions the default full text index" {
 
 test "lite connection adopts a legacy file whose first write persisted the default namespace" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/legacy-null-identity.aflite", .{tmp.sub_path});
     defer allocator.free(path);
@@ -275,7 +275,7 @@ test "lite connection adopts a legacy file whose first write persisted the defau
 
 test "lite connection open or create initializes a missing file" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/new.aflite", .{tmp.sub_path});
     defer allocator.free(path);

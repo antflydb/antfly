@@ -458,7 +458,7 @@ pub const Backend = runtime_backend.Backend;
 // Keep the concrete type available so host-oriented code remains type-correct
 // when compiled for WASI; `initIoLane` prevents constructing it on hostless
 // targets.
-pub const IoImpl = if (builtin.os.tag == .freestanding) void else platform.Threaded;
+pub const IoImpl = if (builtin.os.tag == .freestanding) void else platform.Io.Threaded;
 pub const default_io_concurrent_limit: u32 = threaded_io_limits.backend_runtime_durable_background;
 
 pub const Config = struct {
@@ -685,7 +685,7 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
         // lanes. Threaded retains concurrent workers until deinit, so a finite
         // ceiling prevents any lane from converting a transient fan-out spike
         // into an unbounded kernel-thread/stack reservation ratchet.
-        io_impl.* = platform.Threaded.init(alloc, .{
+        io_impl.* = platform.Io.Threaded.init(alloc, .{
             .async_limit = boundedIoAsyncLimit(concurrent_limit),
             .concurrent_limit = .limited(concurrent_limit),
         });
@@ -693,7 +693,7 @@ fn initIoLane(alloc: Allocator, concurrent_limit: u32) !*IoImpl {
     }
 }
 
-/// `platform.Threaded` controls `async` and `concurrent` fan-out independently.
+/// `platform.Io.Threaded` controls `async` and `concurrent` fan-out independently.
 /// CPU stages use `Group.async`, so leaving the async side at its default would
 /// bypass the runtime lane's configured backstop. Keep at most one async worker
 /// per additional detected CPU; the caller always runs one task inline.
@@ -728,7 +728,7 @@ const OwnerRegistry = struct {
     };
 
     alloc: Allocator,
-    sync_io: Io = if (builtin.os.tag == .freestanding) .failing else platform.Threaded.global_single_threaded.io(),
+    sync_io: Io = if (builtin.os.tag == .freestanding) .failing else platform.Io.Threaded.global_single_threaded.io(),
     mutex: Io.Mutex = .init,
     idle: Io.Condition = .init,
     states: std.AutoHashMapUnmanaged(u64, State) = .empty,
@@ -1366,7 +1366,7 @@ pub const BackendRuntime = struct {
             // This deliberately overcounts already-submitted work: observing
             // spare capacity must not steal a sibling's as-yet-unused grant.
             // No waiting, task submission, or transport occurs under this lock.
-            const sync_io = platform.Threaded.global_single_threaded.io();
+            const sync_io = platform.Io.Threaded.global_single_threaded.io();
             impl.mutex.lockUncancelable(sync_io);
             const remaining = @backingInt(impl.concurrent_limit) -| impl.busy_count;
             const reserved = self.request_forward_lane_gate.active() * threaded_io_limits.request_forward_workers_per_request;
@@ -1699,7 +1699,7 @@ pub const BackendRuntime = struct {
 
     pub const WorkerOptions = struct {
         capacity: usize = 1,
-        stack_size: usize = (platform.Threaded.InitOptions{}).stack_size,
+        stack_size: usize = (platform.Io.Threaded.InitOptions{}).stack_size,
     };
 
     /// An exclusive scheduling lane, separate from request and durable-job
@@ -1748,7 +1748,7 @@ pub const BackendRuntime = struct {
             return .{ .runtime = self, .borrowed_io = borrowed.general, .capacity = options.capacity };
         }
         const io_impl = try self.alloc.create(IoImpl);
-        io_impl.* = platform.Threaded.init(self.alloc, .{
+        io_impl.* = platform.Io.Threaded.init(self.alloc, .{
             .stack_size = options.stack_size,
             .async_limit = .nothing,
             .concurrent_limit = .limited(options.capacity),

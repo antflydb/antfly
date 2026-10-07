@@ -18,10 +18,10 @@
 //! execution behavior, and live transport/resource ceilings. Legacy catalogs
 //! fail closed instead of making limits up in the client.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 const httpx = @import("httpx");
 const work = @import("antfly_inference_work");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
@@ -1187,7 +1187,7 @@ const DiscoveredCapability = struct {
 };
 
 test "remote Antfly capability cache retains and invalidates routing token with descriptor" {
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var cache = Cache.init(std.testing.allocator, io_impl.io());
     defer cache.deinit();
@@ -1472,7 +1472,7 @@ test "remote Antfly capability v3 rejects unknown exact values" {
 }
 
 test "remote Antfly capability single-flight wait observes deadline and cancellation" {
-    const io = native_platform.debug_io;
+    const io = platform.debug_io;
     var flight = CapabilityFlight{ .key = @constCast("test") };
     try std.testing.expectError(error.Timeout, waitForFlight(io, &flight, .{ .deadline_ns = 0 }));
 
@@ -1484,7 +1484,7 @@ test "remote Antfly capability single-flight wait observes deadline and cancella
 
 test "remote Antfly completed capability flight remains tracked until all waiters release" {
     const alloc = std.testing.allocator;
-    var cache = Cache.init(alloc, native_platform.debug_io);
+    var cache = Cache.init(alloc, platform.debug_io);
     defer cache.deinit();
 
     const flight = try alloc.create(CapabilityFlight);
@@ -1570,7 +1570,7 @@ test "legacy capability discovery preserves owner cancellation after publishing"
 }
 
 test "capability stale revocation prevents transient rediscovery fallback" {
-    var cache = Cache.init(std.testing.allocator, native_platform.debug_io);
+    var cache = Cache.init(std.testing.allocator, platform.debug_io);
     defer cache.deinit();
     const lookup_key = "proxy\x1fmodel\x1fread\x1fauth";
     const owned_key = try std.testing.allocator.dupe(u8, lookup_key);
@@ -1594,7 +1594,7 @@ test "capability stale revocation prevents transient rediscovery fallback" {
 
 pub fn testCapabilityInvalidationFencesActiveFlight() !void {
     const alloc = std.testing.allocator;
-    var cache = Cache.init(alloc, native_platform.debug_io);
+    var cache = Cache.init(alloc, platform.debug_io);
     defer cache.deinit();
     const headers: []const [2][]const u8 = &.{};
     const key = try capabilityCacheKeyAlloc(alloc, "http://proxy", "model", .read, headers);
@@ -1634,7 +1634,7 @@ test "capability invalidation fences an active discovery flight" {
 
 pub fn testCapabilityInvalidationFencesCompletedFlight() !void {
     const alloc = std.testing.allocator;
-    var cache = Cache.init(alloc, native_platform.debug_io);
+    var cache = Cache.init(alloc, platform.debug_io);
     defer cache.deinit();
     const headers: []const [2][]const u8 = &.{};
     const key = try capabilityCacheKeyAlloc(alloc, "http://proxy", "model", .read, headers);

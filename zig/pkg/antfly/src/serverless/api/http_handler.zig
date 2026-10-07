@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ant_json = @import("antfly-json");
@@ -85,7 +85,7 @@ const wal_mod = @import("../wal/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const scraping = @import("antfly_scraping");
-const platform_time = native_platform.time;
+const platform_time = platform.time;
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const graph_metric_segment_mod = @import("../graph_metric_segment/mod.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
@@ -6431,11 +6431,11 @@ fn currentTimeNs() u64 {
 }
 
 fn sleepNs(duration_ns: u64) void {
-    var req = native_platform.c.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),
         .nsec = @intCast(duration_ns % std.time.ns_per_s),
     };
-    while (true) switch (std.posix.errno(native_platform.c.nanosleep(&req, &req))) {
+    while (true) switch (std.posix.errno(platform.c.nanosleep(&req, &req))) {
         .SUCCESS => return,
         .INTR => continue,
         else => return,
@@ -8362,7 +8362,7 @@ test "serverless graph metric qualified scatter is allocation-failure safe" {
             defer alloc.free(scattered);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn graphMetricDependenciesNeeded(query: graph_query_mod.GraphQuery) bool {
@@ -15105,13 +15105,13 @@ test "serverless graph HTTP result copies are allocation-failure safe" {
             defer freeGraphTraversalNode(a, copy);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{node});
+    try platform.allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{node});
 }
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

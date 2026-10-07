@@ -17,7 +17,7 @@
 //! objectstore fault client. Fault selection belongs to VOPR; artifacts,
 //! manifests, WAL, and progress stores remain their production implementations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const vopr = @import("vopr");
@@ -248,8 +248,8 @@ test "serverless object store VOPR composes real artifact manifest WAL and progr
 
 test "standby seed backup restore VOPR retries ambiguous publication and canceled download" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io; // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
-    var tmp = native_platform.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
+    const io = platform.testing.io; // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
+    var tmp = platform.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) seed artifact materialization is the retained native differential boundary
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "source");
     try tmp.dir.writeFile(io, .{ .sub_path = "source/table.sst", .data = "durable-table-state" });
@@ -552,7 +552,7 @@ test "serverless object store VOPR enrichment conflict preserves pruning progres
     // protection. This case exercises eventual collection after those rights
     // have expired, not unsafe immediate deletion of their source versions.
     const lease = @import("../serverless/manifest/read_lease.zig");
-    const gc_now = native_platform.time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
+    const gc_now = platform.time.realtimeNs() + lease.duration_ns + lease.gc_grace_ns + 1;
     runtime.pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
         pub fn read(ptr: *const anyopaque) u64 {
             return @as(*const u64, @ptrCast(@alignCast(ptr))).*;

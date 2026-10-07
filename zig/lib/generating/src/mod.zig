@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const json = @import("antfly-json");
@@ -743,12 +743,12 @@ fn executeWithRetry(
 }
 
 fn sleepMs(ms: u32) void {
-    var req = native_platform.c.timespec{
+    var req = platform.c.timespec{
         .sec = @intCast(ms / std.time.ms_per_s),
         .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
     };
     while (true) {
-        const err = std.posix.errno(native_platform.c.nanosleep(&req, &req));
+        const err = std.posix.errno(platform.c.nanosleep(&req, &req));
         switch (err) {
             .SUCCESS => return,
             .INTR => continue,

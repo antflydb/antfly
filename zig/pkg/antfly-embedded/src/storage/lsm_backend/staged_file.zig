@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 /// Bounded staging for platforms without the POSIX atomic writer. The caller
@@ -103,8 +103,8 @@ pub fn StagedFile(comptime Crc32: type) type {
 }
 
 test "staged output is bounded and patches and checksums cross the disk buffer boundary" {
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "staging", .{ .read = true, .exclusive = true });
     defer file.close(io);
@@ -133,8 +133,8 @@ test "staged output is bounded and patches and checksums cross the disk buffer b
 }
 
 test "a failed staging read prevents later publication" {
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "staging", .{ .read = true });
     defer file.close(io);

@@ -16,7 +16,6 @@
 // HTTP API server for Antfly inference.
 // Uses generated types and server router from openapi-zig.
 
-const native_platform = @import("antfly_platform");
 const std = @import("std");
 const builtin = @import("builtin");
 const build_info = @import("build_info");
@@ -3960,7 +3959,7 @@ pub const Node = struct {
     fn runTensorBatch(raw: *anyopaque, task: executor_microbatch.Task, allocator: std.mem.Allocator, session: backends_mod.Session, permit: ?*@import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, inputs: []const backends_mod.Tensor, supplied: ?InferenceExecutionControl) anyerror![]backends_mod.Tensor {
         const self: *Node = @ptrCast(@alignCast(raw));
         const control = self.bindExecutionControl(null, supplied orelse .{});
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const io = self.inferenceIo(allocator, control.io, &owned_io);
         const selected_gate = gate orelse session.execution_gate orelse return error.MissingExecutionGate;
@@ -3986,7 +3985,7 @@ pub const Node = struct {
             &self.session_manager,
             &required_backend_scratch,
         );
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*threaded| threaded.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -4118,11 +4117,11 @@ pub const Node = struct {
         self: *Node,
         allocator: std.mem.Allocator,
         caller_io: ?std.Io,
-        owned: *?platform.Threaded,
+        owned: *?platform.Io.Threaded,
     ) std.Io {
         if (caller_io) |io| return io;
         if (self.session_manager.io) |io| return io;
-        owned.* = platform.Threaded.init(allocator, .{});
+        owned.* = platform.Io.Threaded.init(allocator, .{});
         return owned.*.?.io();
     }
 
@@ -4210,7 +4209,7 @@ pub const Node = struct {
         model_name: []const u8,
         texts: []const []const u8,
     ) ![][]f32 {
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         return try self.embedDenseTextsDirectWithContext(allocator, io, null, model_name, texts);
@@ -4342,7 +4341,7 @@ pub const Node = struct {
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, 0, 0, 0);
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const request_io = self.inferenceIo(allocator, control.io, &owned_io);
         if (trace) |*value| value.resolve_manifest_ns = embedding_trace.now() -| resolve_started;
@@ -4476,7 +4475,7 @@ pub const Node = struct {
         self.metrics.incRequest("embed_sparse.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -4568,7 +4567,7 @@ pub const Node = struct {
         self.metrics.incRequest("rerank.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const request_io = self.inferenceIo(allocator, io, &owned_io);
 
@@ -4664,7 +4663,7 @@ pub const Node = struct {
         self.metrics.incRequest("rewrite.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, if (model_name.len > 0) model_name else null, "rewriters");
@@ -4747,7 +4746,7 @@ pub const Node = struct {
         self.metrics.incRequest("classify.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const requested = if (model_name.len > 0) model_name else null;
@@ -5281,7 +5280,7 @@ pub const Node = struct {
         try execution_control.update(.loading_model, 0, 1);
         const started_at_ns = embedTimingNowNs();
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -5725,7 +5724,7 @@ pub const Node = struct {
         if (model.kind != .generator) return error.A4bPrefetchRequiresGenerator;
         if (model.backend != null and model.backend.? != .cuda)
             return error.A4bPrefetchRequiresCuda;
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
@@ -5754,7 +5753,7 @@ pub const Node = struct {
     }
 
     fn materializeWarmModelOptionalSessions(self: *Node, allocator: std.mem.Allocator, model: WarmModel) !void {
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, warmModelTaskDir(model.kind));
@@ -5843,7 +5842,7 @@ pub const Node = struct {
         std.log.info("warming inference embedder model={s}", .{model_name});
         const texts = [_][]const u8{"ping"};
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model_name, "embedders");
@@ -5907,7 +5906,7 @@ pub const Node = struct {
         const started_at_ns = embedTimingNowNs();
         std.log.info("warming inference reranker model={s}", .{model_name});
         const documents = [_][]const u8{"pong"};
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model_name, "rerankers");
@@ -5929,7 +5928,7 @@ pub const Node = struct {
         const task_dir = warmModelTaskDir(model.kind);
         const started_at_ns = embedTimingNowNs();
         std.log.info("loading inference {s} model={s}", .{ @tagName(model.kind), model.name });
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model.name, task_dir);
@@ -5948,7 +5947,7 @@ pub const Node = struct {
         model_name: []const u8,
         input: std.json.Value,
     ) ![][]f32 {
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         return try self.embedDenseJsonInputDirectWithContext(allocator, io, null, model_name, input);
@@ -6010,7 +6009,7 @@ pub const Node = struct {
         model_name: []const u8,
         parts: []const DirectDenseEmbedPart,
     ) ![][]f32 {
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         return try self.embedDensePartsDirectWithContext(allocator, io, null, model_name, parts);
@@ -6350,7 +6349,7 @@ pub const Node = struct {
         // Official ONNX GLiNER contracts are singleton executors. They retain
         // their existing path and never pay a native batch-fill delay.
         if (pipeline.session.backend() == .onnx or contract.batch.max_items <= 1) return if (scoring) direct.scoreLabelsBatch(texts, labels) else direct.recognizeWithLabelTokenBatch(texts, labels, label_token, threshold, flat_ner);
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*value| value.deinit();
         const control = self.bindExecutionControl(null, pipeline.execution_control orelse .{});
         const io = self.inferenceIo(allocator, control.io, &owned_io);
@@ -7163,7 +7162,7 @@ pub const Node = struct {
         self.metrics.incRequest("read.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -7357,7 +7356,7 @@ pub const Node = struct {
         for (request.images) |image| try decoded_budget.addImage(image.bytes);
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
@@ -7649,7 +7648,7 @@ pub const Node = struct {
             return error.ReadBatchTooLarge;
         const required_units = @max(admission.units, decoded_budget.requiredUnits());
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const broker_deadline = try directExecutorDeadline(io, deadline_ns);
@@ -8430,7 +8429,7 @@ pub const Node = struct {
         self.metrics.incRequest("transcribe.local");
         defer self.metrics.decActive();
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -8870,7 +8869,7 @@ pub const Node = struct {
         if (parsed.value != .object) return null;
         const name = parsed.value.object.get("model") orelse return null;
         if (name != .string or name.string.len == 0) return null;
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(scratch, null, &owned_io);
         const path = self.resolveRequestModelPath(scratch, io, name.string, "extractors") catch |err| switch (err) {
@@ -8947,7 +8946,7 @@ pub const Node = struct {
             .pipeline = .{ .regex_context = &validators, .validate_value_fn = regex.Context.validateValue },
             .max_response_bytes = @min(64 * 1024 * 1024, response_limit orelse 64 * 1024 * 1024),
         };
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(scratch, null, &owned_io);
         failure.* = .{ .stage = "model" };
@@ -9291,7 +9290,7 @@ pub const Node = struct {
             .include_spans = options.include_spans orelse false,
         };
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
 
@@ -9420,7 +9419,7 @@ pub const Node = struct {
             .input_ids = input_ids,
         };
 
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveRequestModelPath(allocator, io, model_name, "extractors");
@@ -9572,7 +9571,7 @@ pub const Node = struct {
         texts: []const []const u8,
         execution_control: ?InferenceExecutionControl,
     ) ![]u8 {
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveClassificationRequestModelPath(allocator, io, model_name);
@@ -9930,10 +9929,10 @@ pub const Node = struct {
 
     fn findFirstModelInDir(self: *Node, dir_path: []const u8) ?[]const u8 {
         if (!build_options.link_libc) {
-            var dir = std.Io.Dir.cwd().openDir(native_platform.debug_io, dir_path, .{ .iterate = true }) catch return null;
-            defer dir.close(native_platform.debug_io);
+            var dir = std.Io.Dir.cwd().openDir(platform.debug_io, dir_path, .{ .iterate = true }) catch return null;
+            defer dir.close(platform.debug_io);
             var iter = dir.iterate();
-            while (iter.next(native_platform.debug_io) catch null) |entry| {
+            while (iter.next(platform.debug_io) catch null) |entry| {
                 const ename_slice = entry.name;
                 if (ename_slice.len == 0 or ename_slice[0] == '.') continue;
 
@@ -9979,10 +9978,10 @@ pub const Node = struct {
 
     fn findFirstModelDir(self: *Node) ?[]const u8 {
         if (!build_options.link_libc) {
-            var dir = std.Io.Dir.cwd().openDir(native_platform.debug_io, self.config.models_dir, .{ .iterate = true }) catch return null;
-            defer dir.close(native_platform.debug_io);
+            var dir = std.Io.Dir.cwd().openDir(platform.debug_io, self.config.models_dir, .{ .iterate = true }) catch return null;
+            defer dir.close(platform.debug_io);
             var iter = dir.iterate();
-            while (iter.next(native_platform.debug_io) catch null) |entry| {
+            while (iter.next(platform.debug_io) catch null) |entry| {
                 const name_slice = entry.name;
                 if (name_slice.len == 0 or name_slice[0] == '.') continue;
 
@@ -16686,7 +16685,7 @@ pub const Node = struct {
         }
 
         var completion_tokens: usize = 0;
-        var rewrite_owned_io: ?platform.Threaded = null;
+        var rewrite_owned_io: ?platform.Io.Threaded = null;
         defer if (rewrite_owned_io) |*owned| owned.deinit();
         const rewrite_io = self.inferenceIo(ctx.allocator, execution_control.io, &rewrite_owned_io);
         const rewritten = pipeline.rewritePrepared(rewrite_io, &prepared) catch |err|
@@ -19182,7 +19181,7 @@ pub const Node = struct {
         defer arena.deinit();
         const a = arena.allocator();
         const request = try decide_mod.parse(a, request_json);
-        var owned_io: ?platform.Threaded = null;
+        var owned_io: ?platform.Io.Threaded = null;
         defer if (owned_io) |*io_impl| io_impl.deinit();
         const io = self.inferenceIo(a, null, &owned_io);
         const path = try self.resolveRequestModelPath(a, io, request.model, "extractors");
@@ -20799,12 +20798,12 @@ test "gliner boundary v2 direct cancellation and HTTP capacity use existing admi
 }
 
 test "node attachment propagates model eviction scheduling failure" {
-    var unavailable_io = platform.Threaded.init(std.testing.allocator, .{
+    var unavailable_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .nothing,
     });
     defer unavailable_io.deinit();
-    var available_io = platform.Threaded.init(std.testing.allocator, .{
+    var available_io = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .nothing,
         .concurrent_limit = .limited(1),
     });
@@ -25015,7 +25014,7 @@ test "generate batch admission units sum pending generation work" {
 }
 
 test "generate batch shared backends own the outer model lock" {
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     var mutex: std.atomic.Mutex = .unlocked;
 
@@ -27269,7 +27268,7 @@ test "node attachIo wires model session manager" {
     try std.testing.expect(node.session_manager.io != null);
     try std.testing.expect(node.model_manager.session_manager.io != null);
 
-    var owned_io: ?platform.Threaded = null;
+    var owned_io: ?platform.Io.Threaded = null;
     defer if (owned_io) |*io_impl| io_impl.deinit();
     _ = node.inferenceIo(std.testing.allocator, null, &owned_io);
     try std.testing.expect(owned_io == null);
@@ -27279,7 +27278,7 @@ test "unattached direct inference owns its executor fallback" {
     var node = try Node.init(std.testing.allocator, .{});
     defer node.deinit();
 
-    var owned_io: ?platform.Threaded = null;
+    var owned_io: ?platform.Io.Threaded = null;
     defer if (owned_io) |*io_impl| io_impl.deinit();
     _ = node.inferenceIo(std.testing.allocator, null, &owned_io);
     try std.testing.expect(owned_io != null);
@@ -28274,7 +28273,7 @@ test "readiness inventory initializes once and owns its refresh task" {
 
 test "readiness inventory starts with no async worker capacity" {
     const allocator = std.testing.allocator;
-    var threaded = platform.Threaded.init(allocator, .{ .async_limit = .nothing });
+    var threaded = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing });
     defer threaded.deinit();
     var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -29370,10 +29369,10 @@ fn dirContainsModel(path: []const u8) bool {
     }
 
     if (!build_options.link_libc) {
-        var dir = std.Io.Dir.cwd().openDir(native_platform.debug_io, path, .{ .iterate = true }) catch return false;
-        defer dir.close(native_platform.debug_io);
+        var dir = std.Io.Dir.cwd().openDir(platform.debug_io, path, .{ .iterate = true }) catch return false;
+        defer dir.close(platform.debug_io);
         var iter = dir.iterate();
-        while (iter.next(native_platform.debug_io) catch null) |entry| {
+        while (iter.next(platform.debug_io) catch null) |entry| {
             const name = entry.name;
             if (name.len > 5 and std.mem.endsWith(u8, name, ".gguf")) return true;
             if (name.len > 5 and std.mem.endsWith(u8, name, ".onnx")) return true;

@@ -21,7 +21,7 @@
 //! writes only to a caller-owned staging directory and verifies every digest;
 //! publication remains the restore owner's atomic generation swap.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const backup_codec = @import("backup_codec.zig");
@@ -816,10 +816,10 @@ fn pathExists(io: std.Io, path: []const u8) bool {
 
 test "AFB2 native directory round trips through staged extraction" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var source_tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var source_tmp = platform.testing.tmpDir(.{});
     defer source_tmp.cleanup();
-    var output_tmp = native_platform.testing.tmpDir(.{});
+    var output_tmp = platform.testing.tmpDir(.{});
     defer output_tmp.cleanup();
 
     const source_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native", .{source_tmp.sub_path});
@@ -883,8 +883,8 @@ fn materializeTestBaseBlob(
 
 test "AFB2 native delta requires and resolves the exact parent manifest" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const base_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/base", .{tmp.sub_path});

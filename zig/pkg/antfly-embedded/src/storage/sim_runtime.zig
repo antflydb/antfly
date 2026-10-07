@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -1197,8 +1197,8 @@ fn resizeBuffer(alloc: Allocator, buffer: *[]u8, new_len: usize) !void {
 fn realNowNs(_: ?*anyopaque) u64 {
     if (comptime builtin.os.tag == .freestanding) return 0;
 
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => {},
         else => unreachable,
     }
@@ -1209,7 +1209,7 @@ fn realSleepNs(_: ?*anyopaque, ns: u64) void {
     if (ns == 0) return;
     if (comptime builtin.os.tag == .freestanding) return;
 
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Clock.Duration.sleep(.{
         .clock = .awake,

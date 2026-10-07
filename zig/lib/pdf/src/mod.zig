@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -1616,7 +1616,7 @@ const RenderBatchThreadControl = struct {
     stopping: bool = false,
 
     fn init() @This() {
-        return .{ .sync_io = native_platform.Threaded.global_single_threaded.io() };
+        return .{ .sync_io = platform.Io.Threaded.global_single_threaded.io() };
     }
 
     fn startWave(self: *@This(), active_len: usize) void {
@@ -1941,8 +1941,8 @@ const PageRenderWorker = struct {
 
 fn monotonicNowNs() u64 {
     if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .windows) return 0;
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => {},
         else => return 0,
     }
@@ -5419,7 +5419,7 @@ test "bounded render batch uses a caller-owned executor without local threads" {
     defer parsed.deinit();
     var batch = try renderParsedPagesBatchAlloc(alloc, &parsed, &requests, .{
         .max_parallel_pages = 2,
-        .executor_io = native_platform.testing.io,
+        .executor_io = platform.testing.io,
     });
     defer batch.deinit(alloc);
 
@@ -5497,7 +5497,7 @@ test "bounded render batch keeps results alive across fixed-executor scratch res
                 .concurrent_capacity = 2,
                 .run_batch_fn = InlineExecutor.runBatch,
             },
-            .executor_io = native_platform.testing.io,
+            .executor_io = platform.testing.io,
         },
     ));
 }

@@ -205,9 +205,9 @@ test "gliner boundary socket pinned small concurrent admission rejection release
         // driver must therefore run outside that four-lane client executor.
         // One separate driver lane is sufficient; it and the competing
         // client's metadata share this existing 4 MiB bounded owner.
-        var driver = platform.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
+        var driver = platform.Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(1) });
         defer driver.deinit();
-        var second_io = platform.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
+        var second_io = platform.Io.Threaded.init(second_budget.allocator(), .{ .concurrent_limit = .limited(4) });
         defer second_io.deinit();
         var second = httpx.Client.initWithConfig(second_budget.allocator(), second_io.io(), .{
             .timeouts = .{ .connect_ms = wait_ms, .read_ms = request_ms, .write_ms = wait_ms, .request_ms = request_ms },

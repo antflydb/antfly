@@ -16,7 +16,7 @@
 //! Receiver-local serving ownership while its disjoint donor interval is a
 //! shadow. The canonical physical claim keys do not change; normal readers and
 //! participants may only observe the live base interval until atomic publish.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ranges = @import("range_state.zig");
@@ -179,7 +179,7 @@ test "online integrity shadow confines borrowed serving range without changing f
 
 test "relational index system online integrity shadow cleanup publication and reopen preserve serving ownership" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/shadow", .{tmp.sub_path});
     defer alloc.free(path);

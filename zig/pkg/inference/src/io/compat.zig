@@ -13,16 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 /// Temporary bridge for tests that do not yet receive an I/O implementation
 /// from their fixture. Production code must accept and propagate `std.Io`.
 pub fn testingIo() std.Io {
     return if (@import("builtin").is_test)
-        native_platform.testing.io
+        platform.testing.io
     else
-        native_platform.Threaded.global_single_threaded.io();
+        platform.Io.Threaded.global_single_threaded.io();
 }
 
 pub fn cwd() std.Io.Dir {
@@ -30,5 +30,5 @@ pub fn cwd() std.Io.Dir {
 }
 
 pub fn io() std.Io {
-    return native_platform.Threaded.global_single_threaded.io();
+    return platform.Io.Threaded.global_single_threaded.io();
 }

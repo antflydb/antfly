@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -241,7 +241,7 @@ fn admissionFactsJson(db: *DB, alloc: Allocator, request: wire.Request, cancella
 
 test "relational index system online admission facts are unbound read only and reflect durable native epochs" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/facts", .{tmp.sub_path});
     defer alloc.free(path);
@@ -416,7 +416,7 @@ test "relational index system online admission facts are unbound read only and r
 
 test "relational index system native source admission rechecks artifact DDL at commit" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/native-source-artifact-recheck", .{tmp.sub_path});
     defer alloc.free(path);
@@ -461,7 +461,7 @@ test "relational index system native source admission rechecks artifact DDL at c
 
 test "relational index system native source admission rechecks artifact DDL cleanup debt" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cleanup-admission", .{tmp.sub_path});
     defer alloc.free(path);
@@ -539,7 +539,7 @@ test "relational index system native source admission rejects portable latent gr
     const footprint = @import("../artifact_footprint.zig");
     const backup = @import("../portable_backup.zig");
     const keys = @import("../internal_keys.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const from_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/footprint-from", .{tmp.sub_path});
     defer alloc.free(from_path);
@@ -596,7 +596,7 @@ test "relational index system native source admission resumes bounded footprint 
     const alloc = std.testing.allocator;
     const footprint = @import("../artifact_footprint.zig");
     const keys = @import("../internal_keys.zig");
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/footprint-reconcile", .{tmp.sub_path});
     defer alloc.free(path);
@@ -665,7 +665,7 @@ test "relational index system native source admission resumes bounded footprint 
 
 test "relational index system online receiver status preserves persisted positioned rows after reopen" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/receiver-status", .{tmp.sub_path});
     defer alloc.free(path);
@@ -1013,7 +1013,7 @@ fn encodeFragment(alloc: Allocator, scope: source.Scope, fragment: *tail.Fragmen
 
 test "relational index system rewrite admission owns complete immutable historical schema manifest" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/history", .{tmp.sub_path});
     defer alloc.free(path);

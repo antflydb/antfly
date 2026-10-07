@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const build_options = @import("build_options");
@@ -177,7 +177,7 @@ fn exerciseConfig(a: std.mem.Allocator, execution: controller.Execution, attenti
         try parameters.append(scratch, .{ .name = name, .canonical_name = canonical, .dimensions = dims, .values = tensor.asFloat32(), .kind = .original });
     }
     const source = bundle.Identity{ .backbone = config.backbone, .precision = .fp32, .weight = bundle.Digest.of("immutable tiny test weights"), .sidecars = .{ bundle.Digest.of("model"), bundle.Digest.of("encoder"), bundle.Digest.of("tokenizer"), bundle.Digest.of("tokenizer config") } };
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native.safetensors", .{temporary.sub_path});
     defer a.free(path);
@@ -383,7 +383,7 @@ test "boundary native trainer composes immutable batches full and heads training
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const test_allocator = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const test_allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     try exercise(test_allocator, .native, .materialized_v1);
 }
 
@@ -397,7 +397,7 @@ test "boundary native trainer replay attention full and heads jobs preserve canc
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const test_allocator = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const test_allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     try exercise(test_allocator, .native, .replay_tiled_v1);
 }
 
@@ -411,7 +411,7 @@ test "boundary native trainer regional recomputation two layers full and heads p
     // Keep leak checks and failure injection; allocation backtraces are opt-in.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
-    const test_allocator = if (native_platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
+    const test_allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     try exerciseWithActivation(test_allocator, .native, .replay_tiled_v1, .layer_recompute_v1);
 }
 
@@ -527,7 +527,7 @@ fn restoredFlushAdmission(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(controller.Identity{ .optimizer_step = 1, .microbatch_step = 3 }, original.optimizer.identity());
     try std.testing.expectEqual(@as(u32, 1), original.optimizer.owner.accum_count);
     try std.testing.expect((try original.position()).requires_flush);
-    var temporary = native_platform.testing.tmpDir(.{});
+    var temporary = platform.testing.tmpDir(.{});
     defer temporary.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/epoch-end.safetensors", .{temporary.sub_path});
     defer a.free(path);
@@ -780,7 +780,7 @@ test "boundary native trainer prefetches the next microbatch's teacher states wi
         var options = NeckedFixture.options(teacher.teacher(1));
         options.run.epochs = 2;
         options.run.accumulation = 2;
-        if (prefetch) options.distillation.?.prefetch = native_platform.testing.io;
+        if (prefetch) options.distillation.?.prefetch = platform.testing.io;
         var distilled = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), fixture.source, fixture.config, &fixture.samples, fixture.parameters.items, options, null);
         defer distilled.deinit();
         while (try distilled.next(null)) |report| {

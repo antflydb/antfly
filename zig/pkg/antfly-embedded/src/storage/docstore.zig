@@ -46,7 +46,7 @@ fn backoffWriterLockRetry(io: ?std.Io) void {
         return;
     }
     if (comptime builtin.os.tag == .freestanding) return;
-    platform.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
+    platform.Io.Threaded.global_single_threaded.io().sleep(.fromNanoseconds(@intCast(writer_locked_retry_sleep_ns)), .awake) catch {};
 }
 
 const replay_hints = [_]change_journal_mod.TargetHint{
@@ -1283,7 +1283,7 @@ pub const DocStore = struct {
     }
 
     fn payloadPolicyIo() std.Io {
-        return if (builtin.os.tag == .freestanding) .failing else platform.Threaded.global_single_threaded.io();
+        return if (builtin.os.tag == .freestanding) .failing else platform.Io.Threaded.global_single_threaded.io();
     }
 
     fn unlockPayloadPolicy(self: *DocStore) void {
@@ -3583,14 +3583,14 @@ fn tmpPath(buf: []u8) [*:0]const u8 {
     const ts = platform_time.monotonicNs();
     const nonce = @atomicRmw(u64, &tmp_path_nonce, .Add, 1, .monotonic);
     const slice = std.fmt.bufPrint(buf, "{s}{d}-{d}\x00", .{ base, ts, nonce }) catch unreachable;
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     fs_paths.createDirPathPortable(io_impl.io(), std.mem.span(@as([*:0]const u8, @ptrCast(slice.ptr)))) catch unreachable;
     return @ptrCast(slice.ptr);
 }
 
 fn cleanupTmp(path: [*:0]const u8) void {
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }

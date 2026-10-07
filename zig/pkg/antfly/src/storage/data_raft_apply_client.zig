@@ -15,7 +15,7 @@
 
 //! Storage-free consumer for the compiled data-Raft apply/projection owner.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
@@ -413,7 +413,7 @@ pub const RaftApplyStore = struct {
             size: u64,
 
             pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-                std.Io.Dir.cwd().deleteFile(native_platform.debug_io, self.path) catch {};
+                std.Io.Dir.cwd().deleteFile(platform.debug_io, self.path) catch {};
                 alloc.free(self.path);
                 self.* = undefined;
             }
@@ -425,7 +425,7 @@ pub const RaftApplyStore = struct {
             defer abi.antfly_storage_owner_buffer_destroy(&result.path);
             if (result.version != abi.abi_version) return error.InvalidAbiVersion;
             const path = alloc.dupe(u8, result.path.slice()) catch |err| {
-                std.Io.Dir.cwd().deleteFile(native_platform.debug_io, result.path.slice()) catch {};
+                std.Io.Dir.cwd().deleteFile(platform.debug_io, result.path.slice()) catch {};
                 return err;
             };
             return .{ .path = path, .size = result.size };

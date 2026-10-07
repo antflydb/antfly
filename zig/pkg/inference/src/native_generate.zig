@@ -7486,7 +7486,7 @@ fn runServerGenerate(allocator: std.mem.Allocator, io: std.Io, opts: Options, qu
         return error.UnsupportedServerGenerateOption;
     }
 
-    var io_impl = platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
     var http = httpx.Client.init(allocator, io_impl.io());
     defer http.deinit();

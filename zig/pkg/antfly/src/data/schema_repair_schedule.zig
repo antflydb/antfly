@@ -16,7 +16,7 @@
 //! Reconstructible node-local scheduling over durable per-index repair intents.
 //! Only the maintenance owner mutates this queue. Completion is a cached proof
 //! for an exact table/schema/root/ownership identity, never catalog authority.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const Identity = struct {
@@ -199,7 +199,7 @@ test "schema repair queue preserves unstarted turns across a truncated pass" {
 test "schema repair scheduling workload benchmark" {
     if (std.c.getenv("ANTFLY_CATALOG_REPORT_BENCH") == null) return;
     const a = std.heap.c_allocator;
-    var threaded = native_platform.Threaded.init(a, .{});
+    var threaded = platform.Io.Threaded.init(a, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const identity: Identity = .{ .table_id = 1, .schema_hash = 2, .root_generation = 3, .ownership_generation = 4 };

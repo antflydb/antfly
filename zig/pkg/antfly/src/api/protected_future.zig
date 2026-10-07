@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 /// Await mutation work without forwarding caller I/O cancellation to it.
@@ -25,7 +25,7 @@ pub fn wait(io: std.Io, future: *std.Io.Future(void)) void {
 }
 
 test "caller cancellation does not interrupt protected child work" {
-    var pool = native_platform.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
+    var pool = platform.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(8) });
     defer pool.deinit();
     const io = pool.io();
     const State = struct {

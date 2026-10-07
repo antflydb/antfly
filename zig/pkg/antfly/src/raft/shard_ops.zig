@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 const builtin = @import("builtin");
 const metadata_actions = @import("../metadata/transition_actions.zig");
@@ -140,11 +140,11 @@ pub const OwnedShardOperationAdapter = struct {
         references: usize = 1,
 
         fn lock(self: *State) void {
-            self.mutex.lockUncancelable(native_platform.debug_io);
+            self.mutex.lockUncancelable(platform.debug_io);
         }
 
         fn unlock(self: *State) void {
-            self.mutex.unlock(native_platform.debug_io);
+            self.mutex.unlock(platform.debug_io);
         }
 
         fn retain(self: *State) void {
@@ -191,7 +191,7 @@ pub const OwnedShardOperationAdapter = struct {
             bucket.unlock();
             defer self.unlock();
             while (self.active_calls != 0) {
-                self.drained.waitUncancelable(native_platform.debug_io, &self.mutex);
+                self.drained.waitUncancelable(platform.debug_io, &self.mutex);
             }
         }
     };
@@ -201,11 +201,11 @@ pub const OwnedShardOperationAdapter = struct {
         head: ?*State = null,
 
         fn lock(self: *RegistryBucket) void {
-            self.mutex.lockUncancelable(native_platform.debug_io);
+            self.mutex.lockUncancelable(platform.debug_io);
         }
 
         fn unlock(self: *RegistryBucket) void {
-            self.mutex.unlock(native_platform.debug_io);
+            self.mutex.unlock(platform.debug_io);
         }
     };
 
@@ -221,18 +221,18 @@ pub const OwnedShardOperationAdapter = struct {
             released: bool = false,
 
             fn waitUntilEntered(self: *Gate) void {
-                self.mutex.lockUncancelable(native_platform.debug_io);
-                defer self.mutex.unlock(native_platform.debug_io);
+                self.mutex.lockUncancelable(platform.debug_io);
+                defer self.mutex.unlock(platform.debug_io);
                 while (!self.entered) {
-                    self.changed.waitUncancelable(native_platform.debug_io, &self.mutex);
+                    self.changed.waitUncancelable(platform.debug_io, &self.mutex);
                 }
             }
 
             fn release(self: *Gate) void {
-                self.mutex.lockUncancelable(native_platform.debug_io);
-                defer self.mutex.unlock(native_platform.debug_io);
+                self.mutex.lockUncancelable(platform.debug_io);
+                defer self.mutex.unlock(platform.debug_io);
                 self.released = true;
-                self.changed.broadcast(native_platform.debug_io);
+                self.changed.broadcast(platform.debug_io);
             }
         };
 
@@ -240,12 +240,12 @@ pub const OwnedShardOperationAdapter = struct {
 
         fn pauseBeforeAcquire() void {
             const active = gate orelse return;
-            active.mutex.lockUncancelable(native_platform.debug_io);
-            defer active.mutex.unlock(native_platform.debug_io);
+            active.mutex.lockUncancelable(platform.debug_io);
+            defer active.mutex.unlock(platform.debug_io);
             active.entered = true;
-            active.changed.broadcast(native_platform.debug_io);
+            active.changed.broadcast(platform.debug_io);
             while (!active.released) {
-                active.changed.waitUncancelable(native_platform.debug_io, &active.mutex);
+                active.changed.waitUncancelable(platform.debug_io, &active.mutex);
             }
         }
     } else struct {
@@ -260,7 +260,7 @@ pub const OwnedShardOperationAdapter = struct {
             state.lock();
             std.debug.assert(state.active_calls > 0);
             state.active_calls -= 1;
-            if (state.active_calls == 0) state.drained.broadcast(native_platform.debug_io);
+            if (state.active_calls == 0) state.drained.broadcast(platform.debug_io);
             state.unlock();
             self.* = undefined;
         }

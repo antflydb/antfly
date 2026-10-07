@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -1414,7 +1414,7 @@ test "context-aware embedder receives the request lifetime and fails closed when
         .dense_embed_with_context_fn = Probe.controlled,
     };
     const context = RequestContext{
-        .io = native_platform.testing.io,
+        .io = platform.testing.io,
         .deadline_ns = std.math.maxInt(u64),
     };
     const vector = try controlled.embedDenseWithContext(std.testing.allocator, "model", "text", 3, context);

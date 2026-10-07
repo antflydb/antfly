@@ -204,7 +204,7 @@ test "mounted SQL ADD PRIMARY KEY publishes only validated fresh generation" {
     defer alloc.free(data_catalog);
     const snapshots = try std.fmt.allocPrint(alloc, "{s}/snapshots", .{root});
     defer alloc.free(snapshots);
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     var metadata = try metadata_runtime.Server.init(process_alloc, .{
         .local_node_id = 1,

@@ -15,7 +15,7 @@
 
 //! One supervised immutable-export job per native owner. RPC deadlines govern
 //! scheduling/polling, never the lifetime of an already admitted export.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -110,8 +110,8 @@ pub const Job = struct {
 
 test "relational index system source publication job survives polling deadlines reuses receipts and joins on close" {
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/publisher", .{tmp.sub_path});
     defer alloc.free(path);

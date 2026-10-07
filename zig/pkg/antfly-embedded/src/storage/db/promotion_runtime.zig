@@ -31,11 +31,11 @@
 //! fields and unions aliases. The stage advances `applied_sequence` only after
 //! the upserts return.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
-const platform_sync = native_platform.sync;
-const AtomicU64 = native_platform.atomic.Value(u64);
+const platform_sync = platform.sync;
+const AtomicU64 = platform.atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const internal_keys = @import("../internal_keys.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -510,9 +510,9 @@ pub const PromotionRuntime = struct {
     sink_available: std.atomic.Value(bool),
     missing_sink_blocked: std.atomic.Value(bool),
     missing_sink_policy: MissingSinkPolicy,
-    applied_sequence: native_platform.atomic.Value(u64),
-    target_sequence: native_platform.atomic.Value(u64),
-    error_count: native_platform.atomic.Value(u64),
+    applied_sequence: platform.atomic.Value(u64),
+    target_sequence: platform.atomic.Value(u64),
+    error_count: platform.atomic.Value(u64),
     shutdown_flag: std.atomic.Value(bool),
     catch_up_mutex: std.atomic.Mutex = .unlocked,
     worker_started: std.atomic.Value(bool) = .init(false),
@@ -1733,7 +1733,7 @@ test "PromotionRuntime pending retry delay backs off to a bounded maximum" {
 }
 
 test "PromotionRuntime pending retry wait is interrupted by a worker signal" {
-    var io_impl = native_platform.Threaded.init(testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

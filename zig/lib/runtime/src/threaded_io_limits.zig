@@ -13,13 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Process-lifetime `native_platform.Threaded` concurrency ceilings.
+//! Process-lifetime `platform.Io.Threaded` concurrency ceilings.
 //!
 //! Threaded executors retain workers until deinitialization. Long-lived owners
 //! must therefore use a finite limit even when their normal workload has tighter
 //! admission control. These values are backstops, not scheduling targets.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 /// General ceiling for process- or database-lifetime executors. Production
@@ -109,16 +109,16 @@ pub const BackendRuntimeLaneLimits = struct {
 /// allowing unbounded retention.
 pub const serverless_object_store: u32 = service;
 
-pub fn initService(alloc: std.mem.Allocator) native_platform.Threaded {
-    if (comptime @import("builtin").os.tag == .freestanding) return native_platform.Threaded.init(alloc, .{});
-    return native_platform.Threaded.init(alloc, .{
+pub fn initService(alloc: std.mem.Allocator) platform.Io.Threaded {
+    if (comptime @import("builtin").os.tag == .freestanding) return platform.Io.Threaded.init(alloc, .{});
+    return platform.Io.Threaded.init(alloc, .{
         .concurrent_limit = .limited(service),
     });
 }
 
-pub fn initServerlessObjectStore(alloc: std.mem.Allocator) native_platform.Threaded {
-    if (comptime @import("builtin").os.tag == .freestanding) return native_platform.Threaded.init(alloc, .{});
-    return native_platform.Threaded.init(alloc, .{
+pub fn initServerlessObjectStore(alloc: std.mem.Allocator) platform.Io.Threaded {
+    if (comptime @import("builtin").os.tag == .freestanding) return platform.Io.Threaded.init(alloc, .{});
+    return platform.Io.Threaded.init(alloc, .{
         .concurrent_limit = .limited(serverless_object_store),
     });
 }

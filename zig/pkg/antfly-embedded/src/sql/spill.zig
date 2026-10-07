@@ -15,7 +15,7 @@
 
 //! Statement-owned temporary storage and bounded external merge runs. Files
 //! are private, quota-controlled, snapshot-local and deleted on every unwind.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const operators = @import("operators.zig");
@@ -2093,7 +2093,7 @@ test "SQL spill runs merge under bounded memory preserve exact datum tags and cl
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var sorter = Sort.init(a, &manager, &.{.{}}, 8192);
     defer sorter.deinit();
@@ -2127,7 +2127,7 @@ test "SQL spill quotas cancellation and corrupt records fail without leaked file
         }
     };
     var canceled = false;
-    var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &canceled, .checkpoint = Hook.check, .max_bytes = 128 };
+    var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &canceled, .checkpoint = Hook.check, .max_bytes = 128 };
     defer manager.deinit();
     var file = try manager.create();
     defer file.close();
@@ -2148,9 +2148,9 @@ test "SQL spill quotas cancellation and corrupt records fail without leaked file
     try std.testing.expectEqual(@as(usize, 0), manager.files);
     const name = manager.directory_name;
     manager.deinit();
-    const parent = try std.Io.Dir.openDirAbsolute(native_platform.testing.io, "/tmp", .{});
-    defer parent.close(native_platform.testing.io);
-    try std.testing.expectError(error.FileNotFound, parent.openDir(native_platform.testing.io, &name, .{}));
+    const parent = try std.Io.Dir.openDirAbsolute(platform.testing.io, "/tmp", .{});
+    defer parent.close(platform.testing.io);
+    try std.testing.expectError(error.FileNotFound, parent.openDir(platform.testing.io, &name, .{}));
 }
 
 test "SQL compressed spill validates decoded quotas and preserves matched flags" {
@@ -2159,7 +2159,7 @@ test "SQL compressed spill validates decoded quotas and preserves matched flags"
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var file = try manager.create();
     defer file.close();
@@ -2186,7 +2186,7 @@ test "SQL buffered spill joins outstanding writes on cancelled close" {
         }
     };
     var canceled = false;
-    var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &canceled, .checkpoint = Hook.check };
+    var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &canceled, .checkpoint = Hook.check };
     defer manager.deinit();
     var file = try manager.create();
     defer file.close();
@@ -2210,7 +2210,7 @@ test "SQL multiway spill reduces rewrite bytes under the same memory budget" {
         var budget: @import("memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = 256 * 1024 };
         const a = budget.allocator();
         {
-            var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+            var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
             defer manager.deinit();
             var sort = Sort.init(a, &manager, &.{.{}}, 64 * 1024);
             sort.merge_fan_in = fan_in;
@@ -2241,7 +2241,7 @@ test "SQL typed sequential blocks preserve tags nulls compression restart and qu
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     var file = try Sequential.init(&manager, 64 * 1024);
     defer file.close();
@@ -2271,7 +2271,7 @@ test "SQL sequential runs mix wide records and typed blocks across restarts" {
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
     defer manager.deinit();
     var file = try Sequential.init(&manager, 4096);
     defer file.close();
@@ -2311,19 +2311,19 @@ test "SQL concurrent spill files enforce one quota and reclaim all reservations"
     };
     var dummy: u8 = 0;
     var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
-    var manager: Manager = .{ .alloc = budget.allocator(), .io = native_platform.testing.io, .context = &dummy, .checkpoint = Worker.check, .max_bytes = 64 * 1024, .async_writes = false };
+    var manager: Manager = .{ .alloc = budget.allocator(), .io = platform.testing.io, .context = &dummy, .checkpoint = Worker.check, .max_bytes = 64 * 1024, .async_writes = false };
     defer manager.deinit();
     var tasks: [4]std.Io.Future(anyerror!usize) = undefined;
     var started: usize = 0;
     defer for (tasks[0..started]) |*task| {
-        _ = task.cancel(native_platform.testing.io) catch 0;
+        _ = task.cancel(platform.testing.io) catch 0;
     };
     for (&tasks) |*task| {
-        task.* = try native_platform.testing.io.concurrent(Worker.run, .{&manager});
+        task.* = try platform.testing.io.concurrent(Worker.run, .{&manager});
         started += 1;
     }
     var accepted: usize = 0;
-    for (&tasks) |*task| accepted += try task.await(native_platform.testing.io);
+    for (&tasks) |*task| accepted += try task.await(platform.testing.io);
     started = 0;
     try std.testing.expect(accepted != 0);
     try std.testing.expect(manager.peak_bytes <= manager.max_bytes);
@@ -2341,7 +2341,7 @@ test "SQL parallel sort runs preserve stable order and join on early close" {
         var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 2 * 1024 * 1024 };
         const a = budget.allocator();
         {
-            var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+            var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
             defer manager.deinit();
             var sort = Sort.init(a, &manager, &.{.{}}, 256 * 1024);
             defer sort.deinit();
@@ -2372,7 +2372,7 @@ test "SQL radix sort preserves native key direction and ordinal ties" {
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     for ([_]bool{ false, true }) |descending| {
         var sort = Sort.init(a, &manager, &.{.{ .descending = descending }}, 8 * 1024 * 1024);
@@ -2404,7 +2404,7 @@ test "SQL independent merge compaction jobs preserve sorted output and release f
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: Manager = .{ .alloc = a, .io = platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
     defer manager.deinit();
     {
         var sort = Sort.init(a, &manager, &.{.{}}, 1024 * 1024);

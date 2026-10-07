@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -117,7 +117,7 @@ pub const Pruner = struct {
         // This short, durable ownership barrier makes every older publisher
         // incapable of committing HEAD. Do not hold it across graph traversal:
         // newer publishers use higher tokens and pin their source manifests.
-        var fallback_io = native_platform.Threaded.init(self.alloc, .{});
+        var fallback_io = platform.Io.Threaded.init(self.alloc, .{});
         defer fallback_io.deinit();
         const io = if (cancellation) |token| token.io else fallback_io.io();
         const provider = try self.progress.workLeaseProvider();
@@ -477,7 +477,7 @@ fn freeOwnedKeys(alloc: Allocator, map: *std.StringHashMapUnmanaged(void)) void 
 
 test "serverless retention fences upload attempts and rediscovers late orphan uploads" {
     const alloc = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var memory = objectstore.MemoryClient.init(alloc);
@@ -972,7 +972,7 @@ test "serverless retention never sweeps recreated candidate artifacts or deletes
             };
             try manifests.put(candidate);
             // Reserve the old worker's token; the collector obtains token 2.
-            var old_lease = (try work_lease.acquireHeld(try progress.workLeaseProvider(), native_platform.testing.io, "docs", "old", std.time.ns_per_s)).?;
+            var old_lease = (try work_lease.acquireHeld(try progress.workLeaseProvider(), platform.testing.io, "docs", "old", std.time.ns_per_s)).?;
             try std.testing.expect(try old_lease.release());
             var new_refs = [_]manifest_mod.ArtifactRef{.{ .kind = .document_segment, .artifact_id = replacement_artifact.artifact_id, .checksum = replacement_artifact.checksum, .byte_len = replacement_artifact.byte_len }};
             candidate.publication_fencing_token = 3;
@@ -1201,7 +1201,7 @@ test "serverless retention resumes artifact cleanup after cancellation" {
     };
     var cancel_state = CancelAfterFirstDelete{ .requested = &requested };
     const token = (maintenance_cancellation.Token{
-        .io = native_platform.testing.io,
+        .io = platform.testing.io,
         .requested = &requested,
     }).withCheckpoint(&cancel_state, CancelAfterFirstDelete.checkpoint);
 
@@ -1304,7 +1304,7 @@ test "serverless retention pruner retains recent manifests and truncates WAL his
     var pruner = Pruner.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
     // Completed writers conservatively leave their source pins until expiry.
     // Exercise reclamation after that protection interval, never through it.
-    const gc_now = native_platform.time.realtimeNs() + read_lease.duration_ns + read_lease.gc_grace_ns + 1;
+    const gc_now = platform.time.realtimeNs() + read_lease.duration_ns + read_lease.gc_grace_ns + 1;
     pruner.read_lease_clock = .{ .ptr = &gc_now, .unix_fn = struct {
         fn now(ptr: *const anyopaque) u64 {
             return @as(*const u64, @ptrCast(@alignCast(ptr))).*;
@@ -1409,11 +1409,11 @@ test "serverless retention concurrent pruners observe gc watermark conflict" {
     };
     defer if (state.result_a) |*result| result.deinit(alloc);
     defer if (state.result_b) |*result| result.deinit(alloc);
-    var thread_a = try native_platform.testing.io.concurrent(RaceState.runA, .{&state});
-    defer thread_a.await(native_platform.testing.io);
-    var thread_b = try native_platform.testing.io.concurrent(RaceState.runB, .{&state});
-    thread_a.await(native_platform.testing.io);
-    thread_b.await(native_platform.testing.io);
+    var thread_a = try platform.testing.io.concurrent(RaceState.runA, .{&state});
+    defer thread_a.await(platform.testing.io);
+    var thread_b = try platform.testing.io.concurrent(RaceState.runB, .{&state});
+    thread_a.await(platform.testing.io);
+    thread_b.await(platform.testing.io);
 
     try std.testing.expect(state.result_a != null);
     try std.testing.expect(state.result_b != null);
@@ -1425,8 +1425,8 @@ test "serverless retention concurrent pruners observe gc watermark conflict" {
 
 var test_nonce: std.atomic.Value(u64) = .init(0);
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn nowNs() u64 {

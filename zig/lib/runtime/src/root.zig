@@ -13,7 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub const Threaded = @import("antfly_platform").Threaded;
+pub const Io = @import("antfly_platform").Io;
+/// Compatibility export for runtime clients; new owners use Io.Threaded.
+pub const Threaded = Io.Threaded;
 
 pub const error_abi = @import("runtime_error_abi.zig");
 pub const http_abi = @import("runtime_http_abi.zig");

@@ -21,7 +21,7 @@
 //! leaves a complete recoverable generation. Old artifacts are removed only
 //! after CURRENT is durably replaced.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -159,7 +159,7 @@ pub const RetainedSegment = union(enum) {
             },
             .heap => |data| alloc.free(data),
             .mapped => |data| if (builtin.os.tag != .freestanding and builtin.os.tag != .windows and builtin.os.tag != .wasi)
-                native_platform.filesystem.unmapMemory(data)
+                platform.filesystem.unmapMemory(data)
             else
                 unreachable,
         }
@@ -205,7 +205,7 @@ test "storage.posting shared immutable segments retain namespace-bound payload o
 test "storage.posting retired segment owns deletion storage past provider shutdown" {
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
@@ -556,7 +556,7 @@ pub const Store = struct {
     ) !void {
         if (self.read_only) return error.ReadOnly;
         const trace = @import("dense_perf_experiments.zig").enabled("ANTFLY_EXPERIMENT_CAPTURE_STAGES");
-        const started = if (trace) native_platform.time.monotonicNs() else 0;
+        const started = if (trace) platform.time.monotonicNs() else 0;
         if (self.poisoned) return error.PostingStoreRequiresReopen;
         if (self.checkpoint == null) return error.MissingPostingCheckpoint;
         if (records.len == 0) return error.EmptyPostingWalBatch;
@@ -580,7 +580,7 @@ pub const Store = struct {
 
         const wal_path = try self.walPathAlloc(self.wal_generation);
         defer self.alloc.free(wal_path);
-        const encoded_at = if (trace) native_platform.time.monotonicNs() else 0;
+        const encoded_at = if (trace) platform.time.monotonicNs() else 0;
         self.storage.appendFileAbsolute(self.alloc, wal_path, writer.bytes(), options.sync) catch |err| {
             // The storage error may be ambiguous (for example fsync failed
             // after the append reached the page cache). Refuse retries on this
@@ -601,8 +601,8 @@ pub const Store = struct {
         self.last_committed_batch = batch_id;
         self.covered_source_sequence = covered_source_sequence;
         if (trace) std.log.info("dense WAL stages batch={} sequence={} records={} bytes={} encode_ns={} append_sync_ns={} sync={}", .{
-            batch_id,              covered_source_sequence,                          records.len,  writer.bytes().len,
-            encoded_at -| started, native_platform.time.monotonicNs() -| encoded_at, options.sync,
+            batch_id,              covered_source_sequence,                   records.len,  writer.bytes().len,
+            encoded_at -| started, platform.time.monotonicNs() -| encoded_at, options.sync,
         });
     }
 
@@ -1386,13 +1386,13 @@ pub const Store = struct {
                     @import("antfly_hash").Crc32.hash(mapped) == descriptor.checksum);
                 if (published_checksum_matches) {
                     if (posting_segment.Reader.init(mapped)) |_| {
-                        native_platform.filesystem.adviseMemory(mapped.ptr, mapped.len, native_platform.c.MADV.RANDOM) catch {};
+                        platform.filesystem.adviseMemory(mapped.ptr, mapped.len, platform.c.MADV.RANDOM) catch {};
                         var payload = RetainedSegment{ .mapped = mapped };
                         errdefer payload.deinit(self.alloc);
                         return try RetainedSegment.share(self.alloc, payload, self.root_dir, descriptor);
                     } else |_| {}
                 }
-                native_platform.filesystem.unmapMemory(mapped);
+                platform.filesystem.unmapMemory(mapped);
             } else |_| {}
         }
         var payload = RetainedSegment{ .heap = try self.readSegmentAllocFor(descriptor) };

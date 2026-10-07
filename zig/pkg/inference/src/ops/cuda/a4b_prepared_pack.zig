@@ -25,7 +25,7 @@
 //! shard before exposing expert slices, so an admitted pack cannot turn silent
 //! bit rot or an unsampled modification into model output drift.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -563,13 +563,13 @@ pub fn prefetchInstalled(
 test "prepared pack validates source identity geometry bounds and shards" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(root);
     const source_path = try std.fs.path.join(allocator, &.{ root, "model.gguf" });
     defer allocator.free(source_path);
-    try std.Io.Dir.cwd().writeFile(native_platform.testing.io, .{ .sub_path = source_path, .data = "canonical-source" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = source_path, .data = "canonical-source" });
     const output_path = try std.fs.path.join(allocator, &.{ root, default_directory_name });
     defer allocator.free(output_path);
     const geometry = GeometryIdentity{
@@ -583,7 +583,7 @@ test "prepared pack validates source identity geometry bounds and shards" {
     try std.testing.expect(!(try preflightInstalled(allocator, root, source_path, geometry)));
     const a = "abcdefgh";
     const b = "ijklmnopqr";
-    const report = try write(allocator, native_platform.testing.io, source_path, output_path, geometry, &.{
+    const report = try write(allocator, platform.testing.io, source_path, output_path, geometry, &.{
         .{ .name = "layer.0.w13", .bytes = a },
         .{ .name = "layer.0.w2", .bytes = b },
     }, 2);
@@ -591,7 +591,7 @@ test "prepared pack validates source identity geometry bounds and shards" {
     try std.testing.expectEqual(@as(u64, a.len + b.len), report.total_source_bytes);
     try std.testing.expectError(error.A4bPreparedPackAlreadyExists, write(
         allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         source_path,
         output_path,
         geometry,
@@ -610,9 +610,9 @@ test "prepared pack validates source identity geometry bounds and shards" {
     try std.testing.expectError(error.A4bPreparedPackGeometryMismatch, load(allocator, root, source_path, wrong));
     const verified = try verify(allocator, root, source_path, geometry);
     try std.testing.expectEqual(@as(usize, 2), verified.shard_count);
-    var inline_io = native_platform.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+    var inline_io = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
     defer inline_io.deinit();
-    for ([_]std.Io{ native_platform.testing.io, inline_io.io() }) |io| {
+    for ([_]std.Io{ platform.testing.io, inline_io.io() }) |io| {
         const prefetched = (try prefetchInstalled(io, allocator, root, source_path, 4)).?;
         try std.testing.expectEqual(@as(usize, 2), prefetched.shard_count);
         try std.testing.expectEqual(@as(u64, a.len + b.len), prefetched.bytes);
@@ -630,13 +630,13 @@ test "prepared pack digest helper is stable" {
 test "prepared pack hot load rejects corruption outside sampled identity windows" {
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(root);
     const source_path = try std.fs.path.join(allocator, &.{ root, "model.gguf" });
     defer allocator.free(source_path);
-    try std.Io.Dir.cwd().writeFile(native_platform.testing.io, .{ .sub_path = source_path, .data = "canonical-source" });
+    try std.Io.Dir.cwd().writeFile(platform.testing.io, .{ .sub_path = source_path, .data = "canonical-source" });
     const output_path = try std.fs.path.join(allocator, &.{ root, default_directory_name });
     defer allocator.free(output_path);
     const geometry = GeometryIdentity{
@@ -650,7 +650,7 @@ test "prepared pack hot load rejects corruption outside sampled identity windows
     const payload = try allocator.alloc(u8, 2 * 1024 * 1024);
     defer allocator.free(payload);
     @memset(payload, 0x5a);
-    _ = try write(allocator, native_platform.testing.io, source_path, output_path, geometry, &.{.{
+    _ = try write(allocator, platform.testing.io, source_path, output_path, geometry, &.{.{
         .name = "large-packed-source",
         .bytes = payload,
     }}, 1);
@@ -658,13 +658,13 @@ test "prepared pack hot load rejects corruption outside sampled identity windows
 
     const shard_path = try std.fs.path.join(allocator, &.{ output_path, "experts-00.bin" });
     defer allocator.free(shard_path);
-    var shard_file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, shard_path, .{ .mode = .read_write });
-    defer shard_file.close(native_platform.testing.io);
+    var shard_file = try std.Io.Dir.cwd().openFile(platform.testing.io, shard_path, .{ .mode = .read_write });
+    defer shard_file.close(platform.testing.io);
     // For a 2 MiB shard the first sampled window ends at 64 KiB and the
     // second starts above 128 KiB. This byte is deliberately invisible to the
     // quick identity while remaining covered by the manifest's full digest.
-    try shard_file.writePositionalAll(native_platform.testing.io, &.{0xa5}, 96 * 1024);
-    try shard_file.sync(native_platform.testing.io);
+    try shard_file.writePositionalAll(platform.testing.io, &.{0xa5}, 96 * 1024);
+    try shard_file.sync(platform.testing.io);
 
     try std.testing.expect(try preflightInstalled(allocator, root, source_path, geometry));
     try std.testing.expectError(

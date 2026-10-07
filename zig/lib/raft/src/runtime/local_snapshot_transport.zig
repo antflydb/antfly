@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const core = @import("../core/mod.zig");
@@ -24,7 +24,7 @@ pub const LocalSnapshotTransport = struct {
     root_dir: []const u8,
 
     pub fn init(alloc: std.mem.Allocator, root_dir: []const u8) !LocalSnapshotTransport {
-        var io: native_platform.Threaded = .init(alloc, .{});
+        var io: platform.Io.Threaded = .init(alloc, .{});
         defer io.deinit();
         try std.Io.Dir.cwd().createDirPath(io.io(), root_dir);
         return .{
@@ -56,7 +56,7 @@ pub const LocalSnapshotTransport = struct {
         else
             try std.fmt.allocPrint(self.alloc, "{d}", .{req.to});
         defer self.alloc.free(snapshot_key);
-        var io: native_platform.Threaded = .init(self.alloc, .{});
+        var io: platform.Io.Threaded = .init(self.alloc, .{});
         defer io.deinit();
         const data_path = try std.fmt.allocPrint(self.alloc, "{s}/{d}-{s}.bin", .{ self.root_dir, req.group_id, snapshot_key });
         defer self.alloc.free(data_path);
@@ -86,7 +86,7 @@ pub const LocalSnapshotTransport = struct {
         receiver: snapshot_transport_iface.SnapshotReceiver,
     ) !void {
         const self: *LocalSnapshotTransport = @ptrCast(@alignCast(ptr));
-        var io: native_platform.Threaded = .init(self.alloc, .{});
+        var io: platform.Io.Threaded = .init(self.alloc, .{});
         defer io.deinit();
         const data_path = try std.fmt.allocPrint(self.alloc, "{s}/{d}-{s}.bin", .{ self.root_dir, req.group_id, req.locator.snapshot_id });
         defer self.alloc.free(data_path);
@@ -218,7 +218,7 @@ test "local snapshot transport sends and fetches snapshot bytes" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshots", .{tmp.sub_path});
     defer std.testing.allocator.free(root_dir);

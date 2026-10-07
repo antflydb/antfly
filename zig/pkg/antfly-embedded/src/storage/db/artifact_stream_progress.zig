@@ -17,7 +17,7 @@
 //! runs outside the writer; commit repeats causal fences and predecessor CAS.
 //! Root-only scope closure is receiver-derived, not a sender claim. Neither
 //! enumeration nor one closed stream is document discharge or replay ACK.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const census = @import("artifact_stream_census.zig");
@@ -390,7 +390,7 @@ test "ordered artifact inventory authored vectors close provider scope without r
     const authored = @import("artifact_authored_acceptance.zig");
     const codec = @import("enrichment/artifact_codec.zig");
     for ([_]bool{ true, false }) |dense| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/authored-closure", .{tmp.sub_path});
         defer alloc.free(path);
@@ -486,7 +486,7 @@ test "ordered artifact inventory document stream closure requires current output
     const input = @import("artifact_producer_input.zig");
     const keys = @import("../internal_keys.zig");
     for ([_]bool{ true, false }) |dense| {
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/document-closure", .{tmp.sub_path});
         defer alloc.free(path);
@@ -617,7 +617,7 @@ test "ordered artifact inventory document stream closure requires current output
                         defer closure.deinit();
                     }
                 };
-                try native_platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan });
+                try platform.allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan });
             }
             if (pass == 0) {
                 // Unrelated writes must not restart an owner-local stream.

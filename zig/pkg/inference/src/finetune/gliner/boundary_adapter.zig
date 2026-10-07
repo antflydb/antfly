@@ -16,7 +16,7 @@
 //! Bounded PEFT LoRA/DoRA artifacts for the published boundary architectures.
 //! Receipts bind bytes and training provenance; they are not quality approval
 //! or publisher signatures. Every base parameter is frozen in this profile.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const graph = @import("boundary_peft_graph.zig");
@@ -817,9 +817,9 @@ fn testFill(values: []f32, frequency: f32, scale: f32) void {
 test "GLiNER2.5 adapter files roundtrip LoRA DoRA all backbones and merged eval math" {
     const a = std.testing.allocator;
     const ml = @import("ml").graph;
-    var temp = native_platform.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
-    const parent = try temp.dir.realPathFileAlloc(native_platform.testing.io, ".", a);
+    const parent = try temp.dir.realPathFileAlloc(platform.testing.io, ".", a);
     defer a.free(parent);
     for ([_]model.Backbone{ .small, .base, .multi }) |backbone| for ([_]graph.Kind{ .lora, .dora }) |kind| {
         errdefer std.debug.print("adapter artifact {s}/{s}\n", .{ @tagName(backbone), @tagName(kind) });
@@ -856,9 +856,9 @@ test "GLiNER2.5 adapter files roundtrip LoRA DoRA all backbones and merged eval 
         if (kind == .dora) try std.testing.expect(std.mem.endsWith(u8, snapshot.tensors[2].name, ".lora_magnitude_vector"));
         const directory = try std.fs.path.join(scratch, &.{ parent, try std.fmt.allocPrint(scratch, "{s}-{s}", .{ @tagName(backbone), @tagName(kind) }) });
         const binding = testBinding(backbone);
-        var exported = try exportDirectory(a, native_platform.testing.io, directory, snapshot.config_bytes, snapshot.tensors, binding, .{}, null);
+        var exported = try exportDirectory(a, platform.testing.io, directory, snapshot.config_bytes, snapshot.tensors, binding, .{}, null);
         defer exported.deinit();
-        try std.testing.expectError(error.PathAlreadyExists, exportDirectory(a, native_platform.testing.io, directory, snapshot.config_bytes, snapshot.tensors, binding, .{}, null));
+        try std.testing.expectError(error.PathAlreadyExists, exportDirectory(a, platform.testing.io, directory, snapshot.config_bytes, snapshot.tensors, binding, .{}, null));
         var loaded = try importDirectory(a, directory, binding, .{}, null);
         defer loaded.deinit();
         try std.testing.expectEqual(@as(usize, 1), loaded.modules.len);
@@ -957,9 +957,9 @@ test "GLiNER2.5 adapter files reject unsupported malformed config and clean canc
     left[0] = std.math.nan(f32);
     try std.testing.expectError(error.NonFiniteBoundaryAdapterTensor, validateTensors(scratch, config, &tensors, .{}, null));
     left[0] = 0.1;
-    var temp = native_platform.testing.tmpDir(.{ .iterate = true });
+    var temp = platform.testing.tmpDir(.{ .iterate = true });
     defer temp.cleanup();
-    const parent = try temp.dir.realPathFileAlloc(native_platform.testing.io, ".", scratch);
+    const parent = try temp.dir.realPathFileAlloc(platform.testing.io, ".", scratch);
     const output = try std.fs.path.join(scratch, &.{ parent, "cancelled" });
     const Cancel = struct {
         count: usize = 0,
@@ -970,14 +970,14 @@ test "GLiNER2.5 adapter files reject unsupported malformed config and clean canc
         }
     };
     var cancel = Cancel{};
-    try std.testing.expectError(error.Cancelled, exportDirectory(a, native_platform.testing.io, output, test_config, &tensors, testBinding(.small), .{}, .{ .ptr = &cancel, .check_fn = Cancel.call }));
+    try std.testing.expectError(error.Cancelled, exportDirectory(a, platform.testing.io, output, test_config, &tensors, testBinding(.small), .{}, .{ .ptr = &cancel, .check_fn = Cancel.call }));
     try std.testing.expectEqual(@as(usize, 8), cancel.count);
     var iterator = temp.dir.iterate();
-    try std.testing.expect((try iterator.next(native_platform.testing.io)) == null);
+    try std.testing.expect((try iterator.next(platform.testing.io)) == null);
     const weight_path = try std.fs.path.join(scratch, &.{ parent, "tiny.safetensors" });
     try checkpoint.save(a, weight_path, &tensors);
     const bytes = try c_file.readFileMax(scratch, weight_path, 32 * 1024);
-    try native_platform.allocator.checkAllAllocationFailures(a, importAllocationFailures, .{ test_config, bytes });
+    try platform.allocator.checkAllAllocationFailures(a, importAllocationFailures, .{ test_config, bytes });
     var loaded = try importBytes(a, test_config, bytes, null, testBinding(.small), .{}, null);
     defer loaded.deinit();
     const modules = @constCast(loaded.modules);
@@ -999,9 +999,9 @@ test "GLiNER2.5 adapter full merge rejects incomplete canonical model before pub
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    var temp = native_platform.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
-    const parent = try temp.dir.realPathFileAlloc(native_platform.testing.io, ".", scratch);
+    const parent = try temp.dir.realPathFileAlloc(platform.testing.io, ".", scratch);
     const source = try std.fs.path.join(scratch, &.{ parent, "source" });
     const output = try std.fs.path.join(scratch, &.{ parent, "merged" });
     const sidecars = [_][]const u8{
@@ -1012,7 +1012,7 @@ test "GLiNER2.5 adapter full merge rejects incomplete canonical model before pub
     };
     var binding = testBinding(.small);
     for (bundle.sidecar_names, sidecars, &binding.source.sidecars) |name, bytes, *digest| {
-        try writeFile(a, native_platform.testing.io, source, name, bytes, null);
+        try writeFile(a, platform.testing.io, source, name, bytes, null);
         digest.* = bundle.Digest.of(bytes);
     }
     const model_path = try std.fs.path.join(scratch, &.{ source, "model.safetensors" });
@@ -1026,6 +1026,6 @@ test "GLiNER2.5 adapter full merge rejects incomplete canonical model before pub
     const tensor_bytes = try c_file.readFileMax(scratch, tensor_path, 32 * 1024);
     var loaded = try importBytes(a, test_config, tensor_bytes, null, binding, .{}, null);
     defer loaded.deinit();
-    try std.testing.expectError(error.IncompleteGlinerBoundaryTensorInventory, materializeMerged(a, native_platform.testing.io, source, &loaded, output, .{}, null));
-    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(native_platform.testing.io, output, .{}));
+    try std.testing.expectError(error.IncompleteGlinerBoundaryTensorInventory, materializeMerged(a, platform.testing.io, source, &loaded, output, .{}, null));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(platform.testing.io, output, .{}));
 }

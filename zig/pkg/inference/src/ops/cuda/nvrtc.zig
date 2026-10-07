@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -92,7 +92,7 @@ const Table = struct {
 };
 
 pub const Nvrtc = struct {
-    lib: native_platform.DynLib,
+    lib: platform.DynLib,
     fns: Table,
     version_major: u16,
     version_minor: u16,
@@ -276,14 +276,14 @@ fn libraryNames() []const []const u8 {
     };
 }
 
-fn openAny(names: []const []const u8) Error!native_platform.DynLib {
+fn openAny(names: []const []const u8) Error!platform.DynLib {
     for (names) |name| {
-        if (native_platform.DynLib.open(name)) |lib| return lib else |_| {}
+        if (platform.DynLib.open(name)) |lib| return lib else |_| {}
     }
     return error.NvrtcUnavailable;
 }
 
-fn lookup(lib: *native_platform.DynLib, comptime T: type, name: [:0]const u8) Error!T {
+fn lookup(lib: *platform.DynLib, comptime T: type, name: [:0]const u8) Error!T {
     return lib.lookup(T, name) orelse error.NvrtcSymbolMissing;
 }
 

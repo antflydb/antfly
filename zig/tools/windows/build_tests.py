@@ -47,6 +47,12 @@ def module(root, dependencies, tail):
 
 
 SUITES = {
+    "io-namespace": (
+        ["platform Io "],
+        module(
+            "lib/platform/tests/io_namespace_test.zig", ["antfly_platform"], PLATFORM
+        ),
+    ),
     "socket-errors": (
         ["Windows socket "],
         module("tools/windows/socket_error_test.zig", ["antfly_platform"], PLATFORM),

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -176,7 +176,7 @@ fn parseU32(maybe_value: ?[]const u8, default_value: u32) !u32 {
 }
 
 fn benchJpegDecode(alloc: std.mem.Allocator, fixture_path: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try test_support.readFixtureAlloc(alloc, io_impl.io(), fixture_path);
@@ -202,7 +202,7 @@ fn benchAllJpegDecode(alloc: std.mem.Allocator, iterations: usize) !void {
 }
 
 fn benchPngDecode(alloc: std.mem.Allocator, fixture_path: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try test_support.readFixtureAlloc(alloc, io_impl.io(), fixture_path);
@@ -217,7 +217,7 @@ fn benchAllPngDecode(alloc: std.mem.Allocator, iterations: usize) !void {
 }
 
 fn benchPngSpngCompare(alloc: std.mem.Allocator, fixture_path: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try test_support.readFixtureAlloc(alloc, io_impl.io(), fixture_path);
@@ -321,7 +321,7 @@ fn decodeSpngOnce(alloc: std.mem.Allocator, bytes: []const u8) !usize {
 }
 
 fn benchAllManifestDecodeFormat(alloc: std.mem.Allocator, format: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -370,7 +370,7 @@ fn benchAllManifestDecodeFormat(alloc: std.mem.Allocator, format: []const u8, it
 }
 
 fn benchImageDecodeSuite(alloc: std.mem.Allocator, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const manifest = try test_support.loadManifest(alloc, io_impl.io());
@@ -427,7 +427,7 @@ fn benchImageDecodeSuite(alloc: std.mem.Allocator, iterations: usize) !void {
 }
 
 fn benchJpeg2000Decode(alloc: std.mem.Allocator, path: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try readBenchInputAlloc(alloc, io_impl.io(), path);
@@ -439,7 +439,7 @@ fn benchJpeg2000Decode(alloc: std.mem.Allocator, path: []const u8, iterations: u
 }
 
 fn benchJpeg2000OpenJpegCompare(alloc: std.mem.Allocator, path: []const u8, iterations: usize) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try readBenchInputAlloc(alloc, io_impl.io(), path);
@@ -621,7 +621,7 @@ fn benchPreprocess(
     target_size: u32,
     iterations: usize,
 ) !void {
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
 
     const bytes = try test_support.readFixtureAlloc(alloc, io_impl.io(), fixture_path);
@@ -733,12 +733,12 @@ fn ratePerSecond(units: usize, elapsed_ns: u64) u64 {
 }
 
 fn monotonicNowNs() u64 {
-    const clock_id: native_platform.c.clockid_t = switch (builtin.os.tag) {
-        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => native_platform.c.CLOCK.UPTIME_RAW,
-        else => native_platform.c.CLOCK.MONOTONIC,
+    const clock_id: platform.c.clockid_t = switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => platform.c.CLOCK.UPTIME_RAW,
+        else => platform.c.CLOCK.MONOTONIC,
     };
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(clock_id, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(clock_id, &ts))) {
         .SUCCESS => return @intCast(@as(u128, @intCast(ts.sec)) * std.time.ns_per_s + @as(u128, @intCast(ts.nsec))),
         else => return 0,
     }

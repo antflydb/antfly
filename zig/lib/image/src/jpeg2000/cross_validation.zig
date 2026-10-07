@@ -35,7 +35,7 @@
 //!   zig test lib/image/src/jpeg2000/cross_validation.zig
 //!
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const compat = @import("compat.zig");
@@ -202,7 +202,7 @@ fn isAsciiWhitespace(b: u8) bool {
 }
 
 fn runChild(allocator: std.mem.Allocator, argv: []const []const u8) !u8 {
-    var io_impl = native_platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     var child = try std.process.spawn(io_impl.io(), .{
@@ -630,7 +630,7 @@ test "diagnostic: dump opj's own 9/7 encoded stream for comparison" {
     const out_j2k = "/tmp/diag_opj_ref.j2k";
     defer deleteFile(out_j2k);
 
-    var io_impl = native_platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     var c1 = try std.process.spawn(io_impl.io(), .{
@@ -686,7 +686,7 @@ test "diagnostic: dump ours 9/7 stream to /tmp and probe opj_decompress stderr" 
         "/opt/homebrew/bin/opj_dump", "/usr/local/bin/opj_dump", "/usr/bin/opj_dump",
     }) orelse return;
 
-    var io_impl = native_platform.Threaded.init(allocator, .{});
+    var io_impl = platform.Io.Threaded.init(allocator, .{});
     defer io_impl.deinit();
 
     var child = try std.process.spawn(io_impl.io(), .{

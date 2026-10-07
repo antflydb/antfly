@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
@@ -39,7 +39,7 @@ fn syncParent(io: Io, parent: []const u8) !void {
 fn createRootWithSync(alloc: Allocator, io: Io, parent: []const u8, id: []const u8, comptime sync: fn (Io, []const u8) anyerror!void) ![]u8 {
     for (0..64) |_| {
         var entropy: [8]u8 = undefined;
-        try native_platform.entropy.fill(io, &entropy);
+        try platform.entropy.fill(io, &entropy);
         const nonce = std.fmt.bytesToHex(entropy, .lower);
         const candidate = try std.fmt.allocPrint(alloc, "{s}/.{s}.staging-{s}", .{ parent, id, &nonce });
         errdefer alloc.free(candidate);
@@ -59,10 +59,10 @@ fn createRootWithSync(alloc: Allocator, io: Io, parent: []const u8, id: []const 
 
 test "snapshot staging cleanup removes nested files and preserves pending cancellation" {
     const alloc = std.testing.allocator;
-    var pool = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
+    var pool = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
     defer pool.deinit();
     const io = pool.io();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "survivor", .data = "published" });
     const parent = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
@@ -102,10 +102,10 @@ test "snapshot staging cleanup removes nested files and preserves pending cancel
 
 test "snapshot staging creation cleans up when parent sync fails with cancellation pending" {
     const alloc = std.testing.allocator;
-    var pool = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
+    var pool = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
     defer pool.deinit();
     const io = pool.io();
-    var tmp = native_platform.testing.tmpDir(.{ .iterate = true });
+    var tmp = platform.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const parent = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(parent);

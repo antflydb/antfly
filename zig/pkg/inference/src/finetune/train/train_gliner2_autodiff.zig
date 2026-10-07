@@ -59,7 +59,7 @@
 //   --early-stopping-threshold <f>
 //                                  Minimum eval-loss decrease (default: 0)
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -4111,8 +4111,8 @@ const EpochTiming = struct {
 };
 
 fn monotonicNowNs() u64 {
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }
@@ -4569,7 +4569,7 @@ test "classifier head setup is failure-atomic" {
             try initClassifierHeadInNativeStore(allocator, &weight_store, 42, 16, 4);
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 fn fillRectIdentity(data: []f32, out_dim: usize, in_dim: usize) void {
@@ -5959,7 +5959,7 @@ test "held-out examples reject training text overlap and unknown labels" {
 }
 
 test "periodic checkpoint retention keeps newest canonical files" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_][]const u8{
         "epoch-1.safetensors",
@@ -5968,55 +5968,55 @@ test "periodic checkpoint retention keeps newest canonical files" {
         "epoch-03.safetensors",
         "notes.txt",
     }) |name| {
-        try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = name, .data = "x" });
+        try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = name, .data = "x" });
     }
     const root = try std.fs.path.join(std.testing.allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer std.testing.allocator.free(root);
     try prunePeriodicCheckpoints(std.testing.allocator, root, 10, 2);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(native_platform.testing.io, "epoch-1.safetensors", .{}));
-    _ = try tmp.dir.statFile(native_platform.testing.io, "epoch-3.safetensors", .{});
-    _ = try tmp.dir.statFile(native_platform.testing.io, "epoch-10.safetensors", .{});
-    _ = try tmp.dir.statFile(native_platform.testing.io, "epoch-03.safetensors", .{});
-    _ = try tmp.dir.statFile(native_platform.testing.io, "notes.txt", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(platform.testing.io, "epoch-1.safetensors", .{}));
+    _ = try tmp.dir.statFile(platform.testing.io, "epoch-3.safetensors", .{});
+    _ = try tmp.dir.statFile(platform.testing.io, "epoch-10.safetensors", .{});
+    _ = try tmp.dir.statFile(platform.testing.io, "epoch-03.safetensors", .{});
+    _ = try tmp.dir.statFile(platform.testing.io, "notes.txt", .{});
 }
 
 test "periodic checkpoint retention removes abandoned future epochs" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "epoch-1.safetensors", .data = "old" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "epoch-3.safetensors", .data = "current" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "epoch-8.safetensors", .data = "stale" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "epoch-9.safetensors", .data = "stale" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "epoch-10.safetensors", .data = "stale" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "epoch-1.safetensors", .data = "old" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "epoch-3.safetensors", .data = "current" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "epoch-8.safetensors", .data = "stale" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "epoch-9.safetensors", .data = "stale" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "epoch-10.safetensors", .data = "stale" });
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
     try prunePeriodicCheckpoints(std.testing.allocator, root, 3, 2);
-    _ = try tmp.dir.statFile(native_platform.testing.io, "epoch-1.safetensors", .{});
-    _ = try tmp.dir.statFile(native_platform.testing.io, "epoch-3.safetensors", .{});
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(native_platform.testing.io, "epoch-8.safetensors", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(native_platform.testing.io, "epoch-9.safetensors", .{}));
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(native_platform.testing.io, "epoch-10.safetensors", .{}));
+    _ = try tmp.dir.statFile(platform.testing.io, "epoch-1.safetensors", .{});
+    _ = try tmp.dir.statFile(platform.testing.io, "epoch-3.safetensors", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(platform.testing.io, "epoch-8.safetensors", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(platform.testing.io, "epoch-9.safetensors", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(platform.testing.io, "epoch-10.safetensors", .{}));
 }
 
 test "best checkpoint history remains resumable while abandoned future bests are removed" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "best-epoch-1.safetensors", .data = "best one" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "best-epoch-2.safetensors", .data = "best two" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "best-epoch-3.safetensors", .data = "future" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "best-epoch-1.safetensors", .data = "best one" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "best-epoch-2.safetensors", .data = "best two" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "best-epoch-3.safetensors", .data = "future" });
     const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer std.testing.allocator.free(root);
     try pruneBestCheckpointsAfter(std.testing.allocator, root, 2);
-    _ = try tmp.dir.statFile(native_platform.testing.io, "best-epoch-1.safetensors", .{});
-    _ = try tmp.dir.statFile(native_platform.testing.io, "best-epoch-2.safetensors", .{});
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(native_platform.testing.io, "best-epoch-3.safetensors", .{}));
+    _ = try tmp.dir.statFile(platform.testing.io, "best-epoch-1.safetensors", .{});
+    _ = try tmp.dir.statFile(platform.testing.io, "best-epoch-2.safetensors", .{});
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(platform.testing.io, "best-epoch-3.safetensors", .{}));
 }
 
 test "resume source is retained under its content digest" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "epoch-1.safetensors", .data = "recoverable state" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "epoch-1.safetensors", .data = "recoverable state" });
     const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(root);
     const source_path = try std.fs.path.join(allocator, &.{ root, "epoch-1.safetensors" });
@@ -6939,7 +6939,7 @@ test "training manifest uses canonical full-task objective spelling" {
 
 test "training manifest serializes initial adapter provenance and requested max steps" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const out_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(out_dir);
@@ -7132,9 +7132,9 @@ test "training manifest serializes initial adapter provenance and requested max 
 
 test "artifact fingerprint rejects a missing required file" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "present", .data = "present" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "present", .data = "present" });
     const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(dir);
     const required = [_][]const u8{ "present", "missing" };
@@ -7147,9 +7147,9 @@ test "artifact fingerprint rejects a missing required file" {
 test "artifact fingerprint records an absent optional file instead of failing" {
     const allocator = std.testing.allocator;
 
-    var absent_tmp = native_platform.testing.tmpDir(.{});
+    var absent_tmp = platform.testing.tmpDir(.{});
     defer absent_tmp.cleanup();
-    try absent_tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "present", .data = "present" });
+    try absent_tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "present", .data = "present" });
     const absent_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{absent_tmp.sub_path});
     defer allocator.free(absent_dir);
 
@@ -7162,10 +7162,10 @@ test "artifact fingerprint records an absent optional file instead of failing" {
 
     // An optional file that is present still contributes its bytes, so
     // identity moves when it changes.
-    var present_tmp = native_platform.testing.tmpDir(.{});
+    var present_tmp = platform.testing.tmpDir(.{});
     defer present_tmp.cleanup();
-    try present_tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "present", .data = "present" });
-    try present_tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "maybe", .data = "v1" });
+    try present_tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "present", .data = "present" });
+    try present_tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "maybe", .data = "v1" });
     const present_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{present_tmp.sub_path});
     defer allocator.free(present_dir);
 
@@ -7173,14 +7173,14 @@ test "artifact fingerprint records an absent optional file instead of failing" {
     defer allocator.free(present_digest);
     try std.testing.expect(!std.mem.eql(u8, absent_digest, present_digest));
 
-    try present_tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "maybe", .data = "v2" });
+    try present_tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "maybe", .data = "v2" });
     const changed_digest = try fingerprintEntriesAlloc(allocator, present_dir, &entries);
     defer allocator.free(changed_digest);
     try std.testing.expect(!std.mem.eql(u8, present_digest, changed_digest));
 
     // The absent marker is framed with a tag byte a present file can never
     // emit, so content equal to the marker cannot forge "absent".
-    try present_tmp.dir.writeFile(native_platform.testing.io, .{
+    try present_tmp.dir.writeFile(platform.testing.io, .{
         .sub_path = "maybe",
         .data = fingerprint_absent_marker,
     });
@@ -7189,10 +7189,10 @@ test "artifact fingerprint records an absent optional file instead of failing" {
     try std.testing.expect(!std.mem.eql(u8, absent_digest, forged_digest));
 
     // An optional path that exists but is not a regular file is still fatal.
-    var broken_tmp = native_platform.testing.tmpDir(.{});
+    var broken_tmp = platform.testing.tmpDir(.{});
     defer broken_tmp.cleanup();
-    try broken_tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "present", .data = "present" });
-    try broken_tmp.dir.createDirPath(native_platform.testing.io, "maybe");
+    try broken_tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "present", .data = "present" });
+    try broken_tmp.dir.createDirPath(platform.testing.io, "maybe");
     const broken_dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{broken_tmp.sub_path});
     defer allocator.free(broken_dir);
     try std.testing.expectError(
@@ -7203,10 +7203,10 @@ test "artifact fingerprint records an absent optional file instead of failing" {
 
 test "optional fingerprint entries keep fully present snapshots byte-stable" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "a", .data = "alpha" });
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "b", .data = "beta" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "a", .data = "alpha" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "b", .data = "beta" });
     const dir = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(dir);
 
@@ -7228,14 +7228,14 @@ test "optional fingerprint entries keep fully present snapshots byte-stable" {
 
 test "gliner2 base model fingerprint accepts a stock HuggingFace cache layout" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     // Mirror the HF hub cache: content lives in a shared `blobs` directory and
     // the snapshot exposes symlinks, with the encoder config in a subdirectory
     // and no `spm.model` at all.
-    try tmp.dir.createDirPath(native_platform.testing.io, "blobs");
-    try tmp.dir.createDirPath(native_platform.testing.io, "snapshot/encoder_config");
+    try tmp.dir.createDirPath(platform.testing.io, "blobs");
+    try tmp.dir.createDirPath(platform.testing.io, "snapshot/encoder_config");
     const snapshot_files = [_][]const u8{
         "model.safetensors",
         "config.json",
@@ -7254,17 +7254,17 @@ test "gliner2 base model fingerprint accepts a stock HuggingFace cache layout" {
         defer allocator.free(blob_rel);
         const body = try std.fmt.allocPrint(allocator, "{{\"file\":\"{s}\"}}", .{name});
         defer allocator.free(body);
-        try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = blob_rel, .data = body });
+        try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = blob_rel, .data = body });
 
         const link_rel = try std.fs.path.join(allocator, &.{ "snapshot", name });
         defer allocator.free(link_rel);
         const link_target = try std.fmt.allocPrint(allocator, "../blobs/{d}", .{idx});
         defer allocator.free(link_target);
-        try tmp.dir.symLink(native_platform.testing.io, link_target, link_rel, .{});
+        try tmp.dir.symLink(platform.testing.io, link_target, link_rel, .{});
     }
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "blobs/encoder", .data = "{\"hidden_size\":768}" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "blobs/encoder", .data = "{\"hidden_size\":768}" });
     try tmp.dir.symLink(
-        native_platform.testing.io,
+        platform.testing.io,
         "../../blobs/encoder",
         "snapshot/encoder_config/config.json",
         .{},
@@ -7276,13 +7276,13 @@ test "gliner2 base model fingerprint accepts a stock HuggingFace cache layout" {
 
     // Contents must be read *through* the symlinks: rewriting a blob has to
     // move the fingerprint.
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "blobs/encoder", .data = "{\"hidden_size\":1024}" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "blobs/encoder", .data = "{\"hidden_size\":1024}" });
     const changed_digest = try gliner2BaseModelFingerprintAlloc(allocator, model_dir);
     defer allocator.free(changed_digest);
     try std.testing.expect(!std.mem.eql(u8, digest, changed_digest));
 
     // Dropping a still-required file remains fatal.
-    try tmp.dir.deleteFile(native_platform.testing.io, "snapshot/tokenizer.json");
+    try tmp.dir.deleteFile(platform.testing.io, "snapshot/tokenizer.json");
     try std.testing.expectError(
         error.RequiredFingerprintFileMissing,
         gliner2BaseModelFingerprintAlloc(allocator, model_dir),
@@ -7291,10 +7291,10 @@ test "gliner2 base model fingerprint accepts a stock HuggingFace cache layout" {
 
 test "gliner2 base model fingerprint matches the cross-language release golden" {
     const allocator = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.createDirPath(native_platform.testing.io, "model/encoder_config");
+    try tmp.dir.createDirPath(platform.testing.io, "model/encoder_config");
     const required_paths = [_][]const u8{
         "model.safetensors",
         "config.json",
@@ -7307,7 +7307,7 @@ test "gliner2 base model fingerprint matches the cross-language release golden" 
     for (required_paths) |relative_path| {
         const fixture_path = try std.fs.path.join(allocator, &.{ "model", relative_path });
         defer allocator.free(fixture_path);
-        try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = fixture_path, .data = relative_path });
+        try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = fixture_path, .data = relative_path });
     }
 
     const root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/model", .{tmp.sub_path});
@@ -7319,7 +7319,7 @@ test "gliner2 base model fingerprint matches the cross-language release golden" 
         absent_digest,
     );
 
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "model/spm.model", .data = "spm.model" });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "model/spm.model", .data = "spm.model" });
     const present_digest = try gliner2BaseModelFingerprintAlloc(allocator, root);
     defer allocator.free(present_digest);
     try std.testing.expectEqualStrings(

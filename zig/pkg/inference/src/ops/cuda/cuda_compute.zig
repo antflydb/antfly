@@ -167,7 +167,7 @@ const CudaA4bLoadSlot = struct {
 };
 
 const CudaA4bLoadPipelineState = struct {
-    io: std.Io = platform.Threaded.global_single_threaded.io(),
+    io: std.Io = platform.Io.Threaded.global_single_threaded.io(),
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     plan: *const CudaA4bSourceLoadPlan,
@@ -3094,7 +3094,7 @@ pub const CudaCompute = struct {
 
         // Staging producers depend on the upload consumer. Reserve their
         // capacity independently of request work and retain it through drain.
-        var worker_io = platform.Threaded.init(self.allocator, .{
+        var worker_io = platform.Io.Threaded.init(self.allocator, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(worker_count),
         });
@@ -23748,7 +23748,7 @@ test "CUDA A4B pipeline notification observes ready slots and stop" {
 
 test "CUDA A4B pipeline rolls back partial worker startup and drains blocked producers" {
     for (0..3) |capacity| {
-        var io_impl = platform.Threaded.init(std.testing.allocator, .{
+        var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
             .async_limit = .nothing,
             .concurrent_limit = .limited(capacity),
         });

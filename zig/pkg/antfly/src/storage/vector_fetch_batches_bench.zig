@@ -14,14 +14,14 @@
 // limitations.
 
 //! Real-file, checksum-validated fetch batch replay; never mutates the store.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
 const native = @import("antfly_local_sources").storage_vector_block_store;
 const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
 const resources = @import("antfly_local_sources").storage_resource_manager;
-const time = native_platform.time;
+const time = platform.time;
 extern "c" fn getenv([*:0]const u8) ?[*:0]const u8;
 const Row = struct { generation: u64, shard: u32, offset: usize, length: usize, checksum: u32 };
 const Trace = struct { root: []const u8, batches: [][]Row };
@@ -109,7 +109,7 @@ test "vector block complete fetch batch replay benchmark" {
         }
     }
     locations.clearAndFree();
-    var runtime = native_platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(64) });
+    var runtime = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(64) });
     defer runtime.deinit();
     const workers = try a.alloc(Worker, 10);
     workers[0] = .{ .opened = &opened, .io = runtime.io(), .batches = batches, .split = false, .repeats = 1 };

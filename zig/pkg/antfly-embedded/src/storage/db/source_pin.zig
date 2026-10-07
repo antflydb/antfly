@@ -16,7 +16,7 @@
 //! Source-primary pin owner. Admission's prepared record is a durable short
 //! mutation fence; no live recapture is permitted after its pinned receipt.
 //! Artifact serialization and hashing run only against the durable seal.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const ledger = @import("online_source.zig");
@@ -561,7 +561,7 @@ fn tryCleanupLock(alloc: Allocator, io: std.Io, lock_path: []const u8) !?seal.St
 
 test "relational index system source pin cancellation releases a prepared cut before files exist" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cancel-source", .{tmp.sub_path});
     defer alloc.free(path);
@@ -586,7 +586,7 @@ test "relational index system source pin cancellation releases a prepared cut be
 
 test "relational index system source pin interrupted cleanup reserves slot across later admission and restart" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/cleanup-source", .{tmp.sub_path});
     defer alloc.free(path);
@@ -603,18 +603,18 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     defer alloc.free(old_root);
     const garbage = try std.fmt.allocPrint(alloc, "{s}/abandoned/deep", .{old_root});
     defer alloc.free(garbage);
-    try fs.createDirPathPortable(native_platform.testing.io, garbage);
-    var garbage_dir = try std.Io.Dir.cwd().openDir(native_platform.testing.io, garbage, .{});
+    try fs.createDirPathPortable(platform.testing.io, garbage);
+    var garbage_dir = try std.Io.Dir.cwd().openDir(platform.testing.io, garbage, .{});
     for (0..500) |i| {
         var name: [32]u8 = undefined;
-        const file = try garbage_dir.createFile(native_platform.testing.io, try std.fmt.bufPrint(&name, "{d}.part", .{i}), .{});
-        file.close(native_platform.testing.io);
+        const file = try garbage_dir.createFile(platform.testing.io, try std.fmt.bufPrint(&name, "{d}.part", .{i}), .{});
+        file.close(platform.testing.io);
     }
-    garbage_dir.close(native_platform.testing.io);
+    garbage_dir.close(platform.testing.io);
     test_failure = .before_cleanup;
     defer test_failure = .none;
     try std.testing.expectError(error.InjectedSourcePinFailure, @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 2 }));
-    try std.testing.expect(try exists(native_platform.testing.io, old_root));
+    try std.testing.expect(try exists(platform.testing.io, old_root));
     var next = scope;
     next.consumer_epoch = 2;
     next.copy_attempt.sequence = 2;
@@ -622,13 +622,13 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     {
         const export_lock_path = try lockPath(alloc, path, old_slot);
         defer alloc.free(export_lock_path);
-        var exporting = try seal.StoreLock.acquire(alloc, native_platform.testing.io, export_lock_path, .none);
+        var exporting = try seal.StoreLock.acquire(alloc, platform.testing.io, export_lock_path, .none);
         defer exporting.deinit();
         // Admission's fair cleanup pass skips an exporting slot without
         // blocking the apply fence, and cannot erase its cleanup ownership.
         try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = next } } }, .{ .term = 1, .index = 3 });
         try std.testing.expect(old_slot != (try locate(&db, next)).slot);
-        try std.testing.expect(try exists(native_platform.testing.io, old_root));
+        try std.testing.expect(try exists(platform.testing.io, old_root));
         const next_slot = (try locate(&db, next)).slot;
         test_failure = .before_cleanup;
         try std.testing.expectError(error.InjectedSourcePinFailure, @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .release = next } }, .{ .term = 1, .index = 4 }));
@@ -647,25 +647,25 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     defer alloc.free(durable_cursor);
     for (0..16) |_| {
         _ = try reconcileReleasedWithBudget(&db, .{ .max_entries = 12, .max_metadata_bytes = 64 * 1024, .max_duration_ns = std.time.ns_per_s });
-        if (try exists(native_platform.testing.io, durable_cursor)) break;
+        if (try exists(platform.testing.io, durable_cursor)) break;
     }
-    try std.testing.expect(try exists(native_platform.testing.io, durable_cursor));
+    try std.testing.expect(try exists(platform.testing.io, durable_cursor));
     try std.testing.expect(!(try db.onlineSourceStatus(scope)).local_cleanup_complete);
-    const valid_cursor = try backup.readFileAlloc(alloc, native_platform.testing.io, durable_cursor, CleanupCursor.max_encoded);
+    const valid_cursor = try backup.readFileAlloc(alloc, platform.testing.io, durable_cursor, CleanupCursor.max_encoded);
     defer alloc.free(valid_cursor);
-    _ = try backup.writeFileDurable(native_platform.testing.io, durable_cursor, "corrupt cursor");
+    _ = try backup.writeFileDurable(platform.testing.io, durable_cursor, "corrupt cursor");
     var healthy = scope;
     healthy.consumer_epoch = 3;
     healthy.copy_attempt.sequence = 3;
     const healthy_root = try pathAlloc(alloc, path, healthy);
     defer alloc.free(healthy_root);
-    var healthy_dir = try std.Io.Dir.cwd().openDir(native_platform.testing.io, healthy_root, .{});
+    var healthy_dir = try std.Io.Dir.cwd().openDir(platform.testing.io, healthy_root, .{});
     for (0..200) |i| {
         var name: [32]u8 = undefined;
-        const file = try healthy_dir.createFile(native_platform.testing.io, try std.fmt.bufPrint(&name, "{d}.pending", .{i}), .{});
-        file.close(native_platform.testing.io);
+        const file = try healthy_dir.createFile(platform.testing.io, try std.fmt.bufPrint(&name, "{d}.pending", .{i}), .{});
+        file.close(platform.testing.io);
     }
-    healthy_dir.close(native_platform.testing.io);
+    healthy_dir.close(platform.testing.io);
     test_failure = .before_cleanup;
     try std.testing.expectError(error.InjectedSourcePinFailure, @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .release = healthy } }, .{ .term = 1, .index = 6 }));
     test_failure = .none;
@@ -684,7 +684,7 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     try std.testing.expect(db.source_pin_cleanup.work_units.load(.acquire) > units_before);
     // Useful later-slot work keeps the next pass prompt despite the earlier
     // damaged cursor, while zero-progress errors retain exponential backoff.
-    try std.testing.expect(db.sourcePinCleanupStatus().next_attempt_ns <= native_platform.time.monotonicNs() + 2 * std.time.ns_per_ms);
+    try std.testing.expect(db.sourcePinCleanupStatus().next_attempt_ns <= platform.time.monotonicNs() + 2 * std.time.ns_per_ms);
     try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .timestamp_ns = 7, .writes = &.{.{ .key = "healthy", .value = "{\"ok\":true}" }} }, .{ .term = 1, .index = 7 });
     for (0..100) |_| {
         attempt: {
@@ -697,11 +697,11 @@ test "relational index system source pin interrupted cleanup reserves slot acros
     }
     try std.testing.expect((try db.onlineSourceStatus(healthy)).local_cleanup_complete);
     try std.testing.expect(!(try db.onlineSourceStatus(scope)).local_cleanup_complete);
-    _ = try backup.writeFileDurable(native_platform.testing.io, durable_cursor, valid_cursor);
+    _ = try backup.writeFileDurable(platform.testing.io, durable_cursor, valid_cursor);
     try drainCleanupForTest(&db, scope);
-    try std.testing.expect(!try exists(native_platform.testing.io, old_root));
+    try std.testing.expect(!try exists(platform.testing.io, old_root));
     try std.testing.expect((try db.onlineSourceStatus(scope)).local_cleanup_complete);
-    try std.testing.expect(!try exists(native_platform.testing.io, durable_cursor));
+    try std.testing.expect(!try exists(platform.testing.io, durable_cursor));
     var last = scope;
     last.consumer_epoch = 4;
     last.copy_attempt.sequence = 4;
@@ -743,7 +743,7 @@ test "relational index system source pin GC cursor binds scope and validates res
 
 test "relational index system source pin prepared reopen pages abandoned staging before acknowledging cut" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-gc", .{tmp.sub_path});
     defer alloc.free(path);
@@ -762,13 +762,13 @@ test "relational index system source pin prepared reopen pages abandoned staging
         defer alloc.free(root);
         const abandoned = try std.fmt.allocPrint(alloc, "{s}.staging/abandoned", .{root});
         defer alloc.free(abandoned);
-        try fs.createDirPathPortable(native_platform.testing.io, abandoned);
-        var dir = try std.Io.Dir.cwd().openDir(native_platform.testing.io, abandoned, .{});
-        defer dir.close(native_platform.testing.io);
+        try fs.createDirPathPortable(platform.testing.io, abandoned);
+        var dir = try std.Io.Dir.cwd().openDir(platform.testing.io, abandoned, .{});
+        defer dir.close(platform.testing.io);
         for (0..200) |i| {
             var name: [32]u8 = undefined;
-            const file = try dir.createFile(native_platform.testing.io, try std.fmt.bufPrint(&name, "{d}.part", .{i}), .{});
-            file.close(native_platform.testing.io);
+            const file = try dir.createFile(platform.testing.io, try std.fmt.bufPrint(&name, "{d}.part", .{i}), .{});
+            file.close(platform.testing.io);
         }
     }
     var retries: usize = 0;
@@ -793,7 +793,7 @@ test "relational index system source pin prepared reopen pages abandoned staging
 test "relational index system source pin prepared crash blocks markers then reopens exact immutable artifact" {
     const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
     const changed = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
@@ -883,19 +883,19 @@ test "relational index system source pin prepared crash blocks markers then reop
         defer alloc.free(root);
         const receipt_path = try std.fmt.allocPrint(alloc, "{s}/source.certificate", .{root});
         defer alloc.free(receipt_path);
-        try std.testing.expect(!try exists(native_platform.testing.io, receipt_path));
+        try std.testing.expect(!try exists(platform.testing.io, receipt_path));
         try std.testing.expect(try publicationCertificateIfPresent(&db, scope, .none) == null);
         // A crash during receipt creation leaves only unpublished staging;
         // the next attempt safely reserializes the same immutable cut.
         const partial_receipt = try std.fmt.allocPrint(alloc, "{s}.staging", .{receipt_path});
         defer alloc.free(partial_receipt);
-        _ = try backup.writeFileDurable(native_platform.testing.io, partial_receipt, "partial");
+        _ = try backup.writeFileDurable(platform.testing.io, partial_receipt, "partial");
         const certificate = try db.prepareOnlineSourcePublication(scope, .none);
         try std.testing.expect(certificate.eql((try publicationCertificateIfPresent(&db, scope, .none)).?));
         {
             const observing_lock = try lockPath(alloc, path, (try locate(&db, scope)).slot);
             defer alloc.free(observing_lock);
-            var exporting = try seal.StoreLock.acquire(alloc, native_platform.testing.io, observing_lock, .none);
+            var exporting = try seal.StoreLock.acquire(alloc, platform.testing.io, observing_lock, .none);
             defer exporting.deinit();
             try std.testing.expect(try publicationCertificateIfPresent(&db, scope, .none) == null);
         }
@@ -907,12 +907,12 @@ test "relational index system source pin prepared crash blocks markers then reop
             // The online reader must accept the same certified source-proof
             // block as the one-pass and checkpointed restore paths.
             const verifier = @import("../portable_source_verifier.zig");
-            const verified_file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, artifact, .{});
-            defer verified_file.close(native_platform.testing.io);
+            const verified_file = try std.Io.Dir.cwd().openFile(platform.testing.io, artifact, .{});
+            defer verified_file.close(platform.testing.io);
             for (0..256) |_| {
-                if ((try verifier.step(alloc, native_platform.testing.io, verified_file, root, scope.pin(), certificate, .none, .{})).complete) break;
+                if ((try verifier.step(alloc, platform.testing.io, verified_file, root, scope.pin(), certificate, .none, .{})).complete) break;
             } else return error.TestExpectedSourceVerificationCompletion;
-            var objects = try verifier.ObjectReader.open(alloc, native_platform.testing.io, verified_file, root, scope.pin(), certificate);
+            var objects = try verifier.ObjectReader.open(alloc, platform.testing.io, verified_file, root, scope.pin(), certificate);
             defer objects.deinit();
             var proof_seen = false;
             for (0..objects.objectCount()) |ordinal| {
@@ -920,7 +920,7 @@ test "relational index system source pin prepared crash blocks markers then reop
             }
             try std.testing.expect(proof_seen);
         }
-        const bytes = try backup.readFileAlloc(alloc, native_platform.testing.io, artifact, 8 * 1024 * 1024);
+        const bytes = try backup.readFileAlloc(alloc, platform.testing.io, artifact, 8 * 1024 * 1024);
         defer alloc.free(bytes);
         const decoder_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/decoder-{d}", .{ tmp.sub_path, trial });
         defer alloc.free(decoder_path);
@@ -947,11 +947,11 @@ test "relational index system source pin prepared crash blocks markers then reop
             defer alloc.free(paged_path);
             var paged = try db_mod.DB.open(alloc, paged_path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
             defer paged.close();
-            const source_file = try std.Io.Dir.cwd().openFile(native_platform.testing.io, artifact, .{});
-            defer source_file.close(native_platform.testing.io);
-            const source_size = (try source_file.stat(native_platform.testing.io)).size;
+            const source_file = try std.Io.Dir.cwd().openFile(platform.testing.io, artifact, .{});
+            defer source_file.close(platform.testing.io);
+            const source_size = (try source_file.stat(platform.testing.io)).size;
             for (0..128) |_| {
-                if (try portable.importSourceCopyFilePage(alloc, paged.core.store, native_platform.testing.io, source_file, source_size, proof, scope.pin(), 1, .none)) break;
+                if (try portable.importSourceCopyFilePage(alloc, paged.core.store, platform.testing.io, source_file, source_size, proof, scope.pin(), 1, .none)) break;
             } else return error.TestExpectedSourceImportCompletion;
             const paged_proof = try paged.core.store.get(alloc, &imported_key);
             defer alloc.free(paged_proof);
@@ -970,13 +970,13 @@ test "relational index system source pin prepared crash blocks markers then reop
         try std.testing.expect(certificate.eql(try db.prepareOnlineSourcePublication(scope, .none)));
         try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .publish_certificate = .{ .scope = scope, .certificate = certificate } } }, .{ .term = 1, .index = 4 });
         try std.testing.expectEqual(.published, (try db.onlineSourceStatus(scope)).snapshot_phase);
-        _ = try backup.writeFileDurable(native_platform.testing.io, artifact, "corrupt");
+        _ = try backup.writeFileDurable(platform.testing.io, artifact, "corrupt");
         try std.testing.expectError(error.BackupSealSourceChanged, publicationCertificateIfPresent(&db, scope, .none));
         try std.testing.expectError(error.BackupSealSourceChanged, db.prepareOnlineSourcePublication(scope, .none));
-        try std.Io.Dir.cwd().deleteFile(native_platform.testing.io, artifact);
+        try std.Io.Dir.cwd().deleteFile(platform.testing.io, artifact);
         try std.testing.expectError(error.FileNotFound, db.prepareOnlineSourcePublication(scope, .none));
         // A missing published artifact is not recaptured from the later row.
-        try std.testing.expect(!try exists(native_platform.testing.io, artifact));
+        try std.testing.expect(!try exists(platform.testing.io, artifact));
         try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .release = scope } }, .{ .term = 1, .index = 5 });
         // An old applied admission never resurrects a released pin.
         try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .online_source = .{ .admit = .{ .scope = scope } } }, .{ .term = 1, .index = 2 });

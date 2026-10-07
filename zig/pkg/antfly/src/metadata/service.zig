@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const builtin = @import("builtin");
 const std = @import("std");
@@ -46,9 +46,9 @@ const metadata_table_manager = @import("table_manager.zig");
 const metadata_table_workflow = @import("table_workflow.zig");
 const metadata_topology_protocol = @import("topology_protocol.zig");
 const metadata_storage = @import("storage/mod.zig");
-const platform_clock = native_platform.clock;
-const process_memory_mod = native_platform.process_memory;
-const platform_time = native_platform.time;
+const platform_clock = platform.clock;
+const process_memory_mod = platform.process_memory;
+const platform_time = platform.time;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const transition_state = @import("transition_state.zig");
 const raft_catalog = @import("../raft/storage/catalog.zig");
@@ -324,8 +324,8 @@ const EmbeddingActivityCache = struct {
             }
 
             const shard = self.shardForStore(report.store_id);
-            shard.mutex.lockUncancelable(native_platform.debug_io);
-            defer shard.mutex.unlock(native_platform.debug_io);
+            shard.mutex.lockUncancelable(platform.debug_io);
+            defer shard.mutex.unlock(platform.debug_io);
             const shard_index = shardIndex(report.store_id);
             if (!expired_shards[shard_index]) {
                 expireAssumeLocked(shard, alloc, now_ns);
@@ -369,8 +369,8 @@ const EmbeddingActivityCache = struct {
             std.sort.pdq(u64, ids, {}, std.sort.asc(u64));
         }
         for (&self.shards, 0..) |*shard, shard_index| {
-            shard.mutex.lockUncancelable(native_platform.debug_io);
-            defer shard.mutex.unlock(native_platform.debug_io);
+            shard.mutex.lockUncancelable(platform.debug_io);
+            defer shard.mutex.unlock(platform.debug_io);
             if (maybe_live_store_ids) |live_store_ids| {
                 var fences = shard.owner_fences.iterator();
                 while (fences.next()) |fence| {
@@ -418,9 +418,9 @@ const EmbeddingActivityCache = struct {
     fn entryCount(self: *@This()) usize {
         var total: usize = 0;
         for (&self.shards) |*shard| {
-            shard.mutex.lockUncancelable(native_platform.debug_io);
+            shard.mutex.lockUncancelable(platform.debug_io);
             total += shard.entries.count();
-            shard.mutex.unlock(native_platform.debug_io);
+            shard.mutex.unlock(platform.debug_io);
         }
         return total;
     }
@@ -1799,8 +1799,8 @@ const MetadataProposalProgressDriver = struct {
     };
 
     fn registerManagedOwner(self: *MetadataProposalProgressDriver, wake: @import("../raft/runtime_loop.zig").ProgressWake) !void {
-        self.owner_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.owner_mutex.unlock(native_platform.debug_io);
+        self.owner_mutex.lockUncancelable(platform.debug_io);
+        defer self.owner_mutex.unlock(platform.debug_io);
         if (self.managed_wake != null) return error.MetadataProgressAlreadyOwned;
         self.managed_wake = wake;
         self.managed_owned.store(true, .release);
@@ -1808,8 +1808,8 @@ const MetadataProposalProgressDriver = struct {
     }
 
     fn releaseManagedOwner(self: *MetadataProposalProgressDriver) void {
-        self.owner_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.owner_mutex.unlock(native_platform.debug_io);
+        self.owner_mutex.lockUncancelable(platform.debug_io);
+        defer self.owner_mutex.unlock(platform.debug_io);
         self.managed_wake = null;
         self.managed_owned.store(false, .release);
         self.notifyWaiters();
@@ -1818,8 +1818,8 @@ const MetadataProposalProgressDriver = struct {
     fn notifyManagedOwner(self: *MetadataProposalProgressDriver) bool {
         // Serialize only the borrowed notification's lifetime. Never hold
         // this lock over Raft persistence, apply, or a proposal wait.
-        self.owner_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.owner_mutex.unlock(native_platform.debug_io);
+        self.owner_mutex.lockUncancelable(platform.debug_io);
+        defer self.owner_mutex.unlock(platform.debug_io);
         const wake = self.managed_wake orelse return false;
         wake.notify();
         return true;
@@ -1838,7 +1838,7 @@ const MetadataProposalProgressDriver = struct {
     fn waitForHandoff(self: *MetadataProposalProgressDriver, observed_epoch: u32, timeout_ns: u64) void {
         if (self.wake_epoch.load(.acquire) != observed_epoch) return;
         std.Io.futexWaitTimeout(
-            native_platform.debug_io,
+            platform.debug_io,
             u32,
             &self.wake_epoch.raw,
             observed_epoch,
@@ -1851,7 +1851,7 @@ const MetadataProposalProgressDriver = struct {
 
     fn notifyWaiters(self: *MetadataProposalProgressDriver) void {
         _ = self.wake_epoch.fetchAdd(1, .release);
-        std.Io.futexWake(native_platform.debug_io, u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+        std.Io.futexWake(platform.debug_io, u32, &self.wake_epoch.raw, std.math.maxInt(u32));
     }
 };
 
@@ -1900,7 +1900,7 @@ const TableTopologyProtocolProbeCoordinator = struct {
             self.coordinator.lane.unlock();
             if (self.publishes_completion) {
                 std.Io.futexWake(
-                    native_platform.debug_io,
+                    platform.debug_io,
                     u32,
                     &self.coordinator.wake_epoch.raw,
                     std.math.maxInt(u32),
@@ -1953,7 +1953,7 @@ const TableTopologyProtocolProbeCoordinator = struct {
     fn waitForHandoff(self: *@This(), observed_epoch: u32, timeout_ns: u64) void {
         if (self.wake_epoch.load(.acquire) != observed_epoch) return;
         std.Io.futexWaitTimeout(
-            native_platform.debug_io,
+            platform.debug_io,
             u32,
             &self.wake_epoch.raw,
             observed_epoch,
@@ -2117,7 +2117,7 @@ const LifecycleSignal = struct {
             if (elapsed_ns >= timeout_ns) return;
             const remaining_ns = timeout_ns - elapsed_ns;
             std.Io.futexWaitTimeout(
-                native_platform.debug_io,
+                platform.debug_io,
                 u32,
                 &self.wake_epoch.raw,
                 wake_epoch,
@@ -2145,17 +2145,17 @@ const LifecycleSignal = struct {
     }
 
     fn lock(self: *LifecycleSignal) void {
-        self.mutex.lockUncancelable(native_platform.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
     }
 
     fn unlock(self: *LifecycleSignal) void {
-        self.mutex.unlock(native_platform.debug_io);
+        self.mutex.unlock(platform.debug_io);
     }
 
     fn unlockAndWake(self: *LifecycleSignal) void {
         self.unlock();
         _ = self.wake_epoch.fetchAdd(1, .release);
-        std.Io.futexWake(native_platform.debug_io, u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+        std.Io.futexWake(platform.debug_io, u32, &self.wake_epoch.raw, std.math.maxInt(u32));
     }
 };
 
@@ -2482,8 +2482,8 @@ pub fn installOnlineMergeDriverWithAdmission(service: anytype, executor: @import
     var runtime = try @import("online_merge_driver.zig").create(service, executor, capabilities);
     errdefer runtime.deinit();
     if (!allow_new_admissions) runtime.driver.admit = null;
-    service.transition_mutex.lockUncancelable(native_platform.debug_io);
-    defer service.transition_mutex.unlock(native_platform.debug_io);
+    service.transition_mutex.lockUncancelable(platform.debug_io);
+    defer service.transition_mutex.unlock(platform.debug_io);
     if (service.online_merge_runtime) |*old| old.deinit();
     service.online_merge_runtime = runtime;
     // A fresh metadata process has not yet observed any data runtimes, so its
@@ -2520,7 +2520,7 @@ test "metadata transition driver online installs before registration and reattac
         };
     };
     const alloc = std.testing.allocator;
-    var temp = native_platform.testing.tmpDir(.{});
+    var temp = platform.testing.tmpDir(.{});
     defer temp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/online-install", .{temp.sub_path});
     defer alloc.free(root);
@@ -3795,27 +3795,27 @@ const LinearizableMetadataReadTracker = struct {
 
     fn registerRequest(self: *@This()) !u64 {
         const request_id = self.next_request_id.fetchAdd(1, .monotonic);
-        self.mutex.lockUncancelable(native_platform.debug_io);
-        defer self.mutex.unlock(native_platform.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         try self.requests.put(self.alloc, request_id, false);
         return request_id;
     }
 
     fn isComplete(self: *@This(), request_id: u64) bool {
-        self.mutex.lockUncancelable(native_platform.debug_io);
-        defer self.mutex.unlock(native_platform.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         return if (self.requests.get(request_id)) |complete| complete else false;
     }
 
     fn markComplete(self: *@This(), request_id: u64) void {
-        self.mutex.lockUncancelable(native_platform.debug_io);
-        defer self.mutex.unlock(native_platform.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         if (self.requests.getPtr(request_id)) |complete| complete.* = true;
     }
 
     fn finishRequest(self: *@This(), request_id: u64) void {
-        self.mutex.lockUncancelable(native_platform.debug_io);
-        defer self.mutex.unlock(native_platform.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         _ = self.requests.remove(request_id);
     }
 
@@ -4228,8 +4228,8 @@ fn SharedStoreReports(comptime T: type, comptime free: anytype) type {
         }
         fn materialize(self: *@This(), _: std.mem.Allocator) ![]T {
             const alloc = self.allocator;
-            self.materialize_mutex.lockUncancelable(native_platform.debug_io);
-            defer self.materialize_mutex.unlock(native_platform.debug_io);
+            self.materialize_mutex.lockUncancelable(platform.debug_io);
+            defer self.materialize_mutex.unlock(platform.debug_io);
             if (!self.materialized) {
                 self.items = try alloc.alloc(T, if (self.leaves.root) |root| root.count else 0);
                 var offset: usize = 0;
@@ -4574,8 +4574,8 @@ const CoreProjectionChanges = struct {
     pending: Pending = .{},
 
     fn mark(self: *@This(), signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
-        self.mutex.lockUncancelable(native_platform.debug_io);
-        defer self.mutex.unlock(native_platform.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         if (signal.kind == .metadata_incarnation) self.pending.all = true;
         self.pending.kinds.insert(signal.kind);
         if (signal.kind != .store or self.pending.all or self.pending.all_stores) return;
@@ -4602,8 +4602,8 @@ const CoreProjectionChanges = struct {
         return self.takeKinds(.full);
     }
     fn takeKinds(self: *@This(), kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind)) Pending {
-        self.mutex.lockUncancelable(native_platform.debug_io);
-        defer self.mutex.unlock(native_platform.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         const all = self.pending.all;
         if (self.pending.all) {
             self.pending.kinds = .full;
@@ -4622,8 +4622,8 @@ const CoreProjectionChanges = struct {
         return result;
     }
     fn invalidate(self: *@This()) void {
-        self.mutex.lockUncancelable(native_platform.debug_io);
-        defer self.mutex.unlock(native_platform.debug_io);
+        self.mutex.lockUncancelable(platform.debug_io);
+        defer self.mutex.unlock(platform.debug_io);
         self.pending.all = true;
     }
 };
@@ -5460,8 +5460,8 @@ pub const MetadataService = struct {
     }
 
     pub fn ensureBackendRuntime(self: *MetadataService) !*backend_runtime_mod.BackendRuntime {
-        self.backend_runtime_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.backend_runtime_mutex.unlock(native_platform.debug_io);
+        self.backend_runtime_mutex.lockUncancelable(platform.debug_io);
+        defer self.backend_runtime_mutex.unlock(platform.debug_io);
         if (self.backend_runtime == null) {
             self.owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(self.alloc, .{});
             self.backend_runtime = self.owned_backend_runtime.?.ptr();
@@ -5471,19 +5471,19 @@ pub const MetadataService = struct {
     }
 
     fn lockRuntime(self: *MetadataService) void {
-        self.runtime_mutex.lockUncancelable(native_platform.debug_io);
+        self.runtime_mutex.lockUncancelable(platform.debug_io);
     }
 
     fn unlockRuntime(self: *MetadataService) void {
-        self.runtime_mutex.unlock(native_platform.debug_io);
+        self.runtime_mutex.unlock(platform.debug_io);
     }
 
     fn lockTransitions(self: *MetadataService) void {
-        self.transition_mutex.lockUncancelable(native_platform.debug_io);
+        self.transition_mutex.lockUncancelable(platform.debug_io);
     }
 
     fn unlockTransitions(self: *MetadataService) void {
-        self.transition_mutex.unlock(native_platform.debug_io);
+        self.transition_mutex.unlock(platform.debug_io);
     }
 
     fn stepTransitions(self: *MetadataService) !void {
@@ -5612,8 +5612,8 @@ pub const MetadataService = struct {
     }
 
     fn ensureLifecycleListenerRegistered(self: *MetadataService) !void {
-        self.lifecycle_listener_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.lifecycle_listener_mutex.unlock(native_platform.debug_io);
+        self.lifecycle_listener_mutex.lockUncancelable(platform.debug_io);
+        defer self.lifecycle_listener_mutex.unlock(platform.debug_io);
         if (self.lifecycle_listener_closing) return error.ServiceClosing;
         if (self.lifecycle_listener_registered) return;
         const store = self.projectedStore() orelse return;
@@ -5643,8 +5643,8 @@ pub const MetadataService = struct {
     /// still required not to race `deinit`; this closes the retained callback
     /// path owned by Raft itself.
     fn closeLifecycleListener(self: *MetadataService) void {
-        self.lifecycle_listener_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.lifecycle_listener_mutex.unlock(native_platform.debug_io);
+        self.lifecycle_listener_mutex.lockUncancelable(platform.debug_io);
+        defer self.lifecycle_listener_mutex.unlock(platform.debug_io);
         self.lifecycle_listener_closing = true;
         if (self.lifecycle_listener_registration) |value| {
             const store = self.projectedStore() orelse {
@@ -5660,12 +5660,12 @@ pub const MetadataService = struct {
 
     fn metadataServicePlacementCommitBegin(ptr: *anyopaque) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
-        self.placement_catalog_gate.lockUncancelable(native_platform.debug_io);
+        self.placement_catalog_gate.lockUncancelable(platform.debug_io);
     }
 
     fn metadataServicePlacementCommitEnd(ptr: *anyopaque) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
-        self.placement_catalog_gate.unlock(native_platform.debug_io);
+        self.placement_catalog_gate.unlock(platform.debug_io);
     }
 
     fn catalogProjectionSource(self: *MetadataService) catalog_projection_reader.CatalogProjectionReader.Source {
@@ -6204,23 +6204,23 @@ pub const MetadataService = struct {
     }
 
     pub fn lockCatalogMutation(self: *MetadataService) void {
-        self.catalog_mutation_mutex.lockUncancelable(native_platform.debug_io);
+        self.catalog_mutation_mutex.lockUncancelable(platform.debug_io);
     }
 
     pub fn unlockCatalogMutation(self: *MetadataService) void {
-        self.catalog_mutation_mutex.unlock(native_platform.debug_io);
+        self.catalog_mutation_mutex.unlock(platform.debug_io);
     }
 
     pub fn lockTableCatalogMutation(self: *MetadataService, table_name: []const u8) void {
         // Serialize the table first so same-table queueing does not occupy a
         // shared slot and delay a pending exclusive catalog mutation.
-        self.tableCatalogMutationLane(table_name).lockUncancelable(native_platform.debug_io);
-        self.catalog_mutation_mutex.lockSharedUncancelable(native_platform.debug_io);
+        self.tableCatalogMutationLane(table_name).lockUncancelable(platform.debug_io);
+        self.catalog_mutation_mutex.lockSharedUncancelable(platform.debug_io);
     }
 
     pub fn unlockTableCatalogMutation(self: *MetadataService, table_name: []const u8) void {
-        self.catalog_mutation_mutex.unlockShared(native_platform.debug_io);
-        self.tableCatalogMutationLane(table_name).unlock(native_platform.debug_io);
+        self.catalog_mutation_mutex.unlockShared(platform.debug_io);
+        self.tableCatalogMutationLane(table_name).unlock(platform.debug_io);
     }
 
     fn tableCatalogMutationLane(self: *MetadataService, table_name: []const u8) *std.Io.Mutex {
@@ -6693,7 +6693,7 @@ pub const MetadataService = struct {
             return error.ReallocationProtocolUpgradeRequired;
         const barrier = try reallocationBarrierContract(incarnation, required_node_ids);
         const runtime = try self.ensureBackendRuntime();
-        const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse native_platform.debug_io);
+        const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse platform.debug_io);
         // Serialize request publication with the node/store topology captured
         // by reconciliation. This lock is intentionally acquired after the
         // protocol probe and entropy work so slow admission never stalls DDL.
@@ -6747,8 +6747,8 @@ pub const MetadataService = struct {
     }
 
     fn runRoundInternal(self: *MetadataService, advance_raft: bool) !void {
-        self.control_round_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.control_round_mutex.unlock(native_platform.debug_io);
+        self.control_round_mutex.lockUncancelable(platform.debug_io);
+        defer self.control_round_mutex.unlock(platform.debug_io);
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
         if (advance_raft) {
@@ -6785,8 +6785,8 @@ pub const MetadataService = struct {
     }
 
     pub fn runLifecycleRound(self: *MetadataService) !void {
-        self.control_round_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.control_round_mutex.unlock(native_platform.debug_io);
+        self.control_round_mutex.lockUncancelable(platform.debug_io);
+        defer self.control_round_mutex.unlock(platform.debug_io);
         try self.ensureLifecycleListenerRegistered();
         defer self.lifecycle_signal.notify(null);
         self.lockRuntime();
@@ -6828,8 +6828,8 @@ pub const MetadataService = struct {
     /// Drains accepted proposals and inbound consensus work without coupling
     /// an exact proposal waiter to reconciliation or transition execution.
     fn runRaftProgressOnly(self: *MetadataService) !void {
-        self.control_round_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.control_round_mutex.unlock(native_platform.debug_io);
+        self.control_round_mutex.lockUncancelable(platform.debug_io);
+        defer self.control_round_mutex.unlock(platform.debug_io);
         self.lockRuntime();
         defer self.unlockRuntime();
         try self.raft.runRaftProgressOnly();
@@ -6980,8 +6980,8 @@ pub const MetadataService = struct {
     }
 
     pub fn syncPending(self: *MetadataService) !raft_managed_host.ManagedSyncResult {
-        self.control_round_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.control_round_mutex.unlock(native_platform.debug_io);
+        self.control_round_mutex.lockUncancelable(platform.debug_io);
+        defer self.control_round_mutex.unlock(platform.debug_io);
         self.lockTransitions();
         defer self.unlockTransitions();
         self.lockRuntime();
@@ -7177,7 +7177,7 @@ pub const MetadataService = struct {
         }
         if (self.metadata_incarnation_proposal_pending) return false;
         if (self.metadata_incarnation_candidate == null) {
-            self.metadata_incarnation_candidate = try metadata_mod.incarnation.generate(native_platform.debug_io);
+            self.metadata_incarnation_candidate = try metadata_mod.incarnation.generate(platform.debug_io);
         }
         self.proposeTransitionCommand(.{
             .initialize_metadata_incarnation = self.metadata_incarnation_candidate.?,
@@ -7205,8 +7205,8 @@ pub const MetadataService = struct {
     }
 
     pub fn reconcileLeaseStats(self: *MetadataService) metadata_reconcile_lease.Stats {
-        self.reconcile_lease_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.reconcile_lease_mutex.unlock(native_platform.debug_io);
+        self.reconcile_lease_mutex.lockUncancelable(platform.debug_io);
+        defer self.reconcile_lease_mutex.unlock(platform.debug_io);
         return self.reconcile_lease.stats();
     }
 
@@ -7391,8 +7391,8 @@ pub const MetadataService = struct {
     }
 
     fn refreshLocalPlacementIntents(self: *MetadataService) !void {
-        self.placement_reconcile_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.placement_reconcile_mutex.unlock(native_platform.debug_io);
+        self.placement_reconcile_mutex.lockUncancelable(platform.debug_io);
+        defer self.placement_reconcile_mutex.unlock(platform.debug_io);
 
         const current_epoch = self.placement_epoch.load(.monotonic);
         if (!shouldRefreshLocalEpoch(
@@ -7499,7 +7499,7 @@ pub const MetadataService = struct {
         // The prepared catalog image keeps this joint critical section to an
         // atomic rename, directory sync, and live teardown.
         self.lockRuntime();
-        self.placement_catalog_gate.lockUncancelable(native_platform.debug_io);
+        self.placement_catalog_gate.lockUncancelable(platform.debug_io);
         if (self.placement_epoch.load(.acquire) != current_epoch) {
             reconcile.suppressRetirements();
             self.local_placement_epoch = null;
@@ -7521,7 +7521,7 @@ pub const MetadataService = struct {
                 }
             }
         }
-        self.placement_catalog_gate.unlock(native_platform.debug_io);
+        self.placement_catalog_gate.unlock(platform.debug_io);
         if (retirement_error) |err| {
             reconcile.noteRetirementDurabilityFailure(err);
             self.unlockRuntime();
@@ -7647,7 +7647,7 @@ pub const MetadataService = struct {
                 tables,
                 ranges,
                 .{
-                    .io = backend_runtime.io() orelse native_platform.debug_io,
+                    .io = backend_runtime.io() orelse platform.debug_io,
                     .backend_runtime = backend_runtime,
                     .destination_authorizer = self.destination_authorizer,
                 },
@@ -7834,8 +7834,8 @@ pub const MetadataService = struct {
     }
 
     fn ensureReconcileLease(self: *MetadataService) !bool {
-        self.reconcile_lease_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.reconcile_lease_mutex.unlock(native_platform.debug_io);
+        self.reconcile_lease_mutex.lockUncancelable(platform.debug_io);
+        defer self.reconcile_lease_mutex.unlock(platform.debug_io);
         return try self.ensureReconcileLeaseLocked();
     }
 
@@ -7904,7 +7904,7 @@ pub const MetadataService = struct {
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
-                .io = runtime.io() orelse native_platform.debug_io,
+                .io = runtime.io() orelse platform.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
@@ -7934,7 +7934,7 @@ pub const MetadataService = struct {
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
-                .io = runtime.io() orelse native_platform.debug_io,
+                .io = runtime.io() orelse platform.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source.source(),
                 .secret_store = self.secret_store,
@@ -8180,8 +8180,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn ensureBackendRuntime(self: *MetadataHttpService) !*backend_runtime_mod.BackendRuntime {
-        self.backend_runtime_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.backend_runtime_mutex.unlock(native_platform.debug_io);
+        self.backend_runtime_mutex.lockUncancelable(platform.debug_io);
+        defer self.backend_runtime_mutex.unlock(platform.debug_io);
         if (self.backend_runtime == null) {
             self.owned_backend_runtime = try backend_runtime_mod.BackendRuntimeHandle.init(self.alloc, .{});
             self.backend_runtime = self.owned_backend_runtime.?.ptr();
@@ -8250,8 +8250,8 @@ pub const MetadataHttpService = struct {
     }
 
     fn ensureLifecycleListenerRegistered(self: *MetadataHttpService) !void {
-        self.lifecycle_listener_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.lifecycle_listener_mutex.unlock(native_platform.debug_io);
+        self.lifecycle_listener_mutex.lockUncancelable(platform.debug_io);
+        defer self.lifecycle_listener_mutex.unlock(platform.debug_io);
         if (self.lifecycle_listener_closing) return error.ServiceClosing;
         if (self.lifecycle_listener_registered) return;
         const store = self.projectedStore() orelse return;
@@ -8277,8 +8277,8 @@ pub const MetadataHttpService = struct {
     }
 
     fn closeLifecycleListener(self: *MetadataHttpService) void {
-        self.lifecycle_listener_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.lifecycle_listener_mutex.unlock(native_platform.debug_io);
+        self.lifecycle_listener_mutex.lockUncancelable(platform.debug_io);
+        defer self.lifecycle_listener_mutex.unlock(platform.debug_io);
         self.lifecycle_listener_closing = true;
         if (self.lifecycle_listener_registration) |value| {
             const store = self.projectedStore() orelse {
@@ -8294,12 +8294,12 @@ pub const MetadataHttpService = struct {
 
     fn metadataHttpServicePlacementCommitBegin(ptr: *anyopaque) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
-        self.placement_catalog_gate.lockUncancelable(native_platform.debug_io);
+        self.placement_catalog_gate.lockUncancelable(platform.debug_io);
     }
 
     fn metadataHttpServicePlacementCommitEnd(ptr: *anyopaque) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
-        self.placement_catalog_gate.unlock(native_platform.debug_io);
+        self.placement_catalog_gate.unlock(platform.debug_io);
     }
 
     fn catalogProjectionSource(self: *MetadataHttpService) catalog_projection_reader.CatalogProjectionReader.Source {
@@ -8845,8 +8845,8 @@ pub const MetadataHttpService = struct {
         // Serialize runtime/owner creation and submission with teardown. Once
         // shutdown observes this owner, closeOwner drains every accepted job
         // before the service can release callback-owned state.
-        self.runtime_status_protocol_probe_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.runtime_status_protocol_probe_mutex.unlock(native_platform.debug_io);
+        self.runtime_status_protocol_probe_mutex.lockUncancelable(platform.debug_io);
+        defer self.runtime_status_protocol_probe_mutex.unlock(platform.debug_io);
         if (self.runtime_status_protocol_probe_shutdown.load(.acquire)) {
             self.finishRuntimeStatusProtocolProbe(false);
             return;
@@ -8973,8 +8973,8 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         membership_fingerprint: RuntimeStatusMembershipFingerprint,
     ) u16 {
-        self.runtime_status_protocol_cache_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.runtime_status_protocol_cache_mutex.unlock(native_platform.debug_io);
+        self.runtime_status_protocol_cache_mutex.lockUncancelable(platform.debug_io);
+        defer self.runtime_status_protocol_cache_mutex.unlock(platform.debug_io);
         if (!std.mem.eql(
             u8,
             &self.runtime_status_protocol_ready_fingerprint,
@@ -8988,8 +8988,8 @@ pub const MetadataHttpService = struct {
         membership_fingerprint: RuntimeStatusMembershipFingerprint,
         ready_version: u16,
     ) void {
-        self.runtime_status_protocol_cache_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.runtime_status_protocol_cache_mutex.unlock(native_platform.debug_io);
+        self.runtime_status_protocol_cache_mutex.lockUncancelable(platform.debug_io);
+        defer self.runtime_status_protocol_cache_mutex.unlock(platform.debug_io);
         const same_membership = std.mem.eql(
             u8,
             &self.runtime_status_protocol_ready_fingerprint,
@@ -9131,12 +9131,12 @@ pub const MetadataHttpService = struct {
             else => return err,
         };
         const lane = &self.store_report_lanes[envelope.report.store_id % self.store_report_lanes.len];
-        lane.lockUncancelable(native_platform.debug_io);
-        defer lane.unlock(native_platform.debug_io);
+        lane.lockUncancelable(platform.debug_io);
+        defer lane.unlock(platform.debug_io);
         try self.ensureLinearizableReadWithContext(context);
-        self.catalog_mutation_mutex.lockSharedUncancelable(native_platform.debug_io);
+        self.catalog_mutation_mutex.lockSharedUncancelable(platform.debug_io);
         var catalog_locked = true;
-        defer if (catalog_locked) self.catalog_mutation_mutex.unlockShared(native_platform.debug_io);
+        defer if (catalog_locked) self.catalog_mutation_mutex.unlockShared(platform.debug_io);
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         const last_request = if (envelope.action == .batch) envelope.batch[envelope.batch.len - 1] else envelope;
         const last_admission = try last_request.admissionFacts();
@@ -9199,7 +9199,7 @@ pub const MetadataHttpService = struct {
         defer if (combined) |bytes_owned| alloc.free(bytes_owned);
         const command = combined orelse commands.items[0];
         const receipt = try self.proposeTransitionCommandWithReceipt(.{ .apply_store_report_baseline = command });
-        self.catalog_mutation_mutex.unlockShared(native_platform.debug_io);
+        self.catalog_mutation_mutex.unlockShared(platform.debug_io);
         catalog_locked = false;
         try self.waitForTransitionAppliedWithContext(receipt, context);
         const observed = try store.reportBaselineProgressForKey(self.metadata_group_id, last_facts);
@@ -9227,12 +9227,12 @@ pub const MetadataHttpService = struct {
             else => return err,
         };
         const lane = &self.store_report_lanes[update.report.store_id % self.store_report_lanes.len];
-        lane.lockUncancelable(native_platform.debug_io);
-        defer lane.unlock(native_platform.debug_io);
+        lane.lockUncancelable(platform.debug_io);
+        defer lane.unlock(platform.debug_io);
         try self.ensureLinearizableReadWithContext(context);
-        self.catalog_mutation_mutex.lockSharedUncancelable(native_platform.debug_io);
+        self.catalog_mutation_mutex.lockSharedUncancelable(platform.debug_io);
         var catalog_locked = true;
-        defer if (catalog_locked) self.catalog_mutation_mutex.unlockShared(native_platform.debug_io);
+        defer if (catalog_locked) self.catalog_mutation_mutex.unlockShared(platform.debug_io);
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var expected: store_report_update.Cursor = .{ .reporter_incarnation = update.report.reporter_incarnation, .sequence = update.sequence, .digest = undefined };
         std.crypto.hash.sha2.Sha256.hash(bytes, &expected.digest, .{});
@@ -9257,7 +9257,7 @@ pub const MetadataHttpService = struct {
                 // No durable change: retain the applied base, including for
                 // telemetry-only requests. Do not create a Raft entry merely
                 // to acknowledge a new transport sequence.
-                self.catalog_mutation_mutex.unlockShared(native_platform.debug_io);
+                self.catalog_mutation_mutex.unlockShared(platform.debug_io);
                 catalog_locked = false;
                 self.observeSparseReportActivity(alloc, update) catch |err| std.log.warn("store report activity update skipped err={s}", .{@errorName(err)});
                 return update.base.?;
@@ -9273,7 +9273,7 @@ pub const MetadataHttpService = struct {
         const command_bytes = try metadata_storage.raft_apply_store.encodeStoreReportUpdate(alloc, .{ .update = durable, .request_digest = expected.digest, .expected_header = try metadata_storage.raft_apply_store.RaftApplyStore.reportHeaderDigest(alloc, prior), .admission_cursor = admission_cursor });
         defer alloc.free(command_bytes);
         const receipt = try self.proposeTransitionCommandWithReceipt(.{ .apply_store_report_update = command_bytes });
-        self.catalog_mutation_mutex.unlockShared(native_platform.debug_io);
+        self.catalog_mutation_mutex.unlockShared(platform.debug_io);
         catalog_locked = false;
         try self.waitForTransitionAppliedWithContext(receipt, context);
         const observed = (try store.reportCursor(self.metadata_group_id, update.report.store_id)) orelse return error.StoreReportBaseMismatch;
@@ -9702,7 +9702,7 @@ pub const MetadataHttpService = struct {
     pub fn requestReallocation(self: *MetadataHttpService, requested_at_ms: u64) !void {
         const barrier = try self.ensureReallocationBarrierProtocolReady();
         const runtime = try self.ensureBackendRuntime();
-        const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse native_platform.debug_io);
+        const request_id = try metadata_reallocation_request.generateRequestId(runtime.io() orelse platform.debug_io);
         // Keep the replicated request causally ordered with node/store joins
         // without holding the catalog lane during remote protocol probes.
         self.lockCatalogMutation();
@@ -10650,20 +10650,20 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn observeSplitTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.SplitObservation {
-        self.transition_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.transition_mutex.unlock(native_platform.debug_io);
+        self.transition_mutex.lockUncancelable(platform.debug_io);
+        defer self.transition_mutex.unlock(platform.debug_io);
         return try self.raft.observeSplitTransition(transition_id);
     }
 
     pub fn observeMergeTransition(self: *MetadataHttpService, transition_id: u64) !?transition_state.MergeObservation {
-        self.transition_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.transition_mutex.unlock(native_platform.debug_io);
+        self.transition_mutex.lockUncancelable(platform.debug_io);
+        defer self.transition_mutex.unlock(platform.debug_io);
         return try self.raft.observeMergeTransition(transition_id);
     }
 
     fn stepTransitions(self: *MetadataHttpService) !raft_transition_service.TransitionStepResult {
-        self.transition_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.transition_mutex.unlock(native_platform.debug_io);
+        self.transition_mutex.lockUncancelable(platform.debug_io);
+        defer self.transition_mutex.unlock(platform.debug_io);
         if (self.online_merge_runtime) |runtime| if (self.raft.transition_svc) |*transitions| {
             transitions.online_driver = runtime.driver;
         };
@@ -10689,9 +10689,9 @@ pub const MetadataHttpService = struct {
         snapshot.read_index_requests = self.raft.metrics.read_index_requests;
         self.unlockRuntime();
 
-        self.transition_metrics_mutex.lockUncancelable(native_platform.debug_io);
+        self.transition_metrics_mutex.lockUncancelable(platform.debug_io);
         const transition_metrics = self.transition_metrics_snapshot;
-        self.transition_metrics_mutex.unlock(native_platform.debug_io);
+        self.transition_metrics_mutex.unlock(platform.debug_io);
         applyTransitionMetrics(&snapshot, transition_metrics);
         return snapshot;
     }
@@ -10779,11 +10779,11 @@ pub const MetadataHttpService = struct {
     }
 
     fn lockMetadataStatusCache(self: *MetadataHttpService) void {
-        self.metadata_status_cache_mutex.lockUncancelable(native_platform.debug_io);
+        self.metadata_status_cache_mutex.lockUncancelable(platform.debug_io);
     }
 
     fn unlockMetadataStatusCache(self: *MetadataHttpService) void {
-        self.metadata_status_cache_mutex.unlock(native_platform.debug_io);
+        self.metadata_status_cache_mutex.unlock(platform.debug_io);
     }
 
     fn refreshMetadataStatusCacheIfDue(self: *MetadataHttpService) void {
@@ -11271,8 +11271,8 @@ pub const MetadataHttpService = struct {
         self: *MetadataHttpService,
         group_id: u64,
     ) !transition_state.StablePlacementReadiness {
-        self.transition_readiness_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.transition_readiness_mutex.unlock(native_platform.debug_io);
+        self.transition_readiness_mutex.lockUncancelable(platform.debug_io);
+        defer self.transition_readiness_mutex.unlock(platform.debug_io);
 
         const cache = &self.transition_readiness_cache;
         for (0..4) |_| {
@@ -11561,7 +11561,7 @@ pub const MetadataHttpService = struct {
         }
         if (self.metadata_incarnation_proposal_pending) return false;
         if (self.metadata_incarnation_candidate == null) {
-            self.metadata_incarnation_candidate = try metadata_mod.incarnation.generate(native_platform.debug_io);
+            self.metadata_incarnation_candidate = try metadata_mod.incarnation.generate(platform.debug_io);
         }
         self.proposeTransitionCommand(.{
             .initialize_metadata_incarnation = self.metadata_incarnation_candidate.?,
@@ -11605,8 +11605,8 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn reconcileLeaseStats(self: *MetadataHttpService) metadata_reconcile_lease.Stats {
-        self.reconcile_lease_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.reconcile_lease_mutex.unlock(native_platform.debug_io);
+        self.reconcile_lease_mutex.lockUncancelable(platform.debug_io);
+        defer self.reconcile_lease_mutex.unlock(platform.debug_io);
         return self.reconcile_lease.stats();
     }
 
@@ -12005,10 +12005,10 @@ pub const MetadataHttpService = struct {
     }
 
     fn lockComponents(self: *MetadataHttpService) void {
-        self.component_projection_mutex.lockUncancelable(native_platform.debug_io);
+        self.component_projection_mutex.lockUncancelable(platform.debug_io);
     }
     fn unlockComponents(self: *MetadataHttpService) void {
-        self.component_projection_mutex.unlock(native_platform.debug_io);
+        self.component_projection_mutex.unlock(platform.debug_io);
     }
     fn componentKinds() std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) {
         var kinds: std.EnumSet(metadata_storage.raft_apply_store.ProjectionSignalKind) = .full;
@@ -12017,19 +12017,19 @@ pub const MetadataHttpService = struct {
     }
 
     fn lockProjection(self: *MetadataHttpService) void {
-        self.projection_mutex.lockUncancelable(native_platform.debug_io);
+        self.projection_mutex.lockUncancelable(platform.debug_io);
     }
 
     fn unlockProjection(self: *MetadataHttpService) void {
-        self.projection_mutex.unlock(native_platform.debug_io);
+        self.projection_mutex.unlock(platform.debug_io);
     }
 
     fn lockRuntime(self: *MetadataHttpService) void {
-        self.runtime_mutex.lockUncancelable(native_platform.debug_io);
+        self.runtime_mutex.lockUncancelable(platform.debug_io);
     }
 
     fn unlockRuntime(self: *MetadataHttpService) void {
-        self.runtime_mutex.unlock(native_platform.debug_io);
+        self.runtime_mutex.unlock(platform.debug_io);
     }
 
     /// Serializes snapshot-derived catalog commands through Raft admission.
@@ -12038,11 +12038,11 @@ pub const MetadataHttpService = struct {
     /// order agree without holding the Raft runtime lock across disk or
     /// network waits.
     pub fn lockCatalogMutation(self: *MetadataHttpService) void {
-        self.catalog_mutation_mutex.lockUncancelable(native_platform.debug_io);
+        self.catalog_mutation_mutex.lockUncancelable(platform.debug_io);
     }
 
     pub fn unlockCatalogMutation(self: *MetadataHttpService) void {
-        self.catalog_mutation_mutex.unlock(native_platform.debug_io);
+        self.catalog_mutation_mutex.unlock(platform.debug_io);
     }
 
     /// DDL holds a shared catalog gate plus a stable per-table lane through
@@ -12052,13 +12052,13 @@ pub const MetadataHttpService = struct {
     pub fn lockTableCatalogMutation(self: *MetadataHttpService, table_name: []const u8) void {
         // Serialize the table first so same-table queueing does not occupy a
         // shared slot and delay a pending exclusive catalog mutation.
-        self.tableCatalogMutationLane(table_name).lockUncancelable(native_platform.debug_io);
-        self.catalog_mutation_mutex.lockSharedUncancelable(native_platform.debug_io);
+        self.tableCatalogMutationLane(table_name).lockUncancelable(platform.debug_io);
+        self.catalog_mutation_mutex.lockSharedUncancelable(platform.debug_io);
     }
 
     pub fn unlockTableCatalogMutation(self: *MetadataHttpService, table_name: []const u8) void {
-        self.catalog_mutation_mutex.unlockShared(native_platform.debug_io);
-        self.tableCatalogMutationLane(table_name).unlock(native_platform.debug_io);
+        self.catalog_mutation_mutex.unlockShared(platform.debug_io);
+        self.tableCatalogMutationLane(table_name).unlock(platform.debug_io);
     }
 
     fn tableCatalogMutationLane(self: *MetadataHttpService, table_name: []const u8) *std.Io.Mutex {
@@ -12086,8 +12086,8 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshLocalPlacementIntents(self: *MetadataHttpService, round_inputs: ?*const LocalPlacementInputs) !void {
-        self.placement_reconcile_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.placement_reconcile_mutex.unlock(native_platform.debug_io);
+        self.placement_reconcile_mutex.lockUncancelable(platform.debug_io);
+        defer self.placement_reconcile_mutex.unlock(platform.debug_io);
 
         const current_epoch = self.placement_epoch.load(.monotonic);
         if (!shouldRefreshLocalEpoch(
@@ -12203,7 +12203,7 @@ pub const MetadataHttpService = struct {
         // the placement publication barrier. Preparation above keeps the
         // jointly locked work bounded to publication and live teardown.
         self.lockRuntime();
-        self.placement_catalog_gate.lockUncancelable(native_platform.debug_io);
+        self.placement_catalog_gate.lockUncancelable(platform.debug_io);
         if (self.placement_epoch.load(.acquire) != current_epoch) {
             reconcile.suppressRetirements();
             self.local_placement_epoch = null;
@@ -12225,7 +12225,7 @@ pub const MetadataHttpService = struct {
                 }
             }
         }
-        self.placement_catalog_gate.unlock(native_platform.debug_io);
+        self.placement_catalog_gate.unlock(platform.debug_io);
         if (retirement_error) |err| {
             reconcile.noteRetirementDurabilityFailure(err);
             self.unlockRuntime();
@@ -12237,8 +12237,8 @@ pub const MetadataHttpService = struct {
     }
 
     fn refreshLocalTransitions(self: *MetadataHttpService, round_inputs: ?*const LocalTransitionInputs) !void {
-        self.transition_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.transition_mutex.unlock(native_platform.debug_io);
+        self.transition_mutex.lockUncancelable(platform.debug_io);
+        defer self.transition_mutex.unlock(platform.debug_io);
         defer self.publishTransitionMetricsLocked();
         const transition_svc = if (self.raft.transition_svc) |*svc| svc else return;
         const current_epoch = self.transition_epoch.load(.monotonic);
@@ -12303,9 +12303,9 @@ pub const MetadataHttpService = struct {
     /// transition mutex (or is still in single-threaded initialization).
     fn publishTransitionMetricsLocked(self: *MetadataHttpService) void {
         const snapshot: raft_transition_service.TransitionServiceMetrics = if (self.raft.transition_svc) |*svc| svc.metrics else .{};
-        self.transition_metrics_mutex.lockUncancelable(native_platform.debug_io);
+        self.transition_metrics_mutex.lockUncancelable(platform.debug_io);
         self.transition_metrics_snapshot = snapshot;
-        self.transition_metrics_mutex.unlock(native_platform.debug_io);
+        self.transition_metrics_mutex.unlock(platform.debug_io);
     }
 
     fn refreshLocalTableProvisioning(self: *MetadataHttpService, round_inputs: ?*const LocalProjectionInputs) !metadata_table_provisioner.ProvisionSummary {
@@ -12365,7 +12365,7 @@ pub const MetadataHttpService = struct {
                 inputs.tables,
                 inputs.ranges,
                 .{
-                    .io = backend_runtime.io() orelse native_platform.debug_io,
+                    .io = backend_runtime.io() orelse platform.debug_io,
                     .backend_runtime = backend_runtime,
                     .destination_authorizer = self.destination_authorizer,
                 },
@@ -12560,8 +12560,8 @@ pub const MetadataHttpService = struct {
     }
 
     fn ensureReconcileLease(self: *MetadataHttpService) !bool {
-        self.reconcile_lease_mutex.lockUncancelable(native_platform.debug_io);
-        defer self.reconcile_lease_mutex.unlock(native_platform.debug_io);
+        self.reconcile_lease_mutex.lockUncancelable(platform.debug_io);
+        defer self.reconcile_lease_mutex.unlock(platform.debug_io);
         return try self.ensureReconcileLeaseLocked();
     }
 
@@ -12644,7 +12644,7 @@ pub const MetadataHttpService = struct {
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
-                .io = runtime.io() orelse native_platform.debug_io,
+                .io = runtime.io() orelse platform.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
                 .secret_store = self.secret_store,
@@ -12677,7 +12677,7 @@ pub const MetadataHttpService = struct {
             .alloc = self.alloc,
             .runner = .{
                 .alloc = self.alloc,
-                .io = runtime.io() orelse native_platform.debug_io,
+                .io = runtime.io() orelse platform.debug_io,
                 .registry = &self.cdc_backfill_registry,
                 .write_source = write_source,
                 .secret_store = self.secret_store,
@@ -14025,10 +14025,10 @@ test "metadata service reallocation barrier covers configured and transitional m
 
 fn shutdownRuntimeStatusProtocolProbe(service: *MetadataHttpService) void {
     service.runtime_status_protocol_probe_shutdown.store(true, .release);
-    service.runtime_status_protocol_probe_mutex.lockUncancelable(native_platform.debug_io);
+    service.runtime_status_protocol_probe_mutex.lockUncancelable(platform.debug_io);
     const runtime = service.backend_runtime;
     const owner_id = service.runtime_status_protocol_probe_owner_id;
-    service.runtime_status_protocol_probe_mutex.unlock(native_platform.debug_io);
+    service.runtime_status_protocol_probe_mutex.unlock(platform.debug_io);
     if (runtime) |value| {
         if (owner_id != 0) value.durable_jobs.closeOwner(owner_id);
     }
@@ -14036,10 +14036,10 @@ fn shutdownRuntimeStatusProtocolProbe(service: *MetadataHttpService) void {
 
 fn shutdownCdcRuntimeJobs(service: anytype) void {
     service.cdc_shutdown.store(true, .release);
-    service.cdc_runtime_mutex.lockUncancelable(native_platform.debug_io);
+    service.cdc_runtime_mutex.lockUncancelable(platform.debug_io);
     const runtime = service.backend_runtime;
     const owner_id = service.cdc_job_owner_id;
-    service.cdc_runtime_mutex.unlock(native_platform.debug_io);
+    service.cdc_runtime_mutex.unlock(platform.debug_io);
     if (runtime) |value| {
         if (owner_id != 0) value.durable_jobs.closeOwner(owner_id);
     }
@@ -14069,8 +14069,8 @@ fn ensureCdcWorkPermit(service: anytype) !void {
     const now_ns = platform_time.monotonicNs();
     if (now_ns < service.cdc_permit_check_after_ns.load(.acquire)) return;
 
-    service.reconcile_lease_mutex.lockUncancelable(native_platform.debug_io);
-    defer service.reconcile_lease_mutex.unlock(native_platform.debug_io);
+    service.reconcile_lease_mutex.lockUncancelable(platform.debug_io);
+    defer service.reconcile_lease_mutex.unlock(platform.debug_io);
 
     const locked_now_ns = platform_time.monotonicNs();
     if (locked_now_ns < service.cdc_permit_check_after_ns.load(.acquire)) return;
@@ -14191,8 +14191,8 @@ fn cdcWorkDeadlineNs(service: anytype) !u64 {
     if (!service.reconcile_lease.config.enabled)
         return platform_time.monotonicNs() +| 5 * std.time.ns_per_s;
 
-    service.reconcile_lease_mutex.lockUncancelable(native_platform.debug_io);
-    defer service.reconcile_lease_mutex.unlock(native_platform.debug_io);
+    service.reconcile_lease_mutex.lockUncancelable(platform.debug_io);
+    defer service.reconcile_lease_mutex.unlock(platform.debug_io);
     const now_ms = service.reconcile_lease.nowMs();
     if (service.reconcile_lease.owner_node_id !=
         service.reconcile_lease.local_node_id or
@@ -14268,8 +14268,8 @@ fn scheduleReplicationBackfillJob(service: anytype) !void {
     const Service = @TypeOf(service.*);
     if (service.replica_root_dir == null or !cdcLocalMetadataLeader(service)) return;
 
-    service.cdc_runtime_mutex.lockUncancelable(native_platform.debug_io);
-    defer service.cdc_runtime_mutex.unlock(native_platform.debug_io);
+    service.cdc_runtime_mutex.lockUncancelable(platform.debug_io);
+    defer service.cdc_runtime_mutex.unlock(platform.debug_io);
     if (service.cdc_shutdown.load(.acquire)) return;
     if (service.cdc_job_in_flight.load(.acquire)) return;
 
@@ -14703,7 +14703,7 @@ fn syncLocalStoreStatus(
     defer service.freeAdminSnapshot(&admin_snapshot);
     const backend_runtime = try service.ensureBackendRuntime();
     const status_io = backend_runtime.io() orelse if (builtin.is_test)
-        native_platform.testing.io
+        platform.testing.io
     else
         return error.BackendIoUnavailable;
     var owned_backfill_markers: ?[]const StoreStatusBackfillMarker = null;
@@ -15395,7 +15395,7 @@ fn latestLocalGroupStatus(
 
 test "metadata service status preserves the last observation during a generation transition" {
     const alloc = std.testing.allocator;
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(
@@ -15406,7 +15406,7 @@ test "metadata service status preserves the last observation during a generation
     defer alloc.free(replica_root);
     const db_path = try std.fmt.allocPrint(alloc, "{s}/group-77/table-db", .{replica_root});
     defer alloc.free(db_path);
-    try fs_paths.createDirPathPortable(native_platform.testing.io, db_path);
+    try fs_paths.createDirPathPortable(platform.testing.io, db_path);
 
     var runtime = try backend_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
     defer runtime.deinit();
@@ -15759,7 +15759,7 @@ fn openDirPath(io: anytype, path: []const u8, iterate: bool) !std.Io.Dir {
 
 fn backendIoForService(service: anytype) !std.Io {
     return (try service.ensureBackendRuntime()).io() orelse if (builtin.is_test)
-        native_platform.testing.io
+        platform.testing.io
     else
         error.BackendIoUnavailable;
 }
@@ -15813,7 +15813,7 @@ fn maybeRefreshStoreStatusBackfillMarkerCache(
 ) !void {
     return maybeRefreshStoreStatusBackfillMarkerCacheWithIo(
         alloc,
-        native_platform.debug_io,
+        platform.debug_io,
         replica_root_dir,
         store_status_ticks,
         probe_ticks,
@@ -15854,7 +15854,7 @@ fn refreshStoreStatusBackfillMarkerCacheNow(
 ) !void {
     return refreshStoreStatusBackfillMarkerCacheNowWithIo(
         alloc,
-        native_platform.debug_io,
+        platform.debug_io,
         replica_root_dir,
         probe_ticks,
         cache,
@@ -15880,7 +15880,7 @@ fn monotonicMs() u64 {
     // fixtures in that same clock domain too: on platforms where `.awake`
     // includes suspend time, POSIX CLOCK_MONOTONIC can otherwise make a fresh
     // cache entry appear immediately expired after the machine has slept.
-    return monotonicMsWithIo(native_platform.debug_io);
+    return monotonicMsWithIo(platform.debug_io);
 }
 
 fn monotonicMsWithIo(io: std.Io) u64 {
@@ -15982,7 +15982,7 @@ fn rebuildStateForPath(path: []const u8) backfill_state_mod.RebuildState {
 }
 
 fn collectStoreStatusBackfillMarkers(alloc: std.mem.Allocator, replica_root_dir: []const u8) ![]StoreStatusBackfillMarker {
-    return collectStoreStatusBackfillMarkersWithIo(alloc, native_platform.debug_io, replica_root_dir);
+    return collectStoreStatusBackfillMarkersWithIo(alloc, platform.debug_io, replica_root_dir);
 }
 
 pub fn collectStoreStatusBackfillMarkersWithIo(
@@ -16023,7 +16023,7 @@ fn backfillMarkerStateFileExists(
     replica_root_dir: []const u8,
     marker: StoreStatusBackfillMarker,
 ) !bool {
-    return backfillMarkerStateFileExistsWithIo(alloc, native_platform.debug_io, replica_root_dir, marker);
+    return backfillMarkerStateFileExistsWithIo(alloc, platform.debug_io, replica_root_dir, marker);
 }
 
 fn maybeRequestStoreStatusBackfillMarkerRescan(
@@ -17628,8 +17628,8 @@ pub fn snapshotStatusWithOptions(
 }
 
 fn realtimeNowMillis() u64 {
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(.REALTIME, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(.REALTIME, &ts))) {
         .SUCCESS => {},
         else => return 0,
     }
@@ -17695,7 +17695,7 @@ test "metadata service proposes split transitions into the metadata group" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-service-root", .{tmp.sub_path});
@@ -17829,7 +17829,7 @@ test "metadata service status reflects reconcile lease ownership" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-lease-root", .{tmp.sub_path});
@@ -18054,7 +18054,7 @@ test "metadata service can apply reconciliation plan proposals" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-plan-root", .{tmp.sub_path});
@@ -18195,7 +18195,7 @@ test "metadata control loop preserves prepared state while renewing its lease" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-loop-root", .{tmp.sub_path});
@@ -18313,7 +18313,7 @@ test "metadata service projects committed table and range topology" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-topology-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -18426,7 +18426,7 @@ test "table workflow can drive real metadata service topology and split setup" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-workflow-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -18593,7 +18593,7 @@ test "metadata service projects committed placement intents into local hosted re
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-placement-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -18694,7 +18694,7 @@ test "table workflow can drive placement intents through the real metadata contr
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-control-loop-placement-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -18802,7 +18802,7 @@ test "metadata service reports store status without losing placement attributes"
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-store-status-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -18960,7 +18960,7 @@ test "metadata service batches store status reports" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-store-status-batch-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -19078,7 +19078,7 @@ test "metadata service persists coalesces promotes and clears reallocation reque
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-reallocation-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -19203,9 +19203,9 @@ test "metadata service auto-reports local store backfill status during runRound"
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-auto-store-status-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -19248,7 +19248,7 @@ test "metadata service auto-reports local store backfill status during runRound"
 
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-8801/table-db", .{replica_root});
     defer std.testing.allocator.free(db_path);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
@@ -19319,9 +19319,9 @@ test "metadata service reports automatic store status across shared multi-store 
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-auto-store-status-multi-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -19365,7 +19365,7 @@ test "metadata service reports automatic store status across shared multi-store 
 
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-8901/table-db", .{replica_root});
     defer std.testing.allocator.free(db_path);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
@@ -19446,9 +19446,9 @@ test "metadata service reports automatic store status across explicit multi-stor
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-auto-store-status-explicit-roots", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -19491,7 +19491,7 @@ test "metadata service reports automatic store status across explicit multi-stor
     try svc.upsertRange(.{ .group_id = 9002, .table_id = 90, .start_key = "doc:m", .end_key = "doc:z" });
     try svc.runRound();
 
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const left_db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/store-71/group-9001/table-db", .{replica_root});
     defer std.testing.allocator.free(left_db_path);
@@ -19579,9 +19579,9 @@ test "metadata service prefers placement-role-compatible store affinity in share
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-auto-store-status-role-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -19625,7 +19625,7 @@ test "metadata service prefers placement-role-compatible store affinity in share
 
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-9101/table-db", .{replica_root});
     defer std.testing.allocator.free(db_path);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
@@ -19656,16 +19656,16 @@ test "metadata service prefers placement-role-compatible store affinity in share
 }
 
 test "metadata service shared-root reports survive transient rebuild marker removal" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-auto-store-status-transient-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
 
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-9301/table-db", .{replica_root});
     defer std.testing.allocator.free(db_path);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
@@ -19715,7 +19715,7 @@ test "metadata service shared-root reports survive transient rebuild marker remo
     const projected = try collectSharedRootLocalStoreStatusReports(
         .{},
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         replica_root,
         1,
         stores[0..],
@@ -19796,9 +19796,9 @@ test "metadata service lifecycle round uses cached backfill markers" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-lifecycle-store-status-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -19846,7 +19846,7 @@ test "metadata service lifecycle round uses cached backfill markers" {
 
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-10101/table-db", .{replica_root});
     defer std.testing.allocator.free(db_path);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
@@ -19922,9 +19922,9 @@ test "metadata service lifecycle round discovers backfill markers immediately" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-lifecycle-discovery-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -19967,7 +19967,7 @@ test "metadata service lifecycle round discovers backfill markers immediately" {
 
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-10201/table-db", .{replica_root});
     defer std.testing.allocator.free(db_path);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
@@ -20039,9 +20039,9 @@ test "metadata service lifecycle round backs off empty backfill probes after ini
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-lifecycle-empty-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
@@ -20093,16 +20093,16 @@ test "metadata service lifecycle round backs off empty backfill probes after ini
 }
 
 test "metadata service cached backfill markers rescan immediately after disappearance" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-store-status-rescan-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
 
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-9401/table-db", .{replica_root});
     defer std.testing.allocator.free(db_path);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
@@ -20166,16 +20166,16 @@ test "metadata service cached backfill markers rescan immediately after disappea
 }
 
 test "metadata service caches corrupt rebuild state and publishes quarantine status" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-corrupt-backfill-marker-cache", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
     const index_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-9501/table-db/indexes/search_idx", .{replica_root});
     defer std.testing.allocator.free(index_root);
 
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), index_root);
     const rebuild_state = backfill_state_mod.RebuildState.initOwned(index_root, null, 95);
@@ -20295,14 +20295,14 @@ test "metadata service caches corrupt rebuild state and publishes quarantine sta
 }
 
 test "metadata service does not rescan empty backfill markers before idle interval" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-empty-backfill-marker-cache", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
 
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), replica_root);
 
@@ -20326,16 +20326,16 @@ test "metadata service does not rescan empty backfill markers before idle interv
 }
 
 test "metadata service prefers planned store affinity in shared roots" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cwd = try std.process.currentPathAlloc(native_platform.testing.io, std.testing.allocator);
+    const cwd = try std.process.currentPathAlloc(platform.testing.io, std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/metadata-auto-store-status-planned-root", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(replica_root);
 
     const db_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/group-9201/table-db", .{replica_root});
     defer std.testing.allocator.free(db_path);
-    var io_impl = native_platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
@@ -20381,7 +20381,7 @@ test "metadata service prefers planned store affinity in shared roots" {
     const projected = try collectSharedRootLocalStoreStatusReports(
         .{},
         std.testing.allocator,
-        native_platform.testing.io,
+        platform.testing.io,
         replica_root,
         1,
         stores[0..],
@@ -20447,7 +20447,7 @@ test "metadata service status reports repair and rebalance counts" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-status-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -20705,7 +20705,7 @@ test "metadata service admin snapshot captures projected topology and status" {
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-admin-snapshot-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -20852,7 +20852,7 @@ test "metadata service committed metadata changes request lifecycle reconcile ho
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-lifecycle-hook-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -21193,7 +21193,7 @@ test "metadata http service catalog cache is independent from volatile projectio
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -21557,7 +21557,7 @@ test "metadata http service linearizable reads leave elections to the cadence dr
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-barrier-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -21804,7 +21804,7 @@ test "metadata http projected clone helpers clean up on allocation failure" {
         }
     };
 
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "metadata service local replica root reconcile permit hook defers reconcile work" {
@@ -21874,7 +21874,7 @@ test "metadata service local replica root reconcile permit hook defers reconcile
         }
     };
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-reconcile-permit-root", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_root);
@@ -22216,7 +22216,7 @@ test "metadata service sparse leases preserve pinned groups through allocation f
             try std.testing.expect(!removed.capabilities.flags.contains(.repair));
         }
     };
-    try native_platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "metadata service projection journal keeps group bursts sparse and isolates overflow" {

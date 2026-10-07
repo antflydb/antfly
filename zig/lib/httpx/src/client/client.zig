@@ -29,7 +29,7 @@
 //! per-stream completion signaled via `Io.Event`. Without fiber support,
 //! frames are pumped inline (one request at a time).
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const array_list_writer_mod = @import("../util/array_list_writer.zig");
@@ -3908,14 +3908,14 @@ pub const Client = struct {
 
 test "Client initialization" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, native_platform.testing.io);
+    var client = Client.init(allocator, platform.testing.io);
     defer client.deinit();
 
     try std.testing.expectEqualStrings(meta.default_user_agent, client.config.user_agent);
 }
 
 test "Client rejects an already cancelled request" {
-    var client = Client.init(std.testing.allocator, native_platform.testing.io);
+    var client = Client.init(std.testing.allocator, platform.testing.io);
     defer client.deinit();
     var cancellation = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
@@ -3926,7 +3926,7 @@ test "Client rejects an already cancelled request" {
 
 test "ClientConfig supplies cancellation to provider adapters" {
     var cancellation = std.atomic.Value(bool).init(true);
-    var client = Client.initWithConfig(std.testing.allocator, native_platform.testing.io, .{
+    var client = Client.initWithConfig(std.testing.allocator, platform.testing.io, .{
         .request_cancellation = .fromAtomic(&cancellation),
     });
     defer client.deinit();
@@ -3948,7 +3948,7 @@ test "Client rejects callback-backed cancellation" {
 
     var state = State{ .canceled = true };
     const token = CancellationToken.fromCallback(&state, State.isCancelled).?;
-    var client = Client.init(std.testing.allocator, native_platform.testing.io);
+    var client = Client.init(std.testing.allocator, platform.testing.io);
     defer client.deinit();
     try std.testing.expectError(
         error.Cancelled,
@@ -3958,7 +3958,7 @@ test "Client rejects callback-backed cancellation" {
 
 test "Client with config" {
     const allocator = std.testing.allocator;
-    var client = Client.initWithConfig(allocator, native_platform.testing.io, .{
+    var client = Client.initWithConfig(allocator, platform.testing.io, .{
         .base_url = "https://api.example.com",
         .user_agent = "TestClient/1.0",
     });
@@ -4028,7 +4028,7 @@ test "HTTP 1 response reuse requires persistent self-delimited framing" {
 
 test "Client stores Set-Cookie headers" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, native_platform.testing.io);
+    var client = Client.init(allocator, platform.testing.io);
     defer client.deinit();
 
     var response = Response.init(allocator, 200);
@@ -4045,7 +4045,7 @@ test "Client stores Set-Cookie headers" {
 
 test "Client attaches Cookie header from jar" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, native_platform.testing.io);
+    var client = Client.init(allocator, platform.testing.io);
     defer client.deinit();
 
     try client.setCookie("session", "abc123");
@@ -4063,7 +4063,7 @@ test "Client attaches Cookie header from jar" {
 
 test "Client cookie jar public API" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, native_platform.testing.io);
+    var client = Client.init(allocator, platform.testing.io);
     defer client.deinit();
 
     try client.setCookie("session", "abc123");
@@ -4081,7 +4081,7 @@ test "Client cookie jar public API" {
 
 test "Client method convenience functions" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, native_platform.testing.io);
+    var client = Client.init(allocator, platform.testing.io);
     defer client.deinit();
 
     // Compile-time check that convenience methods exist.
@@ -4093,7 +4093,7 @@ test "Client method convenience functions" {
 
 test "Client hasCookie and cookieCount" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, native_platform.testing.io);
+    var client = Client.init(allocator, platform.testing.io);
     defer client.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), client.cookieCount());
@@ -4134,7 +4134,7 @@ const DnsRetryFixture = struct {
     }
 
     fn lookup(_: ?*anyopaque, _: HostName, resolved: *Io.Queue(HostName.LookupResult), options: HostName.LookupOptions) HostName.LookupError!void {
-        const io = native_platform.testing.io;
+        const io = platform.testing.io;
         defer resolved.close(io);
         const call = calls.fetchAdd(1, .acq_rel);
         if (cancellation) |signal| signal.store(true, .release);
@@ -4148,7 +4148,7 @@ const DnsRetryFixture = struct {
 
 test "DNS retry recovers idempotent GET and HEAD without external DNS" {
     const TestServer = @import("../testing.zig").TestServer;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var vtable = io.vtable.*;
     vtable.netLookup = DnsRetryFixture.lookup;
     const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
@@ -4175,7 +4175,7 @@ test "DNS retry recovers idempotent GET and HEAD without external DNS" {
 }
 
 test "DNS retry preserves terminal lookup errors method policy and attempt bound" {
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var vtable = io.vtable.*;
     vtable.netLookup = DnsRetryFixture.lookup;
     const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
@@ -4200,7 +4200,7 @@ test "DNS retry preserves terminal lookup errors method policy and attempt bound
 }
 
 test "DNS retry backoff obeys the original request deadline and cancellation" {
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var vtable = io.vtable.*;
     vtable.netLookup = DnsRetryFixture.lookup;
     const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
@@ -4226,7 +4226,7 @@ test "DNS retry backoff obeys the original request deadline and cancellation" {
 }
 
 test "per-request retry ceiling overrides unsafe global replay policy" {
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var vtable = io.vtable.*;
     vtable.netLookup = DnsRetryFixture.lookup;
     const fault_io: Io = .{ .userdata = io.userdata, .vtable = &vtable };
@@ -4253,7 +4253,7 @@ test "Client config keep alive default" {
 
 test "Client interceptor management" {
     const allocator = std.testing.allocator;
-    var client = Client.init(allocator, native_platform.testing.io);
+    var client = Client.init(allocator, platform.testing.io);
     defer client.deinit();
 
     try client.addInterceptor(.{
@@ -4267,7 +4267,7 @@ test "Client interceptor management" {
 
 test "Client config base URL" {
     const allocator = std.testing.allocator;
-    var client = Client.initWithConfig(allocator, native_platform.testing.io, .{
+    var client = Client.initWithConfig(allocator, platform.testing.io, .{
         .base_url = "https://api.example.com",
     });
     defer client.deinit();
@@ -4289,7 +4289,7 @@ test "Client config max_response_headers default" {
 
 test "Client config limits are customizable" {
     const allocator = std.testing.allocator;
-    var client = Client.initWithConfig(allocator, native_platform.testing.io, .{
+    var client = Client.initWithConfig(allocator, platform.testing.io, .{
         .max_response_size = 1024,
         .max_response_headers = 32,
     });
@@ -4301,7 +4301,7 @@ test "Client config limits are customizable" {
 
 test "Client per-request response limit only lowers the configured ceiling" {
     const allocator = std.testing.allocator;
-    var client = Client.initWithConfig(allocator, native_platform.testing.io, .{
+    var client = Client.initWithConfig(allocator, platform.testing.io, .{
         .max_response_size = 1024,
     });
     defer client.deinit();
@@ -4402,7 +4402,7 @@ test "decodeChunkedBody handles trailers" {
 }
 
 test "client resolveAddress falls back to hostname lookup" {
-    const addr = try resolveAddress(native_platform.testing.io, "localhost", 443);
+    const addr = try resolveAddress(platform.testing.io, "localhost", 443);
     switch (addr) {
         .ip4 => |ip4| try std.testing.expectEqual(@as(u16, 443), ip4.port),
         .ip6 => |ip6| try std.testing.expectEqual(@as(u16, 443), ip6.port),
@@ -4416,7 +4416,7 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
     var entry = H2PoolEntry{
         .socket = undefined,
         .session = undefined,
-        .h2 = H2Connection.initClient(allocator, native_platform.testing.io),
+        .h2 = H2Connection.initClient(allocator, platform.testing.io),
         .is_tls = false,
     };
     defer entry.h2.deinit();
@@ -4436,7 +4436,7 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
 
     var reader = Client.H2StreamReader{
         .stream = stream,
-        .io = native_platform.testing.io,
+        .io = platform.testing.io,
         .h2 = h2,
         .entry = &entry, // completed=true means close() skips socket/TLS access.
         .data_event = data_event,
@@ -4467,13 +4467,13 @@ test "H2StreamReader reads pre-buffered data and returns EOF" {
 }
 
 test "H2 entry lease defers retired teardown while another request is in flight" {
-    var client = Client.init(std.testing.allocator, native_platform.testing.io);
+    var client = Client.init(std.testing.allocator, platform.testing.io);
     defer client.deinit();
 
     var entry = H2PoolEntry{
         .socket = undefined,
         .session = undefined,
-        .h2 = H2Connection.initClient(std.testing.allocator, native_platform.testing.io),
+        .h2 = H2Connection.initClient(std.testing.allocator, platform.testing.io),
         .is_tls = false,
         .retired = true,
         .active_requests = 2,
@@ -4491,7 +4491,7 @@ test "H2 entry lease defers retired teardown while another request is in flight"
 
 test "pooled H2 stream creation serializes ids and map publication" {
     const alloc = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -4528,13 +4528,13 @@ test "pooled H2 stream creation serializes ids and map publication" {
 }
 
 test "H2 stream response without status releases its retired lease" {
-    var client = Client.init(std.testing.allocator, native_platform.testing.io);
+    var client = Client.init(std.testing.allocator, platform.testing.io);
     defer client.deinit();
 
     var entry = H2PoolEntry{
         .socket = undefined,
         .session = undefined,
-        .h2 = H2Connection.initClient(std.testing.allocator, native_platform.testing.io),
+        .h2 = H2Connection.initClient(std.testing.allocator, platform.testing.io),
         .is_tls = false,
         .retired = true,
         // Keep one synthetic in-flight request so release avoids socket
@@ -4559,7 +4559,7 @@ test "H2 stream response without status releases its retired lease" {
 
 test "H2 stream cleanup detaches receiver before resetting a published stream" {
     const allocator = std.testing.allocator;
-    var h2 = H2Connection.initClient(allocator, native_platform.testing.io);
+    var h2 = H2Connection.initClient(allocator, platform.testing.io);
     defer h2.deinit();
 
     const published = try h2.stream_manager.createStream();
@@ -4567,7 +4567,7 @@ test "H2 stream cleanup detaches receiver before resetting a published stream" {
     published_event.* = .unset;
     published.data_event = published_event;
 
-    h2.write_mutex.lockUncancelable(native_platform.testing.io);
+    h2.write_mutex.lockUncancelable(platform.testing.io);
     try std.testing.expect(Client.prepareH2StreamCleanupLocked(&h2, published.id, published_event, true));
     // The receive loop takes this mutex before delivering an event, so after
     // this detach it cannot retain the event pointer across destruction.
@@ -4576,7 +4576,7 @@ test "H2 stream cleanup detaches receiver before resetting a published stream" {
     try std.testing.expect(published.completed);
     try std.testing.expectEqual(.closed, published.state);
     h2.stream_manager.removeStream(published.id);
-    h2.write_mutex.unlock(native_platform.testing.io);
+    h2.write_mutex.unlock(platform.testing.io);
     allocator.destroy(published_event);
 
     // A stream that never sent HEADERS is local-only and must not be reset.
@@ -4585,13 +4585,13 @@ test "H2 stream cleanup detaches receiver before resetting a published stream" {
     idle_event.* = .unset;
     idle.data_event = idle_event;
 
-    h2.write_mutex.lockUncancelable(native_platform.testing.io);
+    h2.write_mutex.lockUncancelable(platform.testing.io);
     try std.testing.expect(!Client.prepareH2StreamCleanupLocked(&h2, idle.id, idle_event, false));
     try std.testing.expect(idle.data_event == null);
     try std.testing.expect(!idle.completed);
     try std.testing.expectEqual(.open, idle.state);
     h2.stream_manager.removeStream(idle.id);
-    h2.write_mutex.unlock(native_platform.testing.io);
+    h2.write_mutex.unlock(platform.testing.io);
     allocator.destroy(idle_event);
 }
 
@@ -4972,10 +4972,10 @@ fn requestWithRetry(client: *Client, io: Io, method: types.Method, url: []const 
 
 test "close-delimited H1 responses are evicted for buffered and writer requests" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const port = try reserveEphemeralPort(io);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_close_delimited_server_script });
     var port_buf: [16]u8 = undefined;
@@ -5026,10 +5026,10 @@ test "close-delimited H1 responses are evicted for buffered and writer requests"
 
 test "buffered H1 timeout evicts an interrupted pooled connection" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const port = try reserveEphemeralPort(io);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_slow_drip_server_script });
     var port_buf: [16]u8 = undefined;
@@ -5062,9 +5062,9 @@ test "buffered H1 timeout evicts an interrupted pooled connection" {
 
 test "per-request response limit rejects the body before allocation" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
     var child = std.process.spawn(io, .{
@@ -5152,7 +5152,7 @@ test "request task admission bounds handoff retries cancellation and deadlines" 
             count.* += 1;
         }
     };
-    var vtable = native_platform.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.now = Fixture.now;
     vtable.checkCancel = Fixture.check;
     vtable.sleep = Fixture.sleep;
@@ -5197,7 +5197,7 @@ test "request task admission bounds handoff retries cancellation and deadlines" 
 
 test "request task admission saturation unwinds watchdog without sending" {
     const allocator = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
+    var io_impl = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(1) });
     defer io_impl.deinit();
     const io = io_impl.io();
     var client = Client.initWithConfig(allocator, io, .{
@@ -5235,11 +5235,11 @@ test "successful H1 requests do not wait for their timeout deadline" {
     // Reproduce a saturated async pool deterministically. A watchdog submitted
     // with `Io.async` runs eagerly in this configuration and blocks its caller
     // before the completed request result can be observed.
-    var io_impl = native_platform.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
+    var io_impl = platform.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .limited(2) });
     defer io_impl.deinit();
     const io = io_impl.io();
-    const fixture_io = native_platform.testing.io;
-    var tmp = native_platform.testing.tmpDir(.{});
+    const fixture_io = platform.testing.io;
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(fixture_io, .{ .sub_path = "server.py", .data = python_bounded_response_server_script });
     var child = std.process.spawn(fixture_io, .{
@@ -5319,7 +5319,7 @@ test "successful H1 requests do not wait for their timeout deadline" {
 
 test "request cancellation before socket publication prevents sending" {
     const allocator = std.testing.allocator;
-    const fixture_io = native_platform.testing.io;
+    const fixture_io = platform.testing.io;
     const TestServer = @import("../testing.zig").TestServer;
     const Fixture = struct {
         fn canceledShutdown(_: ?*anyopaque, _: Io.net.Socket.Handle, _: Io.net.ShutdownHow) Io.net.ShutdownError!void {
@@ -5377,10 +5377,10 @@ test "request cancellation before socket publication prevents sending" {
 
 test "H1 transport cancellation interrupts an active response read" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const port = try reserveEphemeralPort(io);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_slow_drip_server_script });
     var port_buf: [16]u8 = undefined;
@@ -5427,10 +5427,10 @@ test "H1 transport cancellation interrupts an active response read" {
 
 test "writer H1 timeout evicts an interrupted pooled connection" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const port = try reserveEphemeralPort(io);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_slow_drip_server_script });
     var port_buf: [16]u8 = undefined;
@@ -5468,11 +5468,11 @@ test "writer H1 timeout evicts an interrupted pooled connection" {
 
 test "HTTPS client round trip via local TLS server" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
     const port = try reserveEphemeralPort(io);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
@@ -5530,11 +5530,11 @@ test "HTTPS client round trip via local TLS server" {
 
 fn expectChunkedCompressedResponse(mode: []const u8, to_writer: bool) !void {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
     const port = try reserveEphemeralPort(io);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
@@ -5609,9 +5609,9 @@ test "HTTPS client streams supported chunked content encodings to writer" {
 
 test "requestToWriter follows redirects without streaming intermediate redirect body" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "server.py", .data = python_redirect_writer_server_script });
 
@@ -5661,9 +5661,9 @@ test "requestToWriter follows redirects without streaming intermediate redirect 
 
 test "HTTPS client streams fixed content-length body with keep-alive to writer" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
@@ -5729,11 +5729,11 @@ test "HTTPS client streams fixed content-length body with keep-alive to writer" 
 
 test "HTTPS HEAD returns after headers on a keep-alive connection" {
     const allocator = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
 
     const port = try reserveEphemeralPort(io);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "cert.pem", .data = test_tls_cert_pem });
     try tmp.dir.writeFile(io, .{ .sub_path = "key.pem", .data = test_tls_key_pem });
@@ -5791,40 +5791,40 @@ test "request gate retains the last borrower until release owns the drain lock" 
             // The shutdown actor owns the lock when release tries to enter.
             // If it sees zero here it may finish draining and free the client.
             self.observed_active = self.gate.active();
-            self.gate.drain_mutex.unlock(native_platform.testing.io);
+            self.gate.drain_mutex.unlock(platform.testing.io);
             if (self.observed_active == 0) {
-                self.gate.drain(native_platform.testing.io);
+                self.gate.drain(platform.testing.io);
                 self.drained_during_release = true;
             }
         }
         fn wake(_: ?*anyopaque, ptr: *const u32, count: u32) void {
-            native_platform.testing.io.vtable.futexWake(native_platform.testing.io.userdata, ptr, count);
+            platform.testing.io.vtable.futexWake(platform.testing.io.userdata, ptr, count);
         }
     };
     var gate: RequestGate = .{};
-    _ = try gate.tryAcquire(native_platform.testing.io);
-    gate.close(native_platform.testing.io);
-    gate.drain_mutex.lockUncancelable(native_platform.testing.io);
+    _ = try gate.tryAcquire(platform.testing.io);
+    gate.close(platform.testing.io);
+    gate.drain_mutex.lockUncancelable(platform.testing.io);
     var schedule: Interleave = .{ .gate = &gate };
-    var vtable = native_platform.testing.io.vtable.*;
+    var vtable = platform.testing.io.vtable.*;
     vtable.futexWaitUncancelable = Interleave.wait;
     vtable.futexWake = Interleave.wake;
     gate.release(.{ .userdata = &schedule, .vtable = &vtable });
     try std.testing.expectEqual(@as(usize, 1), schedule.observed_active);
     try std.testing.expect(!schedule.drained_during_release);
-    gate.drain(native_platform.testing.io);
+    gate.drain(platform.testing.io);
     try std.testing.expectEqual(@as(usize, 0), gate.active());
 }
 
 test "request gate closes admission and drains a committed borrower" {
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var gate: RequestGate = .{};
     var lease = try gate.tryAcquire(io);
     var shutdown_done = std.atomic.Value(bool).init(false);
 
     const Task = struct {
         fn shutdown(request_gate: *RequestGate, done: *std.atomic.Value(bool)) std.Io.Cancelable!void {
-            request_gate.closeAndDrain(native_platform.testing.io);
+            request_gate.closeAndDrain(platform.testing.io);
             done.store(true, .release);
         }
     };
@@ -5841,7 +5841,7 @@ test "request gate closes admission and drains a committed borrower" {
 }
 
 test "request gate shutdown immediately wakes a cancellation watchdog" {
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var gate: RequestGate = .{};
     var combined = CombinedCancellation{ .gate = &gate, .external = null };
     const cancellation = combined.token();
@@ -5858,7 +5858,7 @@ test "request gate shutdown immediately wakes a cancellation watchdog" {
         ) anyerror!void {
             has_started.store(true, .release);
             result.* = try waitForRequestCancellationOrTimeout(
-                native_platform.testing.io,
+                platform.testing.io,
                 stop_signal,
                 signal,
                 std.time.ms_per_hour,
@@ -5874,7 +5874,7 @@ test "request gate shutdown immediately wakes a cancellation watchdog" {
 }
 
 test "request watchdog reports parent task cancellation as stopped" {
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     var stop = std.atomic.Value(u32).init(0);
     var started = std.atomic.Value(bool).init(false);
 
@@ -5885,7 +5885,7 @@ test "request watchdog reports parent task cancellation as stopped" {
         ) anyerror!RequestWatchdogOutcome {
             has_started.store(true, .release);
             return waitForRequestCancellationOrTimeout(
-                native_platform.testing.io,
+                platform.testing.io,
                 stop_signal,
                 null,
                 std.time.ms_per_hour,
@@ -5899,7 +5899,7 @@ test "request watchdog reports parent task cancellation as stopped" {
 }
 
 test "error envelopes preserve success ceilings and the client hard ceiling" {
-    var client = Client.initWithConfig(std.testing.allocator, native_platform.testing.io, .{
+    var client = Client.initWithConfig(std.testing.allocator, platform.testing.io, .{
         .max_response_size = 1024,
         .max_error_response_size = 4096,
     });
@@ -5932,9 +5932,9 @@ test "error envelopes preserve success ceilings and the client hard ceiling" {
 
 test "H1 error envelopes use actual status for buffered and writer responses" {
     const allocator = std.testing.allocator;
-    var client = Client.initWithConfig(allocator, native_platform.testing.io, .{ .max_error_response_size = 4096 });
+    var client = Client.initWithConfig(allocator, platform.testing.io, .{ .max_error_response_size = 4096 });
     defer client.deinit();
-    var session = TlsSession.init(TlsConfig.insecure(allocator), native_platform.testing.io);
+    var session = TlsSession.init(TlsConfig.insecure(allocator), platform.testing.io);
     defer session.deinit();
     const Case = struct {
         status: u16,
@@ -6033,9 +6033,9 @@ test "error envelope writer preserves upstream response start ordering" {
         .{ .code = 404, .bytes = 352, .expected_bytes = 0, .expected_error = error.FixtureResponseRejected, .reject = true },
     };
     const allocator = std.testing.allocator;
-    var client = Client.initWithConfig(allocator, native_platform.testing.io, .{ .max_error_response_size = 4096 });
+    var client = Client.initWithConfig(allocator, platform.testing.io, .{ .max_error_response_size = 4096 });
     defer client.deinit();
-    var session = TlsSession.init(TlsConfig.insecure(allocator), native_platform.testing.io);
+    var session = TlsSession.init(TlsConfig.insecure(allocator), platform.testing.io);
     defer session.deinit();
     const payload = @as([4097]u8, @splat('e'));
     for (cases) |case| {
@@ -6069,18 +6069,18 @@ test "error envelope writer preserves upstream response start ordering" {
 }
 
 test "residual TLS buffered header failure terminates" {
-    var client = Client.initWithConfig(std.testing.allocator, native_platform.testing.io, .{});
+    var client = Client.initWithConfig(std.testing.allocator, platform.testing.io, .{});
     defer client.deinit();
-    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), native_platform.testing.io);
+    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), platform.testing.io);
     defer session.deinit();
     std.debug.print("RESIDUAL_RED TLS header buffered expects terminal error\n", .{});
     try std.testing.expectError(error.TlsTransportReadFailed, client.readResponse(&session, .PUT, 1024));
 }
 
 test "residual TLS writer header failure terminates" {
-    var client = Client.initWithConfig(std.testing.allocator, native_platform.testing.io, .{});
+    var client = Client.initWithConfig(std.testing.allocator, platform.testing.io, .{});
     defer client.deinit();
-    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), native_platform.testing.io);
+    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator), platform.testing.io);
     defer session.deinit();
     var output = std.ArrayListUnmanaged(u8).empty;
     defer output.deinit(std.testing.allocator);
@@ -6092,9 +6092,9 @@ test "residual TLS writer header failure terminates" {
 const ResidualTlsBodyTest = struct {
     fn run(comptime framing: []const u8, comptime to_writer: bool, head: []const u8) !void {
         const allocator = std.testing.allocator;
-        var client = Client.initWithConfig(allocator, native_platform.testing.io, .{});
+        var client = Client.initWithConfig(allocator, platform.testing.io, .{});
         defer client.deinit();
-        var session = TlsSession.init(TlsConfig.insecure(allocator), native_platform.testing.io);
+        var session = TlsSession.init(TlsConfig.insecure(allocator), platform.testing.io);
         defer session.deinit();
         var parser = Parser.initResponse(allocator);
         defer parser.deinit();
@@ -6177,7 +6177,7 @@ test "residual terminal TLS errors remain outside PUT retry aliases" {
 test "request redirects share a deadline for buffered streaming and cancellable requests" {
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     for ([_]bool{ false, true }) |to_writer| {
         for ([_]bool{ false, true }) |coordinated| {
             var server = try TestServer.start(alloc, io, &.{
@@ -6224,7 +6224,7 @@ test "request redirects share a deadline for buffered streaming and cancellable 
 test "request redirect error paths release responses exactly once" {
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const Case = struct { location: ?[]const u8, max_redirects: u32 = 10, expected: anyerror };
     for ([_]bool{ false, true }) |to_writer| {
         for ([_]Case{
@@ -6269,7 +6269,7 @@ test "request redirect error paths release responses exactly once" {
 test "request redirects preserve unlimited budgets and successful response ownership" {
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     for ([_]bool{ false, true }) |to_writer| {
         var server = try TestServer.start(alloc, io, &.{
             .{ .path = "/redirect", .respond = .{ .status = 307, .body = "redirect-body", .headers = &.{.{ .name = "Location", .value = "/final" }}, .delay_ns = 20 * std.time.ns_per_ms } },
@@ -6303,7 +6303,7 @@ test "request redirects preserve unlimited budgets and successful response owner
 test "client body framing preserves truncation and syntax errors without replaying streamed output" {
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     const Case = struct { body: []const u8, chunked: bool = false, truncate: ?usize = null, expected: anyerror };
     for ([_]bool{ false, true }) |to_writer| {
         for ([_]Case{
@@ -6337,7 +6337,7 @@ test "client body framing preserves truncation and syntax errors without replayi
 test "client compressed bodies validate complete HTTP framing before success" {
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     // gzip.compress(b"ready", mtime=0), including its checksum/footer.
     const encoded = "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\x2b\x4a\x4d\x4c\xa9\x04\x00\xaf\x85\x95\x28\x05\x00\x00\x00";
     const complete = try std.fmt.allocPrint(alloc, "{x}\r\n{s}\r\n0\r\n\r\n", .{ encoded.len, encoded });
@@ -6375,7 +6375,7 @@ test "client compressed bodies validate complete HTTP framing before success" {
 test "client body replay preserves method safety after truncation" {
     const TestServer = @import("../testing.zig").TestServer;
     const alloc = std.testing.allocator;
-    const io = native_platform.testing.io;
+    const io = platform.testing.io;
     for ([_]types.Method{ .GET, .POST }) |method| {
         var server = try TestServer.start(alloc, io, &.{
             .{ .method = method, .path = "/", .max_uses = 1, .respond = .{ .body = "ready", .truncate_body_at = 2 } },

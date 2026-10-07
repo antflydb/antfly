@@ -13,7 +13,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 pub const IntegrationBackend = enum {
@@ -94,7 +94,7 @@ pub const NamespaceUris = struct {
 };
 
 pub fn integrationNonce() u64 {
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const now = std.Io.Timestamp.now(io_impl.io(), .awake);
     return @intCast(now.toNanoseconds());

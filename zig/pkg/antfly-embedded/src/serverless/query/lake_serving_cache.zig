@@ -15,7 +15,7 @@
 
 //! Server-owned version-keyed range cache. The mutex protects memory only;
 //! provider I/O runs outside it. Bytes never live in a request allocator.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const parquet = @import("lake_parquet_rowgroup.zig");
@@ -703,7 +703,7 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     slow.vtable.get_object = Slow.get;
     var cache = Cache.init(a);
     defer cache.deinit();
-    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = native_platform.testing.io } };
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = platform.testing.io } };
     defer reader.drain(true);
     const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "data", .byte_len = 16, .version = .{ .etag = put.etag.? } };
     var reads: [4]ranges.RangeRead = undefined;
@@ -712,7 +712,7 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     defer slow.gate.store(true, .release);
     for (0..200) |_| {
         if (slow.entered.load(.acquire) >= 2) break;
-        try native_platform.testing.io.sleep(.fromMilliseconds(10), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     try std.testing.expect(slow.entered.load(.acquire) >= 2);
     slow.gate.store(true, .release);
@@ -731,7 +731,7 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     try reader.prefetch(&.{ reads[0], reads[0], reads[0], reads[0] });
     for (0..200) |_| {
         if (slow.entered.load(.acquire) > identical_before) break;
-        try native_platform.testing.io.sleep(.fromMilliseconds(10), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     try std.testing.expectEqual(identical_before + 1, slow.entered.load(.acquire));
     slow.gate.store(true, .release);
@@ -746,7 +746,7 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     try reader.prefetch(&reads);
     for (0..200) |_| {
         if (slow.entered.load(.acquire) > entered_before) break;
-        try native_platform.testing.io.sleep(.fromMilliseconds(10), .awake);
+        try platform.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     reader.drain(true);
     try std.testing.expect(slow.canceled.load(.acquire) > 0);
@@ -755,10 +755,10 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
 
 test "external lake immutable artifact cache survives restart without provider reads" {
     const a = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(a, .{});
+    var io_impl = platform.Io.Threaded.init(a, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/immutable-cache", .{tmp.sub_path});
     defer a.free(root);
@@ -814,7 +814,7 @@ test "external lake immutable cache authenticates payloads and separates credent
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(source.bytes, &digest, .{});
     for (0..2) |_| {
-        const bytes = try cache.readImmutableAlloc(a, @splat(1), "artifact", 9, digest, .{ .io = native_platform.testing.io }, loader);
+        const bytes = try cache.readImmutableAlloc(a, @splat(1), "artifact", 9, digest, .{ .io = platform.testing.io }, loader);
         defer a.free(bytes);
         try std.testing.expectEqualStrings("immutable", bytes);
     }
@@ -841,10 +841,10 @@ test "external lake immutable cache authenticates payloads and separates credent
 test "external lake immutable native mappings survive eviction and reject cache damage" {
     if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(a, .{});
+    var io_impl = platform.Io.Threaded.init(a, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-mappings", .{tmp.sub_path});
     defer a.free(path);
@@ -929,10 +929,10 @@ test "external lake range admission unwinds every allocation failure" {
 test "external lake serving persistent tier survives restart and isolates credentials and versions" {
     const storage = @import("../../storage/object_storage.zig");
     const a = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(a, .{});
+    var io_impl = platform.Io.Threaded.init(a, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/serving-cache", .{tmp.sub_path});
     defer a.free(root);
@@ -1015,10 +1015,10 @@ test "external lake serving RAM protects metadata under broad scan pressure" {
 
 test "external lake disk cache initialization failure preserves source reads" {
     const a = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(a, .{});
+    var io_impl = platform.Io.Threaded.init(a, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "not-a-directory", .data = "file" });
     const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/not-a-directory/cache", .{tmp.sub_path});

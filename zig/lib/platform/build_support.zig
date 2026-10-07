@@ -123,7 +123,23 @@ pub fn addTests(b: *std.Build, options: struct {
         .optimize = optimize,
         .link_libc = false,
     }) });
+    const io_platform = createModule(b, .{
+        .root_source_file = options.root.path(b, "src/root.zig"),
+        .filesystem_capacity_source_file = options.root.path(b, "src/filesystem_capacity.c"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    const io_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = options.root.path(b, "tests/io_namespace_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+        .imports = &.{.{ .name = "antfly_platform", .module = io_platform }},
+    }) });
+    const run_io_tests = b.addRunArtifact(io_tests);
     const run_unit = b.addRunArtifact(unit);
+    run_unit.step.dependOn(&run_io_tests.step);
     run_unit.step.dependOn(&run_clocks.step);
     run_unit.step.dependOn(&syscall_clocks.step);
     run_unit.step.dependOn(&run_atomic_tests.step);

@@ -20,7 +20,7 @@
 //! slots, stream records, submit standby status updates, and ask whether a
 //! target LSN satisfies the configured async/remote-write/remote-apply policy.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const replication_policy = @import("durability_policy.zig");
@@ -898,7 +898,7 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     );
     defer alloc.free(standby_progress_raw);
 
-    var io_impl = native_platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), log_raw) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), slots_raw) catch {};
@@ -1118,14 +1118,14 @@ test "storage.hot_standby primary adoption serializes standby ownership transfer
         .handoff = handoff,
     };
     defer if (adoption.primary) |*result| result.close();
-    var thread = native_platform.testing.io.concurrent(Adoption.run, .{&adoption}) catch |err| {
+    var thread = platform.testing.io.concurrent(Adoption.run, .{&adoption}) catch |err| {
         standby.unlockExclusive();
         return err;
     };
     var thread_awaited = false;
     defer if (!thread_awaited) {
         standby.unlockExclusive();
-        thread.await(native_platform.testing.io);
+        thread.await(platform.testing.io);
     };
     while (!adoption.started.load(.acquire)) std.atomic.spinLoopHint();
     for (0..10_000) |_| {
@@ -1135,7 +1135,7 @@ test "storage.hot_standby primary adoption serializes standby ownership transfer
     try std.testing.expect(!adoption.finished.load(.acquire));
 
     standby.unlockExclusive();
-    thread.await(native_platform.testing.io);
+    thread.await(platform.testing.io);
     thread_awaited = true;
     if (adoption.err) |err| return err;
     var primary = adoption.primary orelse return error.TestExpectedEqual;

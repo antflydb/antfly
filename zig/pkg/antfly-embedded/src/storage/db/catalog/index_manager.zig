@@ -5284,7 +5284,7 @@ pub const IndexManager = struct {
         defer self.alloc.free(canonical_path);
         const pointer_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(pointer_path);
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const raw = std.Io.Dir.cwd().readFileAlloc(
             io_impl.io(),
@@ -11772,7 +11772,7 @@ pub const IndexManager = struct {
         return self.io orelse if (comptime builtin.os.tag == .freestanding)
             .failing
         else
-            platform.Threaded.global_single_threaded.io();
+            platform.Io.Threaded.global_single_threaded.io();
     }
 
     /// Binds rebuild cursors to the same storage backend as their index kind.
@@ -13328,7 +13328,7 @@ pub const IndexManager = struct {
         defer alloc.free(relative_path);
         if (!validRelativeRepairIndexRoot(index_name, relative_path)) return error.InvalidIndexRootPointer;
 
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         const target_exists = blk: {
@@ -13540,7 +13540,7 @@ pub const IndexManager = struct {
             if (test_repair_shadow_cleanup_after_pointer_snapshot) |hook| try hook.callback(hook.context);
         }
 
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, self.base_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -20144,7 +20144,7 @@ pub const IndexManager = struct {
             try std.Io.Dir.cwd().deleteTree(io, path);
             return;
         }
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try std.Io.Dir.cwd().deleteTree(io_impl.io(), path);
     }
@@ -20155,7 +20155,7 @@ pub const IndexManager = struct {
 
     pub fn writeRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
         if (is_hostless) return;
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         try fs_paths.createDirPathPortable(io, shadow_root_path);
@@ -20171,7 +20171,7 @@ pub const IndexManager = struct {
 
     pub fn clearRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
         if (is_hostless) return;
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         const marker_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ shadow_root_path, repair_shadow_in_progress_file });
@@ -20198,7 +20198,7 @@ pub const IndexManager = struct {
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const raw = std.Io.Dir.cwd().readFileAlloc(io_impl.io(), marker_path, self.alloc, .limited(4096)) catch |err| switch (err) {
             error.FileNotFound => return null,
@@ -20271,7 +20271,7 @@ pub const IndexManager = struct {
                 else => return err,
             }
         else blk: {
-            var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+            var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
             defer io_impl.deinit();
             break :blk std.Io.Dir.cwd().readFileAlloc(
                 io_impl.io(),
@@ -20311,7 +20311,7 @@ pub const IndexManager = struct {
     fn writeActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, relative_active_path: []const u8) !void {
         if (is_hostless) return;
         if (!validRelativeRepairIndexRoot(std.fs.path.basename(canonical_path), relative_active_path)) return error.InvalidIndexRootPointer;
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         try fs_paths.createDirPathPortable(io, canonical_path);
@@ -20331,7 +20331,7 @@ pub const IndexManager = struct {
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         std.Io.Dir.cwd().deleteFile(io, marker_path) catch |err| switch (err) {
@@ -20375,7 +20375,7 @@ pub const IndexManager = struct {
         const path = try self.activeIndexPath(name);
         defer self.alloc.free(path);
         if (is_hostless) return 0;
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
@@ -20462,7 +20462,7 @@ pub const IndexManager = struct {
         const indexes_path = try std.fs.path.join(self.alloc, &.{ self.base_path, "indexes" });
         defer self.alloc.free(indexes_path);
 
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var indexes_dir = std.Io.Dir.cwd().openDir(io, indexes_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -20618,7 +20618,7 @@ pub const IndexManager = struct {
 
     fn pruneCanonicalIndexRootAfterPointerInstall(canonical_path: []const u8) !void {
         if (is_hostless) return;
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
         var dir = std.Io.Dir.cwd().openDir(io, canonical_path, .{ .iterate = true }) catch |err| switch (err) {
@@ -21491,7 +21491,7 @@ pub const IndexManager = struct {
                 const reverse_path = try std.fmt.allocPrint(self.alloc, "{s}/reverse", .{path});
                 defer self.alloc.free(reverse_path);
                 const reverse_store_missing = if (self.effectiveGraphStorage() != null) false else if (comptime builtin.os.tag == .freestanding) true else blk: {
-                    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+                    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
                     defer io_impl.deinit();
                     var reverse_dir = std.Io.Dir.cwd().openDir(io_impl.io(), reverse_path, .{}) catch |err| switch (err) {
                         error.FileNotFound => break :blk true,
@@ -30484,7 +30484,7 @@ fn isPrimaryDocumentCandidate(key: []const u8) bool {
 fn newCoverageGeneration(runtime_io: ?std.Io) !u64 {
     if (runtime_io) |io| return try coverage_identity.generate(io);
     if (builtin.os.tag == .freestanding) return try coverage_identity.generate(.failing);
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     return try coverage_identity.generate(io_impl.io());
 }
@@ -33374,7 +33374,7 @@ fn ensureIndexDir(alloc: Allocator, base_path: []const u8, path: []const u8) !vo
     defer alloc.free(parent_path);
 
     if (!is_hostless) {
-        var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+        var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), parent_path);
         try fs_paths.createDirPathPortable(io_impl.io(), path);
@@ -33395,7 +33395,7 @@ fn ensureIndexDirDurable(
     if (shared_io) |io| {
         return ensureIndexDirDurableWithIo(alloc, io, base_path, path);
     }
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     try ensureIndexDirDurableWithIo(alloc, io_impl.io(), base_path, path);
 }
@@ -33420,7 +33420,7 @@ fn ensureIndexDirDurableWithIo(
 fn deleteIndexDirIfPresent(path: []const u8) void {
     if (is_hostless) return;
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 }
@@ -33428,7 +33428,7 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
 fn repairShadowRootInProgress(path: []const u8) bool {
     if (is_hostless) return false;
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const marker_path = std.fmt.allocPrint(std.heap.page_allocator, "{s}/{s}", .{ path, repair_shadow_in_progress_file }) catch return true;
@@ -35465,7 +35465,7 @@ fn indexManagerReplayArtifactPath(buf: []u8, suffix: []const u8) []const u8 {
 }
 
 fn cleanupIndexManagerDir(path: [*:0]const u8) void {
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), std.mem.span(path)) catch {};
 }
@@ -37145,7 +37145,7 @@ test "dense vector id uses deterministic key hash with legacy mapping fallback" 
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37187,7 +37187,7 @@ test "production exact dense scorer cancels during bounded vector work" {
     var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37273,7 +37273,7 @@ test "dense vector id ignores ordinal metadata for a different doc" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37364,7 +37364,7 @@ test "dense vector id allocator spills preferred-id collisions without aliasing 
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37461,7 +37461,7 @@ test "dense metadata prefetch includes legacy ordinal vector ids" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -37597,7 +37597,7 @@ test "dense index manager accepts explicit embedding writes after addAllNoBackfi
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const cwd = try std.process.currentPathAlloc(io_impl.io(), alloc);
     defer alloc.free(cwd);
@@ -43393,7 +43393,7 @@ test "text merge deletion states synchronize recording with per-index detach" {
     defer state_b.destroy();
     state_b.segment_ids[0] = source_b[0].id;
 
-    var io_impl = platform.Threaded.init(alloc, .{});
+    var io_impl = platform.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var entry: IndexManager.TextIndex = undefined;
@@ -44142,7 +44142,7 @@ fn testNativeReadScratchReclamation(cross_pool: bool) !void {
 
 test "native read scratch pool keeps concurrent leases isolated" {
     const alloc = std.testing.allocator;
-    var runtime = platform.Threaded.init(alloc, .{ .concurrent_limit = .limited(8) });
+    var runtime = platform.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(8) });
     defer runtime.deinit();
     var resources = resource_manager_mod.ResourceManager.init(.{});
     defer resources.deinit(alloc);
@@ -45222,7 +45222,7 @@ test "authoritative posting capture starts inside an existing replay session" {
 
 test "completed native publication defers to capture ownership without starting maintenance" {
     const alloc = std.testing.allocator;
-    var runtime = platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     var resources = resource_manager_mod.ResourceManager.init(.{});
     defer resources.deinit(alloc);

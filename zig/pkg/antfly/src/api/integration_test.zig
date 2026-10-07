@@ -946,7 +946,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     // has published its durable generation. Wait on that owner's activity
     // contract instead of assuming a fixed number of metadata rounds is
     // enough on a loaded CI runner.
-    var structural_wait_io = platform.Threaded.init(std.testing.allocator, .{});
+    var structural_wait_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer structural_wait_io.deinit();
     var structural_wait_attempts: usize = 0;
     while (structural_wait_attempts < 120_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (structural_wait_attempts += 1) {
@@ -1022,7 +1022,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     // data runtime's local-replica reconciliation hook does in production.
     // Without this step the lightweight fixture would retain the pre-cutover
     // cached writer even though metadata correctly moved reads to v1.
-    var owner_wait_io = platform.Threaded.init(std.testing.allocator, .{});
+    var owner_wait_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer owner_wait_io.deinit();
     var owner_wait_attempts: usize = 0;
     while (owner_wait_attempts < 10_000 and provisioned_write_source.hasGroupActivityBestEffort(docs_identity.name, group_id)) : (owner_wait_attempts += 1) {
@@ -1115,7 +1115,7 @@ test "public api smoke integration creates table inserts and queries documents" 
     // Batch acknowledgement precedes asynchronous full-text generation
     // publication. Wait on the observable query contract instead of assuming
     // an unloaded scheduler makes the first query see the new generation.
-    var query_visibility_io = platform.Threaded.init(std.testing.allocator, .{});
+    var query_visibility_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer query_visibility_io.deinit();
     var query = try fetchQueryUntilTotal(
         &client,
@@ -1745,7 +1745,7 @@ test "public api integration rebuilds schema-migration full-text index on exact 
     // that owner's activity is both the production contract and substantially
     // cheaper than repeatedly cold-opening the standalone fixture through the
     // public status endpoint while the corpus-sized rebuild is in flight.
-    var wait_io = platform.Threaded.init(std.testing.allocator, .{});
+    var wait_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer wait_io.deinit();
     try std.testing.expect(provisioned_write_source.hasGroupActivityBestEffort("docs", 0));
     var wait_attempts: usize = 0;
@@ -2508,7 +2508,7 @@ test "public api integration backs up drops and restores a table" {
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -2644,7 +2644,7 @@ test "public api split integration backs up drops and restores a table" {
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-split-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
@@ -2785,7 +2785,7 @@ test "public api standalone-like integration backs up drops and restores a table
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-standalone-like-backup-restore-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
@@ -3162,7 +3162,7 @@ test "split data runtime registers a store with metadata" {
     const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/split-metadata-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
@@ -3289,7 +3289,7 @@ test "hosted relational parent placement opens a real Raft owner" {
     defer alloc.free(data_root);
     const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/hosted-parent-catalog", .{tmp.sub_path});
     defer alloc.free(catalog_path);
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     defer std.Io.Dir.cwd().deleteTree(io, metadata_root) catch {};
@@ -3487,7 +3487,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
     const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/split-retrieval-metadata-catalog.txt", .{tmp.sub_path});
     defer std.testing.allocator.free(replica_catalog_path);
 
-    var io_impl = platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), metadata_replica_root) catch {};
     std.Io.Dir.cwd().deleteTree(io_impl.io(), data_replica_root) catch {};
@@ -4380,7 +4380,7 @@ test "public api integration supports hybrid query pruner and reranker" {
     // which needs I/O that can run concurrent work. Index validation uses the
     // network view and query embedding the API view; without a backend
     // runtime both otherwise fall back to single-threaded I/O.
-    var network_io = platform.Threaded.init(std.testing.allocator, .{});
+    var network_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer network_io.deinit();
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6028,7 +6028,7 @@ test "public api integration supports embedding_template remote media helper" {
     // which needs I/O that can run concurrent work. Index validation uses the
     // network view and query embedding the API view; without a backend
     // runtime both otherwise fall back to single-threaded I/O.
-    var network_io = platform.Threaded.init(std.testing.allocator, .{});
+    var network_io = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer network_io.deinit();
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6985,7 +6985,7 @@ test "public api integration restores graph indexes from table backup" {
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/api-graph-backup-out", .{tmp.sub_path});
     defer std.testing.allocator.free(backup_root);
 
-    var backup_io = platform.Threaded.init(std.heap.page_allocator, .{});
+    var backup_io = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer backup_io.deinit();
     try std.Io.Dir.cwd().createDirPath(backup_io.io(), backup_root);
     const backup_root_absolute = try std.Io.Dir.cwd().realPathFileAlloc(backup_io.io(), backup_root, std.testing.allocator);
@@ -7799,7 +7799,7 @@ test "public api integration serves cluster backup list and restore routes" {
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-backup-out", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
@@ -8054,7 +8054,7 @@ test "public api integration does not publish or restore a partial cluster backu
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-partial-out", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 
@@ -8181,7 +8181,7 @@ test "public api integration reports unsupported multi-range tables in cluster b
     const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/api-cluster-multirange-out", .{ cwd, tmp.sub_path });
     defer std.testing.allocator.free(backup_root);
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), backup_root) catch {};
 

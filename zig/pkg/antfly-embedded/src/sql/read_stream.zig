@@ -16,7 +16,7 @@
 //! Pull execution for scan/filter/projection plans and disk-spooled blocking
 //! results. Binding and parameters live once per cursor; evaluation/result
 //! pages share one memory budget and are reclaimed before the next pull.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const catalog = @import("catalog.zig");
@@ -114,13 +114,13 @@ test "SQL pull stream releases pages and streams beyond materialized result limi
     const stream = (try Stream.open(std.testing.allocator, fixture.backend(), &compiled, &.{}, .{ .result_rows = 2, .page_rows = 128, .retained_bytes = 256 * 1024 })).?;
     defer stream.close();
     var seen: usize = 0;
-    const started = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds;
+    const started = std.Io.Clock.awake.now(platform.testing.io).nanoseconds;
     var first_page_ns: i96 = 0;
     while (true) {
         var page = try stream.next(73);
         defer page.deinit();
         if (seen == 0) {
-            first_page_ns = std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds - started;
+            first_page_ns = std.Io.Clock.awake.now(platform.testing.io).nanoseconds - started;
             try std.testing.expectEqual(@as(usize, 73), fixture.offset);
         }
         for (page.output.rows) |row| {
@@ -133,7 +133,7 @@ test "SQL pull stream releases pages and streams beyond materialized result limi
     try std.testing.expectEqual(@as(usize, 1), fixture.opened);
     try std.testing.expectEqual(@as(usize, 1), fixture.closed);
     try std.testing.expect(stream.budget.peak < 256 * 1024);
-    std.debug.print("SQL pull stream: rows={d} peak_bytes={d} first_page_ns={d} elapsed_ns={d}\n", .{ seen, stream.budget.peak, first_page_ns, std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds - started });
+    std.debug.print("SQL pull stream: rows={d} peak_bytes={d} first_page_ns={d} elapsed_ns={d}\n", .{ seen, stream.budget.peak, first_page_ns, std.Io.Clock.awake.now(platform.testing.io).nanoseconds - started });
 }
 
 test "SQL pull stream keeps one pinned policy setting across pages" {
@@ -1441,7 +1441,7 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
         defer compiled.deinit();
         var fixture: Fixture = .{ .count = 1000 };
         var backend = fixture.backend();
-        backend.execution_io = native_platform.testing.io;
+        backend.execution_io = platform.testing.io;
         const stream = (try Stream.open(std.heap.page_allocator, backend, &compiled, &.{}, .{ .result_rows = 2, .page_rows = 16, .retained_bytes = 256 * 1024 })).?;
         defer stream.close();
         try std.testing.expect(stream.spool != null);
@@ -1624,7 +1624,7 @@ test "SQL ordered parallel scan evaluates complete pipelines with bounded delive
         }.check;
         backend.ptr = &fixture;
         backend.vtable = &vtable;
-        backend.execution_io = native_platform.testing.io;
+        backend.execution_io = platform.testing.io;
         var compiled = try compiler.compile(a, sql, .{});
         defer compiled.deinit();
         const stream = (try Stream.open(a, backend, &compiled, &.{}, .{})).?;
@@ -1663,7 +1663,7 @@ test "SQL ordered parallel scan admits bounded limits without charging speculati
     }.check;
     backend.ptr = &fixture;
     backend.vtable = &vtable;
-    backend.execution_io = native_platform.testing.io;
+    backend.execution_io = platform.testing.io;
     var compiled = try compiler.compile(a, "SELECT n FROM docs LIMIT 8192", .{});
     defer compiled.deinit();
     const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_rows = 8192 })).?;

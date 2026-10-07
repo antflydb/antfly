@@ -20,7 +20,7 @@
 // matrices.  It verifies model-level CLIP/CLAP text/vision paths reach the
 // quantized NativeCompute kernels rather than only exercising microbenches.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const build_options = @import("build_options");
@@ -661,8 +661,8 @@ fn populateCudaWeights(
 }
 
 fn nowNs() u64 {
-    var ts: native_platform.c.timespec = undefined;
-    switch (std.posix.errno(native_platform.c.clock_gettime(native_platform.c.CLOCK.MONOTONIC, &ts))) {
+    var ts: platform.c.timespec = undefined;
+    switch (std.posix.errno(platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts))) {
         .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
         else => return 0,
     }

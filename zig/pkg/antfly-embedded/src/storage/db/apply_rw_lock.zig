@@ -69,7 +69,7 @@ pub const ApplyRwLock = struct {
             return;
         }
         if (comptime builtin.os.tag != .freestanding and !builtin.single_threaded) {
-            platform.Threaded.global_single_threaded.io().futexWake(u32, &self.wake_epoch.raw, std.math.maxInt(u32));
+            platform.Io.Threaded.global_single_threaded.io().futexWake(u32, &self.wake_epoch.raw, std.math.maxInt(u32));
         }
     }
 
@@ -92,7 +92,7 @@ pub const ApplyRwLock = struct {
         } else {
             // The epoch is sampled before testing the predicate, so an unlock
             // between that test and parking cannot become a lost wakeup.
-            platform.Threaded.global_single_threaded.io().futexWaitUncancelable(u32, &self.wake_epoch.raw, epoch);
+            platform.Io.Threaded.global_single_threaded.io().futexWaitUncancelable(u32, &self.wake_epoch.raw, epoch);
         }
     }
 
@@ -459,7 +459,7 @@ test "apply rw lock runtime shared wait cancellation clears priority handoff" {
         }
     };
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var cancelled = std.atomic.Value(bool).init(true);
@@ -485,7 +485,7 @@ test "apply rw lock runtime writer cancellation clears intent and reader gate" {
         }
     };
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var cancelled = std.atomic.Value(bool).init(true);
@@ -527,7 +527,7 @@ test "apply rw lock preserves backend task cancellation" {
         }
     };
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var lock: ApplyRwLock = .{ .io = io };
@@ -619,7 +619,7 @@ test "apply rw lock cooperative writer yields to queued reader on one-worker run
         }
     };
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .limited(1),
     });
     defer io_impl.deinit();
@@ -686,7 +686,7 @@ test "apply rw lock queued io writer blocks later shared barging" {
         }
     };
 
-    var io_impl = platform.Threaded.init(std.testing.allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     var lock: ApplyRwLock = .{ .io = io };

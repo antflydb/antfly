@@ -13,10 +13,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
-const platform_sync = native_platform.sync;
+const platform_sync = platform.sync;
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const wal_types = @import("types.zig");
@@ -317,8 +317,8 @@ pub const FsStore = struct {
     }
 };
 
-fn threadedIo() native_platform.Threaded {
-    return native_platform.Threaded.init(std.heap.page_allocator, .{});
+fn threadedIo() platform.Io.Threaded {
+    return platform.Io.Threaded.init(std.heap.page_allocator, .{});
 }
 
 fn fileExists(path: []const u8) bool {

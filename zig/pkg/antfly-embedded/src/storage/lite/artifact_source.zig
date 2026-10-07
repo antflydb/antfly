@@ -17,7 +17,7 @@
 //! root, rather than an entire checkpoint. A locked, empty marker distinguishes
 //! live leases from crash leftovers without changing the .aflite wire format.
 //! Provider/runtime ownership is independent of the document Store lifetime.
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 const native = @import("native.zig");
 const docs = @import("docstore.zig");
@@ -30,7 +30,7 @@ const marker_prefix = ".aflite-lease-";
 
 pub const Registry = struct {
     allocator: Allocator,
-    io_impl: native_platform.Threaded,
+    io_impl: platform.Io.Threaded,
     path: []u8,
     store: ?*docs.Store,
     mutex: std.Io.Mutex = .init,

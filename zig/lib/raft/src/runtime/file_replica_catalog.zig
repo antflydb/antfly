@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
@@ -43,7 +43,7 @@ pub const FileReplicaCatalog = struct {
     loaded_from_backup: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8) !FileReplicaCatalog {
-        return initWithIo(alloc, path, native_platform.Threaded.global_single_threaded.io());
+        return initWithIo(alloc, path, platform.Io.Threaded.global_single_threaded.io());
     }
 
     /// Borrows `io` for catalog synchronization; it must outlive the catalog.
@@ -190,7 +190,7 @@ pub const FileReplicaCatalog = struct {
         alloc: std.mem.Allocator,
         path: []const u8,
     ) ![]replica.ReplicaRecord {
-        var io_instance: native_platform.Threaded = .init(self.alloc, .{});
+        var io_instance: platform.Io.Threaded = .init(self.alloc, .{});
         defer io_instance.deinit();
         const io = io_instance.io();
 
@@ -271,7 +271,7 @@ pub const FileReplicaCatalog = struct {
         std.crypto.hash.sha2.Sha256.hash(buffer.items, &digest, .{});
         try buffer.appendSlice(self.alloc, &digest);
 
-        var io_instance: native_platform.Threaded = .init(self.alloc, .{});
+        var io_instance: platform.Io.Threaded = .init(self.alloc, .{});
         defer io_instance.deinit();
         const io = io_instance.io();
 
@@ -591,9 +591,9 @@ test "file replica catalog rejects relative paths before filesystem access" {
 }
 
 test "file replica catalog decoder accepts v2 while predecessor writer stays fail closed" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", std.testing.allocator);
+    const tmp_path = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "versioned-catalog.bin" });
     defer std.testing.allocator.free(path);
@@ -644,7 +644,7 @@ test "file replica catalog decoder accepts v2 while predecessor writer stays fai
     try catalog_bytes.appendSlice(std.testing.allocator, file_magic);
     try appendInt(std.testing.allocator, &catalog_bytes, u32, 1);
     try catalog_bytes.appendSlice(std.testing.allocator, encoded_record.items);
-    var io_instance: native_platform.Threaded = .init(std.testing.allocator, .{});
+    var io_instance: platform.Io.Threaded = .init(std.testing.allocator, .{});
     defer io_instance.deinit();
     try writeFileAtomicallyDurable(
         std.testing.allocator,
@@ -678,9 +678,9 @@ test "file replica catalog decoder accepts v2 while predecessor writer stays fai
 }
 
 test "file replica catalog rejects format loss and round trips predecessor records" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", std.testing.allocator);
+    const tmp_path = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "replica-catalog.bin" });
     defer std.testing.allocator.free(path);
@@ -773,9 +773,9 @@ test "file replica catalog rejects format loss and round trips predecessor recor
 }
 
 test "file replica catalog detects torn primary and restores last-known-good generation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", std.testing.allocator);
+    const tmp_path = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", std.testing.allocator);
     defer std.testing.allocator.free(tmp_path);
     const path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "replica-catalog.bin" });
     defer std.testing.allocator.free(path);
@@ -796,7 +796,7 @@ test "file replica catalog detects torn primary and restores last-known-good gen
         try std.testing.expectEqual(@as(u64, 2), catalog.generation);
     }
 
-    var io_instance: native_platform.Threaded = .init(std.testing.allocator, .{});
+    var io_instance: platform.Io.Threaded = .init(std.testing.allocator, .{});
     defer io_instance.deinit();
     const io = io_instance.io();
     var corrupt = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });

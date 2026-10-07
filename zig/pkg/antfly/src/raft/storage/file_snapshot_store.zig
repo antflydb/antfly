@@ -13,12 +13,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const builtin = @import("builtin");
-const platform_sync = native_platform.sync;
-const platform_time = native_platform.time;
+const platform_sync = platform.sync;
+const platform_time = platform.time;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const http_server = @import("../transport/http_server.zig");
@@ -32,7 +32,7 @@ const MappedSnapshotOwner = struct {
     fn release(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const alloc = self.alloc;
-        native_platform.filesystem.unmapMemory(self.mapped);
+        platform.filesystem.unmapMemory(self.mapped);
         alloc.destroy(self);
     }
 };
@@ -87,7 +87,7 @@ pub const FileSnapshotStore = struct {
 
     alloc: std.mem.Allocator,
     cfg: FileSnapshotStoreConfig,
-    io_impl: native_platform.Threaded,
+    io_impl: platform.Io.Threaded,
     root_dir: []u8,
     upload_locks: [1024]std.atomic.Mutex = @as([1024]std.atomic.Mutex, @splat(.unlocked)),
     artifact_ledger_mutex: std.atomic.Mutex = .unlocked,
@@ -555,8 +555,8 @@ pub const FileSnapshotStore = struct {
                 mapped_file.handle,
                 0,
             );
-            errdefer native_platform.filesystem.unmapMemory(mapped);
-            native_platform.filesystem.adviseMemory(mapped.ptr, mapped.len, native_platform.c.MADV.SEQUENTIAL) catch {};
+            errdefer platform.filesystem.unmapMemory(mapped);
+            platform.filesystem.adviseMemory(mapped.ptr, mapped.len, platform.c.MADV.SEQUENTIAL) catch {};
             const owner = try alloc.create(MappedSnapshotOwner);
             errdefer alloc.destroy(owner);
             owner.* = .{ .alloc = alloc, .mapped = mapped };
@@ -1197,9 +1197,9 @@ test "file snapshot maintenance uses borrowed scheduling for deadlines wakeups a
             .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),
         });
         defer sim.deinit();
-        var tmp = native_platform.testing.tmpDir(.{});
+        var tmp = platform.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const root = try tmp.dir.realPathFileAlloc(native_platform.testing.io, ".", alloc);
+        const root = try tmp.dir.realPathFileAlloc(platform.testing.io, ".", alloc);
         defer alloc.free(root);
         var store = try FileSnapshotStore.init(alloc, .{ .root_dir = root, .maintenance_io = sim.io() });
         defer store.deinit();
@@ -1276,7 +1276,7 @@ test "file snapshot maintenance uses borrowed scheduling for deadlines wakeups a
 }
 
 test "file snapshot store persists snapshot bodies" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps", .{tmp.sub_path});
@@ -1300,7 +1300,7 @@ test "file snapshot store persists snapshot bodies" {
 }
 
 test "file snapshot admission uses its constant-time quota ledger" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_dir = try std.fmt.allocPrint(
@@ -1332,7 +1332,7 @@ test "file snapshot admission uses its constant-time quota ledger" {
 }
 
 test "file snapshot store rejects invalid snapshot ids" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps", .{tmp.sub_path});
@@ -1345,7 +1345,7 @@ test "file snapshot store rejects invalid snapshot ids" {
 }
 
 test "file snapshot store rejects oversized uploads before persistence" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps", .{tmp.sub_path});
@@ -1364,7 +1364,7 @@ test "file snapshot store rejects oversized uploads before persistence" {
 }
 
 test "legacy snapshot artifacts share quota and expiry lifecycle" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps-legacy-policy", .{tmp.sub_path});
@@ -1393,7 +1393,7 @@ test "legacy snapshot artifacts share quota and expiry lifecycle" {
 }
 
 test "snapshot quota returns retryable pressure while background maintenance reclaims expiry" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_dir = try std.fmt.allocPrint(
@@ -1438,7 +1438,7 @@ test "snapshot quota returns retryable pressure while background maintenance rec
 }
 
 test "chunked quota pressure reclaims a colliding expired artifact off the request path" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const root_dir = try std.fmt.allocPrint(
@@ -1490,7 +1490,7 @@ test "chunked quota pressure reclaims a colliding expired artifact off the reque
 }
 
 test "file snapshot store resumes chunks and atomically verifies commit" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps-v2", .{tmp.sub_path});
     defer std.testing.allocator.free(root_dir);
@@ -1585,7 +1585,7 @@ test "file snapshot store resumes chunks and atomically verifies commit" {
 }
 
 test "legacy snapshot retry is idempotent under a full artifact quota" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -1617,7 +1617,7 @@ test "legacy snapshot retry is idempotent under a full artifact quota" {
 }
 
 test "committed chunked snapshot protocol retry reuses one artifact quota" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -1679,7 +1679,7 @@ test "committed chunked snapshot protocol retry reuses one artifact quota" {
 }
 
 test "chunked snapshot generations fence stale upload and release requests" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -1781,7 +1781,7 @@ test "chunked snapshot generations fence stale upload and release requests" {
 }
 
 test "active chunked fetch lease fences committed artifact expiry" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps-fetch-lease", .{tmp.sub_path});
     defer std.testing.allocator.free(root_dir);
@@ -1857,7 +1857,7 @@ test "active chunked fetch lease fences committed artifact expiry" {
 }
 
 test "file snapshot store enforces logical artifact quota before sparse allocation" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps-quota", .{tmp.sub_path});
     defer std.testing.allocator.free(root_dir);
@@ -1886,7 +1886,7 @@ test "file snapshot store enforces logical artifact quota before sparse allocati
 }
 
 test "file snapshot store expires abandoned staging artifacts" {
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/raft-snaps-expiry", .{tmp.sub_path});
     defer std.testing.allocator.free(root_dir);

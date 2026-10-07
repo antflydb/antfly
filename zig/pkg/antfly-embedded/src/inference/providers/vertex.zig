@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 const data_uri = @import("antfly_scraping").data_uri;
@@ -1070,7 +1070,7 @@ pub fn testGeminiEmbeddingBatchesOneInputPerRequest() !void {
     );
     try std.testing.expectEqual(@as(usize, 250), provider_defaults.vertexMaxEmbeddingBatchSize("text-embedding-005"));
 
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
     const path = "/projects/proj/locations/us-central1/publishers/google/models/gemini-embedding-001:predict";
@@ -1125,7 +1125,7 @@ pub fn testGeminiEmbeddingBatchesOneInputPerRequest() !void {
 
 test "vertex provider exchanges service account credentials and generates content" {
     const alloc = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 
@@ -1144,9 +1144,9 @@ test "vertex provider exchanges service account credentials and generates conten
     const credentials_json = try fakeVertexCredentialsJsonAlloc(alloc, token_uri);
     defer alloc.free(credentials_json);
 
-    var tmp = native_platform.testing.tmpDir(.{});
+    var tmp = platform.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(native_platform.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
+    try tmp.dir.writeFile(platform.testing.io, .{ .sub_path = "credentials.json", .data = credentials_json });
     const credentials_path = try std.fs.path.join(alloc, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "credentials.json" });
     defer alloc.free(credentials_path);
 
@@ -1193,7 +1193,7 @@ test "vertex provider exchanges service account credentials and generates conten
 
 test "vertex provider cancels and times out a stalled credential exchange" {
     const alloc = std.testing.allocator;
-    var runtime = native_platform.Threaded.init(alloc, .{});
+    var runtime = platform.Io.Threaded.init(alloc, .{});
     defer runtime.deinit();
     const io = runtime.io();
     for ([_]bool{ true, false }) |cancel| {
@@ -1251,7 +1251,7 @@ test "vertex provider cancels and times out a stalled credential exchange" {
 }
 
 test "vertex provider checks the original deadline before credential discovery" {
-    var client = httpx.Client.init(std.testing.allocator, native_platform.testing.io);
+    var client = httpx.Client.init(std.testing.allocator, platform.testing.io);
     defer client.deinit();
     try std.testing.expectError(error.Timeout, Provider.init(std.testing.allocator, &client, .{
         .credentials_path = "missing-credentials.json",
@@ -1261,7 +1261,7 @@ test "vertex provider checks the original deadline before credential discovery" 
 
 test "gemini provider sends api key and generates content" {
     const alloc = std.testing.allocator;
-    var io_impl = native_platform.Threaded.init(std.heap.page_allocator, .{});
+    var io_impl = platform.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     const io = io_impl.io();
 

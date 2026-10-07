@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const native_platform = @import("antfly_platform");
+const platform = @import("antfly_platform");
 const std = @import("std");
 
 /// Local projection supervision. The borrowed round owns catalog pins and publication checks.
@@ -41,7 +41,7 @@ pub const Owner = struct {
     }
     pub fn stop(self: *Owner, io: std.Io) void {
         self.stopping.store(true, .release);
-        while (!self.mutex.tryLock()) native_platform.time.yieldNow();
+        while (!self.mutex.tryLock()) platform.time.yieldNow();
         var future = self.future;
         self.future = null;
         self.mutex.unlock();
@@ -88,14 +88,14 @@ test "native projection owner joins observation and rejects admission after shut
     };
     var f: F = .{};
     var owner: Owner = .{ .enabled = true };
-    defer owner.stop(native_platform.testing.io);
-    const port: Owner.Port = .{ .ptr = &f, .io = native_platform.testing.io, .closing = &f.closing, .round = F.round };
+    defer owner.stop(platform.testing.io);
+    const port: Owner.Port = .{ .ptr = &f, .io = platform.testing.io, .closing = &f.closing, .round = F.round };
     owner.schedule(port);
-    const deadline = native_platform.time.monotonicNs() + 5 * std.time.ns_per_s;
-    while (!f.closing.load(.acquire) and native_platform.time.monotonicNs() < deadline)
-        native_platform.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+    const deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!f.closing.load(.acquire) and platform.time.monotonicNs() < deadline)
+        platform.testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     try std.testing.expect(f.closing.load(.acquire));
-    owner.stop(native_platform.testing.io);
+    owner.stop(platform.testing.io);
     f.closing.store(false, .release);
     owner.schedule(port);
     try std.testing.expect(owner.future == null);
