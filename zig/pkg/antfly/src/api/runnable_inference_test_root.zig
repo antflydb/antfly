@@ -62,6 +62,7 @@ test "inference admission uses shared node capacity after parent parking and pre
 
 test "inference model gate wait preserves real owner bytes and control progress" {
     const control_module = @import("inference_execution_control");
+    try control_module.testNestedSynchronousResourceWait();
     const Mode = enum { success, canceled, deadline };
     const Clock = struct {
         var current: u64 = 0;

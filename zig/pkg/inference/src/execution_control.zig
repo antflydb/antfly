@@ -33,6 +33,7 @@ threadlocal var waiting_synchronous_resource: bool = false;
 
 pub const CheckpointScope = struct {
     previous: ?SynchronousCheckpoint,
+    previous_waiting: bool,
     depth: usize,
     thread: if (@import("builtin").single_threaded) void else std.Thread.Id,
     active: bool = true,
@@ -40,15 +41,18 @@ pub const CheckpointScope = struct {
     pub fn init(checkpoint: SynchronousCheckpoint) CheckpointScope {
         std.debug.assert((checkpoint.wait_begin_fn == null) == (checkpoint.wait_end_fn == null));
         const previous = synchronous_checkpoint;
+        const previous_waiting = waiting_synchronous_resource;
+        waiting_synchronous_resource = false;
         synchronous_checkpoint_depth += 1;
         synchronous_checkpoint = checkpoint;
-        return .{ .previous = previous, .depth = synchronous_checkpoint_depth, .thread = if (comptime @import("builtin").single_threaded) {} else std.Thread.getCurrentId() };
+        return .{ .previous = previous, .previous_waiting = previous_waiting, .depth = synchronous_checkpoint_depth, .thread = if (comptime @import("builtin").single_threaded) {} else std.Thread.getCurrentId() };
     }
 
     pub fn deinit(self: *CheckpointScope) void {
         if (comptime !@import("builtin").single_threaded) std.debug.assert(self.thread == std.Thread.getCurrentId());
         std.debug.assert(self.active and self.depth == synchronous_checkpoint_depth and !waiting_synchronous_resource);
         synchronous_checkpoint = self.previous;
+        waiting_synchronous_resource = self.previous_waiting;
         synchronous_checkpoint_depth -= 1;
         self.active = false;
     }
@@ -73,7 +77,7 @@ pub const ResourceWait = struct {
         if (waiting_synchronous_resource) return .{};
         const checkpoint = synchronous_checkpoint orelse return .{};
         const begin = checkpoint.wait_begin_fn orelse return .{};
-        try checkpoint.check_fn(checkpoint.context);
+        try checkSynchronousCheckpoint();
         try begin(checkpoint.context);
         waiting_synchronous_resource = true;
         return .{ .checkpoint = checkpoint, .scope_depth = synchronous_checkpoint_depth };
@@ -475,4 +479,57 @@ pub fn testSynchronousResourceWait() !void {
 
 test "runnable execution synchronous resource wait preserves cancellation and unlocks failures" {
     try testSynchronousResourceWait();
+}
+
+pub fn testNestedSynchronousResourceWait() !void {
+    const Probe = struct {
+        parked: bool = false,
+        checks: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            self.checks += 1;
+            // Collective controls may check their members recursively. The
+            // owner checkpoint must not recursively yield the same capsule.
+            try (InferenceExecutionControl{}).check();
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            self.parked = true;
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.parked);
+            self.parked = false;
+        }
+        fn checkpoint(self: *@This()) SynchronousCheckpoint {
+            return .{ .context = self, .check_fn = check, .wait_begin_fn = begin, .wait_end_fn = end };
+        }
+    };
+    var parent = Probe{};
+    var child = Probe{};
+    var outer = CheckpointScope.init(parent.checkpoint());
+    defer if (outer.active) outer.deinit();
+    var parent_wait = try ResourceWait.init();
+    var inner = CheckpointScope.init(child.checkpoint());
+    defer if (inner.active) inner.deinit();
+    try (InferenceExecutionControl{}).check();
+    var child_wait = try ResourceWait.init();
+    try (InferenceExecutionControl{}).check();
+    try child_wait.finish();
+    inner.deinit();
+    // The parent's checkpoint stays suspended until its own wait finishes.
+    try (InferenceExecutionControl{}).check();
+    try std.testing.expectEqual(@as(usize, 1), parent.checks);
+    try std.testing.expectEqual(@as(usize, 2), child.checks);
+    try parent_wait.finish();
+    try (InferenceExecutionControl{}).check();
+    try std.testing.expectEqual(@as(usize, 2), parent.checks);
+    outer.deinit();
+    try (InferenceExecutionControl{}).check();
+}
+
+test "runnable execution nested admitted scope restores a parked caller and prevents recursive checkpoints" {
+    try testNestedSynchronousResourceWait();
 }
