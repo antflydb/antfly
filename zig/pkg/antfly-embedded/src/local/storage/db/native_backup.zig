@@ -370,7 +370,7 @@ pub const PinnedGeneratedArtifacts = struct {
     }
 
     pub fn deinit(self: *PinnedGeneratedArtifacts) void {
-        if (self.pin_present) std.Io.Dir.cwd().deleteTree(self.io, self.pin_root) catch {};
+        if (self.pin_present) cleanupPinTree(self.io, self.pin_root);
         for (self.files) |*file| file.deinit(self.alloc);
         self.alloc.free(self.files);
         self.alloc.free(self.pin_root);
@@ -417,6 +417,14 @@ pub const PinnedGeneratedArtifacts = struct {
     }
 };
 
+// Pin cleanup must finish even when cancellation arrives just before unwind.
+// Restore protection before closing leases which may release their I/O runtime.
+fn cleanupPinTree(io: Io, pin_root: []const u8) void {
+    const previous = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(previous);
+    std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+}
+
 pub fn pinGeneratedArtifacts(
     alloc: Allocator,
     io: Io,
@@ -446,7 +454,7 @@ pub fn pinGeneratedCheckpointMetadata(
 ) !PinnedGeneratedArtifacts {
     try ensureActive(cancellation);
     try fs_paths.createDirPathPortable(io, pin_root);
-    errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+    errdefer cleanupPinTree(io, pin_root);
     var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
     errdefer {
         for (files.items) |*file| file.deinit(alloc);
@@ -517,7 +525,7 @@ pub fn pinExplicitArtifacts(
 ) !PinnedGeneratedArtifacts {
     try ensureActive(cancellation);
     try fs_paths.createDirPathPortable(io, pin_root);
-    errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+    errdefer cleanupPinTree(io, pin_root);
     var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
     errdefer {
         for (files.items) |*file| file.deinit(alloc);
@@ -586,7 +594,7 @@ pub fn pinGeneratedArtifactsForProjections(
         }
     }
     try fs_paths.createDirPathPortable(io, pin_root);
-    errdefer std.Io.Dir.cwd().deleteTree(io, pin_root) catch {};
+    errdefer cleanupPinTree(io, pin_root);
     var files = std.ArrayListUnmanaged(PinnedArtifactFile).empty;
     errdefer {
         for (files.items) |*file| file.deinit(alloc);
@@ -1986,4 +1994,44 @@ test "native generated pin rejects in-place artifact mutation" {
         error.SourceFileChanged,
         pinned.materialize(snapshot, .none),
     );
+}
+
+test "native generated pin cleanup removes hardlinks despite pending cancellation" {
+    const alloc = std.testing.allocator;
+    var pool = std.Io.Threaded.init(alloc, .{ .concurrent_limit = .limited(2) });
+    defer pool.deinit();
+    const io = pool.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "source", .data = "immutable" });
+    const source = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/source", .{tmp.sub_path});
+    defer alloc.free(source);
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pins", .{tmp.sub_path});
+    defer alloc.free(root);
+    var pins = try pinExplicitArtifacts(alloc, io, root, &.{.{ .relative_path = "artifact", .source = .{ .immutable_file = source } }}, .{});
+    var active = true;
+    defer if (active) pins.deinit();
+    const State = struct {
+        started: std.Io.Event = .unset,
+        gate: std.Io.Event = .unset,
+        cancellation_restored: bool = false,
+        fn run(i: std.Io, self: *@This(), owned: *PinnedGeneratedArtifacts) void {
+            self.started.set(i);
+            self.gate.wait(i) catch i.recancel();
+            owned.deinit();
+            i.checkCancel() catch |err| {
+                self.cancellation_restored = err == error.Canceled;
+            };
+        }
+    };
+    var state: State = .{};
+    var task = try io.concurrent(State.run, .{ io, &state, &pins });
+    active = false;
+    state.started.waitUncancelable(io);
+    task.cancel(io);
+    try std.testing.expect(state.cancellation_restored);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "pins", .{}));
+    const original = try readFileAlloc(alloc, io, source, 64);
+    defer alloc.free(original);
+    try std.testing.expectEqualStrings("immutable", original);
 }

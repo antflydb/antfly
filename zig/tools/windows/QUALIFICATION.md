@@ -381,6 +381,27 @@ retained at `/private/tmp/antfly-pr987-hardlink-app-smoke`; the build log is
 Lite under Wine; it does not extend the earlier native hard-reset results to
 this new binary.
 
+## Backup pin cancellation cleanup
+
+Review found that `PinnedGeneratedArtifacts.deinit` ignored a canceled tree
+delete and discarded its pin paths. A deterministic macOS regression left the
+hardlink in place before the fix, retaining the immutable generation on disk.
+The same review regression passed under CrossOver before the fix.
+
+Pin-set destruction and the three failed-pin-creation unwind paths now share
+`cleanupPinTree`. It blocks cancellation only during tree deletion and restores
+the prior protection before file leases can release their owning I/O runtime.
+Normal materialization remains cancelable. The regression re-arms a real task
+cancellation immediately before destruction, verifies removal of the pin tree
+and preservation of the source bytes, and confirms cancellation remains pending
+after cleanup.
+
+The focused backup suite passes all 12 tests on macOS and Windows Debug and
+ReleaseFast under CrossOver, with zero skips, failures or leaks and one expected
+error log. Formatting and whitespace checks pass. This cleanup follow-up has
+not been included in a native NTFS run or a full application rebuild; the earlier
+native and application results above qualify their specified source snapshots.
+
 ## Cleanup
 
 The disposable VM, auto-delete boot disk, artifact bucket, service account,

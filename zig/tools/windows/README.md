@@ -402,9 +402,11 @@ ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
 ```
 
 The repository runner verifies expected error logs. With the current overlay,
-all 11 tests pass under CrossOver in Debug and ReleaseFast, including the five
-previously blocked by hardlinks. All 11 also pass on native Windows NTFS in both configurations and on macOS
-(include the filesystem capacity C source as above).
+all 12 tests pass under CrossOver in Debug and ReleaseFast and on macOS
+(include the filesystem capacity C source as above). This includes the five
+previously blocked by hardlinks and a new pending-cancellation pin cleanup
+regression. The earlier 11-test suite also passed on native Windows NTFS in
+both configurations; the cleanup follow-up has not been rerun there.
 
 The overlay appends `threaded_windows_hardlink.zig` inside `std.Io.Threaded`.
 Directory and file hardlinks therefore retain the caller's I/O authority and
