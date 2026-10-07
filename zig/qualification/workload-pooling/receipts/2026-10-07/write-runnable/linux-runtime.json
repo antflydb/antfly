@@ -32,5 +32,6 @@
   "cpus": 2,
   "memory_bytes": 2147483648,
   "memory_swap_bytes": 2147483648,
-  "compiler_invoked": false
+  "compiler_invoked": false,
+  "verifier_sha256": "83bcd6d9ab6ae3f3a45fede9e9a02d49f78f07ee141f45ff6150a887ef448e68"
 }

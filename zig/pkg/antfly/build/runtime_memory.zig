@@ -40,6 +40,17 @@ pub const CompileMemoryProfile = struct {
     sanitize_thread: bool = false,
 };
 
+/// The routed implementation test owner is separate from production archives.
+/// Pinned Nix/glibc GNU ARM64 ReleaseSafe reached 17,479,122,944 bytes;
+/// 21 GiB supplies >25% measured compiler headroom, without changing runtimes.
+pub fn routedImplementationCompileMaxRss(profile: CompileMemoryProfile) usize {
+    if (profile.target.os.tag == .macos) return @as(usize, 12) << 30;
+    const measured = profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
+        profile.target.os.tag == .linux and profile.target.cpu.arch == .aarch64 and profile.target.abi == .gnu and
+        profile.optimize == .safe and !profile.sanitize_thread;
+    return @as(usize, if (measured) 21 else 8) << 30;
+}
+
 pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProfile) usize {
     const target = profile.target;
     const native_gnu_arm64_safe = profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
@@ -229,4 +240,27 @@ test "measured ReleaseSafe CPU archives overlap within the E2E runner budget" {
         try std.testing.expectEqual(runtimeCompileMaxRss(unit, fallback), runtimeCompileMaxRss(unit, sanitized));
     }
     try std.testing.expect(runtimeCompileMaxRss(.storage_kernel, measured) + runtimeCompileMaxRss(.inference, measured) <= 22 * gib);
+}
+
+test "routed implementation compiler claim covers measured native GNU ARM64 only" {
+    const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu });
+    const profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .safe, .strip = false, .cpu_inference = true };
+    const peak: usize = 17_479_122_944;
+    try std.testing.expectEqual(@as(usize, 21) << 30, routedImplementationCompileMaxRss(profile));
+    try std.testing.expect(routedImplementationCompileMaxRss(profile) >= peak + peak / 4);
+    var other = profile;
+    other.optimize = .fast;
+    try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.sanitize_thread = true;
+    try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.host = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu });
+    try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl });
+    try std.testing.expectEqual(@as(usize, 8) << 30, routedImplementationCompileMaxRss(other));
+    other = profile;
+    other.target = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    try std.testing.expectEqual(@as(usize, 12) << 30, routedImplementationCompileMaxRss(other));
 }

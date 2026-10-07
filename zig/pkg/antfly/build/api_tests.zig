@@ -1678,7 +1678,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .name = "api-table-write-implementation-tests",
         .root_module = write_implementation_module,
         .filters = &.{"api.table_reads.implementationTests."},
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 8) * 1024 * 1024 * 1024,
+        .max_rss = @import("runtime_memory.zig").routedImplementationCompileMaxRss(.{
+            .host = b.graph.host.result,
+            .target = target.result,
+            .optimize = optimize,
+            .strip = write_implementation_module.strip orelse false,
+            .cpu_inference = false,
+            .sanitize_thread = write_implementation_module.sanitize_thread orelse false,
+        }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     const run_api_table_writes_docid_tests = @import("linked_tests.zig").runPair(b, api_table_writes_docid_tests, write_implementation_tests);

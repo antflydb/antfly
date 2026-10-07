@@ -59,3 +59,10 @@ preserve that proof. This qualifies the preparation, read-index and ordinary
 write API snapshot together. It does not prove serverless scheduling, production
 CLI compilation of the write changes, stalled accepted mutation handoff,
 inference/background execution owners or automatic defaults.
+
+The repository commit hook formatted the runtime verifier. The exact committed
+script was therefore rerun against the same artifacts under the unchanged
+2 GiB gate and also exits zero. `linux-runtime.json` now pins its verifier hash,
+and `linux-runtime.log.gz` records that terminal run. The separate
+[compiler claim receipt](compiler-claims/README.md) records the measured routed
+implementation reservation and five profile/graph checks on both platforms.
