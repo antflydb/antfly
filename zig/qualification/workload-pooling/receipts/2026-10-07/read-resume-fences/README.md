@@ -55,8 +55,12 @@ sql/read_fence.zig explicitly: 737 authored sources, no server coordination impo
 
 The expanded native API pooling target also passes all 50 build steps and all
 75 selected tests (36 embedded and 39 coordinator), with no skips or leaks.
-`native-full-api.log.gz` preserves the complete run. The full Linux API target
-is currently being qualified separately.
+`native-full-api.log.gz` preserves the complete run. The full Nix/glibc GNU AArch64 API target also passes all 47 build steps
+and the same 75 selected tests without skips or leaks. Both exact artifacts
+subsequently pass again in a separate two-CPU, 2 GiB container with no extra
+swap and explicit zero exit statuses. Artifact hashes and complete build/runtime
+logs are adjacent. The build snapshot has the nine source hashes recorded here
+and precedes the separate private spill creation wait change.
 These focused results establish managed Basic/API-key and publication fences,
 not fresh validation of externally issued trusted credentials, general storage/RPC
 or directory wait suspension, serialization/preparation scheduling, parallel-child

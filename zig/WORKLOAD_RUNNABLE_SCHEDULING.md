@@ -3,7 +3,7 @@
 Status: scheduler core, opt-in HTTP/pgwire SQL read integration, and private
 spill read/write suspension pass native and Nix/glibc Linux API qualification.
 Shared managed-policy/catalog resume fences pass focused checks on both platforms
-and the expanded native API suite; their expanded Linux API run is pending.
+and both expanded API suites, with exact Linux artifacts rerun at 2 GiB.
 Runtime metrics endpoint checks, other backend waits, parallel child ownership,
 remote-attempt accounting, qualification and default selection remain required.
 The whole delivery goal remains safe sharing across

@@ -875,3 +875,13 @@ Whole API qualification of the new creation hooks remains required. General
 storage/RPC waits and cleanup execution ownership, independent parallel children,
 preparation/serialization, wider workloads, uncertain remote completion and
 automatic default qualification remain incomplete.
+
+
+The expanded read-resume fence API target now passes all 36 embedded and 39
+coordinator contracts on pinned Nix/glibc GNU AArch64, with all 47 build steps.
+Both exact compiled artifacts subsequently pass again in a separate two-CPU,
+2 GiB container without extra swap, including all 22 coordinator authority
+schedules. The [read-resume receipt](qualification/workload-pooling/receipts/2026-10-07/read-resume-fences/README.md)
+preserves source/artifact hashes, complete logs and explicit zero runtime exit
+statuses. This qualification snapshot precedes private spill creation waits;
+whole API verification of those newer hooks is running separately on macOS.
