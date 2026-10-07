@@ -23,10 +23,13 @@ const platform_time = @import("antfly_platform").time;
 pub const SynchronousCheckpoint = struct {
     context: *anyopaque,
     check_fn: *const fn (*anyopaque) anyerror!void,
+    wait_begin_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    wait_end_fn: ?*const fn (*anyopaque) anyerror!void = null,
 };
 threadlocal var synchronous_checkpoint: ?SynchronousCheckpoint = null;
 threadlocal var synchronous_checkpoint_depth: usize = 0;
 threadlocal var checking_synchronous_checkpoint: bool = false;
+threadlocal var waiting_synchronous_resource: bool = false;
 
 pub const CheckpointScope = struct {
     previous: ?SynchronousCheckpoint,
@@ -35,6 +38,7 @@ pub const CheckpointScope = struct {
     active: bool = true,
 
     pub fn init(checkpoint: SynchronousCheckpoint) CheckpointScope {
+        std.debug.assert((checkpoint.wait_begin_fn == null) == (checkpoint.wait_end_fn == null));
         const previous = synchronous_checkpoint;
         synchronous_checkpoint_depth += 1;
         synchronous_checkpoint = checkpoint;
@@ -43,7 +47,7 @@ pub const CheckpointScope = struct {
 
     pub fn deinit(self: *CheckpointScope) void {
         if (comptime !@import("builtin").single_threaded) std.debug.assert(self.thread == std.Thread.getCurrentId());
-        std.debug.assert(self.active and self.depth == synchronous_checkpoint_depth);
+        std.debug.assert(self.active and self.depth == synchronous_checkpoint_depth and !waiting_synchronous_resource);
         synchronous_checkpoint = self.previous;
         synchronous_checkpoint_depth -= 1;
         self.active = false;
@@ -51,12 +55,38 @@ pub const CheckpointScope = struct {
 };
 
 fn checkSynchronousCheckpoint() !void {
-    if (checking_synchronous_checkpoint) return;
+    if (checking_synchronous_checkpoint or waiting_synchronous_resource) return;
     const checkpoint = synchronous_checkpoint orelse return;
     checking_synchronous_checkpoint = true;
     defer checking_synchronous_checkpoint = false;
     try checkpoint.check_fn(checkpoint.context);
 }
+
+/// Park only a contended resource wait. Original cancellation/deadline checks
+/// continue while parked, but a runnable-only scheduler checkpoint cannot run.
+/// The owning caller retires the operation if reacquisition fails.
+pub const ResourceWait = struct {
+    checkpoint: ?SynchronousCheckpoint = null,
+    scope_depth: usize = 0,
+
+    pub fn init() !ResourceWait {
+        if (waiting_synchronous_resource) return .{};
+        const checkpoint = synchronous_checkpoint orelse return .{};
+        const begin = checkpoint.wait_begin_fn orelse return .{};
+        try checkpoint.check_fn(checkpoint.context);
+        try begin(checkpoint.context);
+        waiting_synchronous_resource = true;
+        return .{ .checkpoint = checkpoint, .scope_depth = synchronous_checkpoint_depth };
+    }
+
+    pub fn finish(self: *ResourceWait) !void {
+        const checkpoint = self.checkpoint orelse return;
+        std.debug.assert(waiting_synchronous_resource and self.scope_depth == synchronous_checkpoint_depth);
+        self.checkpoint = null;
+        waiting_synchronous_resource = false;
+        try checkpoint.wait_end_fn.?(checkpoint.context);
+    }
+};
 
 /// Stable phases shared by API, enrichment, model loading, pipelines, and
 /// backends. Progress is advisory; cancellation and deadlines are mandatory.
@@ -240,9 +270,21 @@ pub const InferenceExecutionControl = struct {
     /// Acquire a process-local execution gate without turning queueing behind
     /// another inference request into an uncancellable wait.
     pub fn lock(self: InferenceExecutionControl, mutex: *std.atomic.Mutex) !void {
+        if (mutex.tryLock()) {
+            self.check() catch |err| {
+                mutex.unlock();
+                return err;
+            };
+            return;
+        }
+        var wait = try ResourceWait.init();
         var spins: usize = 0;
-        while (!mutex.tryLock()) {
-            try self.check();
+        while (true) {
+            self.check() catch |err| {
+                try wait.finish();
+                return err;
+            };
+            if (mutex.tryLock()) break;
             if (spins < 64) {
                 std.atomic.spinLoopHint();
                 spins += 1;
@@ -250,6 +292,10 @@ pub const InferenceExecutionControl = struct {
                 @import("antfly_platform").time.yieldNow();
             }
         }
+        wait.finish() catch |err| {
+            mutex.unlock();
+            return err;
+        };
         self.check() catch |err| {
             mutex.unlock();
             return err;
@@ -370,4 +416,63 @@ pub fn testSynchronousCheckpoint() !void {
 
 test "runnable execution synchronous checkpoint stays on its worker and restores nested scopes" {
     try testSynchronousCheckpoint();
+}
+
+pub fn testSynchronousResourceWait() !void {
+    const Mode = enum { success, canceled, resume_rejected };
+    const Probe = struct {
+        gate: std.atomic.Mutex = .unlocked,
+        mode: Mode,
+        parked: bool = false,
+        canceled: bool = false,
+        waits: usize = 0,
+        resumes: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.parked = true;
+            self.waits += 1;
+            self.canceled = self.mode == .canceled;
+            self.gate.unlock();
+        }
+        fn end(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.parked);
+            self.resumes += 1;
+            if (self.mode == .resume_rejected) return error.Forbidden;
+            self.parked = false;
+        }
+        fn canceledNow(raw: ?*anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return self.canceled;
+        }
+    };
+    for ([_]Mode{ .success, .canceled, .resume_rejected }) |mode| {
+        var probe = Probe{ .mode = mode };
+        const control = InferenceExecutionControl{ .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.canceledNow } };
+        var scope = CheckpointScope.init(.{ .context = &probe, .check_fn = Probe.check, .wait_begin_fn = Probe.begin, .wait_end_fn = Probe.end });
+        defer if (scope.active) scope.deinit();
+        try std.testing.expect(probe.gate.tryLock());
+        switch (mode) {
+            .success => {
+                try control.lock(&probe.gate);
+                probe.gate.unlock();
+            },
+            .canceled => try std.testing.expectError(error.Cancelled, control.lock(&probe.gate)),
+            .resume_rejected => try std.testing.expectError(error.Forbidden, control.lock(&probe.gate)),
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.waits);
+        try std.testing.expectEqual(@as(usize, 1), probe.resumes);
+        try std.testing.expect(probe.gate.tryLock());
+        probe.gate.unlock();
+        scope.deinit();
+        try (InferenceExecutionControl{}).check();
+    }
+}
+
+test "runnable execution synchronous resource wait preserves cancellation and unlocks failures" {
+    try testSynchronousResourceWait();
 }
