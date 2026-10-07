@@ -59,6 +59,7 @@ fn spinOrYield() void {
 pub const SegmentReader = segment_mod.SegmentReader;
 pub const PostingsLoader = segment_mod.PostingsLoader;
 pub const SegmentData = union(enum) {
+    native: @import("segment_source.zig").Source,
     heap: []u8,
     mmap: []align(std.heap.page_size_min) u8,
     owned_view: struct {
@@ -70,6 +71,7 @@ pub const SegmentData = union(enum) {
         advise_random: ?*const fn (*anyopaque) void = null,
         discard_clean_pages: ?*const fn (*anyopaque) void = null,
     },
+    artifact: @import("segment_source.zig").MappedArtifact,
 
     pub fn fromOwnedHeap(segment_bytes: []u8) SegmentData {
         return .{ .heap = segment_bytes };
@@ -79,41 +81,81 @@ pub const SegmentData = union(enum) {
         return .{ .mmap = segment_bytes };
     }
 
+    pub fn fromMappedArtifact(artifact: @import("segment_source.zig").MappedArtifact) SegmentData {
+        return .{ .artifact = artifact };
+    }
+
+    pub fn fromNative(input_source: @import("segment_source.zig").Source) SegmentData {
+        return .{ .native = input_source };
+    }
+
+    pub fn source(self: SegmentData) @import("segment_source.zig").Source {
+        return switch (self) {
+            .native => |value| value,
+            else => .{ .contiguous = self.bytes() },
+        };
+    }
+
+    pub fn len(self: SegmentData) usize {
+        return @intCast(self.source().len());
+    }
+
+    pub fn initReader(self: SegmentData, allocator: Allocator) !segment_mod.SegmentReader {
+        return switch (self) {
+            .native => |value| segment_mod.SegmentReader.initSource(allocator, value),
+            else => segment_mod.SegmentReader.init(allocator, self.bytes()),
+        };
+    }
+
     pub fn bytes(self: SegmentData) []const u8 {
         return switch (self) {
+            .native => unreachable, // Native consumers must use source() or initReader().
             .heap => |data| data,
             .mmap => |data| data,
             .owned_view => |view| view.bytes,
+            .artifact => |artifact| artifact.bytes,
         };
     }
 
     pub fn isFileBacked(self: SegmentData) bool {
         return switch (self) {
             .heap => false,
-            .mmap => true,
+            .owned_view => |view| view.file_backed,
+            else => true,
+        };
+    }
+
+    pub fn isMapped(self: SegmentData) bool {
+        return switch (self) {
+            .native, .heap => false,
+            .mmap, .artifact => true,
             .owned_view => |view| view.file_backed,
         };
     }
 
     pub fn madviseAccessPattern(self: SegmentData) void {
         switch (self) {
-            .heap => {},
+            .native, .heap => {},
             .owned_view => |view| if (view.advise_random) |advise| advise(view.owner),
             .mmap => |data| adviseMappedRandom(data),
+            .artifact => |artifact| adviseMappedRandom(artifact.bytes),
         }
     }
 
     pub fn madviseDiscardCleanPages(self: SegmentData) void {
         switch (self) {
-            .heap => {},
+            .native, .heap => {},
             .owned_view => |view| if (view.discard_clean_pages) |discard| discard(view.owner),
             .mmap => |data| adviseMappedDontNeed(data),
+            .artifact => |artifact| adviseMappedDontNeed(artifact.bytes),
         }
     }
 
     pub fn deinit(self: *SegmentData, alloc: Allocator) void {
         switch (self.*) {
+            .native => |*value| value.close(),
             .heap => |data| alloc.free(data),
+            .artifact => |*artifact| artifact.deinit(),
             .mmap => |data| {
                 if (builtin.os.tag != .freestanding) std.posix.munmap(data);
             },
@@ -161,6 +203,8 @@ pub const SegmentShared = struct {
     residency_accounted: u64 = 0,
     mapping_bytes: u64 = 0,
 
+    /// Immutable streaming-column admission estimate; zero means uncomputed.
+    typed_merge_estimate: @import("antfly_platform").atomic.Value(u64) = .init(0),
     /// Conservative per-mapping residency state. The virtual mapping remains
     /// intact when this transitions to cold; only clean file-backed pages are
     /// advised away. A subsequent query marks the segment resident again.
@@ -373,23 +417,21 @@ fn initializeTypedDocValuesFieldCoverage(
     if (coverage.initialized.load(.acquire)) return;
     if (validation) |active| try active.checkActive();
 
-    const section_data = reader.getSection(coverage.field, .typed_doc_values) catch {
-        if (validation) |active| try active.checkActive();
-        coverage.physical_status = .malformed_doc_values_section;
-        coverage.initialized.store(true, .release);
-        return;
-    } orelse {
+    var typed_reader = (reader.typedDocValuesScoped(alloc, coverage.field) catch |err| switch (err) {
+        error.InvalidData, error.InvalidSegment, error.CrcMismatch => {
+            if (validation) |active| try active.checkActive();
+            coverage.physical_status = .malformed_doc_values_section;
+            coverage.initialized.store(true, .release);
+            return;
+        },
+        else => return err,
+    }) orelse {
         if (validation) |active| try active.checkActive();
         coverage.physical_status = .missing_doc_values_section;
         coverage.initialized.store(true, .release);
         return;
     };
-    const typed_reader = typed_dv.TypedDocValuesReader.init(alloc, section_data) catch {
-        if (validation) |active| try active.checkActive();
-        coverage.physical_status = .malformed_doc_values_section;
-        coverage.initialized.store(true, .release);
-        return;
-    };
+    defer typed_reader.deinit();
     const value_type = typed_reader.value_type;
 
     var present = try std.DynamicBitSetUnmanaged.initEmpty(alloc, reader.doc_count);
@@ -531,9 +573,17 @@ pub const SegmentEntry = struct {
     layout_stats: segment_mod.SegmentLayoutStats = .{},
     shared: *SegmentShared,
 
+    pub fn typedMergeWorkingSetBytes(self: *const SegmentEntry) !u64 {
+        const cached = self.shared.typed_merge_estimate.load(.acquire);
+        if (cached != 0) return cached - 1;
+        const bytes = try self.reader.typedMergeWorkingSetBytes();
+        self.shared.typed_merge_estimate.store(try std.math.add(u64, bytes, 1), .release);
+        return bytes;
+    }
+
     fn initShared(shared: *SegmentShared, data: SegmentData, coverage: []TypedDocValuesFieldCoverage) void {
         shared.* = .{ .ref_count = 1, .typed_doc_values_coverage = coverage };
-        if (data.isFileBacked()) {
+        if (data.isMapped()) {
             // Opening a segment reads headers and dictionaries. Count the
             // whole mapping conservatively until the owner advises it cold.
             shared.mapping_bytes = @intCast(data.bytes().len);
@@ -557,17 +607,17 @@ pub const SegmentEntry = struct {
     }
 
     pub fn noteAccess(self: *const SegmentEntry) void {
-        if (self.data.isFileBacked()) self.shared.noteMappedAccess();
+        if (self.data.isMapped()) self.shared.noteMappedAccess();
     }
 
     pub fn beginAccess(self: *const SegmentEntry) void {
-        if (!self.data.isFileBacked()) return;
+        if (!self.data.isMapped()) return;
         _ = self.shared.active_mapped_readers.fetchAdd(1, .acq_rel);
         self.shared.noteMappedAccess();
     }
 
     pub fn endAccess(self: *const SegmentEntry) void {
-        if (!self.data.isFileBacked()) return;
+        if (!self.data.isMapped()) return;
         _ = self.shared.active_mapped_readers.fetchSub(1, .acq_rel);
     }
 
@@ -821,6 +871,8 @@ const TermDocFreqCache = std.HashMapUnmanaged(
     TermDocFreqStoredCtx,
     std.hash_map.default_max_load_percentage,
 );
+const max_term_doc_freq_cache_entries: usize = 4096;
+const max_term_doc_freq_cache_key_bytes: usize = 256 * 1024;
 
 const BM25BoundTableKey = struct {
     avg_doc_len_bits: u32,
@@ -848,6 +900,8 @@ pub const IndexSnapshot = struct {
     // instead of re-walking dictionaries/postings.
     term_doc_freq_cache_mu: std.atomic.Mutex,
     term_doc_freq_cache: TermDocFreqCache,
+    term_doc_freq_cache_eviction_cursor: u32 = 0,
+    term_doc_freq_cache_key_bytes: usize = 0,
     term_doc_freq_cache_hits: u64,
     term_doc_freq_cache_misses: u64,
     bm25_bound_table_cache_mu: std.atomic.Mutex,
@@ -1043,9 +1097,11 @@ pub const IndexSnapshot = struct {
             var upper_bound: f32 = std.math.inf(f32);
             if (use_segment_bound_planning) {
                 upper_bound = 0;
-                if (try seg.reader.invertedIndex(field)) |inv_reader| {
+                if (try seg.reader.invertedIndexScoped(alloc, field)) |opened| {
+                    var inv_reader = opened;
+                    defer inv_reader.deinit();
                     for (terms, 0..) |term, term_idx| {
-                        const lookup_result = (try inv_reader.lookupChecked(term)) orelse continue;
+                        const lookup_result = (try inv_reader.lookup(term)) orelse continue;
                         const df = if (term_doc_freqs[term_idx] != 0) term_doc_freqs[term_idx] else lookup_result.docFreq();
                         upper_bound += switch (lookup_result) {
                             .postings => |p| if (p.block_max) |block_max|
@@ -1087,9 +1143,10 @@ pub const IndexSnapshot = struct {
             }
             seg.beginAccess();
             defer seg.endAccess();
-            const inv_reader = (try seg.reader.invertedIndex(field)) orelse {
+            var inv_reader = (try seg.reader.invertedIndexScoped(alloc, field)) orelse {
                 continue;
             };
+            defer inv_reader.deinit();
 
             {
                 seg.shared.lockDeletionShared();
@@ -1100,7 +1157,7 @@ pub const IndexSnapshot = struct {
                 var added_terms: usize = 0;
 
                 for (terms, 0..) |term, term_idx| {
-                    const lookup_result = (try inv_reader.lookupChecked(term)) orelse continue;
+                    const lookup_result = (try inv_reader.lookup(term)) orelse continue;
                     const iter = try lookup_result.iterator(alloc);
 
                     const block_max: ?inverted.BlockMaxInfo = switch (lookup_result) {
@@ -1185,6 +1242,13 @@ pub const IndexSnapshot = struct {
         return try self.segments[resolved.seg_idx].reader.storedDoc(resolved.local_id);
     }
 
+    /// Native IDs belong to the supplied read scope, never the segment cache.
+    pub fn storedIdScoped(self: *const IndexSnapshot, alloc: Allocator, global_id: u32) !?[]const u8 {
+        const resolved = self.resolveDocId(global_id) orelse return null;
+        self.segments[resolved.seg_idx].noteAccess();
+        return self.segments[resolved.seg_idx].reader.storedIdScoped(alloc, resolved.local_id);
+    }
+
     pub fn docOrdinal(self: *const IndexSnapshot, global_id: u32) !?u32 {
         const resolved = self.resolveDocId(global_id) orelse return null;
         self.segments[resolved.seg_idx].noteAccess();
@@ -1200,6 +1264,15 @@ pub const IndexSnapshot = struct {
         self.segments[resolved.seg_idx].noteAccess();
         const result = (try self.segments[resolved.seg_idx].reader.storedDocDecompressed(alloc, resolved.local_id)) orelse return null;
         return DecompressedDoc{ .id = result.id, .data = result.data };
+    }
+
+    /// Borrowed body until the cursor advances to another block. The snapshot
+    /// must outlive the cursor. Native identities expire on every cursor get.
+    pub fn storedDocWithCursor(self: *const IndexSnapshot, cursor: *segment_mod.SegmentReader.StoredDocCursor, global_id: u32) !?segment_mod.SegmentReader.StoredDocRef {
+        const resolved = self.resolveDocId(global_id) orelse return null;
+        const segment = &self.segments[resolved.seg_idx];
+        segment.noteAccess();
+        return cursor.get(&segment.reader, resolved.local_id);
     }
 
     pub fn docNumsForOrdinalsAlloc(self: *const IndexSnapshot, alloc: Allocator, ordinals: []const u32) ![]u32 {
@@ -1249,14 +1322,16 @@ pub const IndexSnapshot = struct {
     pub fn hasDocOrdinalCoverage(self: *const IndexSnapshot) !bool {
         for (self.segments) |*seg| {
             if (seg.reader.doc_count == 0) continue;
-            if ((try seg.reader.getSection(segment_mod.doc_ordinals_field, .doc_ordinals)) == null) return false;
+            if ((try seg.reader.sectionView(segment_mod.doc_ordinals_field, .doc_ordinals)) == null) return false;
         }
         return true;
     }
 
     pub fn hasInvertedField(self: *const IndexSnapshot, field: []const u8) !bool {
         for (self.segments) |*seg| {
-            if (try seg.reader.invertedIndex(field) != null) return true;
+            if (seg.reader.native) |native| {
+                if (native.range.findSection(field, .inverted_text) != null) return true;
+            } else if (try seg.reader.invertedIndex(field) != null) return true;
         }
         return false;
     }
@@ -1280,7 +1355,6 @@ pub const IndexSnapshot = struct {
     }
 
     pub fn termDocFreq(self: *const IndexSnapshot, alloc: Allocator, field: []const u8, term: []const u8) !u32 {
-        _ = alloc;
         if (self.liveDocCount() == 0) return 0;
         const mutable = @constCast(self);
         const adapted = TermDocFreqAdapted{ .field = field, .term = term };
@@ -1297,24 +1371,45 @@ pub const IndexSnapshot = struct {
 
         var total: u32 = 0;
         for (self.segments) |*seg| {
-            const inv_reader = (try seg.reader.invertedIndex(field)) orelse continue;
-            const lookup_result = (try inv_reader.lookupChecked(term)) orelse continue;
-            total +|= lookup_result.docFreq();
+            var inv_reader = (try seg.reader.invertedIndexScoped(alloc, field)) orelse continue;
+            defer inv_reader.deinit();
+            total +|= (try inv_reader.docFrequency(term)) orelse continue;
         }
 
         while (!cache_mu.tryLock()) spinOrYield();
         defer cache_mu.unlock();
-        const storage = try self.alloc.alloc(u8, field.len + term.len);
-        errdefer self.alloc.free(storage);
-        const gop = try mutable.term_doc_freq_cache.getOrPutAdapted(self.alloc, adapted, adapted_ctx);
-        if (gop.found_existing) {
+        if (mutable.term_doc_freq_cache.getAdapted(adapted, adapted_ctx)) |cached| return cached;
+        const key_bytes = std.math.add(usize, field.len, term.len) catch return total;
+        if (key_bytes > max_term_doc_freq_cache_key_bytes) return total;
+        // Cache admission is optional. Memory pressure must not turn an
+        // otherwise successful exact frequency read into a query failure.
+        const storage = self.alloc.alloc(u8, key_bytes) catch return total;
+        mutable.term_doc_freq_cache.ensureUnusedCapacity(self.alloc, 1) catch {
             self.alloc.free(storage);
-            return gop.value_ptr.*;
+            return total;
+        };
+        while (mutable.term_doc_freq_cache.count() >= max_term_doc_freq_cache_entries or
+            mutable.term_doc_freq_cache_key_bytes > max_term_doc_freq_cache_key_bytes - key_bytes)
+        {
+            // Sweep hash buckets in a circle so old high-index entries do
+            // not remain immortal and eviction does not repeatedly scan an
+            // ever-longer empty prefix. No auxiliary key queue is needed.
+            var entries = mutable.term_doc_freq_cache.iterator();
+            entries.index = @min(mutable.term_doc_freq_cache_eviction_cursor, mutable.term_doc_freq_cache.capacity());
+            const victim = entries.next() orelse blk: {
+                entries.index = 0;
+                break :blk entries.next().?;
+            };
+            mutable.term_doc_freq_cache_eviction_cursor = entries.index;
+            const evicted = victim.key_ptr.*;
+            _ = mutable.term_doc_freq_cache.remove(evicted);
+            mutable.term_doc_freq_cache_key_bytes -= evicted.storage.len;
+            self.alloc.free(evicted.storage);
         }
         @memcpy(storage[0..field.len], field);
         @memcpy(storage[field.len..], term);
-        gop.key_ptr.* = .{ .storage = storage, .field_len = @intCast(field.len) };
-        gop.value_ptr.* = total;
+        mutable.term_doc_freq_cache.putAssumeCapacity(.{ .storage = storage, .field_len = @intCast(field.len) }, total);
+        mutable.term_doc_freq_cache_key_bytes += key_bytes;
         return total;
     }
 
@@ -1337,8 +1432,9 @@ pub const IndexSnapshot = struct {
         if (doc_nums.len != 1) return null;
 
         const resolved = self.resolveDocId(doc_nums[0]) orelse return null;
-        const inv_reader = (try self.segments[resolved.seg_idx].reader.invertedIndex(field)) orelse return null;
-        const lookup = (try inv_reader.lookupChecked(term)) orelse return null;
+        var inv_reader = (try self.segments[resolved.seg_idx].reader.invertedIndexScoped(self.alloc, field)) orelse return null;
+        defer inv_reader.deinit();
+        const lookup = (try inv_reader.lookup(term)) orelse return null;
         var postings = try lookup.iterator(alloc);
         defer postings.deinit();
         const hit = (try postings.advanceTo(resolved.local_id)) orelse return null;
@@ -1720,8 +1816,8 @@ pub const IndexWriter = struct {
     fn mappedResidencyStatsForSnapshot(self: *const IndexWriter, snap: *const IndexSnapshot, now_ns: u64) MappedResidencyStats {
         var stats = MappedResidencyStats{ .eviction_count = self.mapped_residency_evictions };
         for (snap.segments) |*seg| {
-            if (!seg.data.isFileBacked()) continue;
-            const bytes: u64 = @intCast(seg.data.bytes().len);
+            if (!seg.data.isMapped()) continue;
+            const bytes: u64 = @intCast(seg.data.len());
             stats.virtual_mapped_bytes +|= bytes;
             if (seg.shared.mapped_residency_state.load(.acquire) != mapped_residency_cold) {
                 stats.estimated_resident_bytes +|= bytes;
@@ -1778,7 +1874,7 @@ pub const IndexWriter = struct {
             var candidate: ?*SegmentEntry = null;
             var candidate_access_ns: u64 = std.math.maxInt(u64);
             for (snap.segments) |*seg| {
-                if (!seg.data.isFileBacked()) continue;
+                if (!seg.data.isMapped()) continue;
                 if (seg.shared.mapped_residency_state.load(.acquire) != mapped_residency_resident) continue;
                 if (seg.shared.active_mapped_readers.load(.acquire) != 0) continue;
                 const last_access_ns = seg.shared.last_mapped_access_ns.load(.acquire);
@@ -1828,7 +1924,7 @@ pub const IndexWriter = struct {
         errdefer self.alloc.free(owned);
 
         var data = SegmentData.fromOwnedHeap(owned);
-        var reader = try segment_mod.SegmentReader.init(self.alloc, data.bytes());
+        var reader = try data.initReader(self.alloc);
         errdefer reader.deinit();
 
         const seg_id = self.next_segment_id;
@@ -1915,8 +2011,7 @@ pub const IndexWriter = struct {
             for (seg.reader.fields) |*fi| {
                 for (fi.sections) |*si| {
                     if (si.section_type != .inverted_text) continue;
-                    const sec_data = seg.reader.data[@intCast(si.offset)..][0..@intCast(si.length)];
-                    const inv = inverted.InvertedIndexReader.init(self.alloc, sec_data) catch continue;
+                    const inv = (try seg.reader.invertedFieldStats(fi.name)) orelse continue;
                     const gop = try global_field_lens.getOrPut(self.alloc, fi.name);
                     if (!gop.found_existing) gop.value_ptr.* = 0;
                     gop.value_ptr.* += inv.total_field_len;
@@ -1949,10 +2044,11 @@ pub const IndexWriter = struct {
             if (std.mem.eql(u8, fi.name, segment_mod.doc_ordinals_field)) continue;
             for (fi.sections) |*si| {
                 if (si.section_type != .inverted_text) continue;
-                const offset: usize = @intCast(si.offset);
-                if (offset > reader.data.len or si.length > reader.data.len - offset) continue;
-                const sec_data = reader.data[offset..][0..@intCast(si.length)];
-                const inv = inverted.InvertedIndexReader.init(alloc, sec_data) catch continue;
+                if (reader.native == null) {
+                    const offset: usize = @intCast(si.offset);
+                    if (offset > reader.data.len or si.length > reader.data.len - offset) continue;
+                }
+                const inv = (try reader.invertedFieldStats(fi.name)) orelse continue;
                 const gop = try global_field_lens.getOrPut(alloc, fi.name);
                 if (!gop.found_existing) gop.value_ptr.* = 0;
                 gop.value_ptr.* += inv.total_field_len;
@@ -2005,7 +2101,7 @@ pub const IndexWriter = struct {
         var owned: ?SegmentData = segment_data;
         errdefer if (owned) |*data| data.deinit(self.alloc);
 
-        var reader = try segment_mod.SegmentReader.init(self.alloc, owned.?.bytes());
+        var reader = try owned.?.initReader(self.alloc);
         if (owned.? == .owned_view) reader.postings_loader = owned.?.owned_view.postings_loader;
         errdefer reader.deinit();
 
@@ -2119,7 +2215,7 @@ pub const IndexWriter = struct {
         }
 
         for (replacements, 0..) |*replacement, i| {
-            replacement_readers[i] = try segment_mod.SegmentReader.init(self.alloc, replacement.data.bytes());
+            replacement_readers[i] = try replacement.data.initReader(self.alloc);
             if (replacement.data == .owned_view) replacement_readers[i].postings_loader = replacement.data.owned_view.postings_loader;
             replacement_readers_initialized += 1;
         }
@@ -2403,9 +2499,12 @@ pub const IndexWriter = struct {
             {
                 seg.shared.lockDeletionShared();
                 defer seg.shared.unlockDeletionShared();
+                var identities = @import("segment_source.zig").Scratch.init(alloc, 64 * 1024);
+                defer identities.deinit();
                 for (0..seg.reader.doc_count) |local_id| {
-                    const stored = (try seg.reader.storedDoc(@intCast(local_id))) orelse continue;
-                    if (wanted.contains(stored.id)) {
+                    identities.reset();
+                    const id = (try seg.reader.storedIdAlloc(identities.allocator(), @intCast(local_id))) orelse continue;
+                    if (wanted.contains(id)) {
                         if (seg.shared.deleted) |d| {
                             if (d.contains(@intCast(local_id))) continue;
                         }
@@ -3461,4 +3560,56 @@ fn sharedImmutableCorpusScenario(a: Allocator) !void {
 }
 test "external lake sealed corpora compose physical readers from several generations" {
     try sharedImmutableCorpusScenario(std.testing.allocator);
+}
+
+test "snapshot term frequency cache bounds distinct misses and owned keys" {
+    const a = std.testing.allocator;
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    var segment_writer = segment_mod.SegmentWriter.init(a);
+    defer segment_writer.deinit();
+    try segment_writer.addStoredDoc("doc", "{}");
+    const bytes = try segment_writer.build();
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    for (0..10_000) |i| {
+        var key: [128]u8 = undefined;
+        const term = try std.fmt.bufPrint(&key, "missing-term-with-enough-bytes-to-exercise-the-key-budget-{d}", .{i});
+        try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(a, "body", term));
+    }
+    try std.testing.expect(snapshot.term_doc_freq_cache.count() <= max_term_doc_freq_cache_entries);
+    try std.testing.expect(snapshot.term_doc_freq_cache_key_bytes <= max_term_doc_freq_cache_key_bytes);
+    var actual_bytes: usize = 0;
+    var keys = snapshot.term_doc_freq_cache.keyIterator();
+    while (keys.next()) |key| actual_bytes += key.storage.len;
+    try std.testing.expectEqual(actual_bytes, snapshot.term_doc_freq_cache_key_bytes);
+    const hits_before = snapshot.term_doc_freq_cache_hits;
+    var cached_keys = snapshot.term_doc_freq_cache.keyIterator();
+    const cached = cached_keys.next().?.*;
+    try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(a, cached.storage[0..cached.field_len], cached.storage[cached.field_len..]));
+    try std.testing.expectEqual(hits_before + 1, snapshot.term_doc_freq_cache_hits);
+}
+
+test "snapshot frequency cache allocation failures preserve successful reads" {
+    const a = std.testing.allocator;
+    var writer = try IndexWriter.init(a);
+    defer writer.deinit();
+    var segment_writer = segment_mod.SegmentWriter.init(a);
+    defer segment_writer.deinit();
+    try segment_writer.addStoredDoc("doc", "{}");
+    const bytes = try segment_writer.build();
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    const snapshot = writer.snapshot();
+    const mutable = @constCast(snapshot);
+    const saved = mutable.alloc;
+    defer mutable.alloc = saved;
+    for (0..2) |failure| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = failure });
+        mutable.alloc = failing.allocator();
+        try std.testing.expectEqual(@as(u32, 0), try snapshot.termDocFreq(a, "body", "missing"));
+        try std.testing.expectEqual(@as(u32, 0), snapshot.term_doc_freq_cache.count());
+        try std.testing.expectEqual(@as(usize, 0), snapshot.term_doc_freq_cache_key_bytes);
+    }
 }

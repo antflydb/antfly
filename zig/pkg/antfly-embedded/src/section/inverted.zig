@@ -72,12 +72,14 @@ const platform_time = @import("antfly_platform").time;
 //   v37: restores the selective 1,024-document bounds and adaptively encodes
 //        repeated (frequency ceiling, minimum norm) pairs through a per-term
 //        palette; v36 remains a measured, rejected branch-only experiment
+//   v39: append-once merged blocks, trailing fixed-width range navigation;
+//        the existing v38 posting layout remains valid for ordinary terms.
 //   v38: v35 query structures + a compact postings header that derives block
 //        count, compact-metadata length, and skip length; single-block terms
 //        also omit redundant impact count and range-ID length fields
 //
-// Writers emit v38. The production reader accepts v23, the exact format shipped
-// by origin/main when this migration began, and v38. Versions v24-v37 are
+// Writers emit v39. The production reader accepts v23, the exact format shipped
+// by origin/main when this migration began, v38, and v39. Versions v24-v37 are
 // development-only experiments on this branch and are deliberately not part of
 // the compatibility contract.
 
@@ -96,7 +98,9 @@ const wire_version_packed_impact_frequency: u8 = 34;
 const wire_version_vertical_bp128: u8 = 35;
 const wire_version_payload_aligned_impacts: u8 = 36;
 const wire_version_compact_postings_header: u8 = 38;
-const wire_version_current: u8 = wire_version_compact_postings_header;
+const wire_version_streaming_blocks: u8 = 39;
+const wire_version_current: u8 = wire_version_streaming_blocks;
+const streamed_record_size: usize = 32;
 const v7_header_size: usize = 4 + 1 + 4 + 8 + 4 + 4 + 4 + 4; // 33 bytes
 const postings_chunk_meta_header_size: usize = 4;
 const postings_skip_record_size_v23: usize = 8;
@@ -643,13 +647,16 @@ const StreamingTermDictionaryBuilder = struct {
     finalized_blocks: bool = false,
 
     fn init(alloc: Allocator) !StreamingTermDictionaryBuilder {
+        return initWithHint(alloc, 65_536);
+    }
+
+    fn initWithHint(alloc: Allocator, terms: usize) !StreamingTermDictionaryBuilder {
         return .{
             .alloc = alloc,
-            // Large merges benefit from the maximum bounded registry. This is
-            // independent of vocabulary size and avoids resizing the FST
-            // builder while keeping its working set predictable.
+            // Initial runs know their vocabulary. Small fields must not pay
+            // for the maximum registry used by unknown-size large merges.
             .block_fst_builder = try fst.Builder.init(alloc, .{
-                .registry_table_size = 65_536,
+                .registry_table_size = std.math.clamp(terms, 64, 65_536),
             }),
         };
     }
@@ -863,6 +870,7 @@ pub const InvertedIndexBuilder = struct {
     /// instead of repeating them in every term posting.
     doc_norms: std.ArrayListUnmanaged(u32),
     doc_count: u32 = 0,
+    postings_capacity_bytes: u64 = 0,
     /// Total tokens across all documents (for avgdl)
     total_field_len: u64 = 0,
 
@@ -887,14 +895,10 @@ pub const InvertedIndexBuilder = struct {
     }
 
     pub fn estimatedMemoryBytes(self: *const InvertedIndexBuilder) u64 {
-        var total: u64 = @as(u64, @intCast(self.terms.capacity())) * @sizeOf(std.StringHashMapUnmanaged(PostingAccumulator).Entry);
-        total +|= @as(u64, @intCast(self.doc_norms.capacity)) * @sizeOf(u32);
-        var it = self.terms.iterator();
-        while (it.next()) |entry| {
-            total +|= @intCast(entry.key_ptr.*.len);
-            total +|= entry.value_ptr.estimatedMemoryBytes();
-        }
-        return total;
+        return self.postings_capacity_bytes +|
+            @as(u64, self.terms.capacity()) *| (@sizeOf(PostingAccumulator) + @sizeOf([]const u8) + 24) +|
+            @as(u64, @intCast(self.doc_norms.capacity)) *| @sizeOf(u32) +|
+            @as(u64, @intCast(self.term_arena.queryCapacity()));
     }
 
     fn recordDocNorm(self: *InvertedIndexBuilder, doc_num: u32, norm: u32) !void {
@@ -927,10 +931,12 @@ pub const InvertedIndexBuilder = struct {
             if (!gop.found_existing) {
                 // Re-key into arena-owned storage; the HashMap copied a borrowed
                 // slice from the caller, but the arena copy will outlive the call.
-                gop.key_ptr.* = try self.term_arena.allocator().dupe(u8, hit.term);
                 gop.value_ptr.* = PostingAccumulator.init();
+                gop.key_ptr.* = try self.term_arena.allocator().dupe(u8, hit.term);
             }
+            const before = gop.value_ptr.estimatedMemoryBytes();
             try gop.value_ptr.add(self.alloc, doc_num, hit.freq, hit.norm, hit.positions);
+            self.postings_capacity_bytes +|= gop.value_ptr.estimatedMemoryBytes() - before;
             field_len += hit.freq;
         }
         if (doc_norm == 0) doc_norm = field_len;
@@ -943,10 +949,12 @@ pub const InvertedIndexBuilder = struct {
     pub fn addDocumentSingle(self: *InvertedIndexBuilder, doc_num: u32, term: []const u8, freq: u32, norm_val: u32) !void {
         const gop = try self.terms.getOrPut(self.alloc, term);
         if (!gop.found_existing) {
-            gop.key_ptr.* = try self.term_arena.allocator().dupe(u8, term);
             gop.value_ptr.* = PostingAccumulator.init();
+            gop.key_ptr.* = try self.term_arena.allocator().dupe(u8, term);
         }
+        const before = gop.value_ptr.estimatedMemoryBytes();
         try gop.value_ptr.add(self.alloc, doc_num, freq, norm_val, &.{});
+        self.postings_capacity_bytes +|= gop.value_ptr.estimatedMemoryBytes() - before;
         try self.recordDocNorm(doc_num, norm_val);
         self.total_field_len += freq;
     }
@@ -994,6 +1002,56 @@ pub const InvertedIndexBuilder = struct {
 
     pub fn buildAlloc(self: *InvertedIndexBuilder, output_alloc: Allocator) ![]u8 {
         return self.buildAllocProfile(output_alloc, null);
+    }
+
+    /// Emit postings directly into a private publication sink. Large terms
+    /// retain one output block; the dictionary retains compact navigation.
+    pub fn writeToSink(self: *InvertedIndexBuilder, alloc: Allocator, sink: anytype) !void {
+        return self.writeToSinkProfile(alloc, sink, null);
+    }
+
+    pub fn writeToSinkProfile(self: *InvertedIndexBuilder, alloc: Allocator, sink: anytype, profile: ?*InvertedIndexBuildProfile) !void {
+        const sort_start = if (profile != null) platform_time.monotonicNs() else 0;
+        const term_count = self.terms.count();
+        if (term_count == 0) return;
+        const sorted = try alloc.alloc([]const u8, term_count);
+        defer alloc.free(sorted);
+        var keys = self.terms.keyIterator();
+        var n: usize = 0;
+        while (keys.next()) |key| : (n += 1) sorted[n] = key.*;
+        std.mem.sort([]const u8, sorted, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+        if (profile) |p| p.sort_ns +|= platform_time.monotonicNs() - sort_start;
+        const start = sink.len();
+        const empty_header: [v7_header_size]u8 = @splat(0);
+        try sink.appendSlice(&empty_header);
+        var dictionary = try StreamingTermDictionaryBuilder.initWithHint(alloc, term_count);
+        defer dictionary.deinit();
+        var scratch = PostingSerializeScratch{};
+        defer scratch.deinit(alloc);
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(alloc);
+        const postings_start = if (profile != null) platform_time.monotonicNs() else 0;
+        for (sorted) |term| {
+            const acc = self.terms.getPtr(term).?;
+            const value = if (self.config.wireVersion() == wire_version_current and
+                self.config.postings_layout == .posting_count_v35 and acc.doc_ids.items.len > self.config.chunk_size)
+            blk: {
+                var stream = AccumulatorStream{ .source = acc, .alloc = alloc };
+                var ignored_total: u64 = 0;
+                break :blk (try appendPostingStreamToSink(alloc, sink, start, &stream, acc.all_positions.items.len > 0, self.doc_norms.items, &ignored_total, self.config)).?;
+            } else try appendMergedTermToSink(alloc, sink, start, &encoded, &scratch, acc, self.config, self.doc_count);
+            try dictionary.add(term, value);
+        }
+        if (profile) |p| p.postings_serialize_ns +|= platform_time.monotonicNs() - postings_start;
+        const norms_start = if (profile != null) platform_time.monotonicNs() else 0;
+        const norms = try encodeNormTable(alloc, self.doc_norms.items);
+        defer alloc.free(norms);
+        if (profile) |p| p.norms_ns +|= platform_time.monotonicNs() - norms_start;
+        try finishStreamingSectionProfile(alloc, sink, start, self.doc_count, self.total_field_len, norms, &dictionary, self.config, profile);
     }
 
     pub fn buildAllocProfile(
@@ -1876,6 +1934,85 @@ const PostingAccumulator = struct {
         try self.all_positions.appendSlice(alloc, positions);
     }
 
+    const EncodedPostingChunk = struct { metadata: V7ChunkMeta, max_freq: u16, min_norm: u16 };
+
+    fn appendEncodedChunk(self: *const PostingAccumulator, alloc: Allocator, scratch: *PostingSerializeScratch, config: IndexConfig, doc_start: usize, doc_end: usize, chunk_id: u32, pos_offset: *usize, store_positions: bool) !EncodedPostingChunk {
+        var chunk_max_freq: u16 = 0;
+        var chunk_min_norm: u16 = std.math.maxInt(u16);
+        scratch.doc_deltas.clearRetainingCapacity();
+        scratch.freq_values.clearRetainingCapacity();
+        scratch.position_chunk.clearRetainingCapacity();
+        try scratch.doc_deltas.ensureTotalCapacity(alloc, doc_end - doc_start);
+        try scratch.freq_values.ensureTotalCapacity(alloc, doc_end - doc_start);
+        const chunk_positions_start = pos_offset.*;
+
+        var prev_doc: u32 = 0;
+        var i = doc_start;
+        while (i < doc_end) : (i += 1) {
+            const doc_id = self.doc_ids.items[i];
+            const meta = self.metas.items[i];
+            scratch.doc_deltas.appendAssumeCapacity(if (i == doc_start)
+                (if (config.postings_layout == .posting_count_v35) doc_id else doc_id - chunk_id * config.chunk_size)
+            else
+                doc_id - prev_doc);
+            const has_locs = meta.position_count > 0;
+            if (has_locs and meta.position_count != meta.freq) return error.InvalidData;
+            const encoded_freq_has_locs: u32 = @intCast(encodeFreqHasLocs(meta.freq, has_locs));
+            scratch.freq_values.appendAssumeCapacity(encoded_freq_has_locs);
+            prev_doc = doc_id;
+
+            const freq_u16: u16 = if (meta.freq > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.freq);
+            const norm_u16: u16 = if (meta.norm > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.norm);
+            if (freq_u16 > chunk_max_freq) chunk_max_freq = freq_u16;
+            if (norm_u16 < chunk_min_norm) chunk_min_norm = norm_u16;
+
+            const count: usize = meta.position_count;
+            if (store_positions and !usesGroupedPositions(config.wireVersion())) {
+                try appendChunkFramedPositionsForDoc(
+                    alloc,
+                    &scratch.position_chunk,
+                    self.all_positions.items[pos_offset.*..][0..count],
+                );
+            }
+            pos_offset.* += count;
+        }
+
+        if (store_positions and usesGroupedPositions(config.wireVersion())) {
+            try appendGroupedPositionsForChunk(
+                alloc,
+                &scratch.position_chunk,
+                self.metas.items[doc_start..doc_end],
+                self.all_positions.items[chunk_positions_start..pos_offset.*],
+                &scratch.position_group_deltas,
+            );
+        }
+
+        if (store_positions) {
+            try writeVarintU32(alloc, &scratch.positions, @intCast(scratch.position_chunk.items.len));
+            try scratch.positions.appendSlice(alloc, scratch.position_chunk.items);
+        }
+
+        const packed_chunk = if (config.postings_layout == .posting_count_v35)
+            try appendPackedPostingBlock(alloc, &scratch.payload, scratch.doc_deltas.items, scratch.freq_values.items, config.wireVersion())
+        else
+            try appendPackedPostingChunk(alloc, &scratch.payload, scratch.doc_deltas.items, scratch.freq_values.items);
+        const metadata = V7ChunkMeta{
+            .chunk_id = chunk_id,
+            .max_doc = self.doc_ids.items[doc_end - 1],
+            .doc_count = @intCast(doc_end - doc_start),
+            .doc_ctrl_off = packed_chunk.off,
+            .doc_ctrl_len = packed_chunk.len,
+            .doc_data_off = 0,
+            .doc_data_len = 0,
+            .freq_ctrl_off = 0,
+            .freq_ctrl_len = 0,
+            .freq_data_off = 0,
+            .freq_data_len = 0,
+        };
+
+        return .{ .metadata = metadata, .max_freq = chunk_max_freq, .min_norm = chunk_min_norm };
+    }
+
     fn serializeV9(
         self: *const PostingAccumulator,
         alloc: Allocator,
@@ -1978,78 +2115,10 @@ const PostingAccumulator = struct {
                 while (doc_end < self.doc_ids.items.len and self.doc_ids.items[doc_end] / config.chunk_size == chunk_id) : (doc_end += 1) {}
             }
 
-            var chunk_max_freq: u16 = 0;
-            var chunk_min_norm: u16 = std.math.maxInt(u16);
-            scratch.doc_deltas.clearRetainingCapacity();
-            scratch.freq_values.clearRetainingCapacity();
-            scratch.position_chunk.clearRetainingCapacity();
-            try scratch.doc_deltas.ensureTotalCapacity(alloc, doc_end - doc_start);
-            try scratch.freq_values.ensureTotalCapacity(alloc, doc_end - doc_start);
-            const chunk_positions_start = pos_offset;
-
-            var prev_doc: u32 = 0;
-            var i = doc_start;
-            while (i < doc_end) : (i += 1) {
-                const doc_id = self.doc_ids.items[i];
-                const meta = self.metas.items[i];
-                scratch.doc_deltas.appendAssumeCapacity(if (i == doc_start)
-                    (if (posting_count_blocks) doc_id else doc_id - chunk_id * config.chunk_size)
-                else
-                    doc_id - prev_doc);
-                const has_locs = meta.position_count > 0;
-                if (has_locs and meta.position_count != meta.freq) return error.InvalidData;
-                const encoded_freq_has_locs: u32 = @intCast(encodeFreqHasLocs(meta.freq, has_locs));
-                scratch.freq_values.appendAssumeCapacity(encoded_freq_has_locs);
-                prev_doc = doc_id;
-
-                const freq_u16: u16 = if (meta.freq > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.freq);
-                const norm_u16: u16 = if (meta.norm > std.math.maxInt(u16)) std.math.maxInt(u16) else @intCast(meta.norm);
-                if (freq_u16 > chunk_max_freq) chunk_max_freq = freq_u16;
-                if (norm_u16 < chunk_min_norm) chunk_min_norm = norm_u16;
-
-                const count: usize = meta.position_count;
-                if (store_positions and !usesGroupedPositions(config.wireVersion())) {
-                    try appendChunkFramedPositionsForDoc(
-                        alloc,
-                        &scratch.position_chunk,
-                        self.all_positions.items[pos_offset..][0..count],
-                    );
-                }
-                pos_offset += count;
-            }
-
-            if (store_positions and usesGroupedPositions(config.wireVersion())) {
-                try appendGroupedPositionsForChunk(
-                    alloc,
-                    &scratch.position_chunk,
-                    self.metas.items[doc_start..doc_end],
-                    self.all_positions.items[chunk_positions_start..pos_offset],
-                    &scratch.position_group_deltas,
-                );
-            }
-
-            if (store_positions) {
-                try writeVarintU32(alloc, &scratch.positions, @intCast(scratch.position_chunk.items.len));
-                try scratch.positions.appendSlice(alloc, scratch.position_chunk.items);
-            }
-
-            const packed_chunk = if (posting_count_blocks)
-                try appendPackedPostingBlock(alloc, &scratch.payload, scratch.doc_deltas.items, scratch.freq_values.items, config.wireVersion())
-            else
-                try appendPackedPostingChunk(alloc, &scratch.payload, scratch.doc_deltas.items, scratch.freq_values.items);
-            try scratch.chunks.append(alloc, .{
-                .chunk_id = chunk_id,
-                .max_doc = self.doc_ids.items[doc_end - 1],
-                .doc_count = @intCast(doc_end - doc_start),
-                .doc_ctrl_off = packed_chunk.off,
-                .doc_ctrl_len = packed_chunk.len,
-                .doc_data_off = 0,
-                .doc_data_len = 0,
-                .freq_ctrl_off = 0,
-                .freq_ctrl_len = 0,
-                .freq_data_off = 0,
-                .freq_data_len = 0,
-            });
+            const encoded = try self.appendEncodedChunk(alloc, scratch, config, doc_start, doc_end, chunk_id, &pos_offset, store_positions);
+            const chunk_max_freq = encoded.max_freq;
+            const chunk_min_norm = encoded.min_norm;
+            try scratch.chunks.append(alloc, encoded.metadata);
             if (payload_aligned_impacts) {
                 // The scoring bound shares the exact ordinal and document
                 // interval of the payload it can prune. This avoids both the
@@ -2173,7 +2242,7 @@ pub const InvertedIndexReader = struct {
         if (data.len < v7_header_size) return error.InvalidData;
         if (!std.mem.eql(u8, data[0..4], "INVT")) return error.InvalidMagic;
         const version = data[4];
-        if (version != wire_version_legacy and version != wire_version_current) return error.UnsupportedVersion;
+        if (version != wire_version_legacy and version != wire_version_compact_postings_header and version != wire_version_current) return error.UnsupportedVersion;
 
         const doc_count = std.mem.readInt(u32, data[5..9], .little);
         const total_field_len = std.mem.readInt(u64, data[9..17], .little);
@@ -2234,7 +2303,6 @@ pub const InvertedIndexReader = struct {
     /// norm representation as scoring, so deletion-adjusted aggregate stats
     /// remain consistent with the lengths consumed by the scorer.
     pub fn docLength(self: *const InvertedIndexReader, doc_id: u32) u32 {
-        if (doc_id >= self.doc_count) return 0;
         return self.normForDoc(doc_id);
     }
 
@@ -2325,65 +2393,9 @@ pub const InvertedIndexReader = struct {
     }
 
     pub fn detailedLayoutStats(self: *const InvertedIndexReader) !LayoutStats {
-        var stats = self.layoutStats();
-
         var it = try self.termIterator();
         defer it.deinit();
-        while (try it.next()) |entry| {
-            switch (entry.result) {
-                .one_hit => stats.one_hit_terms +|= 1,
-                .postings => |postings| {
-                    stats.postings_terms +|= 1;
-                    if (postings.doc_freq == 1) stats.single_doc_postings_terms +|= 1;
-                    stats.postings_doc_frequency_total +|= postings.doc_freq;
-                    stats.projected_posting_count_blocks_64 +|= (@as(u64, postings.doc_freq) + 63) / 64;
-                    stats.projected_posting_count_blocks_128 +|= (@as(u64, postings.doc_freq) + 127) / 128;
-                    stats.projected_posting_count_blocks_256 +|= (@as(u64, postings.doc_freq) + 255) / 256;
-                    stats.postings_header_bytes +|= @intCast(postings.header_len);
-                    if (postings.inline_single_doc) {
-                        stats.projected_compact_postings_header_bytes +|= @intCast(postings.header_len);
-                    } else {
-                        const positions_len = if (postings.positions_data) |positions| positions.len else 0;
-                        var projected_header = varintU32Size(postings.doc_freq) +
-                            varintU32Size(@intCast(postings.payload_data.len)) +
-                            varintU32Size(@intCast(positions_len));
-                        if (postings.doc_freq > simd_bitpack.block_values) {
-                            const projection = if (postings.block_max) |block_max_info| block_max_info.adaptiveColumnProjection() else BlockMaxInfo.AdaptiveColumnProjection{};
-                            const descriptor = (@as(u64, projection.records) << 1) | @intFromBool(projection.use_adaptive);
-                            if (descriptor <= std.math.maxInt(u32)) projected_header += varintU32Size(@intCast(descriptor));
-                            const impact_ids_len = if (postings.impact_chunk_ids_data) |ids| ids.len else 0;
-                            projected_header += varintU32Size(@intCast(impact_ids_len));
-                        }
-                        stats.projected_compact_postings_header_bytes +|= @intCast(projected_header);
-                    }
-                    if (postings.inline_single_doc and postings.inline_has_locs) {
-                        stats.positions_bytes +|= @as(u64, @intCast(postings.inline_positions_data.len)) + 1;
-                    }
-                    if (postings.block_max) |block_max_info| {
-                        stats.block_max_bytes +|= @intCast(block_max_info.meta.len);
-                        const projection = block_max_info.adaptiveColumnProjection();
-                        stats.impact_record_count +|= projection.records;
-                        stats.projected_adaptive_impact_bytes +|= projection.selected_bytes;
-                        stats.projected_impact_descriptor_header_delta += projection.descriptor_header_delta;
-                        if (projection.use_adaptive) {
-                            stats.projected_adaptive_impact_terms +|= 1;
-                        } else {
-                            stats.projected_raw_impact_terms +|= 1;
-                        }
-                    }
-                    if (postings.impact_chunk_ids_data) |ids| stats.impact_range_id_bytes +|= @intCast(ids.len);
-                    stats.chunk_meta_bytes +|= @intCast(postings.chunk_meta_data.len);
-                    stats.postings_payload_bytes +|= @intCast(postings.payload_data.len);
-                    if (postings.positions_data) |positions_data| {
-                        stats.positions_bytes +|= @intCast(positions_data.len);
-                    }
-                    if (postings.skip_data) |skip_data| {
-                        stats.skip_bytes +|= @intCast(skip_data.len);
-                    }
-                },
-            }
-        }
-        return stats;
+        return accumulateLayoutStats(self.layoutStats(), &it);
     }
 
     /// Look up a term using the blocked term dictionary. Returns posting data, or null.
@@ -2482,69 +2494,7 @@ pub const InvertedIndexReader = struct {
     }
 
     fn lookupInTermBlock(self: *const InvertedIndexReader, block_offset: u32, term: []const u8) !u64 {
-        if (block_offset >= self.dict_blocks.len) return error.InvalidData;
-        var cursor: usize = block_offset;
-        const prefix_len = try readVarintU32(self.dict_blocks, &cursor);
-        const entry_count = try readVarintU32(self.dict_blocks, &cursor);
-        if (cursor + prefix_len > self.dict_blocks.len) return error.Truncated;
-        const prefix = self.dict_blocks[cursor..][0..prefix_len];
-        cursor += prefix_len;
-        if (!std.mem.startsWith(u8, term, prefix)) return error.NotFound;
-        const wanted_suffix = term[prefix.len..];
-
-        // Query terms are overwhelmingly short. Reconstruct only the prefix
-        // needed to compare against the requested suffix and keep the common
-        // path entirely on the stack. A dictionary entry longer than the
-        // requested suffix can never match, so retaining its tail only creates
-        // allocator traffic in every segment lookup.
-        var stack_suffix: [256]u8 = undefined;
-        var heap_suffix: ?[]u8 = null;
-        const suffix_buf: []u8 = if (wanted_suffix.len <= stack_suffix.len)
-            stack_suffix[0..wanted_suffix.len]
-        else blk: {
-            const owned = try self.alloc.alloc(u8, wanted_suffix.len);
-            heap_suffix = owned;
-            break :blk owned;
-        };
-        defer if (heap_suffix) |owned| self.alloc.free(owned);
-
-        var suffix_prefix_len: usize = 0;
-        var previous_suffix_len: usize = 0;
-        var last_postings_offset: u64 = 0;
-        var remaining = entry_count;
-        while (remaining > 0) : (remaining -= 1) {
-            const shared_len: usize = try readVarintU32(self.dict_blocks, &cursor);
-            const leaf_len: usize = try readVarintU32(self.dict_blocks, &cursor);
-            if (shared_len > previous_suffix_len) return error.InvalidData;
-            if (cursor + leaf_len > self.dict_blocks.len) return error.Truncated;
-
-            const retained_len = @min(shared_len, suffix_buf.len);
-            if (retained_len > suffix_prefix_len) {
-                // We retain min(actual length, requested length) bytes from the
-                // previous suffix. Therefore a shared prefix can exceed the
-                // retained bytes only after both have reached the requested
-                // length, in which case retained_len == suffix_prefix_len.
-                return error.InvalidData;
-            }
-            const copied_leaf_len = @min(leaf_len, suffix_buf.len - retained_len);
-            @memcpy(suffix_buf[retained_len..][0..copied_leaf_len], self.dict_blocks[cursor..][0..copied_leaf_len]);
-            suffix_prefix_len = retained_len + copied_leaf_len;
-            previous_suffix_len = shared_len +| leaf_len;
-            cursor += leaf_len;
-            const value = decodeTermDictBlockValueDelta(try readVarintU64(self.dict_blocks, &cursor), &last_postings_offset);
-
-            const prefix_order = std.mem.order(u8, suffix_buf[0..suffix_prefix_len], wanted_suffix);
-            const order: std.math.Order = if (prefix_order != .eq)
-                prefix_order
-            else
-                std.math.order(previous_suffix_len, wanted_suffix.len);
-            switch (order) {
-                .eq => return value,
-                .gt => return error.NotFound,
-                .lt => {},
-            }
-        }
-        return error.NotFound;
+        return lookupBlockedTerm(self.alloc, self.dict_blocks, block_offset, term);
     }
 
     fn readPostingsChecked(self: *const InvertedIndexReader, offset: u64) !TermPostings {
@@ -2560,6 +2510,16 @@ pub const InvertedIndexReader = struct {
         const doc_freq = readVarintU32(self.data, &cursor) catch unreachable;
         if (doc_freq == 0 and usesInlineSingleDocPostings(self.version)) {
             const doc_id = readVarintU32(self.data, &cursor) catch unreachable;
+            if (self.version >= wire_version_streaming_blocks and doc_id == std.math.maxInt(u32)) {
+                const descriptor = StreamedDescriptor.decode(self.data[cursor..][0..StreamedDescriptor.size]);
+                descriptor.validate(self.data.len, self.doc_count, self.chunk_size, base) catch unreachable;
+                const span = self.data[@intCast(descriptor.span_start)..][0..@intCast(descriptor.span_length)];
+                const table = self.data[@intCast(descriptor.table_start)..][0 .. @as(usize, descriptor.chunks) * streamed_record_size];
+                const impact_len = packedU32ByteLen(descriptor.impacts, 5) + descriptor.impacts;
+                const impacts = self.data[@intCast(descriptor.impact_start)..][0..impact_len];
+                const ids = self.data[@intCast(descriptor.impact_start + impact_len)..][0..descriptor.ids_length];
+                return .{ .doc_freq = descriptor.doc_frequency, .serialized_data = self.data[@intCast(descriptor.span_start) .. cursor + StreamedDescriptor.size], .header_len = cursor + StreamedDescriptor.size - base, .chunk_size = self.chunk_size, .version = self.version, .doc_range_aligned = descriptor.ids_length > 0, .block_max = if (descriptor.impacts == 0) null else .{ .meta = impacts, .chunk_size = impact_range_doc_count, .chunk_meta_data = ids, .chunk_meta_count = descriptor.impacts, .version = self.version, .range_ids = true, .packed_impact_frequency = true }, .chunk_meta_data = &.{}, .chunk_meta_count = descriptor.chunks, .streamed_records = table, .payload_data = span, .norms_data = self.norms_data, .positions_data = if (descriptor.positions_length == 0) null else span, .logical_payload_length = @intCast(descriptor.payload_length), .logical_positions_length = @intCast(descriptor.positions_length), .impact_chunk_ids_data = if (descriptor.ids_length == 0) null else ids, .impact_chunk_count = descriptor.impacts };
+            }
             const encoded_freq = readVarintU32(self.data, &cursor) catch unreachable;
             const decoded = decodeFreqHasLocs(encoded_freq);
             const inline_header_len = cursor - base;
@@ -3102,10 +3062,65 @@ pub const BlockMaxInfo = struct {
     }
 };
 
+const StreamedDescriptor = struct {
+    doc_frequency: u32,
+    chunks: u32,
+    span_start: u64,
+    span_length: u64,
+    table_start: u64,
+    impact_start: u64,
+    impacts: u32,
+    ids_length: u32,
+    payload_length: u64,
+    positions_length: u64,
+    const size: usize = 64;
+    fn decode(bytes: *const [size]u8) StreamedDescriptor {
+        return .{
+            .doc_frequency = std.mem.readInt(u32, bytes[0..][0..4], .little),
+            .chunks = std.mem.readInt(u32, bytes[4..][0..4], .little),
+            .span_start = std.mem.readInt(u64, bytes[8..][0..8], .little),
+            .span_length = std.mem.readInt(u64, bytes[16..][0..8], .little),
+            .table_start = std.mem.readInt(u64, bytes[24..][0..8], .little),
+            .impact_start = std.mem.readInt(u64, bytes[32..][0..8], .little),
+            .impacts = std.mem.readInt(u32, bytes[40..][0..4], .little),
+            .ids_length = std.mem.readInt(u32, bytes[44..][0..4], .little),
+            .payload_length = std.mem.readInt(u64, bytes[48..][0..8], .little),
+            .positions_length = std.mem.readInt(u64, bytes[56..][0..8], .little),
+        };
+    }
+    fn encode(self: StreamedDescriptor) [size]u8 {
+        var bytes: [size]u8 = undefined;
+        std.mem.writeInt(u32, bytes[0..][0..4], self.doc_frequency, .little);
+        std.mem.writeInt(u32, bytes[4..][0..4], self.chunks, .little);
+        std.mem.writeInt(u64, bytes[8..][0..8], self.span_start, .little);
+        std.mem.writeInt(u64, bytes[16..][0..8], self.span_length, .little);
+        std.mem.writeInt(u64, bytes[24..][0..8], self.table_start, .little);
+        std.mem.writeInt(u64, bytes[32..][0..8], self.impact_start, .little);
+        std.mem.writeInt(u32, bytes[40..][0..4], self.impacts, .little);
+        std.mem.writeInt(u32, bytes[44..][0..4], self.ids_length, .little);
+        std.mem.writeInt(u64, bytes[48..][0..8], self.payload_length, .little);
+        std.mem.writeInt(u64, bytes[56..][0..8], self.positions_length, .little);
+        return bytes;
+    }
+    fn validate(self: StreamedDescriptor, section_length: u64, doc_count: u32, chunk_size: u32, header_start: u64) !void {
+        if (chunk_size == 0 or self.doc_frequency == 0 or self.doc_frequency > doc_count or self.chunks != 1 + (self.doc_frequency - 1) / chunk_size) return error.InvalidData;
+        if (self.span_start < v7_header_size or self.span_start > header_start or self.span_length > header_start - self.span_start) return error.InvalidData;
+        if (self.table_start != self.span_start + self.span_length or self.table_start > header_start or @as(u64, self.chunks) * streamed_record_size > header_start - self.table_start) return error.InvalidData;
+        if (self.impact_start != self.table_start + @as(u64, self.chunks) * streamed_record_size or self.impact_start > header_start) return error.InvalidData;
+        const max_ranges = (@as(u64, std.math.maxInt(u32)) + 1) / impact_range_doc_count;
+        if (self.impacts > self.doc_frequency or self.impacts > max_ranges or (self.impacts == 0) != (self.ids_length == 0)) return error.InvalidData;
+        const impact_bytes = @as(u64, packedU32ByteLen(self.impacts, 5)) + self.impacts;
+        if (impact_bytes + self.ids_length != header_start - self.impact_start or header_start > section_length) return error.InvalidData;
+        if (self.payload_length > self.span_length or self.positions_length != self.span_length - self.payload_length) return error.InvalidData;
+    }
+};
+
 /// Parsed posting data for a single term (zero-copy view into section data).
 pub const TermPostings = struct {
     doc_freq: u32,
+    metadata_owner: ?@import("../segment_source.zig").SharedOwner = null,
     serialized_data: []const u8,
+    serialized_range: ?@import("../segment_source.zig").View = null,
     header_len: usize,
     chunk_size: u32,
     version: u8,
@@ -3113,9 +3128,18 @@ pub const TermPostings = struct {
     block_max: ?BlockMaxInfo = null,
     chunk_meta_data: []const u8,
     chunk_meta_count: u32,
+    streamed_records: []const u8 = &.{},
+    streamed_records_range: ?@import("../segment_source.zig").View = null,
+    logical_payload_length: ?usize = null,
+    logical_positions_length: ?usize = null,
     payload_data: []const u8,
+    payload_range: ?@import("../segment_source.zig").View = null,
+    max_payload_chunk_bytes: usize = 64 * 1024,
     norms_data: []const u8,
+    norms_reader: ?RangeInvertedIndexReader = null,
     positions_data: ?[]const u8 = null,
+    positions_range: ?@import("../segment_source.zig").View = null,
+    max_position_record_bytes: usize = 1024 * 1024,
     skip_data: ?[]const u8 = null,
     impact_chunk_ids_data: ?[]const u8 = null,
     impact_chunk_count: u32 = 0,
@@ -3125,6 +3149,13 @@ pub const TermPostings = struct {
     inline_has_locs: bool = false,
     inline_position_bits: u8 = 0,
     inline_positions_data: []const u8 = &.{},
+
+    pub fn payloadLength(self: TermPostings) usize {
+        return self.logical_payload_length orelse if (self.payload_range) |view| @intCast(view.length) else self.payload_data.len;
+    }
+    pub fn positionsLength(self: TermPostings) usize {
+        return self.logical_positions_length orelse if (self.positions_range) |view| @intCast(view.length) else if (self.positions_data) |data| data.len else 0;
+    }
 
     pub fn scoringChunkSize(self: *const TermPostings) u32 {
         return if (self.block_max) |block_max| block_max.chunk_size else self.chunk_size;
@@ -3145,22 +3176,38 @@ pub const TermPostings = struct {
 
     /// Create a postings iterator that yields (doc_id, freq, norm, positions) tuples.
     pub fn iterator(self: *const TermPostings, alloc: Allocator) !PostingsIterator {
-        if (self.inline_single_doc) return PostingsIterator.initInlineSingleDoc(self, alloc);
+        if (self.inline_single_doc) {
+            var inline_iterator = try PostingsIterator.initInlineSingleDoc(self, alloc);
+            if (self.metadata_owner) |owner| {
+                owner.retain(owner.ptr);
+                inline_iterator.metadata_owner = owner;
+            }
+            return inline_iterator;
+        }
         var iter = PostingsIterator{
             .alloc = alloc,
+            .metadata_owner = self.metadata_owner,
             .doc_freq = self.doc_freq,
             .chunk_size = self.chunk_size,
             .chunk_meta_data = self.chunk_meta_data,
             .chunk_meta_count = self.chunk_meta_count,
+            .streamed_records = self.streamed_records,
+            .streamed_records_range = self.streamed_records_range,
             .payload_data = self.payload_data,
+            .payload_range = self.payload_range,
+            .max_payload_chunk_bytes = self.max_payload_chunk_bytes,
             .norms_data = self.norms_data,
+            .norms_reader = self.norms_reader,
             .version = self.version,
             .doc_range_aligned = self.doc_range_aligned,
             .positions_data = self.positions_data,
+            .positions_range = self.positions_range,
+            .max_position_record_bytes = self.max_position_record_bytes,
             .skip_data = self.skip_data,
             .impact_chunk_ids_data = self.impact_chunk_ids_data,
             .impact_chunk_count = self.impact_chunk_count,
         };
+        if (self.metadata_owner) |owner| owner.retain(owner.ptr);
         errdefer iter.deinit();
         try iter.decodeImpactChunkIds();
         return iter;
@@ -3229,12 +3276,19 @@ pub const PackedPositionCursor = struct {
 /// Iterates over (doc_id, freq, norm, positions) for a term's posting list.
 pub const PostingsIterator = struct {
     alloc: Allocator,
+    metadata_owner: ?@import("../segment_source.zig").SharedOwner = null,
     doc_freq: u32 = 0,
     chunk_size: u32 = 0,
     chunk_meta_data: []const u8 = &.{},
     chunk_meta_count: u32 = 0,
+    streamed_records: []const u8 = &.{},
+    streamed_records_range: ?@import("../segment_source.zig").View = null,
     payload_data: []const u8 = &.{},
+    payload_range: ?@import("../segment_source.zig").View = null,
+    payload_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    max_payload_chunk_bytes: usize = 64 * 1024,
     norms_data: []const u8 = &.{},
+    norms_reader: ?RangeInvertedIndexReader = null,
     current_chunk_index: usize = std.math.maxInt(usize),
     current_chunk_meta: ?V7ChunkMeta = null,
     current_chunk_min_doc: u32 = 0,
@@ -3243,6 +3297,9 @@ pub const PostingsIterator = struct {
     version: u8 = wire_version_current,
     doc_range_aligned: bool = false,
     positions_data: ?[]const u8 = null,
+    positions_range: ?@import("../segment_source.zig").View = null,
+    position_read_buffer: std.ArrayListUnmanaged(u8) = .empty,
+    max_position_record_bytes: usize = 1024 * 1024,
     skip_data: ?[]const u8 = null,
     impact_chunk_ids_data: ?[]const u8 = null,
     impact_chunk_count: u32 = 0,
@@ -3305,14 +3362,14 @@ pub const PostingsIterator = struct {
         };
     }
 
-    fn initInlineSingleDoc(postings: *const TermPostings, alloc: Allocator) PostingsIterator {
+    fn initInlineSingleDoc(postings: *const TermPostings, alloc: Allocator) !PostingsIterator {
         return .{
             .alloc = alloc,
             .norms_data = postings.norms_data,
             .version = postings.version,
             .is_one_hit = true,
             .one_hit_doc = postings.inline_doc_id,
-            .one_hit_norm = decodeNormValue(postings.norms_data, postings.inline_doc_id),
+            .one_hit_norm = if (postings.norms_reader) |reader| try reader.docLength(postings.inline_doc_id) else decodeNormValue(postings.norms_data, postings.inline_doc_id),
             .one_hit_freq = postings.inline_freq,
             .one_hit_has_locs = postings.inline_has_locs,
             .one_hit_position_bits = postings.inline_position_bits,
@@ -3327,7 +3384,7 @@ pub const PostingsIterator = struct {
         self.positions_buf.clearRetainingCapacity();
         if (with_positions and self.one_hit_has_locs) {
             const count: usize = @intCast(self.one_hit_freq);
-            try self.positions_buf.ensureTotalCapacity(self.alloc, count);
+            if (self.positions_range != null) try self.positions_buf.ensureTotalCapacityPrecise(self.alloc, count) else try self.positions_buf.ensureTotalCapacity(self.alloc, count);
             self.positions_buf.items.len = count;
             try decodePackedU32Into(
                 self.one_hit_positions_data,
@@ -3479,7 +3536,24 @@ pub const PostingsIterator = struct {
         self.chunk_meta_decoded = true;
     }
 
+    fn hasStreamedRecords(self: *const PostingsIterator) bool {
+        return self.streamed_records_range != null or self.streamed_records.len != 0;
+    }
+    fn streamedRecord(self: *const PostingsIterator, index: usize) ![streamed_record_size]u8 {
+        if (index >= self.chunk_meta_count) return error.InvalidData;
+        var bytes: [streamed_record_size]u8 = undefined;
+        if (self.streamed_records_range) |view| try view.readInto(index * streamed_record_size, &bytes) else @memcpy(&bytes, self.streamed_records[index * streamed_record_size ..][0..streamed_record_size]);
+        return bytes;
+    }
+
     fn chunkMeta(self: *PostingsIterator, index: usize) !V7ChunkMeta {
+        if (self.hasStreamedRecords()) {
+            const bytes = try self.streamedRecord(index);
+            const count = std.mem.readInt(u32, bytes[4..8], .little);
+            const expected = if (index + 1 < self.chunk_meta_count) self.chunk_size else self.doc_freq - @as(u32, @intCast(index)) * self.chunk_size;
+            if (count != expected) return error.InvalidData;
+            return .{ .chunk_id = @intCast(index), .max_doc = std.mem.readInt(u32, bytes[0..4], .little), .doc_count = count, .doc_ctrl_off = 0, .doc_ctrl_len = std.mem.readInt(u32, bytes[16..20], .little), .doc_data_off = 0, .doc_data_len = 0, .freq_ctrl_off = 0, .freq_ctrl_len = 0, .freq_data_off = 0, .freq_data_len = 0 };
+        }
         if (self.version >= wire_version_checkpoints) {
             const checkpoint = self.chunkCheckpoint(index);
             return readCompactChunkMetaAtCheckpoint(
@@ -3593,7 +3667,7 @@ pub const PostingsIterator = struct {
     }
 
     fn loadChunk(self: *PostingsIterator, index: usize) !void {
-        const meta = if (self.version >= wire_version_checkpoints and
+        const meta = if (!self.hasStreamedRecords() and self.version >= wire_version_checkpoints and
             self.current_chunk_meta != null and
             self.current_chunk_index != std.math.maxInt(usize) and
             index == self.current_chunk_index + 1)
@@ -3618,8 +3692,19 @@ pub const PostingsIterator = struct {
         try self.freq_values.ensureTotalCapacity(self.alloc, meta.doc_count);
         self.freq_values.items.len = meta.doc_count;
 
-        if (@as(usize, meta.doc_ctrl_off) + meta.doc_ctrl_len > self.payload_data.len) return error.InvalidData;
-        const chunk_data = self.payload_data[meta.doc_ctrl_off..][0..meta.doc_ctrl_len];
+        const payload_length = if (self.payload_range) |view| view.length else self.payload_data.len;
+        const payload_offset: u64 = if (self.hasStreamedRecords()) blk: {
+            const record = try self.streamedRecord(index);
+            break :blk std.mem.readInt(u64, record[8..16], .little);
+        } else meta.doc_ctrl_off;
+        if (payload_offset > payload_length or meta.doc_ctrl_len > payload_length - payload_offset) return error.InvalidData;
+        const chunk_data: []const u8 = if (self.payload_range) |view| blk: {
+            if (meta.doc_ctrl_len > self.max_payload_chunk_bytes) return error.SegmentReadBudgetExceeded;
+            try self.payload_buffer.ensureTotalCapacityPrecise(self.alloc, meta.doc_ctrl_len);
+            self.payload_buffer.items.len = meta.doc_ctrl_len;
+            try view.readInto(payload_offset, self.payload_buffer.items);
+            break :blk self.payload_buffer.items;
+        } else self.payload_data[@intCast(payload_offset)..][0..meta.doc_ctrl_len];
         var payload_cursor: usize = 0;
         const first_doc = if (usesPostingCountBlocks(self.version))
             readVarintU32(chunk_data, &payload_cursor) catch return error.InvalidData
@@ -3684,14 +3769,91 @@ pub const PostingsIterator = struct {
         self.chunk_doc_pos = 0;
     }
 
+    fn positionLength(self: *const PostingsIterator) ?usize {
+        if (self.positions_range) |view| return std.math.cast(usize, view.length);
+        return if (self.positions_data) |data| data.len else null;
+    }
+
+    fn positionByte(self: *PostingsIterator, offset: usize) !u8 {
+        const length = self.positionLength() orelse return error.InvalidData;
+        if (offset >= length) return error.InvalidData;
+        if (self.positions_range) |view| {
+            var byte: [1]u8 = undefined;
+            try view.readInto(offset, &byte);
+            return byte[0];
+        }
+        return self.positions_data.?[offset];
+    }
+
+    fn positionVarint(self: *PostingsIterator, offset: *usize) !u32 {
+        if (self.positions_range == null) return readVarintU32(self.positions_data.?, offset) catch return error.InvalidData;
+        var value: u32 = 0;
+        for (0..5) |i| {
+            const byte = try self.positionByte(offset.*);
+            offset.* += 1;
+            if (i == 4 and byte > 15) return error.InvalidData;
+            value |= @as(u32, byte & 127) << @as(u5, @intCast(i * 7));
+            if (byte & 128 == 0) return value;
+        }
+        return error.InvalidData;
+    }
+
+    fn positionSlice(self: *PostingsIterator, offset: usize, length: usize) ![]const u8 {
+        const total = self.positionLength() orelse return error.InvalidData;
+        if (offset > total or length > total - offset) return error.InvalidData;
+        if (self.positions_range) |view| {
+            if (length > self.max_position_record_bytes) return error.SegmentReadBudgetExceeded;
+            try self.position_read_buffer.ensureTotalCapacityPrecise(self.alloc, length);
+            self.position_read_buffer.items.len = length;
+            try view.readInto(offset, self.position_read_buffer.items);
+            return self.position_read_buffer.items;
+        }
+        return self.positions_data.?[offset..][0..length];
+    }
+
+    fn decodePositionPackedRange(self: *PostingsIterator, offset: usize, start: usize, values: []u32, bits: u8) !void {
+        if (self.positions_range == null) return decodePackedU32Range(self.positions_data.?[offset..self.positions_chunk_end], start, values, bits);
+        const start_bit = std.math.mul(usize, start, bits) catch return error.InvalidData;
+        const length_bits = std.math.mul(usize, values.len, bits) catch return error.InvalidData;
+        const skip: u3 = @intCast(start_bit % 8);
+        const length = (std.math.add(usize, length_bits, @as(usize, skip) + 7) catch return error.InvalidData) / 8;
+        const byte_offset = std.math.add(usize, offset, start_bit / 8) catch return error.InvalidData;
+        if (byte_offset > self.positions_chunk_end or length > self.positions_chunk_end - byte_offset) return error.InvalidData;
+        const bytes = try self.positionSlice(byte_offset, length);
+        var cursor = PackedPositionCursor{ .data = bytes, .remaining = values.len, .bits = bits, .byte_index = 0 };
+        if (bits != 0 and skip != 0) {
+            cursor.reservoir = @as(u64, bytes[0]) >> skip;
+            cursor.reservoir_bits = 8 - @as(u8, skip);
+            cursor.byte_index = 1;
+        }
+        for (values) |*value| {
+            // This helper matches decodePackedU32Range's raw delta contract;
+            // decodePositionRecord applies the document-local prefix sum.
+            cursor.previous = 0;
+            value.* = (try cursor.next()) orelse return error.InvalidData;
+        }
+    }
+
     fn enterPositionChunk(self: *PostingsIterator, chunk_index: usize) !void {
-        if (self.version < wire_version_chunk_framed_positions or self.positions_data == null) return;
+        if (self.version < wire_version_chunk_framed_positions or self.positionLength() == null) return;
         if (self.positions_chunk_index == chunk_index) return;
-        const pd = self.positions_data.?;
-        if (self.positions_cursor >= pd.len) return error.InvalidData;
-        const chunk_len = readVarintU32(pd, &self.positions_cursor) catch return error.InvalidData;
+        const pd_len = self.positionLength().?;
+        if (self.hasStreamedRecords()) {
+            const record = try self.streamedRecord(chunk_index);
+            self.positions_cursor = std.math.cast(usize, std.mem.readInt(u64, record[20..28], .little)) orelse return error.SegmentReadBudgetExceeded;
+            const length = std.mem.readInt(u32, record[28..32], .little);
+            if (self.positions_cursor > pd_len or length > pd_len - self.positions_cursor) return error.InvalidData;
+        }
+        if (self.positions_cursor >= pd_len) return error.InvalidData;
+        const chunk_len = try self.positionVarint(&self.positions_cursor);
         const chunk_end = self.positions_cursor + @as(usize, chunk_len);
-        if (chunk_end > pd.len) return error.InvalidData;
+        if (chunk_end > pd_len) return error.InvalidData;
+        if (self.hasStreamedRecords()) {
+            const record = try self.streamedRecord(chunk_index);
+            const start = std.mem.readInt(u64, record[20..28], .little);
+            const length = std.mem.readInt(u32, record[28..32], .little);
+            if (@as(u64, start) + length != chunk_end) return error.InvalidData;
+        }
         self.positions_chunk_end = chunk_end;
         self.positions_chunk_index = chunk_index;
         self.positions_group_doc_end = 0;
@@ -3702,11 +3864,11 @@ pub const PostingsIterator = struct {
     }
 
     fn skipPositionChunk(self: *PostingsIterator) !void {
-        const pd = self.positions_data orelse return;
+        const pd_len = self.positionLength() orelse return;
         if (self.version < wire_version_chunk_framed_positions) return error.InvalidData;
-        if (self.positions_cursor >= pd.len) return error.InvalidData;
-        const chunk_len = readVarintU32(pd, &self.positions_cursor) catch return error.InvalidData;
-        if (self.positions_cursor + @as(usize, chunk_len) > pd.len) return error.InvalidData;
+        if (self.positions_cursor >= pd_len) return error.InvalidData;
+        const chunk_len = try self.positionVarint(&self.positions_cursor);
+        if (self.positions_cursor + @as(usize, chunk_len) > pd_len) return error.InvalidData;
         self.positions_cursor += @as(usize, chunk_len);
         self.positions_chunk_index = std.math.maxInt(usize);
         self.positions_chunk_end = self.positions_cursor;
@@ -3722,7 +3884,7 @@ pub const PostingsIterator = struct {
         if (doc_pos < self.positions_group_doc_end) return self.positions_group_bits;
         if (doc_pos != self.positions_group_doc_end) return error.InvalidData;
         if (self.positions_cursor >= self.positions_chunk_end) return error.InvalidData;
-        const bits = self.positions_data.?[self.positions_cursor];
+        const bits = try self.positionByte(self.positions_cursor);
         self.positions_cursor += 1;
         if (bits > 32) return error.InvalidData;
         self.positions_group_bits = bits;
@@ -3750,7 +3912,7 @@ pub const PostingsIterator = struct {
     }
 
     fn skipPositionRecord(self: *PostingsIterator) !void {
-        const pd = self.positions_data orelse return;
+        const pd_len = self.positionLength() orelse return;
         if (self.version >= wire_version_chunk_framed_positions) {
             const decoded = decodeFreqHasLocs(self.freq_values.items[self.chunk_doc_pos]);
             const bits = if (usesGroupedPositions(self.version))
@@ -3758,7 +3920,7 @@ pub const PostingsIterator = struct {
             else blk: {
                 if (!decoded.has_locs) return;
                 if (self.positions_cursor >= self.positions_chunk_end) return error.InvalidData;
-                const value = pd[self.positions_cursor];
+                const value = try self.positionByte(self.positions_cursor);
                 self.positions_cursor += 1;
                 break :blk value;
             };
@@ -3774,21 +3936,21 @@ pub const PostingsIterator = struct {
             self.positions_cursor += packed_len;
             return;
         }
-        if (self.positions_cursor >= pd.len) return error.InvalidData;
-        const num_pos = readVarintU32(pd, &self.positions_cursor) catch return error.InvalidData;
+        if (self.positions_cursor >= pd_len) return error.InvalidData;
+        const num_pos = try self.positionVarint(&self.positions_cursor);
         if (num_pos == 0) return;
-        if (self.positions_cursor >= pd.len) return error.InvalidData;
-        const bits = pd[self.positions_cursor];
+        if (self.positions_cursor >= pd_len) return error.InvalidData;
+        const bits = try self.positionByte(self.positions_cursor);
         self.positions_cursor += 1;
         if (bits > 32) return error.InvalidData;
         const packed_len = packedU32ByteLen(@intCast(num_pos), bits);
-        if (self.positions_cursor + packed_len > pd.len) return error.InvalidData;
+        if (self.positions_cursor + packed_len > pd_len) return error.InvalidData;
         self.positions_cursor += packed_len;
     }
 
     fn decodePositionRecord(self: *PostingsIterator, doc_pos: usize, expected_count: u32, has_locs: bool) !void {
         self.positions_buf.clearRetainingCapacity();
-        const pd = self.positions_data orelse return;
+        const pd_len = self.positionLength() orelse return;
         self.position_records_decoded +|= 1;
         const num_pos = if (self.version >= wire_version_chunk_framed_positions) blk: {
             if (!has_locs) {
@@ -3800,16 +3962,16 @@ pub const PostingsIterator = struct {
             }
             break :blk expected_count;
         } else blk: {
-            if (self.positions_cursor >= pd.len) return error.InvalidData;
-            break :blk readVarintU32(pd, &self.positions_cursor) catch return error.InvalidData;
+            if (self.positions_cursor >= pd_len) return error.InvalidData;
+            break :blk try self.positionVarint(&self.positions_cursor);
         };
-        const positions_end = if (self.version >= wire_version_chunk_framed_positions) self.positions_chunk_end else pd.len;
+        const positions_end = if (self.version >= wire_version_chunk_framed_positions) self.positions_chunk_end else pd_len;
         const bits = if (usesGroupedPositions(self.version))
             try self.ensurePositionGroup(doc_pos)
         else blk: {
             if (num_pos == 0) return;
             if (self.positions_cursor >= positions_end) return error.InvalidData;
-            const value = pd[self.positions_cursor];
+            const value = try self.positionByte(self.positions_cursor);
             self.positions_cursor += 1;
             break :blk value;
         };
@@ -3817,14 +3979,10 @@ pub const PostingsIterator = struct {
         if (bits > 32) return error.InvalidData;
         const count: usize = @intCast(num_pos);
         if (usesContiguousPositionGroups(self.version)) {
-            try self.positions_buf.ensureTotalCapacity(self.alloc, count);
+            if (self.positions_range != null and count > self.max_position_record_bytes / 4) return error.SegmentReadBudgetExceeded;
+            if (self.positions_range != null) try self.positions_buf.ensureTotalCapacityPrecise(self.alloc, count) else try self.positions_buf.ensureTotalCapacity(self.alloc, count);
             self.positions_buf.items.len = count;
-            try decodePackedU32Range(
-                pd[self.positions_group_data_start..self.positions_chunk_end],
-                self.positions_group_value_offset,
-                self.positions_buf.items,
-                bits,
-            );
+            try self.decodePositionPackedRange(self.positions_group_data_start, self.positions_group_value_offset, self.positions_buf.items, bits);
             try self.advanceContiguousPositionRecord(doc_pos, count);
             var prev: u32 = 0;
             for (self.positions_buf.items) |*delta| {
@@ -3836,9 +3994,10 @@ pub const PostingsIterator = struct {
         }
         const packed_len = packedU32ByteLen(count, bits);
         if (self.positions_cursor + packed_len > positions_end) return error.InvalidData;
-        try self.positions_buf.ensureTotalCapacity(self.alloc, count);
+        if (self.positions_range != null and count > self.max_position_record_bytes / 4) return error.SegmentReadBudgetExceeded;
+        if (self.positions_range != null) try self.positions_buf.ensureTotalCapacityPrecise(self.alloc, count) else try self.positions_buf.ensureTotalCapacity(self.alloc, count);
         self.positions_buf.items.len = count;
-        try decodePackedU32Into(pd[self.positions_cursor..][0..packed_len], self.positions_buf.items, bits);
+        try decodePackedU32Into(try self.positionSlice(self.positions_cursor, packed_len), self.positions_buf.items, bits);
         self.positions_cursor += packed_len;
         var prev: u32 = 0;
         for (self.positions_buf.items) |*delta| {
@@ -3848,11 +4007,16 @@ pub const PostingsIterator = struct {
         }
     }
 
+    fn readNorm(self: *const PostingsIterator, doc: u32) !u32 {
+        if (self.norms_reader) |reader| return reader.docLength(doc);
+        return decodeNormValue(self.norms_data, doc);
+    }
+
     fn takeCurrentWithPositions(self: *PostingsIterator) !Hit {
         const doc_pos = self.chunk_doc_pos;
         const doc_id = self.doc_values.items[self.chunk_doc_pos];
         const freq_has_locs_val = self.freq_values.items[self.chunk_doc_pos];
-        const norm_val = decodeNormValue(self.norms_data, doc_id);
+        const norm_val = try self.readNorm(doc_id);
         self.chunk_doc_pos += 1;
         const decoded = decodeFreqHasLocs(freq_has_locs_val);
         try self.decodePositionRecord(doc_pos, @intCast(decoded.freq), decoded.has_locs);
@@ -3860,10 +4024,10 @@ pub const PostingsIterator = struct {
         return .{ .doc_id = doc_id, .freq = @intCast(decoded.freq), .norm = norm_val, .positions = self.positions_buf.items };
     }
 
-    inline fn takeCurrentScoring(self: *PostingsIterator) Hit {
+    inline fn takeCurrentScoring(self: *PostingsIterator) !Hit {
         const doc_id = self.doc_values.items[self.chunk_doc_pos];
         const freq_has_locs_val = self.freq_values.items[self.chunk_doc_pos];
-        const norm_val = decodeNormValue(self.norms_data, doc_id);
+        const norm_val = try self.readNorm(doc_id);
         self.chunk_doc_pos += 1;
         self.noteReturnedDoc(doc_id);
         return .{
@@ -3883,7 +4047,7 @@ pub const PostingsIterator = struct {
             if (self.next_chunk_index >= self.chunkCount()) return null;
             try self.loadChunk(self.next_chunk_index);
         }
-        return self.takeCurrentScoring();
+        return try self.takeCurrentScoring();
     }
 
     pub fn next(self: *PostingsIterator) !?Hit {
@@ -3922,7 +4086,7 @@ pub const PostingsIterator = struct {
         const target_chunk_index = try self.nextChunkIndexForTarget(target);
         if (target_chunk_index >= self.chunkCount()) return null;
         var skipped_chunk = self.next_chunk_index;
-        while (skipped_chunk < target_chunk_index) : (skipped_chunk += 1) {
+        while (!self.hasStreamedRecords() and skipped_chunk < target_chunk_index) : (skipped_chunk += 1) {
             if (self.version >= wire_version_chunk_framed_positions) {
                 try self.skipPositionChunk();
             } else {
@@ -3985,7 +4149,7 @@ pub const PostingsIterator = struct {
         const target_chunk_index = try self.nextChunkIndexForTarget(target);
         if (target_chunk_index >= self.chunkCount()) return null;
         var skipped_chunk = self.next_chunk_index;
-        while (skipped_chunk < target_chunk_index) : (skipped_chunk += 1) try self.skipPositionChunk();
+        while (!self.hasStreamedRecords() and skipped_chunk < target_chunk_index) : (skipped_chunk += 1) try self.skipPositionChunk();
         try self.loadChunk(target_chunk_index);
         try self.enterPositionChunk(target_chunk_index);
         while (self.chunk_doc_pos < self.doc_values.items.len and self.doc_values.items[self.chunk_doc_pos] < target) {
@@ -4004,7 +4168,7 @@ pub const PostingsIterator = struct {
         return .{
             .doc_id = doc_id,
             .freq = @intCast(decoded.freq),
-            .norm = decodeNormValue(self.norms_data, doc_id),
+            .norm = try self.readNorm(doc_id),
         };
     }
 
@@ -4018,7 +4182,7 @@ pub const PostingsIterator = struct {
     }
 
     pub fn canTakeDeferredPackedPositions(self: *const PostingsIterator) bool {
-        return !self.is_one_hit and self.positions_data != null and usesContiguousPositionGroups(self.version);
+        return !self.is_one_hit and self.positions_range == null and self.positions_data != null and usesContiguousPositionGroups(self.version);
     }
 
     /// Consume a deferred v30+ positional record as a zero-copy packed view.
@@ -4080,7 +4244,7 @@ pub const PostingsIterator = struct {
             while (self.chunk_doc_pos < self.doc_values.items.len and self.doc_values.items[self.chunk_doc_pos] < target) {
                 self.chunk_doc_pos += 1;
             }
-            if (self.chunk_doc_pos < self.doc_values.items.len) return self.takeCurrentScoring();
+            if (self.chunk_doc_pos < self.doc_values.items.len) return try self.takeCurrentScoring();
         }
 
         const target_chunk_index = try self.nextChunkIndexForTarget(target);
@@ -4093,7 +4257,7 @@ pub const PostingsIterator = struct {
         }
         if (self.chunk_doc_pos >= self.doc_values.items.len) return try self.advanceTo(target);
 
-        return self.takeCurrentScoring();
+        return try self.takeCurrentScoring();
     }
 
     /// Return a chunk's conservative BM25 upper bound using the iterator's
@@ -4409,9 +4573,12 @@ pub const PostingsIterator = struct {
     }
 
     pub fn deinit(self: *PostingsIterator) void {
+        defer if (self.metadata_owner) |owner| owner.release(owner.ptr);
         if (self.is_one_hit) {
             if (self.one_hit_owns_scratch) self.positions_buf.deinit(self.alloc);
         } else {
+            self.position_read_buffer.deinit(self.alloc);
+            self.payload_buffer.deinit(self.alloc);
             self.doc_values.deinit(self.alloc);
             self.freq_values.deinit(self.alloc);
             self.chunk_metas.deinit(self.alloc);
@@ -4877,6 +5044,8 @@ fn mergedSectionCapacityHint(sections: []const ?[]const u8) usize {
 
 const MergeMemorySink = struct {
     alloc: Allocator,
+    write_calls: usize = 0,
+    largest_write: usize = 0,
     output: std.ArrayListUnmanaged(u8) = .empty,
 
     pub fn deinit(self: *MergeMemorySink) void {
@@ -4892,6 +5061,8 @@ const MergeMemorySink = struct {
     }
 
     fn writeAt(self: *MergeMemorySink, offset: usize, bytes: []const u8) !void {
+        self.write_calls += 1;
+        self.largest_write = @max(self.largest_write, bytes.len);
         if (offset > self.output.items.len or bytes.len > self.output.items.len - offset) return error.InvalidData;
         @memcpy(self.output.items[offset..][0..bytes.len], bytes);
     }
@@ -4918,155 +5089,190 @@ pub fn mergeInvertedSectionSlotsWithDeletes(
 pub fn writeMergedInvertedSectionSlotsWithDeletes(
     alloc: Allocator,
     sink: anytype,
-    sections: []const ?[]const u8,
+    sections: anytype,
     doc_counts: []const u32,
     deleted_docs: ?[]const ?roaring.RoaringBitmap,
     config: IndexConfig,
 ) !void {
     if (sections.len != doc_counts.len) return error.InvalidData;
-
-    // Open readers for all present sections, preserving slot order so doc
-    // offsets include segments that do not contain this field.
-    var readers = try alloc.alloc(InvertedIndexReader, sections.len);
-    defer alloc.free(readers);
-    var reader_present = try alloc.alloc(bool, sections.len);
-    defer alloc.free(reader_present);
-    for (sections, 0..) |section_opt, i| {
-        reader_present[i] = false;
-        const section = section_opt orelse continue;
-        const reader = try InvertedIndexReader.init(alloc, section);
-        // The inverted section's doc_count reflects only documents that had
-        // content for this field, which can be fewer than the segment's total
-        // doc_count when documents have varying field structures.
-        if (reader.doc_count > doc_counts[i]) return error.InvalidData;
-        readers[i] = reader;
-        reader_present[i] = true;
-    }
-
-    // Track document number remapping: each segment's doc IDs get offset.
-    // Account for deleted docs when computing offsets.
-    var doc_offsets = try alloc.alloc(u32, sections.len);
-    defer alloc.free(doc_offsets);
-    var running_offset: u32 = 0;
-    for (doc_counts, 0..) |doc_count, i| {
-        doc_offsets[i] = running_offset;
-        var live_docs = doc_count;
-        if (deleted_docs) |dels| {
-            if (i < dels.len) {
-                if (dels[i]) |del_bitmap| {
-                    live_docs -|= @intCast(del_bitmap.cardinality());
-                }
-            }
-        }
-        running_offset += live_docs;
-    }
-
-    // Iterate all terms from all readers, merge postings
-    // We need to renumber docs per-segment, skipping deleted ones.
-    // Since multiple terms reference the same docs, we build a renumber
-    // map per segment on first pass.
-    var renumber_maps = try alloc.alloc(?[]u32, sections.len);
+    if (deleted_docs) |deleted| if (deleted.len != sections.len) return error.InvalidData;
+    const maps = try alloc.alloc(RankDocMap, sections.len);
+    for (maps) |*map| map.* = .{ .len = 0, .offset = 0 };
     defer {
-        for (renumber_maps) |m| if (m) |map| alloc.free(map);
-        alloc.free(renumber_maps);
+        for (maps) |*map| if (map.rank_index) |*rank| rank.deinit();
+        alloc.free(maps);
     }
-    @memset(renumber_maps, null);
+    var offset: u32 = 0;
+    for (doc_counts, maps, 0..) |count, *map, i| {
+        const deleted = if (deleted_docs) |d| d[i] else null;
+        const cardinality = if (deleted) |d| d.cardinality() else 0;
+        if (deleted) |d| {
+            const valid = d.rank(count);
+            if (valid != cardinality) return error.InvalidData;
+        }
+        map.* = .{ .len = count, .offset = offset, .deleted = deleted };
+        if (deleted) |d| map.rank_index = try roaring.FrozenRankIndex.init(alloc, d);
+        offset = try std.math.add(u32, offset, count - @as(u32, @intCast(cardinality)));
+    }
+    try writeMappedInvertedSection(alloc, sink, sections, doc_counts, maps, offset, config);
+}
 
-    for (doc_counts, 0..) |doc_count, seg_idx| {
-        // Build renumber map for this segment
-        var rmap = try alloc.alloc(u32, doc_count);
-        var new_id = doc_offsets[seg_idx];
-        for (0..doc_count) |doc_id| {
-            const is_deleted = if (deleted_docs) |dels| blk: {
-                if (seg_idx < dels.len) {
-                    if (dels[seg_idx]) |del_bitmap| {
-                        break :blk del_bitmap.contains(@intCast(doc_id));
+const StreamedNorms = struct { len: usize };
+fn updateMergedNorm(norms: anytype, doc: u32, value: u32) !void {
+    if (doc >= norms.len) return error.InvalidData;
+    if (@TypeOf(norms) != StreamedNorms) norms[doc] = @max(norms[doc], value);
+}
+fn MappedNormStream(comptime Map: type) type {
+    return struct {
+        len: usize,
+        readers: []const ScopedInvertedIndexReader,
+        present: []const bool,
+        maps: []const Map,
+        fn write(self: @This(), sink: anytype) !void {
+            const count: u32 = @intCast(self.len - 5);
+            var header: [5]u8 = undefined;
+            std.mem.writeInt(u32, header[0..4], count, .little);
+            header[4] = 0xff;
+            try sink.appendSlice(&header);
+            var bytes: [16 * 1024]u8 = @splat(0);
+            var position: u32 = 0;
+            var next_doc: u32 = 0;
+            for (self.readers, self.present, self.maps) |*reader, present, map| {
+                if (!present) continue;
+                for (0..map.len) |doc| {
+                    const id = try mapDocument(map, @intCast(doc));
+                    if (id == std.math.maxInt(u32)) continue;
+                    if (id < next_doc or id >= count) return error.InvalidData;
+                    while (id - position >= bytes.len) {
+                        try sink.appendSlice(&bytes);
+                        position += bytes.len;
+                        @memset(&bytes, 0);
                     }
+                    bytes[id - position] = fieldNormToId(try reader.docLength(@intCast(doc)));
+                    next_doc = id + 1;
                 }
-                break :blk false;
-            } else false;
-
-            if (is_deleted) {
-                rmap[doc_id] = std.math.maxInt(u32); // sentinel
-            } else {
-                rmap[doc_id] = new_id;
-                new_id += 1;
+            }
+            while (position < count) {
+                const take = @min(bytes.len, count - position);
+                try sink.appendSlice(bytes[0..take]);
+                position += @intCast(take);
+                @memset(&bytes, 0);
             }
         }
-        renumber_maps[seg_idx] = rmap;
-    }
-
-    var term_iters = try alloc.alloc(TermIterator, sections.len);
-    const term_iter_present = alloc.alloc(bool, sections.len) catch |err| {
-        alloc.free(term_iters);
-        return err;
     };
-    @memset(term_iter_present, false);
-    defer {
-        for (term_iters, 0..) |*iter, i| {
-            if (term_iter_present[i]) iter.deinit();
-        }
-        alloc.free(term_iter_present);
-        alloc.free(term_iters);
-    }
+}
+const InitialNormStream = MappedNormStream(AffineDocMap);
+const AppendNormStream = MappedNormStream(RankDocMap);
 
-    var current_entries = try alloc.alloc(?TermIterator.Entry, sections.len);
-    defer alloc.free(current_entries);
-    @memset(current_entries, null);
+pub const RankDocMap = struct {
+    len: u32,
+    offset: u32,
+    deleted: ?roaring.RoaringBitmap = null,
+    rank_index: ?roaring.FrozenRankIndex = null,
+};
 
-    for (readers, 0..) |*reader, seg_idx| {
-        if (!reader_present[seg_idx]) continue;
-        term_iters[seg_idx] = try reader.termIterator();
-        term_iter_present[seg_idx] = true;
-        current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
-    }
-
-    const section_start = sink.len();
-    var header_placeholder: [v7_header_size]u8 = undefined;
-    @memset(&header_placeholder, 0);
-    try sink.appendSlice(&header_placeholder);
-    var term_postings = std.ArrayListUnmanaged(u8).empty;
-    defer term_postings.deinit(alloc);
-
-    var total_field_len: u64 = 0;
-    const merged_norms = try alloc.alloc(u32, running_offset);
-    defer alloc.free(merged_norms);
-    @memset(merged_norms, 0);
-    var serialize_scratch = PostingSerializeScratch{};
-    defer serialize_scratch.deinit(alloc);
-    var dict_builder = try StreamingTermDictionaryBuilder.init(alloc);
-    defer dict_builder.deinit();
-    var merged_term = std.ArrayListUnmanaged(u8).empty;
-    defer merged_term.deinit(alloc);
-
-    while (true) {
-        const min_term = findMinCurrentTerm(current_entries) orelse break;
-        merged_term.clearRetainingCapacity();
-        try merged_term.appendSlice(alloc, min_term);
-
-        {
-            var acc = PostingAccumulator.init();
-            defer acc.deinit(alloc);
-
-            for (current_entries, 0..) |entry_opt, seg_idx| {
-                const entry = entry_opt orelse continue;
-                if (!std.mem.eql(u8, entry.term, merged_term.items)) continue;
-
-                const rmap = renumber_maps[seg_idx].?;
-                try appendLookupResultToAccumulator(alloc, &acc, entry.result, rmap, merged_norms, &total_field_len);
-                current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
+/// Private sorted-plan mapping. Live source IDs are monotonic within each
+/// physically sorted input; the output-reference stream supplies norm order.
+pub const FileDocMap = struct {
+    len: u32,
+    ids: @import("../segment_source.zig").View,
+    records: @import("../segment_source.zig").View,
+};
+const FileNormStream = struct {
+    len: usize,
+    readers: []const ScopedInvertedIndexReader,
+    present: []const bool,
+    records: @import("../segment_source.zig").View,
+    maps: []const FileDocMap,
+    fn write(self: @This(), sink: anytype) !void {
+        const count = self.len - 5;
+        if (self.records.length != count * 8) return error.InvalidData;
+        var header: [5]u8 = undefined;
+        std.mem.writeInt(u32, header[0..4], @intCast(count), .little);
+        header[4] = 0xff;
+        try sink.appendSlice(&header);
+        var output: [16 * 1024]u8 = undefined;
+        var records: [64 * 8]u8 = undefined;
+        var emitted: usize = 0;
+        var used: usize = 0;
+        while (emitted < count) {
+            const take: usize = @min(64, count - emitted);
+            try self.records.readInto(emitted * 8, records[0 .. take * 8]);
+            for (0..take) |i| {
+                const input = std.mem.readInt(u32, records[i * 8 ..][0..4], .little);
+                const doc = std.mem.readInt(u32, records[i * 8 + 4 ..][0..4], .little);
+                if (input >= self.readers.len or doc >= self.maps[input].len) return error.InvalidData;
+                output[used] = if (self.present[input]) fieldNormToId(try self.readers[input].docLength(doc)) else 0;
+                used += 1;
+                if (used == output.len) {
+                    try sink.appendSlice(&output);
+                    used = 0;
+                }
             }
-
-            if (acc.doc_ids.items.len == 0) continue;
-            try sortPostingAccumulatorByDocId(alloc, &acc);
-            const dict_value = try appendMergedTermToSink(alloc, sink, section_start, &term_postings, &serialize_scratch, &acc, config, running_offset);
-            try dict_builder.add(merged_term.items, dict_value);
+            emitted += take;
         }
+        if (used > 0) try sink.appendSlice(output[0..used]);
     }
+};
 
-    const norms_data = try encodeNormTable(alloc, merged_norms);
-    defer alloc.free(norms_data);
-    try finishStreamingMergedSectionToSink(alloc, sink, section_start, running_offset, total_field_len, norms_data, &dict_builder, config);
+/// Run-local coordinates use affine maps: no identity array or monotonicity
+/// scan grows with the segment's document space.
+pub const AffineDocMap = struct {
+    len: u32,
+    offset: u32,
+    ids: ?@import("../segment_source.zig").View = null,
+};
+
+fn mapLength(map: anytype) usize {
+    return map.len;
+}
+fn mapDocument(map: anytype, doc: u32) !u32 {
+    if (@TypeOf(map) == AffineDocMap) {
+        if (map.ids) |ids| {
+            var bytes: [4]u8 = undefined;
+            try ids.readInto(@as(u64, doc) * 4, &bytes);
+            return try std.math.add(u32, map.offset, std.mem.readInt(u32, &bytes, .little));
+        }
+        return try std.math.add(u32, map.offset, doc);
+    }
+    if (@TypeOf(map) == RankDocMap) {
+        if (map.deleted) |deleted| {
+            if (deleted.contains(doc)) return std.math.maxInt(u32);
+            return try std.math.add(u32, map.offset, doc - @as(u32, @intCast(if (map.rank_index) |rank| rank.rank(doc) else deleted.rank(doc))));
+        }
+        return try std.math.add(u32, map.offset, doc);
+    }
+    if (@TypeOf(map) == FileDocMap) {
+        var bytes: [4]u8 = undefined;
+        try map.ids.readInto(@as(u64, doc) * 4, &bytes);
+        return std.mem.readInt(u32, &bytes, .little);
+    }
+    return map[doc];
+}
+
+pub fn writeMergedInitialRunsToSink(
+    alloc: Allocator,
+    sink: anytype,
+    sections: []const ?@import("../segment_source.zig").View,
+    maps: []const AffineDocMap,
+    document_space: u32,
+    field_doc_count: u32,
+    config: IndexConfig,
+) !void {
+    if (field_doc_count > document_space or maps.len != sections.len) return error.InvalidData;
+    const counts = try alloc.alloc(u32, sections.len);
+    defer alloc.free(counts);
+    for (maps, counts) |map, *count| {
+        if (map.ids) |ids| {
+            if (ids.length != @as(u64, map.len) * 4) return error.InvalidData;
+        } else if (map.offset > document_space or map.len > document_space - map.offset) return error.InvalidData;
+        count.* = map.len;
+    }
+    const start = sink.len();
+    try writeMappedInvertedSection(alloc, sink, sections, counts, maps, document_space, config);
+    var encoded: [4]u8 = undefined;
+    std.mem.writeInt(u32, &encoded, field_doc_count, .little);
+    try sink.writeAt(start + 5, &encoded);
 }
 
 pub fn mergeInvertedSectionSlotsWithDocMaps(
@@ -5087,29 +5293,81 @@ pub fn mergeInvertedSectionSlotsWithDocMaps(
 pub fn writeMergedInvertedSectionSlotsWithDocMaps(
     alloc: Allocator,
     sink: anytype,
-    sections: []const ?[]const u8,
+    sections: anytype,
     doc_counts: []const u32,
     doc_maps: []const []const u32,
     merged_doc_count: u32,
     config: IndexConfig,
 ) !void {
+    try writeMappedInvertedSection(alloc, sink, sections, doc_counts, doc_maps, merged_doc_count, config);
+}
+
+pub fn writeMergedInvertedSectionSlotsWithFileMaps(alloc: Allocator, sink: anytype, sections: anytype, doc_counts: []const u32, maps: []const FileDocMap, doc_count: u32, config: IndexConfig) !void {
+    if (maps.len == 0) return error.InvalidData;
+    for (maps) |map| if (map.ids.length != @as(u64, map.len) * 4 or map.records.length != @as(u64, doc_count) * 8) return error.InvalidData;
+    try writeMappedInvertedSection(alloc, sink, sections, doc_counts, maps, doc_count, config);
+}
+
+fn writeMappedInvertedSection(
+    alloc: Allocator,
+    sink: anytype,
+    sections: anytype,
+    doc_counts: []const u32,
+    doc_maps: anytype,
+    merged_doc_count: u32,
+    config: IndexConfig,
+) !void {
     if (sections.len != doc_counts.len or sections.len != doc_maps.len) return error.InvalidData;
 
-    var readers = try alloc.alloc(InvertedIndexReader, sections.len);
+    const initial_runs = std.meta.Elem(@TypeOf(doc_maps)) == AffineDocMap;
+    const append_maps = std.meta.Elem(@TypeOf(doc_maps)) == RankDocMap;
+    const file_maps = std.meta.Elem(@TypeOf(doc_maps)) == FileDocMap;
+    const stream_norms = initial_runs or append_maps or file_maps;
+    const effective_maps = if (initial_runs) try alloc.dupe(AffineDocMap, doc_maps) else doc_maps;
+    defer if (initial_runs) alloc.free(effective_maps);
+    var readers = try alloc.alloc(ScopedInvertedIndexReader, sections.len);
     defer alloc.free(readers);
     var reader_present = try alloc.alloc(bool, sections.len);
-    defer alloc.free(reader_present);
+    @memset(reader_present, false);
+    defer {
+        for (readers, reader_present) |*reader, present| if (present) reader.deinit();
+        alloc.free(reader_present);
+    }
     for (sections, 0..) |section_opt, i| {
-        if (doc_maps[i].len != doc_counts[i]) return error.InvalidData;
+        if (mapLength(doc_maps[i]) != doc_counts[i]) return error.InvalidData;
         reader_present[i] = false;
-        const section = section_opt orelse continue;
-        const reader = try InvertedIndexReader.init(alloc, section);
+        const section = if (std.meta.Elem(@TypeOf(sections)) == ?@import("../segment_source.zig").View)
+            section_opt orelse continue
+        else blk: {
+            const bytes = section_opt orelse continue;
+            break :blk try @import("../segment_source.zig").View.init(.{ .contiguous = bytes }, 0, bytes.len);
+        };
+        var backing = section;
+        if (initial_runs) {
+            if (doc_maps[i].ids) |ids| {
+                const same_source = switch (section.source) {
+                    .contiguous => false,
+                    .ranges => |ranges| switch (ids.source) {
+                        .contiguous => false,
+                        .ranges => |other| ranges.ptr == other.ptr and ranges.read_into == other.read_into,
+                    },
+                };
+                if (same_source and ids.offset == section.offset + section.length)
+                    backing = try @import("../segment_source.zig").View.init(section.source, section.offset, section.length + ids.length);
+            }
+        }
+        var reader = switch (section.source) {
+            .contiguous => |bytes| try ScopedInvertedIndexReader.initContiguous(alloc, bytes[@intCast(section.offset)..][0..@intCast(section.length)]),
+            .ranges => try ScopedInvertedIndexReader.initRangesWithBacking(alloc, section, backing, .{}),
+        };
+        errdefer reader.deinit();
+        if (initial_runs and backing.length != section.length) effective_maps[i].ids = try reader.backingView(section.length, backing.length - section.length);
         if (reader.doc_count > doc_counts[i]) return error.InvalidData;
         readers[i] = reader;
         reader_present[i] = true;
     }
 
-    var term_iters = try alloc.alloc(TermIterator, sections.len);
+    var term_iters = try alloc.alloc(ScopedInvertedIndexReader.Iterator, sections.len);
     const term_iter_present = alloc.alloc(bool, sections.len) catch |err| {
         alloc.free(term_iters);
         return err;
@@ -5131,7 +5389,7 @@ pub fn writeMergedInvertedSectionSlotsWithDocMaps(
         if (!reader_present[seg_idx]) continue;
         term_iters[seg_idx] = try reader.termIterator();
         term_iter_present[seg_idx] = true;
-        current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
+        current_entries[seg_idx] = try term_iters[seg_idx].next();
     }
 
     const section_start = sink.len();
@@ -5142,9 +5400,9 @@ pub fn writeMergedInvertedSectionSlotsWithDocMaps(
     defer term_postings.deinit(alloc);
 
     var total_field_len: u64 = 0;
-    const merged_norms = try alloc.alloc(u32, merged_doc_count);
-    defer alloc.free(merged_norms);
-    @memset(merged_norms, 0);
+    const merged_norms = if (stream_norms) StreamedNorms{ .len = merged_doc_count } else try alloc.alloc(u32, merged_doc_count);
+    defer if (!stream_norms) alloc.free(merged_norms);
+    if (!stream_norms) @memset(merged_norms, 0);
     var serialize_scratch = PostingSerializeScratch{};
     defer serialize_scratch.deinit(alloc);
     var dict_builder = try StreamingTermDictionaryBuilder.init(alloc);
@@ -5152,10 +5410,27 @@ pub fn writeMergedInvertedSectionSlotsWithDocMaps(
     var merged_term = std.ArrayListUnmanaged(u8).empty;
     defer merged_term.deinit(alloc);
 
+    const stream_maps = effective_maps;
+    const stream_postings = config.wireVersion() == wire_version_current and config.postings_layout == .posting_count_v35 and monotonicDocMaps(stream_maps);
     while (true) {
         const min_term = findMinCurrentTerm(current_entries) orelse break;
         merged_term.clearRetainingCapacity();
         try merged_term.appendSlice(alloc, min_term);
+
+        var candidate_frequency: u64 = 0;
+        for (current_entries) |entry_opt| {
+            const entry = entry_opt orelse continue;
+            if (std.mem.eql(u8, entry.term, merged_term.items)) candidate_frequency += entry.result.docFreq();
+        }
+        if (stream_postings and candidate_frequency >= 4096) {
+            const value = try appendStreamedMergedTermToSink(alloc, sink, section_start, current_entries, merged_term.items, stream_maps, merged_norms, &total_field_len, config);
+            for (current_entries, 0..) |entry_opt, i| {
+                const entry = entry_opt orelse continue;
+                if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
+            }
+            if (value) |dict_value| try dict_builder.add(merged_term.items, dict_value);
+            continue;
+        }
 
         {
             var acc = PostingAccumulator.init();
@@ -5165,8 +5440,8 @@ pub fn writeMergedInvertedSectionSlotsWithDocMaps(
                 const entry = entry_opt orelse continue;
                 if (!std.mem.eql(u8, entry.term, merged_term.items)) continue;
 
-                try appendLookupResultToAccumulator(alloc, &acc, entry.result, doc_maps[seg_idx], merged_norms, &total_field_len);
-                current_entries[seg_idx] = try nextTermIteratorEntry(term_iters, seg_idx);
+                try appendLookupResultToAccumulator(alloc, &acc, entry.result, effective_maps[seg_idx], merged_norms, &total_field_len);
+                current_entries[seg_idx] = try term_iters[seg_idx].next();
             }
 
             if (acc.doc_ids.items.len == 0) continue;
@@ -5176,9 +5451,17 @@ pub fn writeMergedInvertedSectionSlotsWithDocMaps(
         }
     }
 
-    const norms_data = try encodeNormTable(alloc, merged_norms);
-    defer alloc.free(norms_data);
-    try finishStreamingMergedSectionToSink(alloc, sink, section_start, merged_doc_count, total_field_len, norms_data, &dict_builder, config);
+    if (file_maps) {
+        const norms_data = FileNormStream{ .len = @as(usize, merged_doc_count) + 5, .readers = readers, .present = reader_present, .records = effective_maps[0].records, .maps = effective_maps };
+        try finishStreamingMergedSectionToSink(alloc, sink, section_start, merged_doc_count, total_field_len, norms_data, &dict_builder, config);
+    } else if (stream_norms) {
+        const norms_data = MappedNormStream(std.meta.Elem(@TypeOf(doc_maps))){ .len = @as(usize, merged_doc_count) + 5, .readers = readers, .present = reader_present, .maps = effective_maps };
+        try finishStreamingMergedSectionToSink(alloc, sink, section_start, merged_doc_count, total_field_len, norms_data, &dict_builder, config);
+    } else {
+        const norms_data = try encodeNormTable(alloc, merged_norms);
+        defer alloc.free(norms_data);
+        try finishStreamingMergedSectionToSink(alloc, sink, section_start, merged_doc_count, total_field_len, norms_data, &dict_builder, config);
+    }
 }
 
 const PostingSortEntry = struct {
@@ -5193,6 +5476,14 @@ fn postingSortEntryLessThan(_: void, a: PostingSortEntry, b: PostingSortEntry) b
 
 fn sortPostingAccumulatorByDocId(alloc: Allocator, acc: *PostingAccumulator) !void {
     if (acc.doc_ids.items.len <= 1) return;
+    var ordered = true;
+    for (acc.doc_ids.items[1..], acc.doc_ids.items[0 .. acc.doc_ids.items.len - 1]) |next, previous| {
+        if (next < previous) {
+            ordered = false;
+            break;
+        }
+    }
+    if (ordered) return;
 
     const entries = try alloc.alloc(PostingSortEntry, acc.doc_ids.items.len);
     defer alloc.free(entries);
@@ -5277,18 +5568,16 @@ fn appendLookupResultToAccumulator(
     alloc: Allocator,
     acc: *PostingAccumulator,
     result: LookupResult,
-    rmap: []const u32,
-    doc_norms: []u32,
+    rmap: anytype,
+    doc_norms: anytype,
     total_field_len: *u64,
 ) !void {
     switch (result) {
         .one_hit => |hit| {
-            if (hit.doc_num >= rmap.len) return;
-            const remapped_doc = rmap[hit.doc_num];
+            if (hit.doc_num >= mapLength(rmap)) return;
+            const remapped_doc = try mapDocument(rmap, hit.doc_num);
             if (remapped_doc == std.math.maxInt(u32)) return;
-            if (remapped_doc < doc_norms.len and (doc_norms[remapped_doc] == 0 or hit.norm_bits > doc_norms[remapped_doc])) {
-                doc_norms[remapped_doc] = hit.norm_bits;
-            }
+            try updateMergedNorm(doc_norms, remapped_doc, hit.norm_bits);
             try acc.add(alloc, remapped_doc, 1, hit.norm_bits, &.{});
             total_field_len.* += 1;
         },
@@ -5298,17 +5587,243 @@ fn appendLookupResultToAccumulator(
             defer post_iter.deinit();
 
             while (try post_iter.next()) |hit| {
-                if (hit.doc_id >= rmap.len) continue;
-                const remapped_doc = rmap[hit.doc_id];
+                if (hit.doc_id >= mapLength(rmap)) continue;
+                const remapped_doc = try mapDocument(rmap, hit.doc_id);
                 if (remapped_doc == std.math.maxInt(u32)) continue;
-                if (remapped_doc < doc_norms.len and (doc_norms[remapped_doc] == 0 or hit.norm > doc_norms[remapped_doc])) {
-                    doc_norms[remapped_doc] = hit.norm;
-                }
+                try updateMergedNorm(doc_norms, remapped_doc, hit.norm);
                 try acc.add(alloc, remapped_doc, hit.freq, hit.norm, hit.positions);
                 total_field_len.* += hit.freq;
             }
         },
     }
+}
+
+/// A heap contains one borrowed hit per source iterator. Each hit is copied
+/// into the output block before advancing its source, so positions never escape
+/// the iterator's bounded working buffer.
+fn MergedPostingStream(comptime Maps: type) type {
+    return struct {
+        const Head = struct { source: usize, doc_id: u32, hit: PostingsIterator.Hit };
+        const Heap = std.PriorityQueue(Head, void, struct {
+            fn compare(_: void, a: Head, b: Head) std.math.Order {
+                return std.math.order(a.doc_id, b.doc_id);
+            }
+        }.compare);
+        allocator: Allocator,
+        iterators: []?PostingsIterator,
+        maps: Maps,
+        heap: Heap = .empty,
+
+        fn init(alloc: Allocator, entries: []const ?TermIterator.Entry, term: []const u8, maps: Maps) !@This() {
+            var self = @This(){ .allocator = alloc, .iterators = try alloc.alloc(?PostingsIterator, entries.len), .maps = maps };
+            @memset(self.iterators, null);
+            errdefer self.deinit();
+            for (entries, 0..) |entry_opt, i| {
+                const entry = entry_opt orelse continue;
+                if (!std.mem.eql(u8, entry.term, term)) continue;
+                var result = entry.result;
+                self.iterators[i] = try result.iterator(alloc);
+                try self.advance(i);
+            }
+            return self;
+        }
+        fn deinit(self: *@This()) void {
+            for (self.iterators) |*iterator| if (iterator.*) |*present| present.deinit();
+            self.allocator.free(self.iterators);
+            self.heap.deinit(self.allocator);
+        }
+        fn advance(self: *@This(), source: usize) !void {
+            const iterator = &self.iterators[source].?;
+            while (try iterator.next()) |hit| {
+                if (hit.doc_id >= mapLength(self.maps[source])) return error.InvalidData;
+                const mapped = try mapDocument(self.maps[source], hit.doc_id);
+                if (mapped == std.math.maxInt(u32)) continue;
+                try self.heap.push(self.allocator, .{ .source = source, .doc_id = mapped, .hit = hit });
+                return;
+            }
+        }
+        fn block(self: *@This(), acc: *PostingAccumulator, count: u32) !bool {
+            acc.doc_ids.clearRetainingCapacity();
+            acc.metas.clearRetainingCapacity();
+            acc.all_positions.clearRetainingCapacity();
+            while (acc.doc_ids.items.len < count) {
+                const head = self.heap.pop() orelse break;
+                if (acc.doc_ids.items.len > 0 and acc.doc_ids.items[acc.doc_ids.items.len - 1] >= head.doc_id) return error.InvalidData;
+                try acc.add(self.allocator, head.doc_id, head.hit.freq, head.hit.norm, head.hit.positions);
+                try self.advance(head.source);
+            }
+            return acc.doc_ids.items.len > 0;
+        }
+    };
+}
+
+fn monotonicDocMaps(maps: anytype) bool {
+    if (std.meta.Elem(@TypeOf(maps)) == AffineDocMap or std.meta.Elem(@TypeOf(maps)) == RankDocMap or std.meta.Elem(@TypeOf(maps)) == FileDocMap) return true;
+    for (maps) |map| {
+        var previous: ?u32 = null;
+        for (map) |id| {
+            if (id == std.math.maxInt(u32)) continue;
+            if (previous) |last| if (id <= last) return false;
+            previous = id;
+        }
+    }
+    return true;
+}
+
+/// Coalesce random writes to the pre-sized term ranges. Native publication
+/// must issue a handful of writes per range, not one syscall per posting block.
+/// Emit v39 blocks once, followed by a paged block directory. The dictionary
+/// points to a trailer marked (0, maxInt(u32)), followed by a 64-byte descriptor.
+/// Each 32-byte directory record holds max doc/count (u32), payload offset/length
+/// (u64/u32), and position offset/length (u64/u32), all LE. Offsets in records are
+/// relative to the interleaved block span; descriptor offsets are section-local.
+/// Only directory/impact navigation scales with term frequency; document and
+/// position scratch contains at most one output block. Arbitrary non-monotonic
+/// remappings continue through the sorting fallback.
+fn appendStreamedMergedTermToSink(
+    alloc: Allocator,
+    sink: anytype,
+    section_start: usize,
+    entries: []const ?TermIterator.Entry,
+    term: []const u8,
+    maps: anytype,
+    norms: anytype,
+    total_field_len: *u64,
+    config: IndexConfig,
+) !?u64 {
+    var has_positions = false;
+    for (entries) |maybe| if (maybe) |entry| {
+        if (!std.mem.eql(u8, entry.term, term)) continue;
+        switch (entry.result) {
+            .one_hit => {},
+            .postings => |postings| {
+                has_positions = has_positions or postings.positionsLength() > 0 or postings.inline_has_locs;
+            },
+        }
+    };
+    const T = @TypeOf(maps);
+    const normalized_maps: if (T == []const AffineDocMap or T == []AffineDocMap) []const AffineDocMap else if (T == []const RankDocMap or T == []RankDocMap) []const RankDocMap else if (T == []const FileDocMap or T == []FileDocMap) []const FileDocMap else []const []const u32 = maps;
+    var stream = try MergedPostingStream(@TypeOf(normalized_maps)).init(alloc, entries, term, normalized_maps);
+    defer stream.deinit();
+    return appendPostingStreamToSink(alloc, sink, section_start, &stream, has_positions, norms, total_field_len, config);
+}
+
+/// Common block encoder for in-memory initial runs and merged source cursors.
+const AccumulatorStream = struct {
+    source: *const PostingAccumulator,
+    alloc: Allocator,
+    doc: usize = 0,
+    position: usize = 0,
+
+    fn block(self: *@This(), out: *PostingAccumulator, count: u32) !bool {
+        if (self.doc == self.source.doc_ids.items.len) return false;
+        out.doc_ids.clearRetainingCapacity();
+        out.metas.clearRetainingCapacity();
+        out.all_positions.clearRetainingCapacity();
+        const end = @min(self.source.doc_ids.items.len, self.doc + count);
+        try out.doc_ids.appendSlice(self.alloc, self.source.doc_ids.items[self.doc..end]);
+        try out.metas.appendSlice(self.alloc, self.source.metas.items[self.doc..end]);
+        var positions: usize = 0;
+        for (self.source.metas.items[self.doc..end]) |meta| positions += meta.position_count;
+        try out.all_positions.appendSlice(self.alloc, self.source.all_positions.items[self.position..][0..positions]);
+        self.doc = end;
+        self.position += positions;
+        return true;
+    }
+};
+
+fn appendPostingStreamToSink(
+    alloc: Allocator,
+    sink: anytype,
+    section_start: usize,
+    stream: anytype,
+    has_positions: bool,
+    norms: anytype,
+    total_field_len: *u64,
+    config: IndexConfig,
+) !?u64 {
+    var acc = PostingAccumulator.init();
+    defer acc.deinit(alloc);
+    var block_scratch = PostingSerializeScratch{};
+    defer block_scratch.deinit(alloc);
+    var navigation = PostingSerializeScratch{};
+    defer navigation.deinit(alloc);
+    var payload_length: u64 = 0;
+    var positions_length: u64 = 0;
+    const span_start = sink.len();
+    var records = std.ArrayListUnmanaged(u8).empty;
+    defer records.deinit(alloc);
+    var doc_freq: u32 = 0;
+    var previous_doc: ?u32 = null;
+    var current_impact: ?u32 = null;
+    var impact_max: u16 = 0;
+    var impact_min: u16 = std.math.maxInt(u16);
+    if (config.chunk_size == 0) return error.InvalidData;
+    while (try stream.block(&acc, config.chunk_size)) {
+        if (previous_doc) |last| if (last >= acc.doc_ids.items[0]) return error.InvalidData;
+        previous_doc = acc.doc_ids.items[acc.doc_ids.items.len - 1];
+        for (acc.doc_ids.items, acc.metas.items) |id, meta| {
+            try updateMergedNorm(norms, id, meta.norm);
+            total_field_len.* = try std.math.add(u64, total_field_len.*, meta.freq);
+            const range = id / impact_range_doc_count;
+            if (current_impact != null and current_impact.? != range) {
+                try navigation.impact_chunk_ids.append(alloc, current_impact.?);
+                try appendImpactRecord(alloc, &navigation.impact_block_max, impact_max, impact_min);
+                impact_max = 0;
+                impact_min = std.math.maxInt(u16);
+            }
+            current_impact = range;
+            const freq: u16 = @intCast(@min(meta.freq, std.math.maxInt(u16)));
+            const norm: u16 = @intCast(@min(meta.norm, std.math.maxInt(u16)));
+            impact_max = @max(impact_max, freq);
+            impact_min = @min(impact_min, norm);
+        }
+        doc_freq = try std.math.add(u32, doc_freq, @intCast(acc.doc_ids.items.len));
+        block_scratch.reset();
+        var position_offset: usize = 0;
+        // Size all position frames, including empty-location groups. If the
+        // entire term has no positions, the positions stream is omitted.
+        const encoded = try acc.appendEncodedChunk(alloc, &block_scratch, config, 0, acc.doc_ids.items.len, 0, &position_offset, has_positions);
+        var record: [streamed_record_size]u8 = undefined;
+        std.mem.writeInt(u32, record[0..4], encoded.metadata.max_doc, .little);
+        std.mem.writeInt(u32, record[4..8], encoded.metadata.doc_count, .little);
+        std.mem.writeInt(u64, record[8..16], sink.len() - span_start, .little);
+        std.mem.writeInt(u32, record[16..20], @intCast(block_scratch.payload.items.len), .little);
+        try sink.appendSlice(block_scratch.payload.items);
+        std.mem.writeInt(u64, record[20..28], sink.len() - span_start, .little);
+        std.mem.writeInt(u32, record[28..32], @intCast(block_scratch.positions.items.len), .little);
+        try sink.appendSlice(block_scratch.positions.items);
+        try records.appendSlice(alloc, &record);
+        payload_length = try std.math.add(u64, payload_length, @intCast(block_scratch.payload.items.len));
+        // A positions-bearing term also frames blocks with no locations.
+        positions_length = try std.math.add(u64, positions_length, @intCast(block_scratch.positions.items.len));
+    }
+    if (doc_freq == 0) return null;
+    if (doc_freq > config.chunk_size) {
+        try navigation.impact_chunk_ids.append(alloc, current_impact.?);
+        try appendImpactRecord(alloc, &navigation.impact_block_max, impact_max, impact_min);
+    } else {
+        navigation.impact_chunk_ids.clearRetainingCapacity();
+        navigation.impact_block_max.clearRetainingCapacity();
+    }
+    const span_length: u64 = sink.len() - span_start;
+    const table_start = sink.len();
+    try sink.appendSlice(records.items);
+    const impacts: u32 = @intCast(navigation.impact_block_max.items.len / blockMaxRecordSize(config.wireVersion()));
+    try encodeImpactMetadata(alloc, &navigation, impacts, config.wireVersion());
+    try encodeImpactChunkIds(alloc, &navigation.impact_ids, navigation.impact_chunk_ids.items, &navigation.doc_deltas);
+    const impact_start = sink.len();
+    try sink.appendSlice(navigation.impact_encoded.items);
+    try sink.appendSlice(navigation.impact_ids.items);
+    const header_start = sink.len();
+    var marker = std.ArrayListUnmanaged(u8).empty;
+    defer marker.deinit(alloc);
+    try writeVarintU32(alloc, &marker, 0);
+    try writeVarintU32(alloc, &marker, std.math.maxInt(u32));
+    try sink.appendSlice(marker.items);
+    const descriptor = StreamedDescriptor{ .doc_frequency = doc_freq, .chunks = @intCast(records.items.len / streamed_record_size), .span_start = span_start - section_start, .span_length = span_length, .table_start = table_start - section_start, .impact_start = impact_start - section_start, .impacts = impacts, .ids_length = @intCast(navigation.impact_ids.items.len), .payload_length = payload_length, .positions_length = positions_length };
+    try sink.appendSlice(&descriptor.encode());
+    return @intCast(header_start - section_start - v7_header_size);
 }
 
 fn appendMergedTermToSink(
@@ -5347,16 +5862,35 @@ fn finishStreamingMergedSectionToSink(
     section_start: usize,
     doc_count: u32,
     total_field_len: u64,
-    norms_data: []const u8,
+    norms_data: anytype,
     dict_builder: *StreamingTermDictionaryBuilder,
     config: IndexConfig,
 ) !void {
+    return finishStreamingSectionProfile(alloc, sink, section_start, doc_count, total_field_len, norms_data, dict_builder, config, null);
+}
+
+fn finishStreamingSectionProfile(
+    alloc: Allocator,
+    sink: anytype,
+    section_start: usize,
+    doc_count: u32,
+    total_field_len: u64,
+    norms_data: anytype,
+    dict_builder: *StreamingTermDictionaryBuilder,
+    config: IndexConfig,
+    profile: ?*InvertedIndexBuildProfile,
+) !void {
+    const bloom_start = if (profile != null) platform_time.monotonicNs() else 0;
     const bloom_bytes = try dict_builder.encodeBloomAlloc(config);
     defer alloc.free(bloom_bytes);
+    if (profile) |p| p.bloom_finish_ns +|= platform_time.monotonicNs() - bloom_start;
 
-    try sink.appendSlice(norms_data);
+    const assembly_start = if (profile != null) platform_time.monotonicNs() else 0;
+    if (@TypeOf(norms_data) == InitialNormStream or @TypeOf(norms_data) == AppendNormStream or @TypeOf(norms_data) == FileNormStream) try norms_data.write(sink) else try sink.appendSlice(norms_data);
     if (bloom_bytes.len > 0) try sink.appendSlice(bloom_bytes);
+    const dict_start = if (profile != null) platform_time.monotonicNs() else 0;
     const term_dict_len = try dict_builder.finishIntoSink(sink);
+    if (profile) |p| p.term_dict_ns +|= platform_time.monotonicNs() - dict_start;
 
     var header: [v7_header_size]u8 = undefined;
     writeCurrentHeader(
@@ -5370,6 +5904,7 @@ fn finishStreamingMergedSectionToSink(
         @intCast(norms_data.len),
     );
     try sink.writeAt(section_start, &header);
+    if (profile) |p| p.final_assembly_ns +|= platform_time.monotonicNs() - assembly_start;
 }
 
 // ============================================================================
@@ -6599,7 +7134,7 @@ test "production reader rejects branch-only v24-v37 formats" {
     var candidate = try alloc.dupe(u8, section);
     defer alloc.free(candidate);
     var version: u8 = wire_version_checkpoints;
-    while (version < wire_version_current) : (version += 1) {
+    while (version < wire_version_compact_postings_header) : (version += 1) {
         candidate[4] = version;
         try std.testing.expectError(error.UnsupportedVersion, InvertedIndexReader.init(alloc, candidate));
     }
@@ -7190,4 +7725,1249 @@ test "current reader reopens origin-main v23 postings and block-max layout" {
     try std.testing.expectEqual(@as(u32, 2), first.freq);
     try std.testing.expectEqual(@as(u32, 1), second.doc_id);
     try std.testing.expectEqual(@as(u32, 3), second.freq);
+    const ranged = try RangeInvertedIndexReader.init(alloc, try @import("../segment_source.zig").View.init(.{ .contiguous = legacy }, 0, legacy.len), 4096);
+    var scratch = @import("../segment_source.zig").Scratch.init(alloc, 4096);
+    defer scratch.deinit();
+    const address = (try ranged.lookupAddress("compat", &scratch)).?;
+    var owned = try ranged.openPostings(address.postings_offset, 4096, 4096, 4096);
+    defer owned.deinit();
+    var range_iter = try owned.value.iterator(alloc);
+    defer range_iter.deinit();
+    try std.testing.expectEqualDeep(first, (try range_iter.next()).?);
+    try std.testing.expectEqualDeep(second, (try range_iter.next()).?);
+    try std.testing.expect((try range_iter.next()) == null);
+}
+
+fn lookupBlockedTerm(allocator: Allocator, blocks: []const u8, block_offset: u32, term: []const u8) !u64 {
+    if (block_offset >= blocks.len) return error.InvalidData;
+    var cursor: usize = block_offset;
+    const prefix_len = try readVarintU32(blocks, &cursor);
+    const entry_count = try readVarintU32(blocks, &cursor);
+    if (cursor + prefix_len > blocks.len) return error.Truncated;
+    const prefix = blocks[cursor..][0..prefix_len];
+    cursor += prefix_len;
+    if (!std.mem.startsWith(u8, term, prefix)) return error.NotFound;
+    const wanted_suffix = term[prefix.len..];
+
+    // Query terms are overwhelmingly short. Reconstruct only the prefix
+    // needed to compare against the requested suffix and keep the common
+    // path entirely on the stack. A dictionary entry longer than the
+    // requested suffix can never match, so retaining its tail only creates
+    // allocator traffic in every segment lookup.
+    var stack_suffix: [256]u8 = undefined;
+    var heap_suffix: ?[]u8 = null;
+    const suffix_buf: []u8 = if (wanted_suffix.len <= stack_suffix.len)
+        stack_suffix[0..wanted_suffix.len]
+    else blk: {
+        const owned = try allocator.alloc(u8, wanted_suffix.len);
+        heap_suffix = owned;
+        break :blk owned;
+    };
+    defer if (heap_suffix) |owned| allocator.free(owned);
+
+    var suffix_prefix_len: usize = 0;
+    var previous_suffix_len: usize = 0;
+    var last_postings_offset: u64 = 0;
+    var remaining = entry_count;
+    while (remaining > 0) : (remaining -= 1) {
+        const shared_len: usize = try readVarintU32(blocks, &cursor);
+        const leaf_len: usize = try readVarintU32(blocks, &cursor);
+        if (shared_len > previous_suffix_len) return error.InvalidData;
+        if (cursor + leaf_len > blocks.len) return error.Truncated;
+
+        const retained_len = @min(shared_len, suffix_buf.len);
+        if (retained_len > suffix_prefix_len) {
+            // We retain min(actual length, requested length) bytes from the
+            // previous suffix. Therefore a shared prefix can exceed the
+            // retained bytes only after both have reached the requested
+            // length, in which case retained_len == suffix_prefix_len.
+            return error.InvalidData;
+        }
+        const copied_leaf_len = @min(leaf_len, suffix_buf.len - retained_len);
+        @memcpy(suffix_buf[retained_len..][0..copied_leaf_len], blocks[cursor..][0..copied_leaf_len]);
+        suffix_prefix_len = retained_len + copied_leaf_len;
+        previous_suffix_len = shared_len +| leaf_len;
+        cursor += leaf_len;
+        const value = decodeTermDictBlockValueDelta(try readVarintU64(blocks, &cursor), &last_postings_offset);
+
+        const prefix_order = std.mem.order(u8, suffix_buf[0..suffix_prefix_len], wanted_suffix);
+        const order: std.math.Order = if (prefix_order != .eq)
+            prefix_order
+        else
+            std.math.order(previous_suffix_len, wanted_suffix.len);
+        switch (order) {
+            .eq => return value,
+            .gt => return error.NotFound,
+            .lt => {},
+        }
+    }
+    return error.NotFound;
+}
+
+/// Native section navigation. Header and dictionary descriptors are retained;
+/// term ceilings and the selected dictionary block are read on demand. The
+/// section view is borrowed, normally from a query-owned bounded block cache.
+pub const RangeInvertedIndexReader = struct {
+    allocator: Allocator,
+    view: @import("../segment_source.zig").View,
+    doc_count: u32,
+    total_field_len: u64,
+    chunk_size: u32,
+    version: u8,
+    block_count: u32,
+    blocks_offset: u64,
+    blocks_length: u32,
+    index_offset: u64,
+    index_length: u32,
+    norms_offset: u64,
+    norms_length: u32,
+    norm_count: u32,
+    norm_bits: u8,
+    max_dictionary_block_bytes: usize,
+    term_bloom: ?struct { bytes_offset: u64, bit_count: u32, hash_count: u8 } = null,
+
+    pub fn init(allocator: Allocator, view: @import("../segment_source.zig").View, max_dictionary_block_bytes: usize) !RangeInvertedIndexReader {
+        if (view.length < v7_header_size) return error.InvalidData;
+        var header: [v7_header_size]u8 = undefined;
+        try view.readInto(0, &header);
+        if (!std.mem.eql(u8, header[0..4], "INVT")) return error.InvalidMagic;
+        const version = header[4];
+        if (version != wire_version_legacy and version != wire_version_compact_postings_header and version != wire_version_current) return error.UnsupportedVersion;
+        const dict_length = std.mem.readInt(u32, header[21..25], .little);
+        const bloom_length = std.mem.readInt(u32, header[25..29], .little);
+        const norms_length = std.mem.readInt(u32, header[29..33], .little);
+        if (dict_length < term_dict_header_size or dict_length > view.length - v7_header_size) return error.InvalidData;
+        const dict_offset = view.length - dict_length;
+        if (@as(u64, bloom_length) + norms_length > dict_offset - v7_header_size) return error.InvalidData;
+        var dict: [term_dict_header_size]u8 = undefined;
+        try view.readInto(dict_offset, &dict);
+        if (!std.mem.eql(u8, dict[0..4], term_dict_magic)) return error.InvalidData;
+        const count = std.mem.readInt(u32, dict[4..8], .little);
+        const blocks_length = std.mem.readInt(u32, dict[8..12], .little);
+        const index_length = std.mem.readInt(u32, dict[12..16], .little);
+        const fst_length = std.mem.readInt(u32, dict[16..20], .little);
+        if (@as(u64, count) * term_dict_index_record_size > index_length or
+            term_dict_header_size + @as(u64, blocks_length) + index_length + fst_length != dict_length) return error.InvalidData;
+        const chunk_size = std.mem.readInt(u32, header[17..21], .little);
+        if (chunk_size == 0) return error.InvalidData;
+        var term_bloom: ?struct { bytes_offset: u64, bit_count: u32, hash_count: u8 } = null;
+        const bloom_header_length = bloom.magic.len + 13;
+        if (bloom_length >= bloom_header_length) {
+            var bloom_header: [bloom_header_length]u8 = undefined;
+            try view.readInto(dict_offset - bloom_length, &bloom_header);
+            const bit_count = std.mem.readInt(u32, bloom_header[bloom.magic.len + 4 ..][0..4], .little);
+            const bytes_length = std.mem.readInt(u32, bloom_header[bloom.magic.len + 9 ..][0..4], .little);
+            if (std.mem.eql(u8, bloom_header[0..bloom.magic.len], bloom.magic) and
+                std.mem.readInt(u32, bloom_header[bloom.magic.len..][0..4], .little) == bloom.version and
+                bytes_length == bloom_length - bloom_header_length and bytes_length == (@as(u64, bit_count) + 7) / 8)
+            {
+                term_bloom = .{ .bytes_offset = dict_offset - bloom_length + bloom_header_length, .bit_count = bit_count, .hash_count = bloom_header[bloom.magic.len + 8] };
+            }
+        }
+        const norms_offset = dict_offset - bloom_length - norms_length;
+        var norm_count = std.mem.readInt(u32, header[5..9], .little);
+        var norm_bits: u8 = 0;
+        if (norms_length != 0) {
+            if (norms_length < 5) return error.InvalidData;
+            var norm_header: [5]u8 = undefined;
+            try view.readInto(norms_offset, &norm_header);
+            norm_count = std.mem.readInt(u32, norm_header[0..4], .little);
+            norm_bits = norm_header[4];
+            const bytes = if (norm_bits == 255) @as(u64, norm_count) else if (norm_bits <= 32) (@as(u64, norm_count) * norm_bits + 7) / 8 else return error.InvalidData;
+            if (bytes > norms_length - 5) return error.InvalidData;
+        }
+        return .{ .allocator = allocator, .view = view, .doc_count = std.mem.readInt(u32, header[5..9], .little), .total_field_len = std.mem.readInt(u64, header[9..17], .little), .chunk_size = chunk_size, .version = version, .block_count = count, .blocks_offset = dict_offset + term_dict_header_size, .blocks_length = blocks_length, .index_offset = dict_offset + term_dict_header_size + blocks_length, .index_length = index_length, .norms_offset = norms_offset, .norms_length = norms_length, .norm_count = norm_count, .norm_bits = norm_bits, .max_dictionary_block_bytes = max_dictionary_block_bytes, .term_bloom = if (term_bloom) |filter| .{ .bytes_offset = filter.bytes_offset, .bit_count = filter.bit_count, .hash_count = filter.hash_count } else null };
+    }
+
+    pub fn layoutStats(self: *const RangeInvertedIndexReader) !InvertedIndexReader.LayoutStats {
+        var header: [v7_header_size]u8 = undefined;
+        try self.view.readInto(0, &header);
+        const dictionary_length = std.mem.readInt(u32, header[21..25], .little);
+        const bloom_length = std.mem.readInt(u32, header[25..29], .little);
+        var stats = InvertedIndexReader.LayoutStats{
+            .header_bytes = v7_header_size,
+            .term_dict_bytes = dictionary_length,
+            .norm_bytes = self.norms_length,
+            .bloom_bytes = bloom_length,
+            .postings_bytes = self.norms_offset - v7_header_size,
+            .term_block_bytes = self.blocks_length,
+            .term_index_bytes = self.index_length,
+            .fst_bytes = dictionary_length - term_dict_header_size - @as(u64, self.blocks_length) - self.index_length,
+        };
+        for (0..self.block_count) |block| {
+            const offset = try self.blockOffset(@intCast(block));
+            if (offset >= self.blocks_length) return error.InvalidData;
+            var bytes: [10]u8 = undefined;
+            const take = @min(bytes.len, self.blocks_length - offset);
+            try self.view.readInto(self.blocks_offset + offset, bytes[0..take]);
+            var cursor: usize = 0;
+            _ = try readVarintU32(bytes[0..take], &cursor);
+            stats.term_count += try readVarintU32(bytes[0..take], &cursor);
+        }
+        return stats;
+    }
+
+    pub fn docLength(self: *const RangeInvertedIndexReader, doc: u32) !u32 {
+        if (doc >= self.norm_count or self.norms_length < 5) return 0;
+        const count = self.norm_count;
+        const bits = self.norm_bits;
+        if (bits == 255) {
+            if (@as(u64, count) + 5 > self.norms_length) return error.InvalidData;
+            var norm: [1]u8 = undefined;
+            try self.view.readInto(self.norms_offset + 5 + doc, &norm);
+            return fieldNormFromId(norm[0]);
+        }
+        if (bits > 32 or (@as(u64, count) * bits + 7) / 8 > self.norms_length - 5) return error.InvalidData;
+        if (bits == 0) return 0;
+        const start_bit = @as(u64, doc) * bits;
+        const first_byte = start_bit / 8;
+        const skip: u6 = @intCast(start_bit % 8);
+        const byte_count: usize = @intCast((skip + @as(u64, bits) + 7) / 8);
+        var norm_bytes: [8]u8 = @splat(0);
+        try self.view.readInto(self.norms_offset + 5 + first_byte, norm_bytes[0..byte_count]);
+        const mask: u64 = (@as(u64, 1) << @as(u6, @intCast(bits))) - 1;
+        return @intCast((std.mem.readInt(u64, &norm_bytes, .little) >> skip) & mask);
+    }
+
+    pub const TermAddress = union(enum) { one_hit: LookupResult.OneHit, postings_offset: u64 };
+
+    pub fn lookupAddress(self: *const RangeInvertedIndexReader, term: []const u8, scratch: *@import("../segment_source.zig").Scratch) !?TermAddress {
+        const value = (try self.lookupValue(term, scratch)) orelse return null;
+        if (fstValIs1Hit(value)) {
+            const decoded = fstValDecode1Hit(value);
+            if (decoded.doc_num >= self.norm_count) return error.InvalidData;
+            return .{ .one_hit = .{ .doc_num = @intCast(decoded.doc_num), .norm_bits = try self.docLength(@intCast(decoded.doc_num)) } };
+        }
+        return .{ .postings_offset = value };
+    }
+
+    /// Metadata owns its buffers until deinit; iterators borrow them. Payload
+    /// and positions stay in native ranges and are read by bounded iterators.
+    pub fn openPostings(self: *const RangeInvertedIndexReader, offset: u64, max_metadata_bytes: usize, max_payload_chunk_bytes: usize, max_position_record_bytes: usize) !OwnedRangePostings {
+        return self.openPostingsWithNorms(offset, max_metadata_bytes, max_payload_chunk_bytes, max_position_record_bytes, null);
+    }
+
+    fn openPostingsWithNorms(self: *const RangeInvertedIndexReader, offset: u64, max_metadata_bytes: usize, max_payload_chunk_bytes: usize, max_position_record_bytes: usize, cached_norms: ?[]const u8) !OwnedRangePostings {
+        const base = std.math.add(u64, v7_header_size, offset) catch return error.InvalidData;
+        if (base >= self.norms_offset) return error.InvalidData;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        errdefer arena.deinit();
+        var input = RangePostingInput{ .view = self.view, .position = base, .end = self.norms_offset, .allocator = arena.allocator(), .budget = max_metadata_bytes };
+        const norms = cached_norms orelse &.{};
+        const doc_frequency = try input.varint();
+        if (doc_frequency == 0) {
+            if (!usesInlineSingleDocPostings(self.version)) return error.InvalidData;
+            const doc = try input.varint();
+            if (self.version >= wire_version_streaming_blocks and doc == std.math.maxInt(u32)) {
+                var descriptor_bytes: [StreamedDescriptor.size]u8 = undefined;
+                if (input.position > input.end or descriptor_bytes.len > input.end - input.position) return error.InvalidData;
+                try self.view.readInto(input.position, &descriptor_bytes);
+                const descriptor = StreamedDescriptor.decode(&descriptor_bytes);
+                try descriptor.validate(self.view.length, self.doc_count, self.chunk_size, base);
+                const View = @import("../segment_source.zig").View;
+                const span = try View.init(self.view.source, self.view.offset + descriptor.span_start, descriptor.span_length);
+                const table = try View.init(self.view.source, self.view.offset + descriptor.table_start, @as(u64, descriptor.chunks) * streamed_record_size);
+                const impact_len = packedU32ByteLen(descriptor.impacts, 5) + descriptor.impacts;
+                const impacts = try input.bytesAt(descriptor.impact_start, impact_len);
+                const ids = try input.bytesAt(descriptor.impact_start + impact_len, descriptor.ids_length);
+                const header_len: usize = @intCast(input.position + StreamedDescriptor.size - base);
+                const serialized = try View.init(self.view.source, self.view.offset + descriptor.span_start, input.position + StreamedDescriptor.size - descriptor.span_start);
+                return .{ .arena = arena, .value = .{ .doc_freq = descriptor.doc_frequency, .serialized_data = &.{}, .serialized_range = serialized, .header_len = header_len, .chunk_size = self.chunk_size, .version = self.version, .doc_range_aligned = descriptor.ids_length > 0, .block_max = if (descriptor.impacts == 0) null else .{ .meta = impacts, .chunk_size = impact_range_doc_count, .chunk_meta_data = ids, .chunk_meta_count = descriptor.impacts, .version = self.version, .range_ids = true, .packed_impact_frequency = true }, .chunk_meta_data = &.{}, .chunk_meta_count = descriptor.chunks, .streamed_records_range = table, .payload_data = &.{}, .payload_range = span, .max_payload_chunk_bytes = max_payload_chunk_bytes, .norms_data = norms, .norms_reader = if (cached_norms == null) self.* else null, .positions_range = if (descriptor.positions_length == 0) null else span, .max_position_record_bytes = max_position_record_bytes, .logical_payload_length = @intCast(descriptor.payload_length), .logical_positions_length = @intCast(descriptor.positions_length), .impact_chunk_ids_data = if (descriptor.ids_length == 0) null else ids, .impact_chunk_count = descriptor.impacts } };
+            }
+            if (doc >= self.norm_count) return error.InvalidData;
+            const encoded_frequency = try input.varint();
+            const decoded = decodeFreqHasLocs(encoded_frequency);
+            const header_length: usize = @intCast(input.position - base);
+            var bits: u8 = 0;
+            var positions: []const u8 = &.{};
+            if (decoded.has_locs) {
+                bits = try input.byte();
+                if (bits > 32) return error.InvalidData;
+                positions = try input.bytes(packedU32ByteLen(@intCast(decoded.freq), bits));
+            }
+            const serialized = try @import("../segment_source.zig").View.init(self.view.source, self.view.offset + base, input.position - base);
+            return .{ .arena = arena, .value = .{ .doc_freq = 1, .serialized_data = &.{}, .serialized_range = serialized, .header_len = header_length, .chunk_size = self.chunk_size, .version = self.version, .doc_range_aligned = false, .chunk_meta_data = &.{}, .chunk_meta_count = 0, .payload_data = &.{}, .norms_data = norms, .norms_reader = if (cached_norms == null) self.* else null, .inline_single_doc = true, .inline_doc_id = doc, .inline_freq = @intCast(decoded.freq), .inline_has_locs = decoded.has_locs, .inline_position_bits = bits, .inline_positions_data = positions } };
+        }
+        if (doc_frequency > self.doc_count) return error.InvalidData;
+        const compact_header = usesCompactPostingsHeader(self.version);
+        const chunks = if (compact_header) 1 + (doc_frequency - 1) / self.chunk_size else try input.varint();
+        if (chunks == 0 or chunks > doc_frequency) return error.InvalidData;
+        const stored_meta_length: ?u32 = if (compact_header) null else try input.varint();
+        const stored_payload_length: ?u32 = if (self.version >= wire_version_checkpoints) try input.varint() else null;
+        const positions_length = try input.varint();
+        const skip_length: u64 = if (compact_header) if (chunks < postings_skip_min_chunks) 0 else @as(u64, (chunks - 1) / postings_skip_stride_chunks) * postings_skip_record_size_v24 else try input.varint();
+        const explicit_impacts = usesSeparateImpactRanges(self.version) and (!compact_header or doc_frequency > self.chunk_size);
+        const impacts: u32 = if (explicit_impacts) try input.varint() else if (usesSeparateImpactRanges(self.version)) 1 else 0;
+        const impact_ids_length: u32 = if (explicit_impacts) try input.varint() else 0;
+        const header_length: usize = @intCast(input.position - base);
+        const old_block_max = try input.bytes(if (usesSeparateImpactRanges(self.version)) 0 else @as(u64, chunks) * blockMaxRecordSize(self.version));
+        const metadata_length: u64 = if (stored_meta_length) |length| length else blk: {
+            const header_size: usize = if (usesCompactPostingCountMeta(self.version)) 2 else postings_chunk_meta_header_size;
+            var header: [postings_chunk_meta_header_size]u8 = undefined;
+            if (input.position > input.end or header_size > input.end - input.position) return error.InvalidData;
+            try self.view.readInto(input.position, header[0..header_size]);
+            var total: u64 = header_size;
+            for (header[0..header_size]) |bits| {
+                if (bits > 32) return error.InvalidData;
+                total += packedU32ByteLen(chunks, bits);
+            }
+            break :blk total;
+        };
+        const metadata = try input.bytes(metadata_length);
+        _ = try compactChunkMetaLayout(metadata, chunks, self.version);
+        const payload_length: u64 = if (stored_payload_length) |length| length else blk: {
+            const last = try readCompactChunkMetaAt(metadata, chunks, self.version, self.chunk_size, doc_frequency, chunks - 1);
+            break :blk @as(u64, last.doc_ctrl_off) + last.doc_ctrl_len;
+        };
+        const payload = try input.skipView(payload_length);
+        const positions = try input.skipView(positions_length);
+        const skips = try input.bytes(skip_length);
+        const impact_metadata = try input.bytes(if (usesPackedImpactFrequency(self.version)) @as(u64, packedU32ByteLen(impacts, 5)) + impacts else @as(u64, impacts) * blockMaxRecordSize(self.version));
+        const ids = try input.bytes(impact_ids_length);
+        const block_max: ?BlockMaxInfo = if (usesSeparateImpactRanges(self.version)) if (impacts > 0) .{ .meta = impact_metadata, .chunk_size = if (impact_ids_length > 0) impact_range_doc_count else self.chunk_size, .chunk_meta_data = if (impact_ids_length > 0) ids else metadata, .chunk_meta_count = impacts, .version = self.version, .range_ids = impact_ids_length > 0, .packed_impact_frequency = usesPackedImpactFrequency(self.version) } else null else .{ .meta = old_block_max, .chunk_size = self.chunk_size, .chunk_meta_data = metadata, .chunk_meta_count = chunks, .version = self.version };
+        const serialized = try @import("../segment_source.zig").View.init(self.view.source, self.view.offset + base, input.position - base);
+        return .{ .arena = arena, .value = .{ .doc_freq = doc_frequency, .serialized_data = &.{}, .serialized_range = serialized, .header_len = header_length, .chunk_size = self.chunk_size, .version = self.version, .doc_range_aligned = !usesPostingCountBlocks(self.version) or (usesSeparateImpactRanges(self.version) and impact_ids_length > 0), .block_max = block_max, .chunk_meta_data = metadata, .chunk_meta_count = chunks, .payload_data = &.{}, .payload_range = payload, .max_payload_chunk_bytes = max_payload_chunk_bytes, .norms_data = norms, .norms_reader = if (cached_norms == null) self.* else null, .positions_range = if (positions_length == 0) null else positions, .max_position_record_bytes = max_position_record_bytes, .skip_data = if (skip_length == 0) null else skips, .impact_chunk_ids_data = if (impact_ids_length == 0) null else ids, .impact_chunk_count = if (impact_ids_length == 0) 0 else impacts } };
+    }
+
+    pub fn lookupValue(self: *const RangeInvertedIndexReader, term: []const u8, scratch: *@import("../segment_source.zig").Scratch) !?u64 {
+        scratch.reset();
+        if (self.term_bloom) |filter| {
+            if (filter.bit_count == 0 or filter.hash_count == 0) return null;
+            const hashes = termBloomHashes(term);
+            const h2 = if (hashes.h2 == 0) 0x9e3779b97f4a7c15 else hashes.h2;
+            for (0..filter.hash_count) |i| {
+                const bit = (hashes.h1 +% (@as(u64, i) *% h2)) % filter.bit_count;
+                var byte: [1]u8 = undefined;
+                try self.view.readInto(filter.bytes_offset + bit / 8, &byte);
+                if (byte[0] & (@as(u8, 1) << @as(u3, @intCast(bit % 8))) == 0) return null;
+            }
+        }
+
+        const lo = (try self.ceilingBlock(term)) orelse return null;
+        const start = try self.blockOffset(lo);
+        const end = if (lo + 1 < self.block_count) try self.blockOffset(lo + 1) else self.blocks_length;
+        if (start > end or end > self.blocks_length) return error.InvalidData;
+        if (end - start > self.max_dictionary_block_bytes) return error.SegmentReadBudgetExceeded;
+        const block = try scratch.allocator().alloc(u8, end - start);
+        try self.view.readInto(self.blocks_offset + start, block);
+        return lookupBlockedTerm(self.allocator, block, 0, term) catch |err| switch (err) {
+            error.NotFound => null,
+            else => return err,
+        };
+    }
+
+    fn ceilingBlock(self: *const RangeInvertedIndexReader, term: []const u8) !?u32 {
+        var lo: u32 = 0;
+        var hi = self.block_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (try self.compareCeiling(mid, term) == .lt) lo = mid + 1 else hi = mid;
+        }
+        return if (lo < self.block_count) lo else null;
+    }
+
+    fn blockOffset(self: *const RangeInvertedIndexReader, block: u32) !u32 {
+        var bytes: [4]u8 = undefined;
+        try self.view.readInto(self.index_offset + @as(u64, block) * term_dict_index_record_size, &bytes);
+        return std.mem.readInt(u32, &bytes, .little);
+    }
+
+    fn compareCeiling(self: *const RangeInvertedIndexReader, block: u32, term: []const u8) !std.math.Order {
+        var bytes: [4]u8 = undefined;
+        try self.view.readInto(self.index_offset + @as(u64, block) * term_dict_index_record_size + 4, &bytes);
+        const records_length = @as(u64, self.block_count) * term_dict_index_record_size;
+        const term_offset = std.mem.readInt(u32, &bytes, .little);
+        if (term_offset >= self.index_length - records_length) return error.InvalidData;
+        var cursor = self.index_offset + records_length + term_offset;
+        const end = self.index_offset + self.index_length;
+        var length: u32 = 0;
+        var finished = false;
+        for (0..5) |i| {
+            if (cursor >= end) return error.InvalidData;
+            var byte: [1]u8 = undefined;
+            try self.view.readInto(cursor, &byte);
+            cursor += 1;
+            if (i == 4 and byte[0] > 15) return error.InvalidData;
+            length |= @as(u32, byte[0] & 127) << @as(u5, @intCast(i * 7));
+            if (byte[0] & 128 == 0) {
+                finished = true;
+                break;
+            }
+        }
+        if (!finished or length > end - cursor) return error.InvalidData;
+        const wanted = @min(length, term.len);
+        var stack: [256]u8 = undefined;
+        const prefix = if (wanted <= stack.len) stack[0..wanted] else try self.allocator.alloc(u8, wanted);
+        defer if (wanted > stack.len) self.allocator.free(prefix);
+        try self.view.readInto(cursor, prefix);
+        const order = std.mem.order(u8, prefix, term[0..wanted]);
+        return if (order == .eq) std.math.order(@as(usize, length), term.len) else order;
+    }
+};
+
+pub const OwnedRangePostings = struct {
+    arena: std.heap.ArenaAllocator,
+    value: TermPostings,
+    pub fn deinit(self: *OwnedRangePostings) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+const RangePostingInput = struct {
+    view: @import("../segment_source.zig").View,
+    position: u64,
+    end: u64,
+    allocator: Allocator,
+    budget: usize,
+    claimed: usize = 0,
+
+    fn byte(self: *RangePostingInput) !u8 {
+        if (self.position >= self.end) return error.InvalidData;
+        var result: [1]u8 = undefined;
+        try self.view.readInto(self.position, &result);
+        self.position += 1;
+        return result[0];
+    }
+
+    fn varint(self: *RangePostingInput) !u32 {
+        var result: u32 = 0;
+        for (0..5) |i| {
+            const value = try self.byte();
+            if (i == 4 and value > 15) return error.InvalidData;
+            result |= @as(u32, value & 127) << @as(u5, @intCast(i * 7));
+            if (value & 128 == 0) return result;
+        }
+        return error.InvalidData;
+    }
+
+    fn bytesAt(self: *RangePostingInput, offset: u64, length: u64) ![]const u8 {
+        if (offset > self.view.length or length > self.view.length - offset) return error.InvalidData;
+        if (length > self.budget - self.claimed) return error.SegmentMetadataTooLarge;
+        self.claimed += @intCast(length);
+        const output = try self.allocator.alloc(u8, @intCast(length));
+        try self.view.readInto(offset, output);
+        return output;
+    }
+
+    fn bytes(self: *RangePostingInput, length: u64) ![]const u8 {
+        if (self.position > self.end or length > self.end - self.position) return error.InvalidData;
+        const output = try self.bytesAt(self.position, length);
+        self.position += length;
+        return output;
+    }
+
+    fn skipView(self: *RangePostingInput, length: u64) !@import("../segment_source.zig").View {
+        if (self.position > self.end or length > self.end - self.position) return error.InvalidData;
+        const result = try @import("../segment_source.zig").View.init(self.view.source, self.view.offset + self.position, length);
+        self.position += length;
+        return result;
+    }
+};
+
+/// One worker's field scope. Native metadata and read buffers survive until
+/// the scope AND every escaping postings iterator have closed. A contiguous
+/// scope allocates nothing and borrows its existing immutable section.
+pub const ScopedInvertedIndexReader = struct {
+    contiguous: ?InvertedIndexReader = null,
+    context: ?*Context = null,
+    doc_count: u32,
+    total_field_len: u64,
+    chunk_size: u32,
+    version: u8,
+
+    pub const Options = struct {
+        cache_bytes: usize = 256 * 1024,
+        navigation_bytes: usize = std.math.maxInt(usize),
+        dictionary_block_bytes: usize = std.math.maxInt(usize),
+        dictionary_retained_bytes: usize = 1024 * 1024,
+        payload_chunk_bytes: usize = std.math.maxInt(usize),
+        position_record_bytes: usize = std.math.maxInt(usize),
+    };
+
+    pub fn initContiguous(allocator: Allocator, bytes: []const u8) !ScopedInvertedIndexReader {
+        const reader = try InvertedIndexReader.init(allocator, bytes);
+        return .{ .contiguous = reader, .doc_count = reader.doc_count, .total_field_len = reader.total_field_len, .chunk_size = reader.chunk_size, .version = reader.version };
+    }
+
+    pub fn initRanges(allocator: Allocator, view: @import("../segment_source.zig").View, options: Options) !ScopedInvertedIndexReader {
+        return initRangesWithBacking(allocator, view, view, options);
+    }
+    fn initRangesWithBacking(allocator: Allocator, view: @import("../segment_source.zig").View, backing: @import("../segment_source.zig").View, options: Options) !ScopedInvertedIndexReader {
+        const context = try allocator.create(Context);
+        context.* = .{ .allocator = allocator, .view = backing, .options = options, .navigation = std.heap.ArenaAllocator.init(allocator), .dictionary = @import("../segment_source.zig").Scratch.init(allocator, options.dictionary_retained_bytes) };
+        errdefer context.destroy();
+        const source = @import("../segment_source.zig").Source{ .ranges = .{ .ptr = context, .length = backing.length, .read_into = Context.read, .close = Context.closeBorrow } };
+        context.cache = try @import("../segment_source.zig").BlockCache.init(allocator, source, options.cache_bytes);
+        context.native = try RangeInvertedIndexReader.init(allocator, try @import("../segment_source.zig").View.init(context.cache.?.borrowedSource(), 0, view.length), options.dictionary_block_bytes);
+        return .{ .context = context, .doc_count = context.native.doc_count, .total_field_len = context.native.total_field_len, .chunk_size = context.native.chunk_size, .version = context.native.version };
+    }
+
+    fn backingView(self: *const ScopedInvertedIndexReader, offset: u64, length: u64) !@import("../segment_source.zig").View {
+        return @import("../segment_source.zig").View.init(self.context.?.cache.?.borrowedSource(), offset, length);
+    }
+
+    pub fn deinit(self: *ScopedInvertedIndexReader) void {
+        if (self.context) |context| Context.release(context);
+        self.* = undefined;
+    }
+
+    pub fn layoutStats(self: *const ScopedInvertedIndexReader) !InvertedIndexReader.LayoutStats {
+        if (self.contiguous) |reader| return reader.layoutStats();
+        return self.context.?.native.layoutStats();
+    }
+    pub fn detailedLayoutStats(self: *const ScopedInvertedIndexReader) !InvertedIndexReader.LayoutStats {
+        var iterator = try self.termIterator();
+        defer iterator.deinit();
+        return accumulateLayoutStats(try self.layoutStats(), &iterator);
+    }
+
+    pub fn avgDocLen(self: *const ScopedInvertedIndexReader) f32 {
+        return if (self.doc_count == 0) 0 else @as(f32, @floatFromInt(self.total_field_len)) / @as(f32, @floatFromInt(self.doc_count));
+    }
+
+    pub fn docLength(self: *const ScopedInvertedIndexReader, doc: u32) !u32 {
+        if (self.contiguous) |reader| return reader.docLength(doc);
+        const context = self.context.?;
+        return context.native.docLength(doc);
+    }
+
+    pub fn lookup(self: *const ScopedInvertedIndexReader, term: []const u8) !?LookupResult {
+        if (self.contiguous) |reader| return reader.lookupChecked(term);
+        const context = self.context.?;
+        if (context.over_budget) return error.SegmentReadBudgetExceeded;
+        const value = (try context.native.lookupValue(term, &context.dictionary)) orelse return null;
+        return try context.lookupValue(value);
+    }
+
+    /// Frequency queries need only the dictionary address and first posting
+    /// varint. Do not allocate norms, impact tables or posting navigation.
+    pub fn docFrequency(self: *const ScopedInvertedIndexReader, term: []const u8) !?u32 {
+        if (self.contiguous) |reader| return if (try reader.lookupChecked(term)) |value| value.docFreq() else null;
+        const context = self.context.?;
+        const value = (try context.native.lookupValue(term, &context.dictionary)) orelse return null;
+        if (fstValIs1Hit(value)) {
+            if (fstValDecode1Hit(value).doc_num >= context.native.norm_count) return error.InvalidData;
+            return 1;
+        }
+        const base = std.math.add(u64, v7_header_size, value) catch return error.InvalidData;
+        if (base >= context.native.norms_offset) return error.InvalidData;
+        var input = RangePostingInput{ .view = context.native.view, .position = base, .end = context.native.norms_offset, .allocator = context.allocator, .budget = 0 };
+        const frequency = try input.varint();
+        if (frequency == 0) {
+            if (!usesInlineSingleDocPostings(self.version)) return error.InvalidData;
+            const doc = try input.varint();
+            if (self.version >= wire_version_streaming_blocks and doc == std.math.maxInt(u32)) {
+                var count: [4]u8 = undefined;
+                if (input.position > input.end or count.len > input.end - input.position) return error.InvalidData;
+                try input.view.readInto(input.position, &count);
+                const result = std.mem.readInt(u32, &count, .little);
+                if (result == 0 or result > self.doc_count) return error.InvalidData;
+                return result;
+            }
+            if (doc >= context.native.norm_count) return error.InvalidData;
+            return 1;
+        }
+        if (frequency > self.doc_count) return error.InvalidData;
+        return frequency;
+    }
+
+    pub fn termIterator(self: *const ScopedInvertedIndexReader) !Iterator {
+        return self.rangeTermIterator(null, null);
+    }
+
+    pub fn rangeTermIterator(self: *const ScopedInvertedIndexReader, start: ?[]const u8, end: ?[]const u8) !Iterator {
+        if (self.contiguous) |*reader| return .{ .contiguous = try reader.rangeTermIterator(start, end) };
+        const context = self.context.?;
+        const block = if (start) |key| (try context.native.ceilingBlock(key)) orelse context.native.block_count else 0;
+        Context.retain(context);
+        return .{ .ranges = .{ .context = context, .block = block, .scratch = @import("../segment_source.zig").Scratch.init(context.allocator, context.options.dictionary_retained_bytes), .start = start, .end = end } };
+    }
+
+    pub fn fstSearchIterator(self: *const ScopedInvertedIndexReader, automaton: fst.Automaton) !Iterator {
+        if (self.contiguous) |*reader| return .{ .contiguous = try reader.fstSearchIterator(automaton) };
+        var iterator = try self.termIterator();
+        iterator.ranges.automaton = automaton;
+        return iterator;
+    }
+
+    pub const Iterator = union(enum) {
+        contiguous: TermIterator,
+        ranges: RangeIterator,
+
+        pub fn blocksPruned(self: *const Iterator) u64 {
+            return switch (self.*) {
+                .contiguous => |*iterator| iterator.blocks_pruned,
+                .ranges => |*iterator| iterator.blocks_pruned,
+            };
+        }
+
+        pub fn next(self: *Iterator) !?TermIterator.Entry {
+            return switch (self.*) {
+                .contiguous => |*iterator| iterator.next(),
+                .ranges => |*iterator| iterator.next(),
+            };
+        }
+
+        pub fn nextWithDecodedCount(self: *Iterator, decoded: *u64) !?TermIterator.Entry {
+            return switch (self.*) {
+                .contiguous => |*iterator| iterator.nextWithDecodedCount(decoded),
+                .ranges => |*iterator| iterator.nextTracked(decoded),
+            };
+        }
+
+        pub fn deinit(self: *Iterator) void {
+            switch (self.*) {
+                .contiguous => |*iterator| iterator.deinit(),
+                .ranges => |*iterator| iterator.deinit(),
+            }
+            self.* = undefined;
+        }
+    };
+
+    const RangeIterator = struct {
+        context: *Context,
+        scratch: @import("../segment_source.zig").Scratch,
+        block: u32 = 0,
+        bytes: []const u8 = &.{},
+        cursor: usize = 0,
+        remaining: u32 = 0,
+        prefix_length: usize = 0,
+        last_postings_offset: u64 = 0,
+        key: std.ArrayListUnmanaged(u8) = .empty,
+        start: ?[]const u8,
+        end: ?[]const u8,
+        automaton: ?fst.Automaton = null,
+        automaton_states: std.ArrayListUnmanaged(usize) = .empty,
+        seek_scratch: std.ArrayListUnmanaged(u8) = .empty,
+        blocks_pruned: u64 = 0,
+        done: bool = false,
+        current_metadata: ?*TermMetadata = null,
+
+        fn next(self: *RangeIterator) !?TermIterator.Entry {
+            return self.nextInternal(false, null);
+        }
+
+        fn nextTracked(self: *RangeIterator, decoded: *u64) !?TermIterator.Entry {
+            return self.nextInternal(true, decoded);
+        }
+
+        fn nextInternal(self: *RangeIterator, comptime tracked: bool, decoded: ?*u64) !?TermIterator.Entry {
+            if (self.current_metadata) |metadata| {
+                if (metadata.references.load(.acquire) == 1) {
+                    // Keep small navigation capacity; release exceptional terms.
+                    _ = metadata.arena.reset(if (metadata.arena.queryCapacity() <= 256 * 1024) .retain_capacity else .free_all);
+                } else {
+                    TermMetadata.release(metadata);
+                    self.current_metadata = null;
+                }
+            }
+            const a = self.context.allocator;
+            while (!self.done) {
+                if (self.remaining == 0 and !try self.loadBlock()) return null;
+                const shared = try readVarintU32(self.bytes, &self.cursor);
+                const leaf_length = try readVarintU32(self.bytes, &self.cursor);
+                if (self.prefix_length + shared > self.key.items.len or leaf_length > self.bytes.len - self.cursor) return error.InvalidData;
+                const leaf = self.bytes[self.cursor..][0..leaf_length];
+                self.cursor += leaf_length;
+                const value = decodeTermDictBlockValueDelta(try readVarintU64(self.bytes, &self.cursor), &self.last_postings_offset);
+                self.remaining -= 1;
+                if (tracked) decoded.?.* += 1;
+                self.key.shrinkRetainingCapacity(self.prefix_length + shared);
+                try self.key.appendSlice(a, leaf);
+                if (self.start) |start| if (std.mem.order(u8, self.key.items, start) == .lt) continue;
+                if (self.end) |end| if (std.mem.order(u8, self.key.items, end) != .lt) {
+                    self.done = true;
+                    return null;
+                };
+                if (self.automaton) |automaton| if (!try self.advanceAutomaton(automaton, self.prefix_length + shared)) continue;
+                const result = if (fstValIs1Hit(value)) try self.context.lookupValue(value) else blk: {
+                    const metadata = self.current_metadata orelse try TermMetadata.create(self.context);
+                    self.current_metadata = metadata;
+
+                    var native = self.context.native;
+                    native.allocator = metadata.arena.allocator();
+                    var owned = try native.openPostingsWithNorms(value, self.context.options.navigation_bytes, self.context.options.payload_chunk_bytes, self.context.options.position_record_bytes, null);
+                    if (metadata.arena.queryCapacity() > self.context.options.navigation_bytes) return error.SegmentReadBudgetExceeded;
+                    owned.value.metadata_owner = .{ .ptr = metadata, .retain = TermMetadata.retain, .release = TermMetadata.release };
+                    break :blk LookupResult{ .postings = owned.value };
+                };
+                return .{ .term = self.key.items, .result = result };
+            }
+            return null;
+        }
+
+        fn loadBlock(self: *RangeIterator) !bool {
+            while (true) {
+                const reader = &self.context.native;
+                if (self.block >= reader.block_count) {
+                    self.done = true;
+                    return false;
+                }
+                const start = try reader.blockOffset(self.block);
+                const end = if (self.block + 1 < reader.block_count) try reader.blockOffset(self.block + 1) else reader.blocks_length;
+                if (start > end or end > reader.blocks_length) return error.InvalidData;
+                if (end - start > reader.max_dictionary_block_bytes) return error.SegmentReadBudgetExceeded;
+                self.scratch.reset();
+                const bytes = try self.scratch.allocator().alloc(u8, end - start);
+                try reader.view.readInto(reader.blocks_offset + start, bytes);
+                self.bytes = bytes;
+                self.cursor = 0;
+                self.prefix_length = try readVarintU32(bytes, &self.cursor);
+                self.remaining = try readVarintU32(bytes, &self.cursor);
+                if (self.remaining == 0 or self.prefix_length > bytes.len - self.cursor) return error.InvalidData;
+                self.key.clearRetainingCapacity();
+                try self.key.appendSlice(self.context.allocator, bytes[self.cursor..][0..self.prefix_length]);
+                self.cursor += self.prefix_length;
+                self.last_postings_offset = 0;
+                self.block += 1;
+                if (self.automaton) |automaton| {
+                    if (try self.primeAutomaton(automaton)) |dead_length| {
+                        self.blocks_pruned += 1;
+                        self.seek_scratch.clearRetainingCapacity();
+                        try self.seek_scratch.appendSlice(self.context.allocator, self.key.items[0..dead_length]);
+                        while (self.seek_scratch.items.len != 0 and self.seek_scratch.items[self.seek_scratch.items.len - 1] == 255) self.seek_scratch.items.len -= 1;
+                        if (self.seek_scratch.items.len == 0) {
+                            self.done = true;
+                            return false;
+                        }
+                        self.seek_scratch.items[self.seek_scratch.items.len - 1] += 1;
+                        self.block = @max(self.block, (try reader.ceilingBlock(self.seek_scratch.items)) orelse reader.block_count);
+                        self.remaining = 0;
+                        continue;
+                    }
+                }
+                return true;
+            }
+        }
+
+        fn primeAutomaton(self: *RangeIterator, automaton: fst.Automaton) !?usize {
+            self.automaton_states.clearRetainingCapacity();
+            try self.automaton_states.ensureTotalCapacity(self.context.allocator, self.prefix_length + 1);
+            var state = automaton.start();
+            self.automaton_states.appendAssumeCapacity(state);
+            if (!automaton.canMatch(state)) return 0;
+            for (self.key.items, 0..) |byte, i| {
+                state = automaton.accept(state, byte);
+                self.automaton_states.appendAssumeCapacity(state);
+                if (!automaton.canMatch(state)) return i + 1;
+            }
+            return null;
+        }
+
+        fn advanceAutomaton(self: *RangeIterator, automaton: fst.Automaton, retained: usize) !bool {
+            if (self.automaton_states.items.len <= retained) return error.InvalidData;
+            self.automaton_states.shrinkRetainingCapacity(retained + 1);
+            try self.automaton_states.ensureUnusedCapacity(self.context.allocator, self.key.items.len - retained);
+            var state = self.automaton_states.items[retained];
+            for (self.key.items[retained..]) |byte| {
+                if (automaton.canMatch(state)) state = automaton.accept(state, byte);
+                self.automaton_states.appendAssumeCapacity(state);
+            }
+            return automaton.canMatch(state) and automaton.isMatch(state);
+        }
+
+        fn deinit(self: *RangeIterator) void {
+            if (self.current_metadata) |metadata| TermMetadata.release(metadata);
+            self.key.deinit(self.context.allocator);
+            self.automaton_states.deinit(self.context.allocator);
+            self.seek_scratch.deinit(self.context.allocator);
+            self.scratch.deinit();
+            Context.release(self.context);
+        }
+    };
+
+    /// An enumeration entry borrows navigation until next(). Postings iterators
+    /// retain it independently; a cursor reuses scratch only while unshared.
+    const TermMetadata = struct {
+        context: *Context,
+        arena: std.heap.ArenaAllocator,
+        references: std.atomic.Value(usize) = .init(1),
+
+        fn create(context: *Context) !*TermMetadata {
+            const owner = try context.allocator.create(TermMetadata);
+            owner.* = .{ .context = context, .arena = std.heap.ArenaAllocator.init(context.allocator) };
+            Context.retain(context);
+            return owner;
+        }
+        fn retain(ptr: *anyopaque) void {
+            const owner: *TermMetadata = @ptrCast(@alignCast(ptr));
+            _ = owner.references.fetchAdd(1, .monotonic);
+        }
+        fn release(ptr: *anyopaque) void {
+            const owner: *TermMetadata = @ptrCast(@alignCast(ptr));
+            if (owner.references.fetchSub(1, .acq_rel) != 1) return;
+            const context = owner.context;
+            owner.arena.deinit();
+            context.allocator.destroy(owner);
+            Context.release(context);
+        }
+    };
+
+    const Context = struct {
+        allocator: Allocator,
+        references: std.atomic.Value(usize) = .init(1),
+        view: @import("../segment_source.zig").View,
+        options: Options,
+        navigation: std.heap.ArenaAllocator,
+        dictionary: @import("../segment_source.zig").Scratch,
+        cache: ?@import("../segment_source.zig").BlockCache = null,
+        native: RangeInvertedIndexReader = undefined,
+        over_budget: bool = false,
+
+        fn destroy(self: *Context) void {
+            self.navigation.deinit();
+            self.dictionary.deinit();
+            if (self.cache) |*cache| cache.deinit();
+            self.allocator.destroy(self);
+        }
+
+        fn retain(ptr: *anyopaque) void {
+            const self: *Context = @ptrCast(@alignCast(ptr));
+            _ = self.references.fetchAdd(1, .monotonic);
+        }
+
+        fn release(ptr: *anyopaque) void {
+            const self: *Context = @ptrCast(@alignCast(ptr));
+            if (self.references.fetchSub(1, .acq_rel) == 1) self.destroy();
+        }
+
+        fn read(ptr: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *Context = @ptrCast(@alignCast(ptr));
+            try self.view.readInto(offset, output);
+        }
+
+        fn closeBorrow(_: *anyopaque) void {}
+
+        fn lookupValue(self: *Context, value: u64) !LookupResult {
+            if (fstValIs1Hit(value)) {
+                const decoded = fstValDecode1Hit(value);
+                if (decoded.doc_num >= self.native.norm_count) return error.InvalidData;
+                return .{ .one_hit = .{ .doc_num = @intCast(decoded.doc_num), .norm_bits = try self.native.docLength(@intCast(decoded.doc_num)) } };
+            }
+            var native = self.native;
+            native.allocator = self.navigation.allocator();
+            const retained = self.navigation.queryCapacity();
+            if (retained > self.options.navigation_bytes) return error.SegmentReadBudgetExceeded;
+            var owned = try native.openPostingsWithNorms(value, self.options.navigation_bytes - retained, self.options.payload_chunk_bytes, self.options.position_record_bytes, null);
+            // Child arenas allocate through navigation, so the context owns
+            // every buffer. Its lease also retains the cache used by ranges.
+            if (self.navigation.queryCapacity() > self.options.navigation_bytes) {
+                self.over_budget = true;
+                return error.SegmentReadBudgetExceeded;
+            }
+            owned.value.metadata_owner = .{ .ptr = self, .retain = retain, .release = release };
+            return .{ .postings = owned.value };
+        }
+    };
+};
+
+fn accumulateLayoutStats(initial: InvertedIndexReader.LayoutStats, it: anytype) !InvertedIndexReader.LayoutStats {
+    var stats = initial;
+    while (try it.next()) |entry| {
+        switch (entry.result) {
+            .one_hit => stats.one_hit_terms +|= 1,
+            .postings => |postings| {
+                stats.postings_terms +|= 1;
+                if (postings.doc_freq == 1) stats.single_doc_postings_terms +|= 1;
+                stats.postings_doc_frequency_total +|= postings.doc_freq;
+                stats.projected_posting_count_blocks_64 +|= (@as(u64, postings.doc_freq) + 63) / 64;
+                stats.projected_posting_count_blocks_128 +|= (@as(u64, postings.doc_freq) + 127) / 128;
+                stats.projected_posting_count_blocks_256 +|= (@as(u64, postings.doc_freq) + 255) / 256;
+                stats.postings_header_bytes +|= @intCast(postings.header_len);
+                if (postings.inline_single_doc) {
+                    stats.projected_compact_postings_header_bytes +|= @intCast(postings.header_len);
+                } else {
+                    const positions_len = postings.positionsLength();
+                    var projected_header = varintU32Size(postings.doc_freq) +
+                        varintU32Size(@intCast(postings.payloadLength())) +
+                        varintU32Size(@intCast(positions_len));
+                    if (postings.doc_freq > simd_bitpack.block_values) {
+                        const projection = if (postings.block_max) |block_max_info| block_max_info.adaptiveColumnProjection() else BlockMaxInfo.AdaptiveColumnProjection{};
+                        const descriptor = (@as(u64, projection.records) << 1) | @intFromBool(projection.use_adaptive);
+                        if (descriptor <= std.math.maxInt(u32)) projected_header += varintU32Size(@intCast(descriptor));
+                        const impact_ids_len = if (postings.impact_chunk_ids_data) |ids| ids.len else 0;
+                        projected_header += varintU32Size(@intCast(impact_ids_len));
+                    }
+                    stats.projected_compact_postings_header_bytes +|= @intCast(projected_header);
+                }
+                if (postings.inline_single_doc and postings.inline_has_locs) {
+                    stats.positions_bytes +|= @as(u64, @intCast(postings.inline_positions_data.len)) + 1;
+                }
+                if (postings.block_max) |block_max_info| {
+                    stats.block_max_bytes +|= @intCast(block_max_info.meta.len);
+                    const projection = block_max_info.adaptiveColumnProjection();
+                    stats.impact_record_count +|= projection.records;
+                    stats.projected_adaptive_impact_bytes +|= projection.selected_bytes;
+                    stats.projected_impact_descriptor_header_delta += projection.descriptor_header_delta;
+                    if (projection.use_adaptive) {
+                        stats.projected_adaptive_impact_terms +|= 1;
+                    } else {
+                        stats.projected_raw_impact_terms +|= 1;
+                    }
+                }
+                if (postings.impact_chunk_ids_data) |ids| stats.impact_range_id_bytes +|= @intCast(ids.len);
+                stats.chunk_meta_bytes +|= @intCast(postings.chunk_meta_data.len + postings.streamed_records.len);
+                if (postings.streamed_records_range) |records| stats.chunk_meta_bytes +|= records.length;
+                stats.postings_payload_bytes +|= @intCast(postings.payloadLength());
+                stats.positions_bytes +|= postings.positionsLength();
+                if (postings.skip_data) |skip_data| {
+                    stats.skip_bytes +|= @intCast(skip_data.len);
+                }
+            },
+        }
+    }
+    return stats;
+}
+
+test "native term frequency reads do not load norms or posting navigation" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    try builder.addDocument(0, &.{
+        .{ .term = "one", .freq = 1 },
+        .{ .term = "inline", .freq = 2, .positions = &.{ 0, 3 } },
+        .{ .term = "many", .freq = 1 },
+    });
+    for (1..1024) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "many", .freq = 1 }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const View = @import("../segment_source.zig").View;
+    var native = try ScopedInvertedIndexReader.initRanges(a, try View.init(.{ .contiguous = bytes }, 0, bytes.len), .{});
+    defer native.deinit();
+    try std.testing.expectEqual(@as(?u32, 1), try native.docFrequency("one"));
+    try std.testing.expectEqual(@as(?u32, 1), try native.docFrequency("inline"));
+    try std.testing.expectEqual(@as(?u32, 1024), try native.docFrequency("many"));
+    try std.testing.expectEqual(@as(?u32, null), try native.docFrequency("missing"));
+    try std.testing.expectEqual(@as(usize, 0), native.context.?.navigation.queryCapacity());
+}
+
+test "streamed common postings merge matches sorting fallback with bounded scratch" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    for (0..25_000) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 3, .positions = &.{ 0, 2, 5 } }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const first = try a.alloc(u32, 25_000);
+    defer a.free(first);
+    const second = try a.alloc(u32, 25_000);
+    defer a.free(second);
+    for (first, second, 0..) |*one, *two, i| {
+        one.* = @intCast(i);
+        two.* = @intCast(i + 25_000);
+    }
+    const Budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator;
+    var streamed_budget = Budget{ .backing = a, .limit = 1024 * 1024 };
+    var streamed_sink = MergeMemorySink{ .alloc = a };
+    defer streamed_sink.deinit();
+    const Source = @import("../segment_source.zig");
+    const State = struct {
+        bytes: []const u8,
+        reads: usize = 0,
+        largest: usize = 0,
+        fn read(ptr: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reads += 1;
+            self.largest = @max(self.largest, out.len);
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state = State{ .bytes = bytes };
+    const view = try Source.View.init(.{ .ranges = .{ .ptr = &state, .length = bytes.len, .read_into = State.read, .close = State.close } }, 0, bytes.len);
+    const stream_start = platform_time.monotonicNs();
+    try writeMergedInvertedSectionSlotsWithDocMaps(streamed_budget.allocator(), &streamed_sink, @as([]const ?Source.View, &.{ view, view }), &.{ 25_000, 25_000 }, &.{ first, second }, 50_000, .{});
+    const stream_ns = platform_time.monotonicNs() - stream_start;
+    try std.testing.expectEqual(@as(usize, 0), streamed_budget.live);
+    try std.testing.expect(state.largest <= 64 * 1024);
+    // Same logical output, but non-monotonic maps force the reference sorter.
+    std.mem.reverse(u32, first);
+    std.mem.reverse(u32, second);
+    var fallback_budget = Budget{ .backing = a };
+    var fallback_sink = MergeMemorySink{ .alloc = a };
+    defer fallback_sink.deinit();
+    const fallback_start = platform_time.monotonicNs();
+    try writeMergedInvertedSectionSlotsWithDocMaps(fallback_budget.allocator(), &fallback_sink, @as([]const ?[]const u8, &.{ bytes, bytes }), &.{ 25_000, 25_000 }, &.{ first, second }, 50_000, .{});
+    const fallback_ns = platform_time.monotonicNs() - fallback_start;
+    const fallback_reader = try InvertedIndexReader.init(a, fallback_sink.output.items);
+    const fallback_result = fallback_reader.lookup("common").?;
+    var fallback_postings = try fallback_result.iterator(a);
+    defer fallback_postings.deinit();
+    try std.testing.expect(streamed_budget.peak < fallback_budget.peak / 2);
+    try std.testing.expect(streamed_sink.write_calls <= 8);
+    try std.testing.expect(streamed_sink.largest_write <= 64 * 1024);
+    var reader = try InvertedIndexReader.init(a, streamed_sink.output.items);
+    var result = reader.lookup("common").?;
+    var postings = try result.iterator(a);
+    defer postings.deinit();
+    const native_view = try Source.View.init(.{ .contiguous = streamed_sink.output.items }, 0, streamed_sink.output.items.len);
+    var native = try ScopedInvertedIndexReader.initRanges(a, native_view, .{ .navigation_bytes = 4096 });
+    defer native.deinit();
+    try std.testing.expectEqual(@as(?u32, 50_000), try native.docFrequency("common"));
+    const native_result = (try native.lookup("common")).?;
+    try std.testing.expect(native_result.postings.streamed_records_range != null);
+    var native_postings = try native_result.iterator(a);
+    defer native_postings.deinit();
+    const seek = (try native_postings.advanceToWithPositions(10_000)).?;
+    try std.testing.expectEqual(@as(u32, 10_000), seek.doc_id);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 5 }, seek.positions);
+    const deferred = (try native_postings.advanceToDeferredPositions(20_000)).?;
+    try std.testing.expectEqual(@as(u32, 20_000), deferred.doc_id);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 2, 5 }, (try native_postings.decodeDeferredPositions()).positions);
+    var count: u32 = 0;
+    while (try postings.next()) |hit| {
+        const reference = (try fallback_postings.next()).?;
+        try std.testing.expectEqual(reference.doc_id, hit.doc_id);
+        try std.testing.expectEqual(reference.freq, hit.freq);
+        try std.testing.expectEqual(reference.norm, hit.norm);
+        try std.testing.expectEqualSlices(u32, reference.positions, hit.positions);
+        try std.testing.expectEqual(count, hit.doc_id);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 2, 5 }, hit.positions);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 50_000), count);
+    std.debug.print("LITE_POSTINGS_MERGE documents=50000 streamed_peak={d} fallback_peak={d} streamed_ns={d} fallback_ns={d} writes={d}\n", .{ streamed_budget.peak, fallback_budget.peak, stream_ns, fallback_ns, streamed_sink.write_calls });
+}
+
+test "streamed postings preserve empty location blocks deletions and allocation failure ownership" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    for (0..4096) |doc| {
+        const located = doc >= 1024 and doc < 2048;
+        try builder.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = if (located) 2 else 1, .positions = if (located) &.{ 1, 4 } else &.{} }});
+    }
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var reader = try InvertedIndexReader.init(a, bytes);
+    const entries = [_]?TermIterator.Entry{.{ .term = "common", .result = reader.lookup("common").? }};
+    const map = try a.alloc(u32, 4096);
+    defer a.free(map);
+    for (map, 0..) |*id, i| id.* = if (i % 127 == 0) std.math.maxInt(u32) else @intCast(i);
+    const maps = [_][]const u32{map};
+    const norms = try a.alloc(u32, 4096);
+    defer a.free(norms);
+    @memset(norms, 0);
+    var total: u64 = 0;
+    var expected = PostingAccumulator.init();
+    defer expected.deinit(a);
+    try appendLookupResultToAccumulator(a, &expected, entries[0].?.result, map, norms, &total);
+    var scratch = PostingSerializeScratch{};
+    defer scratch.deinit(a);
+    var expected_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer expected_bytes.deinit(a);
+    try expected.serializeV9(a, &expected_bytes, &scratch, .{});
+    @memset(norms, 0);
+    var streamed_total: u64 = 0;
+    var sink = MergeMemorySink{ .alloc = a };
+    defer sink.deinit();
+    const placeholder: [v7_header_size]u8 = @splat(0);
+    try sink.appendSlice(&placeholder);
+    const offset = (try appendStreamedMergedTermToSink(a, &sink, 0, &entries, "common", &maps, norms, &streamed_total, .{})).?;
+    try std.testing.expectEqual(total, streamed_total);
+    var stream_reader = reader;
+    stream_reader.data = sink.output.items;
+    const stream_result = stream_reader.readPostings(offset);
+    var stream_iterator = try stream_result.iterator(a);
+    defer stream_iterator.deinit();
+    var reference_reader = reader;
+    var reference_data = std.ArrayListUnmanaged(u8).empty;
+    defer reference_data.deinit(a);
+    try reference_data.appendNTimes(a, 0, v7_header_size);
+    try reference_data.appendSlice(a, expected_bytes.items);
+    reference_reader.data = reference_data.items;
+    const reference_result = reference_reader.readPostings(0);
+    var reference_iterator = try reference_result.iterator(a);
+    defer reference_iterator.deinit();
+    while (try reference_iterator.next()) |expected_hit| {
+        const actual = (try stream_iterator.next()).?;
+        try std.testing.expectEqual(expected_hit.doc_id, actual.doc_id);
+        try std.testing.expectEqual(expected_hit.freq, actual.freq);
+        try std.testing.expectEqualSlices(u32, expected_hit.positions, actual.positions);
+    }
+    try std.testing.expect((try stream_iterator.next()) == null);
+    const Harness = struct {
+        fn run(backing: Allocator, input_entries: []const ?TermIterator.Entry, input_maps: []const []const u32) !void {
+            var stable = @import("../storage/lite/test_allocator.zig").NoResizeAllocator{ .backing = backing };
+            const alloc = stable.allocator();
+            const lengths = try alloc.alloc(u32, 4096);
+            defer alloc.free(lengths);
+            @memset(lengths, 0);
+            var length: u64 = 0;
+            var output = MergeMemorySink{ .alloc = alloc };
+            defer output.deinit();
+            const header: [v7_header_size]u8 = @splat(0);
+            try output.appendSlice(&header);
+            _ = try appendStreamedMergedTermToSink(alloc, &output, 0, input_entries, "common", input_maps, lengths, &length, .{});
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const []const u32, &maps) });
+    @memset(map, std.math.maxInt(u32));
+    @memset(norms, 0);
+    streamed_total = 0;
+    const before = sink.len();
+    try std.testing.expect((try appendStreamedMergedTermToSink(a, &sink, 0, &entries, "common", &maps, norms, &streamed_total, .{})) == null);
+    try std.testing.expectEqual(before, sink.len());
+    try std.testing.expectEqual(@as(u64, 0), streamed_total);
+}
+
+test "native postings read norms larger than the navigation budget by range" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    const last: u32 = 4 * 1024 * 1024 + 1;
+    try builder.addDocument(0, &.{.{ .term = "many", .freq = 3, .norm = 9 }});
+    try builder.addDocument(last, &.{
+        .{ .term = "one", .freq = 1, .norm = 7 },
+        .{ .term = "inline", .freq = 2, .norm = 7, .positions = &.{ 1, 4 } },
+        .{ .term = "many", .freq = 2, .norm = 7 },
+    });
+    // Sparse fixture represents a field on a larger document population.
+    builder.doc_count = last + 1;
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const View = @import("../segment_source.zig").View;
+    var native = try ScopedInvertedIndexReader.initRanges(a, try View.init(.{ .contiguous = bytes }, 0, bytes.len), .{ .navigation_bytes = 4 * 1024 * 1024 });
+    defer native.deinit();
+    const contiguous = try InvertedIndexReader.init(a, bytes);
+    try std.testing.expect(native.context.?.native.norms_length > native.context.?.options.navigation_bytes);
+    for ([_][]const u8{ "one", "inline", "many" }) |term| {
+        const result = (try native.lookup(term)).?;
+        var iter = try result.iterator(a);
+        defer iter.deinit();
+        while (try iter.nextScoring()) |hit| try std.testing.expectEqual(contiguous.docLength(hit.doc_id), hit.norm);
+    }
+    try std.testing.expectEqual(contiguous.docLength(last), try native.docLength(last));
+    try std.testing.expect(native.context.?.navigation.queryCapacity() < 64 * 1024);
+}
+
+test "v38 contiguous and native readers remain compatible with legacy posting layout" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    for (0..512) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "legacy", .freq = 2, .norm = 7, .positions = &.{ 1, 4 } }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    bytes[4] = wire_version_compact_postings_header;
+    const contiguous = try InvertedIndexReader.init(a, bytes);
+    const View = @import("../segment_source.zig").View;
+    var native = try ScopedInvertedIndexReader.initRanges(a, try View.init(.{ .contiguous = bytes }, 0, bytes.len), .{});
+    defer native.deinit();
+    const reference = contiguous.lookup("legacy").?;
+    const result = (try native.lookup("legacy")).?;
+    var expected = try reference.iterator(a);
+    defer expected.deinit();
+    var actual = try result.iterator(a);
+    defer actual.deinit();
+    while (try expected.next()) |hit| {
+        const fresh = (try actual.next()).?;
+        try std.testing.expectEqual(hit.doc_id, fresh.doc_id);
+        try std.testing.expectEqual(hit.norm, fresh.norm);
+        try std.testing.expectEqualSlices(u32, hit.positions, fresh.positions);
+    }
+    try std.testing.expect((try actual.next()) == null);
+}
+
+test "range norms preserve sparse field document IDs above field population" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    try builder.addDocument(127, &.{.{ .term = "common", .freq = 2, .norm = 7 }});
+    try builder.addDocument(128, &.{
+        .{ .term = "common", .freq = 2, .norm = 9 },
+        .{ .term = "one", .freq = 1, .norm = 9 },
+        .{ .term = "inline", .freq = 2, .norm = 9, .positions = &.{ 1, 4 } },
+    });
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const contiguous = try InvertedIndexReader.init(a, bytes);
+    const View = @import("../segment_source.zig").View;
+    var native = try ScopedInvertedIndexReader.initRanges(a, try View.init(.{ .contiguous = bytes }, 0, bytes.len), .{});
+    defer native.deinit();
+    try std.testing.expectEqual(@as(u32, 2), native.doc_count);
+    for ([_][]const u8{ "common", "one", "inline" }) |term| {
+        const expected = contiguous.lookup(term).?;
+        const result = (try native.lookup(term)).?;
+        try std.testing.expectEqual(@as(?u32, expected.docFreq()), try native.docFrequency(term));
+        var reference = try expected.iterator(a);
+        defer reference.deinit();
+        var actual = try result.iterator(a);
+        defer actual.deinit();
+        while (try reference.next()) |hit| {
+            const fresh = (try actual.next()).?;
+            try std.testing.expectEqual(hit.doc_id, fresh.doc_id);
+            try std.testing.expectEqual(hit.norm, fresh.norm);
+            try std.testing.expectEqualSlices(u32, hit.positions, fresh.positions);
+            try std.testing.expectEqual(hit.norm, try native.docLength(hit.doc_id));
+        }
+    }
+}
+
+test "unrelated merge heads never enable streamed positions" {
+    const a = std.testing.allocator;
+    var common = InvertedIndexBuilder.init(a, .{});
+    defer common.deinit();
+    for (0..4096) |id| try common.addDocument(@intCast(id), &.{.{ .term = "a", .freq = 2 }});
+    var other = InvertedIndexBuilder.init(a, .{});
+    defer other.deinit();
+    try other.addDocument(0, &.{.{ .term = "z", .freq = 2, .positions = &.{ 1, 2 } }});
+    const one = try common.build();
+    defer a.free(one);
+    const two = try other.build();
+    defer a.free(two);
+    const one_reader = try InvertedIndexReader.init(a, one);
+    const two_reader = try InvertedIndexReader.init(a, two);
+    const maps = try a.alloc(u32, 4096);
+    defer a.free(maps);
+    for (maps, 0..) |*id, i| id.* = @intCast(i);
+    const norms = try a.alloc(u32, 4097);
+    defer a.free(norms);
+    @memset(norms, 0);
+    var sink = MergeMemorySink{ .alloc = a };
+    defer sink.deinit();
+    try sink.output.appendNTimes(a, 0, v7_header_size);
+    var total: u64 = 0;
+    const entries = [_]?TermIterator.Entry{
+        .{ .term = "a", .result = one_reader.lookup("a").? },
+        .{ .term = "z", .result = two_reader.lookup("z").? },
+    };
+    const value = (try appendStreamedMergedTermToSink(a, &sink, 0, &entries, "a", &.{ maps, &.{4096} }, norms, &total, .{})).?;
+    const at = v7_header_size + @as(usize, @intCast(value));
+    var cursor = at;
+    _ = try readVarintU32(sink.output.items, &cursor);
+    _ = try readVarintU32(sink.output.items, &cursor);
+    const descriptor = StreamedDescriptor.decode(sink.output.items[cursor..][0..StreamedDescriptor.size]);
+    std.debug.print("LITE_UNRELATED_POSITIONS documents=4096 positions_bytes={d}\n", .{descriptor.positions_length});
+    try std.testing.expectEqual(@as(u64, 0), descriptor.positions_length);
+}
+
+test "append merge uses fixed scratch for sparse document spaces and deletion rank mappings" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, productionIndexConfig());
+    defer builder.deinit();
+    for (0..1024) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 1, .norm = 3 }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(7);
+    var peaks: [2]usize = undefined;
+    for ([_]u32{ 1024, 100_000 }, 0..) |space, case| {
+        var output = @import("../segment.zig").MemorySegmentSink.init(a);
+        defer output.deinit();
+        var sink = output.sink();
+        var budget = @import("../storage/lite/test_allocator.zig").BudgetAllocator{ .backing = a, .limit = 256 * 1024 };
+        try writeMergedInvertedSectionSlotsWithDeletes(budget.allocator(), &sink, @as([]const ?[]const u8, &.{ bytes, null, bytes }), &.{ space, 7, space }, &.{ deleted, null, deleted }, productionIndexConfig());
+        peaks[case] = budget.peak;
+        var reader = try ScopedInvertedIndexReader.initContiguous(a, output.out.items);
+        defer reader.deinit();
+        try std.testing.expectEqual(@as(u32, 3), try reader.docLength(7));
+        try std.testing.expectEqual(@as(u32, 0), try reader.docLength(space - 1));
+        try std.testing.expectEqual(@as(u32, 3), try reader.docLength(space + 6));
+        var result = (try reader.lookup("common")).?;
+        try std.testing.expectEqual(@as(u32, 2046), result.docFreq());
+    }
+    try std.testing.expectEqual(peaks[0], peaks[1]);
+    std.debug.print("APPEND_MERGE sparse_spaces=2053,200005 scratch_peaks={d},{d}\n", .{ peaks[0], peaks[1] });
 }

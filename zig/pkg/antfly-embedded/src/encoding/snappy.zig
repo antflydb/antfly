@@ -124,6 +124,133 @@ pub fn decodedLen(src: []const u8) !usize {
     return try readVarint(src, &pos);
 }
 
+/// Decode a legacy block from bounded input windows. The required output is
+/// charged to the caller allocator; no compressed-block-sized copy is made.
+pub fn decodeFromView(alloc: Allocator, view: @import("../segment_source.zig").View, max_output_bytes: usize) ![]u8 {
+    var input = RangeInput{ .view = view };
+    const size = try input.decodedSize();
+    if (size > max_output_bytes) return error.SegmentReadBudgetExceeded;
+    const dst = try alloc.alloc(u8, size);
+    errdefer alloc.free(dst);
+    try decodeRangePayload(&input, dst, dst.len, true);
+    return dst;
+}
+
+const RangeInput = struct {
+    view: @import("../segment_source.zig").View,
+    pos: u64 = 0,
+    start: u64 = 0,
+    valid: usize = 0,
+    window_bytes: usize = 8192,
+    bytes: [8192]u8 = undefined,
+    fn decodedSize(self: *@This()) !usize {
+        if (self.view.length == 0) return 0;
+        var prefix: [5]u8 = undefined;
+        var length: usize = 0;
+        while (true) {
+            if (length == prefix.len) return error.CorruptInput;
+            prefix[length] = try self.byte();
+            length += 1;
+            if (prefix[length - 1] & 128 == 0) break;
+        }
+        return try decodedLen(prefix[0..length]);
+    }
+    fn byte(self: *@This()) !u8 {
+        if (self.pos >= self.view.length) return error.CorruptInput;
+        if (self.valid == 0 or self.pos - self.start >= self.valid) {
+            self.start = self.pos;
+            self.valid = @intCast(@min(self.window_bytes, self.view.length - self.pos));
+            try self.view.readInto(self.pos, self.bytes[0..self.valid]);
+        }
+        const value = self.bytes[@intCast(self.pos - self.start)];
+        self.pos += 1;
+        return value;
+    }
+    fn integer(self: *@This(), count: usize) !usize {
+        var value: usize = 0;
+        for (0..count) |i| value |= @as(usize, try self.byte()) << @intCast(i * 8);
+        return value;
+    }
+    fn literal(self: *@This(), out: []u8) !void {
+        if (out.len > self.view.length - self.pos) return error.CorruptInput;
+        var copied: usize = 0;
+        while (copied < out.len) {
+            const first = try self.byte();
+            out[copied] = first;
+            copied += 1;
+            const available = self.valid - @as(usize, @intCast(self.pos - self.start));
+            const take = @min(available, out.len - copied);
+            @memcpy(out[copied..][0..take], self.bytes[@intCast(self.pos - self.start)..][0..take]);
+            copied += take;
+            self.pos += take;
+        }
+    }
+};
+
+/// Decode into reusable caller-owned output without allocating input or output.
+pub fn decodeFromViewInto(view: @import("../segment_source.zig").View, dst: []u8) !void {
+    if (view.length == 0) {
+        if (dst.len != 0) return error.CorruptInput;
+        return;
+    }
+    var input = RangeInput{ .view = view };
+    if (try input.decodedSize() != dst.len) return error.CorruptInput;
+    try decodeRangePayload(&input, dst, dst.len, true);
+}
+
+/// Decode only an admission prefix using a small input window. This does not
+/// validate the suffix; callers must still fully decode before exposing data.
+/// Returns the declared decoded size, without allocating input or output.
+pub fn decodePrefixFromView(view: @import("../segment_source.zig").View, prefix: []u8) !usize {
+    var input = RangeInput{ .view = view, .window_bytes = 32 };
+    const size = try input.decodedSize();
+    if (prefix.len > size) return error.CorruptInput;
+    try decodeRangePayload(&input, prefix, size, false);
+    return size;
+}
+
+fn decodeRangePayload(input: *RangeInput, dst: []u8, expected: usize, comptime complete: bool) !void {
+    var written: usize = 0;
+    while (input.pos < input.view.length) {
+        if (!complete and written == dst.len) return;
+        const tag = try input.byte();
+        const kind: u2 = @truncate(tag);
+        var count: usize = @as(usize, tag >> 2) + 1;
+        var offset: usize = 0;
+        switch (kind) {
+            tag_literal => if (count > 60) {
+                count = std.math.add(usize, 1, try input.integer(count - 60)) catch return error.CorruptInput;
+            },
+            tag_copy1 => {
+                count = @as(usize, (tag >> 2) & 7) + 4;
+                offset = (@as(usize, tag & 0xe0) << 3) | try input.byte();
+            },
+            tag_copy2 => offset = try input.integer(2),
+            tag_copy4 => offset = try input.integer(4),
+        }
+        if (count > expected - written) return error.CorruptInput;
+        const take = @min(count, dst.len - written);
+        if (kind == tag_literal) try input.literal(dst[written..][0..take]) else {
+            if (offset == 0 or offset > written) return error.CorruptInput;
+            copyOverlapping(dst, written, offset, take);
+        }
+        written += take;
+    }
+    if (written != dst.len) return error.CorruptInput;
+}
+
+/// Valid Snappy payloads expand by at most 64 output bytes per three
+/// encoded bytes (COPY_2). Literal, COPY_1 and COPY_4 tags expand less.
+/// Counting the length preamble too makes this a conservative admission
+/// bound without reading payload pages or allocating decoder output.
+pub fn decodedSizeUpperBound(encoded_bytes: u64) !u64 {
+    return try std.math.add(
+        u64,
+        try std.math.mul(u64, encoded_bytes / 3, 64),
+        (encoded_bytes % 3) * 64 / 3,
+    );
+}
+
 /// Encode data using Snappy block compression.
 /// Returns compressed bytes owned by caller.
 pub fn encode(alloc: Allocator, src: []const u8) ![]u8 {
@@ -285,10 +412,12 @@ fn readVarint(data: []const u8, pos: *usize) !usize {
     while (pos.* < data.len) {
         const b = data[pos.*];
         pos.* += 1;
-        result |= @as(usize, b & 0x7f) << shift;
+        const value: usize = b & 0x7f;
+        if (value > @as(usize, std.math.maxInt(usize)) >> shift) return error.CorruptInput;
+        result |= value << shift;
         if (b & 0x80 == 0) return result;
+        if (shift > @bitSizeOf(usize) - 1 - 7) return error.CorruptInput;
         shift += 7;
-        if (shift >= @bitSizeOf(usize)) return error.CorruptInput;
     }
     return error.CorruptInput;
 }
