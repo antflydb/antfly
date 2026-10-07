@@ -12,6 +12,7 @@ pub const Store = struct {
     opened: local.serverless_object_store_support.OpenedObjectStore,
     implementation: artifacts.ObjectStore,
     identity: local.metadata_lake_index_catalog.Digest,
+    locator: local.metadata_lake_index_catalog.StoreLocator,
 
     pub fn open(a: A, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, read_only: bool) !Store {
         return openNative(a, config, secrets, read_only, config.deployment_mode, null);
@@ -33,7 +34,7 @@ pub const Store = struct {
         errdefer opened.deinit();
         // The configured opener already enforces create-if-missing policy.
         // This wrapper must never add bucket provisioning authority.
-        var implementation = try artifacts.ObjectStore.initWithClientOptions(a, opened.client, opened.bucket, opened.prefix, .{ .read_only = read_only });
+        var implementation = try artifacts.ObjectStore.initWithClientOptions(a, opened.client, opened.bucket, opened.prefix, .{ .read_only = read_only, .filesystem = opened.fs_client });
         errdefer implementation.deinit();
         const encoded = try std.json.Stringify.valueAlloc(a, .{
             .domain = "native-lake-artifact-store-v1",
@@ -55,7 +56,32 @@ pub const Store = struct {
         defer a.free(encoded);
         var identity: local.metadata_lake_index_catalog.Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(encoded, &identity, .{});
-        return .{ .opened = opened, .implementation = implementation, .identity = identity };
+        const locator: local.metadata_lake_index_catalog.StoreLocator = .{
+            .protocol = if (opened.fs_client != null) .filesystem else if (opened.s3_client != null) .s3 else .gcs,
+            .connection = storage.artifacts.connection,
+            .bucket = opened.bucket,
+            .prefix = opened.prefix,
+            .root = if (opened.fs_client) |fs| fs.root_dir else if (opened.s3_client) |s3| s3.cfg.credentials.endpoint else if (opened.gcs_client) |gcs| gcs.cfg.endpoint else return error.NativeArtifactStorageRequired,
+            .tls = if (opened.s3_client) |s3| s3.cfg.credentials.use_ssl else true,
+        };
+        try locator.validate();
+        return .{ .opened = opened, .implementation = implementation, .identity = identity, .locator = locator };
+    }
+    /// Reopen a retained namespace with currently authorized credentials. A
+    /// connection can rotate keys, but cannot silently redirect old collection
+    /// work into a different physical endpoint/root. Missing old connections
+    /// leave their publications retained until operators restore the mapping.
+    pub fn openRetained(a: A, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, locator: local.metadata_lake_index_catalog.StoreLocator, read_only: bool) !Store {
+        return openRetainedNative(a, config, secrets, locator, read_only, config.deployment_mode, null);
+    }
+    pub fn openRetainedNative(a: A, config: *const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, locator: local.metadata_lake_index_catalog.StoreLocator, read_only: bool, deployment: local.common_config.DeploymentMode, local_base_dir: ?[]const u8) !Store {
+        try locator.validate();
+        var retained = config.*;
+        retained.storage.artifacts = .{ .connection = if (locator.connection) |connection| @constCast(connection) else null, .bucket = @constCast(locator.bucket), .prefix = @constCast(locator.prefix) };
+        var opened = try openNative(a, &retained, secrets, read_only, deployment, local_base_dir);
+        errdefer opened.deinit();
+        if (opened.locator.protocol != locator.protocol or opened.locator.tls != locator.tls or !std.mem.eql(u8, opened.locator.root, locator.root) or !std.mem.eql(u8, opened.locator.bucket, locator.bucket) or !std.mem.eql(u8, opened.locator.prefix, locator.prefix)) return error.NativeArtifactStoreLocationChanged;
+        return opened;
     }
     /// The Store's address must remain stable while this handle is borrowed.
     pub fn artifactStore(self: *Store) stores.ArtifactStore {
@@ -78,6 +104,10 @@ test "external lake native artifact storage survives reopen and excludes read ca
     defer config.deinit();
     var writer = try Store.open(a, &config, null, false);
     const identity = writer.identity;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const encoded_locator = try std.json.Stringify.valueAlloc(arena.allocator(), writer.locator, .{});
+    const retained_locator = try std.json.parseFromSliceLeaky(local.metadata_lake_index_catalog.StoreLocator, arena.allocator(), encoded_locator, .{ .allocate = .alloc_always });
     var handle = writer.artifactStore();
     var artifact = try handle.put("persistent native artifact");
     defer artifact.deinit(a);
@@ -89,6 +119,12 @@ test "external lake native artifact storage survives reopen and excludes read ca
     const bytes = try reads.getVerifiedAllocWithCancellation(artifact.artifact_id, artifact.byte_len, artifact.checksum, .none);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("persistent native artifact", bytes);
+    var retained = try Store.openRetained(a, &config, null, retained_locator, true);
+    defer retained.deinit();
+    try std.testing.expectEqual(identity, retained.identity);
+    var wrong = retained_locator;
+    wrong.root = "a different physical root";
+    try std.testing.expectError(error.NativeArtifactStoreLocationChanged, Store.openRetained(a, &config, null, wrong, true));
     config.deployment_mode = .distributed;
     try std.testing.expectError(error.NativeArtifactStorageRequired, Store.open(a, &config, null, false));
 }

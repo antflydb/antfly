@@ -41,6 +41,7 @@ pub const Table = struct {
         /// schema/prepared-plan cache must never retain a publication pointer.
         catalog_json: []const u8,
         indexes_json: []const u8,
+        schema_json: []const u8 = "",
         desired: [32]u8,
     };
     pub const Scope = struct {
@@ -79,10 +80,21 @@ pub const Condition = struct {
     value: std.json.Value = .null,
 };
 pub const Scan = struct {
+    pub const Order = struct { column: []const u8, descending: bool = false, nulls_first: bool = false };
     pub const IndexEquality = struct {
         name: []const u8,
         values: []const std.json.Value,
     };
+    pub const IndexRange = struct {
+        pub const Bound = struct { values: []const std.json.Value, inclusive: bool = true };
+        name: []const u8,
+        lower: ?Bound = null,
+        upper: ?Bound = null,
+        after: ?[]const u8 = null,
+    };
+    /// A request, never proof. Providers explicitly attest the entire order.
+    order: []const Order = &.{},
+    index_range: ?IndexRange = null,
     fields: []const []const u8,
     /// Mutation-only full document preimage; ordinary reads remain projected.
     include_document: bool = false,
@@ -92,6 +104,10 @@ pub const Scan = struct {
     /// Exact physical identity, not a schema predicate. Point pages exhaust
     /// after their matching row (or absence), without a continuation probe.
     primary_key: ?[]const u8 = null,
+    /// Snapshot-bound remote candidates. null means a full scan; an empty
+    /// slice means no rows. Consumers retain ranking separately from physical
+    /// hydration order. The lake cursor owns and validates the selection.
+    row_refs: ?[]const @import("../storage/rowsource/types.zig").RowRef = null,
     /// Require a READY schema-bound index. Unlike auto_index this must fail
     /// closed; the coordinated owner read returns one exact-span proof.
     index_equality: ?IndexEquality = null,
@@ -105,6 +121,7 @@ pub const Row = struct {
     id: []const u8,
     version: u64,
     value: std.json.Value,
+    index_cursor: ?[]const u8 = null,
     /// Digest of the exact primary bytes in this snapshot. Timestamps alone
     /// are not a version fence when a custom TTL field is unchanged.
     expected_content_digest: ?[32]u8 = null,
@@ -196,6 +213,8 @@ pub const ColumnPage = struct {
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
 pub const Cursor = struct {
+    /// True only when this cursor preserves every requested Scan.order key.
+    order_satisfied: bool = false,
     /// Snapshot-local optimizer estimates; absent means unknown, never zero.
     estimated_rows: ?u64 = null,
     estimated_bytes: ?u64 = null,
@@ -340,6 +359,9 @@ pub const Backend = struct {
         scan: *const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!Page,
         /// null means this provider cannot retain a statement snapshot. Never
         /// substitute a collection of independently refreshed shard pages.
+        /// Allows order negotiation before rows are pulled. Ordinary backends
+        /// need not open speculative scans merely to decline an ordering.
+        supports_scan_order: bool = false,
         open_scan: ?*const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!?Cursor = null,
         /// Fresh authority/source/coverage proofs belong to the provider. The
         /// SQL engine binds a strict recipe and retains projection, HAVING,

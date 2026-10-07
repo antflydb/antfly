@@ -59,6 +59,14 @@ fn spinOrYield() void {
 pub const SegmentData = union(enum) {
     heap: []u8,
     mmap: []align(std.heap.page_size_min) u8,
+    owned_view: struct {
+        bytes: []const u8,
+        owner: *anyopaque,
+        release: *const fn (*anyopaque) void,
+        file_backed: bool,
+        advise_random: ?*const fn (*anyopaque) void = null,
+        discard_clean_pages: ?*const fn (*anyopaque) void = null,
+    },
 
     pub fn fromOwnedHeap(segment_bytes: []u8) SegmentData {
         return .{ .heap = segment_bytes };
@@ -72,6 +80,7 @@ pub const SegmentData = union(enum) {
         return switch (self) {
             .heap => |data| data,
             .mmap => |data| data,
+            .owned_view => |view| view.bytes,
         };
     }
 
@@ -79,12 +88,14 @@ pub const SegmentData = union(enum) {
         return switch (self) {
             .heap => false,
             .mmap => true,
+            .owned_view => |view| view.file_backed,
         };
     }
 
     pub fn madviseAccessPattern(self: SegmentData) void {
         switch (self) {
             .heap => {},
+            .owned_view => |view| if (view.advise_random) |advise| advise(view.owner),
             .mmap => |data| adviseMappedRandom(data),
         }
     }
@@ -92,6 +103,7 @@ pub const SegmentData = union(enum) {
     pub fn madviseDiscardCleanPages(self: SegmentData) void {
         switch (self) {
             .heap => {},
+            .owned_view => |view| if (view.discard_clean_pages) |discard| discard(view.owner),
             .mmap => |data| adviseMappedDontNeed(data),
         }
     }
@@ -102,6 +114,7 @@ pub const SegmentData = union(enum) {
             .mmap => |data| {
                 if (builtin.os.tag != .freestanding) std.posix.munmap(data);
             },
+            .owned_view => |view| view.release(view.owner),
         }
         self.* = undefined;
     }
@@ -138,6 +151,13 @@ pub const SegmentShared = struct {
     const deletion_writer_bit: u32 = 1 << 31;
 
     ref_count: u32,
+    residency_mutex: std.atomic.Mutex = .unlocked,
+    // One process-level accounting owner per physical mapping. The manager
+    // outlives all snapshots/forks sharing this segment, including query pins.
+    residency_manager: ?*resource_manager_mod.ResourceManager = null,
+    residency_accounted: u64 = 0,
+    mapping_bytes: u64 = 0,
+
     /// Conservative per-mapping residency state. The virtual mapping remains
     /// intact when this transitions to cold; only clean file-backed pages are
     /// advised away. A subsequent query marks the segment resident again.
@@ -165,9 +185,20 @@ pub const SegmentShared = struct {
     /// once the last reference dies, after resources are deinited.
     retired_cleanup: ?RetiredSegmentCleanup = null,
 
+    fn observeResidency(self: *SegmentShared, manager: ?*resource_manager_mod.ResourceManager) void {
+        while (!self.residency_mutex.tryLock()) spinOrYield();
+        defer self.residency_mutex.unlock();
+        if (manager) |owner| {
+            if (self.residency_manager) |previous| std.debug.assert(previous == owner);
+            self.residency_manager = owner;
+        }
+        if (self.residency_manager) |owner| owner.observeUsage(.full_text_segment_residency, &self.residency_accounted, if (self.mapped_residency_state.load(.acquire) == mapped_residency_cold) 0 else self.mapping_bytes);
+    }
+
     fn noteMappedAccess(self: *SegmentShared) void {
         self.last_mapped_access_ns.store(platform_time.monotonicNs(), .release);
-        self.mapped_residency_state.store(mapped_residency_resident, .release);
+        const prior = self.mapped_residency_state.swap(mapped_residency_resident, .acq_rel);
+        if (prior != mapped_residency_resident) self.observeResidency(null);
     }
 
     pub fn lockDeletionShared(self: *SegmentShared) void {
@@ -502,6 +533,7 @@ pub const SegmentEntry = struct {
         if (data.isFileBacked()) {
             // Opening a segment reads headers and dictionaries. Count the
             // whole mapping conservatively until the owner advises it cold.
+            shared.mapping_bytes = @intCast(data.bytes().len);
             shared.mapped_residency_state.store(mapped_residency_resident, .release);
         }
     }
@@ -515,6 +547,7 @@ pub const SegmentEntry = struct {
     }
 
     fn destroyShared(alloc: Allocator, shared: *SegmentShared) void {
+        if (shared.residency_manager) |manager| manager.observeUsage(.full_text_segment_residency, &shared.residency_accounted, 0);
         if (shared.deleted) |*deleted| deleted.deinit();
         freeTypedDocValuesCoverage(alloc, shared.typed_doc_values_coverage);
         alloc.destroy(shared);
@@ -549,10 +582,8 @@ pub const SegmentEntry = struct {
         const cleanup = self.shared.retired_cleanup;
         self.data.madviseDiscardCleanPages();
         self.reader.deinit();
-        freeTypedDocValuesCoverage(alloc, self.shared.typed_doc_values_coverage);
-        if (self.shared.deleted) |*d| d.deinit();
         self.data.deinit(alloc);
-        alloc.destroy(self.shared);
+        destroyShared(alloc, self.shared);
         if (cleanup) |c| c.run(seg_id);
     }
 
@@ -1407,7 +1438,6 @@ pub const IndexWriter = struct {
     retired_segment_cleanup: ?RetiredSegmentCleanup = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     mapped_residency_mu: std.atomic.Mutex,
-    mapped_residency_accounted_bytes: u64,
     mapped_residency_next_check_ns: @import("antfly_platform").atomic.Value(u64),
     mapped_residency_evictions: u64,
 
@@ -1504,10 +1534,100 @@ pub const IndexWriter = struct {
             .retired_segment_cleanup = null,
             .resource_manager = null,
             .mapped_residency_mu = .unlocked,
-            .mapped_residency_accounted_bytes = 0,
             .mapped_residency_next_check_ns = .init(0),
             .mapped_residency_evictions = 0,
         };
+    }
+
+    /// Fork a sealed immutable corpus. Both writers share reference-counted
+    /// segment readers; the new writer can replace segments without parsing
+    /// unchanged readers again. Neither owner may mutate deletion bitmaps or
+    /// install retired-file cleanup on these immutable shared segments.
+    pub fn forkImmutable(self: *IndexWriter) !IndexWriter {
+        std.debug.assert(self.retired_segment_cleanup == null);
+        var fork = try IndexWriter.init(self.alloc);
+        const snapshot_ref = self.acquireSnapshot();
+        fork.current.release();
+        fork.current = snapshot_ref;
+        fork.next_epoch = snapshot_ref.epoch + 1;
+        for (snapshot_ref.segments) |segment| fork.next_segment_id = @max(fork.next_segment_id, segment.id + 1);
+        return fork;
+    }
+
+    pub const ImmutableSegment = struct { snapshot: *IndexSnapshot, ordinal: usize, target_id: u64 };
+    /// Compose a sealed corpus from already admitted physical readers. All
+    /// owners use the same allocator and immutable deletion state. This avoids
+    /// loading the same artifact twice when generations overlap partially.
+    pub fn shareImmutableSegments(self: *IndexWriter, sources: []const ImmutableSegment) !void {
+        if (sources.len == 0) return;
+        std.debug.assert(self.retired_segment_cleanup == null);
+        self.lockMutex();
+        defer self.mu.unlock();
+        const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        const segments = try self.alloc.alloc(SegmentEntry, old.segments.len + sources.len);
+        errdefer self.alloc.free(segments);
+        @memcpy(segments[0..old.segments.len], old.segments);
+        var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
+        errdefer totals.deinit(self.alloc);
+        var next_id = self.next_segment_id;
+        for (sources, segments[old.segments.len..]) |source, *target| {
+            if (source.snapshot.alloc.ptr != self.alloc.ptr or source.snapshot.alloc.vtable != self.alloc.vtable) return error.InvalidSegment;
+            if (source.ordinal >= source.snapshot.segments.len) return error.InvalidSegment;
+            const segment = source.snapshot.segments[source.ordinal];
+            if (segment.shared.deleted_count.load(.acquire) != 0) return error.InvalidSegment;
+            target.* = segment;
+            target.id = source.target_id;
+            next_id = @max(next_id, source.target_id + 1);
+            try addSegmentFieldLens(self.alloc, &totals, &segment.reader);
+        }
+        // Validate IDs before publishing or retaining any physical reader.
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        defer ids.deinit(self.alloc);
+        try ids.ensureTotalCapacity(self.alloc, @intCast(segments.len));
+        for (segments) |segment| {
+            if (ids.getOrPutAssumeCapacity(segment.id).found_existing) return error.InvalidSegment;
+        }
+        const empty = try IndexWriter.init(self.alloc);
+        const snapshot_ref = empty.current;
+        snapshot_ref.segments = segments;
+        snapshot_ref.global_total_field_len = totals;
+        snapshot_ref.epoch = self.next_epoch;
+        self.next_epoch += 1;
+        self.next_segment_id = next_id;
+        for (segments) |*segment| segment.retain();
+        self.publishSnapshot(snapshot_ref);
+        old.release();
+    }
+
+    /// Preserve the sealed corpus order when a fork retains readers from a
+    /// previous generation. Segment offsets and tied hits must be independent
+    /// of cold-load completion order and identical after a cold restart.
+    pub fn orderImmutableSegments(self: *IndexWriter, ids: []const u64) !void {
+        self.lockMutex();
+        defer self.mu.unlock();
+        const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        if (ids.len != old.segments.len) return error.InvalidSegment;
+        const same = for (ids, old.segments) |id, segment| {
+            if (id != segment.id) break false;
+        } else true;
+        if (same) return;
+        var by_id: std.AutoHashMapUnmanaged(u64, SegmentEntry) = .empty;
+        defer by_id.deinit(self.alloc);
+        for (old.segments) |segment| try by_id.put(self.alloc, segment.id, segment);
+        const ordered = try self.alloc.alloc(SegmentEntry, ids.len);
+        errdefer self.alloc.free(ordered);
+        for (ids, ordered) |id, *segment| segment.* = (by_id.fetchRemove(id) orelse return error.InvalidSegment).value;
+        var totals = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
+        errdefer totals.deinit(self.alloc);
+        const empty = try IndexWriter.init(self.alloc);
+        const snapshot_ref = empty.current;
+        snapshot_ref.segments = ordered;
+        snapshot_ref.global_total_field_len = totals;
+        snapshot_ref.epoch = self.next_epoch;
+        self.next_epoch += 1;
+        for (ordered) |*segment| segment.retain();
+        self.publishSnapshot(snapshot_ref);
+        old.release();
     }
 
     pub fn attachResourceManager(self: *IndexWriter, manager: *resource_manager_mod.ResourceManager) void {
@@ -1527,13 +1647,6 @@ pub const IndexWriter = struct {
 
     pub fn deinit(self: *IndexWriter) void {
         self.lockMappedResidencyMutex();
-        if (self.resource_manager) |manager| {
-            manager.observeUsage(
-                .full_text_segment_residency,
-                &self.mapped_residency_accounted_bytes,
-                0,
-            );
-        }
         self.resource_manager = null;
         self.mapped_residency_mu.unlock();
 
@@ -1624,12 +1737,7 @@ pub const IndexWriter = struct {
         defer self.mapped_residency_mu.unlock();
 
         const manager = self.resource_manager orelse return;
-        var stats = self.mappedResidencyStatsForSnapshot(snap, now_ns);
-        manager.observeUsage(
-            .full_text_segment_residency,
-            &self.mapped_residency_accounted_bytes,
-            stats.estimated_resident_bytes,
-        );
+        for (snap.segments) |segment| if (segment.data.isFileBacked()) segment.shared.observeResidency(manager);
 
         var decision = manager.pressureDecision(.full_text_segment_residency);
         if (decision.action != .shrink_cache or decision.pressure == .normal) return;
@@ -1681,12 +1789,7 @@ pub const IndexWriter = struct {
                 );
             }
             self.mapped_residency_evictions +|= 1;
-            stats = self.mappedResidencyStatsForSnapshot(snap, now_ns);
-            manager.observeUsage(
-                .full_text_segment_residency,
-                &self.mapped_residency_accounted_bytes,
-                stats.estimated_resident_bytes,
-            );
+            coldest.shared.observeResidency(manager);
             decision = manager.pressureDecision(.full_text_segment_residency);
         }
     }
@@ -1954,10 +2057,7 @@ pub const IndexWriter = struct {
     /// Takes ownership of replacement data only after the replacement snapshot
     /// is published successfully. On error, the caller still owns each data item.
     pub fn replaceSegmentsManyData(self: *IndexWriter, old_ids: []const u64, replacements: []ReplacementSegmentData) !void {
-        if (replacements.len == 0) {
-            try self.removeSegments(old_ids);
-            return;
-        }
+        if (replacements.len == 0 and old_ids.len == 0) return;
 
         var prepared = try self.prepareSegmentsManyData(old_ids, replacements);
         prepared.publish();
@@ -2072,14 +2172,30 @@ pub const IndexWriter = struct {
 
         // Appends retain every old segment, so their field-name storage and
         // aggregate totals remain valid. Read only the newly added segments.
-        var global_field_lens = if (old_ids.len == 0)
-            try cloneGlobalFieldLens(self.alloc, old.global_total_field_len)
-        else
-            try self.buildGlobalFieldLens(new_segments);
+        var global_field_lens = try cloneGlobalFieldLens(self.alloc, old.global_total_field_len);
         errdefer global_field_lens.deinit(self.alloc);
-        if (old_ids.len == 0) for (replacement_readers) |*reader| {
-            try addSegmentFieldLens(self.alloc, &global_field_lens, reader);
-        };
+        // Only changed readers contribute statistics. Rebind keys below to
+        // retained/new reader storage before the old snapshot can disappear.
+        for (retired[0..ret_idx]) |*segment| {
+            var removed = std.StringHashMapUnmanaged(u64).empty;
+            defer removed.deinit(self.alloc);
+            try addSegmentFieldLens(self.alloc, &removed, &segment.reader);
+            var iterator = removed.iterator();
+            while (iterator.next()) |entry| {
+                const total = global_field_lens.getPtr(entry.key_ptr.*) orelse return error.InvalidSegment;
+                total.* = try std.math.sub(u64, total.*, entry.value_ptr.*);
+            }
+        }
+        for (replacement_readers) |*reader| try addSegmentFieldLens(self.alloc, &global_field_lens, reader);
+        if (ret_idx != 0) {
+            var rebound = std.StringHashMapUnmanaged(u64).empty;
+            errdefer rebound.deinit(self.alloc);
+            for (new_segments) |*segment| for (segment.reader.fields) |field| {
+                if (global_field_lens.get(field.name)) |total| try rebound.put(self.alloc, field.name, total);
+            };
+            global_field_lens.deinit(self.alloc);
+            global_field_lens = rebound;
+        }
         const new_snap = try self.alloc.create(IndexSnapshot);
         new_snap.* = .{
             .alloc = self.alloc,
@@ -2516,6 +2632,23 @@ fn mapTestSegment(segment_bytes: []const u8) !SegmentData {
     );
     @memcpy(mapped, segment_bytes);
     return SegmentData.fromMapped(mapped);
+}
+
+test "external lake shared immutable mapped segments have one residency owner across forks" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegment(a, &.{.{ .terms = &.{.{ .term = "shared", .freq = 1, .norm = 8 }} }});
+    defer a.free(bytes);
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    var writer = try IndexWriter.init(a);
+    try writer.addSegmentWithIdData(1, try mapTestSegment(bytes));
+    writer.attachResourceManager(&manager);
+    var fork = try writer.forkImmutable();
+    fork.attachResourceManager(&manager);
+    try std.testing.expectEqual(@as(u64, @intCast(bytes.len)), manager.sliceStats(.full_text_segment_residency).used_bytes);
+    writer.deinit();
+    try std.testing.expectEqual(@as(u64, @intCast(bytes.len)), manager.sliceStats(.full_text_segment_residency).used_bytes);
+    fork.deinit();
+    try std.testing.expectEqual(@as(u64, 0), manager.sliceStats(.full_text_segment_residency).used_bytes);
 }
 
 test "resource-managed mapped residency evicts cold segments and preserves hot mappings" {
@@ -3235,4 +3368,71 @@ test "held snapshot pins exactly the retired segments it references" {
     held.release();
     try std.testing.expectEqual(@as(usize, 2), cleaned.ids.items.len);
     try std.testing.expectEqual(id1, cleaned.ids.items[1]);
+}
+
+test "external lake immutable corpus forks share readers and update scoring totals" {
+    const a = std.testing.allocator;
+    const first = try buildTestSegmentWithIds(a, &.{.{ .id = "a", .terms = &.{.{ .term = "common", .freq = 10, .norm = 10 }} }});
+    defer a.free(first);
+    const second = try buildTestSegmentWithIds(a, &.{.{ .id = "b", .terms = &.{.{ .term = "common", .freq = 20, .norm = 20 }} }});
+    defer a.free(second);
+    var writer = try IndexWriter.init(a);
+    var writer_open = true;
+    defer if (writer_open) writer.deinit();
+    try writer.addSegment(first);
+    try writer.addSegment(second);
+    var fork = try writer.forkImmutable();
+    defer fork.deinit();
+    const prior = writer.acquireSnapshot();
+    defer prior.release();
+    const replacement_bytes = try a.dupe(u8, second);
+    var replacements = [_]ReplacementSegmentData{.{ .id = 3, .data = .fromOwnedHeap(replacement_bytes) }};
+    fork.replaceSegmentsManyData(&.{1}, &replacements) catch |err| {
+        a.free(replacement_bytes);
+        return err;
+    };
+    writer.deinit();
+    writer_open = false;
+    try fork.orderImmutableSegments(&.{ 3, 2 });
+    try std.testing.expectError(error.InvalidSegment, fork.orderImmutableSegments(&.{ 3, 3 }));
+    const current = fork.acquireSnapshot();
+    defer current.release();
+    try std.testing.expect(current.segments[1].shared == prior.segments[1].shared);
+    try std.testing.expectApproxEqAbs(@as(f32, 15), prior.textAvgDocLen("body"), 0.00001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), current.textAvgDocLen("body"), 0.00001);
+    try std.testing.expectEqual(@as(u32, 2), try current.termDocFreq(a, "body", "common"));
+}
+
+fn sharedImmutableCorpusScenario(a: Allocator) !void {
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "shared", .terms = &.{.{ .term = "common", .freq = 10, .norm = 10 }} }});
+    defer a.free(bytes);
+    var composed = try IndexWriter.init(a);
+    defer composed.deinit();
+    var left = try IndexWriter.init(a);
+    defer left.deinit();
+    var right = try IndexWriter.init(a);
+    defer right.deinit();
+    try left.addSegment(bytes);
+    try right.addSegment(bytes);
+    const first = left.acquireSnapshot();
+    defer first.release();
+    const second = right.acquireSnapshot();
+    defer second.release();
+    try composed.shareImmutableSegments(&.{ .{ .snapshot = first, .ordinal = 0, .target_id = 10 }, .{ .snapshot = second, .ordinal = 0, .target_id = 20 } });
+    const joined = composed.acquireSnapshot();
+    defer joined.release();
+    try std.testing.expectEqual(@as(u32, 2), joined.liveDocCount());
+    try std.testing.expect(joined.segments[0].shared == first.segments[0].shared);
+    try std.testing.expect(joined.segments[1].shared == second.segments[0].shared);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), joined.textAvgDocLen("body"), 0.00001);
+    try std.testing.expectEqual(@as(u32, 2), try joined.termDocFreq(a, "body", "common"));
+    composed.shareImmutableSegments(&.{.{ .snapshot = first, .ordinal = 0, .target_id = 10 }}) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        try std.testing.expectEqual(error.InvalidSegment, err);
+        return;
+    };
+    return error.TestUnexpectedResult;
+}
+test "external lake sealed corpora compose physical readers from several generations" {
+    try sharedImmutableCorpusScenario(std.testing.allocator);
 }

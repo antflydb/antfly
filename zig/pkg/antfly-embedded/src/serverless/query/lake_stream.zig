@@ -84,6 +84,8 @@ pub const Stream = struct {
     limits: Limits,
     stats: Stats = .{},
     files: []usize,
+    selection: ?@import("lake_row_selection.zig").Selection = null,
+    active_file: usize = 0,
     file_index: usize = 0,
     work: ?*ScanWork = null,
     owns_work: bool = false,
@@ -158,6 +160,8 @@ pub const Stream = struct {
         const plan = self.discovered orelse return;
         const current = self.page_cursor orelse return;
         const ordinal = for (plan.row_group_plan.row_groups[self.group_index..]) |input| {
+            const group = plan.inventory.files[0].row_groups[input.row_group_ordinal];
+            if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) continue;
             if (groupMayMatch(plan.inventory.files[0].row_groups[input.row_group_ordinal], self.groupPredicates())) break input.row_group_ordinal;
         } else return;
         // Names and masks live in the current cursor until clearFile joins.
@@ -190,6 +194,10 @@ pub const Stream = struct {
 
     fn pageMayMatch(raw: *anyopaque, chunk: external.ColumnChunk, page: @import("lake_parquet_metadata.zig").IndexedPage) bool {
         const self: *Stream = @ptrCast(@alignCast(raw));
+        if (self.selection) |selection| {
+            const group = self.page_cursor.?.group.ordinal;
+            if (page.rows != 0 and !selection.rangeMayMatch(self.active_file, group, page.first, page.rows)) return false;
+        }
         for (self.groupPredicates()) |predicate| {
             if (!std.mem.eql(u8, predicate.column, chunk.column_id)) continue;
             if (page.all_null) return false;
@@ -269,6 +277,18 @@ pub const Stream = struct {
         self.alloc.free(self.files);
         self.files = files;
     }
+    pub fn selectRows(self: *Stream, selection: @import("lake_row_selection.zig").Selection) !void {
+        if (self.file_index != 0 or self.discovered != null or self.work != null) return error.InvalidLakeCandidateReference;
+        var files: std.ArrayList(usize) = .empty;
+        defer files.deinit(self.alloc);
+        for (self.files) |file| {
+            if (selection.fileMayMatch(file)) try files.append(self.alloc, file) else self.stats.files_pruned += 1;
+        }
+        const retained = try files.toOwnedSlice(self.alloc);
+        self.alloc.free(self.files);
+        self.files = retained;
+        self.selection = selection;
+    }
     pub fn partitionCount(self: *Stream, maximum: usize) !usize {
         if (self.files.len == 0 or maximum < 2 or self.source.scanner.shared_reader == null) return 1;
         if (self.work) |work| return @min(maximum, work.units.len);
@@ -285,6 +305,7 @@ pub const Stream = struct {
             self.clearFile();
             if (!self.fileMatches(self.source.inventory.files[index])) continue;
             try self.loadFile(index);
+            if (self.selection) |selection| try selection.validateFile(index, self.discovered.?.inventory.files[0]);
             const plan = self.discovered orelse continue;
             if (self.source.prepared_deletes) |prepared| try prepared.bindFile(plan.inventory.files[0]);
             for (plan.row_group_plan.row_groups, 0..) |input, group_index| {
@@ -379,6 +400,10 @@ pub const Stream = struct {
                     const groups = plan.inventory.files[0].row_groups;
                     if (input.row_group_ordinal >= groups.len or groups[input.row_group_ordinal].ordinal != input.row_group_ordinal) return error.InvalidParquetRowGroupBatch;
                     const group = groups[input.row_group_ordinal];
+                    if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) {
+                        self.stats.groups_pruned += 1;
+                        continue;
+                    };
                     if (!groupMayMatch(group, self.groupPredicates())) {
                         self.stats.groups_pruned += 1;
                         continue;
@@ -437,6 +462,7 @@ pub const Stream = struct {
                     break :blk self.work.?.units[position];
                 } else self.work.?.claim() orelse return null;
                 const plan = self.work.?.plans[unit.file].?;
+                self.active_file = unit.file;
                 self.work_ordinal = unit.ordinal;
                 self.discovered = plan.discovered;
                 self.position_starts = plan.position_starts;
@@ -454,11 +480,20 @@ pub const Stream = struct {
                 break :blk index;
             };
             const file = self.source.inventory.files[index];
+            self.active_file = index;
+            if (self.selection) |selection| if (!selection.fileMayMatch(index)) {
+                self.stats.files_pruned += 1;
+                continue;
+            };
             if (!self.fileMatches(file)) {
                 self.stats.files_pruned += 1;
                 continue;
             }
             try self.loadFile(index);
+            if (self.selection) |selection| {
+                const plan = self.discovered orelse return error.InvalidLakeCandidateReference;
+                try selection.validateFile(index, plan.inventory.files[0]);
+            }
         }
     }
     fn prefetchNext(self: *Stream) !void {
@@ -479,6 +514,7 @@ pub const Stream = struct {
             const group = for (file.row_groups) |candidate| {
                 if (candidate.ordinal == input.row_group_ordinal) break candidate;
             } else continue;
+            if (self.selection) |selection| if (!selection.rangeMayMatch(self.active_file, group.ordinal, 0, group.row_count)) continue;
             if (!groupMayMatch(group, self.groupPredicates())) continue;
             const range_io = @import("lake_range_io.zig");
             var reads: std.ArrayList(range_io.RangeRead) = .empty;
@@ -511,7 +547,18 @@ pub const Stream = struct {
             var single = self.source.inventory;
             single.files = self.source.inventory.files[index..][0..1];
             single.deleted_row_groups = &.{};
-            try iceberg.pinInventoryDataFileObjectVersions(self.source.alloc, self.source.scanner.object_reader.client, &single);
+            if (self.source.immutable_objects and self.source.verified_files != null) {
+                const file = &single.files[0];
+                const verified = self.source.verified_files.?.get(file.file_id) orelse return error.ExternalLakeSnapshotMismatch;
+                if (!std.mem.eql(u8, file.object_uri, verified.object_uri) or file.byte_len != verified.byte_len) return error.ExternalLakeSnapshotMismatch;
+                const etag = try self.source.alloc.dupe(u8, verified.etag);
+                errdefer self.source.alloc.free(etag);
+                const version = try self.source.alloc.dupe(u8, verified.version_id);
+                self.source.alloc.free(file.etag);
+                self.source.alloc.free(file.version_id);
+                file.etag = etag;
+                file.version_id = version;
+            } else try iceberg.pinInventoryDataFileObjectVersions(self.source.alloc, self.source.scanner.object_reader.client, &single);
             self.source.pinned_files[index] = true;
         }
         var inventory = self.source.inventory;
@@ -532,7 +579,11 @@ pub const Stream = struct {
             for (self.schema_contract) |expected| {
                 const leaf = leafFor(expected, footer.schema_columns);
                 if (leaf) |found| {
-                    if (!std.mem.eql(u8, try @import("lake_schema.zig").parquetKind(found), expected.kind) or (expected.required and found.nullable)) return error.ExternalLakeSchemaMismatch;
+                    const actual_kind = try @import("lake_schema.zig").parquetKind(found);
+                    if (!std.mem.eql(u8, actual_kind, expected.kind) or (expected.required and found.nullable)) {
+                        std.log.warn("external lake column schema mismatch column={s} expected={s} actual={s} required={} nullable={}", .{ expected.name, expected.kind, actual_kind, expected.required, found.nullable });
+                        return error.ExternalLakeSchemaMismatch;
+                    }
                 } else if (expected.required) return error.ExternalLakeSchemaMismatch;
             }
             if (footer.row_count == 0) return;
@@ -601,6 +652,11 @@ pub const Stream = struct {
                 return a.row_group_ordinal < b.row_group_ordinal;
             }
         }.less);
+        try self.prepareDeletes();
+        try self.bindPositions();
+    }
+    pub fn prepareDeletes(self: *Stream) !void {
+        try self.context.ensureActive();
         if (self.source.scanner.iceberg_delete_plan) |delete_plan| {
             if (self.source.prepared_deletes == null) {
                 const request: iceberg.DeleteRowRefsReadRequest = .{
@@ -657,7 +713,6 @@ pub const Stream = struct {
                 } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.create(self.source.alloc, request);
             }
         }
-        try self.bindPositions();
     }
     fn bindPositions(self: *Stream) !void {
         if (self.position_starts.len != 0) return;

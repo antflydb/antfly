@@ -485,6 +485,19 @@ fn replaceTableDefinitionStampedWithReceipt(
         !std.mem.eql(u8, replacement.name, expected.name))
         return error.InvalidTableDefinitionReplacement;
     const store = service.projectedStore() orelse return error.MissingMetadataStore;
+    if (comptime @TypeOf(service.*) == MetadataService or @TypeOf(service.*) == MetadataHttpService) {
+        if (replacement.lake_index_catalog_json.len != 0 or expected.lake_index_catalog_json.len != 0) {
+            try service.ensureLinearizableRead();
+            var arena = std.heap.ArenaAllocator.init(service.alloc);
+            defer arena.deinit();
+            const a = arena.allocator();
+            const lifecycle = @import("lake_index_lifecycle.zig");
+            const prior = try lifecycle.parse(a, try store.getLakeIndexLifecycle(a, service.metadata_group_id, expected.table_id));
+            var catalog = try @import("antfly_local_sources").metadata_lake_index_catalog.parse(a, replacement.lake_index_catalog_json);
+            defer catalog.deinit();
+            _ = try lifecycle.encode(a, try prior.synchronize(a, catalog.value));
+        }
+    }
     if (!std.mem.eql(u8, expected.schema_json, replacement.schema_json) or
         !std.mem.eql(u8, expected.read_schema_json, replacement.read_schema_json) or
         !std.mem.eql(u8, expected.indexes_json, replacement.indexes_json))
@@ -3236,6 +3249,11 @@ fn highestSupportedRuntimeStatusVersion(service: anytype, required_version: u16)
 /// decode them. This classifier is shared by single and batched proposals;
 /// ordinary document metadata retains its predecessor admission contract.
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    switch (command) {
+        .mutate_lake_index_lifecycle, .remove_table => return metadata_topology_protocol.lake_index_catalog_version,
+        .apply_table_topology => |mutation| if (mutation == .drop) return metadata_topology_protocol.lake_index_catalog_version,
+        else => {},
+    }
     const has_lake_catalog = switch (command) {
         .upsert_table => |table| table.lake_index_catalog_json.len != 0,
         .compare_and_replace_table => |cas| cas.expected.lake_index_catalog_json.len != 0 or cas.replacement.lake_index_catalog_json.len != 0,

@@ -9407,10 +9407,7 @@ pub const IndexManager = struct {
                 const bytes: u64 = @intCast(seg.data.bytes().len);
                 stats.text_segment_bytes +|= bytes;
                 stats.text_max_segment_bytes = @max(stats.text_max_segment_bytes, bytes);
-                switch (seg.data) {
-                    .mmap => stats.text_mmap_segment_bytes +|= bytes,
-                    .heap => stats.text_heap_segment_bytes +|= bytes,
-                }
+                if (seg.data.isFileBacked()) stats.text_mmap_segment_bytes +|= bytes else stats.text_heap_segment_bytes +|= bytes;
                 const layout = seg.layoutStats(detailed_inverted_layout);
                 if (detailed_inverted_layout) seg.data.madviseDiscardCleanPages();
                 stats.stored_fields_bytes +|= layout.stored_fields_bytes;

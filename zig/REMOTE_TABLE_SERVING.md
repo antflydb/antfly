@@ -38,24 +38,26 @@ owner, run SQL again, and assert disk hits with zero repeated provider range rea
 Separate tests cover credential/version isolation, unversioned-read rejection,
 bounded priority eviction across restart, and unavailable local cache fallback.
 
-The following paths remain required before claiming complete remote index serving:
+The integrated serving paths are:
 
-| Path | Current implementation | Remaining integration |
-| --- | --- | --- |
-| Range caching | Public SQL/rows ranges and authenticated native aggregate artifacts share bounded RAM → disk → source reads | Other artifact-reader admission and per-statement explain accounting |
-| Index construction | RowSource sidecar builders, scoped artifact uploads; native catalog CAS leases, API creation/deletion, maintenance recovery and catalog status | Lease renewal during long builds, streaming builders beyond bounded replay |
-| Index selection | Fresh per-execution catalog definitions, complete-coverage proofs and catalog-selected native SQL aggregates | Connect candidate/hydration readers to rows/search and exact SQL predicates |
-| Algebraic execution | Native exact typed reducers, strict recipe matching, shared construction scans/blocks and catalog-selected sparse slot composition | Additional expression/predicate equivalence proofs |
-| Incremental refresh | Immutable file identities and invalidation foundations | Per-file contribution manifests, append merging and delete-aware correction |
+| Path | Implemented behavior |
+| --- | --- |
+| Range caching | SQL, HTTP rows, and native text/vector/row/aggregate artifacts share bounded RAM → disk → source reads and immutable metadata leases |
+| Index construction | Scoped uploads, renewing catalog CAS leases, bounded shared replay, native builders, API maintenance recovery, and catalog status |
+| Index selection | Fresh per-execution definitions and coverage proofs gate native rows, ordered indexes, text/dense/sparse search, and exact SQL materializations |
+| Algebraic execution | Exact typed reducers, strict recipe matching, shared construction scans/blocks, and sparse slot composition; additional equivalence shapes follow the same proof contract |
+| Incremental refresh | Per-file contribution manifests reuse unchanged physical artifacts and handle append, replacement, removal, and delete changes |
+| Retention | Durable reader sessions and resumable fenced mark/sweep protect live generations, with bounded membership batches and filesystem upload inventories |
 
-This table is an acceptance gate. Helper tests or a configured index alone do not
-make any unfinished path query-ready.
+A configured index alone does not establish query readiness: the authorized
+publication, source proof, and reader fence must all validate before consumption.
 
 Native metadata owns external index generations in an internal, versioned table
 record extension. The query-definition projection carries that extension with
 the schema and desired indexes; identity-only projections omit it. Empty legacy
 records retain their original binary encoding and JSON shape. Publication requires
-metadata decoder capability 22 on every coordinated replica.
+metadata decoder capability 22 on every coordinated replica. Native reader
+sessions and reader-safe collection additionally require protocol 24.
 
 Each build attempt records a monotonic generation, a unique token, a bounded
 lease, and separate digests for desired definitions, resolved source coverage,
@@ -384,3 +386,201 @@ not dependencies of Antfly's native execution:
 - [DuckDB external-file cache](https://duckdb.org/2025/05/21/announcing-duckdb-130#external-file-cache)
 - [Performance guidance](https://duckdb.org/docs/current/guides/performance/how_to_tune_workloads)
 - [cache_httpfs extension](https://duckdb.org/community_extensions/extensions/cache_httpfs)
+
+### Native runtime and ordered scan reuse
+
+Native dense and sparse queries borrow a runtime lane keyed by the artifact
+identity, upload domain, logical index and current artifact-store scope. Admission
+still verifies the current schema, publication, credential identity and complete
+source coverage. Each lane serves one execution at a time, keeping kernel scratch
+and lease-bearing callbacks isolated. Returning a lane clears its request context.
+The server retains at most 64 lanes under a shared 512 MiB heap budget, charged to
+the storage resource manager. Each runtime has a 256 MiB ceiling and retains at
+most 8 MiB of authenticated native file blocks. Reader checks also run on warm
+reads. Retirement or eviction closes indexes, releases block leases and frees the
+runtime before the persistent read cache shuts down.
+
+Ordered native indexes now accept signed datetime keys. The tuple encoding is
+version 2 and the desired-publication fingerprint is version 5; a generation or
+cursor built with the older encoding cannot be admitted under the new format.
+The encoding keeps signed nanoseconds ordered without losing the existing local
+unsigned timestamp domain.
+
+SQL can automatically choose leading equality prefixes and a range on the next
+index key. A scan's requested ordering is separate from the provider's ordering
+proof. The executor skips sorting only after a pinned cursor attests every direct
+column, direction and NULL placement. Compatible `ORDER BY ... LIMIT` scans stop
+when residual matches and OFFSET are satisfied. Expression orders and collation
+mismatches retain sorting. Physical hydration gathers projected columns into a
+bounded typed window and exposes the index permutation; covering reads bypass
+Parquet hydration.
+
+### Explicit immutable data objects
+
+The attachment setting `base_source.object_mutability` defaults to `mutable`.
+That mode continues to request fresh provider-version evidence for every data
+file. Set it to `immutable` only when an existing data-file URI is never replaced.
+For example:
+
+```json
+{"kind":"external","table_id":"events","format":"iceberg",
+ "uri":"s3://warehouse/events","object_mutability":"immutable"}
+```
+
+Under that contract, fresh listing versions and authenticated retained publication
+inventories can prove unchanged data objects without one HEAD per file. Reuse is
+limited to matching file identity, URI and size within the current credential and
+artifact-store scope. Conflicting fresh evidence is preserved. New unresolved
+objects are verified individually. Current metadata and deletion objects are
+still verified, and the full coverage signature continues to fence index reuse.
+There is no time-based authority cache.
+
+### Shared native build input
+
+When several native indexes require reconstruction, the publication planner
+collects their projected source columns. One pinned, delete-aware Parquet scan
+writes bounded typed column blocks to a private spill run. Independent readers
+replay projections for text, dense, sparse and ordered builders. File boundaries
+carry both logical and physical offsets, allowing per-file aggregate consumers
+to seek directly rather than replaying the complete run for every file. Replay
+uses the existing spill quotas, cancellation and cleanup lifecycle. Native values,
+NULLs and physical row coordinates survive replay without serializing documents.
+
+
+### Incremental native generations
+
+Native producers authenticate a per-file content identity from the source and
+schema identities, object URI and provider version, partition/sequence metadata,
+and deletion evidence. This identity excludes the serving snapshot label. A new
+snapshot can retain unchanged file contributions after fresh authorization and
+complete coverage verification. Schema or producer configuration changes force
+reconstruction. Position deletes contribute a sorted semantic fingerprint per data file. Equality
+deletes contribute only the versions and applicability metadata of delete files
+that can affect that data file. A global delete-object version is still checked
+at admission and publication; localized changes no longer invalidate unrelated
+native file state. Producer identity v3 and recipe v2 force a one-time rebuild
+of indexes created with the previous global deletion identity.
+
+Text roots retain segments per file and assemble one corpus with global BM25
+statistics. Compatible cached corpora fork immutable reference-counted readers;
+new snapshots decode only added segments and update field totals from changed
+segments. Up to four cold loads share process-wide scheduler admission, and all
+workers join before publication or failure cleanup. Dense and sparse roots retain authenticated per-file document lists;
+rebuilds restore a private native checkpoint, delete removed/replaced file rows,
+and ingest changed-file rows through the existing native kernels. Document-list
+artifacts are part of the GC reference graph. Native text/vector root metadata is
+version 2. Internal `lake2:` identities are stable across compatible snapshots;
+public results keep current snapshot-bound `lake1:` IDs. Search projects identities
+before result filtering, sorting, pagination and fusion, including public ID filters.
+
+Ordered roots use metadata version 4. A second immutable tree indexes each tuple
+key by physical file/row coordinate. Replacements and removals seek only the affected
+file ranges. Authenticated reverse-tree counts estimate changed rows: deltas below
+max(1,024 rows, one eighth of the prior row count) use bounded copy-on-write
+mutations; larger changes use one sorted streaming merge. Small appends retain
+untouched pages and covering blocks. Initial and legacy generations build both trees
+from bounded sorted streams. GC traverses both roots. Removed file slots can be
+reassigned after their old keys are removed, so file churn is bounded by concurrent
+snapshot size rather than lifetime file count. Public coordinates bind to the current
+snapshot. An unchanged generation retains both trees.
+
+Dense and sparse checkpoint publication retains authenticated chunk references for
+unchanged native runs and posting segments. Appended WALs reuse complete prefix
+blocks and publish the changed tail. Manifest bytes are compared against the prior
+chunk checksum before reuse. Dense generations retain small committed WAL deltas;
+full flattening occurs at a 32 MiB WAL, eight-segment, or four-sealed-WAL boundary.
+Rebuild candidates use a private writable overlay on the immutable checkpoint.
+Unchanged runs remain remote and use bounded authenticated range reads. Append or
+rename copies only the affected file; replacements write directly to the overlay,
+and tombstones prevent removed paths from reappearing from the base. Storage leases
+retain the overlay through native worker and checkpoint lifetimes. Publication and
+cross-attempt references remain protected by the same catalog and GC fences.
+
+Search hydration compiles positive output-field patterns into physical Parquet
+projections. Full-document and exclusion-only requests retain full hydration.
+Filter evaluation and sort consumers retain their own field requirements. Missing
+optional columns become typed NULL vectors at the shared row-source boundary, so
+single-index builds, shared replay and ordered key generation agree on schema
+evolution without weakening required-column or type checks.
+
+For compatible unchanged declarations, the shared build replay scans the union of
+changed files. New or unsupported producer recipes conservatively request a full
+shared scan. All candidate checkpoints, spill files and readers close on failure;
+publication still requires fresh coverage verification and the catalog CAS fence.
+
+Search caches bounded immutable publication identity maps after fresh source,
+credential, and coverage validation. Entries own strings and never retain request
+contexts or reader authorization. Queries acquire a fresh reader lease even when
+all payload and metadata reads hit caches. Vector-only tables support `match_none`
+and delete-aware `match_all` scans without requiring a text index. Flat nullable
+Parquet V1 and V2 pages share typed value kernels after version-specific level
+framing and decompression; independent PyArrow fixtures exercise plain and
+dictionary encodings through attachment, index publication, and public reads.
+
+
+### Bounded publication reuse and collection progress
+
+Verified inventories, their file-ID maps, declaration directories, and native
+text/vector/ordered roots share the decoded-cache byte limit and reference-counted
+leases. Cache identities include the metadata type, artifact identity, provider
+scope, and wire version. Authorization, credential binding, source coverage,
+and reader admission are checked for every query; a warm metadata hit grants no
+permission and cannot bypass a deadline. Iceberg data and delete-file version
+checks use the shared scheduler in bounded waves, hashing results in manifest
+order regardless of network completion order. Under the explicit immutable-data
+contract, a freshly resolved Iceberg plan can reuse a canonical data coverage
+proof keyed by metadata content, credential/store scope, publication inventory,
+and definition/source signatures. Delete-object versions still refresh on every
+selection. Source owners retain independent inventory leases and resolve pinned
+provider versions only for files that survive pruning. Mutable sources retain
+complete revalidation; snapshot labels and TTLs never authorize proof reuse.
+
+Text corpus admission reserves each compatible physical segment once across
+active generations, plus each root. Sealed readers compose from all compatible
+ready generations; compatible cold builders single-flight before reserving shared
+segments. Failed builders drain and release their reservations before retry.
+Idle entries can be evicted under pressure; active queries retain their roots and
+segments. Unchanged file groups and physical segment ordinals use maps. Mapped
+residency belongs to each shared segment, so overlapping generations do not
+duplicate resource-manager charges; the final segment release removes the charge.
+
+Initial reader-session admission preserves the caller's deadline and cancellation.
+Shared session heartbeats use independent deadlines bounded by remaining lease
+validity and five seconds, plus owner shutdown cancellation. Request pointers are
+never retained by shared heartbeat owners.
+
+Native remote readers pin immutable chunk leases while copying, with per-chunk
+single-flight loading and no cache lock held during remote I/O. Independent chunks
+can load concurrently. Reads spanning chunks may prefetch two requested successor
+chunks through shared scheduling; all tasks join before the request owner closes.
+Cache admission includes bytes reserved by in-flight loads, and pinned chunks are
+never eviction victims.
+
+Artifact GC checkpoints an immutable native page tree for its live set and a
+separate paged work frontier through the collection's metadata CAS. Each pass
+bounds jobs, payload reads, checkpoint reads/writes, and retained memory; these
+limits bound a pass rather than the size of the live graph. A replacement collector
+resumes the same retirement cut after lease takeover. Checkpoint updates compare
+the previous checkpoint identity as well as the collection token, preventing a
+stale worker from moving progress backwards. Physical retention and structured
+root/page expansion use separate deduplication markers.
+
+Sweeping batches sorted live-set membership through affected native page-tree
+subtrees once, with an operation-local verified routing-page cache. Enumeration
+remains restricted to the collection's upload range. Remote object stores resume
+with the provider's exclusive start-after key. Filesystem artifacts, including the
+standalone object-provider wrapper, append and sync fixed-size upload inventory
+records before writing payloads. Offset continuations survive restart and deletion
+without sorting or rescanning the remaining object namespace for every page.
+Discovery metadata lives outside framed object files. Legacy flat attempts receive
+one streaming backfill, atomically installed under an interprocess lock; incomplete
+backfills and uploads cannot authorize reclamation or make a live object invisible.
+After the durable completion receipt, GC removes discovery journals and directories
+only for fenced attempts with no payloads. Live attempts retain their journals;
+interrupted advisory cleanup retries during later collections, keeping enumeration
+independent of the accumulated history of fully reclaimed attempts. A private
+checkpoint attempt stays protected while its collection runs and is reclaimed
+only after the metadata completion receipt. Interrupted checkpoint cleanup leaves
+ordinary orphans for a later collection. Incomplete background passes reschedule
+without waiting the normal maintenance interval; a pass has a 120-second deadline
+to leave bounded time for checkpoint I/O. Dry-run collection remains read-only.

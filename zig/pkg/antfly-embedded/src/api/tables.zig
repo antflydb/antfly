@@ -275,6 +275,10 @@ pub fn validateLakeIndexCapacity(a: std.mem.Allocator, schema_json: []const u8, 
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidCreateTableRequest;
     var count: usize = 0;
+    if (schema.value.object.get("relational_indexes")) |rows| {
+        if (rows != .array) return error.InvalidCreateTableRequest;
+        count = rows.array.items.len;
+    }
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         const config = entry.value_ptr.*;

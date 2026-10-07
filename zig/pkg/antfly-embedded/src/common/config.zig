@@ -81,6 +81,7 @@ pub const Config = struct {
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
     lake_cache: LakeCacheConfig = .{},
+    lake_indexes: LakeIndexConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
     ha: ?HotStandbyConfig = null,
     inference: InferenceConfig = .{},
@@ -177,6 +178,16 @@ pub const Config = struct {
         max_write_queue_bytes: usize = 32 * 1024 * 1024,
         max_write_queue_entries: usize = 16,
         protected_bytes: usize = 256 * 1024 * 1024,
+    };
+    pub const LakeIndexConfig = struct {
+        artifact_gc: struct {
+            enabled: bool = true,
+            dry_run: bool = false,
+            interval_ms: u64 = 30_000,
+            max_deleted: usize = 4096,
+            max_marked: usize = 262144,
+            max_read_bytes: u64 = 512 * 1024 * 1024,
+        } = .{},
     };
 
     pub const StorageConfig = struct {
@@ -838,6 +849,7 @@ pub const Config = struct {
         const deployment_mode = try deploymentModeFromObject(root, expected_deployment);
         try validateStorageFromOpenApi(deployment_mode, root, validated.value.storage);
         const lake_cache = try parseLakeCacheConfig(alloc, root.get("lake_cache"));
+        const lake_indexes = try parseLakeIndexConfig(alloc, root.get("lake_indexes"));
         errdefer if (lake_cache.root) |path| alloc.free(path);
         var storage_config = try storageFromOpenApi(alloc, validated.value.storage, root.get("storage"));
         errdefer storage_config.deinit(alloc);
@@ -959,6 +971,7 @@ pub const Config = struct {
             ),
             .storage = storage_config,
             .lake_cache = lake_cache,
+            .lake_indexes = lake_indexes,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
             // `hot_standby` is the current config key; `ha` is accepted for one
             // minor release as a deprecated alias. If both are set, `hot_standby`
@@ -3886,6 +3899,30 @@ fn parseLakeCacheConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.La
     errdefer if (config.root) |path| a.free(path);
     if (config.root) |path| if (path.len == 0) return error.InvalidConfig;
     return config;
+}
+
+fn parseLakeIndexConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.LakeIndexConfig {
+    const input = value orelse return .{};
+    var parsed = std.json.parseFromValue(Config.LakeIndexConfig, a, input, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidConfig;
+    defer parsed.deinit();
+    const gc = parsed.value.artifact_gc;
+    if (gc.interval_ms < 1000 or gc.interval_ms > std.time.ms_per_day or gc.max_deleted == 0 or gc.max_deleted > 65536 or gc.max_marked == 0 or gc.max_marked > 1048576 or gc.max_read_bytes == 0 or gc.max_read_bytes > 1024 * 1024 * 1024) return error.InvalidConfig;
+    return parsed.value;
+}
+
+test "external lake native artifact collection config validates bounded operator controls" {
+    const a = std.testing.allocator;
+    var configured = try Config.parseFromSlice(a, "{\"lake_indexes\":{\"artifact_gc\":{\"dry_run\":true,\"interval_ms\":15000,\"max_deleted\":32}}}");
+    defer configured.deinit();
+    try std.testing.expect(configured.lake_indexes.artifact_gc.enabled);
+    try std.testing.expect(configured.lake_indexes.artifact_gc.dry_run);
+    try std.testing.expectEqual(@as(usize, 32), configured.lake_indexes.artifact_gc.max_deleted);
+    for ([_][]const u8{
+        "{\"lake_indexes\":{\"artifact_gc\":{\"interval_ms\":0}}}",
+        "{\"lake_indexes\":{\"artifact_gc\":{\"max_deleted\":0}}}",
+        "{\"lake_indexes\":{\"artifact_gc\":{\"unknown\":1}}}",
+        "{\"lake_indexes\":{\"unknown\":1}}",
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
 }
 
 test "common config persistent lake cache defaults overrides and bounds" {

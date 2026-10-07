@@ -823,6 +823,40 @@ pub const Sequential = struct {
         _ = self.write_arena.reset(.free_all);
         self.pending_bytes = 0;
     }
+    pub const Position = struct { row: u64, byte: u64 };
+    /// Flush a column-block boundary for indexed replay without sealing the run.
+    pub fn replayBoundary(self: *Sequential) !Position {
+        try self.flush();
+        try self.file.flush();
+        return .{ .row = self.size, .byte = self.file.size };
+    }
+    /// Independent read state over a sealed, borrowed file. The owner closes
+    /// after every reader; reader teardown never closes the shared descriptor.
+    pub const Reader = struct {
+        run: Sequential,
+        offset: u64,
+        end: u64,
+        pub fn next(self: *Reader, maximum: usize) !?Block {
+            if (self.offset == self.end) return null;
+            const block = try self.run.readBatchBorrowed(self.offset, @intCast(@min(maximum, self.end - self.offset)));
+            self.offset = block.following;
+            return block;
+        }
+        pub fn deinit(self: *Reader) void {
+            self.run.file.manager.allocator().free(self.run.file.read_buffer);
+            self.run.read_arena.deinit();
+            self.run.write_arena.deinit();
+        }
+    };
+    pub fn reader(self: *Sequential, a: Allocator, begin: Position, end: u64) !Reader {
+        try self.seal();
+        if (begin.row > end or end > self.size or begin.byte > self.file.size) return error.InvalidSqlSpill;
+        var file = self.file;
+        file.read_buffer = &.{};
+        file.read_start = none;
+        file.read_len = 0;
+        return .{ .run = .{ .file = file, .size = end, .block_bytes = self.block_bytes, .read_arena = .init(a), .write_arena = .init(a), .read_first = begin.row, .read_offset = begin.byte }, .offset = begin.row, .end = end };
+    }
     pub fn seal(self: *Sequential) !void {
         try self.flush();
         self.pending.clearAndFree(self.file.manager.allocator());
@@ -2406,4 +2440,31 @@ test "SQL native immutable column blocks reject truncation versions and callback
     var callback: scalar.PatternSet = undefined;
     const callback_rows = [_]Row{.{ .values = &.{.{ .patterns = &callback, .sql_null = false }}, .keys = &.{}, .ordinal = 0 }};
     try std.testing.expectError(error.InvalidSqlSpill, encodeColumnarBlockAlloc(a, &callback_rows, 4096));
+}
+
+test "SQL spill independent replay readers seek column block boundaries and retain their own buffers" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var run = try Sequential.init(&manager, 4096);
+    defer run.close();
+    for (0..100) |i| _ = try run.append(.{ .values = &.{Datum.json(.{ .integer = @intCast(i) })}, .keys = &.{}, .ordinal = i }, none);
+    const boundary = try run.replayBoundary();
+    for (100..200) |i| _ = try run.append(.{ .values = &.{Datum.json(.{ .integer = @intCast(i) })}, .keys = &.{}, .ordinal = i }, none);
+    var first = try run.reader(a, .{ .row = 0, .byte = 0 }, boundary.row);
+    defer first.deinit();
+    var second = try run.reader(a, boundary, run.size);
+    defer second.deinit();
+    for (0..100) |i| {
+        const x = (try first.next(1)).?;
+        const y = (try second.next(1)).?;
+        try std.testing.expectEqual(@as(i64, @intCast(i)), x.rows[0].values[0].value.integer);
+        try std.testing.expectEqual(@as(i64, @intCast(i + 100)), y.rows[0].values[0].value.integer);
+    }
+    try std.testing.expectEqual(null, try first.next(1));
+    try std.testing.expectEqual(null, try second.next(1));
 }

@@ -19,6 +19,9 @@ const std = @import("std");
 const Budget = @import("../../sql/memory_budget.zig");
 const A = std.mem.Allocator;
 pub const Payload = union(enum) {
+    /// Layer-owned immutable metadata. The type-domain is included in the key;
+    /// values and every referenced byte must belong to this item's arena.
+    extension: *anyopaque,
     snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan,
     prepared: *@import("lake_prepared_deletes.zig").Prepared,
     footer: @import("lake_parquet_metadata.zig").ParsedFooter,
@@ -48,6 +51,12 @@ pub const Item = struct {
 pub const Lease = struct {
     cache: *Cache,
     item: *Item,
+    pub fn retain(self: Lease) Lease {
+        self.cache.lock();
+        defer self.cache.mutex.unlock();
+        self.item.refs += 1;
+        return self;
+    }
     pub fn release(self: Lease) void {
         self.cache.lock();
         defer self.cache.mutex.unlock();

@@ -1,0 +1,303 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+//! One projected, delete-aware scan feeds independent bounded native builders.
+//! The replay is statement-owned columnar spill, with direct per-file seeks.
+const std = @import("std");
+const local = @import("antfly_local_sources");
+const rows = local.storage_rowsource_types;
+const spill = local.sql_spill;
+const Provider = @import("lake_index_row_source.zig").Provider;
+const Binding = local.serverless_segment_source_binding.Binding;
+const Cancellation = @import("antfly_cancellation").CancellationToken;
+const A = std.mem.Allocator;
+/// Plan the shared projection once. Unsupported expression dependencies remain
+/// safe through Provider's ordinary-scan fallback when a column is not covered.
+pub fn columnsForBuild(a: A, out: A, table: local.common_topology_records.TableRecord, provider: *Provider, base: local.serverless_manifest_base_source.BaseSourceDescriptor) ![]const []const u8 {
+    const rebuild = @import("../serverless/build/lake_rebuild.zig");
+    var desired = try rebuild.desiredArtifactsFromResolvedExternalSourceAlloc(a, base, provider.source.inventory, .{ .table_name = table.name, .schema_json = table.schema_json, .indexes_json = table.indexes_json });
+    defer desired.deinit(a);
+    var parsed = try local.schema_mod.parseValidatedTableSchema(a, table.schema_json);
+    defer parsed.deinit(a);
+    const schema = try local.schema_mod.deriveRuntimeTableSchema(a, parsed);
+    defer local.storage_schema.freeSchema(a, schema);
+    var layout = try local.storage_db_algebraic_relational_row_codec.PhysicalLayout.init(a, schema);
+    defer layout.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ca = arena.allocator();
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(a);
+    var consumers: usize = 0;
+    for (desired.artifacts) |artifact| {
+        consumers += 1;
+        if (artifact.kind == .text_segment) {
+            const config = try std.json.parseFromSliceLeaky(std.json.Value, ca, artifact.build_spec.?.text.config_json, .{});
+            const field = config.object.get("field");
+            if (field == null or field.? != .string) {
+                for (schema.relational_columns) |column| try names.put(a, column.name, {});
+                continue;
+            }
+        }
+        for (artifact.binding.column_bindings) |column| try names.put(a, column, {});
+    }
+    if (try parsed.relationalIndexDefinitions(ca)) |indexes| for (indexes) |index| {
+        consumers += 1;
+        var tuple = try local.storage_db_relational_index_keys.TuplePlan.init(a, schema, &layout, index.keys);
+        defer tuple.deinit();
+        for (try tuple.columnBindings(ca)) |column| try names.put(a, column, {});
+        for (try @import("lake_index_native_rows.zig").coverColumns(ca, index)) |column| try names.put(a, column, {});
+        if (index.where.len != 0) {
+            var predicate = try local.storage_db_relational_index_predicate.Plan.init(a, schema, &layout, index.where);
+            defer predicate.deinit();
+            for (predicate.conditions) |condition| for (try condition.tuple.columnBindings(ca)) |column| try names.put(a, column, {});
+        }
+    };
+    // Contract binds nullable/missing columns across heterogeneous Parquet files.
+    const contract = try out.alloc(local.serverless_query_lake_schema.Column, schema.relational_columns.len);
+    for (contract, schema.relational_columns) |*column, definition| column.* = .{ .name = try out.dupe(u8, definition.path), .kind = @tagName(definition.column_type), .required = definition.required and !definition.allows_null };
+    provider.schema_contract = contract;
+    if (consumers < 2 or names.count() == 0) return &.{};
+    const columns = try out.alloc([]const u8, names.count());
+    var iterator = names.keyIterator();
+    for (columns) |*column| column.* = try out.dupe(u8, iterator.next().?.*);
+    std.mem.sort([]const u8, columns, {}, struct {
+        fn less(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.less);
+    return columns;
+}
+/// Union changed native files so delta builders share only the necessary input.
+/// Unknown/legacy producer formats conservatively request a complete replay.
+pub fn changedFiles(a: A, out: A, provider: *Provider, store: @import("../serverless/artifacts/store.zig").ArtifactStore, declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact, cancellation: Cancellation) !?[]const bool {
+    const state = @import("lake_index_native_state.zig");
+    const needed = try out.alloc(bool, provider.source.inventory.files.len);
+    @memset(needed, false);
+    for (declarations) |declaration| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const ca = arena.allocator();
+        const previous: []const state.File = switch (declaration.artifact.kind) {
+            .text_segment => text: {
+                const native = @import("lake_index_native_text.zig");
+                if (declaration.artifact.metadata_version != native.metadata_version) return null;
+                const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
+                const files = try ca.alloc(state.File, root.file_groups.len);
+                for (files, root.file_groups) |*file, group| file.* = group.file;
+                break :text files;
+            },
+            .sparse_segment => sparse: {
+                const native = @import("lake_index_native_sparse.zig");
+                if (declaration.artifact.metadata_version != native.metadata_version) return null;
+                break :sparse (try native.loadRoot(ca, store, declaration.artifact, cancellation, null)).file_states;
+            },
+            .vector_segment => dense: {
+                const native = @import("lake_index_native_dense.zig");
+                if (declaration.artifact.metadata_version != native.metadata_version) return null;
+                break :dense (try native.loadRoot(ca, store, declaration.artifact, cancellation, null)).file_states;
+            },
+            .ordered_row_index => ordered: {
+                const native = @import("lake_index_ordered_rows.zig");
+                if (declaration.artifact.metadata_version != native.metadata_version) return null;
+                const root = try native.loadRoot(ca, store, declaration.artifact, cancellation, null);
+                if (root.file_fingerprints.len != root.files.len) return null;
+                const files = try ca.alloc(state.File, root.files.len);
+                for (files, root.files, root.file_fingerprints) |*file, id, digest| file.* = .{ .id = id, .digest = digest };
+                break :ordered files;
+            },
+            else => return null,
+        };
+        var plan = try state.Plan.init(a, ca, provider, previous);
+        defer plan.deinit();
+        for (needed, plan.changed) |*file, changed| file.* = file.* or changed;
+    }
+    return needed;
+}
+pub const Replay = struct {
+    provider: *Provider,
+    columns: []const []const u8,
+    arena: std.heap.ArenaAllocator,
+    budget: local.sql_memory_budget,
+    manager: spill.Manager = undefined,
+    run: ?spill.Sequential = null,
+    kinds: []rows.ColumnKind = &.{},
+    files: []Range = &.{},
+    ready: bool = false,
+    only_files: ?[]const bool = null,
+    const Range = struct { begin: spill.Sequential.Position, end: u64 };
+    pub fn init(a: A, provider: *Provider, columns: []const []const u8) Replay {
+        return .{ .provider = provider, .columns = columns, .arena = .init(a), .budget = .{ .backing = a, .limit = 256 * 1024 * 1024 } };
+    }
+    pub fn deinit(self: *Replay) void {
+        if (self.run) |*run| {
+            run.close();
+            self.manager.deinit();
+        }
+        self.arena.deinit();
+        std.debug.assert(self.budget.live == 0);
+    }
+    fn check(raw: *anyopaque) !void {
+        const self: *Replay = @ptrCast(@alignCast(raw));
+        try self.provider.context.ensureActive();
+    }
+    fn capture(self: *Replay, a: A, original: Binding, cancellation: Cancellation) !void {
+        if (self.ready) return;
+        const io = self.provider.context.io orelse return error.UnsupportedSqlExecution;
+        if (self.run != null) return error.InvalidSqlSpill;
+        self.manager = .{ .alloc = self.budget.allocator(), .io = io, .context = self, .checkpoint = check };
+        self.run = spill.Sequential.init(&self.manager, 512 * 1024) catch |err| {
+            self.manager.deinit();
+            return err;
+        };
+        const ca = self.arena.allocator();
+        self.kinds = try ca.alloc(rows.ColumnKind, self.columns.len);
+        @memset(self.kinds, .bytes);
+        self.files = try ca.alloc(Range, self.provider.source.inventory.files.len);
+        @memset(self.files, .{ .begin = .{ .row = 0, .byte = 0 }, .end = 0 });
+        var by_id: std.StringHashMapUnmanaged(usize) = .empty;
+        defer by_id.deinit(a);
+        for (self.provider.source.inventory.files, 0..) |file, index| try by_id.put(a, file.file_id, index);
+        var input = self.provider.*;
+        input.replay = null;
+        input.only_file = null;
+        input.only_files = self.only_files;
+        var binding = original;
+        binding.column_bindings = self.columns;
+        const source = try input.provider().open_with_cancellation_fn.?(input.provider().ptr, a, binding, cancellation);
+        defer source.deinit(a);
+        var active: ?usize = null;
+        var kinds_bound = false;
+        while (try source.next(a)) |batch| {
+            try cancellation.check();
+            try self.provider.context.ensureActive();
+            if (batch.rowCount() == 0) continue;
+            for (self.columns, self.kinds) |name, *kind| {
+                const column = batch.findColumn(name) orelse return error.RowSourceColumnKindMismatch;
+                const actual = column.kind().logical();
+                if (kinds_bound and kind.* != actual) return error.RowSourceColumnKindMismatch;
+                kind.* = actual;
+            }
+            kinds_bound = true;
+            var page = std.heap.ArenaAllocator.init(self.budget.allocator());
+            defer page.deinit();
+            const pa = page.allocator();
+            const values = try pa.alloc(local.sql_scalar.Datum, self.columns.len);
+            for (batch.row_refs, 0..) |ref, row| {
+                const external = switch (ref) {
+                    .external => |external| external,
+                    else => return error.SidecarSourceBindingMismatch,
+                };
+                const file = by_id.get(external.file_id) orelse return error.SidecarSourceBindingMismatch;
+                if (active == null or active.? != file) {
+                    const position = try self.run.?.replayBoundary();
+                    if (active) |previous| self.files[previous].end = position.row;
+                    // Source order visits each file once, even across delete runs.
+                    if (self.files[file].end != 0) return error.InvalidSqlSpill;
+                    self.files[file].begin = position;
+                    active = file;
+                }
+                for (self.columns, values) |name, *value| {
+                    const column = batch.findColumn(name).?;
+                    value.* = .{ .sql_null = column.nulls.isNull(row), .value = if (column.nulls.isNull(row)) .null else switch (column.values) {
+                        .i64 => |v| .{ .integer = v[row] },
+                        .dictionary_i64 => |v| .{ .integer = v.at(row) },
+                        .f64 => |v| .{ .float = v[row] },
+                        .dictionary_f64 => |v| .{ .float = v.at(row) },
+                        .bool => |v| .{ .bool = v[row] },
+                        .bytes, .json => |v| .{ .string = v[row] },
+                        .dictionary_bytes => |v| .{ .string = v.at(row) },
+                        .vector_f32 => return error.UnsupportedExternalLakeIndex,
+                    } };
+                }
+                const keys = [_]local.sql_scalar.Datum{
+                    .{ .sql_null = false, .value = .{ .integer = @intCast(file) } },
+                    .{ .sql_null = false, .value = .{ .integer = external.row_group_ordinal } },
+                    .{ .sql_null = false, .value = .{ .number_string = try std.fmt.allocPrint(pa, "{d}", .{external.row_ordinal}) } },
+                };
+                _ = try self.run.?.append(.{ .values = values, .keys = &keys, .ordinal = self.run.?.size }, spill.none);
+            }
+        }
+        if (active) |file| self.files[file].end = self.run.?.size;
+        try self.run.?.seal();
+        self.ready = true;
+    }
+    pub fn open(self: *Replay, a: A, binding: Binding, only_file: ?usize, cancellation: Cancellation) !?rows.Source {
+        for (binding.column_bindings) |name| {
+            const present = for (self.columns) |column| {
+                if (std.mem.eql(u8, name, column)) break true;
+            } else false;
+            if (!present) return null;
+        }
+        try self.capture(a, binding, cancellation);
+        const range: Range = if (only_file) |file| blk: {
+            if (file >= self.files.len) return error.SidecarSourceBindingMismatch;
+            break :blk self.files[file];
+        } else .{ .begin = .{ .row = 0, .byte = 0 }, .end = self.run.?.size };
+        const cursor = try a.create(Cursor);
+        errdefer a.destroy(cursor);
+        cursor.* = .{ .owner = self, .reader = try self.run.?.reader(a, range.begin, range.end), .arena = .init(a), .columns = binding.column_bindings, .cancellation = cancellation };
+        return .{ .kind = binding.source_kind, .ctx = cursor, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
+    }
+    const Cursor = struct {
+        owner: *Replay,
+        reader: spill.Sequential.Reader,
+        arena: std.heap.ArenaAllocator,
+        columns: []const []const u8,
+        cancellation: Cancellation,
+        fn deinit(raw: *anyopaque, a: A) void {
+            const self: *Cursor = @ptrCast(@alignCast(raw));
+            self.reader.deinit();
+            self.arena.deinit();
+            a.destroy(self);
+        }
+        fn next(raw: *anyopaque, _: A) !?rows.ColumnBatch {
+            const self: *Cursor = @ptrCast(@alignCast(raw));
+            try self.cancellation.check();
+            try self.owner.provider.context.ensureActive();
+            _ = self.arena.reset(.retain_capacity);
+            const a = self.arena.allocator();
+            const block = try self.reader.next(256) orelse return null;
+            const refs = try a.alloc(rows.RowRef, block.rows.len);
+            const inventory = self.owner.provider.source.inventory;
+            for (block.rows, refs) |row, *ref| {
+                if (row.keys.len != 3) return error.InvalidSqlSpill;
+                const file = std.math.cast(usize, row.keys[0].value.integer) orelse return error.InvalidSqlSpill;
+                if (file >= inventory.files.len) return error.InvalidSqlSpill;
+                ref.* = .{ .external = .{ .source_id = inventory.source_id, .snapshot_id = inventory.snapshot_id, .file_id = inventory.files[file].file_id, .row_group_ordinal = std.math.cast(u32, row.keys[1].value.integer) orelse return error.InvalidSqlSpill, .row_ordinal = try std.fmt.parseInt(u64, row.keys[2].value.number_string, 10) } };
+            }
+            const columns = try a.alloc(rows.ColumnVector, self.columns.len);
+            for (self.columns, columns) |name, *column| {
+                const ordinal = for (self.owner.columns, 0..) |candidate, index| {
+                    if (std.mem.eql(u8, candidate, name)) break index;
+                } else return error.RowSourceColumnKindMismatch;
+                const nulls = try a.alloc(u8, block.rows.len);
+                for (block.rows, nulls) |row, *flag| flag.* = @intFromBool(row.values[ordinal].sql_null);
+                const values: rows.ColumnValues = switch (self.owner.kinds[ordinal]) {
+                    .i64 => blk: {
+                        const v = try a.alloc(i64, block.rows.len);
+                        for (block.rows, v) |row, *value| value.* = if (row.values[ordinal].sql_null) 0 else row.values[ordinal].value.integer;
+                        break :blk .{ .i64 = v };
+                    },
+                    .f64 => blk: {
+                        const v = try a.alloc(f64, block.rows.len);
+                        for (block.rows, v) |row, *value| value.* = if (row.values[ordinal].sql_null) 0 else row.values[ordinal].value.float;
+                        break :blk .{ .f64 = v };
+                    },
+                    .bool => blk: {
+                        const v = try a.alloc(bool, block.rows.len);
+                        for (block.rows, v) |row, *value| value.* = if (row.values[ordinal].sql_null) false else row.values[ordinal].value.bool;
+                        break :blk .{ .bool = v };
+                    },
+                    .bytes, .json => |kind| blk: {
+                        const v = try a.alloc([]const u8, block.rows.len);
+                        for (block.rows, v) |row, *value| value.* = if (row.values[ordinal].sql_null) "" else row.values[ordinal].value.string;
+                        break :blk if (kind == .json) .{ .json = v } else .{ .bytes = v };
+                    },
+                    else => return error.UnsupportedExternalLakeIndex,
+                };
+                column.* = .{ .name = name, .values = values, .nulls = .{ .bytes = nulls } };
+            }
+            return .{ .snapshot = .{ .table_id = inventory.source_id, .snapshot_id = inventory.snapshot_id }, .row_refs = refs, .columns = columns };
+        }
+    };
+};

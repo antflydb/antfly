@@ -21707,6 +21707,11 @@ components:
                   - required:
                       - foreign_sources
       properties:
+        remote_snapshot:
+          type: string
+          description: Opaque remote index snapshot token returned by a previous query. Required when
+            replaying search_after or search_before against an external table; a changed publication returns
+            409.
         evaluate:
           $ref: '#/components/schemas/QueryEvaluation'
         table_target:
@@ -23690,6 +23695,10 @@ components:
         - took
         - status
       properties:
+        remote_snapshot:
+          type: string
+          description: Opaque remote publication and schema fence to echo with ordered pagination. This
+            token does not grant access or retain the publication.
         evaluation:
           type: object
           additionalProperties: true
@@ -27596,6 +27605,15 @@ components:
           enum:
             - read_only
           default: read_only
+        object_mutability:
+          type: string
+          enum:
+            - mutable
+            - immutable
+          default: mutable
+          description: Set immutable only when data files are never replaced at an existing URI. Allows
+            authenticated provider-version proofs from retained index generations to be reused for unchanged
+            data files. Metadata and delete files are still verified.
         credentials:
           $ref: '#/components/schemas/ExternalLakeCredentialRef'
         snapshot:

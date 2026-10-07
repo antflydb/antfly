@@ -419,9 +419,18 @@ pub const Context = struct {
                 if (!slot.found_existing) try native_fields.append(self.arena, column.path);
             },
         };
+        var scan_state: ScanState = .{};
+        defer scan_state.deinit();
+        const requested_order = if (!self.binding.primary_order and !statement.count_all) try @import("describe.zig").scanOrder(self.arena, self.binding, statement) else &.{};
+        const scan_request: catalog.Scan = .{ .fields = native_fields.items, .primary_order = self.binding.primary_order, .order = requested_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = @intCast(self.limits.page_rows) };
+        var ordered_source = false;
+        if (self.backend.vtable.supports_scan_order and requested_order.len != 0 and limit != 0 and !predicates.empty) {
+            try scan_state.open(self, table_def, scan_request);
+            ordered_source = if (scan_state.cursor) |cursor| cursor.order_satisfied else false;
+        }
         var top_k: ?operators.TopK = null;
         defer if (top_k) |*operator| operator.deinit();
-        if (self.binding.order_keys.len != 0 and !self.binding.primary_order and !statement.count_all and limit != 0) {
+        if (self.binding.order_keys.len != 0 and !self.binding.primary_order and !ordered_source and !statement.count_all and limit != 0) {
             const orders = try self.arena.alloc(operators.Order, self.binding.order_keys.len);
             for (self.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
             top_k = try operators.TopK.initWithSpill(self.alloc, offset + limit + @intFromBool(statement.limit == null), orders, self.limits.retained_bytes, self.spill);
@@ -443,8 +452,6 @@ pub const Context = struct {
         var retained: usize = 0;
         var after: ?[]const u8 = null;
         defer if (after) |key| self.alloc.free(key);
-        var scan_state: ScanState = .{};
-        defer scan_state.deinit();
         if (limit == 0) return .{ .columns = columns, .command_tag = "SELECT" };
         var metadata_counted = false;
         if (statement.count_all and statement.predicate == null and !predicates.empty) {
@@ -466,14 +473,9 @@ pub const Context = struct {
             // residual matches still needed. LIMIT 1 must not impose a
             // 1024-row scan ceiling on a selective scalar predicate.
             const wanted = self.limits.page_rows;
-            const page = try scan_state.page(self, page_arena.allocator(), table_def, .{
-                .fields = native_fields.items,
-                .primary_order = self.binding.primary_order,
-                .primary_key = predicates.primary_key,
-                .conditions = predicates.terms.items,
-                .after = after,
-                .limit = @intCast(wanted),
-            });
+            var request = scan_request;
+            request.after = after;
+            const page = try scan_state.page(self, page_arena.allocator(), table_def, request);
             defer page.deinit();
             if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
             if (page.rows.len > self.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;

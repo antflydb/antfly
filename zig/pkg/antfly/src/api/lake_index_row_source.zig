@@ -18,6 +18,8 @@ pub const Provider = struct {
     limits: stream_api.Limits = .{},
     expected_delete_objects: ?[32]u8 = null,
     only_file: ?usize = null,
+    only_files: ?[]const bool = null,
+    replay: ?*@import("lake_index_build_replay.zig").Replay = null,
     schema_contract: []const local.serverless_query_lake_schema.Column = &.{},
     pub fn provider(self: *Provider) @import("../serverless/build/lake_rebuild.zig").RowSourceProvider {
         return .{ .ptr = self, .open_fn = open, .open_with_cancellation_fn = openCanceled };
@@ -40,6 +42,13 @@ pub const Provider = struct {
             !std.mem.eql(u8, binding.source_id, inventory.source_id) or
             !std.mem.eql(u8, binding.snapshot_id, inventory.snapshot_id) or
             !std.mem.eql(u8, binding.schema_fingerprint, inventory.schema_fingerprint)) return error.SidecarSourceBindingMismatch;
+        if (self.only_files) |selected| {
+            if (selected.len != inventory.files.len or self.only_file != null) return error.InvalidNativeLakeFileState;
+            const cursor = try a.create(FileCursor);
+            cursor.* = .{ .provider = self.*, .binding = binding, .cancellation = cancellation };
+            return .{ .kind = kind, .ctx = cursor, .next_batch = FileCursor.next, .deinit_fn = FileCursor.deinit };
+        }
+        if (self.replay) |replay| if (try replay.open(a, binding, self.only_file, cancellation)) |source| return source;
         var names: std.ArrayList([]const u8) = .empty;
         defer names.deinit(a);
         try names.appendSlice(a, binding.column_bindings);
@@ -58,6 +67,38 @@ pub const Provider = struct {
         if (self.only_file) |index| try state.stream.restrictFile(index);
         state.stream.schema_contract = if (self.source.iceberg_schema) |selected| selected.columns else self.schema_contract;
         return .{ .kind = kind, .ctx = state, .next_batch = Cursor.next, .deinit_fn = Cursor.deinit };
+    }
+};
+/// Open only changed files while retaining one decoded page at a time.
+const FileCursor = struct {
+    provider: Provider,
+    binding: bindings.Binding,
+    cancellation: Cancellation,
+    file: usize = 0,
+    active: ?rows.Source = null,
+    fn next(raw: *anyopaque, a: A) !?rows.ColumnBatch {
+        const self: *FileCursor = @ptrCast(@alignCast(raw));
+        while (true) {
+            try self.cancellation.check();
+            try self.provider.context.ensureActive();
+            if (self.active) |source| {
+                if (try source.next(a)) |batch| return batch;
+                source.deinit(a);
+                self.active = null;
+            }
+            while (self.file < self.provider.only_files.?.len and !self.provider.only_files.?[self.file]) self.file += 1;
+            if (self.file == self.provider.only_files.?.len) return null;
+            var input = self.provider;
+            input.only_files = null;
+            input.only_file = self.file;
+            self.file += 1;
+            self.active = try Provider.openCanceled(&input, a, self.binding, self.cancellation);
+        }
+    }
+    fn deinit(raw: *anyopaque, a: A) void {
+        const self: *FileCursor = @ptrCast(@alignCast(raw));
+        if (self.active) |source| source.deinit(a);
+        a.destroy(self);
     }
 };
 const Cursor = struct {
@@ -90,7 +131,8 @@ const Cursor = struct {
             self.position = 0;
             self.columns = &.{};
             if (!self.scratch.reset(.retain_capacity)) return error.OutOfMemory;
-            const batch = try self.stream.next() orelse return null;
+            const physical = try self.stream.next() orelse return null;
+            const batch = try nullableColumns(self.scratch.allocator(), physical, self.source_columns, self.stream.schema_contract);
             if (self.expected_delete_objects) |expected| {
                 if (self.stream.source.prepared_deletes) |prepared| {
                     if (!std.mem.eql(u8, &expected, &prepared.object_versions)) return error.ExternalLakeIndexSourceChanged;
@@ -114,6 +156,44 @@ const Cursor = struct {
         a.destroy(self);
     }
 };
+/// Missing optional fields are typed NULL vectors, including files written before
+/// the field existed. All consumers receive the same schema-bound column shape.
+fn nullableColumns(a: A, batch: rows.ColumnBatch, names: []const []const u8, contract: []const local.serverless_query_lake_schema.Column) !rows.ColumnBatch {
+    var columns: std.ArrayList(rows.ColumnVector) = .empty;
+    try columns.appendSlice(a, batch.columns);
+    for (names) |name| {
+        if (batch.findColumn(name) != null) continue;
+        const definition = for (contract) |column| {
+            if (std.mem.eql(u8, column.name, name)) break column;
+        } else return error.RowSourceMissingColumn;
+        if (definition.required) return error.ExternalLakeSchemaMismatch;
+        const n = batch.rowCount();
+        const nulls = try a.alloc(u8, n);
+        @memset(nulls, 1);
+        const values: rows.ColumnValues = if (std.mem.eql(u8, definition.kind, "integer") or std.mem.eql(u8, definition.kind, "datetime")) value: {
+            const v = try a.alloc(i64, n);
+            @memset(v, 0);
+            break :value .{ .i64 = v };
+        } else if (std.mem.eql(u8, definition.kind, "number")) value: {
+            const v = try a.alloc(f64, n);
+            @memset(v, 0);
+            break :value .{ .f64 = v };
+        } else if (std.mem.eql(u8, definition.kind, "boolean")) value: {
+            const v = try a.alloc(bool, n);
+            @memset(v, false);
+            break :value .{ .bool = v };
+        } else value: {
+            const v = try a.alloc([]const u8, n);
+            @memset(v, "");
+            break :value .{ .bytes = v };
+        };
+        try columns.append(a, .{ .name = name, .values = values, .nulls = .{ .bytes = nulls } });
+    }
+    var result = batch;
+    result.columns = columns.items;
+    return result;
+}
+
 fn slice(columns: []rows.ColumnVector, batch: rows.ColumnBatch, begin: usize, end: usize) !rows.ColumnBatch {
     if (begin > end or end > batch.rowCount()) return error.RowSourceColumnLengthMismatch;
     if (columns.len != batch.columns.len) return error.RowSourceColumnLengthMismatch;
@@ -169,7 +249,7 @@ test "external lake native index input opens one pinned real Parquet scan" {
     var source = try serving.ServingSource.open(a, .{ .storage_mode = .relational, .external_base_source = owned_binding }, .{});
     defer source.deinit();
     const coverage = try @import("lake_index_coverage.zig").pin(&source, .{});
-    var provider_owner: Provider = .{ .source = &source, .context = .{}, .expected_delete_objects = coverage.delete_objects };
+    var provider_owner: Provider = .{ .source = &source, .context = .{ .io = std.testing.io }, .expected_delete_objects = coverage.delete_objects };
     const binding: bindings.Binding = .{ .sidecar_kind = .algebraic, .source_kind = .external_parquet, .row_ref_kind = .external, .source_id = source.inventory.source_id, .snapshot_id = source.inventory.snapshot_id, .schema_fingerprint = source.inventory.schema_fingerprint, .index_config_hash = "config", .column_bindings = &.{"amount"} };
     var row_source = try provider_owner.provider().open(a, binding);
     defer row_source.deinit(a);
@@ -184,6 +264,26 @@ test "external lake native index input opens one pinned real Parquet scan" {
     }
     try std.testing.expectEqual(@as(usize, 3), count);
     try std.testing.expectEqual(@as(i64, 3), total);
+    {
+        var replay = @import("lake_index_build_replay.zig").Replay.init(a, &provider_owner, &.{"amount"});
+        defer replay.deinit();
+        provider_owner.replay = &replay;
+        defer provider_owner.replay = null;
+        var first = try provider_owner.provider().open(a, binding);
+        defer first.deinit(a);
+        var second_provider = provider_owner;
+        second_provider.only_file = 0;
+        var second = try second_provider.provider().open(a, binding);
+        defer second.deinit(a);
+        const x = (try first.next(a)).?;
+        const y = (try second.next(a)).?;
+        try std.testing.expectEqual(@as(i64, 9007199254740993), try x.columns[0].integerAt(0));
+        try std.testing.expectEqual(@as(i64, -9007199254740993), try y.columns[0].integerAt(1));
+        try std.testing.expectEqual(@as(i64, 9007199254740993), try x.columns[0].integerAt(0));
+        try std.testing.expectEqual(@as(usize, 3), x.rowCount());
+        try std.testing.expectEqual(null, try first.next(a));
+        try std.testing.expectEqual(null, try second.next(a));
+    }
     const verified = try @import("lake_index_coverage.zig").pin(&source, .{});
     try std.testing.expectEqual(coverage, verified);
     const changed_bytes = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ 9007199254740993, -9007199254740993, 4 }, .field_id = 1 }});
@@ -196,4 +296,27 @@ test "external lake native index input opens one pinned real Parquet scan" {
     var changed = binding;
     changed.snapshot_id = "stale";
     try std.testing.expectError(error.SidecarSourceBindingMismatch, provider_owner.provider().open(a, changed));
+}
+
+test "external lake native input synthesizes nullable columns with their declared types" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const batch: rows.ColumnBatch = .{ .snapshot = .{ .table_id = "lake", .snapshot_id = "snapshot" }, .row_refs = &.{.{ .relational_key = "a" }}, .columns = &.{.{ .name = "present", .values = .{ .i64 = &.{7} } }} };
+    const contract: []const local.serverless_query_lake_schema.Column = &.{
+        .{ .name = "text", .kind = "string", .required = false },
+        .{ .name = "n", .kind = "integer", .required = false },
+        .{ .name = "f", .kind = "number", .required = false },
+        .{ .name = "b", .kind = "boolean", .required = false },
+        .{ .name = "required", .kind = "integer", .required = true },
+    };
+    const result = try nullableColumns(arena.allocator(), batch, &.{ "present", "text", "n", "f", "b" }, contract);
+    try result.validate();
+    try std.testing.expectEqual(@as(usize, 5), result.columns.len);
+    for (result.columns[1..]) |column| try std.testing.expect(column.nulls.isNull(0));
+    try std.testing.expectEqual(rows.ColumnKind.i64, result.findColumn("n").?.kind());
+    try std.testing.expectEqual(rows.ColumnKind.f64, result.findColumn("f").?.kind());
+    try std.testing.expectEqual(rows.ColumnKind.bool, result.findColumn("b").?.kind());
+    try std.testing.expectError(error.ExternalLakeSchemaMismatch, nullableColumns(arena.allocator(), batch, &.{"required"}, contract));
+    try std.testing.expectError(error.RowSourceMissingColumn, nullableColumns(arena.allocator(), batch, &.{"unknown"}, contract));
 }

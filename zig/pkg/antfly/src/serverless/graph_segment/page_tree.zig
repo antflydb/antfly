@@ -580,6 +580,38 @@ const SortedBuilder = struct {
     }
 };
 
+/// Resolve a sorted membership batch by visiting each affected subtree once.
+/// Unrelated leaves are never scanned; all pages retain normal integrity and
+/// parent separator validation. Duplicate query keys are supported.
+pub fn containsMany(alloc: Allocator, store: Store, root: ?Ref, keys: []const []const u8, found: []bool) !void {
+    if (keys.len != found.len) return error.InvalidGraphPage;
+    for (keys, 0..) |key, index| if (index != 0 and less(key, keys[index - 1])) return error.InvalidGraphPage;
+    @memset(found, false);
+    if (root) |ref| if (keys.len != 0) try containsPage(alloc, store, ref, keys, found, null, null);
+}
+fn containsPage(alloc: Allocator, store: Store, ref: Ref, keys: []const []const u8, found: []bool, first: ?[]const u8, end: ?[]const u8) !void {
+    var page = try load(alloc, store, ref);
+    defer page.deinit(alloc);
+    if (first) |key| if (!std.mem.eql(u8, key, page.entries[0].key)) return error.InvalidGraphPage;
+    if (end) |key| if (!less(page.entries[page.entries.len - 1].key, key)) return error.InvalidGraphPage;
+    var position: usize = 0;
+    if (ref.height == 0) {
+        for (keys, found) |key, *present| {
+            while (position < page.entries.len and less(page.entries[position].key, key)) position += 1;
+            present.* = position < page.entries.len and std.mem.eql(u8, page.entries[position].key, key);
+        }
+        return;
+    }
+    while (position < keys.len and less(keys[position], page.entries[0].key)) position += 1;
+    for (page.entries, 0..) |entry, index| {
+        const upper = if (index + 1 < page.entries.len) page.entries[index + 1].key else end;
+        const begin = position;
+        while (position < keys.len and (upper == null or less(keys[position], upper.?))) position += 1;
+        if (position != begin) try containsPage(alloc, store, entry.child.?, keys[begin..position], found[begin..position], entry.key, upper);
+        if (position == keys.len) break;
+    }
+}
+
 /// Ordered half-open range scan. Memory is bounded by (height + 1) pages, not
 /// degree or graph size. Returned records borrow the cursor until next/deinit.
 pub const Cursor = struct {
@@ -729,6 +761,16 @@ fn countInner(alloc: Allocator, store: Store, ref: Ref, lower: []const u8, upper
 /// Optional visitRecord callbacks borrow leaf bytes only for the duration of
 /// the call and run before visit, allowing body-before-page reclamation without
 /// reloading the leaf.
+/// Visit one authenticated page without recursively loading its descendants.
+/// Durable collectors can checkpoint the child frontier between pages.
+pub fn walkPage(alloc: Allocator, store: Store, root: Ref, visitor: anytype) anyerror!void {
+    var page = try load(alloc, store, root);
+    defer page.deinit(alloc);
+    for (page.entries) |entry| {
+        if (entry.child) |child| try visitor.child(child) else try visitor.record(entry.key, entry.value);
+    }
+}
+
 pub fn walkPostOrder(alloc: Allocator, store: Store, root: Ref, visitor: anytype, allow_missing: bool) anyerror!void {
     try store.check(store.ptr);
     if (try visitor.skip(root)) return;
@@ -1192,4 +1234,33 @@ test "serverless graph pages bound long indivisible keys and branch packing make
     defer cursor.deinit();
     for (changes) |change| try std.testing.expectEqualStrings(change.key, (try cursor.next()).?.key);
     try std.testing.expectEqual(null, try cursor.next());
+}
+
+test "external lake batched membership visits shared routing paths once" {
+    const a = std.testing.allocator;
+    var backing: TestStore = .{ .alloc = a };
+    defer backing.deinit();
+    var names: [2000][8]u8 = undefined;
+    var changes: [2000]Mutation = undefined;
+    const value = @as([128]u8, @splat(42));
+    for (&names, &changes, 0..) |*name, *change, index| {
+        std.mem.writeInt(u64, name, index * 2, .big);
+        change.* = .{ .key = name, .value = &value };
+    }
+    const root = (try apply(a, backing.store(), null, &changes)).?;
+    var query_names: [256][8]u8 = undefined;
+    var keys: [256][]const u8 = undefined;
+    var found: [256]bool = undefined;
+    for (&query_names, &keys, 0..) |*name, *key, index| {
+        std.mem.writeInt(u64, name, 1800 + index, .big);
+        key.* = name;
+    }
+    const reads = backing.reads;
+    try containsMany(a, backing.store(), root, &keys, &found);
+    for (found, 0..) |present, index| try std.testing.expectEqual(index % 2 == 0, present);
+    try std.testing.expect(backing.reads - reads < 8);
+    try containsMany(a, backing.store(), null, &keys, &found);
+    for (found) |present| try std.testing.expect(!present);
+    std.mem.swap([]const u8, &keys[0], &keys[1]);
+    try std.testing.expectError(error.InvalidGraphPage, containsMany(a, backing.store(), root, &keys, &found));
 }

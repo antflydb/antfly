@@ -439,6 +439,81 @@ pub const PersistentObjectRangeCache = struct {
         return self.state.enqueueWrite(cache_key, bytes);
     }
 
+    /// An authenticated, pinned cache mapping. The cache must outlive every
+    /// lease; immutable native snapshots release leases before cache shutdown.
+    pub const MappedEntry = struct {
+        state: *PersistentObjectRangeCacheState,
+        entry: *PersistentObjectRangeCacheEntry,
+        mapping: []align(std.heap.page_size_min) u8,
+        bytes: []const u8,
+        pub fn adviseRandom(self: *const MappedEntry) void {
+            self.advise(.random);
+        }
+        pub fn discardCleanPages(self: *const MappedEntry) void {
+            self.advise(.discard);
+        }
+        fn advise(self: *const MappedEntry, mode: enum { random, discard }) void {
+            switch (@import("builtin").os.tag) {
+                .linux, .macos => std.posix.madvise(self.mapping.ptr, self.mapping.len, if (mode == .random) std.c.MADV.RANDOM else std.c.MADV.DONTNEED) catch {},
+                else => {},
+            }
+        }
+        pub fn deinit(self: *MappedEntry) void {
+            if (comptime @import("builtin").os.tag != .freestanding and @import("builtin").os.tag != .wasi and @import("builtin").os.tag != .windows) std.posix.munmap(self.mapping);
+            self.state.releaseEntry(self.entry, true);
+            self.* = undefined;
+        }
+    };
+    pub fn readMapped(self: *PersistentObjectRangeCache, alloc: Allocator, cache_key: []const u8, expected_len: usize, expected_digest: [32]u8, context: @import("lake_read_context.zig").Context) !?MappedEntry {
+        if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return null;
+        try context.ensureActive();
+        if (expected_len > range_io.max_physical_range_read_bytes) return error.InvalidLakeRangeRead;
+        const state = self.state;
+        if (cache_key.len > state.policy.max_cache_key_bytes) return null;
+        const path = try self.cachePathAlloc(alloc, cache_key);
+        defer alloc.free(path);
+        const entry = state.pinEntry(std.fs.path.basename(path)) orelse return null;
+        var retained = false;
+        var valid = true;
+        defer if (!retained) state.releaseEntry(entry, valid);
+        const header_len = std.math.add(usize, persistent_object_range_cache_magic.len + 4 + 32, cache_key.len) catch return error.InvalidLakeRangeRead;
+        const exact_len = std.math.add(usize, header_len, expected_len) catch return error.InvalidLakeRangeRead;
+        const file = std.Io.Dir.cwd().openFile(state.io, path, .{}) catch {
+            valid = false;
+            return null;
+        };
+        defer file.close(state.io);
+        if (try file.length(state.io) != exact_len) {
+            valid = false;
+            return null;
+        }
+        const mapping = std.posix.mmap(null, exact_len, .{ .READ = true }, .{ .TYPE = .SHARED }, file.handle, 0) catch return null;
+        defer if (!retained) std.posix.munmap(mapping);
+        const magic_len = persistent_object_range_cache_magic.len;
+        const key_end = magic_len + 4 + cache_key.len;
+        const payload = mapping[header_len..];
+        if (!std.mem.eql(u8, mapping[0..magic_len], persistent_object_range_cache_magic) or std.mem.readInt(u32, mapping[magic_len..][0..4], .little) != cache_key.len or !std.mem.eql(u8, mapping[magic_len + 4 .. key_end], cache_key) or !std.mem.eql(u8, mapping[key_end..header_len], &expected_digest)) {
+            valid = false;
+            return null;
+        }
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        var offset: usize = 0;
+        while (offset < payload.len) {
+            try context.ensureActive();
+            const end = @min(offset + 256 * 1024, payload.len);
+            hash.update(payload[offset..end]);
+            offset = end;
+        }
+        if (!std.mem.eql(u8, &hash.finalResult(), &expected_digest)) {
+            valid = false;
+            return null;
+        }
+        try context.ensureActive();
+        retained = true;
+        state.recordReadHit();
+        return .{ .state = state, .entry = entry, .mapping = mapping, .bytes = payload };
+    }
+
     fn cachePathAlloc(self: *const PersistentObjectRangeCache, alloc: Allocator, cache_key: []const u8) ![]u8 {
         const filename = try objectRangeCacheKeyDigestHexAlloc(alloc, cache_key);
         defer alloc.free(filename);

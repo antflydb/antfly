@@ -31,19 +31,19 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     var current = try catalog.parse(a, table.lake_index_catalog_json);
     defer current.deinit();
     if (current.value.published) |ready| {
-        if (current.value.pending == null and std.meta.eql(ready.signature, signature)) return;
+        if (current.value.pending == null and std.meta.eql(ready.signature, signature) and try durableDirectoryAvailable(a, store, ready, cancellation)) return;
     }
     if (current.value.failure) |failure| {
         if (std.mem.eql(u8, &failure.desired, &signature.desired) and now < failure.retry_at_ms) return error.LakeIndexRetryDeferred;
     }
-    const pending_bytes = try publication.begin(a, io, table, source, store.identity, context, now, options.lease_ms);
+    const pending_bytes = try publication.beginWithLocator(a, io, table, source, store.identity, context, now, options.lease_ms, store.locator);
     defer a.free(pending_bytes);
     var pending = table;
     pending.lake_index_catalog_json = pending_bytes;
     // No upload is allowed until this exact attempt has durable authority.
     try authority.replace(authority.ptr, table, pending);
 
-    var lease: Renewal = .{ .a = a, .io = io, .record = pending, .authority = authority, .clock = clock, .lease_ms = options.lease_ms };
+    var lease: Renewal = .{ .a = a, .io = io, .record = pending, .authority = authority, .clock = clock, .lease_ms = options.lease_ms, .parent_context = context };
     defer if (lease.owned) |bytes| a.free(bytes);
     var build_context = context;
     build_context.checkpoint = .{ .ptr = &lease, .check = Renewal.check };
@@ -88,6 +88,23 @@ pub fn reconcile(a: A, io: std.Io, table: local.common_topology_records.TableRec
     try authority.replace(authority.ptr, lease.record, ready);
 }
 
+/// Historical metadata recovery can restore a publication whose retired
+/// directory has already been collected. Its durable schema remains a build
+/// obligation; do not mistake a matching definition signature for available
+/// derived storage. Transient provider errors retain the existing obligation.
+fn durableDirectoryAvailable(a: A, store: *Store, ready: catalog.Publication, cancellation: Cancellation) !bool {
+    if (ready.namespace == null or ready.reader_protocol != 24) return false;
+    const directory = ready.directory orelse return false;
+    var handle = store.artifactStore();
+    handle.allocator = a;
+    const bytes = handle.getVerifiedAllocWithCancellation(directory.artifact_id, directory.byte_len, directory.checksum, cancellation) catch |err| switch (err) {
+        error.FileNotFound, error.NotFound, error.ArtifactIntegrityMismatch => return false,
+        else => return err,
+    };
+    defer a.free(bytes);
+    return true;
+}
+
 const Renewal = struct {
     a: A,
     io: std.Io,
@@ -95,6 +112,7 @@ const Renewal = struct {
     authority: Authority,
     clock: publication.Clock,
     lease_ms: u64,
+    parent_context: Context = .{},
     owned: ?[]u8 = null,
     mutex: std.Io.Mutex = .init,
     terminal_error: ?anyerror = null,
@@ -112,6 +130,7 @@ const Renewal = struct {
     // Provider cancellation callbacks must remain free of metadata I/O.
     fn check(raw: *anyopaque) !void {
         const self: *Renewal = @ptrCast(@alignCast(raw));
+        try self.parent_context.ensureActive();
         if (self.failed.load(.acquire)) return error.LakeIndexPublicationFenceChanged;
     }
     fn run(self: *Renewal) void {
@@ -163,7 +182,7 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     defer fs.deinit();
     var client = fs.client();
     try client.makeBucket("antfly");
-    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "body", .values = &.{"indexed value"} }});
+    const data = try local.serverless_query_lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "body", .field_id = 1, .converted_type = 0, .values = &.{"indexed value"} }});
     defer a.free(data);
     var put = try client.putObject("antfly", "part.parquet", data, .{});
     put.deinit(a);
@@ -237,7 +256,18 @@ test "external lake native coordinator fences ambiguous admission and reuses dur
     try std.testing.expectEqual(@as(u64, 2), selected.publication().generation);
     query_table.external_indexes.?.desired = @splat(9);
     try std.testing.expect((try selection.select(a, query_table, &source, &store, .{}, .automatic)) == null);
-    try std.testing.expectError(error.ExternalLakeIndexUnavailable, selection.select(a, query_table, &source, &store, .{}, .required));
+    try std.testing.expectError(error.ExternalLakeIndexDefinitionChanged, selection.select(a, query_table, &source, &store, .{}, .required));
+    // Simulate restoring historical metadata after its derived directory was
+    // retired. Matching source/schema signatures must still rebuild storage.
+    var artifacts = store.artifactStore();
+    try artifacts.delete(published.value.published.?.directory.?.artifact_id);
+    try reconcile(a, std.testing.io, mock.table, &source, &store, authority, .{}, .none, clock, options);
+    try std.testing.expectEqual(@as(usize, 5), mock.commits);
+    var recovered = try catalog.parse(a, mock.table.lake_index_catalog_json);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u64, 3), recovered.value.published.?.generation);
+    try std.testing.expectEqual(published.value.namespace, recovered.value.namespace);
+    try std.testing.expect(try durableDirectoryAvailable(a, &store, recovered.value.published.?, .none));
 }
 
 test "external lake lease renewal extends a live fence and never replays an ambiguous CAS" {

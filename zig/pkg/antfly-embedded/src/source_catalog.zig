@@ -130,6 +130,7 @@ pub const runtime_thread_config = @import("runtime_thread_config.zig");
 pub const schema_mod = @import("schema/mod.zig");
 pub const schema_relational_declarations = @import("schema/relational_declarations.zig");
 pub const schema_relational_expression = @import("schema/relational_expression.zig");
+pub const schema_relational_checks = @import("schema/relational_checks.zig");
 pub const schema_relational_expression_errors = @import("schema/relational_expression_errors.zig");
 pub const schema_relational_foreign_key_target = @import("schema/relational_foreign_key_target.zig");
 pub const schema_relational_index_namespace = @import("schema/relational_index_namespace.zig");

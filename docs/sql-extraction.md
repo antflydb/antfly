@@ -349,14 +349,112 @@ scan; they do not inherit contributions under a weaker proof. The real PyArrow
 E2E regression covers 320 inline recipes, append rebuilds, unchanged contribution
 identities, HTTP/pgwire results, selected-artifact corruption and cold restart.
 
-Published and queryable remain separate states. Native exact aggregates are
-queryable after current source proof and reader-contract verification. Native
-remote search/row-index consumers and durable superseded/abandoned artifact
-collection still require implementation. Collection must retain all descendants
-of live roots and per-file contributions and coordinate retirement with active
-readers and builders; deleting old attempt namespaces alone is unsafe. Constant-
-time Iceberg coverage also requires an explicit immutable-object proof, rather
-than trusting a snapshot label or a TTL.
+Published and queryable remain separate states. Native exact aggregates and
+ordered relational indexes become queryable after current source proof and
+reader-contract verification. Remote `CREATE INDEX` and the relational index
+API use the schema definition as their durable build obligation; publication is
+asynchronous and readiness is explicit. Remote tables remain read-only for row
+mutations and unsupported constraints.
+
+Ordered indexes use the native tuple encoder, expression evaluator, NULL
+placement and partial-index membership rules. Shared delete-aware source scans
+feed bounded native sort/spill runs into immutable authenticated B+tree pages.
+A key has a physical file/group/row tie, so equal tuples retain distinct rows.
+SQL equality prefixes can select these indexes automatically, with a scan
+fallback only before an artifact is selected. Explicit row queries require a
+ready publication, preserve index order across bounded hydration windows and
+return exclusive cursors fenced by schema, index semantics and immutable root.
+Integers do not cross floating point. Direct key columns and `INCLUDE` columns
+are retained in native column blocks; fully covered projections and residuals
+read those blocks without Parquet data-page hydration. Other queries prune
+unselected files, row groups and pages and preserve Iceberg delete filtering.
+Authenticated page/block reads share the scoped persistent lake cache, whose
+contents never replace current source or authorization proof.
+
+Reader authority lives in native metadata independently of definition CAS.
+One renewable publication lease per process/session amortizes concurrent reads,
+protects an old generation across replacement and DROP, and fences every cache
+read when renewal fails. Lifecycle rows and retained roots survive DROP and
+native metadata snapshots. Retirement atomically closes new reader admission;
+a bounded collector marks directories, inventories, contributions and all
+aggregate, graph and ordered-index descendants before its scoped upload census.
+It preserves pending upload attempts, supports a dry run and resumes the exact
+retirement cut after interruption. A delete budget cannot prematurely release
+retained roots. Deleting old attempt namespaces alone is unsafe.
+
+Retained publications record a physical store locator and a named connection,
+without copying credentials into metadata. Reopening resolves current credentials
+and rejects a connection redirected to another endpoint, root, bucket or prefix.
+A paginated native metadata work feed includes DROP tombstones. Protocol 24
+publications declare their reader contract; collection preserves legacy roots
+and all upload generations below the first leased attempt, including temporary
+files. A protocol upgrade alone cannot prove old readers have drained.
+
+The durable table incarnation has a random upload namespace. Collection cannot
+cross into another incarnation sharing a store and table number. Store bindings
+are recorded when an attempt is admitted, so failed builds and DROP before the
+first publication still leave enumerable cleanup obligations. A successful sweep
+forgets only its own unused binding; credential rotations retain the other stores.
+Historical metadata recovery rechecks the durable publication directory and
+rebuilds missing derived storage instead of treating a matching signature as
+proof that collected artifacts remain available.
+
+Table backup manifests preserve schema and index rebuild obligations rather
+than publication authority. Restore creates an unpublished external table and
+rebuilds against its authorized source. The shared native text executor accepts
+an owned immutable corpus snapshot, with the same global BM25 statistics, typed
+ordering and missing-row filtering as its local storage provider.
+
+Native remote text publication uses the local field projector and segment
+builder, including positions and typed values. A bounded process corpus cache
+constructs global statistics once per immutable root. Warm snapshots hold
+authenticated pinned disk mappings; eviction waits for their leases, while cache
+damage is a miss. Publication leases and source/credential checks remain
+query-owned authority. Corpus metadata, schema arenas, decoded statistics and
+cold payloads share a 256 MiB process heap budget across entries; the encoded
+corpus limit remains 512 MiB. Idle entries yield under memory pressure, and
+active readers keep their pinned payloads.
+
+Native sparse publication retains the existing sparse index’s exact LSM
+manifest and immutable runs. Native dense publication retains HBC posting
+authority, its exact committed WAL prefixes, and a separately pinned LSM plane
+of canonical float32 vectors. Both reopen through the existing native storage
+port over independently authenticated 256 KiB artifact blocks. Native ranking,
+constraints, adaptive candidate refill, and named-source fusion remain in the
+shared executors. Dense exact-vector loads use sorted batched LSM lookups and
+caller-owned decode buffers; physical document delivery also batches rows.
+Read-only HBC recovery neither creates directories nor repairs WAL tails, and
+rejects mutation before writing. Request runtimes share process memory admission
+and enforce a 256 MiB per-request native heap limit. GC marks every retained
+file block, including the dense exact-vector source plane.
+
+Artifact collection runs on a separate bounded cleanup scheduling owner, drains
+before reader/cache teardown, and enumerates DROP tombstones through native
+metadata. Configure `lake_indexes.artifact_gc` with `enabled`, `dry_run`,
+`interval_ms`, `max_deleted`, `max_marked`, and `max_read_bytes`. Defaults enable
+one pass every 30 seconds with at most 4096 deletes, 262144 marked artifacts and
+512 MiB of root reads. Dry runs report eligible/deleted counts without changing
+authority or objects. Legacy generations remain protected rather than inferring
+an old-reader drain from a protocol upgrade.
+
+Native remote text HTTP execution passes a real Parquet regression over several
+native segments, scored offset pages, physical hydration, adjacent exact integers
+above 2^53, and cold restart. Named text sources use the shared composition
+executor. Ordered search pages carry `remote_snapshot` alongside the ordinary
+sort tuple; replay must echo that token and a changed publication fails closed.
+The token grants no access and does not retain artifacts. The Parquet HTTP
+regression checks score-sort continuation across restart and rejection of
+missing or stale snapshot tokens. The real Parquet fixture also verifies native
+dense nearest neighbors, exact sparse dot-product scores, sparse residual filters
+over integers above 2^53, combined text/dense/sparse fusion, physical hydration,
+and vector search across restart. Public graph searches and search aggregations are
+not routed through these adapters; SQL algebraic materializations retain their
+existing native consumer path. Native dense generation metadata is reopened per
+request within its heap budget; a shared detached generation cache and streamed
+contiguous native-file mappings remain further optimization work.
+Constant-time Iceberg coverage also requires
+an explicit immutable-object proof, rather than trusting a snapshot label or a
+TTL.
 
 ### Pre-merge activation work
 
@@ -3386,3 +3484,22 @@ Before advertising the expanded protocol, finish and validate:
    remaining scoped producers and prove it across incomplete/retired uploads,
    membership changes and standby promotion. A retry is not stream completion
    or all-member evidence, and must not replace those barriers.
+
+
+Remote publication metadata now reuses owned decoded-cache leases for inventories,
+file maps, declaration directories, and native ordered/text/vector roots. Current
+coverage, authorization, and reader fences still precede consumption. Remote native
+chunk loading uses per-chunk single-flight admission and bounded successor prefetch;
+cache mutexes protect bookkeeping rather than network calls. See
+[remote serving ownership and GC](../zig/REMOTE_TABLE_SERVING.md#bounded-publication-reuse-and-collection-progress)
+for the durable collection frontier, replacement admission, and shared mapping
+accounting contracts.
+
+
+Variable-width MIN/MAX batch admission includes retained input payloads before
+mutating group state, routing oversized cohorts through ordered spill admission.
+Remote immutable snapshot coverage proofs reuse canonical data hashing while
+refreshing delete evidence. Text corpus limits count unique physical segments
+across active generations, with sealed reader composition across overlapping
+roots. GC batches verified live-set probes and uses durable filesystem upload
+journal offsets; remote providers retain exclusive lexical continuations.

@@ -350,7 +350,11 @@ pub const ServingSource = struct {
     plan_lease: ?@import("lake_decoded_cache.zig").Lease = null,
     delete_lease: ?@import("lake_decoded_cache.zig").Lease = null,
     lazy_versions: bool = false,
+    immutable_objects: bool = false,
     pinned_files: []bool = &.{},
+    // Only installed after a full coverage check against this immutable plan.
+    verified_files: ?*const std.StringHashMapUnmanaged(*const external_source_api.FileEntry) = null,
+    verified_inventory_lease: ?@import("lake_decoded_cache.zig").Lease = null,
     context_store: ?*@import("lake_read_context.zig").Store = null,
     prepared_deletes: ?*@import("lake_prepared_deletes.zig").Prepared = null,
 
@@ -457,9 +461,9 @@ pub const ServingSource = struct {
         var scanner = PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client);
         scanner.iceberg_delete_plan = deletes;
         const lazy_versions = cache != null and binding.format == .iceberg;
-        const pinned_files: []bool = if (lazy_versions) try alloc.alloc(bool, inventory.files.len) else &.{};
+        const pinned_files: []bool = if (lazy_versions or binding.object_mutability == .immutable) try alloc.alloc(bool, inventory.files.len) else &.{};
         @memset(pinned_files, false);
-        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .lazy_versions = lazy_versions, .pinned_files = pinned_files };
+        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_identity = plan_identity, .plan_lease = plan_lease, .lazy_versions = lazy_versions, .immutable_objects = binding.object_mutability == .immutable, .pinned_files = pinned_files };
     }
 
     fn cacheScope(alloc: std.mem.Allocator, store: object_store_support.OpenedObjectStore, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {
@@ -502,6 +506,7 @@ pub const ServingSource = struct {
     }
 
     pub fn deinit(self: *ServingSource) void {
+        if (self.verified_inventory_lease) |lease| lease.release();
         if (self.delete_lease) |lease| lease.release() else if (self.prepared_deletes) |prepared| prepared.destroy(self.alloc);
         if (self.scanner.shared_reader) |reader| {
             reader.drain(true);

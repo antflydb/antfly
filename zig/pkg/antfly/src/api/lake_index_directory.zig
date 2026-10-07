@@ -6,7 +6,7 @@ const local = @import("antfly_local_sources");
 const catalog = local.metadata_lake_index_catalog;
 const stores = @import("../serverless/artifacts/store.zig");
 const A = std.mem.Allocator;
-const Document = struct {
+pub const Document = struct {
     format: []const u8 = "native-lake-index-directory-v1",
     declarations: []const local.serverless_segment_sidecar_manifest.DeclaredArtifact,
     file_contributions: []const catalog.FileContribution = &.{},
@@ -21,7 +21,9 @@ pub fn publishWithContributions(a: A, store: *stores.ArtifactStore, declarations
     const bytes = try std.json.Stringify.valueAlloc(a, Document{ .declarations = declarations, .file_contributions = contributions }, .{});
     defer a.free(bytes);
     if (bytes.len > catalog.max_directory_bytes) return error.InvalidLakeIndexCatalog;
-    const artifact = try store.putWithCancellation(bytes, cancellation);
+    var upload = store.*;
+    upload.allocator = a;
+    const artifact = try upload.putWithCancellation(bytes, cancellation);
     return .{ .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len, .count = @intCast(declarations.len) };
 }
 /// The publication must already have fresh source/store/authorization proof.
@@ -36,4 +38,12 @@ pub fn hydrate(a: A, store: stores.ArtifactStore, publication: *catalog.Publicat
     publication.declarations = document.declarations;
     publication.file_contributions = document.file_contributions;
     try publication.validate();
+}
+
+pub fn loadDocument(a: A, store: stores.ArtifactStore, ref: local.serverless_manifest_artifact_ref.ArtifactRef, cancellation: @import("antfly_cancellation").CancellationToken, cached: ?@import("lake_index_aggregate_artifact.zig").CachedRead) !Document {
+    const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, cached);
+    defer a.free(bytes);
+    const document = try std.json.parseFromSliceLeaky(Document, a, bytes, .{ .allocate = .alloc_always });
+    if (!std.mem.eql(u8, document.format, "native-lake-index-directory-v1")) return error.InvalidLakeIndexCatalog;
+    return document;
 }

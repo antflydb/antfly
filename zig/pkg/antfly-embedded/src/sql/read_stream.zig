@@ -64,6 +64,7 @@ const Fixture = struct {
     closed: usize = 0,
     calls: usize = 0,
     cancel: bool = false,
+    ordered: bool = false,
     fn backend(self: *Fixture) catalog.Backend {
         return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .mutate = mutate, .checkpoint = checkpoint } };
     }
@@ -80,10 +81,10 @@ const Fixture = struct {
         const self: *Fixture = @ptrCast(@alignCast(raw));
         if (self.cancel) return error.QueryCanceled;
     }
-    fn openScan(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+    fn openScan(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *Fixture = @ptrCast(@alignCast(raw));
         self.opened += 1;
-        return .{ .ptr = self, .next = next, .close = close };
+        return .{ .order_satisfied = self.ordered and request.order.len == 1 and std.mem.eql(u8, request.order[0].column, "n") and !request.order[0].descending and !request.order[0].nulls_first, .ptr = self, .next = next, .close = close };
     }
     fn next(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
         const self: *Fixture = @ptrCast(@alignCast(raw));
@@ -621,7 +622,37 @@ pub const Stream = struct {
         for (parameters, params) |value, *out| out.* = try self.context.outputValue(value);
         self.context.parameters = params;
         try @import("decision_eval.zig").validateStatement(arena, statement_backend.decision_provider, binding, params);
-        if (binding.aggregate != null or binding.window != null or binding.table == null or statement.count_all or (binding.order_keys.len != 0 and !binding.primary_order)) {
+        const requested_order = if (!binding.primary_order) try describe.scanOrder(arena, binding, statement) else &.{};
+        var preferred: ?catalog.Cursor = null;
+        errdefer if (preferred) |cursor| cursor.close(cursor.ptr);
+        if (backend.vtable.supports_scan_order and binding.aggregate == null and binding.window == null and binding.relation == null and binding.table != null and !statement.count_all and requested_order.len != 0) {
+            const table = binding.table.?;
+            const predicates = try self.context.conditions(table, statement.predicate);
+            var needed: std.StringHashMapUnmanaged(void) = .empty;
+            if (statement.columns.len == 0) {
+                for (table.columns) |column| try needed.put(arena, column.path, {});
+            } else for (statement.columns) |projection| {
+                if (projection.expression == null and !std.mem.eql(u8, projection.field, "_id")) try needed.put(arena, (try table.column(projection.field)).path, {});
+            }
+            for (binding.scalars.required) |ordinal| {
+                const field = binding.scalars.columns[ordinal].name;
+                if (!std.mem.eql(u8, field, "_id")) try needed.put(arena, field, {});
+            }
+            for (requested_order) |order| if (!std.mem.eql(u8, order.column, "_id")) {
+                try needed.put(arena, order.column, {});
+            };
+            const names = try arena.alloc([]const u8, needed.count());
+            var iterator = needed.keyIterator();
+            for (names) |*name| name.* = iterator.next().?.*;
+            const request: catalog.Scan = .{ .fields = names, .order = requested_order, .conditions = predicates.terms.items, .primary_key = predicates.primary_key, .limit = limits.page_rows };
+            if (backend.vtable.open_scan) |open_scan| {
+                const candidate = try open_scan(backend.ptr, self.budget.allocator(), table, request);
+                if (candidate) |cursor| {
+                    if (cursor.order_satisfied) preferred = cursor else cursor.close(cursor.ptr);
+                }
+            }
+        }
+        if (binding.aggregate != null or binding.window != null or binding.table == null or statement.count_all or (binding.order_keys.len != 0 and !binding.primary_order and preferred == null)) {
             const decisions = @import("decision_eval.zig");
             var external = false;
             for (binding.scalars.projections) |optional| if (optional) |*program| {
@@ -692,6 +723,11 @@ pub const Stream = struct {
             const slot = try seen.getOrPut(arena, field);
             if (!slot.found_existing) try needed.append(arena, field);
         }
+        for (requested_order) |order| {
+            if (std.mem.eql(u8, order.column, "_id")) continue;
+            const slot = try seen.getOrPut(arena, order.column);
+            if (!slot.found_existing) try needed.append(arena, order.column);
+        }
         self.fields = fields.items;
         self.skip = try self.context.count(statement.offset, 0);
         self.remaining = try self.context.count(statement.limit, std.math.maxInt(usize));
@@ -702,8 +738,8 @@ pub const Stream = struct {
         self.emitted = 0;
         self.failed = false;
         self.exhausted = predicates.empty or self.remaining == 0;
-        self.cursor = null;
-        self.request = .{ .fields = needed.items, .primary_order = binding.primary_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = limits.page_rows };
+        self.cursor = preferred;
+        self.request = .{ .order = requested_order, .fields = needed.items, .primary_order = binding.primary_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = limits.page_rows };
         errdefer if (self.stream_manager) |manager| {
             manager.deinit();
             self.budget.allocator().destroy(manager);
@@ -722,8 +758,8 @@ pub const Stream = struct {
                 }
                 self.cursor = try @import("relation_runtime.zig").openCursor(self.context);
             } else {
-                if (backend.vtable.open_scan) |open_scan| {
-                    self.cursor = try open_scan(backend.ptr, self.budget.allocator(), table, self.request);
+                if (self.cursor == null) {
+                    if (backend.vtable.open_scan) |open_scan| self.cursor = try open_scan(backend.ptr, self.budget.allocator(), table, self.request);
                 }
                 if (self.cursor == null and !backend.pinned_statement_snapshot) return error.SqlStatementSnapshotRequired;
             }
@@ -2227,4 +2263,22 @@ test "SQL public blocking stream mixes scalar pulls with live sorted batch lease
         try std.testing.expectEqual(@as(i64, 8), (try first.values.cell(a, 1, 0)).value.integer);
     }
     try std.testing.expect(stream.exhausted);
+}
+
+test "SQL pull stream reuses proven provider order and stops before scanning a large tail" {
+    var fixture: Fixture = .{ .ordered = true };
+    const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .supports_scan_order = true, .resolve = Fixture.resolve, .scan = Fixture.scan, .open_scan = Fixture.openScan, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT n FROM docs WHERE n + 0 > 5 ORDER BY n LIMIT 3 OFFSET 2", .{});
+    defer compiled.deinit();
+    const stream = (try Stream.open(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 16 })).?;
+    defer stream.close();
+    try std.testing.expect(stream.spool == null);
+    var page = try stream.next(3);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 3), page.output.rows.len);
+    for (page.output.rows, 8..) |row, expected| try std.testing.expectEqual(@as(i64, @intCast(expected)), row[0].integer);
+    try std.testing.expect(page.exhausted);
+    try std.testing.expect(fixture.offset <= 16);
+    try std.testing.expectEqual(@as(usize, 1), fixture.opened);
+    try std.testing.expectEqual(@as(usize, 1), fixture.closed);
 }

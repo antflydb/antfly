@@ -532,7 +532,7 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .supports_scan_order = true, .open_scan = openScan, .aggregate_partials = openAggregatePartials, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -622,10 +622,11 @@ pub const Adapter = struct {
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
-        if (binding.external_base_source != null and action != .read) return error.ExternalLakeReadOnly;
+        if (binding.external_base_source != null and action != .read and action != .admin) return error.ExternalLakeReadOnly;
         if (binding.external_base_source != null) binding.external_indexes = .{
             .catalog_json = definition.lake_index_catalog_json,
             .indexes_json = definition.indexes_json,
+            .schema_json = definition.schema_json,
             .desired = @import("antfly_local_sources").metadata_lake_index_catalog.desiredFingerprint(.{
                 .table_id = table.table_id,
                 .name = table.name,
@@ -813,6 +814,7 @@ pub const Adapter = struct {
         adapter: *Adapter,
         table: catalog.Table,
         store: @import("lake_index_store.zig").Store,
+        reader_lease: ?*@import("lake_index_reader_lease.zig").Handle = null,
         arena: std.heap.ArenaAllocator,
         artifacts: []const @import("antfly_local_sources").serverless_manifest_artifact_ref.ArtifactRef,
         recipe: @import("antfly_local_sources").sql_aggregate_materialization.Recipe,
@@ -841,6 +843,7 @@ pub const Adapter = struct {
             const cursor = self.child;
             cursor.close(cursor.ptr);
             self.store.deinit();
+            if (self.reader_lease) |lease| lease.deinit();
             self.arena.deinit();
             a.destroy(self);
         }
@@ -889,12 +892,16 @@ pub const Adapter = struct {
         try self.checkLakeRead(sa, table);
         try self.server.prepareLakeCache();
         const normalized = try self.context.platformDeadline();
-        const context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
+        var context: local.serverless_query_lake_read_context.Context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = local.storage_object_storage.CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) };
         const options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions = .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store };
         var source = try local.serverless_query_lake_serving.ServingSource.openCached(a, .{ .storage_mode = .relational, .external_base_source = table.external_base_source }, options.lakeOptions(), context, &self.server.lake_read_cache);
         defer source.deinit();
         const owner = try a.create(AggregateArtifactCursor);
+        owner.reader_lease = null;
         var keep_owner = false;
+        defer if (!keep_owner) {
+            if (owner.reader_lease) |lease| lease.deinit();
+        };
         defer if (!keep_owner) a.destroy(owner);
         owner.arena = .init(a);
         defer if (!keep_owner) owner.arena.deinit();
@@ -905,6 +912,14 @@ pub const Adapter = struct {
         };
         var keep_store = false;
         defer if (!keep_store) owner.store.deinit();
+        if (self.server.source.lakeIndexLifecycleAuthority(self.context)) |authority| {
+            owner.reader_lease = self.server.lake_reader_leases.acquire(self.server.embedding_provider_runtime.io, authority, table.id, publication.generation, context) catch |err| {
+                try context.ensureActive();
+                if (err == error.OutOfMemory or err == error.MetadataMutationOutcomeUnknown) return err;
+                return null;
+            };
+            context = owner.reader_lease.?.readContext();
+        }
         var selected = (try @import("lake_index_selection.zig").selectCached(sa, table, &source, &owner.store, context, .automatic, &self.server.lake_read_cache)) orelse return null;
         defer selected.deinit();
         const owned = owner.arena.allocator();
@@ -941,13 +956,11 @@ pub const Adapter = struct {
     }
 
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
-        try self.verify(alloc, table);
-        try self.checkLakeRead(alloc, table);
-        try self.server.prepareLakeCache();
-        const cursor = try @import("lake_sql_cursor.zig").openWithCache(alloc, table, request, self.context, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store }, &self.server.lake_read_cache, self.server.embedding_provider_runtime.io);
-        errdefer cursor.close(cursor.ptr);
-        try self.verify(alloc, table);
-        return cursor;
+        const statement = try self.openLakeStatement(alloc, &.{.{ .table = table, .request = request }});
+        errdefer statement.close(statement.ptr);
+        const owner = try alloc.create(SingleStatementCursor);
+        owner.* = .{ .alloc = alloc, .statement = statement };
+        return .{ .ptr = owner, .next = SingleStatementCursor.next, .next_columns = SingleStatementCursor.nextColumns, .set_dynamic_filter = SingleStatementCursor.setDynamicFilter, .close = SingleStatementCursor.close };
     }
 
     fn checkLakeRead(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
@@ -1025,7 +1038,14 @@ pub const Adapter = struct {
         var native_index: usize = 0;
         for (requests, owner.cursors) |request, *cursor| {
             if (request.table.external_base_source != null) {
-                cursor.* = try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, request.request, self.context, owner.sources.get(request.table.id).?);
+                cursor.* = if (request.request.index_range != null)
+                    try @import("lake_index_sql_rows.zig").openPinned(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)
+                else
+                    (try @import("lake_index_sql_rows.zig").tryOpenAuto(alloc, self.server, request.table, request.request, self.context, owner.sources.get(request.table.id).?)) orelse fallback: {
+                        var physical_scan = request.request;
+                        physical_scan.index_equality = null;
+                        break :fallback try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, physical_scan, self.context, owner.sources.get(request.table.id).?);
+                    };
                 errdefer cursor.close(cursor.ptr);
                 try self.verify(scratch.allocator(), request.table);
             } else {
@@ -1045,6 +1065,16 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const cursor = self.statement.cursors[0];
             return cursor.next(cursor.ptr, alloc, limit);
+        }
+        fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursor = self.statement.cursors[0];
+            return if (cursor.set_dynamic_filter) |install| try install(cursor.ptr, filter) else false;
+        }
+        fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const cursor = self.statement.cursors[0];
+            return (cursor.next_columns orelse return error.UnsupportedSqlExecution)(cursor.ptr, alloc, limit);
         }
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));

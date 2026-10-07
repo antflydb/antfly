@@ -160,6 +160,11 @@ pub const Cache = struct {
     /// cached bytes never provide source authority. Admission remains optional.
     pub fn readImmutableAlloc(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
         try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
+        defer a.free(key);
+        return self.readImmutableKeyAlloc(a, key, length, digest, context, loader);
+    }
+    fn immutableKey(a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8) ![]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update("native-lake-immutable-cache-v1");
         hash.update(&scope);
@@ -170,8 +175,39 @@ pub const Cache = struct {
         std.mem.writeInt(u64, &encoded, length, .little);
         hash.update(&encoded);
         hash.update(&digest);
-        const key = try std.fmt.allocPrint(a, "{s}:purpose=sidecar_payload", .{std.fmt.bytesToHex(hash.finalResult(), .lower)});
+        return std.fmt.allocPrint(a, "{s}:purpose=sidecar_payload", .{std.fmt.bytesToHex(hash.finalResult(), .lower)});
+    }
+    pub const ImmutableLease = union(enum) {
+        heap: struct { alloc: Allocator, bytes: []u8 },
+        mapped: parquet.PersistentObjectRangeCache.MappedEntry,
+        pub fn bytes(self: ImmutableLease) []const u8 {
+            return switch (self) {
+                .heap => |value| value.bytes,
+                .mapped => |value| value.bytes,
+            };
+        }
+        pub fn deinit(self: *ImmutableLease) void {
+            switch (self.*) {
+                .heap => |value| value.alloc.free(value.bytes),
+                .mapped => |*value| value.deinit(),
+            }
+            self.* = undefined;
+        }
+    };
+    /// Prefer a verified mapping for native immutable snapshots. Cold misses
+    /// share existing singleflight/provider verification and asynchronously
+    /// populate disk; callers can retain that bounded heap payload meanwhile.
+    pub fn readImmutableLease(self: *Cache, a: Allocator, scope: [32]u8, identity: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) !ImmutableLease {
+        try context.ensureActive();
+        const key = try immutableKey(a, scope, identity, length, digest);
         defer a.free(key);
+        if (self.persistent) |*disk| if (try disk.readMapped(a, key, length, digest, context)) |mapped| {
+            self.recordRead(true, mapped.bytes.len);
+            return .{ .mapped = mapped };
+        };
+        return .{ .heap = .{ .alloc = a, .bytes = try self.readImmutableKeyAlloc(a, key, length, digest, context, loader) } };
+    }
+    fn readImmutableKeyAlloc(self: *Cache, a: Allocator, key: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
         if (try self.lookup(a, key)) |bytes| {
             errdefer a.free(bytes);
             try context.ensureActive();
@@ -662,6 +698,64 @@ test "external lake immutable cache authenticates payloads and separates credent
     }.check };
     try std.testing.expectError(error.Canceled, cache.readImmutableAlloc(a, @splat(1), "artifact", 9, digest, .{ .cancellation = canceled }, loader));
     try std.testing.expectEqual(@as(usize, 4), source.calls);
+}
+
+test "external lake immutable native mappings survive eviction and reject cache damage" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-mappings", .{tmp.sub_path});
+    defer a.free(path);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    try cache.ensurePersistent(io, path, .{ .max_entries = 1, .max_total_bytes = 1024, .protected_bytes = 0 }, .{});
+    const Provider = struct {
+        calls: usize = 0,
+        fn load(raw: *anyopaque, alloc: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "native segment");
+        }
+    };
+    var provider: Provider = .{};
+    const loader: Cache.ImmutableLoader = .{ .ptr = &provider, .load = Provider.load };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("native segment", &digest, .{});
+    var cold = try cache.readImmutableLease(a, @splat(1), "segment", 14, digest, .{ .io = io }, loader);
+    cold.deinit();
+    cache.persistent.?.flush();
+    {
+        var mapped = try cache.readImmutableLease(a, @splat(1), "segment", 14, digest, .{ .io = io }, loader);
+        defer mapped.deinit();
+        try std.testing.expect(mapped == .mapped);
+        try std.testing.expectEqualStrings("native segment", mapped.bytes());
+        try std.testing.expectEqual(@as(usize, 1), provider.calls);
+        _ = cache.persistent.?.enqueueWrite("eviction pressure", "another payload");
+        cache.persistent.?.flush();
+        var again = try cache.readImmutableLease(a, @splat(1), "segment", 14, digest, .{ .io = io }, loader);
+        defer again.deinit();
+        try std.testing.expect(again == .mapped);
+        try std.testing.expectEqualStrings("native segment", again.bytes());
+    }
+    const key = try Cache.immutableKey(a, @splat(1), "segment", 14, digest);
+    defer a.free(key);
+    var key_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(key, &key_digest, .{});
+    const damaged_path = try std.fs.path.join(a, &.{ path, &std.fmt.bytesToHex(key_digest, .lower) });
+    defer a.free(damaged_path);
+    const damaged = try std.Io.Dir.cwd().createFile(io, damaged_path, .{});
+    defer damaged.close(io);
+    try damaged.writePositionalAll(io, "damaged cache", 0);
+    var repaired = try cache.readImmutableLease(a, @splat(1), "segment", 14, digest, .{ .io = io }, loader);
+    defer repaired.deinit();
+    try std.testing.expectEqualStrings("native segment", repaired.bytes());
+    try std.testing.expect(cache.persistentStats().?.corrupt_entries_removed != 0);
+    // A canceled publication owner cannot obtain a new mapping from warm disk.
+    try std.testing.expectError(error.DeadlineExceeded, cache.readImmutableLease(a, @splat(1), "segment", 14, digest, .{ .deadline_ns = 0 }, loader));
 }
 
 test "external lake range leases pin cache bytes across bounded eviction" {

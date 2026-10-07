@@ -32,8 +32,8 @@ pub const Prepared = struct {
     files: std.StringHashMapUnmanaged(FileIndex) = .empty,
     decoded_pages: usize = 0,
     object_versions: [32]u8 = undefined,
-    const FileIndex = struct { index: usize, equality: []const usize = &.{} };
-    const Equality = struct { file: usize, keys: std.StringHashMapUnmanaged(void) = .empty };
+    const FileIndex = struct { index: usize, equality: []const usize = &.{}, fingerprint: [32]u8 = @splat(0) };
+    const Equality = struct { file: usize, fingerprint: [32]u8 = @splat(0), keys: std.StringHashMapUnmanaged(void) = .empty };
     const Position = struct { file: usize, ordinal: u64 };
     pub fn hashObjectVersion(hash: *std.crypto.hash.sha2.Sha256, uri: []const u8, etag: []const u8, version: []const u8) void {
         for ([_][]const u8{ uri, etag, version }) |part| {
@@ -57,8 +57,13 @@ pub const Prepared = struct {
         for (request.delete_plan.files, 0..) |file, file_index| {
             var inventory = try iceberg.singleDeleteFileInventoryAlloc(a, request.data_inventory, file, request.client, if (file.content == .equality_deletes) "iceberg-equality-delete" else "iceberg-position-delete");
             defer inventory.deinit(a);
+            var file_versions = std.crypto.hash.sha2.Sha256.init(.{});
+            const recipe = try std.json.Stringify.valueAlloc(a, file, .{});
+            defer a.free(recipe);
+            file_versions.update(recipe);
             for (inventory.files) |entry| {
                 hashObjectVersion(&versions, entry.object_uri, entry.etag, entry.version_id);
+                hashObjectVersion(&file_versions, entry.object_uri, entry.etag, entry.version_id);
             }
             const names: []const []const u8 = if (file.content == .equality_deletes) file.equality_columns else &.{ "file_path", "pos" };
             var discovered = if (file.content == .equality_deletes)
@@ -66,7 +71,7 @@ pub const Prepared = struct {
             else
                 try parquet.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(a, request.reader, inventory, names, request.footer_probe_bytes);
             defer discovered.deinit(a);
-            var equality: Equality = .{ .file = file_index };
+            var equality: Equality = .{ .file = file_index, .fingerprint = file_versions.finalResult() };
             for (names) |name| {
                 if (file.content != .equality_deletes) break;
                 if (for (columns.items) |prior| {
@@ -108,12 +113,34 @@ pub const Prepared = struct {
         }
         self.equality = equalities.items;
         self.columns = columns.items;
+        const positions = try a.alloc(Position, self.positions.count());
+        defer a.free(positions);
+        var position_iterator = self.positions.keyIterator();
+        for (positions) |*position| position.* = position_iterator.next().?.*;
+        std.mem.sort(Position, positions, {}, struct {
+            fn less(_: void, l: Position, r: Position) bool {
+                return if (l.file != r.file) l.file < r.file else l.ordinal < r.ordinal;
+            }
+        }.less);
+        var position_index: usize = 0;
         for (request.data_inventory.files, 0..) |file, index| {
             var applicable: std.ArrayList(usize) = .empty;
             for (self.equality, 0..) |entry, equality_index| {
                 if (try iceberg.equalityDeleteAppliesToFile(file, request.delete_plan.files[entry.file])) try applicable.append(owned, equality_index);
             }
-            try self.files.put(owned, try owned.dupe(u8, file.file_id), .{ .index = index, .equality = applicable.items });
+            var digest = std.crypto.hash.sha2.Sha256.init(.{});
+            digest.update("native-lake-file-deletes-v1");
+            var encoded: [8]u8 = undefined;
+            const begin = position_index;
+            while (position_index < positions.len and positions[position_index].file == index) : (position_index += 1) {}
+            std.mem.writeInt(u64, &encoded, position_index - begin, .little);
+            digest.update(&encoded);
+            for (positions[begin..position_index]) |position| {
+                std.mem.writeInt(u64, &encoded, position.ordinal, .little);
+                digest.update(&encoded);
+            }
+            for (applicable.items) |equality_index| digest.update(&self.equality[equality_index].fingerprint);
+            try self.files.put(owned, try owned.dupe(u8, file.file_id), .{ .index = index, .equality = applicable.items, .fingerprint = digest.finalResult() });
         }
         // Cached indexes retain only immutable, owned metadata. Provider and
         // request cancellation handles must never escape source admission.
@@ -122,6 +149,16 @@ pub const Prepared = struct {
         self.object_versions = versions.finalResult();
         self.delete_files = try std.json.parseFromSliceLeaky([]iceberg.IcebergDeleteFile, owned, bytes, .{ .allocate = .alloc_always });
         return self;
+    }
+    pub fn emptyFileFingerprint() [32]u8 {
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update("native-lake-file-deletes-v1");
+        const empty_count: [8]u8 = @splat(0);
+        digest.update(&empty_count);
+        return digest.finalResult();
+    }
+    pub fn fileFingerprint(self: *const Prepared, id: []const u8) ![32]u8 {
+        return (self.files.get(id) orelse return error.ExternalSourceFileNotFound).fingerprint;
     }
     pub fn destroy(self: *Prepared, a: A) void {
         self.arena.deinit();
@@ -272,4 +309,37 @@ test "external lake request position offsets preserve empty groups and cached me
     try std.testing.expect(!try prepared.matchesPositions(a, file, batch, 1, &.{ 0, 3, 3, 8 }));
     try std.testing.expectError(error.InvalidParquetRowGroupBatch, prepared.matchesPositions(a, file, batch, 0, &.{0}));
     try std.testing.expectEqual(@as(usize, 1), prepared.positions.count());
+}
+
+test "external lake position delete fingerprints preserve unaffected file identities" {
+    const external = @import("../external_source/types.zig");
+    const Reader = struct {
+        bytes: []const u8,
+        fn read(raw: *anyopaque, a: A, _: []const u8, _: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset > self.bytes.len or len > self.bytes.len - offset) return error.InvalidLakeRangeRead;
+            return a.dupe(u8, self.bytes[@intCast(offset)..][0..len]);
+        }
+    };
+    const a = std.testing.allocator;
+    const first = try parquet.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "pos", .values = &.{0} }}, &.{.{ .column_id = "file_path", .values = &.{"s3://bucket/a"} }});
+    defer a.free(first);
+    const next = try parquet.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{.{ .column_id = "pos", .values = &.{1} }}, &.{.{ .column_id = "file_path", .values = &.{"s3://bucket/a"} }});
+    defer a.free(next);
+    var files = [_]external.FileEntry{
+        .{ .file_id = @constCast("s3://bucket/a"), .object_uri = @constCast("s3://bucket/a"), .version_id = @constCast("a"), .byte_len = 10, .row_count = 2, .data_sequence_number = 5, .partition_spec_id = 0, .row_groups = &.{} },
+        .{ .file_id = @constCast("s3://bucket/b"), .object_uri = @constCast("s3://bucket/b"), .version_id = @constCast("b"), .byte_len = 10, .row_count = 2, .data_sequence_number = 5, .partition_spec_id = 0, .row_groups = &.{} },
+    };
+    const inventory: external.Inventory = .{ .format = .iceberg, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket/t"), .snapshot_id = @constCast("12"), .schema_fingerprint = @constCast("schema"), .files = &files };
+    var reader: Reader = .{ .bytes = first };
+    var delete_files = [_]iceberg.IcebergDeleteFile{.{ .content = .position_deletes, .file_path = @constCast("s3://bucket/deleted"), .file_format = @constCast("PARQUET"), .snapshot_id = 12, .data_sequence_number = 7, .file_sequence_number = 8, .record_count = 1, .file_size_in_bytes = first.len }};
+    const before = try Prepared.create(a, .{ .reader = .{ .ctx = &reader, .read_range_alloc = Reader.read }, .data_inventory = inventory, .delete_plan = .{ .files = &delete_files } });
+    defer before.destroy(a);
+    reader.bytes = next;
+    delete_files[0].file_size_in_bytes = next.len;
+    const after = try Prepared.create(a, .{ .reader = .{ .ctx = &reader, .read_range_alloc = Reader.read }, .data_inventory = inventory, .delete_plan = .{ .files = &delete_files } });
+    defer after.destroy(a);
+    try std.testing.expect(!std.mem.eql(u8, &try before.fileFingerprint(files[0].file_id), &try after.fileFingerprint(files[0].file_id)));
+    try std.testing.expectEqualSlices(u8, &try before.fileFingerprint(files[1].file_id), &try after.fileFingerprint(files[1].file_id));
+    try std.testing.expectEqualSlices(u8, &Prepared.emptyFileFingerprint(), &try after.fileFingerprint(files[1].file_id));
 }

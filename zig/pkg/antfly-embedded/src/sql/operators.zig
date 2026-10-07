@@ -986,6 +986,9 @@ pub const Grouped = struct {
         for (keys) |column| for (column) |value| {
             needed +|= (try datumBytes(value)) *| 4;
         };
+        for (self.specs, inputs) |spec, column| if (spec.kind == .min or spec.kind == .max) {
+            for (column) |value| needed +|= (try datumBytes(value)) *| 4;
+        };
         var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
         for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) {
             fast = false;
@@ -1028,6 +1031,9 @@ pub const Grouped = struct {
         var needed: usize = 4096 +| count *| (512 +| self.specs.len *| @sizeOf(Aggregate) *| 2);
         for (keys) |column| for (0..count) |index| {
             needed +|= (try datumBytes(try column.cell(a, index, 0))) *| 4;
+        };
+        for (self.specs, inputs) |spec, column| if (spec.kind == .min or spec.kind == .max) {
+            for (0..count) |index| needed +|= (try datumBytes(try column.cell(a, index, 0))) *| 4;
         };
         var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
         for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) {
@@ -2161,4 +2167,40 @@ test "SQL sparse partial slots survive native group spilling" {
         seen += 1;
     }
     try std.testing.expectEqual(@as(usize, 600), seen);
+}
+
+test "SQL variable extrema batch admission spills before retaining payloads" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const bytes = try a.alloc(u8, 16384);
+    defer a.free(bytes);
+    @memset(bytes, 'x');
+    var keys: [32]Datum = undefined;
+    var values: [32]Datum = undefined;
+    for (&keys, &values, 0..) |*key, *value, index| {
+        key.* = Datum.json(.{ .integer = @intCast(index) });
+        value.* = Datum.json(.{ .string = bytes });
+    }
+    for ([_]bool{ false, true }) |encoded| {
+        const group = try Grouped.create(a, &.{.{ .kind = .min, .input_type = .string }}, .{ .groups = 64, .bytes = 256 * 1024, .spill = &manager });
+        defer group.deinit();
+        if (encoded) {
+            const Batch = @import("execution_batch.zig").Batch;
+            try group.addEncodedColumns(&.{Batch{ .vectors = .{ .values = &.{&keys}, .count = keys.len } }}, &.{Batch{ .vectors = .{ .values = &.{&values}, .count = values.len } }}, keys.len);
+        } else try group.addColumns(&.{&keys}, &.{&values}, keys.len);
+        try std.testing.expect(group.external != null);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        var count: usize = 0;
+        while (try group.nextResult(arena.allocator())) |result| {
+            try std.testing.expectEqualStrings(bytes, result.aggregates[0].value.string);
+            count += 1;
+        }
+        try std.testing.expectEqual(keys.len, count);
+    }
 }

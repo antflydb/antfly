@@ -8129,14 +8129,20 @@ pub const AntflyApiHandler = struct {
         const request = operationContext(ctx, authenticated_identity);
         if (relational) if (binding.logical) |logical| {
             var lake_adapter: @import("sql_execution.zig").Adapter = .{ .server = self.api_server, .identity = &authenticated_identity, .context = request };
-            const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| return switch (err) {
-                error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
-                error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
-                error.CatalogGenerationChanged, error.ExternalLakeSnapshotMismatch => jsonErrorResponse(ctx, 409, "external table snapshot changed"),
-                error.InvalidQueryRequest, error.InvalidSqlDateTime, error.SqlTypeMismatch, error.UndefinedColumn, error.SqlUnknownColumn, error.RowPolicyUnsupported, error.UnsupportedRowsQuery, error.UnsupportedSqlExecution => jsonErrorResponse(ctx, 400, "external table does not support this read"),
-                error.Canceled, error.Cancelled => error.Canceled,
-                error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
-                else => jsonErrorResponse(ctx, 503, "external table read unavailable"),
+            const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| {
+                std.log.warn("external lake rows read failed table={s} err={s}", .{ decoded_table_name, @errorName(err) });
+                return switch (err) {
+                    error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
+                    error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
+                    error.ExternalLakeRowIndexNotFound => jsonErrorResponse(ctx, 404, "relational index not found"),
+                    error.ExternalLakePartialIndexNotImplied => jsonErrorResponse(ctx, 400, "query conditions must imply the partial index predicate"),
+                    error.ExternalLakeIndexNotPublished, error.ExternalLakeRowIndexNotPublished => jsonErrorResponse(ctx, 503, "relational index publication is not ready"),
+                    error.CatalogGenerationChanged, error.ExternalLakeSnapshotMismatch, error.PreparedGenerationChanged, error.ExternalLakeIndexDefinitionChanged, error.ExternalLakeIndexCredentialsChanged, error.ExternalLakeIndexStoreChanged, error.ExternalLakeIndexSourceChanged => jsonErrorResponse(ctx, 409, "external table snapshot or index publication changed"),
+                    error.InvalidRelationalRowsRequest, error.InvalidRelationalIndexBound, error.InvalidQueryRequest, error.InvalidSqlDateTime, error.SqlTypeMismatch, error.UndefinedColumn, error.SqlUnknownColumn, error.RowPolicyUnsupported, error.UnsupportedRowsQuery, error.UnsupportedSqlExecution => jsonErrorResponse(ctx, 400, "external table does not support this read"),
+                    error.Canceled, error.Cancelled => error.Canceled,
+                    error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
+                    else => jsonErrorResponse(ctx, 503, "external table read unavailable"),
+                };
             };
             if (lake_result) |ndjson| {
                 defer alloc.free(ndjson);

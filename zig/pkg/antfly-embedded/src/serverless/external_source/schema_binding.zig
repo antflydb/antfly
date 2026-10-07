@@ -142,6 +142,7 @@ pub fn externalBindingFromSchemaJsonAlloc(
         },
         .schema_fingerprint = schema_fingerprint,
         .write_policy = write_policy,
+        .object_mutability = if (source.get("object_mutability")) |_| std.meta.stringToEnum(external_binding.ObjectMutability, try requiredJsonString(source, "object_mutability")) orelse return error.InvalidExternalTableBinding else .mutable,
     };
     try binding.validateReadOnlyMvp();
 

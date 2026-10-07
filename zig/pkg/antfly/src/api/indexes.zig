@@ -767,13 +767,26 @@ pub fn encodeLakeIndexList(alloc: std.mem.Allocator, table: metadata_table_manag
     return encodeLakeIndexListWithProof(alloc, table, &.{});
 }
 pub fn encodeLakeIndexListWithProof(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord, queryable_names: []const []const u8) ![]u8 {
-    var configs = try std.json.parseFromSlice(std.json.Value, alloc, indexesJsonSource(table.indexes_json), .{});
-    defer configs.deinit();
-    if (configs.value != .object) return error.InvalidTableIndexMetadata;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var configs = try std.json.parseFromSliceLeaky(std.json.Value, a, indexesJsonSource(table.indexes_json), .{});
+    if (configs != .object) return error.InvalidTableIndexMetadata;
+    if (table.schema_json.len != 0) {
+        var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, table.schema_json);
+        defer schema.deinit(a);
+        var columns: @import("relational_expression_contract.zig").ColumnTypes = .{ .alloc = a, .source = .{ .parsed = &schema } };
+        defer columns.deinit();
+        if (schema.relational_indexes) |definitions| for (definitions.value) |definition| {
+            if (configs.object.contains(definition.name)) return error.InvalidTableIndexMetadata;
+            const json = try @import("relational_index_mutation.zig").configForDefinition(a, definition, &columns);
+            try configs.object.put(a, definition.name, try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{}));
+        };
+    }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
     try out.append(alloc, '[');
-    var it = configs.value.object.iterator();
+    var it = configs.object.iterator();
     var first = true;
     while (it.next()) |entry| {
         if (isReservedIndexMetadataEntry(entry.key_ptr.*)) continue;

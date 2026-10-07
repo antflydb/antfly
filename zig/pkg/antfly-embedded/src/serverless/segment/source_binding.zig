@@ -26,6 +26,7 @@ pub const SidecarKind = enum(u8) {
     graph = 4,
     algebraic = 5,
     graph_metric = 6,
+    ordered_rows = 7,
 };
 
 pub const RowRefKind = enum(u8) {
