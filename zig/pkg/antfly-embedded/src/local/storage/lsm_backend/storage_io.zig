@@ -2395,9 +2395,7 @@ else blk: {
 
             fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
                 const self: *NativeStorage = @ptrCast(@alignCast(ptr));
-                // Experimental Windows: the fd sink is POSIX-only; buffer and
-                // publish through the vtable's sync + rename instead.
-                if (comptime builtin.os.tag == .windows) return try BufferedAtomicWriteSink.create(allocator, self.storage(), path);
+                if (comptime builtin.os.tag == .windows) return try NativeStreamingAtomicWriteSink.create(allocator, path, self.state);
                 return try NativeAtomicWriteSink.create(allocator, path, self.state);
             }
 
@@ -2706,7 +2704,7 @@ else blk: {
         fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {
             const state: *NativeStorageState = @ptrCast(@alignCast(ptr));
             if (comptime builtin.os.tag == .windows) {
-                return try BufferedAtomicWriteSink.create(allocator, .{ .ptr = ptr, .vtable = &threaded_only_vtable }, path);
+                return try NativeStreamingAtomicWriteSink.create(allocator, path, state);
             }
             return try NativeAtomicWriteSink.create(allocator, path, state);
         }
@@ -2958,6 +2956,7 @@ fn renamePathWithIo(io: anytype, old_path: []const u8, new_path: []const u8) !vo
         return;
     }
     try std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io);
+    if (comptime builtin.os.tag == .windows) try syncFileContentsPathWithIo(io, new_path);
 }
 
 fn renameAbsoluteWithIo(io: anytype, old_path: []const u8, new_path: []const u8) !void {
@@ -2978,6 +2977,9 @@ fn renameAbsoluteWithIo(io: anytype, old_path: []const u8, new_path: []const u8)
     defer new_parent.close(io);
 
     try std.Io.Dir.rename(old_parent, old_base_name, new_parent, new_base_name, io);
+    // Flush the published file's metadata after the rename as well as its
+    // contents beforehand. Windows directory sync is not available here.
+    if (comptime builtin.os.tag == .windows) try syncFileContentsPathWithIo(io, new_path);
 }
 
 fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
@@ -3260,90 +3262,94 @@ fn posixStatError(err: std.posix.E) anyerror {
     };
 }
 
-const NativeBufferedAtomicWriteSink = struct {
+const NativeStreamingAtomicWriteSink = struct {
     allocator: Allocator,
     state: *NativeStorageState,
     final_path: []u8,
     tmp_path: []u8,
-    out: std.ArrayListUnmanaged(u8) = .empty,
+    staged: @import("staged_file.zig").StagedFile(Crc32),
+    file_open: bool = true,
 
     fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState) !AtomicWriteSink {
         const retained_state = try state.retain();
         errdefer retained_state.release();
 
-        const self = try allocator.create(NativeBufferedAtomicWriteSink);
+        const self = try allocator.create(NativeStreamingAtomicWriteSink);
         errdefer allocator.destroy(self);
 
         const final_path = try allocator.dupe(u8, path);
         errdefer allocator.free(final_path);
 
-        const tmp_path = try tempSiblingPath(allocator, path);
+        const io = retained_state.threaded.io();
+        var random: [16]u8 = undefined;
+        try io.randomSecure(&random);
+        const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp-{x}", .{ path, random });
         errdefer allocator.free(tmp_path);
+
+        const file = try openFilePathForWriteWithIo(io, tmp_path, .{ .read = true, .exclusive = true });
+        errdefer file.close(io);
 
         self.* = .{
             .allocator = allocator,
             .state = retained_state,
             .final_path = final_path,
             .tmp_path = tmp_path,
+            .staged = .{ .io = io, .file = file },
         };
         return .{
             .ptr = self,
-            .vtable = &native_buffered_atomic_write_sink_vtable,
+            .vtable = &native_streaming_atomic_write_sink_vtable,
         };
     }
 
-    fn deinit(self: *NativeBufferedAtomicWriteSink) void {
+    fn deinit(self: *NativeStreamingAtomicWriteSink) void {
+        if (self.file_open) self.staged.file.close(self.staged.io);
         self.state.release();
-        self.out.deinit(self.allocator);
         self.allocator.free(self.final_path);
         self.allocator.free(self.tmp_path);
         self.allocator.destroy(self);
     }
 
     fn len(ptr: *anyopaque) usize {
-        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        return self.out.items.len;
+        const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        return self.staged.len();
     }
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
-        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
+        const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        try self.staged.append(bytes);
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
-        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
+        const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        try self.staged.writeAt(offset, bytes);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
-        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (len_prefix > self.out.items.len) return error.InvalidAtomicWriteOffset;
-        return Crc32.hash(self.out.items[0..len_prefix]);
+        const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        return try self.staged.crc32Range(0, len_prefix);
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
-        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        if (offset > self.out.items.len or range_len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        return Crc32.hash(self.out.items[offset..][0..range_len]);
+        const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        return try self.staged.crc32Range(offset, range_len);
     }
 
     fn finish(ptr: *anyopaque) !void {
-        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
         defer self.deinit();
 
         const io = self.state.threaded.io();
         self.state.invalidatePath(self.tmp_path);
-        writeFileAbsoluteWithIo(io, self.tmp_path, self.out.items) catch |err| {
+        self.staged.sync() catch |err| {
+            self.staged.file.close(io);
+            self.file_open = false;
             deleteFilePathWithIo(io, self.tmp_path) catch {};
             self.state.invalidatePath(self.tmp_path);
             return err;
         };
-        syncFileContentsPathWithIo(io, self.tmp_path) catch |err| {
-            deleteFilePathWithIo(io, self.tmp_path) catch {};
-            self.state.invalidatePath(self.tmp_path);
-            return err;
-        };
+        self.staged.file.close(io);
+        self.file_open = false;
         self.state.invalidateRename(self.tmp_path, self.final_path);
         defer self.state.invalidateRename(self.tmp_path, self.final_path);
         renamePathWithIo(io, self.tmp_path, self.final_path) catch |err| {
@@ -3354,7 +3360,9 @@ const NativeBufferedAtomicWriteSink = struct {
     }
 
     fn abort(ptr: *anyopaque) void {
-        const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        const self: *NativeStreamingAtomicWriteSink = @ptrCast(@alignCast(ptr));
+        self.staged.file.close(self.staged.io);
+        self.file_open = false;
         self.state.invalidatePath(self.tmp_path);
         deleteFilePathWithIo(self.state.threaded.io(), self.tmp_path) catch {};
         self.state.invalidatePath(self.tmp_path);
@@ -3362,14 +3370,14 @@ const NativeBufferedAtomicWriteSink = struct {
     }
 };
 
-const native_buffered_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
-    .len = NativeBufferedAtomicWriteSink.len,
-    .append_slice = NativeBufferedAtomicWriteSink.appendSlice,
-    .write_at = NativeBufferedAtomicWriteSink.writeAt,
-    .crc32_prefix = NativeBufferedAtomicWriteSink.crc32Prefix,
-    .crc32_range = NativeBufferedAtomicWriteSink.crc32Range,
-    .finish = NativeBufferedAtomicWriteSink.finish,
-    .abort = NativeBufferedAtomicWriteSink.abort,
+const native_streaming_atomic_write_sink_vtable: AtomicWriteSink.VTable = .{
+    .len = NativeStreamingAtomicWriteSink.len,
+    .append_slice = NativeStreamingAtomicWriteSink.appendSlice,
+    .write_at = NativeStreamingAtomicWriteSink.writeAt,
+    .crc32_prefix = NativeStreamingAtomicWriteSink.crc32Prefix,
+    .crc32_range = NativeStreamingAtomicWriteSink.crc32Range,
+    .finish = NativeStreamingAtomicWriteSink.finish,
+    .abort = NativeStreamingAtomicWriteSink.abort,
 };
 
 fn tryBeginNativeColdRandomReads(ptr: *anyopaque, allocator: Allocator, paths: []const []const u8) !?[]ColdSequentialReader {
@@ -4563,9 +4571,9 @@ test "native atomic write sink supports patching and crc before finish" {
     var active = true;
     defer if (active) writer.abort();
     writer.setCacheIntent(.cold_sequential);
-    const native_writer: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
-    try std.testing.expectEqual(AtomicWriteCacheIntent.cold_sequential, native_writer.cache_intent);
     if (supports_posix_fd_cache) {
+        const native_writer: *NativeAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+        try std.testing.expectEqual(AtomicWriteCacheIntent.cold_sequential, native_writer.cache_intent);
         try std.testing.expectEqual(@as(usize, 1), native.snapshotStats().fd_admitted_descriptors);
     }
 
@@ -5425,18 +5433,18 @@ test "native atomic write sink retains invalidation state past storage deinit" {
     try std.testing.expectEqualStrings("leased", written);
 }
 
-test "native buffered atomic write sink retains invalidation state past storage deinit" {
+test "native streaming atomic write sink retains invalidation state past storage deinit" {
     if (!supports_native_storage) return error.SkipZigTest;
 
     var test_tmp = try TestDirectory.init("storage");
     defer test_tmp.cleanup();
-    if (builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi or builtin.os.tag == .freestanding) return error.SkipZigTest;
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}-antfly-storage-buffered-atomic-lease-{d}", .{ test_tmp.path(), atomic_write_nonce.fetchAdd(1, .monotonic) });
 
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
-    var writer = try NativeBufferedAtomicWriteSink.create(std.testing.allocator, path, native.state);
+    var writer = try NativeStreamingAtomicWriteSink.create(std.testing.allocator, path, native.state);
     var active = true;
     defer if (active) writer.abort();
 
@@ -5455,4 +5463,49 @@ test "native buffered atomic write sink retains invalidation state past storage 
     const written = try verifier.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("buffered lease", written);
+}
+
+test "native streaming atomic write sink bounds memory and abort preserves published output" {
+    if (!supports_native_storage or builtin.os.tag == .wasi) return error.SkipZigTest;
+    var test_tmp = try TestDirectory.init("storage");
+    defer test_tmp.cleanup();
+    var native = try NativeStorage.init(std.testing.allocator, .threaded);
+    defer native.deinit();
+    const path = test_tmp.path();
+    try native.storage().writeFileAbsolute(path, "old");
+
+    var memory: [80 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&memory);
+    var sink = try NativeStreamingAtomicWriteSink.create(bounded.allocator(), path, native.state);
+    var active = true;
+    defer if (active) sink.abort();
+    const chunk: [64 * 1024]u8 = @splat('a');
+    var crc = Crc32.init();
+    for (0..128) |_| {
+        try sink.appendSlice(&chunk);
+        crc.update(&chunk);
+    }
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), sink.len());
+    try std.testing.expectEqual(crc.final(), try sink.crc32Prefix(sink.len()));
+    const before = try native.storage().readFileAlloc(std.testing.allocator, path, 16);
+    defer std.testing.allocator.free(before);
+    try std.testing.expectEqualStrings("old", before);
+    active = false;
+    try sink.finish();
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), try native.storage().fileSize(path));
+
+    bounded.reset();
+    sink = try NativeStreamingAtomicWriteSink.create(bounded.allocator(), path, native.state);
+    active = true;
+    try sink.appendSlice("discarded");
+    active = false;
+    sink.abort();
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), try native.storage().fileSize(path));
+    const names = try native.storage().listFileNamesAlloc(std.testing.allocator, std.fs.path.dirname(path).?);
+    defer {
+        for (names) |name| std.testing.allocator.free(name);
+        std.testing.allocator.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings(std.fs.path.basename(path), names[0]);
 }

@@ -768,6 +768,7 @@ fn writeObjectAtomically(
         try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
     try durable_directory.sync(io, std.fs.path.dirname(path) orelse ".");
     try durable_directory.sync(io, std.fs.path.dirname(tmp_path) orelse ".");
+    try durable_directory.syncPublishedFile(io, path);
 }
 
 fn writeObjectFileAtomically(
@@ -843,6 +844,7 @@ fn writeObjectFileAtomically(
         try std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io);
     try durable_directory.sync(io, std.fs.path.dirname(path) orelse ".");
     try durable_directory.sync(io, std.fs.path.dirname(tmp_path) orelse ".");
+    try durable_directory.syncPublishedFile(io, path);
     return etag;
 }
 
@@ -1005,6 +1007,7 @@ fn renameFilePath(io: std.Io, source: []const u8, destination: []const u8) !void
         try std.Io.Dir.renameAbsolute(source, destination, io)
     else
         try std.Io.Dir.rename(std.Io.Dir.cwd(), source, std.Io.Dir.cwd(), destination, io);
+    try durable_directory.syncPublishedFile(io, destination);
 }
 
 fn computePartRange(total_len: usize, part_number: u32) !struct { start: usize, end: usize } {

@@ -90,6 +90,42 @@ pub fn sync(io: std.Io, path: []const u8) anyerror!void {
     try file.sync(io);
 }
 
+/// Windows publication also flushes the renamed file's metadata. Keep this
+/// through the caller's I/O authority so flush failures are observable. This
+/// supplements, rather than establishes, ancestor/directory durability.
+pub fn syncPublishedFile(io: std.Io, path: []const u8) !void {
+    if (comptime builtin.os.tag != .windows) return;
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    try file.sync(io);
+}
+
+test "Windows publication flush uses borrowed I/O and propagates failure after closing" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const State = struct {
+        closed: bool = false,
+        fn open(_: ?*anyopaque, _: std.Io.Dir, _: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (options.mode != .read_write) return error.AccessDenied;
+            return .{ .handle = @ptrFromInt(99), .flags = .{ .nonblocking = false } };
+        }
+        fn close(ptr: ?*anyopaque, _: []const std.Io.File) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr.?));
+            self.closed = true;
+        }
+        fn flush(_: ?*anyopaque, _: std.Io.File) std.Io.File.SyncError!void {
+            return error.InputOutput;
+        }
+    };
+    var state = State{};
+    var vtable = std.Io.failing.vtable.*;
+    vtable.dirOpenFile = State.open;
+    vtable.fileClose = State.close;
+    vtable.fileSync = State.flush;
+    const io = std.Io{ .userdata = &state, .vtable = &vtable };
+    try std.testing.expectError(error.InputOutput, syncPublishedFile(io, "published"));
+    try std.testing.expect(state.closed);
+}
+
 test "durable directory cache proves ancestor durability once and retries failed sync" {
     const State = struct {
         syncs: usize = 0,
