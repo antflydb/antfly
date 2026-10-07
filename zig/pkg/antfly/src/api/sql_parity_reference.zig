@@ -762,6 +762,40 @@ pub fn runInternalArrayQueries(alloc: std.mem.Allocator, handler: anytype) !void
         }
     }
     std.debug.print("SQL public internal-array query contracts: {d} passed; no original disposition credit\n", .{cases.len});
+    try runArrayResults(alloc, handler);
+}
+
+fn runArrayResults(alloc: std.mem.Allocator, handler: anytype) !void {
+    const sources = @import("antfly_local_sources");
+    const Case = struct { sql: []const u8, kind: sources.sql_array_value.ElementType, expected: ?[]const u8 };
+    for ([_]Case{
+        .{ .sql = "SELECT ARRAY[-9223372036854775808,NULL,9223372036854775807]::bigint[]", .kind = .int64, .expected = "{-9223372036854775808,NULL,9223372036854775807}" },
+        .{ .sql = "SELECT '[0:1][3:4]={{1,NULL},{3,4}}'::int4[]", .kind = .int32, .expected = "[0:1][3:4]={{1,NULL},{3,4}}" },
+        .{ .sql = "SELECT ARRAY[]::text[]", .kind = .text, .expected = "{}" },
+        .{ .sql = "SELECT NULL::int4[]", .kind = .int32, .expected = null },
+        .{ .sql = "SELECT ARRAY['null'::jsonb,NULL,'{\"a\":[1,2]}'::jsonb]::jsonb[]", .kind = .jsonb, .expected = "{\"null\",NULL,\"{\\\"a\\\":[1,2]}\"}" },
+        .{ .sql = "SELECT a FROM (SELECT ARRAY[1,NULL]::int2[] a UNION SELECT ARRAY[1,NULL]::int8[]) q ORDER BY 1", .kind = .int64, .expected = "{1,NULL}" },
+        .{ .sql = "SELECT a,row_number() OVER (ORDER BY cardinality(a)) FROM (SELECT ARRAY[1,NULL]::int4[] a) q", .kind = .int32, .expected = "{1,NULL}" },
+    }) |entry| {
+        const case: fixtures.Corpus.Case = .{ .id = "array-result-contract", .name = entry.sql, .family = "array", .sql = entry.sql, .params = &.{}, .source_expectation = "success" };
+        const response = try execute(alloc, handler, &case);
+        defer response.deinit();
+        const result = response.value;
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(wire.SQLColumnType.array, result.columns[0].type);
+        try std.testing.expectEqualStrings(@tagName(entry.kind), @tagName(result.columns[0].element_type.?));
+        const cell = result.rows[0][0];
+        const flag = result.sql_nulls.?[0][0];
+        if (entry.expected) |text| {
+            try std.testing.expect(!flag);
+            var actual = try sources.sql_array_wire.decode(alloc, entry.kind, cell, .{});
+            defer actual.deinit();
+            var expected = try sources.sql_array_text.decode(alloc, entry.kind, text, .{});
+            defer expected.deinit();
+            var work: sources.sql_array_value.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(actual.value, &work));
+        } else try std.testing.expect(flag and cell == .null);
+    }
 }
 
 pub fn runReference(alloc: std.mem.Allocator, handler: anytype, case_ids: []const []const u8, reference_bytes: []const u8) !void {

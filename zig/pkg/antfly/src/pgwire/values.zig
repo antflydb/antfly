@@ -15,8 +15,9 @@
 
 const std = @import("std");
 const Type = @import("backend.zig").Type;
+const Column = @import("backend.zig").Column;
 
-pub fn oid(kind: Type) u32 {
+pub fn oid(kind: Type) !u32 {
     return switch (kind) {
         .boolean => 16,
         .integer => 20,
@@ -25,7 +26,36 @@ pub fn oid(kind: Type) u32 {
         .json => 3802,
         .uuid => 2950,
         .string, .unknown => 25,
+        .array => error.UnsupportedParameterType,
     };
+}
+
+pub fn columnOid(column: Column) !u32 {
+    if (column.type == .array) return (column.element_type orelse return error.InvalidResult).arrayOid();
+    return oid(column.type);
+}
+
+/// Array payloads are validated against the bound descriptor, never inferred
+/// from JSON shape. Only two flat buffers are retained transiently; text and
+/// JSONB payloads borrow the live result owner and stream directly to pgwire.
+pub fn encodeColumnInto(a: std.mem.Allocator, writer: *std.Io.Writer, column: Column, format: u16, value: std.json.Value, wire_bytes: usize) !void {
+    if (format > 1) return error.UnsupportedResultFormat;
+    if (column.type != .array) {
+        var size: std.Io.Writer.Discarding = .init(&.{});
+        try encodeInto(a, &size.writer, column.type, format, value);
+        if (size.count > wire_bytes) return error.ProgramLimitExceeded;
+        return encodeInto(a, writer, column.type, format, value);
+    }
+    const sources = @import("antfly_local_sources");
+    // Envelope bytes and PostgreSQL output bytes are different formats. A
+    // small binary result must not be rejected because its JSON metadata is
+    // larger than the frame allowance. Admission below bounds actual output.
+    var view = try sources.sql_array_wire.decodeBorrowed(a, column.element_type orelse return error.InvalidResult, value, .{});
+    defer view.deinit();
+    if (format == 0)
+        try sources.sql_array_text.encode(view.value, writer, .{ .wire_bytes = wire_bytes })
+    else
+        try sources.sql_array_binary.encode(view.value, writer, .{ .wire_bytes = wire_bytes });
 }
 
 pub fn fromOid(value: u32) !Type {
@@ -151,6 +181,7 @@ pub fn integer(value: std.json.Value) !i64 {
 }
 
 pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json.Value) ![]const u8 {
+    if (kind == .array) return error.InvalidResult;
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) return switch (kind) {
         .boolean => if (value == .bool) try alloc.dupe(u8, if (value.bool) "t" else "f") else error.InvalidResult,
@@ -164,6 +195,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
         else => if (value == .string) try alloc.dupe(u8, value.string) else try std.json.Stringify.valueAlloc(alloc, value, .{}),
     };
     return switch (kind) {
+        .array => error.InvalidResult,
         .boolean => if (value == .bool) try alloc.dupe(u8, &.{@intFromBool(value.bool)}) else error.InvalidResult,
         .integer => try encodeInteger(alloc, try integer(value)),
         .number => blk: {
@@ -198,6 +230,7 @@ pub fn encode(alloc: std.mem.Allocator, kind: Type, format: u16, value: std.json
 /// Append a cell directly to a reusable DataRow buffer. Primitive and JSON
 /// values require no intermediate encoded allocation.
 pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, format: u16, value: std.json.Value) !void {
+    if (kind == .array) return error.InvalidResult;
     if (format > 1) return error.UnsupportedResultFormat;
     if (format == 0) {
         switch (kind) {
@@ -222,6 +255,7 @@ pub fn encodeInto(a: std.mem.Allocator, writer: *std.Io.Writer, kind: Type, form
         return;
     }
     switch (kind) {
+        .array => return error.InvalidResult,
         .boolean => {
             if (value != .bool) return error.InvalidResult;
             try writer.writeByte(@intFromBool(value.bool));
@@ -379,4 +413,46 @@ test "pgwire direct cell encoding matches allocated text and binary formats" {
         try encodeInto(a, &out.writer, case.kind, format, case.value);
         try std.testing.expectEqualSlices(u8, expected, out.written());
     };
+}
+
+test "pgwire array columns retain element OIDs and lossless text and binary payloads" {
+    const sources = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    const Case = struct { kind: sources.sql_array_value.ElementType, oid: u32, input: []const u8 };
+    for ([_]Case{
+        .{ .kind = .text, .oid = 1009, .input = "[0:2]={\"NULL\",NULL,\"a\\\"b\\\\c\"}" },
+        .{ .kind = .int16, .oid = 1005, .input = "{-32768,NULL,32767}" },
+        .{ .kind = .int32, .oid = 1007, .input = "{-2147483648,NULL,2147483647}" },
+        .{ .kind = .int64, .oid = 1016, .input = "{-9223372036854775808,NULL,9223372036854775807}" },
+        .{ .kind = .float32, .oid = 1021, .input = "{NaN,Infinity,-Infinity,NULL,1.5}" },
+        .{ .kind = .float64, .oid = 1022, .input = "{NaN,Infinity,-Infinity,NULL,1.5}" },
+        .{ .kind = .boolean, .oid = 1000, .input = "{t,NULL,f}" },
+        .{ .kind = .uuid, .oid = 2951, .input = "{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11,NULL}" },
+        .{ .kind = .jsonb, .oid = 3807, .input = "{\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}" },
+    }) |case| {
+        var owner: std.heap.ArenaAllocator = .init(a);
+        defer owner.deinit();
+        var value = try sources.sql_array_text.decode(a, case.kind, case.input, .{});
+        defer value.deinit();
+        const envelope = try sources.sql_array_wire.toJsonLeaky(owner.allocator(), value.value, .{});
+        const column: Column = .{ .name = "items", .type = .array, .element_type = case.kind };
+        try std.testing.expectEqual(case.oid, try columnOid(column));
+        for ([_]u16{ 0, 1 }) |format| {
+            var expected: std.Io.Writer.Allocating = .init(a);
+            defer expected.deinit();
+            if (format == 0) try sources.sql_array_text.encode(value.value, &expected.writer, .{}) else try sources.sql_array_binary.encode(value.value, &expected.writer, .{});
+            var actual: std.Io.Writer.Allocating = .init(a);
+            defer actual.deinit();
+            try encodeColumnInto(a, &actual.writer, column, format, envelope, 8 * 1024 * 1024);
+            try std.testing.expectEqualSlices(u8, expected.written(), actual.written());
+            actual.writer.end = 0;
+            try std.testing.expectError(error.InvalidResult, encodeColumnInto(a, &actual.writer, .{ .name = "items", .type = .array }, format, envelope, 1024));
+            try std.testing.expectEqual(@as(usize, 0), actual.written().len);
+            try std.testing.expectError(error.SqlProgramLimitExceeded, encodeColumnInto(a, &actual.writer, column, format, envelope, 1));
+            try std.testing.expectEqual(@as(usize, 0), actual.written().len);
+        }
+    }
+    try std.testing.expectError(error.UnsupportedParameterType, oid(.array));
+    try std.testing.expectError(error.InvalidResult, columnOid(.{ .name = "missing", .type = .array }));
+    try std.testing.expectError(error.UnsupportedParameterType, fromOid(1016));
 }

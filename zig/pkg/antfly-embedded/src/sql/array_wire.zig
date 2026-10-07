@@ -167,6 +167,26 @@ fn dimensionInteger(raw: Json) !i64 {
 /// An allocation-free validation pass rejects malformed envelopes before any
 /// cell/payload storage is retained. Every retained payload is then cloned.
 pub fn decodeLeaky(a: A, kind: arrays.ElementType, input: Json, options: Options) !arrays.Value {
+    return decodeCells(true, a, kind, input, options);
+}
+
+/// The cell/axis buffers are owned; text and JSONB payloads borrow the pinned
+/// input envelope. Suitable for immediate transport encoding, not retention.
+pub const Borrowed = struct {
+    value: arrays.Value,
+    allocator: A,
+    pub fn deinit(self: *Borrowed) void {
+        self.allocator.free(self.value.dimensions);
+        self.allocator.free(self.value.elements);
+        self.* = undefined;
+    }
+};
+
+pub fn decodeBorrowed(a: A, kind: arrays.ElementType, input: Json, options: Options) !Borrowed {
+    return .{ .value = try decodeCells(false, a, kind, input, options), .allocator = a };
+}
+
+fn decodeCells(comptime own_payloads: bool, a: A, kind: arrays.ElementType, input: Json, options: Options) !arrays.Value {
     if (input != .object or input.object.count() != 3) return error.InvalidSqlArrayShape;
     const axes = try arrayField(input.object, "dimensions");
     const values = try arrayField(input.object, "values");
@@ -207,7 +227,11 @@ pub fn decodeLeaky(a: A, kind: arrays.ElementType, input: Json, options: Options
     try std.json.Stringify.value(input, .{}, &wire_size.writer);
     if (wire_size.count > options.wire_bytes or wire_size.count > work.remaining / 2) return error.SqlProgramLimitExceeded;
     const cells = try a.alloc(arrays.Element, values.len);
-    for (values, nulls, cells) |raw, flag, *cell| cell.* = try operators.cloneDatum(a, try readElement(kind, raw, flag.bool));
+    errdefer if (!own_payloads) a.free(cells);
+    for (values, nulls, cells) |raw, flag, *cell| {
+        const decoded = try readElement(kind, raw, flag.bool);
+        cell.* = if (own_payloads) try operators.cloneDatum(a, decoded) else decoded;
+    }
     const owned_dimensions = try a.dupe(arrays.Dimension, dimensions[0..axes.len]);
     return .{ .element_type = kind, .dimensions = owned_dimensions, .elements = cells };
 }
@@ -227,6 +251,25 @@ pub fn decode(backing: A, kind: arrays.ElementType, input: Json, options: Option
 
 fn quotaError(budget: *MemoryBudget, err: anyerror) anyerror {
     return if (err == error.OutOfMemory and budget.exhausted) error.SqlProgramLimitExceeded else err;
+}
+
+test "SQL borrowed array envelopes preserve pinned payloads and unwind both flat allocations" {
+    const Faults = struct {
+        fn run(a: A, input: Json) !void {
+            var view = try decodeBorrowed(a, .jsonb, input, .{});
+            defer view.deinit();
+            const values = input.object.get("values").?.array.items;
+            try std.testing.expect(view.value.elements[2].value.object.keys().ptr == values[2].object.keys().ptr);
+            try std.testing.expect(!view.value.elements[0].sql_null and view.value.elements[1].sql_null);
+        }
+    };
+    const a = std.testing.allocator;
+    var owner: std.heap.ArenaAllocator = .init(a);
+    defer owner.deinit();
+    var original = try @import("array_text.zig").decode(a, .jsonb, "{\"null\",NULL,\"{\\\"a\\\":[1,2]}\"}", .{});
+    defer original.deinit();
+    const input = try toJsonLeaky(owner.allocator(), original.value, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Faults.run, .{input});
 }
 
 test "SQL array envelope matches PostgreSQL binary values without losing bounds or NULL provenance" {

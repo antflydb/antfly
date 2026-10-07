@@ -60,11 +60,18 @@ test "SQL ordered-set execution preserves grouped namespaces and shares compatib
         defer std.testing.allocator.free(actual);
         try std.testing.expectEqualStrings(case.rows, actual);
     }
-    // Public array results remain a separate typed protocol boundary, not a
-    // JSON-array approximation. Internal arrays can feed scalar SQL outputs.
+    // Public array results retain their element descriptor and SQL-null flags;
+    // they are not approximated by untyped JSON arrays.
     var array = try compiler.compile(std.testing.allocator, "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .{});
     defer array.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &array, &.{}, .{}));
+    var array_result = try runtime.execute(std.testing.allocator, backend.backend(), &array, &.{}, .{});
+    defer array_result.deinit();
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_array_value.ElementType.float64, array_result.output.columns[0].element_type.?);
+    const envelope = array_result.output.rows[0][0];
+    const values = envelope.object.get("values").?.array.items;
+    try std.testing.expectEqual(@as(f64, 1.5), values[0].float);
+    try std.testing.expectEqual(@as(f64, 2.5), values[2].float);
+    try std.testing.expect(envelope.object.get("sql_nulls").?.array.items[1].bool);
     const invalid = [_]struct { sql: []const u8, code: []const u8 }{
         .{ .sql = "SELECT COUNT(*) WITHIN GROUP (ORDER BY 1)", .code = "42809" },
         .{ .sql = "SELECT percentile_cont(0.5)", .code = "42883" },

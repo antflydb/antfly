@@ -1500,6 +1500,63 @@ class PostgresReferenceTest(unittest.TestCase):
                         )
                 self.assertEqual("22003", error.exception.sqlstate)
 
+    def test_public_array_result_producer_contracts(self):
+        # Native and mounted HTTP tests run these producer shapes. The oracle
+        # independently proves the expected element OID, bounds and NULL value.
+        cases = [
+            (
+                "SELECT ARRAY[-9223372036854775808,NULL,9223372036854775807]::bigint[]",
+                "bigint",
+                1016,
+                "{-9223372036854775808,NULL,9223372036854775807}",
+            ),
+            (
+                "SELECT '[0:1][3:4]={{1,NULL},{3,4}}'::int4[]",
+                "int4",
+                1007,
+                "[0:1][3:4]={{1,NULL},{3,4}}",
+            ),
+            ("SELECT ARRAY[]::text[]", "text", 1009, "{}"),
+            ("SELECT NULL::int4[]", "int4", 1007, None),
+            (
+                "SELECT ARRAY['null'::jsonb,NULL,'{\"a\":[1,2]}'::jsonb]::jsonb[]",
+                "jsonb",
+                3807,
+                r'{"null",NULL,"{\"a\":[1,2]}"}',
+            ),
+            (
+                "SELECT a FROM (SELECT ARRAY[1,NULL]::int2[] a UNION SELECT ARRAY[1,NULL]::int8[]) q ORDER BY 1",
+                "int8",
+                1016,
+                "{1,NULL}",
+            ),
+            (
+                "SELECT a FROM (VALUES(ARRAY[1,NULL]::int2[]),(ARRAY[1,NULL]::float8[])) q(a) LIMIT 1",
+                "float8",
+                1022,
+                "{1,NULL}",
+            ),
+            (
+                "SELECT a,row_number() OVER (ORDER BY cardinality(a)) FROM (SELECT ARRAY[1,NULL]::int4[] a) q",
+                "int4",
+                1007,
+                "{1,NULL}",
+            ),
+            ("SELECT (SELECT ARRAY[1,NULL]::int4[])", "int4", 1007, "{1,NULL}"),
+        ]
+        for sql, kind, oid, expected in cases:
+            with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                cursor = self.db.execute(sql)
+                self.assertEqual(oid, cursor.description[0].type_code)
+                self.assertEqual(1, len(cursor.fetchall()))
+                self.assertEqual(
+                    (True,),
+                    self.db.execute(
+                        f"SELECT a IS NOT DISTINCT FROM %s::{kind}[] FROM ({sql}) q(a)",
+                        (expected,),
+                    ).fetchone(),
+                )
+
     def test_typed_array_streamed_text_output_contracts(self):
         # These exact byte strings are also asserted against the native
         # streaming encoder. PostgreSQL independently decodes their escaping,

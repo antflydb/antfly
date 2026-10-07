@@ -18,8 +18,12 @@
 //! Parameters remain typed values, never interpolated into SQL text.
 const std = @import("std");
 
-pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, unknown };
-pub const Column = struct { name: []const u8, type: Type };
+pub const Type = enum { string, uuid, integer, number, boolean, datetime, json, array, unknown };
+pub const Column = struct {
+    name: []const u8,
+    type: Type,
+    element_type: ?@import("antfly_local_sources").sql_array_value.ElementType = null,
+};
 pub const TransactionStatus = enum(u8) { idle = 'I', in_transaction = 'T', failed = 'E' };
 
 pub const Identity = struct {

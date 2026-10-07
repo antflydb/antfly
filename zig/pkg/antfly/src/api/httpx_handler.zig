@@ -5951,10 +5951,15 @@ pub const AntflyApiHandler = struct {
             return err;
         };
         defer ctx.allocator.free(columns);
-        for (result.output.columns, columns) |column, *output| output.* = .{ .name = column.name, .type = switch (column.type) {
-            .array => return error.UnsupportedSqlShape,
-            inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
-        } };
+        for (result.output.columns, columns) |column, *output| output.* = .{
+            .name = column.name,
+            .type = switch (column.type) {
+                inline else => |kind| @field(sql_wire.SQLColumnType, @tagName(kind)),
+            },
+            .element_type = if (column.type == .array) switch (column.element_type orelse return error.InvalidSqlBackendResponse) {
+                inline else => |kind| @field(sql_wire.SQLArrayElementType, @tagName(kind)),
+            } else null,
+        };
         const output: sql_wire.SQLResponse = .{
             .columns = columns,
             .rows = result.output.rows,
@@ -14332,6 +14337,42 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
             .cancel_requested = &canceled,
         };
+        for ([_][]const u8{
+            "SELECT ARRAY[1,NULL,9223372036854775807]::bigint[]",
+            "SELECT '[0:2]={\"null\",NULL,\"{\\\"x\\\":[1,2]}\"}'::jsonb[]",
+            "SELECT ARRAY[]::text[]",
+            "SELECT NULL::int4[]",
+        }) |sql| {
+            var array_arena: std.heap.ArenaAllocator = .init(alloc);
+            defer array_arena.deinit();
+            const array_alloc = array_arena.allocator();
+            var array_request = request;
+            array_request.statement = sql;
+            const description = try wire_backend.vtable.describe(wire_backend.context, array_alloc, credential, array_request);
+            try std.testing.expectEqual(@import("../pgwire/backend.zig").Type.array, description.columns[0].type);
+            try std.testing.expect(description.columns[0].element_type != null);
+            var result = try wire_backend.vtable.execute(wire_backend.context, array_alloc, credential, array_request);
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+            const column = result.columns[0];
+            try std.testing.expectEqual(description.columns[0].element_type, column.element_type);
+            try std.testing.expectEqual(try @import("../pgwire/values.zig").columnOid(description.columns[0]), try @import("../pgwire/values.zig").columnOid(column));
+            if (result.sql_nulls.?[0][0]) {
+                try std.testing.expect(result.rows[0][0] == .null);
+                continue;
+            }
+            for ([_]u16{ 0, 1 }) |format| {
+                var output: std.Io.Writer.Allocating = .init(alloc);
+                defer output.deinit();
+                try @import("../pgwire/values.zig").encodeColumnInto(alloc, &output.writer, column, format, result.rows[0][0], 8 * 1024 * 1024);
+                var decoded = if (format == 0) try @import("antfly_local_sources").sql_array_text.decode(alloc, column.element_type.?, output.written(), .{}) else try @import("antfly_local_sources").sql_array_binary.decode(alloc, column.element_type.?, output.written(), .{});
+                defer decoded.deinit();
+                var expected = try @import("antfly_local_sources").sql_array_wire.decode(alloc, column.element_type.?, result.rows[0][0], .{});
+                defer expected.deinit();
+                var work: @import("antfly_local_sources").sql_array_value.Budget = .{};
+                try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(decoded.value, &work));
+            }
+        }
         {
             const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;
             defer stream.close(stream.context);

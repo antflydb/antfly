@@ -187,6 +187,7 @@ pub const sql_bound_scalars = @import("sql/bound_scalars.zig");
 pub const sql_replay_rows = @import("sql/replay_rows.zig");
 pub const sql_array_value = @import("sql/array_value.zig");
 pub const sql_array_binary = @import("sql/array_binary.zig");
+pub const sql_array_text = @import("sql/array_text.zig");
 pub const sql_array_wire = @import("sql/array_wire.zig");
 pub const sql_schema_ddl = @import("sql/schema_ddl.zig");
 pub const sql_session = @import("sql/session.zig");

@@ -54,14 +54,6 @@ pub const Column = struct {
     }
 };
 
-// The public protocol needs element OIDs and a lossless array value envelope
-// before array-valued result columns can be published. Scalar expressions
-// consuming arrays do not need that envelope and remain executable.
-fn publicKind(kind: ?ast.ColumnType) !ast.ColumnType {
-    if (kind == .array) return error.UnsupportedSqlShape;
-    return kind orelse .string;
-}
-
 fn internalKind(kind: ?ast.ColumnType) ast.ColumnType {
     return kind orelse .string;
 }
@@ -197,7 +189,7 @@ fn typedValuesSource(allocator: std.mem.Allocator, source: *const ast.Select, in
 /// execution reuses binding.table instead of resolving another schema epoch.
 pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) anyerror!BoundStatement {
     const result = try bindInternal(allocator, backend, compiled, explicit_parameter_types);
-    for (result.columns) |column| _ = try publicKind(column.type);
+    for (result.columns) |column| if (column.type == .array and column.element_type == null) return error.SqlTypeMismatch;
     return result;
 }
 

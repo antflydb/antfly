@@ -145,12 +145,13 @@ test "SQL typed array rows survive scalar join and grouped relation adapters" {
             }
             var array_output = try @import("compiler.zig").compile(a, "SELECT a FROM items", .{});
             defer array_output.deinit();
-            var unexpected = @import("runtime.zig").execute(a, backend, &array_output, &.{}, .{}) catch |err| {
-                if (err == error.UnsupportedSqlShape) return;
-                return err;
-            };
-            defer unexpected.deinit();
-            return error.TestExpectedError;
+            var result = try @import("runtime.zig").execute(a, backend, &array_output, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+            const envelope = result.output.rows[0][0];
+            try std.testing.expectEqualStrings("9007199254740993", envelope.object.get("values").?.array.items[0].string);
+            try std.testing.expect(envelope.object.get("sql_nulls").?.array.items[1].bool);
+            try std.testing.expectEqual(@as(i64, -3), envelope.object.get("dimensions").?.array.items[0].object.get("lower_bound").?.integer);
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
@@ -201,6 +202,45 @@ test "SQL typed blocking query boundaries unwind allocation failures" {
         }
     };
     for ([_]bool{ false, true }) |with_io| try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{with_io});
+}
+
+test "SQL public array results preserve descriptors through constant set window and scalar paths" {
+    const arrays = @import("array_value.zig");
+    const Case = struct { sql: []const u8, kind: arrays.ElementType, expected: ?[]const u8 };
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |with_io| for ([_]Case{
+        .{ .sql = "SELECT ARRAY[-9223372036854775808,NULL,9223372036854775807]::bigint[]", .kind = .int64, .expected = "{-9223372036854775808,NULL,9223372036854775807}" },
+        .{ .sql = "SELECT '[0:1][3:4]={{1,NULL},{3,4}}'::int4[]", .kind = .int32, .expected = "[0:1][3:4]={{1,NULL},{3,4}}" },
+        .{ .sql = "SELECT ARRAY[]::text[]", .kind = .text, .expected = "{}" },
+        .{ .sql = "SELECT NULL::int4[]", .kind = .int32, .expected = null },
+        .{ .sql = "SELECT ARRAY['null'::jsonb,NULL,'{\"a\":[1,2]}'::jsonb]::jsonb[]", .kind = .jsonb, .expected = "{\"null\",NULL,\"{\\\"a\\\":[1,2]}\"}" },
+        .{ .sql = "SELECT a FROM (SELECT ARRAY[1,NULL]::int2[] a UNION SELECT ARRAY[1,NULL]::int8[]) q ORDER BY 1", .kind = .int64, .expected = "{1,NULL}" },
+        .{ .sql = "SELECT a FROM (VALUES(ARRAY[1,NULL]::int2[]),(ARRAY[1,NULL]::float8[])) q(a) LIMIT 1", .kind = .float64, .expected = "{1,NULL}" },
+        .{ .sql = "SELECT a,row_number() OVER (ORDER BY cardinality(a)) FROM (SELECT ARRAY[1,NULL]::int4[] a) q", .kind = .int32, .expected = "{1,NULL}" },
+        .{ .sql = "SELECT (SELECT ARRAY[1,NULL]::int4[])", .kind = .int32, .expected = "{1,NULL}" },
+    }) |entry| {
+        var fixture: SetTestBackend = .{};
+        var backend = fixture.backend();
+        backend.execution_io = if (with_io) std.testing.io else null;
+        var compiled = try @import("compiler.zig").compile(a, entry.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+        try std.testing.expectEqual(@import("ast.zig").ColumnType.array, result.output.columns[0].type);
+        try std.testing.expectEqual(entry.kind, result.output.columns[0].element_type.?);
+        const cell = result.output.rows[0][0];
+        const flag = result.output.sql_nulls.?[0][0];
+        if (entry.expected) |text| {
+            try std.testing.expect(!flag);
+            var decoded = try @import("array_wire.zig").decode(a, entry.kind, cell, .{});
+            defer decoded.deinit();
+            var expected = try @import("array_text.zig").decode(a, entry.kind, text, .{});
+            defer expected.deinit();
+            var work: arrays.Budget = .{};
+            try std.testing.expectEqual(std.math.Order.eq, try expected.value.compare(decoded.value, &work));
+        } else try std.testing.expect(flag and cell == .null);
+    };
 }
 
 test "SQL common array types are applied before pairwise set identity and VALUES emission" {

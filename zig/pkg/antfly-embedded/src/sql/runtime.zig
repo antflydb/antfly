@@ -2357,9 +2357,15 @@ test "SQL array scalar contracts execute without catalog or storage access" {
             else => return error.InvalidArrayScalarFixture,
         }
     }
-    var unsupported = try compiler.compile(std.testing.allocator, "SELECT ARRAY[1, NULL]", .{});
-    defer unsupported.deinit();
-    try std.testing.expectError(error.UnsupportedSqlShape, execute(std.testing.allocator, iface, &unsupported, &.{}, .{}));
+    var array_query = try compiler.compile(std.testing.allocator, "SELECT ARRAY[1, NULL]", .{});
+    defer array_query.deinit();
+    var array_result = try execute(std.testing.allocator, iface, &array_query, &.{}, .{});
+    defer array_result.deinit();
+    try std.testing.expectEqual(ast.ColumnType.array, array_result.output.columns[0].type);
+    try std.testing.expectEqual(@import("array_value.zig").ElementType.int32, array_result.output.columns[0].element_type.?);
+    const envelope = array_result.output.rows[0][0];
+    try std.testing.expectEqualStrings("1", envelope.object.get("values").?.array.items[0].string);
+    try std.testing.expect(envelope.object.get("sql_nulls").?.array.items[1].bool);
     try std.testing.expectEqual(@as(usize, 0), backend.pages);
     try std.testing.expectEqual(@as(usize, 0), backend.writes);
 }

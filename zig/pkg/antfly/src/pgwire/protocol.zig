@@ -703,7 +703,7 @@ pub const Session = struct {
                 if (count > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
                 for (oids, description.parameter_types, 0..) |*oid, kind, index| {
-                    oid.* = if (index < declared.len and declared[index] != 0) declared[index] else values.oid(kind);
+                    oid.* = if (index < declared.len and declared[index] != 0) declared[index] else try values.oid(kind);
                 }
                 const owned_statement = try a.dupe(u8, statement);
                 const owned_name = try self.alloc.dupe(u8, name);
@@ -885,7 +885,7 @@ pub const Session = struct {
                 const description = try self.describe(a, prepare.statement, prepare.types);
                 if (prepare.types.len > description.parameter_types.len) return error.InvalidParameter;
                 const oids = try a.alloc(u32, description.parameter_types.len);
-                for (oids, description.parameter_types) |*oid, kind| oid.* = values.oid(kind);
+                for (oids, description.parameter_types) |*oid, kind| oid.* = try values.oid(kind);
                 const sql = try a.dupe(u8, prepare.statement);
                 const name = try self.alloc.dupe(u8, prepare.name);
                 errdefer self.alloc.free(name);
@@ -1438,7 +1438,7 @@ pub const Session = struct {
             try bytes.writer.writeByte(0);
             try bytes.writer.writeInt(u32, 0, .big);
             try bytes.writer.writeInt(u16, 0, .big);
-            try bytes.writer.writeInt(u32, values.oid(column.type), .big);
+            try bytes.writer.writeInt(u32, try values.columnOid(column), .big);
             try bytes.writer.writeInt(i16, values.typeSize(column.type), .big);
             try bytes.writer.writeInt(i32, -1, .big);
             try bytes.writer.writeInt(u16, formatAt(formats, index), .big);
@@ -1459,6 +1459,10 @@ pub const Session = struct {
         if (null_flags) |flags| if (flags.len != row.len) return error.InvalidResult;
         try bytes.writer.writeInt(u16, @intCast(row.len), .big);
         for (row, columns, 0..) |value, column, index| {
+            const payload_limit = self.limits.frame_bytes -| 4;
+            const remaining_headers = (row.len - index) * 4;
+            if (bytes.written().len > payload_limit or remaining_headers > payload_limit - bytes.written().len) return error.ProgramLimitExceeded;
+            const cell_limit = payload_limit - bytes.written().len - remaining_headers;
             const sql_null = if (null_flags) |flags| flags[index] else value == .null;
             if (sql_null) {
                 if (value != .null) return error.InvalidResult;
@@ -1467,7 +1471,7 @@ pub const Session = struct {
             }
             const position = bytes.written().len;
             try bytes.writer.writeInt(i32, 0, .big);
-            try values.encodeInto(self.alloc, &bytes.writer, column.type, formatAt(formats, index), value);
+            try values.encodeColumnInto(self.alloc, &bytes.writer, column, formatAt(formats, index), value, cell_limit);
             const length = bytes.written().len - position - 4;
             if (length > self.limits.frame_bytes -| 4 or length > std.math.maxInt(i32)) return error.ProgramLimitExceeded;
             std.mem.writeInt(i32, bytes.writer.buffer[position..][0..4], @intCast(length), .big);
@@ -1520,8 +1524,19 @@ fn cloneColumns(alloc: std.mem.Allocator, columns: []const backend.Column) ![]co
 }
 fn columnsEqual(a: []const backend.Column, b: []const backend.Column) bool {
     if (a.len != b.len) return false;
-    for (a, b) |left, right| if (left.type != right.type or !std.mem.eql(u8, left.name, right.name)) return false;
+    for (a, b) |left, right| if (left.type != right.type or left.element_type != right.element_type or !std.mem.eql(u8, left.name, right.name)) return false;
     return true;
+}
+
+test "pgwire result shape fences array element identity across prepared and cursor pages" {
+    const int4 = [_]backend.Column{.{ .name = "items", .type = .array, .element_type = .int32 }};
+    const int8 = [_]backend.Column{.{ .name = "items", .type = .array, .element_type = .int64 }};
+    const missing = [_]backend.Column{.{ .name = "items", .type = .array }};
+    const json = [_]backend.Column{.{ .name = "items", .type = .json }};
+    try std.testing.expect(columnsEqual(&int4, &int4));
+    try std.testing.expect(!columnsEqual(&int4, &int8));
+    try std.testing.expect(!columnsEqual(&int4, &missing));
+    try std.testing.expect(!columnsEqual(&int4, &json));
 }
 
 fn sqlstate(err: anyerror) []const u8 {

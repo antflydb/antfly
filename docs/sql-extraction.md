@@ -3634,3 +3634,42 @@ complete. Array parameters and native stored-array columns still need their
 typed ingress/storage contracts; this change does not reinterpret document
 JSON arrays as SQL arrays. No original inventory case is credited by these
 architecture-only changes.
+
+### Public array result activation (2026-10-07)
+
+Array-valued result columns now cross the typed public boundary with explicit
+element descriptors. Pgwire describe, retained execution and streaming metadata
+retain that descriptor and advertise its exact PostgreSQL array OID. Both text
+and binary DataRow encoders use the descriptor rather than guessing from JSON.
+NULL arrays use the ordinary outer NULL framing; empty arrays and JSONB-null
+elements remain independently representable.
+
+Prepared/cursor shape checks include element identity, not only column names
+and coarse `array` type, preventing an element-OID change across execution or
+resumed pages. DataRow admission reserves all remaining cell length headers
+and admits each payload against actual remaining frame space. Primitive/JSON
+cells preflight their encoded size as well. A two-array row regression proves
+individually fitting cells cannot publish an oversized combined frame.
+
+Immediate pgwire encoding validates a borrowed envelope view with two flat
+cell/axis buffers. Nested JSONB and text payloads remain pinned to the result
+owner instead of being cloned again. Allocation-failure tests unwind either
+buffer, and payload-pointer tests establish borrowing. Encoder quota checks
+bound the actual PostgreSQL payload independently of the differently sized JSON
+envelope, so compact binary arrays do not inherit a JSON-metadata frame limit.
+Array parameters still reject without a complete typed input descriptor rather
+than silently converting an array expression's JSON-null placeholder.
+
+Native contracts exercise constant, empty, NULL, multidimensional/non-default
+bound, JSONB, set/VALUES promotion, window and scalar-subquery outputs with and
+without execution I/O. Existing array-rejection tests are now positive value
+and ownership assertions, retaining allocation-failure coverage. Ordered-set
+percentile arrays also assert exact fractional values and SQL-null flags.
+Mounted HTTP contracts exercise generated metadata and envelope decoding; the
+authenticated native pgwire adapter exercises describe/execute and both output
+codecs. Protocol tests independently inspect RowDescription OIDs and DataRow
+lengths/payloads in simple-text and extended-binary sessions, including empty
+and NULL arrays. PostgreSQL independently proves the producer result types and
+logical values. These are architectural contracts, not additional original-case
+disposition credit. Typed array ingress, native stored-array columns and original
+source-case reconciliation remain unfinished.
