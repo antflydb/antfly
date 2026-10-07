@@ -518,7 +518,7 @@ const NativeAtomicWriteSink = struct {
         .crc32_prefix = crc32Prefix,
         .crc32_range = crc32Range,
         .finish = finish,
-        .finish_source = if (supports_mapped_artifacts) finishSource else null,
+        .finish_source = if (supports_mapped_artifacts or builtin.os.tag == .windows) finishSource else null,
         .finish_mapped = if (supports_mapped_artifacts) finishMapped else null,
         .abort = abort,
         .set_cache_intent = setCacheIntent,
@@ -2285,4 +2285,32 @@ test "lite artifact leases orphan service advances past live markers with bounde
     try std.testing.expectEqual(@as(usize, 64), try artifact.cleanupOrphans(&docs.file, &sweep));
     try std.testing.expectEqual(@as(usize, 1), try artifact.cleanupOrphans(&docs.file, &sweep));
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite atomic publication returns owned immutable source without requiring mapping" {
+    const a = std.testing.allocator;
+    var tmp = native_platform.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "published-source.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = native_platform.testing.io, .reclamation = .{ .enabled = false } });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    var store = Store.init(a, &docs);
+    const storage = store.storage();
+    var writer = try storage.beginAtomicWrite(a, "/published");
+    var active = true;
+    defer if (active) writer.abort();
+    try writer.appendSlice("original");
+    try std.testing.expect(writer.vtable.finish_source != null);
+    if (builtin.os.tag == .windows) try std.testing.expect(writer.vtable.finish_mapped == null);
+    active = false;
+    var source = try writer.vtable.finish_source.?(writer.ptr);
+    defer source.close();
+    try storage.writeFileAbsolute("/published", "replacement");
+    docs.close();
+    docs_open = false;
+    var bytes: [8]u8 = undefined;
+    try source.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("original", &bytes);
 }
