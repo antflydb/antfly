@@ -386,6 +386,68 @@ test "SQL flat array rejects truncated corrupt rank directories padding offsets 
     try std.testing.expectError(error.NonCanonicalSqlArrayStorage, layout.View.open(.jsonb, variable, .{}));
 }
 
+test "SQL flat JSONB stored arrays canonicalize in-memory and parsed numeric values identically" {
+    const a = std.testing.allocator;
+    const pairs = [_]struct { value: std.json.Value, token: ?[]const u8 }{
+        .{ .value = .{ .float = 1.0 }, .token = "1.00" },
+        .{ .value = .{ .integer = 1 }, .token = "10e-1" },
+        .{ .value = .{ .float = -0.0 }, .token = "0e999" },
+        .{ .value = .{ .float = 0.1 }, .token = "0.1000000000000000055511151231257827021181583404541015625" },
+        .{ .value = .{ .float = 1e30 }, .token = "1000000000000000019884624838656" },
+        .{ .value = .{ .float = @bitCast(@as(u64, 1)) }, .token = null },
+        .{ .value = .{ .float = std.math.floatMax(f64) }, .token = null },
+    };
+    for (pairs) |pair| {
+        const value = try arrays.Value.init(.jsonb, &.{.{ .length = 1 }}, &.{arrays.Element.json(pair.value)}, .{});
+        const left = try encodeAlloc(a, value, .{});
+        defer a.free(left);
+        if (pair.token) |token| {
+            const parsed = try arrays.Value.init(.jsonb, &.{.{ .length = 1 }}, &.{arrays.Element.json(.{ .number_string = token })}, .{});
+            const right = try encodeAlloc(a, parsed, .{});
+            defer a.free(right);
+            try std.testing.expectEqualSlices(u8, left, right);
+        }
+        _ = try validateCanonical(a, .jsonb, left, .{});
+        var decoded = try decode(a, .jsonb, left, .{});
+        defer decoded.deinit();
+        var work: arrays.Budget = .{};
+        try std.testing.expectEqual(std.math.Order.eq, try value.compare(decoded.value, &work));
+    }
+    try std.testing.expectError(error.InvalidJsonNumber, canonical_json.canonicalJsonValueAlloc(a, .{ .float = std.math.inf(f64) }));
+    try std.testing.expectError(error.InvalidJsonNumber, canonical_json.canonicalJsonValueAlloc(a, .{ .float = std.math.nan(f64) }));
+}
+
+test "SQL flat array logical hashes exclude dense compact representation choices" {
+    const a = std.testing.allocator;
+    var cells: [129]arrays.Element = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = if (i % 2 == 0) .{} else arrays.Element.json(.{ .integer = @intCast(i) });
+    const value = try arrays.Value.init(.int64, &.{.{ .length = 129, .lower = -3 }}, &cells, .{});
+    const compact = try encodeAlloc(a, value, .{});
+    defer a.free(compact);
+    const canonical = try layout.View.open(.int64, compact, .{});
+    try std.testing.expect(canonical.compact);
+    // Simulate another physical encoder. These dense bytes are intentionally
+    // not today's canonical format and must not pass the restore gate.
+    var prepared = try Prepared.init(a, value, .{});
+    defer prepared.deinit();
+    prepared.compact = false;
+    prepared.encoded_size = try layout.sectionSize(.int64, 1, cells.len);
+    const dense = try a.alloc(u8, prepared.encoded_size);
+    defer a.free(dense);
+    try prepared.writeInto(dense);
+    try std.testing.expectError(error.NonCanonicalSqlArrayStorage, layout.View.open(.int64, dense, .{}));
+    const alternate = try layout.View.openAuthenticated(.int64, dense, .{});
+    var left = std.crypto.hash.Blake3.init(.{});
+    var right = std.crypto.hash.Blake3.init(.{});
+    canonical.updateLogicalHash(&left);
+    alternate.updateLogicalHash(&right);
+    var left_digest: [32]u8 = undefined;
+    var right_digest: [32]u8 = undefined;
+    left.final(&left_digest);
+    right.final(&right_digest);
+    try std.testing.expectEqualSlices(u8, &left_digest, &right_digest);
+}
+
 test "SQL flat array primitive preparation uses one output allocation and cold shape projection stays bounded" {
     const a = std.testing.allocator;
     const count = 4096;

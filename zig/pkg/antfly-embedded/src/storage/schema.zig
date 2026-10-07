@@ -225,6 +225,9 @@ pub const RelationalColumnType = enum(u8) {
     /// Canonical little-endian IEEE-754 f32 payload. The vector length is
     /// derived from the payload and index contracts validate their dimensions.
     dense_vector = 9,
+    /// Schema-bound flat SQL array; sql_element_type is mandatory. This is
+    /// neither a JSON list nor an embedding vector.
+    sql_array = 10,
 };
 
 pub const RelationalJsonKind = enum(u8) {
@@ -286,7 +289,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 16;
+pub const storage_format_version: u32 = 17;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -372,6 +375,9 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     }
     if (format_version < 16) for (schema.relational_columns) |column| {
         if (column.sql_element_type != null) return error.UnsupportedVersion;
+    };
+    if (format_version < 17) for (schema.relational_columns) |column| {
+        if (column.column_type == .sql_array) return error.UnsupportedVersion;
     };
 
     var buf = std.ArrayListUnmanaged(u8).empty;
@@ -981,6 +987,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
                 7 => .geoshape,
                 8 => .json,
                 9 => .dense_vector,
+                10 => if (fmt_version >= 17) .sql_array else return error.UnsupportedVersion,
                 else => return error.InvalidSchema,
             };
             pos += 1;
@@ -1255,7 +1262,9 @@ fn validateSerializedSchema(data: []const u8) !void {
         for (0..column_count) |_| {
             try cursor.readStr();
             try cursor.readStr();
-            if ((try cursor.readU8()) >= std.meta.fieldNames(RelationalColumnType).len) return error.InvalidSchema;
+            const column_tag = try cursor.readU8();
+            if (column_tag >= std.meta.fieldNames(RelationalColumnType).len) return error.InvalidSchema;
+            if (column_tag == @backingInt(RelationalColumnType.sql_array) and format_version < 17) return error.UnsupportedVersion;
             try cursor.readBool();
             try cursor.readBool();
             try cursor.readBool();
@@ -1271,7 +1280,12 @@ fn validateSerializedSchema(data: []const u8) !void {
 }
 
 fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
+    for (schema.relational_columns) |column| if (column.column_type == .sql_array) {
+        if (schema.storage_mode != .relational or column.sql_element_type == null or column.is_json or column.json_kind != .none)
+            return error.InvalidSchema;
+    };
     for (schema.relational_columns) |column| if (column.sql_element_type) |kind| {
+        if (column.column_type == .sql_array) continue;
         const physical: RelationalColumnType = switch (kind) {
             .text, .uuid => .string,
             .int16, .int32, .int64 => .integer,
@@ -2807,6 +2821,42 @@ test "relational index system SQL schema identities survive durable round trips 
         defer alloc.free(untyped_projection);
         try std.testing.expectEqualSlices(u8, projection, untyped_projection);
     }
+}
+
+test "relational index system SQL array schemas require precise elements and format capability" {
+    const alloc = std.testing.allocator;
+    const Type = @import("../common/sql_builtin_type.zig").Type;
+    inline for (std.meta.tags(Type)) |kind| {
+        const column: RelationalColumn = .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = kind, .allows_null = true };
+        const table: TableSchema = .{ .version = 9, .storage_mode = .relational, .relational_columns = &.{column} };
+        const bytes = try serializeSchema(alloc, table);
+        defer alloc.free(bytes);
+        const decoded = try deserializeSchema(alloc, bytes);
+        defer freeSchema(alloc, decoded);
+        try std.testing.expect(try schemasEqual(alloc, table, decoded));
+        try std.testing.expectEqual(RelationalColumnType.sql_array, decoded.relational_columns[0].column_type);
+        try std.testing.expectEqual(kind, decoded.relational_columns[0].sql_element_type.?);
+        try std.testing.expectError(error.UnsupportedVersion, serializeSchemaFormat(alloc, table, 16));
+        const downgraded = try alloc.dupe(u8, bytes);
+        defer alloc.free(downgraded);
+        std.mem.writeInt(u32, downgraded[4..8], 16, .little);
+        try std.testing.expectError(error.UnsupportedVersion, deserializeSchema(alloc, downgraded));
+        var invalid = column;
+        invalid.sql_element_type = null;
+        try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{ .storage_mode = .relational, .relational_columns = &.{invalid} }));
+        invalid = column;
+        invalid.is_json = true;
+        invalid.json_kind = .array;
+        try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{ .storage_mode = .relational, .relational_columns = &.{invalid} }));
+        try std.testing.expectError(error.InvalidSchema, serializeSchema(alloc, .{ .storage_mode = .document, .relational_columns = &.{column} }));
+    }
+    // Deployed precise scalar schemas remain readable without rewriting them.
+    const scalar: TableSchema = .{ .storage_mode = .relational, .relational_columns = &.{.{ .name = "n", .path = "n", .column_type = .integer, .sql_element_type = .int16 }} };
+    const previous = try serializeSchemaFormat(alloc, scalar, 16);
+    defer alloc.free(previous);
+    const loaded = try deserializeSchema(alloc, previous);
+    defer freeSchema(alloc, loaded);
+    try std.testing.expect(try schemasEqual(alloc, scalar, loaded));
 }
 
 test "relational index system SQL schema rejects incompatible descriptors and malformed bytes" {

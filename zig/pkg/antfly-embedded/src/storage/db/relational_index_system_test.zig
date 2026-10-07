@@ -72,6 +72,59 @@ test "relational index system SQL precise schema publication upgrades catalog at
     try std.testing.expectEqual(@as(i64, 32767), parsed.value.object.get("n").?.integer);
 }
 
+test "relational index system SQL typed arrays survive LSM reopen and portable restore" {
+    const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
+    const storage_schema = @import("../schema.zig");
+    const wire = @import("../../sql/array_wire.zig");
+    var directory = try TestDirectory.init("sql-stored-array-reopen");
+    defer directory.cleanup();
+    var target_directory = try TestDirectory.init("sql-stored-array-portable");
+    defer target_directory.cleanup();
+    const array_schema: storage_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{
+        .{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64, .allows_null = true },
+        .{ .name = "j", .path = "j", .column_type = .sql_array, .sql_element_type = .jsonb, .allows_null = true },
+    } };
+    const json =
+        \\{"a":{"dimensions":[{"length":2,"lower_bound":-3}],"values":["9007199254740993",null],"sql_nulls":[false,true]},"j":{"dimensions":[{"length":2,"lower_bound":1}],"values":[null,null],"sql_nulls":[false,true]}}
+    ;
+    var archive = std.ArrayListUnmanaged(u8).empty;
+    defer archive.deinit(alloc);
+    {
+        var db = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+        defer db.close();
+        try db.setSchema(array_schema);
+        try db.batch(.{ .writes = &.{ .{ .key = "row", .value = json }, .{ .key = "null", .value = "{\"a\":null,\"j\":null}" }, .{ .key = "empty", .value = "{\"a\":{\"dimensions\":[],\"values\":[],\"sql_nulls\":[]}}" } } });
+        try @import("../portable_backup.zig").exportPortable(alloc, db.core.store, &archive);
+    }
+    var reopened = try db_mod.DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer reopened.close();
+    var restored = try db_mod.DB.open(alloc, target_directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false, .primary_backend = .{ .lsm = .{} } });
+    defer restored.close();
+    try restored.importPortableIntoEmpty(alloc, archive.items, @import("doc_identity.zig").default_namespace);
+    for ([_]*db_mod.DB{ &reopened, &restored }) |db| {
+        try std.testing.expectEqual(storage_schema.storage_format_version, db.core.table_catalog.schema_format_version);
+        try std.testing.expectEqual(storage_schema.RelationalColumnType.sql_array, db.core.schema.?.relational_columns[0].column_type);
+        const bytes = (try db.get(alloc, "row")).?;
+        defer alloc.free(bytes);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{ .parse_numbers = false });
+        defer parsed.deinit();
+        var a = try wire.decode(alloc, .int64, parsed.value.object.get("a").?, .{});
+        defer a.deinit();
+        try std.testing.expectEqual(@as(i64, 9007199254740993), a.value.elements[0].value.integer);
+        try std.testing.expectEqual(@as(i32, -3), a.value.dimensions[0].lower);
+        try std.testing.expect(a.value.elements[1].sql_null);
+        var j = try wire.decode(alloc, .jsonb, parsed.value.object.get("j").?, .{});
+        defer j.deinit();
+        try std.testing.expect(j.value.elements[0].value == .null and !j.value.elements[0].sql_null);
+        try std.testing.expect(j.value.elements[1].sql_null);
+        const empty = (try db.get(alloc, "empty")).?;
+        defer alloc.free(empty);
+        const null_row = (try db.get(alloc, "null")).?;
+        defer alloc.free(null_row);
+        try std.testing.expect(!std.mem.eql(u8, empty, null_row));
+    }
+}
+
 test "relational index system SQL public scalar schema survives LSM reopen and rejects domain reinterpretation" {
     const json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"n":{"type":"integer","x-antfly-sql-type":"int16"},"f":{"type":"number","x-antfly-sql-type":"float32"}},"additionalProperties":false}}}}

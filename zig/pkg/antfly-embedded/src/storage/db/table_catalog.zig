@@ -121,7 +121,7 @@ pub const Catalog = struct {
         // The preceding deployed schema format remains readable. Merely
         // opening an owner must not rewrite it or make all document tables
         // unavailable when precise SQL descriptors are introduced.
-        if ((catalog.schema_format_version != 15 and catalog.schema_format_version != schema_mod.storage_format_version) or
+        if ((catalog.schema_format_version < 15 or catalog.schema_format_version > schema_mod.storage_format_version) or
             catalog.row_format_version != row_codec.ordinal_version)
             return error.UnsupportedTableCapabilityVersion;
         return catalog;
@@ -137,6 +137,9 @@ pub const Catalog = struct {
                 return error.TableCatalogSchemaMismatch;
             if (self.schema_format_version < 16) for (schema.relational_columns) |column| {
                 if (column.sql_element_type != null) return error.UnsupportedTableCapabilityVersion;
+            };
+            if (self.schema_format_version < 17) for (schema.relational_columns) |column| {
+                if (column.column_type == .sql_array) return error.UnsupportedTableCapabilityVersion;
             };
             return;
         }
@@ -170,6 +173,19 @@ test "relational index system SQL catalog admits deployed schemas but fences pre
     var unsupported = raw;
     std.mem.writeInt(u32, unsupported[16..20], 14, .little);
     try std.testing.expectError(error.UnsupportedTableCapabilityVersion, Catalog.decode(&unsupported));
+}
+
+test "relational index system SQL array catalog capabilities cannot be downgraded" {
+    const array: schema_mod.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .int64 }} };
+    var catalog: Catalog = .{ .mode_initialized = true, .storage_mode = .relational, .active_schema_version = 1 };
+    try catalog.validateForSchema(array);
+    catalog.schema_format_version = 16;
+    const bytes = catalog.encode();
+    const deployed = try Catalog.decode(&bytes);
+    try std.testing.expectError(error.UnsupportedTableCapabilityVersion, deployed.validateForSchema(array));
+    var scalar = array;
+    scalar.relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .integer, .sql_element_type = .int64 }};
+    try deployed.validateForSchema(scalar);
 }
 
 test "table catalog has a stable canonical representation" {

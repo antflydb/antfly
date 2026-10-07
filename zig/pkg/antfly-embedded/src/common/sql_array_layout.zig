@@ -146,7 +146,10 @@ pub const View = struct {
     payload_start: usize,
     compact: bool,
 
-    pub fn open(kind: Kind, bytes: []const u8, limits: Limits) !View {
+    /// Only for canonical bytes admitted by the owning codec and protected by
+    /// row/page authentication. Checks extents in O(rank), not payload values
+    /// or checkpoint contents. Untrusted ingestion must use open instead.
+    pub fn openAuthenticated(kind: Kind, bytes: []const u8, limits: Limits) !View {
         const shape = try inspectShape(kind, bytes, limits);
         const rank = shape.rank;
         const count = shape.count;
@@ -156,7 +159,15 @@ pub const View = struct {
         }
         const bitmap_start = header_size + @as(usize, rank) * 8;
         const slots_start = bitmap_start + bitmapSize(count);
-        const view: View = .{ .kind = kind, .bytes = bytes, .rank = rank, .count = count, .bitmap_start = bitmap_start, .slots_start = slots_start, .payload_start = if (width(kind) == 0) minimum else slots_start + if (shape.compact) checkpointSize(count) else @as(usize, 0), .compact = shape.compact };
+        return .{ .kind = kind, .bytes = bytes, .rank = rank, .count = count, .bitmap_start = bitmap_start, .slots_start = slots_start, .payload_start = if (width(kind) == 0) minimum else slots_start + if (shape.compact) checkpointSize(count) else @as(usize, 0), .compact = shape.compact };
+    }
+
+    pub fn open(kind: Kind, bytes: []const u8, limits: Limits) !View {
+        const view = try openAuthenticated(kind, bytes, limits);
+        const count = view.count;
+        if (count == 0) return view;
+        const slots_start = view.slots_start;
+        const minimum = try sectionSize(kind, view.rank, count);
         if (count % 8 != 0) {
             const allowed: u8 = (@as(u8, 1) << @intCast(count % 8)) - 1;
             if (bytes[slots_start - 1] & ~allowed != 0) return error.NonCanonicalSqlArrayStorage;
@@ -209,6 +220,36 @@ pub const View = struct {
         if (axis >= self.rank) return error.SqlArraySubscriptOutOfRange;
         const at = header_size + axis * 8;
         return .{ .length = std.mem.readInt(u32, self.bytes[at..][0..4], .little), .lower = std.mem.readInt(i32, self.bytes[at + 4 ..][0..4], .little) };
+    }
+
+    /// Logical identity, deliberately independent of frame version, dense vs
+    /// compact slots, offsets and padding. JSONB bytes must have crossed the
+    /// owning codec's canonical validation gate before hashing.
+    pub fn updateLogicalHash(self: View, hasher: *std.crypto.hash.Blake3) void {
+        hasher.update("sql-array-logical-v1");
+        hasher.update(&.{ @backingInt(self.kind), self.rank });
+        var number: [8]u8 = undefined;
+        std.mem.writeInt(u64, &number, self.count, .little);
+        hasher.update(&number);
+        for (0..self.rank) |axis| {
+            const at = header_size + axis * 8;
+            hasher.update(self.bytes[at..][0..8]);
+        }
+        for (0..self.count) |i| {
+            const raw = self.cellUnchecked(i);
+            hasher.update(&.{@intFromBool(raw.sql_null)});
+            if (raw.sql_null) continue;
+            std.mem.writeInt(u64, &number, raw.bytes.len, .little);
+            hasher.update(&number);
+            // PostgreSQL equality identifies the two zero signs. Physical
+            // encoding preserves them, while semantic identity does not.
+            if ((self.kind == .float32 and std.mem.readInt(u32, raw.bytes[0..4], .little) & 0x7fffffff == 0) or
+                (self.kind == .float64 and std.mem.readInt(u64, raw.bytes[0..8], .little) & 0x7fffffffffffffff == 0))
+            {
+                @memset(&number, 0);
+                hasher.update(number[0..raw.bytes.len]);
+            } else hasher.update(raw.bytes);
+        }
     }
 
     pub fn cell(self: View, index: usize) !Cell {

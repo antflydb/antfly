@@ -232,25 +232,11 @@ fn decimal(value: Json, buffer: []u8, budget: *Budget) !Decimal {
     const text = switch (value) {
         .integer => |v| try std.fmt.bufPrint(buffer, "{d}", .{v}),
         .float => |v| {
-            if (!std.math.isFinite(v)) return error.SqlNumericOutOfRange;
-            if (v == 0) return .{ .negative = false, .magnitude = 0, .digits = "" };
-            const bits: u64 = @bitCast(v);
-            const raw_exponent = (bits >> 52) & 0x7ff;
-            var mantissa: u64 = bits & 0xfffffffffffff;
-            if (raw_exponent != 0) mantissa |= 1 << 52;
-            var exponent: i32 = if (raw_exponent == 0) -1074 else @as(i32, @intCast(raw_exponent)) - 1023 - 52;
-            while (exponent < 0 and mantissa & 1 == 0) {
-                mantissa >>= 1;
-                exponent += 1;
-            }
-            var exact: u4096 = mantissa;
-            if (exponent >= 0) exact <<= @intCast(exponent) else {
-                try budget.consume(@intCast(-exponent));
-                for (0..@intCast(-exponent)) |_| exact *= 5;
-            }
-            var result = try Decimal.parse(try std.fmt.bufPrint(buffer, "{d}", .{exact}), budget);
-            result.negative = bits >> 63 != 0;
-            if (exponent < 0) result.magnitude += exponent;
+            const parts = @import("../common/json_float_decimal.zig").Parts.init(v) catch return error.SqlNumericOutOfRange;
+            try budget.consume(parts.work());
+            var result = try Decimal.parse(try std.fmt.bufPrint(buffer, "{d}", .{parts.coefficient()}), budget);
+            result.negative = parts.negative;
+            result.magnitude += parts.decimalExponent();
             return result;
         },
         .number_string => |v| v,

@@ -267,6 +267,11 @@ fn hashRelationalCellCanonical(
         return;
     }
     switch (column.column_type) {
+        .sql_array => {
+            const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
+            const view = try @import("../../common/sql_array_layout.zig").View.openAuthenticated(kind, cell.value.bytes_val, .{});
+            view.updateLogicalHash(hasher);
+        },
         .string, .blob, .geoshape => {
             hasher.update("s");
             hashBytes(hasher, cell.value.bytes_val);
@@ -344,6 +349,15 @@ fn writeCanonicalJsonValue(alloc: std.mem.Allocator, writer: *std.Io.Writer, val
             try writer.writeByte('}');
         },
         .number_string => |number| try writeCanonicalJsonNumber(alloc, writer, number),
+        .float => |number| {
+            // The same logical JSONB value can arrive as a native float or
+            // an exact parsed number token. Normalize both with the identical
+            // decimal codec so encoding always passes strict restore checks.
+            const parts = try @import("../../common/json_float_decimal.zig").Parts.init(number);
+            var buffer: [800]u8 = undefined;
+            const raw = std.fmt.bufPrint(&buffer, "{s}{d}e{d}", .{ if (parts.negative) "-" else "", parts.coefficient(), parts.decimalExponent() }) catch unreachable;
+            try writeCanonicalJsonNumber(alloc, writer, raw);
+        },
         else => try std.json.Stringify.value(value, .{}, writer),
     }
 }
@@ -601,6 +615,15 @@ fn hashRelationalColumnValue(
         return;
     }
     switch (column.column_type) {
+        .sql_array => {
+            const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
+            var decoded = try @import("../../sql/array_wire.zig").decodeBorrowed(alloc, kind, value, .{});
+            defer decoded.deinit();
+            const bytes = try @import("../../sql/array_storage.zig").encodeAlloc(alloc, decoded.value, .{});
+            defer alloc.free(bytes);
+            const view = try @import("../../common/sql_array_layout.zig").View.open(kind, bytes, .{});
+            view.updateLogicalHash(hasher);
+        },
         .string, .blob, .geoshape => switch (value) {
             .string => |text| {
                 hasher.update("s");

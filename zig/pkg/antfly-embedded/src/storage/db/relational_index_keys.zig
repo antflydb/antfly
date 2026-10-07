@@ -147,7 +147,7 @@ pub const TuplePlan = struct {
             const column_type = if (expression) |compiled| compiled.plan.result_kind else table_schema.relational_columns[ordinal].column_type;
             switch (column_type) {
                 .string, .blob, .boolean, .datetime, .integer, .number => {},
-                .json, .geopoint, .geoshape, .dense_vector => return error.UnsupportedRelationalIndexColumn,
+                .json, .geopoint, .geoshape, .dense_vector, .sql_array => return error.UnsupportedRelationalIndexColumn,
             }
             var fold_ascii = false;
             if (definition.collation) |collation| {

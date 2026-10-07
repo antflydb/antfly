@@ -3958,3 +3958,44 @@ This codec is not yet a published native column format. Native schema capability
 activation, row preparation/materialization, semantic hashing, index semantics
 and restore integration remain required before stored-array DDL can be enabled.
 No original SQL case receives new implementation credit from this groundwork.
+
+### Native typed-array row boundary
+
+Native schemas now distinguish `sql_array` from JSON, blobs and dense vectors.
+ASCH 17 binds the mandatory precise element identity to the immutable column.
+Format 15/16 catalogs and deployed scalar schemas remain readable without an
+upgrade write on open; an older capability cannot authorize an array layout,
+and serialization refuses a downgrade that would lose the array contract.
+Document-mode layouts and JSON-backed array declarations are rejected.
+
+Native preparation borrows the existing parsed envelope while producing one
+canonical flat payload. Packed and cold-column cells retain element identity;
+logical reconstruction uses the lossless dimensions/values/SQL-NULL envelope.
+Semantic hashing includes typed elements, shape, lower bounds and SQL NULLs,
+not offsets, padding, frame flags or the dense/compact representation. Physical
+floating zero signs survive storage while their semantic hashes agree.
+
+Strict restore checks complete array canonicality, including JSONB semantics,
+even when a noncanonical row has a valid physical checksum. Already admitted,
+authenticated rows instead inspect only addressing extents for targeted reads;
+shape projection and primitive cell lookup require no flat cell materialization.
+
+Stored-array public schema/SQL DDL activation and SQL scan/mutation adapters
+remain unfinished. Array ordered/unique/FK index keys remain explicitly guarded
+until typed ordering is implemented; arrays are not silently indexed as blobs.
+These native contracts do not change the original-case disposition counts.
+
+Owned JSON numeric values use one exact IEEE-754-to-decimal kernel for ordering,
+hashing and canonical persistence, avoiding shortest-print rounding after logical
+identity has already been established. Parsed JSONB retains decimal tokens;
+this internal consistency contract does not redefine SQL float-to-JSONB casts.
+Independent Python decimal and PostgreSQL JSONB checks verify the explicit
+numeric fixtures. Native tests also cover subnormal and maximum finite values.
+
+Verification: 406 embedded and 175 hosted SQL tests; 154 embedded and one hosted
+native relational-system test; 101 PostgreSQL oracle tests. Native preparation
+and reconstruction unwind every injected allocation failure for all eleven
+binary array fixtures. The debug trusted-projection fixture performs 10,000
+lookups in approximately 3.7 ms for 4,096 cells and 3.6 ms for 65,536 cells,
+materializing no cell vector. These are local code-path measurements, not an
+end-to-end distributed latency guarantee.

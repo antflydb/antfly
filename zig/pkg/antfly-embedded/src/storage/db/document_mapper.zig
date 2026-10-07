@@ -4330,6 +4330,7 @@ fn buildRelationalRowValueFromParsedInternal(
                     .value_type = value_type,
                     .is_json = column.is_json,
                     .is_dense_vector = column.column_type == .dense_vector,
+                    .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
                     .is_null = true,
                     .value = relationalZeroValue(value_type),
                 };
@@ -4342,7 +4343,15 @@ fn buildRelationalRowValueFromParsedInternal(
                 .none => return error.InvalidBatchRequest,
             };
 
-            const value = if (column.is_json) blk: {
+            const value = if (column.column_type == .sql_array) blk: {
+                const kind = column.sql_element_type orelse return error.InvalidBatchRequest;
+                var decoded = try @import("../../sql/array_wire.zig").decodeBorrowed(output_alloc, kind, found, .{});
+                defer decoded.deinit();
+                const encoded = try @import("../../sql/array_storage.zig").encodeAlloc(output_alloc, decoded.value, .{});
+                errdefer output_alloc.free(encoded);
+                try owned_buffers.append(output_alloc, encoded);
+                break :blk typed_dv.TypedValue{ .bytes_val = encoded };
+            } else if (column.is_json) blk: {
                 const encoded = try document_content_hash.canonicalJsonValueAlloc(output_alloc, found);
                 errdefer output_alloc.free(encoded);
                 try owned_buffers.append(output_alloc, encoded);
@@ -4356,6 +4365,7 @@ fn buildRelationalRowValueFromParsedInternal(
                 .value_type = value_type,
                 .is_json = column.is_json,
                 .is_dense_vector = column.column_type == .dense_vector,
+                .sql_array_element_type = if (column.column_type == .sql_array) column.sql_element_type else null,
                 .value = value,
             };
         }
@@ -4486,7 +4496,7 @@ fn relationalValueType(column_type: runtime_schema.RelationalColumnType) typed_d
         .number => .f64_val,
         .boolean => .bool_val,
         .geopoint => .geo_point,
-        .string, .blob, .geoshape, .json, .dense_vector => .bytes_val,
+        .string, .blob, .geoshape, .json, .dense_vector, .sql_array => .bytes_val,
     };
 }
 
@@ -4509,6 +4519,9 @@ fn relationalTypedValueAlloc(
     owned: *std.ArrayListUnmanaged([]u8),
 ) !?typed_dv.TypedValue {
     return switch (column_type) {
+        // SQL arrays require the complete immutable column descriptor and are
+        // prepared by makeCell, never inferred from this coarse type alone.
+        .sql_array => error.InvalidBatchRequest,
         .string, .blob, .geoshape => switch (value) {
             .string => |text| .{ .bytes_val = text },
             else => null,
@@ -6443,6 +6456,86 @@ test "relational UUID ingress shares canonical typed bytes and semantic hash" {
     try std.testing.expectEqualSlices(u8, &upper.semantic_hash, &lower.semantic_hash);
     try std.testing.expectEqualSlices(u8, upper.packed_row, lower.packed_row);
     try std.testing.expectEqualStrings("a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11", upper.parsedValue().object.get("id").?.string);
+}
+
+test "relational index system SQL array preparation roundtrips PostgreSQL fixtures and logical hashes" {
+    const alloc = std.testing.allocator;
+    const Faults = struct {
+        fn run(backing: Allocator, json: []const u8, schema: runtime_schema.TableSchema) !void {
+            var vtable = backing.vtable.*;
+            vtable.resize = Allocator.noResize;
+            vtable.remap = Allocator.noRemap;
+            const a: Allocator = .{ .ptr = backing.ptr, .vtable = &vtable };
+            var layout = try relational_row_codec.PhysicalLayout.init(a, schema);
+            defer layout.deinit();
+            var row = try PreparedRelationalWrite.init(a, "row", json, null, schema, &layout);
+            defer row.deinit(a);
+            try row.finalizeMetadata(0);
+            const cell = (try relational_row_codec.findCellByOrdinalWithLayout(row.packed_row, schema, &layout, 0)).?;
+            const rendered = try relational_row_codec.reconstructDocumentAlloc(a, &.{cell});
+            defer a.free(rendered);
+        }
+    };
+    const arrays = @import("../../sql/array_value.zig");
+    const wire = @import("../../sql/array_wire.zig");
+    const storage = @import("../../sql/array_storage.zig");
+    const Fixture = struct { entries: []const struct { element_type: arrays.ElementType, binary: []const u8 } };
+    const fixture = try std.json.parseFromSlice(Fixture, alloc, @embedFile("../../sql/fixtures/sql_array_binary_reference.json"), .{ .ignore_unknown_fields = true });
+    defer fixture.deinit();
+    for (fixture.value.entries) |entry| {
+        const pg = try alloc.alloc(u8, entry.binary.len / 2);
+        defer alloc.free(pg);
+        _ = try std.fmt.hexToBytes(pg, entry.binary);
+        var original = try @import("../../sql/array_binary.zig").decode(alloc, entry.element_type, pg, .{});
+        defer original.deinit();
+        const envelope = try wire.encodeAlloc(alloc, original.value, .{});
+        defer alloc.free(envelope);
+        const json = try std.mem.concat(alloc, u8, &.{ "{\"a\":", envelope, "}" });
+        defer alloc.free(json);
+        const schema: runtime_schema.TableSchema = .{ .version = 9, .storage_mode = .relational, .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = entry.element_type, .allows_null = true }} };
+        var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+        defer layout.deinit();
+        var prepared = try PreparedRelationalWrite.init(alloc, "row", json, null, schema, &layout);
+        defer prepared.deinit(alloc);
+        try prepared.finalizeMetadata(0);
+        try relational_row_codec.validateOrdinalWithLayout(prepared.packed_row, schema, &layout);
+        const cell = (try relational_row_codec.findCellByOrdinalWithLayout(prepared.packed_row, schema, &layout, 0)).?;
+        try std.testing.expectEqual(entry.element_type, cell.sql_array_element_type.?);
+        var decoded = try storage.decode(alloc, entry.element_type, cell.value.bytes_val, .{});
+        defer decoded.deinit();
+        var work: arrays.Budget = .{ .remaining = 1_000_000 };
+        try std.testing.expectEqual(std.math.Order.eq, try original.value.compare(decoded.value, &work));
+        const logical = try document_content_hash.hashRelationalParsedValue(alloc, prepared.parsedValue(), schema);
+        try std.testing.expectEqualSlices(u8, &logical, &prepared.semantic_hash);
+        const rendered = try relational_row_codec.reconstructDocumentAlloc(alloc, &.{cell});
+        defer alloc.free(rendered);
+        var restored = try PreparedRelationalWrite.init(alloc, "row", rendered, null, schema, &layout);
+        defer restored.deinit(alloc);
+        try restored.finalizeMetadata(0);
+        try std.testing.expectEqualSlices(u8, prepared.packed_row, restored.packed_row);
+        var region = std.heap.ArenaAllocator.init(alloc);
+        defer region.deinit();
+        const owned_json = try relational_row_codec.ownedJsonValueFromCellAlloc(region.allocator(), schema.relational_columns[0], cell);
+        var from_json = try wire.decode(alloc, entry.element_type, owned_json, .{});
+        defer from_json.deinit();
+        try std.testing.expectEqual(std.math.Order.eq, try original.value.compare(from_json.value, &work));
+        try std.testing.checkAllAllocationFailures(alloc, Faults.run, .{ json, schema });
+    }
+}
+
+test "relational index system SQL array hashes normalize equality without discarding physical zero signs" {
+    const alloc = std.testing.allocator;
+    const schema: runtime_schema.TableSchema = .{ .version = 1, .storage_mode = .relational, .relational_columns = &.{.{ .name = "a", .path = "a", .column_type = .sql_array, .sql_element_type = .float64 }} };
+    var layout = try relational_row_codec.PhysicalLayout.init(alloc, schema);
+    defer layout.deinit();
+    const prefix = "{\"a\":{\"dimensions\":[{\"length\":1,\"lower_bound\":1}],\"values\":[";
+    const suffix = "],\"sql_nulls\":[false]}}";
+    var negative = try PreparedRelationalWrite.init(alloc, "row", prefix ++ "-0.0" ++ suffix, null, schema, &layout);
+    defer negative.deinit(alloc);
+    var positive = try PreparedRelationalWrite.init(alloc, "row", prefix ++ "0.0" ++ suffix, null, schema, &layout);
+    defer positive.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, &negative.semantic_hash, &positive.semantic_hash);
+    try std.testing.expect(!std.mem.eql(u8, negative.packed_row, positive.packed_row));
 }
 
 test "relational index system SQL float4 preparation hashes and indexes canonical logical values" {
