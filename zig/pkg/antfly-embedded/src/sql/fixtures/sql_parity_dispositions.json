@@ -1684,13 +1684,21 @@
     },
     {
       "id": "sql-0197",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact unchanged SQL and parameters execute through strict mounted HTTP over native typed storage. PostgreSQL verifies every nonempty result, label, type, ordering and SQL NULL flag. JSON existence uses top-level keys and string elements; ANY/ALL key sets consume prepared typed text arrays with bounded work, ignoring NULL search elements without conflating JSON null and SQL NULL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0198",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "Exact unchanged SQL and parameters execute through strict mounted HTTP over native typed storage. PostgreSQL verifies every nonempty result, label, type, ordering and SQL NULL flag. JSON existence uses top-level keys and string elements; ANY/ALL key sets consume prepared typed text arrays with bounded work, ignoring NULL search elements without conflating JSON null and SQL NULL.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0199",

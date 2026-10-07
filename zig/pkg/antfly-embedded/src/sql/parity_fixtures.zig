@@ -29,6 +29,7 @@ pub const typed_array_read_reference = @embedFile("fixtures/sql_typed_array_read
 pub const joined_returning_reference = @embedFile("fixtures/sql_joined_returning_reference.json");
 pub const lateral_campaign_reference = @embedFile("fixtures/sql_lateral_campaign_reference.json");
 pub const array_expression_reference = @embedFile("fixtures/sql_array_expression_reference.json");
+pub const json_exists_reference = @embedFile("fixtures/sql_json_exists_reference.json");
 
 const std = @import("std");
 

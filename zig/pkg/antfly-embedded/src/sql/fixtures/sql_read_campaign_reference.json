@@ -1200,6 +1200,118 @@
       "affected": 0
     },
     {
+      "id": "sql-0197",
+      "columns": [
+        "id",
+        "has_flags"
+      ],
+      "rows": [
+        [
+          "c1",
+          true
+        ],
+        [
+          "c2",
+          true
+        ],
+        [
+          "u1",
+          true
+        ],
+        [
+          "u10",
+          true
+        ],
+        [
+          "u11",
+          true
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        16
+      ],
+      "affected": 0
+    },
+    {
+      "id": "sql-0198",
+      "columns": [
+        "id",
+        "has_any_key"
+      ],
+      "rows": [
+        [
+          "u1",
+          true
+        ],
+        [
+          "u10",
+          true
+        ],
+        [
+          "u11",
+          true
+        ],
+        [
+          "u12",
+          true
+        ],
+        [
+          "u13",
+          true
+        ]
+      ],
+      "sql_nulls": [
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ],
+        [
+          false,
+          false
+        ]
+      ],
+      "column_oids": [
+        25,
+        16
+      ],
+      "affected": 0
+    },
+    {
       "id": "sql-0199",
       "columns": [
         "id",

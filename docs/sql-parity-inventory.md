@@ -754,7 +754,7 @@ guard prevents regeneration from silently removing them. The array-result
 original `sql-0561` is independently reconciled using PostgreSQL binary results,
 preserving dimensions, lower bounds, exact element OIDs and SQL NULL flags.
 The oracle rejects unsupported array element types instead of flattening them.
-The read golden now verifies 83 exact original contracts. `--include` can extend
+The read golden now verifies 85 exact original contracts. `--include` can extend
 a checked golden only when every existing contract still matches; unknown or
 duplicate IDs and rejected originals fail closed. Broader array architecture
 tests do not independently grant original-case disposition credit.
@@ -778,6 +778,20 @@ strings while leaving JSON-column numbers numeric. Public regressions cover
 values beyond JavaScript's exact-integer range and mutation DEFAULT RETURNING.
 PostgreSQL stream tests consume the result's typed-cell interface rather than
 assuming legacy materialized rows.
+
+JSONB `?|`/`?&` and `jsonb_exists_any`/`jsonb_exists_all` consume owned typed
+`text[]` cells rather than treating JSON arrays as SQL arrays. Their top-level
+lookup ignores SQL NULL search elements; empty non-NULL sets produce false for
+ANY and true for ALL, while a SQL NULL operand stays SQL NULL. Array dimensions
+and lower bounds do not change which keys are searched. This follows
+[PostgreSQL's existence implementation](https://doxygen.postgresql.org/jsonb__op_8c_source.html).
+Lookup shares the instruction work budget and short-circuits without row-local
+key copies. Constant constructors are prepared once; typed parameter frames
+infer the JSON/text-array signature, own decoded payloads and support zero
+scratch allocation over repeated evaluations. A shared PostgreSQL/native/public
+fixture checks 22 results plus six exact `42883` signature/arity rejections.
+Exact original queries `sql-0197` and `sql-0198` are part of the strict read
+campaign; unrelated document full-text queries gain no disposition credit.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

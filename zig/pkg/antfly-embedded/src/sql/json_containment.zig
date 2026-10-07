@@ -19,6 +19,21 @@ const std = @import("std");
 const order = @import("json_order.zig");
 const Json = std.json.Value;
 
+/// PostgreSQL ignores SQL NULL search elements, flattens all array dimensions,
+/// and treats the empty search set as false for ANY and true for ALL. Reuse
+/// prepared typed cells directly: no JSON serialization or per-row key copies.
+pub fn existsKeys(value: Json, keys: @import("array_value.zig").Value, all: bool, work: *order.Budget) !bool {
+    if (keys.element_type != .text) return error.SqlTypeMismatch;
+    for (keys.elements) |key| {
+        try work.consume(1);
+        if (key.sql_null) continue;
+        if (key.array != null or key.value != .string) return error.SqlTypeMismatch;
+        const found = try exists(value, key.value.string, work);
+        if (found != all) return !all;
+    }
+    return all;
+}
+
 pub fn exists(value: Json, key: []const u8, work: *order.Budget) !bool {
     try work.consume(key.len + 1);
     return switch (value) {

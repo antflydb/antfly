@@ -765,6 +765,48 @@ pub fn runArrayExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
     std.debug.print("SQL public array expression contracts: 164 passed; no original disposition credit\n", .{});
 }
 
+pub fn runJsonExistenceExpressions(alloc: std.mem.Allocator, handler: anytype) !void {
+    const reference = try std.json.parseFromSlice(struct {
+        reference: []const u8,
+        entries: []const struct { sql: []const u8, value: Json },
+        type_errors: []const []const u8,
+    }, alloc, fixtures.json_exists_reference, .{});
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(usize, 22), reference.value.entries.len);
+    for (reference.value.entries) |entry| {
+        const sql = try std.fmt.allocPrint(alloc, "SELECT {s} AS value", .{entry.sql});
+        defer alloc.free(sql);
+        const case: fixtures.Corpus.Case = .{ .id = "json-existence-contract", .name = entry.sql, .family = "query", .sql = sql, .params = &.{}, .source_expectation = "success" };
+        const response = try execute(alloc, handler, &case);
+        defer response.deinit();
+        const result = response.value;
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+        try std.testing.expectEqual(wire.SQLColumnType.boolean, result.columns[0].type);
+        try std.testing.expectEqualStrings("value", result.columns[0].name);
+        try std.testing.expectEqualStrings("SELECT", result.command_tag);
+        try std.testing.expectEqual(@as(i64, 0), result.rows_affected);
+        try std.testing.expect(try rowMatchesWithNulls(alloc, result.columns, result.rows[0], result.sql_nulls.?[0], &.{entry.value}, &.{entry.value == .null}));
+    }
+    for (reference.value.type_errors) |expression| {
+        const sql = try std.fmt.allocPrint(alloc, "SELECT {s}", .{expression});
+        defer alloc.free(sql);
+        const body = try std.json.Stringify.valueAlloc(alloc, .{ .statement = sql }, .{});
+        defer alloc.free(body);
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = body;
+        var context = httpx.Context.init(alloc, std.testing.io, &request);
+        defer context.deinit();
+        var response = try handler.executeSQL(&context);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 400), response.status.code);
+        const diagnostic = try std.json.parseFromSlice(wire.SQLDiagnostic, alloc, response.body.?, .{});
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("42883", diagnostic.value.code);
+    }
+}
+
 pub fn runInternalArrayQueries(alloc: std.mem.Allocator, handler: anytype) !void {
     const Type = @FieldType(wire.SQLColumn, "type");
     const Case = struct { sql: []const u8, rows: []const u8, types: []const Type };

@@ -1867,6 +1867,25 @@ class PostgresReferenceTest(unittest.TestCase):
                     ).fetchall(),
                 )
 
+    def test_json_existence_sets_match_typed_native_contracts(self):
+        import json
+        import psycopg
+
+        fixture = json.loads((FIXTURES / "sql_json_exists_reference.json").read_text())
+        self.assertEqual(22, len(fixture["entries"]))
+        for case in fixture["entries"]:
+            with self.subTest(sql=case["sql"]):
+                cursor = self.db.execute("SELECT " + case["sql"])
+                self.assertEqual(16, cursor.description[0].type_code)
+                self.assertEqual(case["value"], cursor.fetchone()[0])
+        for expression in fixture["type_errors"]:
+            with (
+                self.subTest(sql=expression),
+                self.assertRaises(psycopg.Error) as failure,
+            ):
+                self.db.execute("SELECT " + expression)
+            self.assertEqual("42883", failure.exception.sqlstate)
+
     def test_json_and_typed_array_containment_reference(self):
         import json
         from pathlib import Path
