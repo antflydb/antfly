@@ -444,7 +444,7 @@ pub const Candidates = struct {
                 }
                 break :previous old;
             } else null;
-            const mutation: catalog.Mutation = .{ .key = identity, .expected_version = version, .expected_content_digest = digest, .row = if (deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous };
+            const mutation: catalog.Mutation = .{ .key = identity, .expected_version = version, .expected_content_digest = digest, .unique_absence = inserting, .row = if (deleting) null else .{ .object = object }, .json_null_fields = json_null_fields.items, .previous = previous };
             retained = std.math.add(usize, retained, identity.len +| jsonSize(.{ .object = object })) catch return error.SqlProgramLimitExceeded;
             if (retained > max_bytes) return error.SqlProgramLimitExceeded;
             try mutations.append(alloc, mutation);
@@ -926,8 +926,11 @@ fn bindPointPlan(alloc: Allocator, backend: catalog.Backend, target: catalog.Tab
     const selected: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = source_query }, .parameter_count = @intCast(parameter_types.len) };
     const source_input = try alloc.create(describe.BoundStatement);
     source_input.* = describe.bind(alloc, backend, &selected, parameter_types) catch |err| switch (err) {
-        error.OutOfMemory => return err,
-        else => return null,
+        // An optional strategy may decline an unsupported source shape, but
+        // cancellation, admission and backend failures must not become a
+        // successful fallback which can publish after the request was stopped.
+        error.UnsupportedSqlShape, error.UnsupportedSqlExecution => return null,
+        else => return err,
     };
     if (source_input.columns.len != projection_count) return null;
     return .{ .source_input = source_input, .source_query = source_query, .source_ordinals = source_ordinals, .target_fields = target_fields, .lookup_ordinal = lookup_ordinals[0], .target_scan = relation.scans[0], .index_name = index_name, .index_columns = index_columns, .lookup_ordinals = lookup_ordinals, .source_limit = source_limit };
@@ -1283,6 +1286,7 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
             try context.checkpoint();
             if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
                 !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
+                mutation.unique_absence != original.unique_absence or mutation.conflict_guard != original.conflict_guard or
                 mutation.predicate_only != original.predicate_only or (mutation.row == null) != (original.row == null)) return error.InvalidSqlBackendResponse;
             if (source_index >= selected.count() or source_index < reader.index) return error.InvalidSqlBackendResponse;
             while (reader.index < source_index) _ = (try reader.next()) orelse return error.InvalidSqlBackendResponse;

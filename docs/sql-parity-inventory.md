@@ -279,8 +279,18 @@ target images. Presence metadata preserves physically absent columns, and
 DELETE preimages retain typed arrays, bounds, JSONB null flags and native
 version/digest fences without encoding a redundant storage image. Native
 document/relational regressions exercise matched updates, DELETE, source-array
-widening, parameters and SQL NULL through single-row pages. Broader typed
-point/index saturation and distributed fault evidence remain to be expanded;
+widening, parameters and SQL NULL through single-row pages. Typed point/index
+regressions also cover saturation and index-readiness fallback, source/target
+RETURNING domains and native capture retirement before commit. Exhaustive
+allocation-failure sweeps cover point UPDATE, index DELETE and saturated
+fallback preparation. Source-only INSERT keeps source/target array identities
+through full-scan, point and index candidates. INSERT uses the native unique
+absence fence, and MERGE normalization cannot alter absence or conflict guards.
+Checkpoint-by-checkpoint cancellation and row-limit failures must release all
+native captures without publishing. Broader distributed fault evidence remains
+to be expanded. Optional point-plan binding declines only explicitly unsupported
+shapes; cancellation and backend/admission failures propagate instead of
+silently choosing a write-capable fallback;
 these implementation foundations do not grant original-case parity credit.
 SQL DDL and ordered/constraint index keys also still need end-to-end activation
 gates.

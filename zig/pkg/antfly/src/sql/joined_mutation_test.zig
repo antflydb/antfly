@@ -28,8 +28,11 @@ const Backend = struct {
         offset: usize = 0,
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            if (self.offset == self.owner.row_count) return .{ .rows = &.{} };
-            const count = @min(limit, self.owner.row_count - self.offset);
+            const key = self.request.request.primary_key orelse if (self.request.request.index_equality) |equality| equality.values[0].string else null;
+            const saturated = self.request.request.index_equality != null and self.owner.merge_path == .saturated;
+            const available: usize = if (self.owner.empty_target and self.request.table.id == 1) 0 else if (saturated) 17 else if (key != null) 1 else self.owner.row_count;
+            if (self.offset == available) return .{ .rows = &.{} };
+            const count = @min(limit, available - self.offset);
             const rows = try alloc.alloc(catalog.Row, count);
             const local = @import("antfly_local_sources");
             const target = self.request.table.id == 1;
@@ -44,7 +47,8 @@ const Backend = struct {
             const projection = if (self.owner.arrays) try local.sql_document_row.Projection.init(alloc, self.request.table, self.request.request.fields) else null;
             defer if (projection) |p| p.deinit(alloc);
             const layout = if (projection) |p| try p.pageLayout(alloc) else null;
-            for (rows, self.offset..) |*row, i| {
+            for (rows, self.offset..) |*row, ordinal| {
+                const i: usize = if (key) |identity| if (std.mem.eql(u8, identity, "b")) 1 else 0 else ordinal;
                 const id = if (target or !self.owner.duplicates) (if (i == 0) "a" else if (i == 1) "b" else try std.fmt.allocPrint(alloc, "row{d}", .{i})) else "a";
                 var values: std.json.ObjectMap = .empty;
                 const fields = self.request.request.fields;
@@ -71,12 +75,16 @@ const Backend = struct {
             }
             self.offset += count;
             self.owner.rows_read += count;
-            return .{ .rows = rows, .after = if (self.offset == self.owner.row_count) null else rows[rows.len - 1].id };
+            return .{ .rows = rows, .after = if (self.offset == available) null else rows[rows.len - 1].id };
         }
     };
     duplicates: bool = false,
     document: bool = false,
     arrays: bool = false,
+    empty_target: bool = false,
+    cancel_at: ?usize = null,
+    prepare_guard: enum { none, absence, conflict } = .none,
+    merge_path: enum { none, point, index, saturated, not_ready } = .none,
     array_first: i64 = 3,
     array_lower: i32 = 3,
     array_null: bool = false,
@@ -102,9 +110,14 @@ const Backend = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (std.mem.eql(u8, name.table, "target")) {
             try std.testing.expect(action == .read_write);
-            if (self.arrays) return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .columns = &.{
-                .{ .name = "n", .path = "n", .type = .integer },                       .{ .name = "payload", .path = "payload", .type = .json },              .{ .name = "cold", .path = "cold", .type = .string },
-                .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 }, .{ .name = "j", .path = "j", .type = .array, .element_type = .jsonb }, .{ .name = "missing", .path = "missing", .type = .string },
+            if (self.arrays) return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .indexes = if (self.merge_path != .none and self.merge_path != .point) &.{.{ .name = "id_index", .columns = &.{"id"} }} else &.{}, .columns = &.{
+                .{ .name = "id", .path = "id", .type = .string },
+                .{ .name = "n", .path = "n", .type = .integer },
+                .{ .name = "payload", .path = "payload", .type = .json },
+                .{ .name = "cold", .path = "cold", .type = .string },
+                .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
+                .{ .name = "j", .path = "j", .type = .array, .element_type = .jsonb },
+                .{ .name = "missing", .path = "missing", .type = .string },
             } };
             if (self.generated_mode) return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .json }, .{ .name = "cold", .path = "cold", .type = .string }, .{ .name = "g", .path = "g", .type = .integer, .generated = true } } };
             return .{ .id = 1, .physical_name = "target", .schema_version = 1, .storage_mode = if (self.document) .document else .relational, .columns = &.{ .{ .name = "n", .path = "n", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .json }, .{ .name = "cold", .path = "cold", .type = .string } } };
@@ -128,7 +141,8 @@ const Backend = struct {
     }
     fn open(ptr: *anyopaque, _: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (scans.len != 2 and scans.len != 3 and !((self.default_mode or self.returning_mode) and scans.len == 1)) return error.TestUnexpectedScanCount;
+        if (scans.len != 2 and scans.len != 3 and !((self.default_mode or self.returning_mode or self.merge_path != .none) and scans.len == 1)) return error.TestUnexpectedScanCount;
+        if (self.merge_path == .not_ready and scans[0].request.index_equality != null) return error.RelationalIndexNotReady;
         self.captures += 1;
         self.last_scan_count = scans.len;
         for (scans, self.states[0..scans.len], self.cursors[0..scans.len]) |scan_, *state, *cursor| {
@@ -152,9 +166,19 @@ const Backend = struct {
     fn checkpoint(ptr: *anyopaque) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.checkpoints += 1;
+        if (self.cancel_at == self.checkpoints) return error.Canceled;
     }
     fn prepare(ptr: *anyopaque, alloc: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) ![]const catalog.Mutation {
         const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.prepare_guard != .none) {
+            const normalized = try alloc.dupe(catalog.Mutation, mutations);
+            for (normalized) |*mutation| switch (self.prepare_guard) {
+                .absence => mutation.unique_absence = !mutation.unique_absence,
+                .conflict => mutation.conflict_guard = &self.checkpoints,
+                .none => unreachable,
+            };
+            return normalized;
+        }
         if (!self.default_mode) return mutations;
         if (self.default_prepare_failure) return error.NativeDefaultFailed;
         const normalized = try alloc.dupe(catalog.Mutation, mutations);
@@ -174,7 +198,7 @@ const Backend = struct {
     }
     fn mutate(ptr: *anyopaque, alloc: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        try std.testing.expectEqual(@as(usize, 1), self.closes);
+        try std.testing.expectEqual(self.captures, self.closes);
         self.commits += 1;
         self.writes += mutations.len;
         for (mutations) |mutation| {
@@ -204,13 +228,13 @@ const Backend = struct {
                 if (self.generated_mode) try std.testing.expectEqual(row.object.get("n").?.integer * 2, row.object.get("g").?.integer);
                 try std.testing.expect(row.object.get("payload").? == .null);
                 try std.testing.expectEqualStrings("payload", mutation.json_null_fields[0]);
-                if (self.document) try std.testing.expectEqual(@as(i64, 42), row.object.get("undeclared").?.integer);
+                if (self.document and !self.inserting) try std.testing.expectEqual(@as(i64, 42), row.object.get("undeclared").?.integer);
             }
         }
         return .committed;
     }
     fn backend(self: *@This()) catalog.Backend {
-        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .open_statement = open, .scan = scan, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepare, .checkpoint = checkpoint, .generate_row_id = generateId } };
+        return .{ .ptr = self, .atomic_statement_read_set = self.merge_path != .none, .coordinated_point_reads = self.merge_path != .none, .coordinated_index_reads = self.merge_path != .none and self.merge_path != .point, .vtable = &.{ .resolve = resolve, .open_statement = open, .scan = scan, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepare, .checkpoint = checkpoint, .generate_row_id = generateId } };
     }
     fn generateId(_: *anyopaque, a: std.mem.Allocator) ![]const u8 {
         return a.dupe(u8, "fresh");
@@ -269,6 +293,116 @@ test "SQL joined mutations retain arrays through coercion scratch retirement and
             }
         }
     };
+}
+
+test "SQL MERGE typed point and index candidates preserve arrays through fallback and RETURNING" {
+    const local = @import("antfly_local_sources");
+    for ([_]bool{ false, true }) |document| for ([_]@FieldType(Backend, "merge_path"){ .point, .index, .saturated, .not_ready }) |path| for ([_]bool{ false, true }) |deleting| {
+        var backend: Backend = .{ .arrays = true, .document = document, .merge_path = path, .array_first = if (deleting) 9007199254740993 else 3, .array_lower = if (deleting) -1 else 3 };
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "MERGE INTO target t USING source s ON t.{s}=s.id WHEN MATCHED THEN {s} RETURNING t.a,t.j,s.a", .{ if (path == .point) "_id" else "id", if (deleting) "DELETE" else "UPDATE SET a=s.a,cold='new'" });
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        try std.testing.expectEqual(backend.captures, backend.closes);
+        try std.testing.expectEqual(@as(usize, if (path == .saturated) 3 else 2), backend.captures);
+        for (result.output.rows) |row| {
+            var target = try local.sql_array_wire.decode(std.testing.allocator, .int64, row[0], .{});
+            defer target.deinit();
+            try std.testing.expectEqual(backend.array_first, target.value.elements[0].value.integer);
+            try std.testing.expectEqual(backend.array_lower, target.value.dimensions[0].lower);
+            try std.testing.expect(target.value.elements[1].sql_null);
+            var json = try local.sql_array_wire.decode(std.testing.allocator, .jsonb, row[1], .{});
+            defer json.deinit();
+            try std.testing.expect(!json.value.elements[0].sql_null and json.value.elements[1].sql_null);
+            var source = try local.sql_array_wire.decode(std.testing.allocator, .int16, row[2], .{});
+            defer source.deinit();
+            try std.testing.expectEqual(@as(i64, 3), source.value.elements[0].value.integer);
+            try std.testing.expectEqual(@as(i32, 3), source.value.dimensions[0].lower);
+            try std.testing.expect(source.value.elements[1].sql_null);
+        }
+    };
+}
+
+test "SQL MERGE typed candidates unwind every allocation failure before publication" {
+    const Scenario = struct {
+        fn run(a: std.mem.Allocator, path: @FieldType(Backend, "merge_path"), deleting: bool) !void {
+            var backend: Backend = .{ .arrays = true, .merge_path = path, .array_first = if (deleting) 9007199254740993 else 3, .array_lower = if (deleting) -1 else 3 };
+            const sql = try std.fmt.allocPrint(a, "MERGE INTO target t USING source s ON t.{s}=s.id WHEN MATCHED THEN {s} RETURNING t.a,t.j,s.a", .{ if (path == .point) "_id" else "id", if (deleting) "DELETE" else "UPDATE SET a=s.a,cold='new'" });
+            defer a.free(sql);
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        }
+    };
+    for ([_]@FieldType(Backend, "merge_path"){ .point, .index, .saturated }) |path| {
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{ path, path == .index });
+    }
+}
+
+test "SQL MERGE source-only typed arrays retain assignment and RETURNING domains" {
+    const local = @import("antfly_local_sources");
+    for ([_]bool{ false, true }) |document| for ([_]@FieldType(Backend, "merge_path"){ .none, .point, .index }) |path| {
+        var backend: Backend = .{ .arrays = true, .document = document, .merge_path = path, .empty_target = true, .inserting = true, .row_count = 1 };
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "MERGE INTO target t USING source s ON t.{s}=s.id WHEN NOT MATCHED THEN INSERT (a,j,payload,cold) VALUES (s.a,'{{\"null\",NULL}}'::jsonb[],'null'::jsonb,'new') RETURNING t.a,t.j,s.a", .{if (path == .point or path == .none) "_id" else "id"});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var interface = backend.backend();
+        interface.atomic_statement_read_set = true;
+        var result = try runtime.execute(std.testing.allocator, interface, &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 1), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+        var target = try local.sql_array_wire.decode(std.testing.allocator, .int64, result.output.rows[0][0], .{});
+        defer target.deinit();
+        var source = try local.sql_array_wire.decode(std.testing.allocator, .int16, result.output.rows[0][2], .{});
+        defer source.deinit();
+        try std.testing.expectEqual(@as(i64, 3), target.value.elements[0].value.integer);
+        try std.testing.expectEqual(@as(i32, 3), target.value.dimensions[0].lower);
+        try std.testing.expect(target.value.elements[1].sql_null);
+        try std.testing.expectEqual(@as(i64, 3), source.value.elements[0].value.integer);
+        try std.testing.expect(source.value.elements[1].sql_null);
+    };
+}
+
+test "SQL MERGE refuses normalized guard changes before publication" {
+    for ([_]@FieldType(Backend, "prepare_guard"){ .absence, .conflict }) |guard| {
+        var backend: Backend = .{ .arrays = true, .merge_path = .point, .prepare_guard = guard };
+        var compiled = try compiler.compile(std.testing.allocator, "MERGE INTO target t USING source s ON t._id=s.id WHEN MATCHED THEN UPDATE SET a=s.a,cold='new' RETURNING t.a", .{});
+        defer compiled.deinit();
+        try std.testing.expectError(error.InvalidSqlBackendResponse, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 }));
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+        try std.testing.expectEqual(backend.captures, backend.closes);
+    }
+}
+
+test "SQL MERGE cancellation at every checkpoint releases typed captures before publication" {
+    for ([_]@FieldType(Backend, "merge_path"){ .point, .index, .saturated, .not_ready }) |path| {
+        const sql = try std.fmt.allocPrint(std.testing.allocator, "MERGE INTO target t USING source s ON t.{s}=s.id WHEN MATCHED THEN UPDATE SET a=s.a,cold='new' RETURNING t.a,t.j,s.a", .{if (path == .point) "_id" else "id"});
+        defer std.testing.allocator.free(sql);
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var baseline: Backend = .{ .arrays = true, .merge_path = path };
+        var result = try runtime.execute(std.testing.allocator, baseline.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), baseline.commits);
+        for (1..baseline.checkpoints + 1) |checkpoint| {
+            var backend: Backend = .{ .arrays = true, .merge_path = path, .cancel_at = checkpoint };
+            try std.testing.expectError(error.Canceled, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .page_rows = 1 }));
+            try std.testing.expectEqual(@as(usize, 0), backend.commits);
+            try std.testing.expectEqual(backend.captures, backend.closes);
+        }
+        var limited: Backend = .{ .arrays = true, .merge_path = path };
+        try std.testing.expectError(error.SqlResultTooLarge, runtime.execute(std.testing.allocator, limited.backend(), &compiled, &.{}, .{ .page_rows = 1, .mutation_rows = 1 }));
+        try std.testing.expectEqual(@as(usize, 0), limited.commits);
+        try std.testing.expectEqual(limited.captures, limited.closes);
+    }
 }
 
 test "SQL joined RETURNING resolves ambiguous names before any source capture or write" {
