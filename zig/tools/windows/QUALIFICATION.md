@@ -823,3 +823,36 @@ build and the new `io-namespace` Windows suite. Validation evidence:
 
 This namespace refactor was exercised under CrossOver; it does not add a new
 native Windows VM run to the earlier NTFS qualification evidence.
+
+## Main #1003 merge and composed platform identity (2026-10-07)
+
+Merged `origin/main` at `0c3b38667a6d7cd8589104f12dc343dd32acbef7` with
+no textual conflicts. The external lake API tests exposed a second platform
+module supplied by standalone VOPR. Composed graphs now canonicalize platform
+imports when their target and physical source file match, preserving different
+adapters and cross-target dependencies. Physical path comparison covers relative,
+absolute, and symlinked roots; authored file metadata participates in configuration
+caching. The namespace test graph models a standalone dependency with an absolute
+platform root and checks that it shares the composition's executor type.
+
+Validation after the merge and binding fix:
+
+- Embedded lake reader/SQL tests: 216 passed, no skips, failures, or leaks.
+- Focused external lake API and local-owner tests: 51 passed, no skips,
+  failures, or leaks, including the new scoring and projection regressions.
+- Dedicated lake integration and local-owner suites: 154 passed, no
+  skips, failures, or leaks, including packed text ranges and native GC.
+- macOS platform suite: 19/19 build steps passed, including the duplicate-module
+  regression and Python process-lifecycle checks.
+- CrossOver namespace interoperability tests: 4 passed across Debug and
+  ReleaseFast, no skips, failures, or leaks.
+- Windows Debug application and native/browser module boundary checks:
+  59/59 build steps passed.
+- CrossOver application smoke: 64 queries passed; all 32 acknowledged documents
+  and full-text entries survived forced termination and reopen, with a valid
+  recovered file and no invalid tail.
+
+Windows executable SHA-256:
+`9beb1ef5ae44f2932e2a8d53331a6127b99eab95cf9f247006a96e48c706e1d4`.
+Logs and hashes use `/private/tmp/pr987-main1003-*`. No new native Windows VM
+was created for this merge.

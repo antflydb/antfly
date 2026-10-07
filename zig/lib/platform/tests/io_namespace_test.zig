@@ -23,6 +23,9 @@ fn readClock(io: std.Io) i96 {
 
 test "platform Io context interoperates with standard APIs and owned tasks" {
     try std.testing.expect(platform.Io.Context == std.Io);
+    const dependency = @import("platform_dependency");
+    try std.testing.expect(dependency.Io.Context == platform.Io.Context);
+    try std.testing.expect(dependency.Io.Threaded == platform.Io.Threaded);
     if (builtin.os.tag == .windows) {
         try std.testing.expect(platform.Io.Threaded != std.Io.Threaded);
     } else {

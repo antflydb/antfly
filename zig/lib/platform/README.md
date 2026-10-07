@@ -31,3 +31,9 @@ does not change an existing context's vtable. Shared APIs may continue to accept
 
 `lib/runtime` re-exports this namespace as `Io` and retains its existing `Threaded`
 compatibility alias. New executor owners should use `platform.Io.Threaded`.
+
+Composed builds use `bindPlatform` to share one platform module across standalone
+library dependencies. Imports with the same target and physical platform source
+are rebound to the composition's module, including when dependency roots use
+different path representations. Different adapters and cross-target dependencies
+retain their own modules.

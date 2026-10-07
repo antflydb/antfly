@@ -50,7 +50,14 @@ SUITES = {
     "io-namespace": (
         ["platform Io "],
         module(
-            "lib/platform/tests/io_namespace_test.zig", ["antfly_platform"], PLATFORM
+            "lib/platform/tests/io_namespace_test.zig",
+            ["antfly_platform", "platform_dependency"],
+            PLATFORM
+            + [
+                "--dep",
+                "antfly_platform",
+                "-Mplatform_dependency=lib/platform/tests/platform_dependency_fixture.zig",
+            ],
         ),
     ),
     "socket-errors": (
