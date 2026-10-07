@@ -3184,13 +3184,19 @@ fn writeMergedStoredFields(alloc: Allocator, sink: *SegmentSink, inputs: []const
                 continue;
             }
 
-            if (chunk.items.len == 0) {
-                if (try copyMergedStoredBlockIfPossible(sink, input, doc_id, block_idx, &table, block_offsets_start, block_checksums_start, data_start)) |copied_docs| {
-                    doc_id_usize += copied_docs;
+            // Flush a partial prefix before an intact source block, so one
+            // damaged block does not force every subsequent block to decode.
+            if (try copyableStoredBlockDocs(input, doc_id)) |copied_docs| {
+                if (chunk.items.len != 0) {
+                    try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, block_checksums_start, data_start, block_idx);
                     block_idx += 1;
-                    docs_in_block = 0;
-                    continue;
                 }
+                const copied = (try copyMergedStoredBlockIfPossible(sink, input, doc_id, block_idx, &table, block_offsets_start, block_checksums_start, data_start)) orelse return error.InvalidSegment;
+                if (copied != copied_docs) return error.InvalidSegment;
+                doc_id_usize += copied_docs;
+                block_idx += 1;
+                docs_in_block = 0;
+                continue;
             }
 
             const stored = (try stored_cursor.get(input.reader, doc_id)) orelse {
@@ -3293,8 +3299,13 @@ fn writeMergedStoredFieldsInOrderWithReuse(
 
     var record_iterator_2 = records.iterator();
     while (try record_iterator_2.next()) |record| {
-        if (reuse_blocks and chunk.items.len == 0) {
+        if (reuse_blocks) {
             if (try copyableSortedStoredBlockDocs(inputs, records, record_iterator_2.position - 1, record.ref)) |count| {
+                if (chunk.items.len != 0) {
+                    try flushMergedStoredBlock(alloc, sink, &chunk, block_offsets_start, block_checksums_start, data_start, block_idx);
+                    block_idx += 1;
+                }
+                docs_in_block = 0;
                 const copied = (try copyMergedStoredBlockIfPossible(sink, inputs[record.ref.input_idx], record.ref.doc_id, block_idx, &table, block_offsets_start, block_checksums_start, data_start)) orelse return error.InvalidSegment;
                 if (copied != count) return error.InvalidSegment;
                 record_iterator_2.position += count - 1;
@@ -3332,8 +3343,11 @@ fn countStoredBlocksInOrder(comptime reuse_blocks: bool, inputs: []const MergeIn
     var raw_bytes: usize = 0;
     var record_iterator_1 = records.iterator();
     while (try record_iterator_1.next()) |record| {
-        if (reuse_blocks and raw_bytes == 0) {
+        if (reuse_blocks) {
             if (try copyableSortedStoredBlockDocs(inputs, records, record_iterator_1.position - 1, record.ref)) |count| {
+                if (raw_bytes != 0) blocks += 1;
+                docs_in_block = 0;
+                raw_bytes = 0;
                 record_iterator_1.position += count - 1;
                 record_iterator_1.used = 0;
                 record_iterator_1.length = 0;
@@ -3368,14 +3382,13 @@ fn countMergedStoredBlocks(inputs: []const MergeInput) !u32 {
                 continue;
             }
 
-            if (raw_bytes == 0) {
-                if (try copyableStoredBlockDocs(input, doc_id)) |copied_docs| {
-                    blocks += 1;
-                    doc_id_usize += copied_docs;
-                    docs_in_block = 0;
-                    raw_bytes = 0;
-                    continue;
-                }
+            if (try copyableStoredBlockDocs(input, doc_id)) |copied_docs| {
+                if (raw_bytes != 0) blocks += 1;
+                blocks += 1;
+                doc_id_usize += copied_docs;
+                docs_in_block = 0;
+                raw_bytes = 0;
+                continue;
             }
 
             const length = (try input.reader.storedDocLength(doc_id)) orelse {
@@ -3474,7 +3487,6 @@ fn copyMergedStoredBlockIfPossible(
 }
 
 fn copyableStoredBlockDocs(input: MergeInput, start_doc_id: u32) !?u32 {
-    if (input.deleted != null) return null;
     const reader = input.reader;
     if (reader.storedMetadata()[0] != stored_fields_version_block_compressed) return null;
     const first = (try reader.storedLocationMetadata(start_doc_id)) orelse return null;
@@ -3486,6 +3498,7 @@ fn copyableStoredBlockDocs(input: MergeInput, start_doc_id: u32) !?u32 {
     while (doc_id < reader.doc_count) : (doc_id += 1) {
         const loc = (try reader.storedLocationMetadata(doc_id)) orelse return null;
         if (loc.block_idx != first.block_idx) break;
+        if (input.isDeleted(doc_id)) return null;
         if (loc.block_start != first.block_start or loc.block_end != first.block_end) return null;
         count += 1;
         raw_bytes +|= 4 +| @as(usize, loc.raw_len);
@@ -9001,4 +9014,130 @@ test "native compressed block copying reads payload once and rejects corruption"
     defer corrupt.deinit();
     var corrupt_sink = corrupt.sink();
     try std.testing.expectError(error.CrcMismatch, writeMergedStoredFieldsInOrder(a, &corrupt_sink, &.{.{ .reader = &native }}, &records, 16));
+}
+
+test "partial stored prefixes resume compressed copying in append and sorted merges" {
+    const a = std.testing.allocator;
+    var prefix_writer = SegmentWriter.init(a);
+    defer prefix_writer.deinit();
+    try prefix_writer.addStoredDoc("deleted", "{}");
+    try prefix_writer.addStoredDoc("prefix", "{}");
+    const prefix_bytes = try prefix_writer.build();
+    defer a.free(prefix_bytes);
+    var prefix = try SegmentReader.init(a, prefix_bytes);
+    defer prefix.deinit();
+    var deleted = roaring.RoaringBitmap.init(a);
+    defer deleted.deinit();
+    try deleted.add(0);
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    const body: [4092]u8 = @splat('b');
+    for (0..2048) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), &body);
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const inputs = [_]MergeInput{ .{ .reader = &prefix, .deleted = deleted }, .{ .reader = &reader } };
+    const records = try a.alloc(SortedMergeDoc, 2049);
+    defer a.free(records);
+    records[0] = .{ .ref = .{ .input_idx = 0, .doc_id = 1 } };
+    for (records[1..], 0..) |*record, doc| record.* = .{ .ref = .{ .input_idx = 1, .doc_id = @intCast(doc) } };
+    var baseline = MemorySegmentSink.init(a);
+    defer baseline.deinit();
+    var baseline_sink = baseline.sink();
+    const Budget = @import("storage/lite/test_allocator.zig").BudgetAllocator;
+    var old = Budget{ .backing = a, .limit = 8 * 1024 * 1024 };
+    _ = try writeMergedStoredFieldsInOrderWithReuse(false, old.allocator(), &baseline_sink, &inputs, records, 2049);
+    for ([_]bool{ false, true }) |sorted| {
+        var output = MemorySegmentSink.init(a);
+        defer output.deinit();
+        var sink = output.sink();
+        var budget = Budget{ .backing = a, .limit = 512 * 1024 };
+        const start = platform_time.monotonicNs();
+        const metadata_length = if (sorted)
+            try writeMergedStoredFieldsInOrder(budget.allocator(), &sink, &inputs, records, 2049)
+        else
+            try writeMergedStoredFields(budget.allocator(), &sink, &inputs, 2049);
+        const elapsed = platform_time.monotonicNs() - start;
+        var validations: [17]std.atomic.Value(u8) = @splat(.init(integrity_unverified));
+        const merged = SegmentReader{ .stored_block_validations = &validations, .alloc = a, .data = output.out.items, .stored_offset = 0, .stored_length = output.out.items.len, .stored_metadata_length = metadata_length, .index_offset = 0, .doc_count = 2049, .num_fields = 0, .fields = &.{} };
+        try std.testing.expectEqual(@as(u32, 17), std.mem.readInt(u32, output.out.items[5..9], .little));
+        var cache = SegmentReader.StoredDocBlockCache.init(a, 1024 * 1024);
+        defer cache.deinit();
+        try std.testing.expectEqualStrings("prefix", (try cache.get(&merged, 0)).?.id);
+        for (1..2049) |doc| {
+            const actual = (try cache.get(&merged, @intCast(doc))).?;
+            var id: [32]u8 = undefined;
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&id, "doc-{d}", .{doc - 1}), actual.id);
+            try std.testing.expectEqualSlices(u8, &body, actual.data);
+            if ((doc - 1) % 128 == 0) {
+                const source = (try reader.storedLocationMetadata(@intCast(doc - 1))).?;
+                const dest = (try merged.storedLocationMetadata(@intCast(doc))).?;
+                try std.testing.expectEqualSlices(u8, bytes[source.block_start..source.block_end], output.out.items[dest.block_start..dest.block_end]);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+        try std.testing.expect(budget.peak < old.peak / 4);
+        std.debug.print("LITE_PREFIX_COPY sorted={any} docs=2049 old_peak={d} new_peak={d} elapsed_ns={d}\n", .{ sorted, old.peak, budget.peak, elapsed });
+    }
+}
+
+test "stored block eligibility is local to deletions and preserves live order" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    const body: [4092]u8 = @splat('b');
+    for (0..1024) |doc| {
+        var id: [32]u8 = undefined;
+        try writer.addStoredDoc(try std.fmt.bufPrint(&id, "doc-{d}", .{doc}), &body);
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var reader = try SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    for ([_]u32{ 0, 129, 1023 }) |deleted_doc| {
+        var deleted = roaring.RoaringBitmap.init(a);
+        defer deleted.deinit();
+        try deleted.add(deleted_doc);
+        const input = MergeInput{ .reader = &reader, .deleted = deleted };
+        for (0..8) |block| {
+            const expected: ?u32 = if (deleted_doc / 128 == block) null else 128;
+            try std.testing.expectEqual(expected, try copyableStoredBlockDocs(input, @intCast(block * 128)));
+        }
+        var records: [1023]SortedMergeDoc = undefined;
+        var position: usize = 0;
+        for (0..1024) |doc| {
+            if (doc == deleted_doc) continue;
+            records[position] = .{ .ref = .{ .input_idx = 0, .doc_id = @intCast(doc) } };
+            position += 1;
+        }
+        for ([_]bool{ false, true }) |sorted| {
+            var output = MemorySegmentSink.init(a);
+            defer output.deinit();
+            var sink = output.sink();
+            const metadata_length = if (sorted)
+                try writeMergedStoredFieldsInOrder(a, &sink, &.{input}, &records, 1023)
+            else
+                try writeMergedStoredFields(a, &sink, &.{input}, 1023);
+            var validations: [8]std.atomic.Value(u8) = @splat(.init(integrity_unverified));
+            const merged = SegmentReader{ .stored_block_validations = &validations, .alloc = a, .data = output.out.items, .stored_offset = 0, .stored_length = output.out.items.len, .stored_metadata_length = metadata_length, .index_offset = 0, .doc_count = 1023, .num_fields = 0, .fields = &.{} };
+            try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, output.out.items[5..9], .little));
+            var cache = SegmentReader.StoredDocBlockCache.init(a, 1024 * 1024);
+            defer cache.deinit();
+            for (records, 0..) |record, doc| {
+                const actual = (try cache.get(&merged, @intCast(doc))).?;
+                var id: [32]u8 = undefined;
+                try std.testing.expectEqualStrings(try std.fmt.bufPrint(&id, "doc-{d}", .{record.ref.doc_id}), actual.id);
+                try std.testing.expectEqualSlices(u8, &body, actual.data);
+                if (record.ref.doc_id % 128 == 0 and record.ref.doc_id / 128 != deleted_doc / 128) {
+                    const source = (try reader.storedLocationMetadata(record.ref.doc_id)).?;
+                    const dest = (try merged.storedLocationMetadata(@intCast(doc))).?;
+                    try std.testing.expectEqualSlices(u8, bytes[source.block_start..source.block_end], output.out.items[dest.block_start..dest.block_end]);
+                }
+            }
+        }
+    }
 }
