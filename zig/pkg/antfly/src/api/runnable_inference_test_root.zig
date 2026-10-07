@@ -158,3 +158,75 @@ test "inference model gate wait preserves real owner bytes and control progress"
         try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
     }
 }
+
+test "broker provider wait releases real capacity and fences swallowed reacquisition errors" {
+    const controls = @import("inference_execution_control");
+    const Mode = enum { success, canceled, deadline };
+    const Clock = struct {
+        fn now() u64 {
+            return 0;
+        }
+    };
+    for ([_]Mode{ .success, .canceled, .deadline }) |mode| {
+        var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 2 }), .native_now_ns = Clock.now };
+        defer state.owner.tryDeinit() catch @panic("owner leaked");
+        const port = state.port();
+        var lease = try runtime.runnable_abi.Lease.init(port);
+        defer lease.deinit();
+        const io = std.testing.io;
+        const borrow = runtime.native_abi.IoBorrow.init(&io);
+        var provider = try inference.Provider.init(std.testing.allocator, port);
+        const admission = provider.admission();
+        var canceled = std.atomic.Value(bool).init(false);
+        var internal_cancel = std.atomic.Value(bool).init(false);
+        const payload: usize = 1;
+        var output: usize = undefined;
+        var slot: inference.microbatch.ResultSlot = .{ .output = &output };
+        var items = [_]inference.microbatch.ExecuteItem{.{
+            .allocator = std.testing.allocator,
+            .identity = .{},
+            .payload = &payload,
+            .slot = &slot,
+            .control = .{ .io = io, .cancellation = inference.microbatch.Cancellation.fromAtomic(&canceled), .cancel_requested = &internal_cancel },
+        }};
+        const handle = try admission.begin(admission.context, io, .{ .model = "model", .task = .embed, .resource_class = .cpu }, 123, .{ .items = &items });
+        var finished = false;
+        defer if (!finished) admission.finish(admission.context, handle);
+        const retained = state.owner.scheduler.stats().retained_bytes;
+        try (controls.InferenceExecutionControl{}).check();
+        var wait = try controls.ResourceWait.init();
+        defer wait.finish() catch {};
+        const parked = state.owner.scheduler.stats();
+        try std.testing.expectEqual(@as(usize, 0), parked.runnable_slots);
+        try std.testing.expectEqual(@as(usize, 1), parked.resource_blocked);
+        try std.testing.expectEqual(retained, parked.retained_bytes);
+        var peer: ?*anyopaque = null;
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .out_handle = &peer }).isOk());
+        var control: ?*anyopaque = null;
+        try std.testing.expect(port.start(port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.control), .out_handle = &control }).isOk());
+        try std.testing.expectEqual(@as(usize, 2), state.owner.scheduler.stats().runnable_slots);
+        port.finish(control.?);
+        port.finish(peer.?);
+        if (mode == .canceled) canceled.store(true, .release);
+        if (mode == .deadline) items[0].control.deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = 0 } };
+        if (mode == .success) {
+            try wait.finish();
+            try std.testing.expectEqual(@as(usize, 1), state.owner.scheduler.stats().runnable_slots);
+            internal_cancel.store(true, .release);
+            try admission.checkpoint.?(admission.context, handle);
+        } else {
+            const expected = if (mode == .canceled) error.Canceled else error.DeadlineExceeded;
+            try std.testing.expectError(expected, wait.finish());
+            canceled.store(false, .release);
+            items[0].control.deadline = null;
+            // A backend swallowing and clearing the error cannot revive a grant.
+            try std.testing.expectError(expected, admission.checkpoint.?(admission.context, handle));
+        }
+        admission.finish(admission.context, handle);
+        finished = true;
+        const drained = state.owner.scheduler.stats();
+        try std.testing.expectEqual(@as(usize, 0), drained.operations);
+        try std.testing.expectEqual(@as(usize, 0), drained.runnable_slots);
+        try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
+    }
+}

@@ -375,9 +375,17 @@ pub const ExecutionControl = struct {
 
     pub fn check(raw: ?*anyopaque) !void {
         const self: *const @This() = @ptrCast(@alignCast(raw.?));
+        try self.checkMembers(false);
+    }
+
+    pub fn checkPublication(self: *const @This()) !void {
+        try self.checkMembers(true);
+    }
+
+    fn checkMembers(self: *const @This(), publication: bool) !void {
         var any_deadline_expired = false;
         for (self.items) |item| {
-            item.control.check() catch |err| {
+            (if (publication) item.control.checkPublication() else item.control.check()) catch |err| {
                 if (err == error.DeadlineExceeded) any_deadline_expired = true;
                 continue;
             };

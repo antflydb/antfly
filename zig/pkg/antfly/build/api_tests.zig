@@ -91,6 +91,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     inference_owner_control.addImport("antfly_platform", antfly_imports.platform);
+    inference_owner_admission.addImport("inference_execution_control", inference_owner_control);
     const inference_owner_root = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/runnable_inference_test_root.zig"),
         .target = target,

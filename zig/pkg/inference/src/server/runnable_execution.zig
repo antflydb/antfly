@@ -8,6 +8,7 @@ const std = @import("std");
 const runtime = @import("antfly_runtime_abi");
 const linalg = @import("inference_linalg");
 const broker = @import("executor_microbatch.zig");
+const execution_control = @import("inference_execution_control");
 pub const microbatch = broker;
 
 pub const Provider = struct {
@@ -20,18 +21,22 @@ pub const Provider = struct {
     }
 
     pub fn admission(self: *Provider) broker.ExecutionAdmission {
-        return .{ .context = self, .begin = begin, .finish = finish };
+        return .{ .context = self, .begin = begin, .finish = finish, .checkpoint = checkpoint };
     }
 
     const Invocation = struct {
         control: broker.ExecutionControl,
         handle: ?*anyopaque = null,
         scope: ?linalg.pool.WorkerScope = null,
+        checkpoint_scope: ?execution_control.CheckpointScope = null,
+        owner: runtime.runnable_abi.Owner,
+        publication: bool = false,
+        wait_error: ?anyerror = null,
 
         fn canceled(raw: ?*const anyopaque) callconv(.c) u8 {
             const self: *const Invocation = @ptrCast(@alignCast(raw.?));
             var control = self.control;
-            broker.ExecutionControl.check(&control) catch return 1;
+            (if (self.publication) control.checkPublication() else broker.ExecutionControl.check(&control)) catch return 1;
             return 0;
         }
     };
@@ -42,7 +47,7 @@ pub const Provider = struct {
         try broker.ExecutionControl.check(&collective);
         const invocation = try self.allocator.create(Invocation);
         errdefer self.allocator.destroy(invocation);
-        invocation.* = .{ .control = control };
+        invocation.* = .{ .control = control, .owner = self.owner };
         const borrow = runtime.native_abi.IoBorrow.init(&io);
         const status = self.owner.start(self.owner.context, &.{
             .io = &borrow,
@@ -65,12 +70,62 @@ pub const Provider = struct {
         // foreign BLAS team cannot be proven to fit. This scope is synchronous
         // and must remain on this OS worker until every backend child joins.
         invocation.scope = try linalg.pool.WorkerScope.init(1);
+        invocation.checkpoint_scope = execution_control.CheckpointScope.init(.{
+            .context = invocation,
+            .check_fn = checkInvocation,
+            .wait_begin_fn = parkInvocation,
+            .wait_end_fn = enterInvocation,
+        });
         return invocation;
+    }
+
+    fn checked(status: runtime.error_abi.Status) !void {
+        if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+    }
+
+    fn checkInvocation(raw: *anyopaque) !void {
+        const invocation: *Invocation = @ptrCast(@alignCast(raw));
+        if (invocation.wait_error) |err| return err;
+        if (invocation.publication) try invocation.control.checkPublication() else try broker.ExecutionControl.check(&invocation.control);
+        try checked(invocation.owner.checkpoint(invocation.handle.?));
+    }
+
+    fn parkInvocation(raw: *anyopaque) !void {
+        const invocation: *Invocation = @ptrCast(@alignCast(raw));
+        checked(invocation.owner.park(invocation.handle.?, @backingInt(runtime.runnable_abi.Wait.resource))) catch |err| {
+            invocation.wait_error = err;
+            return err;
+        };
+    }
+
+    fn enterInvocation(raw: *anyopaque) !void {
+        const invocation: *Invocation = @ptrCast(@alignCast(raw));
+        checked(invocation.owner.enter(invocation.handle.?, @backingInt(runtime.runnable_abi.Class.inference))) catch |err| {
+            // Retain failures even if a backend swallows its lock/check error.
+            // The final publication fence must not expose that backend output.
+            var cause = err;
+            // The owner cancellation callback is boolean. Preserve an original
+            // collective deadline cause before publishing its generic error.
+            broker.ExecutionControl.check(&invocation.control) catch |member_error| {
+                cause = member_error;
+            };
+            invocation.wait_error = cause;
+            return cause;
+        };
+    }
+
+    fn checkpoint(_: *anyopaque, handle: *anyopaque) !void {
+        const invocation: *Invocation = @ptrCast(@alignCast(handle));
+        // Internal Io cancellation still returns joined owned output. Explicit
+        // member cancellation/deadlines and owner authority remain mandatory.
+        invocation.publication = true;
+        try checkInvocation(invocation);
     }
 
     fn finish(raw: *anyopaque, handle: *anyopaque) void {
         const self: *Provider = @ptrCast(@alignCast(raw));
         const invocation: *Invocation = @ptrCast(@alignCast(handle));
+        invocation.checkpoint_scope.?.deinit();
         invocation.scope.?.deinit();
         self.owner.finish(invocation.handle.?);
         self.allocator.destroy(invocation);
