@@ -34,3 +34,12 @@ production qualification and automatic defaults remain pending. Linux API
 qualification remains pending: the current GNU ARM64 storage compiler declares
 26 GiB, exceeding the available 23.43 GiB Docker VM budget. Runtime resource
 limits are unchanged.
+
+Complete native production compilation now passes all 56 build steps against
+commit `7e7232ce73`, including CLI, serverless, distributed, API, storage,
+enrichment and inference archives and the installed CLI. `native-production.log`
+contains the complete terminal output; `native-production.json` records the
+command, source hashes, zero exit and installed artifact hash. This resolves the
+previous generated read-fence export/serverless bootstrap compile failures on
+macOS. It does not establish Linux production qualification, serverless
+scheduler support, or broader write scheduling (which was not in this snapshot).
