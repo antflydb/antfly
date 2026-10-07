@@ -584,7 +584,7 @@ fn exerciseReceipt(a: Allocator) !void {
 
 test "boundary training job receipts publish atomically without replacement and clean allocation failures" {
     try exerciseReceipt(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseReceipt, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseReceipt, .{});
 }
 
 fn admissionTestConfig() Config {
@@ -759,7 +759,7 @@ fn exerciseConfigSnapshot(a: Allocator) !void {
 
 test "boundary training job config snapshot binds consumed bytes and cleans allocation failures" {
     try exerciseConfigSnapshot(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseConfigSnapshot, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseConfigSnapshot, .{});
 }
 
 test "boundary training job dataset open preserves declared and backing allocation errors before model loading" {

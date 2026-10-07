@@ -1019,7 +1019,7 @@ fn exerciseFakeMerge(a: Allocator, mode: FakeMergeMode) !void {
 
 test "gliner boundary long executor fake windows preserve global decisions ownership and atomic limits" {
     for ([_]FakeMergeMode{ .success, .output_limit, .cancelled, .exhausted }) |mode| try exerciseFakeMerge(std.testing.allocator, mode);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseFakeMerge, .{FakeMergeMode.success});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseFakeMerge, .{FakeMergeMode.success});
 }
 
 // The current Zig arena can reject a larger speculative resize then try a

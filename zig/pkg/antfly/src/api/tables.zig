@@ -6377,7 +6377,7 @@ test "system catalog schema cache releases partial compilation on allocation fai
             _ = try leases.get(&table);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "system catalog wide schema cache retained budget" {

@@ -3938,6 +3938,14 @@
    }
   },
   {
+   "name": "termite_sdpa_f32_segments_tiled",
+   "family": "attention",
+   "generated": false,
+   "source": {
+    "path": "zig/pkg/inference/src/backends/metal_kernels.m"
+   }
+  },
+  {
    "name": "termite_sdpa_f32_tg",
    "family": "attention",
    "generated": false,

@@ -48381,8 +48381,8 @@ test "native weight handle lifetime is bounded and releases reservations and laz
 
 test "native weight handle lifetime unwinds allocation failures" {
     inline for (.{ false, true }) |stack_owned| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ false, stack_owned });
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ true, stack_owned });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ false, stack_owned });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testWeightHandleLifetime, .{ true, stack_owned });
     }
 }
 
@@ -50332,7 +50332,7 @@ fn testNativeSplitLastDim3Lifetime(allocator: std.mem.Allocator, view_input: boo
 
 test "native splitLastDim3 allocation failures preserve input and release partial outputs" {
     for ([_]bool{ false, true }) |view_input| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, testNativeSplitLastDim3Lifetime, .{view_input});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, testNativeSplitLastDim3Lifetime, .{view_input});
         try testNativeSplitLastDim3Lifetime(std.testing.allocator, view_input);
     }
 }

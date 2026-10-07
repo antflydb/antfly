@@ -200,7 +200,7 @@ test "seeded training allocation failures preserve graph and gradient ownership"
             try std.testing.expectEqual(@as(usize, 0), graph.outputs.items.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 fn exerciseTape(a: std.mem.Allocator, mismatch: bool) !void {
@@ -272,7 +272,7 @@ test "seeded training tape releases retained activations on allocation failures"
             try exerciseTape(a, false);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 fn exerciseStages(a: std.mem.Allocator, invalid: bool) !void {
@@ -354,7 +354,7 @@ test "seeded training stages release all prefix suffix captures on allocation fa
             try exerciseStages(a, false);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }
 
 const StageFailure = enum { none, stale, premature, missing, duplicate, finish_early, cancelled, advance_after_final };
@@ -500,5 +500,5 @@ test "seeded training multi stages release every capture and epoch on allocation
             try exerciseMultiStages(a, .none);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
 }

@@ -286,5 +286,5 @@ test "bounded replay scans a source once and supports independent cursors" {
             defer test_replay.deinit(a);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationRunner.run, .{batches[0..]});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationRunner.run, .{batches[0..]});
 }

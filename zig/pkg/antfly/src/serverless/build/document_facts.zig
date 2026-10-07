@@ -600,7 +600,7 @@ test "serverless document facts allocation failures preserve source and release 
             try std.testing.expect((try lookup(alloc, store, updated, "a")) == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Exercise.run, .{ memory.store(), source });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Exercise.run, .{ memory.store(), source });
 }
 
 test "serverless document facts pending cursors reject wrong-stage future-source and forged ordering entries" {
