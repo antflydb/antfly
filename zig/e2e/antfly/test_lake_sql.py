@@ -1459,6 +1459,29 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         assert [hit["_id"] for hit in ordered_next["hits"]["hits"]] == [
             hit["_id"] for hit in hits[1:]
         ], ordered_next
+        # Pagination and native/residual filters retain column delivery without
+        # exposing predicate/highlight dependency fields in the projection.
+        for payload, labels in [
+            (dict(typed_request, order_by=[{"field": "_score", "desc": True}],
+                  search_after=sort_tuple, remote_snapshot=snapshot_token),
+             {hit["_source"]["label"] for hit in ordered_next["hits"]["hits"]}),
+            (dict(typed_request, order_by=[{"field": "_score", "desc": True}],
+                  search_before=ordered_next["hits"]["hits"][0]["_sort"], remote_snapshot=snapshot_token),
+             {ordered_first["hits"]["hits"][0]["_source"]["label"]}),
+            (dict(typed_request, fields=["label"], filter_query={"term": {"path": "/amount", "value": base + 17}}), {"row-17"}),
+            (dict(typed_request, fields=["label"], exclusion_query={"term": {"path": "/amount", "value": base + 17}}), {"row-18", "row-129", "row-2055"}),
+        ]:
+            with requests.post(server.api_url + "/tables/lake_text/query", json=payload,
+                               auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60, stream=True) as response:
+                assert response.ok, response.text
+                assert "chunked" in response.headers.get("Transfer-Encoding", "").lower(), response.headers
+                page = response.json()["responses"][0]
+                for hit in page["hits"]["hits"]:
+                    assert set(hit["_source"]) == set(payload["fields"]), hit
+                    assert hit["_highlights"]["body"], hit
+                    if "amount" in hit["_source"]:
+                        assert hit["_source"]["amount"] == base + int(hit["_source"]["label"].removeprefix("row-")), hit
+                assert {hit["_source"]["label"] for hit in page["hits"]["hits"]} == labels, page
         unfenced = requests.post(
             server.api_url + "/tables/lake_text/query",
             json=dict(ordered_request, search_after=sort_tuple),

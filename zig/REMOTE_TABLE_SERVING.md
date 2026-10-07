@@ -867,7 +867,7 @@ flushes the worker before destroying the table borrowed by this hook.
 
 Source-independent remote retrieval, including named text/vector fusion, now
 hydrates the final hit page into shared immutable selected column pages. Physical hydration
-still batches 256 identities and applies the same snapshot/delete/lease checks;
+returns bounded 256-row pages and applies the same snapshot/delete/lease checks;
 key lookup uses a batch map rather than repeatedly scanning all requested keys.
 Shared highlighting borrows one source row at a time and public field projection
 operates directly on vectors for flat patterns. The public response is the first JSON encoding of
@@ -876,9 +876,11 @@ memory accounting. Source omitted from the response may still be retained for
 highlighting, without leaking dependency fields into `_source`.
 
 An explicit shared dependency contract keeps encoded hydration for evaluation,
-reranking, hierarchy, document-bound filters, and other source-dependent
+reranking, hierarchy, document-bound bindings, and other source-dependent
 operators. Ordinary native identity/score ordering can use typed delivery;
-field sorting and cursor continuations retain their established execution path.
+field sorting retains its established execution path. Score/identity cursor
+continuations use final projected column hydration after the snapshot-fenced
+collector has applied their boundary.
 This preserves response projection, exact integers, source omission, and
 highlight behavior while removing document encode/parse cycles from the common
 retrieval path.
@@ -919,7 +921,12 @@ outlives bound readers; current query authority remains separate from that owner
 Final eligible search pages retain selected Parquet vectors through response
 serialization, without constructing an owned JSON tree per hit. Reference-counted
 immutable pages gather only selected slots and retain shared dictionary entries
-once. Hit cloning within the same allocator retains a page lease; a clone into
+once. Producers can also grant an immutable column-owner lease. Dense selections
+retain decoded scalar vectors and dictionary payloads directly, copying only
+column descriptors, names and selection ordinals. Sparse selections, unavailable
+ownership capabilities, and owners above the 4 MiB retention ceiling gather
+compact independent slots. Retained cache owners survive cursor pulls, closure,
+and eviction, including their dictionary dependencies. Hit cloning within the same allocator retains a page lease; a clone into
 a different allocator gathers an independent row so it can outlive the original
 request arena. Deinitialization releases the owned lease. Cursor
 advancement and closure cannot invalidate a result. Scalar sources and flat include/exclude projections write directly
@@ -940,7 +947,13 @@ Physical text reads use pack-scoped in-flight coordination separate from unit
 cache admission. A leader probes verified RAM/mapped/disk residency and reads
 only contiguous cold runs; fifteen warm units plus one cold unit transfer only
 64 KiB. Concurrent leaders for different units can share the verified physical
-result even when RAM admission is denied. Flight payloads are temporary leases,
+result even when RAM admission is denied. Flights carry immutable interval
+coverage: readers join a containing interval, while disjoint intervals proceed
+independently under the same shared loader/byte admission. Physical results carry
+verified bytes or an error per unit. A corrupt unit in a broad speculative read
+cannot fail a required reader of a healthy unit, and a failed provider run cannot
+discard successes from other runs. Readers recheck residency before a missing-unit
+fallback GET. Flight payloads are temporary leases,
 with no second resident copy of a pack. The physical loader authenticates each
 unit once and carries its digest proof with a retained slice owner. Cache admission
 copies a unit once into independently evictable RAM residency; denied admission
@@ -959,7 +972,13 @@ cache hit reaps only completed speculation: it does not wait for unrelated units
 in an overlapping pack. Quiesce still cancels and joins all remaining tasks.
 
 Final hydration builds one physical row selection for the complete ranked result,
-including duplicate identity consumers. A single pinned cursor visits selected
+including duplicate identity consumers. Score/identity pagination retains this
+path, with the same snapshot fence and sort tuple semantics. Native-proven filters
+can rank identities without final-source hydration; unresolved predicates retain
+the existing complete-source callback and fail-closed authorization behavior.
+Temporary predicate sources are released before final projected column hydration,
+so predicate/highlight dependencies never broaden the public projection.
+A single pinned cursor visits selected
 files/row groups in physical order and returns bounded pages; an identity map
 scatters each page into rank order. Crossing a 256-hit boundary no longer reopens
 a cursor or revisits the same physical group solely because of rank batching.

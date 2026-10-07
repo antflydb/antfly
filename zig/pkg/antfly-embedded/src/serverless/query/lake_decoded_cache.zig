@@ -89,7 +89,9 @@ pub const Cache = struct {
     max_loaders: usize = 16,
     exclusive_loading: bool = false,
     exclusive_waiters: usize = 0,
+    pub const Coverage = struct { domain: [32]u8, start: u64, end: u64 };
     const Flight = struct {
+        coverage: ?Coverage = null,
         refs: usize = 1,
         done: std.Io.Event = .unset,
         finished: std.atomic.Value(bool) = .init(false),
@@ -101,6 +103,11 @@ pub const Cache = struct {
     /// cannot be admitted to residency. Every waiter owns its cancellation.
     /// Reservations bound active decode work independently of resident bytes.
     pub fn acquire(self: *Cache, key: [32]u8, limit: usize, context: @import("lake_read_context.zig").Context, loader: Loader) !Lease {
+        return self.acquireCovered(key, limit, context, loader, null);
+    }
+    /// A covered flight may serve a smaller interval in the same immutable
+    /// domain. Disjoint intervals keep independent flights and admission.
+    pub fn acquireCovered(self: *Cache, key: [32]u8, limit: usize, context: @import("lake_read_context.zig").Context, loader: Loader, coverage: ?Coverage) !Lease {
         if (limit > self.max_loading_bytes) return error.SqlMemoryLimitExceeded;
         var exclusive = false;
         var registered = false;
@@ -117,7 +124,15 @@ pub const Cache = struct {
                 self.exclusive_waiters += 1;
                 registered = true;
             }
-            if (self.flights.get(key)) |flight| {
+            const joining = self.flights.get(key) orelse covered: {
+                const wanted = coverage orelse break :covered null;
+                var candidates = self.flights.valueIterator();
+                while (candidates.next()) |candidate| if (candidate.*.coverage) |available| {
+                    if (std.mem.eql(u8, &wanted.domain, &available.domain) and available.start <= wanted.start and wanted.end <= available.end) break :covered candidate.*;
+                };
+                break :covered null;
+            };
+            if (joining) |flight| {
                 flight.refs += 1;
                 self.mutex.unlock();
                 defer self.releaseFlight(flight);
@@ -153,7 +168,7 @@ pub const Cache = struct {
                 self.mutex.unlock();
                 return err;
             };
-            flight.* = .{};
+            flight.* = .{ .coverage = coverage };
             self.flights.put(self.a, key, flight) catch |err| {
                 self.a.destroy(flight);
                 self.mutex.unlock();

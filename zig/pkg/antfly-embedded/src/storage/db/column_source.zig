@@ -26,8 +26,10 @@ pub const Page = struct {
     refs: std.atomic.Value(usize) = .init(1),
     columns: []const rows.ColumnVector,
     len: usize,
+    selection: ?[]const usize = null,
+    owner: ?rows.ColumnOwner = null,
     pub fn retainedBytes(self: *const Page) usize {
-        return @sizeOf(Page) +| self.arena.queryCapacity();
+        return @sizeOf(Page) +| self.arena.queryCapacity() +| (if (self.owner) |owner| owner.retained_bytes else 0);
     }
     pub fn retain(self: *Page) void {
         _ = self.refs.fetchAdd(1, .monotonic);
@@ -35,13 +37,14 @@ pub const Page = struct {
     pub fn release(self: *Page) void {
         if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         const a = self.a;
+        if (self.owner) |owner| owner.release();
         self.arena.deinit();
         a.destroy(self);
     }
     pub fn row(self: *Page, index: usize) Row {
         std.debug.assert(index < self.len);
         self.retain();
-        return .{ .page = self, .index = index };
+        return .{ .page = self, .index = if (self.selection) |selection| selection[index] else index };
     }
     /// Copy only selected vector slots before the provider advances. Dictionary
     /// entries are gathered once per page, preserving shared string storage.
@@ -49,6 +52,37 @@ pub const Page = struct {
         try batch.validate();
         for (selection) |index| if (index >= batch.rowCount()) return error.InvalidSqlBackendResponse;
         return gather(a, batch.columns, selection);
+    }
+    /// Prefer retained payloads for dense selections; sparse selections gather
+    /// compact slots so a few hits cannot pin a large decoded page/dictionary.
+    pub fn retainOrCopy(a: A, batch: rows.ColumnBatch, selection: []const usize, capability: anytype) !*Page {
+        try batch.validate();
+        for (selection) |index| if (index >= batch.rowCount()) return error.InvalidSqlBackendResponse;
+        if (selection.len != 0 and selection.len >= batch.rowCount() / 2 + batch.rowCount() % 2) if (capability) |source| {
+            if (try source.retain_fn(source.ptr, a)) |owner| {
+                if (owner.retained_bytes <= 4 * 1024 * 1024) return borrow(a, batch, selection, owner);
+                owner.release();
+            }
+        };
+        return copy(a, batch, selection);
+    }
+    /// Consumes owner on success and failure. Descriptor/name/selection storage
+    /// is independent of the producer; scalar and dictionary payloads are shared.
+    pub fn borrow(a: A, batch: rows.ColumnBatch, selection: []const usize, owner: rows.ColumnOwner) !*Page {
+        var owns = true;
+        errdefer if (owns) owner.release();
+        try batch.validate();
+        for (selection) |index| if (index >= batch.rowCount()) return error.InvalidSqlBackendResponse;
+        const self = try a.create(Page);
+        self.* = .{ .a = a, .arena = .init(a), .columns = &.{}, .len = selection.len, .owner = owner };
+        owns = false;
+        errdefer self.release();
+        const pa = self.arena.allocator();
+        self.selection = try pa.dupe(usize, selection);
+        const columns = try pa.dupe(rows.ColumnVector, batch.columns);
+        for (columns) |*column| column.name = try pa.dupe(u8, column.name);
+        self.columns = columns;
+        return self;
     }
     fn gather(a: A, input: []const rows.ColumnVector, selection: []const usize) !*Page {
         const self = try a.create(Page);
@@ -449,4 +483,50 @@ fn preparedProjectionScenario(a: A) !void {
 test "external lake prepared projection has exact escaped length and survives scratch reset and OOM" {
     try preparedProjectionScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, preparedProjectionScenario, .{});
+}
+
+fn retainedPayloadScenario(a: A) !void {
+    const refs = [_]rows.RowRef{ .{ .relational_key = "zero" }, .{ .relational_key = "one" }, .{ .relational_key = "two" } };
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "body", .values = .{ .dictionary_bytes = .{ .values = &.{ "first", "last" }, .indices = &.{ 0, 0, 1 } } } },
+        .{ .name = "amount", .values = .{ .i64 = &.{ 9007199254740993, 2, 3 } } },
+    };
+    const producer = try Page.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{ 0, 1, 2 });
+    var producer_open = true;
+    defer if (producer_open) producer.release();
+    const Capability = struct {
+        fn release(raw: *anyopaque) void {
+            const page: *Page = @ptrCast(@alignCast(raw));
+            page.release();
+        }
+        fn retain(raw: *anyopaque, _: A) !?rows.ColumnOwner {
+            const page: *Page = @ptrCast(@alignCast(raw));
+            page.retain();
+            return .{ .ptr = page, .release_fn = release, .retained_bytes = page.retainedBytes() };
+        }
+    };
+    const batch: rows.ColumnBatch = .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = producer.columns };
+    const capability: ?struct { ptr: *anyopaque, retain_fn: *const fn (*anyopaque, A) anyerror!?rows.ColumnOwner } = .{ .ptr = producer, .retain_fn = Capability.retain };
+    const dense = try Page.retainOrCopy(a, batch, &.{ 2, 0, 2 }, capability);
+    defer dense.release();
+    try std.testing.expect(dense.owner != null);
+    try std.testing.expect(dense.columns[0].values.dictionary_bytes.values.ptr == producer.columns[0].values.dictionary_bytes.values.ptr);
+    try std.testing.expect(dense.columns[1].values.i64.ptr == producer.columns[1].values.i64.ptr);
+    const sparse = try Page.retainOrCopy(a, batch, &.{2}, capability);
+    defer sparse.release();
+    try std.testing.expect(sparse.owner == null);
+    producer.release();
+    producer_open = false;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    const last = dense.row(0);
+    defer last.deinit();
+    const first = dense.row(1);
+    defer first.deinit();
+    try std.testing.expectEqualStrings("last", (try last.value(&scratch)).object.get("body").?.string);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try first.value(&scratch)).object.get("amount").?.integer);
+}
+test "external lake dense column leases share payloads across producer closure and sparse selections gather under OOM" {
+    try retainedPayloadScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, retainedPayloadScenario, .{});
 }

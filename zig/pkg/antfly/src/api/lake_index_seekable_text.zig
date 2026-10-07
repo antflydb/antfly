@@ -137,13 +137,17 @@ pub fn loadDirectory(a: A, read: Read, ref: Ref) !Directory {
 const Decoded = local.serverless_query_lake_decoded_cache;
 const ServingCache = local.serverless_query_lake_serving_cache.Cache;
 const PhysicalResult = struct {
-    const Unit = struct { offset: u64, value: ServingCache.VerifiedBytes };
-    units: []const Unit,
-    fn find(self: *const @This(), piece: Piece) ?ServingCache.VerifiedBytes {
-        const digest = stores.sha256DigestFromChecksum(piece.ref.checksum) catch return null;
-        for (self.units) |unit| if (unit.offset == piece.pack_offset and unit.value.bytes.len == piece.ref.byte_len and std.mem.eql(u8, &unit.value.digest, &digest)) return unit.value;
+    const Unit = struct { offset: u64, length: u64, result: anyerror!ServingCache.VerifiedBytes };
+    fn get(self: *const @This(), piece: Piece) !?ServingCache.VerifiedBytes {
+        for (self.units) |unit| if (unit.offset == piece.pack_offset and unit.length == piece.ref.byte_len) {
+            const value = try unit.result;
+            const digest = try stores.sha256DigestFromChecksum(piece.ref.checksum);
+            if (!std.mem.eql(u8, &value.digest, &digest)) return error.ArtifactIntegrityMismatch;
+            return value;
+        };
         return null;
     }
+    units: []const Unit,
 };
 const PhysicalPin = struct {
     lease: Decoded.Lease,
@@ -156,6 +160,22 @@ const PhysicalPin = struct {
         const self = try std.heap.page_allocator.create(@This());
         self.* = .{ .lease = lease.retain() };
         return .{ .value = value, .owner = .{ .bytes = value.bytes, .owner = .{ .shared = .{ .ptr = self, .release_fn = release } } } };
+    }
+};
+const PhysicalWarm = struct {
+    lease: ServingCache.ImmutableLease,
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.lease.deinit();
+        std.heap.page_allocator.destroy(self);
+    }
+    fn retain(self: @This(), digest: [32]u8) !ServingCache.VerifiedLease {
+        var owned = self.lease;
+        errdefer owned.deinit();
+        const holder = try std.heap.page_allocator.create(@This());
+        holder.* = self;
+        const bytes = owned.bytes();
+        return .{ .value = .{ .bytes = bytes, .digest = digest }, .owner = .{ .bytes = bytes, .owner = .{ .shared = .{ .ptr = holder, .release_fn = release } } } };
     }
 };
 const CoalescedRead = struct {
@@ -198,14 +218,20 @@ const CoalescedRead = struct {
             const start = self.pieces[first].pack_offset;
             const last = self.pieces[end - 1];
             const length: usize = @intCast(last.pack_offset + last.ref.byte_len - start);
-            const bytes = try self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, start, length, self.cancellation);
-            if (bytes.len != length) return error.ArtifactIntegrityMismatch;
+            const bytes = self.store.getRangeAllocWithCancellationUsingAllocator(a, self.pack.artifact_id, start, length, self.cancellation) catch |err| {
+                try self.cancellation.check();
+                cache.context.ensureActive() catch return error.Canceled;
+                if (err == error.OutOfMemory) return err;
+                for (self.pieces[first..end]) |piece| try units.append(a, .{ .offset = piece.pack_offset, .length = piece.ref.byte_len, .result = err });
+                first = end;
+                continue;
+            };
+            cache.cache.recordPhysicalRead(bytes.len);
             for (self.pieces[first..end]) |piece| {
                 const offset: usize = @intCast(piece.pack_offset - start);
-                const value = try ServingCache.VerifiedBytes.authenticate(bytes[offset..][0..@intCast(piece.ref.byte_len)], try stores.sha256DigestFromChecksum(piece.ref.checksum));
-                try units.append(a, .{ .offset = piece.pack_offset, .value = value });
+                const value: anyerror!ServingCache.VerifiedBytes = if (bytes.len != length) error.ArtifactIntegrityMismatch else ServingCache.VerifiedBytes.authenticate(bytes[offset..][0..@intCast(piece.ref.byte_len)], try stores.sha256DigestFromChecksum(piece.ref.checksum));
+                try units.append(a, .{ .offset = piece.pack_offset, .length = piece.ref.byte_len, .result = value });
             }
-            cache.cache.recordPhysicalRead(length);
             first = end;
         }
         const result = try a.create(PhysicalResult);
@@ -227,7 +253,7 @@ const CoalescedRead = struct {
         // flights. Its owned result contains only verified cold runs.
         if (self.shared) |lease| {
             const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
-            if (result.find(piece)) |value| return PhysicalPin.retain(lease, value);
+            if (try result.get(piece)) |value| return PhysicalPin.retain(lease, value);
             lease.release();
             self.shared = null;
         }
@@ -236,6 +262,13 @@ const CoalescedRead = struct {
         hash.update(&cache.scope);
         hash.update(self.pack.artifact_id);
         hash.update(self.pack.checksum);
+        const domain = hash.finalResult();
+        var interval: [16]u8 = undefined;
+        std.mem.writeInt(u64, interval[0..8], self.start, .little);
+        std.mem.writeInt(u64, interval[8..16], self.start + self.length, .little);
+        var ranged = std.crypto.hash.sha2.Sha256.init(.{});
+        ranged.update(&domain);
+        ranged.update(&interval);
         var loader: PhysicalLoader = .{ .group = self, .cached = cache };
         var flight_context = cache.context;
         // Publish request-authority failures as cancellation so a live
@@ -246,7 +279,7 @@ const CoalescedRead = struct {
         {
             try self.cancellation.check();
             const lease = if (cache.context.io != null)
-                cache.cache.physical.acquire(hash.finalResult(), pack_bytes * 3, flight_context, .{ .ptr = &loader, .load = loadPhysical }) catch |err| {
+                cache.cache.physical.acquireCovered(ranged.finalResult(), pack_bytes * 3, flight_context, .{ .ptr = &loader, .load = loadPhysical }, .{ .domain = domain, .start = self.start, .end = self.start + self.length }) catch |err| {
                     try cache.context.ensureActive();
                     try self.cancellation.check();
                     return err;
@@ -257,12 +290,20 @@ const CoalescedRead = struct {
                 try loadPhysical(&loader, value.item);
                 break :inline_load value;
             };
+            var owns_lease = true;
+            defer if (owns_lease) lease.release();
             const result: *PhysicalResult = @ptrCast(@alignCast(lease.item.payload.extension));
-            if (result.find(piece)) |value| {
+            if (try result.get(piece)) |value| {
                 self.shared = lease;
+                owns_lease = false;
                 return PhysicalPin.retain(lease, value);
             }
-            lease.release();
+            // Residency can change while a flight is planned. Recheck before
+            // falling back to a direct unit read.
+            if (try cache.cache.lookupImmutableBlockLease(a, cache.scope, piece.ref.artifact_id, @intCast(piece.ref.byte_len), try stores.sha256DigestFromChecksum(piece.ref.checksum), cache.context)) |warm| {
+                const owner: PhysicalWarm = .{ .lease = warm };
+                return try owner.retain(try stores.sha256DigestFromChecksum(piece.ref.checksum));
+            }
             // A concurrent flight may cover a different requested subset,
             // or this unit became warm while its leader was being planned.
             // A single-unit direct fallback cannot form a flight cycle.
@@ -1031,12 +1072,15 @@ test "external lake physical pack flights share different unit leaders without r
         started: std.Io.Event = .unset,
         release: std.Io.Event = .unset,
         calls: std.atomic.Value(usize) = .init(0),
+        corrupt_first: bool = false,
         fn range(raw: *anyopaque, alloc: A, id: []const u8, offset: u64, len: usize, cancellation: Cancellation) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(raw));
             _ = self.calls.fetchAdd(1, .monotonic);
             self.started.set(std.testing.io);
             try self.release.wait(std.testing.io);
-            return self.base.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, len, cancellation);
+            const result = try self.base.getRangeAllocWithCancellationUsingAllocator(alloc, id, offset, len, cancellation);
+            if (self.corrupt_first and offset == 0 and result.len != 0) result[0] ^= 1;
+            return result;
         }
     };
     var provider: Provider = .{ .base = store };
@@ -1142,6 +1186,52 @@ test "external lake physical pack flights share different unit leaders without r
     try retried_result;
     try std.testing.expectEqualSlices(u8, bytes[block_bytes..], other);
     try std.testing.expectEqual(@as(usize, 3), provider.calls.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
+    // A broad leader records corrupt unit zero without poisoning a waiter
+    // that needs only the independently authenticated healthy unit one.
+    provider.started = .unset;
+    provider.release = .unset;
+    provider.corrupt_first = true;
+    leader = try io.concurrent(Owner.read, .{ owner, read, @as(u64, 0), output[0 .. block_bytes * 2] });
+    leader_open = true;
+    try provider.started.wait(io);
+    live = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other[0..1] });
+    live_open = true;
+    try Wait.shared(&cache);
+    provider.release.set(io);
+    const corrupt_result = leader.await(io);
+    leader_open = false;
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, corrupt_result);
+    const healthy_result = live.await(io);
+    live_open = false;
+    try healthy_result;
+    try std.testing.expectEqual(@as(u8, 1), other[0]);
+    try std.testing.expectEqual(@as(usize, 4), provider.calls.load(.acquire));
+    // Disjoint requests in one pack must enter the provider concurrently.
+    provider.started = .unset;
+    provider.release = .unset;
+    provider.corrupt_first = false;
+    leader = try io.concurrent(Owner.read, .{ owner, read, @as(u64, 0), output[0..1] });
+    leader_open = true;
+    try provider.started.wait(io);
+    live = try io.concurrent(Owner.read, .{ owner, read, @as(u64, block_bytes), other[0..1] });
+    live_open = true;
+    var overlapped = false;
+    for (0..500) |_| {
+        if (provider.calls.load(.acquire) == 6) {
+            overlapped = true;
+            break;
+        }
+        try io.sleep(.fromMilliseconds(2), .awake);
+    }
+    provider.release.set(io);
+    const first_disjoint = leader.await(io);
+    leader_open = false;
+    try first_disjoint;
+    const second_disjoint = live.await(io);
+    live_open = false;
+    try second_disjoint;
+    try std.testing.expect(overlapped);
     try std.testing.expectEqual(@as(usize, 0), cache.physical.flights.count());
 }
 

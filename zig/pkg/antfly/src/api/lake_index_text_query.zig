@@ -248,7 +248,13 @@ const Execution = struct {
             a.free(values);
         }
         for (hits, values) |*hit, *value| {
-            std.debug.assert(hit.stored_data == null and hit.source_value == null and hit.column_source == null);
+            // Residual predicate evaluation may have temporarily loaded source.
+            // Final projected columns replace it after all filtering/ranking.
+            if (hit.stored_data) |bytes| a.free(bytes);
+            hit.stored_data = null;
+            if (hit.source_value) |*source| types.deinitJsonValue(a, source);
+            hit.source_value = null;
+            std.debug.assert(hit.column_source == null);
             hit.column_source = value.* orelse return error.StoredDocMissing;
             value.* = null;
         }
@@ -487,7 +493,7 @@ const Execution = struct {
                     const page = try next_columns(cursor.ptr, pa, 256);
                     try page.validate();
                     if (T == types.ColumnSource and page.native != null) return error.UnsupportedSqlExecution;
-                    const retained = if (T == types.ColumnSource) try types.ColumnSourcePage.copy(a, page.batch, page.selection) else {};
+                    const retained = if (T == types.ColumnSource) try types.ColumnSourcePage.retainOrCopy(a, page.batch, page.selection, page.retain_columns) else {};
                     defer if (T == types.ColumnSource) retained.release();
                     for (0..page.selection.len) |row_index| {
                         const identity = try page.cell(pa, row_index, "_id");
@@ -535,7 +541,7 @@ const Execution = struct {
     }
     fn loadProjected(raw: ?*anyopaque, a: A, req: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
         const self = from(raw);
-        const fields = self.hydration_fields;
+        const fields = if (requiresEncodedSource(req)) null else self.hydration_fields;
         const result = try loadManySelected(raw, a, keys, fields);
         errdefer {
             for (result) |bytes| if (bytes) |value| a.free(value);
@@ -577,17 +583,20 @@ const Execution = struct {
 /// hands leased column pages directly to highlights and the public encoder.
 fn canDeliverTypedSource(req: types.SearchRequest) bool {
     for (req.order_by) |order| if (!std.mem.eql(u8, order.field, "_score") and !std.mem.eql(u8, order.field, "_id")) return false;
-    return !requiresEncodedSource(req) and req.search_after.len == 0 and req.search_before.len == 0 and
+    return !requiresEarlySource(req) and
         req.evaluation_limit == 0 and req.pruner == null and req.return_mode == .parent and !req.hierarchy_grouped_matches and req.hierarchy_group_level == .source and
         req.hierarchy_children == null and !req.defer_hierarchy_child_hydration and !req.hierarchy_include_source and !req.hierarchy_include_unit and
         req.hierarchy_match_include_all_fields and req.hierarchy_source_include_all_fields and req.hierarchy_unit_include_all_fields;
 }
 
-fn requiresEncodedSource(req: types.SearchRequest) bool {
+fn requiresEarlySource(req: types.SearchRequest) bool {
     return req.hasHitEvaluation() or req.reranker != null or req.defer_hierarchy_child_hydration or
         req.hierarchy_children != null or req.hierarchy_include_source or req.hierarchy_include_unit or
         !req.hierarchy_match_include_all_fields or !req.hierarchy_source_include_all_fields or !req.hierarchy_unit_include_all_fields or
-        req.doc_filter_bindings.len != 0 or req.query != .match_all or req.filter_query_json.len != 0 or
+        req.doc_filter_bindings.len != 0 or req.query != .match_all;
+}
+fn requiresEncodedSource(req: types.SearchRequest) bool {
+    return requiresEarlySource(req) or req.filter_query_json.len != 0 or
         req.exclusion_query_json.len != 0 or req.authorization_filter_query_json.len != 0;
 }
 
@@ -596,7 +605,7 @@ fn requiresEncodedSource(req: types.SearchRequest) bool {
 fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequest) !?[]const []const u8 {
     // Deferred wire projection does not require unrelated physical columns.
     // Consumers without an explicit dependency contract retain full source.
-    if (requiresEncodedSource(req)) return null;
+    if (requiresEarlySource(req)) return null;
     if (!req.include_stored) return &.{};
     if (req.fields.len == 0) return if (req.include_all_fields) null else &.{};
     var positive = false;
@@ -707,14 +716,22 @@ test "external lake hydration unions returned and highlight fields without unrel
     req.order_by = &.{.{ .field = "body" }};
     try std.testing.expectEqualSlices([]const u8, &.{ "label", "body" }, (try owner.planHydration(req)).?);
     req.filter_query_json = "{}";
-    try std.testing.expect((try owner.planHydration(req)) == null);
+    try std.testing.expectEqualSlices([]const u8, &.{ "label", "body" }, (try owner.planHydration(req)).?);
+    try std.testing.expect(requiresEncodedSource(req));
 }
 
-test "external lake typed delivery defers only source-independent native retrieval" {
+test "external lake typed delivery separates final projection from residual predicates and pagination" {
     var req: types.SearchRequest = .{ .full_text = .{ .match = .{ .field = "body", .text = "needle" } }, .fields = &.{"label"}, .highlight = .{ .fields = &.{"body"} } };
     try std.testing.expect(canDeliverTypedSource(req));
     req.filter_query_json = "{}";
-    try std.testing.expect(!canDeliverTypedSource(req));
+    try std.testing.expect(canDeliverTypedSource(req));
+    try std.testing.expect(requiresEncodedSource(req));
+    req.search_after = &.{ .{ .float = 1 }, .{ .string = "id" } };
+    try std.testing.expect(canDeliverTypedSource(req));
+    req.search_after = &.{};
+    req.search_before = &.{ .{ .float = 1 }, .{ .string = "id" } };
+    try std.testing.expect(canDeliverTypedSource(req));
+    req.search_before = &.{};
     req.filter_query_json = "";
     req.order_by = &.{.{ .field = "amount" }};
     try std.testing.expect(!canDeliverTypedSource(req));

@@ -337,6 +337,11 @@ const Owner = struct {
         self.dynamic = filter;
         return true;
     }
+    fn retainColumns(raw: *anyopaque, a: Allocator) !?@import("../storage/rowsource/types.zig").ColumnOwner {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.stream.page_cursor) |*cursor| return cursor.retainColumns(a);
+        return null;
+    }
     fn nextColumns(raw: *anyopaque, alloc: Allocator, limit: u32) !catalog.ColumnPage {
         const self: *Owner = @ptrCast(@alignCast(raw));
         self.started = true;
@@ -387,7 +392,7 @@ const Owner = struct {
             }
             last_id = try @import("../storage/rowsource/identity.zig").allocId(alloc, batch.row_refs[selected[count - 1]]);
             const end = self.position == batch.rowCount() and (self.stream.page_cursor == null or self.stream.page_cursor.?.position == self.stream.page_cursor.?.group.row_count) and self.stream.file_index == self.stream.files.len and self.stream.group_index == self.stream.discovered.?.row_group_plan.row_groups.len;
-            return .{ .batch = view, .selection = selected[0..count], .after = if (end or self.primary_key != null) null else last_id };
+            return .{ .batch = view, .retain_columns = .{ .ptr = self, .retain_fn = retainColumns }, .selection = selected[0..count], .after = if (end or self.primary_key != null) null else last_id };
         }
         return .{ .batch = .{ .snapshot = .{ .table_id = self.stream.source.inventory.source_id, .snapshot_id = self.stream.source.inventory.snapshot_id }, .row_refs = &.{}, .columns = &.{} }, .selection = &.{} };
     }
