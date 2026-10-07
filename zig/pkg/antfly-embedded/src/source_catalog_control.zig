@@ -162,6 +162,7 @@ pub const section_synonyms = @import("section/synonyms.zig");
 pub const section_typed_doc_values = @import("section/typed_doc_values.zig");
 pub const section_vector_section = @import("section/vector_section.zig");
 pub const segment = @import("segment.zig");
+pub const segment_source = @import("segment_source.zig");
 pub const serverless_remote_uri = @import("serverless/remote_uri.zig");
 pub const sparse_sparse = @import("sparse/sparse.zig");
 pub const sql_aggregate_binding = @import("sql/aggregate_binding.zig");

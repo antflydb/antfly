@@ -103,7 +103,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     try context.ensureActive();
     var meta: local.api_query.QueryResponseMeta = .{ .remote_snapshot = &snapshot_token, .shard_count = 1, .took_ms = @intCast((@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms) };
     defer meta.deinit(a);
-    try @import("table_reads.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
+    try @import("query_post_processing.zig").applyQueryPostProcessing(a, effective, &result, &meta, .{ .source_table = table.name, .backend_runtime = server.cfg.backend_runtime, .secret_store = server.cfg.secret_store, .remote_content = server.cfg.remote_content });
     if (owner.typed_delivery) {
         if (!effective.count_only and (effective.include_stored or effective.highlight != null)) try owner.hydrateTyped(a, result.hits);
         try owner.attachHighlights(a, effective, &result);
