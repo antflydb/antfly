@@ -6352,9 +6352,9 @@ pub const HBCIndex = struct {
     fn loadNativeIndexMetadata(alloc: Allocator, backend: *hbc_backend.NativeBackend) !IndexMetadata {
         const posting_root = try std.fs.path.join(alloc, &.{ backend.root_dir, "posting-segments" });
         defer alloc.free(posting_root);
-        var opened = try posting_segment_store_mod.Store.openWithSegmentAlloc(alloc, backend.storage, posting_root);
+        var opened = if (backend.read_only) try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(alloc, backend.storage, posting_root) else try posting_segment_store_mod.Store.openWithSegmentAlloc(alloc, backend.storage, posting_root);
         defer opened.deinit();
-        _ = opened.store.reclaimUnreferencedFiles() catch |err| {
+        if (!backend.read_only) _ = opened.store.reclaimUnreferencedFiles() catch |err| {
             std.log.warn("posting startup cleanup deferred root={s} err={s}", .{ posting_root, @errorName(err) });
         };
         var current: ?[]const u8 = null;
@@ -9504,6 +9504,7 @@ pub const HBCIndex = struct {
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
+        if (self.env_owner == .native and self.env_owner.native.read_only) return try posting_segment_store_mod.Store.openReadOnly(self.alloc, location.storage, posting_root);
         return try posting_segment_store_mod.Store.open(self.alloc, location.storage, posting_root);
     }
 
@@ -9517,6 +9518,7 @@ pub const HBCIndex = struct {
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
+        if (self.env_owner == .native and self.env_owner.native.read_only) return try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(self.alloc, location.storage, posting_root);
         return try posting_segment_store_mod.Store.openWithSegmentAlloc(self.alloc, location.storage, posting_root);
     }
 

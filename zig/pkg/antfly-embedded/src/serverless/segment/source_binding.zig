@@ -26,6 +26,7 @@ pub const SidecarKind = enum(u8) {
     graph = 4,
     algebraic = 5,
     graph_metric = 6,
+    ordered_rows = 7,
 };
 
 pub const RowRefKind = enum(u8) {
@@ -180,7 +181,7 @@ pub fn validateBatchAgainstBinding(binding: Binding, batch: rowsource.ColumnBatc
     try validateBatchSnapshotAgainstBinding(binding, batch);
     for (binding.column_bindings, 0..) |column, idx| {
         const batch_column = batch.findColumn(column) orelse return error.SidecarSourceBindingMismatch;
-        if (binding.column_kinds.len != 0 and batch_column.kind() != binding.column_kinds[idx]) {
+        if (binding.column_kinds.len != 0 and batch_column.kind().logical() != binding.column_kinds[idx].logical()) {
             return error.SidecarSourceBindingMismatch;
         }
     }
@@ -777,4 +778,20 @@ test "sidecar row-ref key decoder rejects malformed and stale candidate keys" {
         error.SidecarSourceBindingMismatch,
         rowRefsFromKeysAlloc(alloc, binding, &[_][]const u8{stale_key}),
     );
+}
+
+test "sidecar bindings compare numeric dictionary logical kinds across page encodings" {
+    const batch: rowsource.ColumnBatch = .{
+        .snapshot = .{ .table_id = "orders", .snapshot_id = "snapshot-1" },
+        .row_refs = &.{.{ .external = .{ .source_id = "orders", .snapshot_id = "snapshot-1", .file_id = "part.parquet", .row_group_ordinal = 0, .row_ordinal = 0 } }},
+        .columns = &.{
+            .{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = &.{9007199254740993}, .indices = &.{0} } } },
+            .{ .name = "f", .values = .{ .dictionary_f64 = .{ .values = &.{2.5}, .indices = &.{0} } } },
+        },
+    };
+    const binding = bindingFromSnapshotWithColumnKinds(.algebraic, .external_parquet, batch.snapshot, "schema-1", &.{ "n", "f" }, &.{ .i64, .f64 }, "configuration-1");
+    try validateBatchAgainstBinding(binding, batch);
+    var wrong = binding;
+    wrong.column_kinds = &.{ .f64, .i64 };
+    try std.testing.expectError(error.SidecarSourceBindingMismatch, validateBatchAgainstBinding(wrong, batch));
 }

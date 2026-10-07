@@ -1402,7 +1402,8 @@ pub const ResourceManager = struct {
             const requester_slice_reclaimable = requester == .dense_search_working_set or
                 requester == .hbc_node_metadata_cache or
                 requester == .relational_preparation_working_set or
-                requester == .document_extraction_working_set;
+                requester == .document_extraction_working_set or
+                requester == .lite_native_page_cache;
             const slice_target = if (!requester_slice_reclaimable or slice_hard == 0)
                 0
             else
@@ -1432,7 +1433,7 @@ pub const ResourceManager = struct {
         // table content. Include the requester's own search slice so one index
         // can reuse capacity retained by another; callbacks use non-blocking
         // owner locks and therefore skip an in-flight scratch handle safely.
-        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache };
+        const candidates = [_]Slice{ requester, .dense_search_working_set, .document_extraction_working_set, .relational_preparation_working_set, .hbc_node_metadata_cache, .lsm_block_table_cache, .lite_native_page_cache };
         for (candidates, 0..) |candidate_slice, candidate_index| {
             if (candidate_index == 0) {
                 if (targets.slice == 0) continue;
@@ -1447,7 +1448,8 @@ pub const ResourceManager = struct {
                 candidate_slice != .dense_search_working_set and
                 candidate_slice != .hbc_node_metadata_cache and
                 candidate_slice != .relational_preparation_working_set and
-                candidate_slice != .document_extraction_working_set) continue;
+                candidate_slice != .document_extraction_working_set and
+                candidate_slice != .lite_native_page_cache) continue;
             // Preserve weighted fairness on the first pass. If some owners
             // cannot use their share, offer the remaining debt once more to
             // available owners before rejecting otherwise admissible work.

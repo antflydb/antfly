@@ -48,6 +48,14 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     defer parsed.deinit(a);
     const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed);
     if (native.storage_mode != .relational) return error.UnsupportedSqlShape;
+    if (native.external_base_source != null) {
+        const change = ddl.schema_change orelse return error.ExternalLakeReadOnly;
+        switch (change) {
+            .create_index => |index| if (index.unique) return error.ExternalLakeReadOnly,
+            .drop_index => {},
+            else => return error.ExternalLakeReadOnly,
+        }
+    }
     var schema = try std.json.parseFromSliceLeaky(std.json.Value, a, definition.schema_json, .{ .parse_numbers = false });
     if (!try @import("antfly_local_sources").sql_schema_ddl.apply(a, &schema, ddl)) return .{};
     _ = schema.object.swapRemove("version");

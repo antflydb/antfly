@@ -54,6 +54,8 @@ pub fn validateCompleteKeyspaceRanges(ranges: anytype) !void {
 }
 
 pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
+    const lake_index_catalog_json = try alloc.dupe(u8, record.lake_index_catalog_json);
+    errdefer alloc.free(lake_index_catalog_json);
     const relational_retirement_json = try alloc.dupe(u8, record.relational_retirement_json);
     errdefer alloc.free(relational_retirement_json);
     var storage_migration = record.storage_migration;
@@ -79,6 +81,7 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     errdefer alloc.free(restore_location);
     return .{
         .storage = record.storage,
+        .lake_index_catalog_json = lake_index_catalog_json,
         .relational_retirement_json = relational_retirement_json,
         .storage_migration = storage_migration,
         .table_id = record.table_id,

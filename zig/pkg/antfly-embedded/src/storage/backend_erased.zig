@@ -227,8 +227,9 @@ pub const Cursor = struct {
     }
 };
 
-/// Values remain valid until close, independently of other scopes on the
-/// same immutable snapshot. A streaming consumer closes one scope per block.
+/// Values remain valid until reset or close, independently of other scopes.
+/// Read transactions share one immutable snapshot. Native Lite write scopes
+/// copy the current pending overlay; cursor fallbacks use their cursor view.
 pub const ReadScope = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -237,20 +238,41 @@ pub const ReadScope = struct {
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         close: *const fn (Allocator, *anyopaque) void,
+        reset: ?*const fn (*anyopaque) anyerror!void = null,
+        get_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
     };
     pub fn get(self: *@This(), key: []const u8) ![]const u8 {
         return self.vtable.get(self.ptr, key);
     }
+    /// The returned slice belongs to out, independently of scope reset.
+    pub fn getInto(self: *@This(), key: []const u8, out: []u8) ![]const u8 {
+        if (self.vtable.get_into) |get_into| return get_into(self.ptr, key, out);
+        const value = try self.get(key);
+        if (value.len > out.len) return error.BufferTooSmall;
+        @memcpy(out[0..value.len], value);
+        return out[0..value.len];
+    }
+
     /// Results share the scope lifetime, not the parent snapshot's lifetime.
     pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
         if (keys.len != values.len) return error.InvalidBatch;
         @memset(values, null);
+        errdefer @memset(values, null);
+        for (keys, 0..) |key, i| {
+            if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.InvalidBatch;
+        }
         if (self.vtable.get_many_sorted) |get_many| return get_many(self.ptr, keys, values);
         for (keys, values) |key, *value| value.* = self.get(key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
         };
     }
+    /// Invalidates scope values and releases pins; keeps bounded reusable scratch.
+    pub fn reset(self: *@This()) !void {
+        const reset_scope = self.vtable.reset orelse return error.ReadScopeResetUnsupported;
+        try reset_scope(self.ptr);
+    }
+
     pub fn close(self: *@This()) void {
         self.vtable.close(self.allocator, self.ptr);
         self.* = undefined;
@@ -273,6 +295,16 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getManySorted(keys, values);
         }
+        fn getInto(ptr: *anyopaque, key: []const u8, out: []u8) anyerror![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.getInto(key, out);
+        }
+
+        fn reset(ptr: *anyopaque) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.handle.reset();
+        }
+
         fn close(a: Allocator, ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.handle.close();
@@ -282,7 +314,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
     };
     const state = try alloc.create(State);
     state.* = .{ .handle = handle, .parent = parent };
-    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close } };
+    return .{ .allocator = alloc, .ptr = state, .vtable = &.{ .get = State.get, .get_many_sorted = if (@hasDecl(@TypeOf(handle), "getManySorted")) State.getManySorted else null, .close = State.close, .reset = if (@hasDecl(@TypeOf(handle), "reset")) State.reset else null, .get_into = if (@hasDecl(@TypeOf(handle), "getInto")) State.getInto else null } };
 }
 
 /// Portable fallback: cursor-owned storage pins are bounded; returned copies
@@ -290,18 +322,22 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
 pub fn cursorReadScope(alloc: Allocator, cursor: Cursor) !ReadScope {
     const Scope = struct {
         cursor: Cursor,
-        arena: std.heap.ArenaAllocator,
+        scratch: @import("../segment_source.zig").Scratch,
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             const entry = (try self.cursor.seekAtOrAfter(key)) orelse return error.NotFound;
             if (!std.mem.eql(u8, entry.key, key)) return error.NotFound;
-            return self.arena.allocator().dupe(u8, entry.value);
+            return self.scratch.allocator().dupe(u8, entry.value);
         }
+        pub fn reset(self: *@This()) void {
+            self.scratch.reset();
+        }
+
         pub fn close(self: *@This()) void {
             self.cursor.close();
-            self.arena.deinit();
+            self.scratch.deinit();
         }
     };
-    return readScopeFrom(alloc, Scope{ .cursor = cursor, .arena = std.heap.ArenaAllocator.init(alloc) });
+    return readScopeFrom(alloc, Scope{ .cursor = cursor, .scratch = @import("../segment_source.zig").Scratch.init(alloc, 256 * 1024) });
 }
 
 pub const ReadTxn = struct {
@@ -504,6 +540,7 @@ pub const WriteTxn = struct {
         put: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         open_cursor: *const fn (Allocator, *anyopaque) anyerror!Cursor,
+        open_read_scope: ?*const fn (Allocator, *anyopaque) anyerror!ReadScope = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -518,6 +555,17 @@ pub const WriteTxn = struct {
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         if (self.write_gate) |mutex| mutex.unlock();
         self.* = undefined;
+    }
+
+    /// Temporary reads own a separate lifetime. Close before commit; the
+    /// adapter prevents publication while native scopes retain the parent.
+    pub fn openReadScope(self: *WriteTxn, allocator: Allocator) !ReadScope {
+        if (self.vtable.open_read_scope) |open_scope| {
+            return try BoundaryAbi.call("open_read_scope", self.boundary_dispatch, open_scope, .{ allocator, self.ptr });
+        }
+        var cursor = try self.openCursor();
+        errdefer cursor.close();
+        return cursorReadScope(allocator, cursor);
     }
 
     pub fn get(self: *WriteTxn, key: []const u8) ![]const u8 {
@@ -1529,6 +1577,15 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             try unbox(ptr).handle.delete(key);
         }
 
+        pub fn openReadScope(alloc: Allocator, ptr: *anyopaque) anyerror!ReadScope {
+            const parent = unbox(ptr);
+            try parent.retainChild();
+            errdefer parent.releaseChild();
+            var scope = try parent.handle.openReadScope(alloc);
+            errdefer scope.close();
+            return readScopeFromWithParent(alloc, scope, parentReleaseFor(parent));
+        }
+
         pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
@@ -1551,6 +1608,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .put = vt.put,
             .delete = vt.delete,
             .open_cursor = vt.openCursor,
+            .open_read_scope = if (@hasDecl(Handle, "openReadScope")) vt.openReadScope else null,
         },
     };
 }

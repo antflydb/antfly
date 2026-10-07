@@ -157,6 +157,12 @@ fn cloneColumnAlloc(alloc: Allocator, column: rowsource.ColumnVector) !rowsource
 fn cloneColumnValuesAlloc(alloc: Allocator, values: rowsource.ColumnValues) !rowsource.ColumnValues {
     return switch (values) {
         .bytes => |items| .{ .bytes = try cloneByteSlicesAlloc(alloc, items) },
+        inline .dictionary_i64, .dictionary_f64 => |items, tag| blk: {
+            const T = std.meta.Elem(@TypeOf(items.values));
+            const entries = try alloc.dupe(T, items.values);
+            errdefer alloc.free(entries);
+            break :blk @unionInit(rowsource.ColumnValues, @tagName(tag), .{ .values = entries, .indices = try alloc.dupe(u32, items.indices), .owned = true });
+        },
         .dictionary_bytes => |items| blk: {
             const entries = try cloneByteSlicesAlloc(alloc, items.values);
             errdefer {
@@ -201,6 +207,7 @@ fn freeColumn(alloc: Allocator, column: rowsource.ColumnVector) void {
     alloc.free(@constCast(column.name));
     alloc.free(@constCast(column.nulls.bytes));
     switch (column.values) {
+        inline .dictionary_i64, .dictionary_f64 => |items| items.deinit(alloc),
         .dictionary_bytes => |items| items.deinit(alloc),
         .bytes, .json => |items| {
             for (items) |item| alloc.free(@constCast(item));
@@ -220,7 +227,11 @@ test "bounded replay scans a source once and supports independent cursors" {
     const alloc = std.testing.allocator;
     const refs = [_]rowsource.RowRef{.{ .relational_key = "a" }};
     const values = [_]i64{7};
-    const columns = [_]rowsource.ColumnVector{.{ .name = "n", .values = .{ .i64 = &values } }};
+    const columns = [_]rowsource.ColumnVector{
+        .{ .name = "n", .values = .{ .i64 = &values } },
+        .{ .name = "exact", .values = .{ .dictionary_i64 = .{ .values = &.{9007199254740993}, .indices = &.{0} } } },
+        .{ .name = "measure", .values = .{ .dictionary_f64 = .{ .values = &.{2.5}, .indices = &.{0} } } },
+    };
     const batches = [_]rowsource.ColumnBatch{.{
         .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
         .row_refs = &refs,
@@ -242,7 +253,12 @@ test "bounded replay scans a source once and supports independent cursors" {
     try std.testing.expectEqual(@as(usize, 1), state.index);
     var first = replay.cursor();
     var second = replay.cursor();
-    try std.testing.expectEqual(@as(i64, 7), (try first.rowSource().next(alloc)).?.columns[0].values.i64[0]);
+    const copied = (try first.rowSource().next(alloc)).?;
+    try std.testing.expectEqual(@as(i64, 7), copied.columns[0].values.i64[0]);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), try copied.columns[1].integerAt(0));
+    try std.testing.expect(copied.columns[1].values.dictionary_i64.owned);
+    try std.testing.expect(copied.columns[1].values.dictionary_i64.values.ptr != columns[1].values.dictionary_i64.values.ptr);
+    try std.testing.expectEqual(@as(f64, 2.5), copied.columns[2].values.dictionary_f64.at(0));
     try std.testing.expectEqual(@as(i64, 7), (try second.rowSource().next(alloc)).?.columns[0].values.i64[0]);
 
     var bounded_state = TestSource{ .batches = &batches };

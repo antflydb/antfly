@@ -54,6 +54,8 @@ pub const ObjectStore = struct {
     gcs_client: ?*objectstore.Gcs.JsonApiClient = null,
     s3_client: ?*objectstore.S3.Client = null,
     owns_client: bool = true,
+    read_only: bool = false,
+    local_inventory: ?@import("fs_store.zig").FsStore = null,
     bucket: []u8,
     prefix: []u8,
     verified_mu: std.atomic.Mutex = .unlocked,
@@ -101,11 +103,16 @@ pub const ObjectStore = struct {
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, "");
         errdefer alloc.free(owned_prefix);
+        const directories = try fs.artifactDirectoriesAlloc(alloc, owned_bucket);
+        defer alloc.free(directories.objects);
+        defer alloc.free(directories.inventory);
+        const inventory = try @import("fs_store.zig").FsStore.initExistingWithInventory(alloc, directories.objects, directories.inventory);
         client_initialized = false;
         return .{
             .alloc = alloc,
             .client = owned_client,
             .fs_client = fs,
+            .local_inventory = inventory,
             .bucket = owned_bucket,
             .prefix = owned_prefix,
         };
@@ -175,22 +182,51 @@ pub const ObjectStore = struct {
     }
 
     pub fn initWithClient(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8) !ObjectStore {
+        return initWithClientOptions(alloc, client, bucket, prefix, .{ .ensure_bucket = true });
+    }
+
+    /// Borrow a configured client without widening its provisioning authority.
+    /// Readers and require-existing writers must not create missing buckets.
+    pub fn initWithClientOptions(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8, options: struct { ensure_bucket: bool = false, read_only: bool = false, filesystem: ?*objectstore.FilesystemClient = null }) !ObjectStore {
+        if (options.read_only and options.ensure_bucket) return error.InvalidArtifactStoreOptions;
         var owned_client = client;
-        if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
+        if (!(try owned_client.bucketExists(bucket))) {
+            if (!options.ensure_bucket) return error.ArtifactBucketNotFound;
+            try owned_client.makeBucket(bucket);
+        }
         const owned_bucket = try alloc.dupe(u8, bucket);
         errdefer alloc.free(owned_bucket);
         const owned_prefix = try alloc.dupe(u8, prefix);
         errdefer alloc.free(owned_prefix);
+        const inventory: ?@import("fs_store.zig").FsStore = if (options.filesystem) |fs| value: {
+            if (prefix.len != 0) {
+                if (std.fs.path.isAbsolute(prefix) or std.mem.indexOfScalar(u8, prefix, 0) != null or std.mem.indexOfScalar(u8, prefix, '\\') != null) return error.InvalidObjectPrefix;
+                var components = std.mem.splitScalar(u8, std.mem.trimEnd(u8, prefix, "/"), '/');
+                while (components.next()) |component| if (component.len == 0 or std.mem.eql(u8, component, ".") or std.mem.eql(u8, component, "..")) return error.InvalidObjectPrefix;
+            }
+
+            const directories = try fs.artifactDirectoriesAlloc(alloc, bucket);
+            defer alloc.free(directories.objects);
+            defer alloc.free(directories.inventory);
+            const local_root = try std.fs.path.join(alloc, &.{ directories.objects, prefix });
+            defer alloc.free(local_root);
+            const inventory_root = try std.fs.path.join(alloc, &.{ directories.inventory, prefix });
+            defer alloc.free(inventory_root);
+            break :value try @import("fs_store.zig").FsStore.initExistingWithInventory(alloc, local_root, inventory_root);
+        } else null;
         return .{
             .alloc = alloc,
             .client = owned_client,
+            .local_inventory = inventory,
             .owns_client = false,
+            .read_only = options.read_only,
             .bucket = owned_bucket,
             .prefix = owned_prefix,
         };
     }
 
     pub fn deinit(self: *ObjectStore) void {
+        if (self.local_inventory) |*inventory| inventory.deinit();
         lockAtomic(&self.verified_mu);
         var verified_it = self.verified_objects.iterator();
         while (verified_it.next()) |entry| {
@@ -226,6 +262,7 @@ pub const ObjectStore = struct {
 
     fn putInScope(self: *ObjectStore, alloc: std.mem.Allocator, scope: ?artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         try cancellation.check();
+        if (self.read_only) return error.ArtifactStoreReadOnly;
         const checksum = try sha256StringWithCancellationAlloc(alloc, contents, cancellation);
         errdefer alloc.free(checksum);
         const artifact_id = if (scope) |value| scoped: {
@@ -236,6 +273,7 @@ pub const ObjectStore = struct {
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
 
+        if (scope) |upload| if (self.local_inventory) |*inventory| try inventory.registerScopedUpload(upload, checksum, cancellation);
         var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
         _ = std.fmt.hexToBytes(&digest, checksum) catch unreachable;
         var checksum_base64_buf: [std.base64.standard.Encoder.calcSize(digest.len)]u8 = undefined;
@@ -503,6 +541,7 @@ pub const ObjectStore = struct {
     }
 
     pub fn delete(self: *ObjectStore, artifact_id: []const u8) !void {
+        if (self.read_only) return error.ArtifactStoreReadOnly;
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         try self.client.deleteObject(self.bucket, key, .{});
@@ -571,11 +610,18 @@ pub const ObjectStore = struct {
     }
 
     fn visitScopedUploads(self: *ObjectStore, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
+        if (!self.read_only and visitor.checkpoint != null) if (self.local_inventory) |*inventory| {
+            var local_store = inventory.artifactStore();
+            return local_store.visitScopedUploads(domain, visitor, cancellation);
+        };
         const prefix = if (self.prefix.len == 0)
             try std.fmt.allocPrint(self.alloc, "graph/{s}/", .{std.fmt.bytesToHex(&domain, .lower)})
         else
             try std.fmt.allocPrint(self.alloc, "{s}/graph/{s}/", .{ self.prefix, std.fmt.bytesToHex(&domain, .lower) });
         defer self.alloc.free(prefix);
+        const start = if (visitor.after_suffix) |after| try std.mem.concat(self.alloc, u8, &.{ prefix, after }) else null;
+        defer if (start) |key| self.alloc.free(key);
+        var visited: usize = 0;
         var token: ?[]u8 = null;
         defer if (token) |value| self.alloc.free(value);
         while (true) {
@@ -585,6 +631,7 @@ pub const ObjectStore = struct {
                 .recursive = true,
                 .max_keys = 256,
                 .continuation_token = token,
+                .start_after = if (token == null) start else null,
                 .cancellation = objectstore.CancellationToken.fromCallback(cancellation.ptr, cancellation.is_cancelled_fn),
             });
             defer page.deinit(self.client.allocator);
@@ -594,7 +641,18 @@ pub const ObjectStore = struct {
             for (page.entries) |entry| {
                 try cancellation.check();
                 if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidArtifactId;
-                try artifact_store.visitScopedSuffix(domain, entry.key[prefix.len..], visitor);
+                const suffix = entry.key[prefix.len..];
+                if (suffix.len != 97 or suffix[32] != '/') continue;
+                var encoded_attempt: [16]u8 = undefined;
+                _ = std.fmt.hexToBytes(&encoded_attempt, suffix[0..32]) catch return error.InvalidArtifactId;
+                const fence = std.mem.readInt(u64, encoded_attempt[0..8], .big);
+                if (visitor.exclude_attempt) |excluded| if (std.mem.eql(u8, &excluded, &encoded_attempt)) continue;
+                if (visitor.only_attempt) |only| if (!std.mem.eql(u8, &only, &encoded_attempt)) continue;
+                if (fence < visitor.fencing_floor) continue;
+                if (visitor.fencing_cutoff) |cutoff| if (fence >= cutoff) return;
+                if (visitor.max_entries) |maximum| if (visited == maximum) return error.ArtifactEnumerationPaused;
+                try artifact_store.visitScopedSuffix(domain, suffix, visitor);
+                visited += 1;
             }
             if (token) |value| self.alloc.free(value);
             token = next;
@@ -609,6 +667,7 @@ pub const ObjectStore = struct {
         .put_with_cancellation = erasedPutWithCancellation,
         .put_scoped = erasedPutScoped,
         .visit_scoped_uploads = erasedVisitScopedUploads,
+        .reclaim_retired_scoped_inventory = erasedReclaimRetiredScopedInventory,
         .get_alloc = erasedGetAlloc,
         .get_alloc_with_cancellation = erasedGetAllocWithCancellation,
         .get_range_alloc = erasedGetRangeAlloc,
@@ -639,6 +698,15 @@ pub const ObjectStore = struct {
     fn erasedPutScoped(ptr: *anyopaque, alloc: std.mem.Allocator, scope: artifact_store.UploadScope, contents: []const u8, cancellation: CancellationToken) !artifact_store.ArtifactMetadata {
         const self: *ObjectStore = @ptrCast(@alignCast(ptr));
         return self.putInScope(alloc, scope, contents, cancellation);
+    }
+
+    fn erasedReclaimRetiredScopedInventory(raw: *anyopaque, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
+        const self: *ObjectStore = @ptrCast(@alignCast(raw));
+        if (self.read_only) return error.ArtifactStoreReadOnly;
+        if (self.local_inventory) |*inventory| {
+            var store = inventory.artifactStore();
+            try store.reclaimRetiredScopedInventory(domain, floor, cutoff, cancellation);
+        }
     }
 
     fn erasedVisitScopedUploads(ptr: *anyopaque, domain: [32]u8, visitor: artifact_store.ScopedUploadVisitor, cancellation: CancellationToken) !void {
@@ -851,6 +919,20 @@ test "objectstore-backed artifacts store round-trips over file uri" {
     const got = try store.getAlloc(meta.artifact_id);
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("payload", got);
+}
+
+test "objectstore-backed artifact readers preserve bucket provisioning authority" {
+    const alloc = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    try std.testing.expectError(error.ArtifactBucketNotFound, ObjectStore.initWithClientOptions(alloc, memory.client(), "missing-bucket", "tenant/a", .{}));
+    try std.testing.expect(!(try memory.client().bucketExists("missing-bucket")));
+    var impl = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .ensure_bucket = true });
+    defer impl.deinit();
+    var reader = try ObjectStore.initWithClientOptions(alloc, memory.client(), "artifact-bucket", "tenant/a", .{ .read_only = true });
+    defer reader.deinit();
+    try std.testing.expectError(error.ArtifactStoreReadOnly, reader.put(alloc, "denied"));
+    try std.testing.expectError(error.ArtifactStoreReadOnly, reader.delete("sha256:abcd"));
 }
 
 test "objectstore-backed artifacts reject malformed content addresses before I/O" {

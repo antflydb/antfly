@@ -47,7 +47,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     if (request.include_primary_digest or request.include_document or request.index_equality != null) return error.UnsupportedSqlExecution;
     try context.ensureActive();
     const binding = table.external_base_source orelse return error.InvalidSqlBackend;
-    try @import("../serverless/query/lake_scan_plan.zig").validateBindingInventory(binding.binding, source.inventory);
+    try source.validateBinding(binding.binding);
     if (request.after) |id| try @import("../storage/rowsource/identity.zig").validateContinuation(id, source.inventory);
     if (request.before) |id| try @import("../storage/rowsource/identity.zig").validateContinuation(id, source.inventory);
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -94,6 +94,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
     stream.identity_only = identity_only;
+    if (request.row_refs) |refs| try stream.selectRows(try @import("../serverless/query/lake_row_selection.zig").Selection.initWithMap(owned, source.inventory, refs, source.fileMap()));
     if (source.iceberg_schema != null or std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
         var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;
         for (table.columns) |column| {
@@ -123,11 +124,14 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     // the local allocator after copying would leave new buffers unowned.
     owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key, .mask_arena = .init(alloc) };
     owner.stream.filter_columns = filter_columns.items;
-    if (source.scanner.iceberg_delete_plan != null or conditions.len != 0 or after != null or before != null or primary_key != null)
+    if (stream.selection != null or source.scanner.iceberg_delete_plan != null or conditions.len != 0 or after != null or before != null or primary_key != null)
         owner.stream.filter = .{ .ptr = owner, .any_match = Owner.anyMatch };
     var estimated_rows: u64 = 0;
     var estimated_bytes: u64 = 0;
-    for (source.inventory.files) |file| {
+    if (source.estimates()) |estimate| {
+        estimated_rows = estimate.rows;
+        estimated_bytes = estimate.bytes;
+    } else for (source.inventory.files) |file| {
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
     }
@@ -232,6 +236,10 @@ const Owner = struct {
         const a = self.mask_arena.allocator();
         const selected = try a.alloc(bool, count);
         @memset(selected, true);
+        if (self.stream.selection) |selection| for (batch.row_refs, selected) |row_ref, *keep| {
+            const r = row_ref.external;
+            keep.* = selection.contains(self.stream.active_file, r.row_group_ordinal, r.row_ordinal);
+        };
         try self.stream.deleteMask(a, batch, selected);
         const vectors = try a.dupe(@import("../storage/rowsource/types.zig").ColumnVector, batch.columns);
         for (vectors) |*vector| for (self.table.columns) |definition| if (std.mem.eql(u8, definition.path, vector.name)) {
@@ -248,9 +256,7 @@ const Owner = struct {
             for (selected, 0..) |*keep, index| {
                 if (!keep.*) continue;
                 const one: catalog.ColumnPage = .{ .batch = view, .selection = &.{index} };
-                if (physical != null and physical.?.values == .dictionary_bytes and !physical.?.nulls.isNull(index)) {
-                    const id = physical.?.values.dictionary_bytes.indices[index];
-                    if (id >= physical.?.values.dictionary_bytes.values.len) return error.InvalidSqlBackendResponse;
+                if (if (physical) |column| try column.dictionaryId(index) else null) |id| {
                     if (dictionary.get(id)) |cached| {
                         keep.* = cached;
                     } else {
@@ -287,7 +293,7 @@ const Owner = struct {
     }
     fn countRows(raw: *anyopaque) !?u64 {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        if (self.dynamic != null or self.conditions.len != 0 or self.after != null or self.before != null or self.primary_key != null or self.batch != null) return null;
+        if (self.stream.selection != null or self.dynamic != null or self.conditions.len != 0 or self.after != null or self.before != null or self.primary_key != null or self.batch != null) return null;
         if (self.stream.source.inventory.deleted_row_groups.len != 0) return null;
         if (self.stream.source.scanner.iceberg_delete_plan) |plan| if (plan.files.len != 0) return null;
         return self.stream.countAll() catch |err| switch (err) {
@@ -411,6 +417,7 @@ const Owner = struct {
     }
     fn splitOrdered(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.stream.selection != null) return null;
         if (self.started or self.dynamic != null or self.stream.partition_count != 1 or maximum < 2 or self.stream.source.scanner.shared_reader == null) return null;
         // Multiple files form lazy contiguous ranges. Opening a later footer
         // must not move its error ahead of an earlier successfully read prefix.
@@ -435,12 +442,24 @@ const Owner = struct {
     }
     fn splitScan(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.stream.selection != null) return null;
         if (self.started or self.dynamic != null or self.stream.partition_count != 1) return null;
         const count = try self.stream.partitionCount(maximum);
         if (count < 2) return null;
         return try self.splitChildren(a, count, false);
     }
     fn cloneVersionState(a: Allocator, source: *serving.ServingSource) !void {
+        const resolved = source.pinned_files.len == source.inventory.files.len and std.mem.allEqual(bool, source.pinned_files, true);
+        if (!source.inventory_owned or !source.lazy_versions or resolved) {
+            // An unopened child borrows the immutable plan and independently
+            // pins only its own files. Parent lifetime pins the plan lease.
+            source.versions = .empty;
+            source.pinned_files = &.{};
+            source.inventory_owned = false;
+            if (resolved) source.lazy_versions = false;
+            source.alloc = a;
+            return;
+        }
         const files = try a.alloc(@import("../serverless/external_source/types.zig").FileEntry, source.inventory.files.len);
         var owned: usize = 0;
         errdefer {
@@ -464,6 +483,8 @@ const Owner = struct {
         source.scanner.inventory = source.inventory;
     }
     fn freeVersionState(a: Allocator, source: *serving.ServingSource) void {
+        source.clearVersions();
+        if (!source.inventory_owned) return;
         for (source.inventory.files) |file| {
             a.free(file.etag);
             a.free(file.version_id);
@@ -521,7 +542,7 @@ const Owner = struct {
     }
 };
 
-fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, table: catalog.Table, conditions: []const catalog.Condition) !bool {
+pub fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, table: catalog.Table, conditions: []const catalog.Condition) !bool {
     for (conditions) |condition| {
         const cell = try page.cell(alloc, 0, condition.column);
         if (condition.op == .is_null) {
@@ -616,6 +637,13 @@ const TestLake = struct {
         reads: usize = 0,
         stats: usize = 0,
         bytes: usize = 0,
+        active: usize = 0,
+        peak: usize = 0,
+        delay_reads: bool = false,
+        mutex: std.atomic.Mutex = .unlocked,
+        fn lock(self: *Meter) void {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        }
         fn client(self: *Meter) storage.ObjectStorage {
             self.vtable.get_object = get;
             self.vtable.stat_object = stat;
@@ -626,16 +654,30 @@ const TestLake = struct {
             const self: *Meter = @ptrCast(@alignCast(raw));
             var base = self.base;
             base.allocator = alloc;
+            self.lock();
             self.stats += 1;
+            self.mutex.unlock();
             return base.statObject(bucket, key);
         }
         fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
             const self: *Meter = @ptrCast(@alignCast(raw));
             var base = self.base;
             base.allocator = alloc;
+            self.lock();
             self.reads += 1;
+            self.active += 1;
+            self.peak = @max(self.peak, self.active);
+            self.mutex.unlock();
+            defer {
+                self.lock();
+                self.active -= 1;
+                self.mutex.unlock();
+            }
+            if (self.delay_reads) try native_platform.testing.io.sleep(.fromMilliseconds(5), .awake);
             const result = try base.getObject(bucket, key, options);
+            self.lock();
             self.bytes += result.body.len;
+            self.mutex.unlock();
             return result;
         }
     };
@@ -839,6 +881,47 @@ test "lake SQL metadata count avoids decoded rows and typed pages preserve null 
     try std.testing.expect(json_null.value == .null and !json_null.sql_null);
     try std.testing.expect((try page.cell(arena.allocator(), 1, "json")).sql_null);
     try std.testing.expectEqual(@as(i64, 9007199254740993), (try page.cell(arena.allocator(), 0, "large")).value.integer);
+}
+
+test "lake SQL candidate hydration prunes files and applies residuals before delivery" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 8, &.{ 10, 20, 30, 40 });
+    defer lake.deinit(a);
+    const Rows = @import("../storage/rowsource/types.zig");
+    const ref: Rows.RowRef = .{ .external = .{
+        .source_id = lake.source.inventory.source_id,
+        .snapshot_id = lake.source.inventory.snapshot_id,
+        .file_id = lake.source.inventory.files[3].file_id,
+        .row_group_ordinal = 0,
+        .row_ordinal = 1,
+    } };
+    var second = ref;
+    second.external.row_ordinal = 3;
+    const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .row_refs = &.{ second, ref, second }, .conditions = &.{.{ .column = "amount", .op = .gte, .value = .{ .integer = 30 } }}, .limit = 2 }, .{}, &lake.source);
+    defer cursor.close(cursor.ptr);
+    const page = try cursor.next(cursor.ptr, a, 10);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+    try std.testing.expectEqual(@as(i64, 40), (try page.rows[0].cell("amount")).value.integer);
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    try std.testing.expectEqual(@as(usize, 1), owner.stream.stats.files_opened);
+    try std.testing.expectEqual(@as(usize, 7), owner.stream.stats.files_pruned);
+    try std.testing.expectEqual(@as(?u64, null), try cursor.count_rows.?(cursor.ptr));
+    const empty = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .row_refs = &.{}, .limit = 1 }, .{}, &lake.source);
+    defer empty.close(empty.ptr);
+    const absent = try empty.next(empty.ptr, a, 1);
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(usize, 0), absent.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), (@as(*Owner, @ptrCast(@alignCast(empty.ptr)))).stream.stats.files_opened);
+    var stale = ref;
+    stale.external.snapshot_id = "replaced";
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, openPinned(a, lake.table, .{ .fields = &.{"amount"}, .row_refs = &.{stale}, .limit = 1 }, .{}, &lake.source));
+    var invalid = ref;
+    invalid.external.row_ordinal = 99;
+    const invalid_cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .row_refs = &.{invalid}, .limit = 1 }, .{}, &lake.source);
+    defer invalid_cursor.close(invalid_cursor.ptr);
+    try std.testing.expectError(error.InvalidLakeCandidateReference, invalid_cursor.next(invalid_cursor.ptr, a, 1));
 }
 
 test "lake SQL typed stream applies Iceberg equality and position deletes before limits" {
@@ -1111,12 +1194,15 @@ test "lake SQL shared row group tasks and exact parallel reducers match serial g
     var cache = Cache.init(a);
     defer cache.deinit();
     try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = native_platform.testing.io });
+    lake.meter.delay_reads = true;
     const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
     defer parent.close(parent.ptr);
     const parts = (try parent.split_scan.?(parent.ptr, a, 4)).?;
     defer a.free(parts);
     defer for (parts) |part| part.close(part.ptr);
     try std.testing.expectEqual(@as(usize, 4), parts.len);
+    try std.testing.expect(lake.meter.peak >= 2);
+    lake.meter.delay_reads = false;
     const parent_owner: *Owner = @ptrCast(@alignCast(parent.ptr));
     try std.testing.expectEqual(@as(usize, 4), parent_owner.stream.stats.files_opened);
     var total: usize = 0;
@@ -1408,4 +1494,100 @@ test "lake SQL lazy ordered range ownership unwinds allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Sweep.run, .{ &lake.source, lake.table });
+}
+
+test "lake SQL shared immutable plans retain sparse file versions and canonical ordering" {
+    const a = std.testing.allocator;
+    const codec = @import("../serverless/external_source/codec.zig");
+    const external = @import("../serverless/external_source/types.zig");
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 2, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    var schema = try @import("../serverless/query/lake_schema.zig").icebergSchema(a, "{\"current-schema-id\":7,\"schemas\":[{\"schema-id\":7,\"fields\":[{\"id\":1,\"name\":\"amount\",\"required\":true,\"type\":\"long\"}]}]}", null);
+    defer schema.deinit();
+    lake.source.iceberg_schema = schema;
+    lake.inventory.format = .iceberg;
+    lake.table.external_base_source.?.binding.format = .iceberg;
+    var zero: [8]u8 = @splat(0);
+    lake.inventory.files[0].lower_bounds = try external.FieldMetric.cloneAll(a, &.{.{ .field_id = 1, .value = &zero }});
+    lake.inventory.files[0].upper_bounds = try external.FieldMetric.cloneAll(a, &.{.{ .field_id = 1, .value = &zero }});
+    const bytes = try codec.encodeAlloc(a, lake.inventory);
+    defer a.free(bytes);
+    const lease = try cache.decoded.create(1024 * 1024);
+    defer lease.release();
+    const ca = lease.item.budget.allocator();
+    lease.item.payload = .{ .snapshot = .{ .inventory = try codec.decodeAlloc(ca, bytes) } };
+    const manifest = &lease.item.payload.snapshot.inventory;
+    ca.free(manifest.files[1].etag);
+    ca.free(manifest.files[1].version_id);
+    manifest.files[1].etag = &.{};
+    manifest.files[1].version_id = try ca.dupe(u8, "iceberg:v1:data_seq=1");
+    try serving.ServingSource.prepareCachedPlan(lease.item);
+    lake.source.inventory = manifest.*;
+    lake.source.scanner.inventory = manifest.*;
+    lake.source.plan_lease = lease;
+    lake.source.inventory_owned = false;
+    lake.source.lazy_versions = true;
+    defer lake.source.clearVersions();
+    var client = lake.memory.client();
+    try client.deleteObject("bucket", "events/0.parquet", .{});
+    for (0..2) |_| {
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .conditions = &.{.{ .column = "amount", .op = .eq, .value = .{ .integer = 2 } }}, .limit = 8 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        try std.testing.expect(owner.stream.files.ptr == lease.item.file_order.?.ptr);
+        try std.testing.expect(!owner.stream.owns_files);
+        const page = try cursor.next(cursor.ptr, a, 8);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqual(@as(usize, 1), lake.meter.stats);
+        try std.testing.expectEqual(@as(usize, 1), lake.source.versions.count());
+        try std.testing.expect(lake.source.pinned_files.len == 0);
+        try std.testing.expect(!lake.source.isFilePinned(0) and lake.source.isFilePinned(1));
+        try std.testing.expectEqual(@as(usize, 0), manifest.files[1].etag.len);
+        try std.testing.expect(lake.source.fileAt(1).etag.len != 0);
+    }
+    try lake.source.ownInventory();
+    defer lake.source.inventory.deinit(a);
+    defer a.free(lake.source.pinned_files);
+    try std.testing.expect(lake.source.inventory_owned);
+    try std.testing.expectEqual(@as(usize, 0), lake.source.versions.count());
+    try std.testing.expect(lake.source.pinned_files[1]);
+    try std.testing.expect(lake.source.inventory.files[1].etag.len != 0);
+    try std.testing.expectEqual(@as(usize, 0), manifest.files[1].etag.len);
+}
+
+test "lake SQL candidate windows share owned projected reader plans after cursor teardown" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 1, &.{ 10, 20, 30, 40 });
+    defer lake.deinit(a);
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = native_platform.testing.io });
+    const ref: @import("../storage/rowsource/types.zig").RowRef = .{ .external = .{ .source_id = lake.source.inventory.source_id, .snapshot_id = lake.source.inventory.snapshot_id, .file_id = lake.source.inventory.files[0].file_id, .row_group_ordinal = 0, .row_ordinal = 3 } };
+    var previous: ?*anyopaque = null;
+    for (0..3) |iteration| {
+        // The request name is freed before the next window. Cached physical
+        // mappings must own their bytes and retain no earlier cursor storage.
+        const name = try a.dupe(u8, "amount");
+        defer a.free(name);
+        const before = lake.meter.reads;
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{name}, .row_refs = &.{ref}, .conditions = &.{.{ .column = name, .op = .gte, .value = .{ .integer = 30 } }}, .limit = 1 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const page = try cursor.next_columns.?(cursor.ptr, arena.allocator(), 1);
+        try std.testing.expectEqual(@as(usize, 1), page.selection.len);
+        try std.testing.expectEqual(@as(i64, 40), (try page.cell(arena.allocator(), 0, "amount")).value.integer);
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        const plan = owner.stream.hydration_plan.?.item.payload.extension;
+        if (iteration != 0) {
+            try std.testing.expect(plan == previous.?);
+            try std.testing.expectEqual(before, lake.meter.reads);
+        }
+        previous = plan;
+    }
 }

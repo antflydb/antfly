@@ -3455,6 +3455,24 @@ pub fn BoundReadTxn(comptime BackendType: type) type {
                 p.backend.recordGetManySortedResults(result.hits, result.misses);
             }
 
+            /// Release payload ownership between streaming batches while
+            /// reusing bounded pin/value pointer arrays. Larger batches never
+            /// permanently inflate the next ordinary batch's scratch.
+            pub fn reset(self: *@This()) void {
+                for (self.held_blocks.items) |*handle| handle.release();
+                for (self.held_values.items) |value| self.allocator.free(value);
+                if (self.held_blocks.capacity * @sizeOf(cache_mod.Handle) > 64 * 1024) {
+                    self.held_blocks.deinit(self.parent.backend.allocator);
+                    self.held_blocks = .empty;
+                } else self.held_blocks.clearRetainingCapacity();
+                if (self.held_values.capacity * @sizeOf([]u8) > 64 * 1024) {
+                    self.held_values.deinit(self.allocator);
+                    self.held_values = .empty;
+                } else self.held_values.clearRetainingCapacity();
+                self.read_hint = null;
+                self.last_l0_group_index = null;
+            }
+
             pub fn close(self: *@This()) void {
                 releaseHeldBlocks(&self.held_blocks, self.parent.backend.allocator);
                 releaseHeldValues(&self.held_values, self.allocator);

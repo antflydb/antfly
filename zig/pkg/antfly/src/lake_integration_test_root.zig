@@ -13,12 +13,39 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+pub const antfly_sources = @import("source_owner_physical.zig");
+
 test {
+    _ = @import("api/sql_execution.zig");
+    _ = @import("api/tables.zig");
+    _ = @import("api/table_contract.zig");
+    _ = @import("serverless/build/lake_sidecar_text.zig");
     _ = @import("api/lake_sql_cursor.zig");
+    _ = @import("api/lake_index_row_source.zig");
+    _ = @import("api/lake_index_publication.zig");
+    _ = @import("api/lake_index_store.zig");
+    _ = @import("api/lake_index_coordinator.zig");
+    _ = @import("api/lake_index_selection.zig");
+    _ = @import("api/lake_index_reader_lease.zig");
+    _ = @import("api/lake_index_gc.zig");
+    _ = @import("api/lake_index_ordered_rows.zig");
+    _ = @import("api/lake_index_native_files.zig");
+    _ = @import("api/lake_index_native_rows.zig");
+    _ = @import("api/lake_index_native_state.zig");
+    _ = @import("api/lake_index_incremental_test.zig");
+    _ = @import("api/lake_index_refinements_test.zig");
+    _ = @import("api/lake_index_sql_rows.zig");
+    _ = @import("api/lake_index_text_query.zig");
+    _ = @import("metadata/lake_index_lifecycle.zig");
+    _ = @import("api/lake_index_aggregate_artifact.zig");
+    _ = @import("api/lake_index_aggregate_composition.zig");
+    _ = @import("api/lake_index_names.zig");
+    _ = @import("api/lake_index_native_aggregates.zig");
     _ = @import("api/lake_schema_detection.zig");
     _ = @import("api/lake_table_reads.zig");
     _ = @import("antfly_local_sources").serverless_query_lake_schema;
     _ = @import("antfly_local_sources").schema_mod;
+    _ = @import("antfly_local_sources").storage_db_relational_index_keys;
     _ = @import("antfly_local_sources").serverless_query_lake_read_context;
     _ = @import("antfly_local_sources").serverless_query_lake_serving_cache;
 }

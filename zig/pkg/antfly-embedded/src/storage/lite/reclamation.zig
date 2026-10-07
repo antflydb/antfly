@@ -30,7 +30,7 @@ pub const Options = struct {
     minimum_reclaim_bytes: u64 = 256 * 1024 * 1024,
     amplification: u32 = 2,
     retry_ms: u32 = 1000,
-    /// Limits combined current, retired and rewrite workspace bytes. Zero is
+    /// Limits combined current, retired, artifact and rewrite workspace bytes. Zero is
     /// unlimited. This is an admission limit, not a filesystem free-space probe.
     max_storage_bytes: u64 = 0,
     disk_headroom_bytes: u64 = 64 * 1024 * 1024,
@@ -66,6 +66,7 @@ pub const Status = struct {
     retired_objects_serviced: u64 = 0,
     retirement_activity_bytes: u64 = 0,
     retired_file_bytes: u64 = 0,
+    artifact_file_bytes: u64 = 0,
     retired_generations: u64 = 0,
     retained_readers: u64 = 0,
     oldest_reader_age_ms: u64 = 0,
@@ -80,7 +81,7 @@ pub const Status = struct {
     last_error: ?[]const u8 = null,
 
     pub fn totalBytes(self: Status) u64 {
-        return self.current_file_bytes +| self.retired_file_bytes +| self.temporary_bytes;
+        return self.current_file_bytes +| self.retired_file_bytes +| self.temporary_bytes +| self.artifact_file_bytes;
     }
 };
 

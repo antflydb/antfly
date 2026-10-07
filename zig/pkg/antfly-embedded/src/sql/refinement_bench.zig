@@ -56,7 +56,7 @@ const CountingAllocator = struct {
     }
 };
 fn now() i96 {
-    return std.Io.Clock.now(.awake, native_platform.testing.io).nanoseconds;
+    return std.Io.Clock.awake.now(native_platform.testing.io).nanoseconds;
 }
 fn expression(vector: bool, program: *const scalar.Program, rows: []const []const Datum, count: usize) !struct { ns: i96, peak: usize, checksum: f64 } {
     var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
@@ -614,5 +614,208 @@ test "native refinements benchmark column-addressable window keys" {
         const refined = if (sample % 2 == 0) second else first;
         try std.testing.expectEqual(baseline.checksum, refined.checksum);
         std.debug.print("native_refinement {{\"case\":\"column_window_keys\",\"rows\":512,\"payload_bytes\":8192,\"sample\":{d},\"row_ns\":{d},\"column_ns\":{d},\"row_read_bytes\":{d},\"column_read_bytes\":{d}}}\n", .{ sample, baseline.ns, refined.ns, baseline.read_bytes, refined.read_bytes });
+    }
+}
+
+fn wideColumnCache(full: bool) !struct { ns: i96, decodes: usize, checksum: i64 } {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows = try disk.Rows.init(a, &manager, 8);
+    defer rows.deinit();
+    try rows.enableColumns();
+    var values: [8]Datum = undefined;
+    for (0..1024) |index| {
+        for (&values, 0..) |*value, column| value.* = Datum.json(.{ .integer = @intCast(index * 8 + column) });
+        try rows.append(.{ .values = &values, .keys = &.{}, .ordinal = index });
+    }
+    try rows.columnar.?.flush();
+    const entries = rows.columnar.?.cache;
+    if (!full) rows.columnar.?.cache = entries[0..4];
+    defer rows.columnar.?.cache = entries;
+    const start = now();
+    var checksum: i64 = 0;
+    for (0..1024) |index| for ((try rows.row(index)).values) |value| {
+        checksum += value.value.integer;
+    };
+    return .{ .ns = now() - start, .decodes = rows.columnar.?.decodes, .checksum = checksum };
+}
+test "native pipeline refinements benchmark wide active column cache" {
+    for (0..3) |sample| {
+        const first = try wideColumnCache(sample % 2 != 0);
+        const second = try wideColumnCache(sample % 2 == 0);
+        const bounded = if (sample % 2 == 0) first else second;
+        const active = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(bounded.checksum, active.checksum);
+        try std.testing.expect(active.decodes < bounded.decodes);
+        std.debug.print("native_refinement {{\"case\":\"wide_column_cache\",\"rows\":1024,\"width\":8,\"sample\":{d},\"four_entry_ns\":{d},\"active_ns\":{d},\"four_entry_decodes\":{d},\"active_decodes\":{d}}}\n", .{ sample, bounded.ns, active.ns, bounded.decodes, active.decodes });
+    }
+}
+
+test {
+    _ = @import("read_stream.zig");
+}
+
+fn dictionaryExpression(encoded: bool, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column) !struct { ns: i96, peak: usize, checksum: i64 } {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 2 * 1024 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    var checksum: i64 = 0;
+    const start = now();
+    for (0..256) |_| {
+        _ = arena.reset(.free_all);
+        const a = arena.allocator();
+        const result: @import("execution_batch.zig").Batch = if (encoded) (try @import("vector_eval.zig").evaluateDictionaryColumns(a, program, page, columns, &.{})).? else blk: {
+            const values = (try @import("vector_eval.zig").evaluateColumns(a, program, page, columns, &.{})).?;
+            const vectors = try a.alloc([]const Datum, 1);
+            vectors[0] = values;
+            break :blk .{ .vectors = .{ .values = vectors, .count = values.len } };
+        };
+        for (0..result.len()) |row| checksum += (try result.cell(a, row, 0)).value.integer;
+    }
+    return .{ .ns = now() - start, .peak = budget.peak, .checksum = checksum };
+}
+test "native refinements benchmark dictionary expression results" {
+    const a = std.testing.allocator;
+    const types = @import("../storage/rowsource/types.zig");
+    const values = try a.alloc(i64, 32);
+    defer a.free(values);
+    const indices = try a.alloc(u32, 4096);
+    defer a.free(indices);
+    const selection = try a.alloc(usize, 4096);
+    defer a.free(selection);
+    const refs = try a.alloc(types.RowRef, 4096);
+    defer a.free(refs);
+    for (values, 0..) |*value, i| value.* = @intCast(i);
+    for (indices, selection, refs, 0..) |*index, *physical, *ref, i| {
+        index.* = @intCast(i % 32);
+        physical.* = 4095 - i;
+        ref.* = .{ .relational_key = "fixture" };
+    }
+    const columns = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    const physical = [_]types.ColumnVector{.{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = values, .indices = indices } } }};
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "fixture", .snapshot_id = "immutable" }, .row_refs = refs, .columns = &physical }, .selection = selection };
+    var parsed = try @import("compiler.zig").compileScalar(a, "n * 3 + 7", .{});
+    defer parsed.deinit();
+    var program = try scalar.bind(a, parsed.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    for (0..3) |sample| {
+        const expanded = try dictionaryExpression(false, &program, page, &columns);
+        const encoded = try dictionaryExpression(true, &program, page, &columns);
+        try std.testing.expectEqual(expanded.checksum, encoded.checksum);
+        std.debug.print("native_refinement {{\"case\":\"dictionary_expression\",\"rows\":4096,\"unique\":32,\"sample\":{d},\"expanded_ns\":{d},\"encoded_ns\":{d},\"expanded_peak_bytes\":{d},\"encoded_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, encoded.ns, expanded.peak, encoded.peak });
+    }
+}
+
+fn leasedResultDelivery(leased: bool, sorted: bool) !struct { ns: i96, peak: usize, checksum: i64 } {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 16 * 1024 * 1024 };
+    const a = budget.allocator();
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const Cursor = @import("result_cursor.zig").Cursor;
+    const cursor = try Cursor.create(a, &manager, 3);
+    defer cursor.close();
+    var top = try operators.TopK.initWithSpill(a, 4096, &.{.{}}, 256 * 1024, &manager);
+    defer top.deinit();
+    const payload: [1024]u8 = @splat('x');
+    for (0..4096) |index| {
+        const key = Datum.json(.{ .integer = @intCast(if (sorted) 4095 - index else index) });
+        const values = &.{ key, Datum.json(.{ .string = &payload }), Datum{} };
+        if (sorted) try top.add(.{ .values = values, .keys = &.{key}, .ordinal = index }) else try Cursor.append(cursor, values);
+    }
+    if (sorted) try Cursor.takeSorted(cursor, &top, 0, 4096, false);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const start = now();
+    var checksum: i64 = 0;
+    while (cursor.index < cursor.count()) {
+        _ = arena.reset(.free_all);
+        if (!leased) {
+            const store = try cursor.nextBatch(arena.allocator(), 137, 256 * 1024);
+            defer store.deinit();
+            for (0..store.len) |row| checksum += (try store.cell(a, row, 0)).value.integer;
+            continue;
+        }
+        const page = try cursor.nextLease(arena.allocator(), 137, 256 * 1024);
+        defer page.deinit();
+        for (0..page.values.len()) |row| checksum += (try page.values.cell(a, row, 0)).value.integer;
+    }
+    return .{ .ns = now() - start, .peak = budget.peak, .checksum = checksum };
+}
+test "native pipeline refinements benchmark leased blocking delivery" {
+    for ([_]bool{ false, true }) |sorted| for (0..3) |sample| {
+        const before = try leasedResultDelivery(false, sorted);
+        const after = try leasedResultDelivery(true, sorted);
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        try std.testing.expectEqual(@as(i64, 8386560), after.checksum);
+        std.debug.print("native_refinement {{\"case\":\"leased_result_delivery\",\"sorted\":{},\"rows\":4096,\"sample\":{d},\"gather_ns\":{d},\"lease_ns\":{d},\"gather_peak_bytes\":{d},\"lease_peak_bytes\":{d}}}\n", .{ sorted, sample, before.ns, after.ns, before.peak, after.peak });
+    };
+}
+
+fn compactTypedDecode(compact: bool, dictionary: bool) !struct { ns: i96, peak: usize, checksum: i64 } {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 16 * 1024 * 1024 };
+    const a = budget.allocator();
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = native_platform.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var file = try spill.Sequential.init(&manager, 1024 * 1024);
+    defer file.close();
+    var values: [32]Datum = undefined;
+    for (0..4096) |row| {
+        for (&values, 0..) |*value, column| value.* = if ((row + column) % 7 == 0) Datum{} else Datum.json(.{ .integer = @intCast((if (dictionary) row % 4 else row) + column) });
+        _ = try file.append(.{ .values = &values, .keys = &.{}, .ordinal = row }, spill.none);
+    }
+    try file.seal();
+    // Decode-only peak: both paths begin after identical spill construction.
+    budget.peak = budget.live;
+    const baseline = budget.live;
+    const start = now();
+    var offset: usize = 0;
+    var checksum: i64 = 0;
+    while (offset < file.size) {
+        if (compact) {
+            const block = try file.readOwnedBlock(offset);
+            defer block.release();
+            for (0..block.count()) |row| for (0..32) |column| {
+                const value = try block.cell(row, column);
+                if (!value.sql_null) checksum += value.value.integer;
+            };
+            offset += block.count();
+        } else {
+            const block = try file.readBatchBorrowed(offset, 256);
+            for (block.rows) |row| for (row.values) |value| {
+                if (!value.sql_null) checksum += value.value.integer;
+            };
+            offset = @intCast(block.following);
+        }
+    }
+    return .{ .ns = now() - start, .peak = budget.peak - baseline, .checksum = checksum };
+}
+test "native pipeline refinements benchmark compact typed spill decoding" {
+    for (0..3) |sample| {
+        const expanded = try compactTypedDecode(false, false);
+        const compact = try compactTypedDecode(true, false);
+        try std.testing.expectEqual(expanded.checksum, compact.checksum);
+        std.debug.print("native_refinement {{\"case\":\"compact_typed_spill_decode\",\"rows\":4096,\"width\":32,\"sample\":{d},\"expanded_ns\":{d},\"compact_ns\":{d},\"expanded_peak_bytes\":{d},\"compact_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, compact.ns, expanded.peak, compact.peak });
+    }
+}
+
+test "native pipeline refinements benchmark dictionary spill decoding" {
+    for (0..3) |sample| {
+        const expanded = try compactTypedDecode(false, true);
+        const compact = try compactTypedDecode(true, true);
+        try std.testing.expectEqual(expanded.checksum, compact.checksum);
+        std.debug.print("native_refinement {{\"case\":\"dictionary_spill_decode\",\"rows\":4096,\"width\":32,\"sample\":{d},\"expanded_ns\":{d},\"compact_ns\":{d},\"expanded_peak_bytes\":{d},\"compact_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, compact.ns, expanded.peak, compact.peak });
     }
 }

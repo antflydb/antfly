@@ -4065,3 +4065,16 @@ pub fn shardAdmissionNamespace(table_id: u64, shard: ShardSnapshot) @import("../
         .range_id = if (shard.doc_identity_range_id != 0) shard.doc_identity_range_id else if (shard.range_id != 0) shard.range_id else shard.group_id,
     };
 }
+
+test "external lake restore retains index rebuild obligations without retired publication authority" {
+    const alloc = std.testing.allocator;
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","base_source":{"kind":"external","table_id":"lake","format":"parquet","uri":"file:///lake","schema_fingerprint":"schema"},"relational_indexes":[{"name":"amount_idx","keys":[{"column":"amount"}]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer"}},"additionalProperties":false}}}}
+    ;
+    const manifest: TableBackupManifest = .{ .format = .portable, .backup_id = "daily", .table_name = "lake", .table_id = 4, .description = "", .schema_json = schema, .read_schema_json = "", .indexes_json = "{}", .replication_sources_json = "[]", .shards = &.{} };
+    const restored = try deriveRestoreTableRecord(alloc, "lake_restored", "file:///backups", &manifest);
+    defer metadata_table_manager.freeTable(alloc, restored);
+    try std.testing.expectEqualStrings(schema, restored.schema_json);
+    try std.testing.expectEqual(@as(usize, 0), restored.lake_index_catalog_json.len);
+    try std.testing.expectEqual(@as(usize, 0), restored.read_schema_json.len);
+}

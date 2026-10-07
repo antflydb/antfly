@@ -674,6 +674,7 @@ pub const DocStore = struct {
         /// aborting the transaction (which also owns the portable-import fence).
         pub fn openReadScope(self: *Txn, alloc: Allocator) !backend_erased.ReadScope {
             if (self.read) |*read| return read.openReadScope(alloc);
+            if (self.write) |*write| return write.openReadScope(alloc);
             return error.ReadOnly;
         }
 

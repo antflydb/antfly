@@ -246,6 +246,10 @@ pub const Handle = struct {
                     self.native_runtime_store = null;
                 }
                 if (self.native_docstore) |store| {
+                    if (self.owned_resource_manager) |manager| if (store.artifact_registry) |registry| {
+                        registry.adoptOwnedResources(manager, self.allocator);
+                        self.owned_resource_manager = null;
+                    };
                     store.close();
                     self.allocator.destroy(store);
                     self.native_docstore = null;
@@ -1742,4 +1746,57 @@ test "lite backend keeps vector blocks inside each single file and namespace" {
             try std.testing.expectEqualStrings(payload, read);
         }
     }
+}
+
+test "lite native artifact cache accounting survives owned backend resource shutdown" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "retained-cache-owner.aflite");
+    defer a.free(path);
+    var handle = try Handle.createWithOptions(a, path, .{ .exclusive = true, .no_sync = true, .io = std.testing.io });
+    var open = true;
+    defer if (open) handle.deinit();
+    const bytes = try a.alloc(u8, 128 * 1024);
+    defer a.free(bytes);
+    @memset(bytes, 73);
+    const storage = handle.native_index_storage.?.storage();
+    try storage.writeFileAbsolute(native_index_base_path ++ "/segments/retained", bytes);
+    var source = try handle.native_docstore.?.openArtifactSource(native_index_base_path ++ "/segments/retained");
+    defer source.close();
+    var out: [16]u8 = undefined;
+    try source.readInto(0, &out);
+    const resources = handle.owned_resource_manager.?;
+    try std.testing.expect(resources.sliceStats(.lite_native_page_cache).used_bytes > 0);
+    handle.deinit();
+    open = false;
+    try source.readInto(100 * 1024, &out);
+    try std.testing.expectEqualSlices(u8, bytes[100 * 1024 ..][0..16], &out);
+    try std.testing.expect(resources.sliceStats(.lite_native_page_cache).used_bytes > 0);
+}
+
+test "lite native retained range reader releases caches before owned manager shutdown" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "range-reader-close.aflite");
+    defer a.free(path);
+    var handle = try Handle.createWithOptions(a, path, .{ .exclusive = true, .no_sync = true, .io = std.testing.io });
+    var open = true;
+    defer if (open) handle.deinit();
+    const segments = @import("../../segment.zig");
+    var writer = segments.SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDocBorrowed("row", "{}");
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    try handle.native_index_storage.?.storage().writeFileAbsolute(native_index_base_path ++ "/segments/probe", bytes);
+    const source = try handle.native_docstore.?.openArtifactSource(native_index_base_path ++ "/segments/probe");
+    var reader = try segments.RangeSegmentReader.init(a, source, .{});
+    defer reader.deinit();
+    var out: [1]u8 = undefined;
+    try reader.source.readInto(0, &out);
+    handle.deinit();
+    open = false;
+    try reader.source.readInto(0, &out);
 }

@@ -476,6 +476,13 @@ fn listTablesJson(svc: anytype, alloc: std.mem.Allocator, context: operation.Req
 
 pub fn call(svc: anytype, alloc: std.mem.Allocator, context: operation.RequestContext, input: @import("server_call.zig").Call) ![]u8 {
     return switch (input) {
+        .lake_index_lifecycle_read => |table_id| @import("../metadata/lake_index_lifecycle.zig").readOnService(svc, alloc, table_id, context),
+        .lake_index_lifecycle_work => |after| @import("../metadata/lake_index_lifecycle.zig").workOnService(svc, alloc, after, context),
+        .lake_index_lifecycle_mutate => |write| blk: {
+            if (!context.setting_admin) return error.Forbidden;
+            try @import("../metadata/lake_index_lifecycle.zig").mutateOnService(svc, alloc, write, context);
+            break :blk alloc.dupe(u8, "{}");
+        },
         .setting_snapshot => |scope| settingSnapshotJson(svc, alloc, context, scope),
         .policy_snapshot => |request| policySnapshotJson(svc, alloc, context, request),
         .policy_install_snapshot => |request| policyInstallSnapshotJson(svc, alloc, context, request),

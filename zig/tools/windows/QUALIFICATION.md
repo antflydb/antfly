@@ -558,12 +558,12 @@ private artifact bucket, service account, subnet and network were deleted and
 absence verified. No inbound firewall rules or tunnels were created.
 
 The final full Windows Debug application passes 46/46 build steps with ONNX
-disabled and BLAS off. Its SHA-256 is `c8de500b4ae9f48347646a3caabaf624daf86ee22b0c3530ac43815f999e67bc`.
+disabled and BLAS off. Its SHA-256 is `fc119c5de3b74c6c689a93981c059b752e82f0ab948a9da1446036b9b112f181`.
 CrossOver confirms 32 acknowledged documents and full-text entries survive
 forced process termination, passes 64 concurrent queries across both starts,
 and reports `valid=true`, zero tail bytes and no integrity issue. Evidence:
-`/private/tmp/antfly-pr987-stock-app-final-startup-build.log` and
-`/private/tmp/antfly-pr987-stock-app-smoke-final/`.
+`/private/tmp/antfly-pr987-stock-app-final-graph-build.log` and
+`/private/tmp/antfly-pr987-stock-app-smoke-qualified/`.
 
 Native macOS focused qualification passes 87 tests with two platform-specific
 skips. Standalone Raft passes 427 tests, VOPR passes 167, structlog passes nine,

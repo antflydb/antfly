@@ -109,6 +109,18 @@ pub fn storageSuffixAlloc(alloc: Allocator, id: []const u8) ![]u8 {
 }
 
 pub const ScopedUploadVisitor = struct {
+    /// Backend-owned durable continuation. Callers persist it only after all
+    /// delivered entries have been processed. Lexical providers may ignore it.
+    continuation: ?[]const u8 = null,
+    /// Remove deterministic local staging files while visiting fenced records.
+    cleanup_staging: bool = false,
+    checkpoint: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
+    after_suffix: ?[]const u8 = null,
+    fencing_floor: u64 = 0,
+    exclude_attempt: ?[16]u8 = null,
+    only_attempt: ?[16]u8 = null,
+    fencing_cutoff: ?u64 = null,
+    max_entries: ?usize = null,
     ptr: *anyopaque,
     /// ID is borrowed only for this call. Enumeration is namespace-local and
     /// bounded; visitors must not assume a snapshot of concurrent late uploads.
@@ -197,7 +209,8 @@ pub const ArtifactStore = struct {
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
         put_scoped: ?*const fn (*anyopaque, Allocator, UploadScope, []const u8, CancellationToken) anyerror!ArtifactMetadata = null,
         visit_scoped_uploads: ?*const fn (*anyopaque, [32]u8, ScopedUploadVisitor, CancellationToken) anyerror!void = null,
-        cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, CancellationToken) anyerror!void = null,
+        reclaim_retired_scoped_inventory: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
+        cleanup_retired_scoped_temporaries: ?*const fn (*anyopaque, [32]u8, u64, u64, CancellationToken) anyerror!void = null,
     };
 
     pub fn deinit(self: *ArtifactStore) void {
@@ -232,12 +245,26 @@ pub const ArtifactStore = struct {
         try visit(self.ptr, domain, visitor, cancellation);
     }
 
+    /// After fenced sweeping, reclaim only discovery metadata whose payload
+    /// attempt is empty. Remote providers need no local inventory cleanup.
+    pub fn reclaimRetiredScopedInventory(self: *ArtifactStore, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
+        if (std.mem.allEqual(u8, &domain, 0) or floor > cutoff or cutoff == 0) return error.InvalidArtifactUploadScope;
+        try cancellation.check();
+        if (self.vtable.reclaim_retired_scoped_inventory) |reclaim| try reclaim(self.ptr, domain, floor, cutoff, cancellation);
+    }
+
     /// Only a collector that has fenced all older publications may call this.
     /// Backends without local staging files need no extra cleanup operation.
     pub fn cleanupRetiredScopedTemporaries(self: *ArtifactStore, domain: [32]u8, cutoff: u64, cancellation: CancellationToken) !void {
+        return self.cleanupRetiredScopedTemporaryRange(domain, 0, cutoff, cancellation);
+    }
+    /// A rolling upgrade can fence new readers without proving old readers
+    /// have drained. Preserve staging files below that admission floor.
+    pub fn cleanupRetiredScopedTemporaryRange(self: *ArtifactStore, domain: [32]u8, floor: u64, cutoff: u64, cancellation: CancellationToken) !void {
         if (cutoff == 0 or std.mem.allEqual(u8, &domain, 0)) return error.InvalidArtifactUploadScope;
+        if (floor > cutoff) return error.InvalidArtifactUploadScope;
         try cancellation.check();
-        if (self.vtable.cleanup_retired_scoped_temporaries) |cleanup| try cleanup(self.ptr, domain, cutoff, cancellation);
+        if (self.vtable.cleanup_retired_scoped_temporaries) |cleanup| try cleanup(self.ptr, domain, floor, cutoff, cancellation);
     }
 
     pub fn putWithCancellation(self: *ArtifactStore, contents: []const u8, cancellation: CancellationToken) !ArtifactMetadata {

@@ -1637,6 +1637,16 @@ pub fn metadataApplyStoreProjection(
             defer if (value) |bytes| alloc.free(bytes);
             break :blk metadataProjectionJson(alloc, out_json, value);
         },
+        .lake_index_lifecycle => blk: {
+            const value = handle.store.getLakeIndexLifecycle(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
+        .lake_index_lifecycle_work => blk: {
+            const value = handle.store.lakeIndexLifecycleWork(alloc, request.group_id, if (request.arg1 != 0) request.arg0 else null) catch |err| break :blk storageOwnerStatusFromError(err);
+            defer alloc.free(value);
+            break :blk metadataProjectionJson(alloc, out_json, value);
+        },
         .backup_cohort_progress => blk: {
             const value = handle.store.getBackupCohortProgress(alloc, request.group_id, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
             defer if (value) |bytes| alloc.free(bytes);

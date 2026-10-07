@@ -96,6 +96,10 @@ pub const AtomicWriteSink = struct {
         crc32_range: *const fn (*anyopaque, usize, usize) anyerror!u32,
         set_cache_intent: ?*const fn (*anyopaque, AtomicWriteCacheIntent) void = null,
         finish: *const fn (*anyopaque) anyerror!void,
+        /// Consumes the writer on success AND failure, like finish. The
+        /// returned read-only mapping owns its inode independently of storage.
+        finish_source: ?*const fn (*anyopaque) anyerror!@import("../../segment_source.zig").Source = null,
+        finish_mapped: ?*const fn (*anyopaque) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
         abort: *const fn (*anyopaque) void,
     };
 
@@ -133,6 +137,13 @@ pub const AtomicWriteSink = struct {
 
     /// Atomically publish the written bytes at the requested destination.
     /// Consumes the sink whether publishing succeeds or fails.
+    /// Unsupported capability does not consume the writer. A supported
+    /// implementation consumes it even when publication or mapping fails.
+    pub fn finishMapped(self: *AtomicWriteSink) !@import("../../segment_source.zig").MappedArtifact {
+        const finish_mapped = self.vtable.finish_mapped orelse return error.MappedArtifactUnsupported;
+        return finish_mapped(self.ptr);
+    }
+
     pub fn finish(self: *AtomicWriteSink) !void {
         try self.vtable.finish(self.ptr);
     }
@@ -559,6 +570,15 @@ pub const Storage = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Physical directory for private build files; null disables filesystem staging.
+        private_scratch_directory: ?*const fn (*anyopaque) ?[]const u8 = null,
+        /// Optional contiguous, file-backed view. The caller owns the mapping
+        /// and releases its lease with deinit; no provider lifetime is retained.
+        map_immutable_artifact: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").MappedArtifact = null,
+        open_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
+        /// Artifact-specific reclamation lease with provider-independent
+        /// descriptor/runtime ownership. Persistent readers use this capability.
+        open_leased_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         read_file_alloc: *const fn (*anyopaque, Allocator, []const u8, usize) anyerror![]u8,
@@ -599,6 +619,11 @@ pub const Storage = struct {
         supports_host_path_generation_publication: bool = false,
         supports_native_path_locks: bool = false,
     };
+
+    pub fn privateScratchDirectory(self: Storage, fallback: []const u8) ?[]const u8 {
+        if (self.vtable.private_scratch_directory) |directory| return directory(self.ptr);
+        return fallback;
+    }
 
     pub fn createDirPath(self: Storage, path: []const u8) !void {
         return self.vtable.create_dir_path(self.ptr, path);
@@ -655,6 +680,26 @@ pub const Storage = struct {
         const len: usize = @intCast(@min(size - offset, out.len));
         try self.readFileRangeInto(allocator, path, offset, out[0..len]);
         return len;
+    }
+
+    /// Optional immutable, lifetime-pinned random access. Unsupported backends
+    /// must not emulate this by resolving the current pathname on each read.
+    /// The storage owner must outlive the returned source. Each source pins
+    /// one immutable artifact version until close; pathname re-resolution is
+    /// forbidden after opening, including during vacuum and replacement.
+    pub fn mapImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
+        const map = self.vtable.map_immutable_artifact orelse return error.MappedArtifactUnsupported;
+        return map(self.ptr, allocator, path);
+    }
+
+    pub fn openLeasedImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
+        const open = self.vtable.open_leased_immutable_source orelse return error.ImmutableReadSourceUnsupported;
+        return open(self.ptr, allocator, path);
+    }
+
+    pub fn openImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {
+        const open = self.vtable.open_immutable_source orelse return error.ImmutableReadSourceUnsupported;
+        return open(self.ptr, allocator, path);
     }
 
     pub fn fileSize(self: Storage, path: []const u8) !u64 {
@@ -4026,7 +4071,12 @@ fn lockAtomic(mutex: *std.atomic.Mutex) bool {
     return true;
 }
 
+fn memoryScratchDirectory(_: *anyopaque) ?[]const u8 {
+    return null;
+}
+
 const memory_vtable: Storage.VTable = .{
+    .private_scratch_directory = memoryScratchDirectory,
     .create_dir_path = memoryCreateDirPath,
     .read_file_alloc = memoryReadFileAlloc,
     .read_file_range_alloc = memoryReadFileRangeAlloc,

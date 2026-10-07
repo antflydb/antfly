@@ -52,6 +52,7 @@ pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
         std.mem.eql(u8, lhs.schema_json, rhs.schema_json) and
         std.mem.eql(u8, lhs.read_schema_json, rhs.read_schema_json) and
         std.mem.eql(u8, lhs.relational_retirement_json, rhs.relational_retirement_json) and
+        std.mem.eql(u8, lhs.lake_index_catalog_json, rhs.lake_index_catalog_json) and
         std.mem.eql(u8, lhs.indexes_json, rhs.indexes_json) and
         std.mem.eql(u8, lhs.replication_sources_json, rhs.replication_sources_json) and
         std.mem.eql(u8, lhs.placement_role, rhs.placement_role) and
@@ -94,6 +95,10 @@ pub fn tableDefinitionFingerprint(table: TableDefinition) TableDefinitionFingerp
     hashTableDefinitionPart(&hasher, table.schema_json);
     hashTableDefinitionPart(&hasher, table.read_schema_json);
     if (table.relational_retirement_json.len != 0) hashTableDefinitionPart(&hasher, table.relational_retirement_json);
+    if (table.lake_index_catalog_json.len != 0) {
+        hashTableDefinitionPart(&hasher, "lake-index-catalog-v1");
+        hashTableDefinitionPart(&hasher, table.lake_index_catalog_json);
+    }
     hashTableDefinitionPart(&hasher, table.indexes_json);
     hashTableDefinitionPart(&hasher, table.replication_sources_json);
     hashTableDefinitionPart(&hasher, table.placement_role);
