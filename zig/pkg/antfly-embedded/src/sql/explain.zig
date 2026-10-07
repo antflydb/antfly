@@ -124,6 +124,7 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
     return switch (node.operation) {
         .singleton => .{ .node_type = "Values" },
         .literal_rows => .{ .node_type = "Values" },
+        .prepared_rows => .{ .node_type = "Prepared Mutation Images" },
         .recursive_ref => .{ .node_type = "Recursive Reference" },
         .outer_ref => .{ .node_type = "Outer Reference" },
         .apply => |apply| blk: {

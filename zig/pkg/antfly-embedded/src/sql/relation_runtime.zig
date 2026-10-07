@@ -369,6 +369,7 @@ fn Engine(comptime Context: type) type {
                 .scan => |scan| self.cursors[scan.index].estimated_rows,
                 .singleton => 1,
                 .literal_rows => |rows| rows.len,
+                .prepared_rows => self.context.returning_rows.len,
                 .query => |query| blk: {
                     const source = self.estimate(query.source);
                     if (query.statement.limit) |limit| {
@@ -584,6 +585,17 @@ fn Engine(comptime Context: type) type {
                         if (self.output_index == rows.len) break :blk null;
                         const values = try normalize(alloc, self.node.columns, rows[self.output_index]);
                         self.output_index += 1;
+                        break :blk values;
+                    },
+                    .prepared_rows => |names| blk: {
+                        if (self.output_index == self.engine.context.returning_rows.len) break :blk null;
+                        const row = self.engine.context.returning_rows[self.output_index];
+                        self.output_index += 1;
+                        const values = try alloc.alloc(Datum, self.node.columns.len);
+                        for (names, self.node.columns, values) |name, column, *out| {
+                            const cell = try row.cell(name);
+                            out.* = .{ .value = try describe.coerceAlloc(alloc, cell.value, column.type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+                        }
                         break :blk values;
                     },
                     .scan => |scan| blk: {
@@ -1438,7 +1450,9 @@ fn Source(comptime Context: type) type {
             self.* = .{ .alloc = context.alloc, .engine = .{ .context = context, .cursors = &.{}, .cache_arena = .init(context.alloc) } };
             errdefer self.close();
             if (relation.scans.len != 0) {
-                if (context.backend.vtable.open_statement) |open| {
+                if (context.statement_capture) |capture| {
+                    self.engine.cursors = try capture.cursors(relation);
+                } else if (context.backend.vtable.open_statement) |open| {
                     self.read = try open(context.backend.ptr, context.alloc, relation.scans);
                     self.engine.cursors = self.read.?.cursors;
                     if (self.engine.cursors.len != relation.scans.len) return error.InvalidSqlBackendResponse;

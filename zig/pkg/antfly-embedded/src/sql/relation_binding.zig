@@ -118,6 +118,8 @@ pub const Node = struct {
         /// Adjacent compiler-owned literal rows share one small operator rather
         /// than each allocating a SELECT program and iterator.
         literal_rows: []const []const scalar.Datum,
+        /// Typed prepared mutation images supplied by the execution owner.
+        prepared_rows: []const []const u8,
     },
 };
 pub const virtual_table_name = "$sql_relation";
@@ -987,7 +989,7 @@ const Builder = struct {
         try self.backend.vtable.checkpoint(self.backend.ptr);
         return switch (input.*) {
             .table => |reference| blk: {
-                if (!reference.mutation_target and reference.name.database == null and reference.name.namespace == null) {
+                if (!reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
                     var i = scope.len;
                     while (i != 0) {
                         i -= 1;
@@ -1039,6 +1041,10 @@ const Builder = struct {
                 }
                 if (self.shape_only) for (columns) |column| try self.shape_columns.append(self.alloc, .{ .name = column.internal, .type = column.type, .nullable = column.nullable });
                 source_columns[table.columns.len] = "_id";
+                if (reference.prepared_rows) {
+                    if (reference.mutation_target or reference.mutation_document or reference.mutation_presence) return error.InvalidSqlBackendResponse;
+                    break :blk try self.node(columns, .{ .prepared_rows = source_columns });
+                }
                 const index = self.scans.items.len;
                 if (index >= 64) return error.SqlProgramLimitExceeded;
                 try self.scans.append(self.alloc, .{ .table = table, .request = .{ .fields = fields, .limit = 256, .include_primary_digest = reference.mutation_target, .include_document = reference.mutation_document and table.storage_mode == .document } });
@@ -1259,7 +1265,7 @@ fn markSelect(alloc: Allocator, needed: *std.StringHashMapUnmanaged(void), state
 }
 fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMapUnmanaged(void)) anyerror!void {
     switch (node.operation) {
-        .singleton, .recursive_ref, .outer_ref, .literal_rows => {},
+        .singleton, .recursive_ref, .outer_ref, .literal_rows, .prepared_rows => {},
         .materialized_ref => |source| {
             // A materialized CTE stores its complete declared output once;
             // references can project different columns without changing its

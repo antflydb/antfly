@@ -364,11 +364,27 @@ PostgreSQL contracts and allocation-fault tests cover this overload.
 The PostgreSQL native mutation runner resets and reads back every fixture table,
 compares complete RETURNING labels/types/SQL NULL provenance and affected rows,
 and verifies complete stored values independently of SQL projections. The
-initial endpoint case is `sql-1500`, which changes only a non-key JSONB column.
-It does not activate the PostgreSQL profile's logical primary-key owner in
-native storage. Key-changing, conflict and joined cases therefore still need
-their matching constraint-owner and routed-read fixtures; no original
-disposition credit is granted by this initial integration.
+endpoint campaign executes 19 original cases, including recursive selectors,
+UPDATE FROM, DELETE USING, JSONB concatenation and source-aware RETURNING, over
+three independently routed native tables. It does not activate the PostgreSQL
+profile's logical primary-key owner in native storage. Key-changing and conflict
+cases still need matching constraint-owner fixtures; no original disposition
+credit is granted by this integration alone.
+
+Source-aware RETURNING binds prepared mutation images as an internal relation.
+Candidate and RETURNING source scans share one captured statement read; target
+expressions see prepared defaults/generated values, while subqueries see the
+pre-publication source snapshot. Projection, scalar cardinality checks and
+allocation admission finish before publication. Empty candidate sets do not
+evaluate RETURNING expressions, and the shared reader is released before commit.
+Simple scalar RETURNING retains its existing fast path. PostgreSQL contracts
+cover prepared-image correlation, self-reads, generated values, INSERT sources
+and atomic failure. Native allocation-fault tests check ownership cleanup. A
+1,024-target/1,024-source regression checks one capture and exactly 2,048 input
+rows read, rather than a source rescan per target. The fixed multi-table test
+router validates routing and lifetime, not distributed concurrent snapshot
+coordination; conditional subquery evaluation and constraint-owner activation
+remain separate unfinished work.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json

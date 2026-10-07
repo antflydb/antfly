@@ -203,6 +203,8 @@ pub const Context = struct {
     /// Internal relational consumers retain typed values. Decimal strings are
     /// a transport encoding, never the representation of an INSERT source.
     typed_output: bool = false,
+    statement_capture: ?*@import("mutation_capture.zig") = null,
+    returning_rows: []const catalog.Row = &.{},
 
     pub fn emitTop(self: Context, top: *@import("operators.zig").TopK, offset: usize, limit: usize, implicit: bool) !Output {
         if (self.sink.?.take_sorted) |take| try take(self.sink.?.ptr, top, offset, limit, implicit) else try top.drain(self.alloc, offset, limit, implicit, self.sink.?);
@@ -260,6 +262,12 @@ pub const Context = struct {
         var context = unscoped;
         context.backend = @import("decision_eval.zig").scopedBackend(context.backend, context.binding);
         if (input != .select) try @import("decision_eval.zig").validateStatement(context.arena, context.backend.decision_provider, context.binding, context.parameters);
+        var capture: ?@import("mutation_capture.zig") = null;
+        defer if (capture) |*owner| owner.deinit();
+        if (context.binding.returning_query != null) {
+            capture = try @import("mutation_capture.zig").open(context.alloc, context.backend, context.binding);
+            context.statement_capture = &capture.?;
+        }
         if (context.binding.joined_mutation) |joined| return @import("joined_mutation.zig").execute(context, joined.*);
         if (context.binding.merge_mutation) |merge| return @import("merge_mutation.zig").execute(context, merge.*);
         return switch (input) {
@@ -1166,35 +1174,47 @@ pub const Context = struct {
             }
             var context = self;
             context.binding = binding.*;
-            var fields: std.ArrayList([]const u8) = .empty;
-            if (projections.len == 0) {
-                for (table.columns) |column| try fields.append(self.arena, column.path);
-            } else for (projections) |projection| try fields.append(self.arena, if (projection.expression != null) "" else (try table.column(projection.field)).path);
-            const rows = try self.arena.alloc([]const Json, prepared.len);
-            const flags = try self.arena.alloc([]const bool, prepared.len);
-            var external = false;
-            for (binding.scalars.projections) |optional| if (optional) |*program| {
-                external = external or @import("decision_eval.zig").hasExternal(program);
-            };
-            if (external) {
-                try context.decisionMutationReturning(table, fields.items, prepared, input, rows, flags);
-            } else for (prepared, input, rows, flags) |mutation, original, *cells, *nulls| {
-                try self.checkpoint();
-                const row = try mutationReturningRow(self.arena, table, mutation, original);
-                const expressions = try binding.scalars.cells(self.arena, row);
-                const projected = try context.projectValues(self.arena, row, fields.items, expressions);
-                const values = try self.arena.alloc(Json, projected.len);
-                const sql_nulls = try self.arena.alloc(bool, projected.len);
-                for (projected, values, sql_nulls, binding.columns) |value_, *cell_value, *is_null, column| {
-                    cell_value.* = try self.outputCell(value_.value, column.type);
-                    is_null.* = value_.sql_null;
+            if (self.binding.returning_query) |query| {
+                const images = try self.arena.alloc(catalog.Row, prepared.len);
+                for (prepared, input, images) |mutation, original, *image| image.* = try mutationReturningRow(self.arena, table, mutation, original);
+                context.returning_rows = images;
+                context.sink = null;
+                const projected = if (images.len == 0) Output{ .columns = binding.columns, .rows = &.{}, .sql_nulls = &.{}, .command_tag = "SELECT" } else try context.select(query);
+                if (projected.rows.len != prepared.len) return error.InvalidSqlBackendResponse;
+                output.columns = projected.columns;
+                output.rows = projected.rows;
+                output.sql_nulls = projected.sql_nulls;
+            } else {
+                var fields: std.ArrayList([]const u8) = .empty;
+                if (projections.len == 0) {
+                    for (table.columns) |column| try fields.append(self.arena, column.path);
+                } else for (projections) |projection| try fields.append(self.arena, if (projection.expression != null) "" else (try table.column(projection.field)).path);
+                const rows = try self.arena.alloc([]const Json, prepared.len);
+                const flags = try self.arena.alloc([]const bool, prepared.len);
+                var external = false;
+                for (binding.scalars.projections) |optional| if (optional) |*program| {
+                    external = external or @import("decision_eval.zig").hasExternal(program);
+                };
+                if (external) {
+                    try context.decisionMutationReturning(table, fields.items, prepared, input, rows, flags);
+                } else for (prepared, input, rows, flags) |mutation, original, *cells, *nulls| {
+                    try self.checkpoint();
+                    const row = try mutationReturningRow(self.arena, table, mutation, original);
+                    const expressions = try binding.scalars.cells(self.arena, row);
+                    const projected = try context.projectValues(self.arena, row, fields.items, expressions);
+                    const values = try self.arena.alloc(Json, projected.len);
+                    const sql_nulls = try self.arena.alloc(bool, projected.len);
+                    for (projected, values, sql_nulls, binding.columns) |value_, *cell_value, *is_null, column| {
+                        cell_value.* = try self.outputCell(value_.value, column.type);
+                        is_null.* = value_.sql_null;
+                    }
+                    cells.* = values;
+                    nulls.* = sql_nulls;
                 }
-                cells.* = values;
-                nulls.* = sql_nulls;
+                output.columns = binding.columns;
+                output.rows = rows;
+                output.sql_nulls = flags;
             }
-            output.columns = binding.columns;
-            output.rows = rows;
-            output.sql_nulls = flags;
         }
         // Projection, quotas and normalization can fail only BEFORE commit.
         // No post-commit lookup or allocation can replace the known outcome.
@@ -1205,6 +1225,9 @@ pub const Context = struct {
             if (mutation.conflict_guard != original.conflict_guard) return error.InvalidSqlBackendResponse;
         }
         try self.checkpoint();
+        // No iterator may borrow the captured cut past publication. Native
+        // proof/version fences have already joined the atomic write read-set.
+        if (self.statement_capture) |capture| capture.release();
         const committed = if (fences.items.len == 0) prepared else blk: {
             try fences.appendSlice(self.arena, prepared);
             break :blk fences.items;

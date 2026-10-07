@@ -76,6 +76,7 @@ pub const BoundStatement = struct {
     insert_source: ?*const BoundStatement = null,
     returning: ?*const BoundStatement = null,
     returning_projections: ?[]const ast.Projection = null,
+    returning_query: ?ast.Select = null,
     relation: ?*const @import("relation_binding.zig").Bound = null,
     aggregate: ?*const @import("aggregate_binding.zig").Bound = null,
     window: ?*const @import("window_binding.zig").Bound = null,
@@ -209,6 +210,7 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         const lowering = @import("subquery_lowering.zig");
         var mutation = compiled.statement.update;
         var needs_relation = if (mutation.predicate) |predicate| lowering.predicateHas(predicate) else false;
+        needs_relation = needs_relation or returningReads(mutation.returning);
         for (mutation.assignments) |assignment| {
             needs_relation = needs_relation or assignment.use_default;
             if (assignment.expression) |expression| needs_relation = needs_relation or lowering.has(expression);
@@ -225,14 +227,14 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
     if (compiled.statement == .delete and compiled.statement.delete.source == null) {
         const lowering = @import("subquery_lowering.zig");
         var mutation = compiled.statement.delete;
-        if (mutation.predicate) |predicate| if (lowering.predicateHas(predicate)) {
+        if ((if (mutation.predicate) |predicate| lowering.predicateHas(predicate) else false) or returningReads(mutation.returning)) {
             const source = try allocator.create(ast.Relation);
             source.* = .{ .table = .{ .name = mutation.table, .alias = mutation.alias, .mutation_target = true, .mutation_presence = true } };
             mutation.source = source;
             var lowered = compiled.*;
             lowered.statement = .{ .delete = mutation };
             return bind(allocator, backend, &lowered, explicit_parameter_types);
-        };
+        }
     }
     if (compiled.statement == .select and @import("relation_binding.zig").accepts(compiled.statement.select)) {
         const relations = @import("relation_binding.zig");
@@ -375,10 +377,20 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         .delete => |statement| statement.alias != null,
         else => false,
     };
-    const returning_select: ?ast.Select = if (returning_columns) |projections| .{ .table = target.name, .columns = try @import("relation_binding.zig").normalizeTargetProjection(allocator, backend, table, projection_name, target_aliased, projections) } else null;
+    const relational_returning = returningReads(returning_columns);
+    const returning_select: ?ast.Select = if (returning_columns) |projections| selection: {
+        if (!relational_returning) break :selection .{ .table = target.name, .columns = try @import("relation_binding.zig").normalizeTargetProjection(allocator, backend, table, projection_name, target_aliased, projections) };
+        const source = try allocator.create(ast.Relation);
+        source.* = .{ .table = .{ .name = target.name, .alias = if (target_aliased) projection_name.table else null, .prepared_rows = true } };
+        break :selection .{ .source = source, .columns = projections, .ctes = switch (compiled.statement) {
+            .update => |mutation| mutation.ctes,
+            .delete => |mutation| mutation.ctes,
+            else => &.{},
+        } };
+    } else null;
     if (returning_select) |selection| {
         if (@import("aggregate_binding.zig").accepts(selection)) return error.UnsupportedSqlShape;
-        var adapter: @import("relation_binding.zig").ResolveAdapter = .{ .backend = backend, .table = table };
+        var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = target.name };
         try @import("relation_binding.zig").inferExpected(allocator, adapter.iface(), selection, parameters, &.{});
     }
     const contexts = try allocator.alloc(?ast.ColumnType, compiled.parameter_count);
@@ -417,6 +429,14 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
             source_query = (try typedValuesSource(allocator, source, insertion, table, &row_index)).*;
             if (row_index != insertion.values_source_rows.len) return error.InvalidSqlParameters;
         }
+        // Source-aware RETURNING must capture simple INSERT SELECT inputs in
+        // the same read set as its own physical subqueries, too.
+        if (relational_returning and source_query.source == null) if (source_query.table) |name| {
+            const relation = try allocator.create(ast.Relation);
+            relation.* = .{ .table = .{ .name = name } };
+            source_query.source = relation;
+            source_query.table = null;
+        };
         // Assignment context supplies the type of otherwise-untyped positional
         // parameters. The SELECT binder retains all source authorization and
         // immutable catalog identities separately from the target binding.
@@ -448,16 +468,24 @@ pub fn bind(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *c
         result.conflict = try @import("conflict.zig").bind(allocator, backend, table, projection_name, target_aliased, clause, parameters, capture_types);
     };
     if (returning_select) |selection| {
-        var adapter: @import("relation_binding.zig").ResolveAdapter = .{ .backend = backend, .table = table };
+        var adapter: @import("relation_binding.zig").TargetResolveAdapter = .{ .backend = backend, .table = table, .name = target.name };
         const returning_compiled: compiler.Compiled = .{ .arena = undefined, .statement = .{ .select = selection }, .parameter_count = compiled.parameter_count };
         const returning_bound = try allocator.create(BoundStatement);
         returning_bound.* = try bind(allocator, adapter.iface(), &returning_compiled, result.parameter_types);
         result.returning = returning_bound;
         result.returning_projections = selection.columns;
+        if (relational_returning) result.returning_query = selection;
         result.columns = returning_bound.columns;
         result.parameter_types = returning_bound.parameter_types;
     }
     return result;
+}
+
+fn returningReads(projections: ?[]const ast.Projection) bool {
+    for (projections orelse return false) |projection| if (projection.expression) |expression| {
+        if (@import("subquery_lowering.zig").has(expression)) return true;
+    };
+    return false;
 }
 
 fn bindConstantSelect(alloc: std.mem.Allocator, compiled: *const compiler.Compiled, hints: []const ?ast.ColumnType, settings: ?*const @import("setting_catalog.zig").View, fallbacks: []const ?ast.ColumnType) !BoundStatement {

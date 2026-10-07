@@ -56,6 +56,8 @@ const Backend = struct {
     default_prepare_failure: bool = false,
     generated_mode: bool = false,
     deny_source: bool = false,
+    returning_mode: bool = false,
+    inserting: bool = false,
     row_count: usize = 2,
     rows_read: usize = 0,
     checkpoints: usize = 0,
@@ -79,13 +81,13 @@ const Backend = struct {
     }
     fn open(ptr: *anyopaque, _: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        if (scans.len != 2 and scans.len != 3 and !(self.default_mode and scans.len == 1)) return error.TestUnexpectedScanCount;
+        if (scans.len != 2 and scans.len != 3 and !((self.default_mode or self.returning_mode) and scans.len == 1)) return error.TestUnexpectedScanCount;
         self.captures += 1;
         self.last_scan_count = scans.len;
         for (scans, self.states[0..scans.len], self.cursors[0..scans.len]) |scan_, *state, *cursor| {
             state.* = .{ .owner = self, .request = scan_ };
             cursor.* = .{ .ptr = state, .next = Cursor.next, .close = undefined };
-            if (scan_.table.id == 1) {
+            if (scan_.table.id == 1 and !self.returning_mode) {
                 try std.testing.expect(scan_.request.include_primary_digest);
                 for (scan_.request.fields) |field| try std.testing.expect(!std.mem.eql(u8, field, "cold"));
             }
@@ -128,8 +130,14 @@ const Backend = struct {
         self.commits += 1;
         self.writes += mutations.len;
         for (mutations) |mutation| {
-            try std.testing.expectEqual(std.math.maxInt(u64) - 1, mutation.expected_version);
-            try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(9)), &mutation.expected_content_digest.?);
+            if (self.inserting) {
+                try std.testing.expectEqualStrings("fresh", mutation.key);
+                try std.testing.expectEqual(@as(?u64, 0), mutation.expected_version);
+                try std.testing.expect(mutation.unique_absence);
+            } else {
+                try std.testing.expectEqual(std.math.maxInt(u64) - 1, mutation.expected_version);
+                try std.testing.expectEqualSlices(u8, &@as([32]u8, @splat(9)), &mutation.expected_content_digest.?);
+            }
             if (mutation.row) |row| {
                 try std.testing.expectEqualStrings(if (self.default_mode) "default" else "new", row.object.get("cold").?.string);
                 if (self.generated_mode) try std.testing.expectEqual(row.object.get("n").?.integer * 2, row.object.get("g").?.integer);
@@ -141,7 +149,10 @@ const Backend = struct {
         return .committed;
     }
     fn backend(self: *@This()) catalog.Backend {
-        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .open_statement = open, .scan = scan, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepare, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .open_statement = open, .scan = scan, .mutate = mutate, .mutate_prepared = mutate, .prepare_mutations = prepare, .checkpoint = checkpoint, .generate_row_id = generateId } };
+    }
+    fn generateId(_: *anyopaque, a: std.mem.Allocator) ![]const u8 {
+        return a.dupe(u8, "fresh");
     }
 };
 
@@ -215,6 +226,129 @@ test "SQL joined mutations preserve one capture exact fences typed values and do
         try std.testing.expectEqual(@as(usize, 2), backend.last_scan_count);
         try std.testing.expectEqual(@as(usize, 1), backend.commits);
     }
+}
+
+test "SQL RETURNING relations share one cut and evaluate prepared postimages before commit" {
+    const cases = [_]struct { sql: []const u8, first: []const []const []const u8, nulls: []const bool = &.{ false, false } }{
+        .{ .sql = "UPDATE target SET n=n+10,cold='new' RETURNING n,(SELECT delta FROM source WHERE id='a') AS x", .first = &.{ &.{ "11", "10" }, &.{ "12", "10" } } },
+        .{ .sql = "UPDATE target t SET n=n+9,cold='new' RETURNING n,(SELECT delta FROM source s WHERE s.delta=t.n) AS x", .first = &.{ &.{ "10", "10" }, &.{ "11", "" } }, .nulls = &.{ false, true } },
+        .{ .sql = "DELETE FROM target RETURNING n,(SELECT delta FROM source WHERE id='a') AS x", .first = &.{ &.{ "1", "10" }, &.{ "2", "10" } } },
+        .{ .sql = "UPDATE target SET n=n+10,cold='new' RETURNING n,(SELECT n FROM target WHERE _id='a') AS previous", .first = &.{ &.{ "11", "1" }, &.{ "12", "1" } } },
+    };
+    for (cases) |case| {
+        var backend: Backend = .{ .returning_mode = true };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u64, 2), result.output.rows_affected);
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        for (result.output.rows, result.output.sql_nulls.?, case.first, case.nulls) |row, flags, expected, is_null| {
+            try std.testing.expectEqualStrings(expected[0], row[0].string);
+            try std.testing.expectEqual(is_null, flags[1]);
+            if (!is_null) try std.testing.expectEqualStrings(expected[1], row[1].string);
+        }
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 2), backend.last_scan_count);
+        try std.testing.expectEqual(@as(usize, 4), backend.rows_read);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    }
+}
+
+test "SQL RETURNING source errors cardinality and zero candidates never publish invalid images" {
+    for ([_]struct { sql: []const u8, failure: anyerror }{
+        .{ .sql = "UPDATE target SET cold='new' RETURNING (SELECT delta FROM source)", .failure = error.SqlCardinalityViolation },
+        .{ .sql = "DELETE FROM target RETURNING (SELECT delta/0 FROM source WHERE id='a')", .failure = error.SqlDivisionByZero },
+    }) |case| {
+        var backend: Backend = .{ .returning_mode = true };
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        try std.testing.expectError(case.failure, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1), backend.closes);
+        try std.testing.expectEqual(@as(usize, 0), backend.commits);
+    }
+    var empty: Backend = .{ .returning_mode = true };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target SET cold='new' WHERE n<0 RETURNING (SELECT delta FROM source)", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, empty.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, 0), result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, 0), result.output.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), empty.closes);
+    try std.testing.expectEqual(@as(usize, 0), empty.commits);
+}
+
+test "SQL RETURNING relations consume generated images and INSERT source snapshots" {
+    var generated: Backend = .{ .returning_mode = true, .default_mode = true, .generated_mode = true };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=n+10,cold=DEFAULT,g=DEFAULT RETURNING g,(SELECT delta FROM source s WHERE s.delta=t.g-2) AS matched", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, generated.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    try std.testing.expectEqualStrings("22", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("20", result.output.rows[0][1].string);
+    try std.testing.expectEqualStrings("24", result.output.rows[1][0].string);
+    try std.testing.expect(result.output.sql_nulls.?[1][1]);
+    try std.testing.expectEqual(@as(usize, 1), generated.captures);
+    try std.testing.expectEqual(@as(usize, 1), generated.commits);
+    for ([_][]const u8{
+        "INSERT INTO target(n,payload,cold) VALUES(9,'null'::jsonb,'new') RETURNING n,(SELECT delta FROM source WHERE id='a') AS x",
+        "INSERT INTO target(n,payload,cold) SELECT delta,'null'::jsonb,'new' FROM source WHERE id='a' RETURNING n,(SELECT delta FROM source WHERE id='b') AS x",
+    }, 0..) |sql, i| {
+        var backend: Backend = .{ .returning_mode = true, .inserting = true };
+        var insertion = try compiler.compile(std.testing.allocator, sql, .{});
+        defer insertion.deinit();
+        var inserted = try runtime.execute(std.testing.allocator, backend.backend(), &insertion, &.{}, .{});
+        defer inserted.deinit();
+        try std.testing.expectEqual(@as(u64, 1), inserted.output.rows_affected);
+        try std.testing.expectEqualStrings(if (i == 0) "9" else "10", inserted.output.rows[0][0].string);
+        try std.testing.expectEqualStrings(if (i == 0) "10" else "20", inserted.output.rows[0][1].string);
+        try std.testing.expectEqual(@as(usize, 1), backend.captures);
+        try std.testing.expectEqual(@as(usize, 1 + i), backend.last_scan_count);
+        try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    }
+}
+
+test "SQL RETURNING correlated relation work scales by captured inputs not target fanout" {
+    const count = 1024;
+    var backend: Backend = .{ .returning_mode = true, .row_count = count };
+    var compiled = try compiler.compile(std.testing.allocator, "UPDATE target t SET n=n+9,cold='new' RETURNING n,(SELECT delta FROM source s WHERE s.delta=t.n)", .{});
+    defer compiled.deinit();
+    const started = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{ .result_rows = count, .page_rows = 17 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u64, count), result.output.rows_affected);
+    try std.testing.expectEqual(@as(usize, count), result.output.rows.len);
+    try std.testing.expectEqual(@as(usize, 2 * count), backend.rows_read);
+    try std.testing.expect(backend.checkpoints < 40 * count);
+    try std.testing.expectEqual(@as(usize, 1), backend.captures);
+    try std.testing.expectEqual(@as(usize, 1), backend.closes);
+    try std.testing.expectEqual(@as(usize, 1), backend.commits);
+    for (result.output.rows, result.output.sql_nulls.?, 0..) |row, flags, i| {
+        const expected: i64 = @intCast(i + 10);
+        try std.testing.expectEqual(expected, try std.fmt.parseInt(i64, row[0].string, 10));
+        try std.testing.expectEqual(@rem(expected, 10) != 0, flags[1]);
+        if (!flags[1]) try std.testing.expectEqual(expected, try std.fmt.parseInt(i64, row[1].string, 10));
+    }
+    std.debug.print("SQL RETURNING relation: targets={} source_rows={} captures=1 peak_bytes={} elapsed_ns={}\n", .{ count, backend.rows_read - count, result.peakMemoryBytes(), std.Io.Clock.now(.awake, std.testing.io).nanoseconds - started });
+}
+
+test "SQL RETURNING relations unwind allocation faults across capture and prepared evaluation" {
+    const Faults = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var backend: Backend = .{ .returning_mode = true };
+            defer {
+                if (backend.captures != backend.closes) @panic("RETURNING capture leaked");
+            }
+            var compiled = try compiler.compile(a, "UPDATE target t SET n=n+9,cold='new' RETURNING n,(SELECT delta FROM source s WHERE s.delta=t.n)", .{});
+            defer compiled.deinit();
+            var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Faults.run, .{});
 }
 
 test "SQL target-only mutation subqueries share one captured relational plan" {

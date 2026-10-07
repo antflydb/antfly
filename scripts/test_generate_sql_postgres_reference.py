@@ -524,6 +524,85 @@ class PostgresReferenceTest(unittest.TestCase):
                 self.assertEqual(case["value"], value)
                 self.assertEqual(case.get("sql_null", False), sql_null)
 
+    def test_returning_correlates_postimages_but_reads_the_statement_snapshot(self):
+        cases = [
+            (
+                "UPDATE target SET n=n+10,cold='new' RETURNING n,(SELECT delta FROM source WHERE id='a') AS x",
+                [(11, 10), (12, 10)],
+            ),
+            (
+                "UPDATE target t SET n=n+9,cold='new' RETURNING n,(SELECT delta FROM source s WHERE s.delta=t.n) AS x",
+                [(10, 10), (11, None)],
+            ),
+            (
+                "DELETE FROM target RETURNING n,(SELECT delta FROM source WHERE id='a') AS x",
+                [(1, 10), (2, 10)],
+            ),
+            (
+                "UPDATE target SET n=n+10,cold='new' RETURNING n,(SELECT n FROM target WHERE _id='a') AS previous",
+                [(11, 1), (12, 1)],
+            ),
+            (
+                "UPDATE target SET cold='new' WHERE n<0 RETURNING (SELECT delta FROM source)",
+                [],
+            ),
+            (
+                "UPDATE target t SET n=n+10,cold=DEFAULT,g=DEFAULT RETURNING g,(SELECT delta FROM source s WHERE s.delta=t.g-2) AS matched",
+                [(22, 20), (24, None)],
+            ),
+            (
+                "INSERT INTO target(n,payload,cold) VALUES(9,'null'::jsonb,'new') RETURNING n,(SELECT delta FROM source WHERE id='a') AS x",
+                [(9, 10)],
+            ),
+            (
+                "INSERT INTO target(n,payload,cold) SELECT delta,'null'::jsonb,'new' FROM source WHERE id='a' RETURNING n,(SELECT delta FROM source WHERE id='b') AS x",
+                [(10, 20)],
+            ),
+        ]
+        for sql, expected in cases:
+            with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                self.db.execute(
+                    "CREATE TABLE target(_id text PRIMARY KEY DEFAULT 'fresh',n bigint,payload jsonb,cold text DEFAULT 'default',g bigint GENERATED ALWAYS AS (n*2) STORED)"
+                )
+                self.db.execute(
+                    "INSERT INTO target(_id,n,payload,cold) VALUES ('a',1,'null','old'),('b',2,'null','old')"
+                )
+                self.db.execute("CREATE TABLE source(id text,delta bigint)")
+                self.db.execute("INSERT INTO source VALUES ('a',10),('b',20)")
+                self.assertEqual(expected, self.db.execute(sql).fetchall())
+
+    def test_returning_cardinality_and_projection_errors_abort_the_mutation(self):
+        import psycopg
+
+        for sql, failure in [
+            (
+                "UPDATE target SET cold='new' RETURNING (SELECT delta FROM source)",
+                psycopg.errors.CardinalityViolation,
+            ),
+            (
+                "DELETE FROM target RETURNING (SELECT delta/0 FROM source WHERE id='a')",
+                psycopg.errors.DivisionByZero,
+            ),
+        ]:
+            with self.subTest(sql=sql), self.db.transaction(force_rollback=True):
+                self.db.execute(
+                    "CREATE TABLE target(_id text PRIMARY KEY,n bigint,payload jsonb,cold text)"
+                )
+                self.db.execute(
+                    "INSERT INTO target VALUES ('a',1,'null','old'),('b',2,'null','old')"
+                )
+                self.db.execute("CREATE TABLE source(id text,delta bigint)")
+                self.db.execute("INSERT INTO source VALUES ('a',10),('b',20)")
+                with self.assertRaises(failure):
+                    with self.db.transaction(force_rollback=True):
+                        self.db.execute(sql)
+                self.assertEqual(
+                    [("a", 1, "old"), ("b", 2, "old")],
+                    self.db.execute(
+                        "SELECT _id,n,cold FROM target ORDER BY _id"
+                    ).fetchall(),
+                )
+
     def test_json_and_typed_array_containment_reference(self):
         import json
         from pathlib import Path

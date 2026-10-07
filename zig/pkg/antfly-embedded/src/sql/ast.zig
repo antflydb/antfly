@@ -119,7 +119,15 @@ pub const Cte = struct {
     materialization: Materialization = .automatic,
 };
 pub const Relation = union(enum) {
-    table: struct { name: Name, alias: ?[]const u8 = null, mutation_target: bool = false, mutation_document: bool = false, mutation_presence: bool = false },
+    table: struct {
+        name: Name,
+        alias: ?[]const u8 = null,
+        mutation_target: bool = false,
+        mutation_document: bool = false,
+        mutation_presence: bool = false,
+        /// Compiler-owned RETURNING input, never a physical table scan.
+        prepared_rows: bool = false,
+    },
     derived: struct { query: *const Select, alias: []const u8, columns: []const []const u8 = &.{}, hidden: bool = false, lateral: bool = false },
     join: struct { kind: JoinKind, left: *const Relation, right: *const Relation, condition: ?*const Scalar = null },
 };
