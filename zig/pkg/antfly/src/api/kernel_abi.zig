@@ -21,6 +21,7 @@ const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 pub const memory_abi = @import("runtime_memory_abi");
 pub const native_abi = @import("antfly_runtime_abi").native_abi;
+pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 
 pub const Status = error_abi.Status;
 pub const StatusCode = error_abi.Code;
@@ -227,6 +228,7 @@ pub const Capability = struct {
     pub const inference_admission_stats: u64 = 1 << 4;
     pub const internal_service_ingress: u64 = 1 << 5;
     pub const node_runnable_owner: u64 = 1 << 6;
+    pub const node_runnable_execution: u64 = 1 << 7;
 };
 
 /// The sole discovery point for the API-kernel ABI. Keeping the table itself
@@ -267,6 +269,7 @@ pub const FunctionTable = extern struct {
     runnable_owner_create: *const fn (*const RunnableOwnerCreateContext) callconv(.c) Status,
     runnable_owner_close: *const fn (*const CallContext) callconv(.c) Status,
     runnable_owner_destroy: *const fn (*const CallContext) callconv(.c) Status,
+    runnable_owner_execution_port: *const fn (*const CallContext) callconv(.c) Status,
 };
 
 pub fn validContext(comptime T: type, version: u32, struct_size: u32) bool {
@@ -289,7 +292,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         Capability.route_manifest |
         Capability.inference_admission_stats |
         Capability.internal_service_ingress |
-        Capability.node_runnable_owner;
+        Capability.node_runnable_owner |
+        Capability.node_runnable_execution;
     if (required_capabilities & ~known != 0) return null;
     var required = functionTableFieldEnd("capabilities");
     if (required_capabilities & Capability.core != 0)
@@ -302,6 +306,8 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
         required = @max(required, functionTableFieldEnd("handler_authorize_internal_service"));
     if (required_capabilities & Capability.node_runnable_owner != 0)
         required = @max(required, functionTableFieldEnd("runnable_owner_destroy"));
+    if (required_capabilities & Capability.node_runnable_execution != 0)
+        required = @max(required, functionTableFieldEnd("runnable_owner_execution_port"));
     return required;
 }
 
@@ -346,6 +352,14 @@ test "API kernel ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_owner));
     table.struct_size += 1;
     try std.testing.expect(validFunctionTable(&table, Capability.node_runnable_owner));
+    // The old owner prefix remains usable, but cannot expose the new tail.
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_execution));
+    table.capabilities |= Capability.node_runnable_execution;
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_execution));
+    table.struct_size = requiredFunctionTableSize(Capability.node_runnable_execution).? - 1;
+    try std.testing.expect(!validFunctionTable(&table, Capability.node_runnable_execution));
+    table.struct_size += 1;
+    try std.testing.expect(validFunctionTable(&table, Capability.node_runnable_execution));
 }
 
 test "API imported runtime capability struct retains versioned C layout" {

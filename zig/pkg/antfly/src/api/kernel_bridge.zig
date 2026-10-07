@@ -87,6 +87,20 @@ pub const NodeRunnableOwner = struct {
         return .{ .handle = handle orelse return error.ApiKernelOperationFailed, .functions = functions, .boundary_allocator = boundary_allocator };
     }
 
+    /// Borrowed port: consumers retain before storing it and release after joins.
+    pub fn executionPort(self: *const NodeRunnableOwner) !abi.runnable_abi.Owner {
+        if (!abi.validFunctionTable(self.functions, abi.Capability.node_runnable_execution)) return error.UnsupportedVersion;
+        var port: abi.runnable_abi.Owner = undefined;
+        try callError(self.functions.runnable_owner_execution_port(&.{
+            .abi_version = abi.abi_version,
+            .handle = self.handle,
+            .output = &port,
+            .output_contract = .of(abi.runnable_abi.Owner),
+        }));
+        if (!port.valid()) return error.UnsupportedVersion;
+        return port;
+    }
+
     pub fn close(self: *const NodeRunnableOwner) !void {
         try callError(self.functions.runnable_owner_close(&.{ .abi_version = abi.abi_version, .handle = self.handle }));
     }
@@ -101,6 +115,11 @@ pub const NodeRunnableOwner = struct {
 
 test "runnable scheduler opaque node owner retains its allocator after refused destruction" {
     var owner = try NodeRunnableOwner.init(std.testing.allocator, .{ .slots = 2 });
+    const port = try owner.executionPort();
+    try std.testing.expectEqual(owner.handle, port.context);
+    try std.testing.expect(port.retain(port.context).isOk());
+    try std.testing.expectError(error.InvalidRunnableTransition, owner.deinit());
+    port.release(port.context);
     const implementation: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(owner.handle));
     try implementation.retain();
     try std.testing.expectError(error.InvalidRunnableTransition, owner.deinit());

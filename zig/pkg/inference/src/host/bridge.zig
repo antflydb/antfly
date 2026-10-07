@@ -21,9 +21,10 @@ const std = @import("std");
 const error_abi = @import("antfly_runtime_abi").error_abi;
 const http_abi = @import("antfly_runtime_abi").http_abi;
 const native_abi = @import("antfly_runtime_abi").native_abi;
+pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const antfly_image = @import("antfly_image");
 
-pub const abi_version: u32 = 27;
+pub const abi_version: u32 = 28;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -117,6 +118,9 @@ pub const ConfigureContext = extern struct {
     struct_size: u32 = @sizeOf(@This()),
     handle: *anyopaque,
     resource_budget: *const ResourceBudget,
+    /// Borrowed during configure; the inference host retains its own lease
+    /// through worker and node teardown. Null preserves unconfigured execution.
+    runnable_owner: ?*const runnable_abi.Owner = null,
 };
 
 pub const AdmissionAmounts = extern struct {
@@ -429,6 +433,19 @@ pub fn requiredFunctionTableSize(required_capabilities: u64) ?u32 {
 }
 
 pub extern fn antfly_standalone_inference_get_function_table() callconv(.c) *const FunctionTable;
+
+test "linked inference configure rejects old layouts before borrowing the runnable owner" {
+    try std.testing.expectEqual(.@"extern", @typeInfo(ConfigureContext).@"struct".layout);
+    const context: ConfigureContext = .{
+        .abi_version = abi_version,
+        .handle = @ptrFromInt(8),
+        .resource_budget = @ptrFromInt(8),
+        .runnable_owner = @ptrFromInt(8),
+    };
+    try std.testing.expect(validContext(ConfigureContext, context.abi_version, context.struct_size));
+    try std.testing.expect(!validContext(ConfigureContext, abi_version - 1, context.struct_size));
+    try std.testing.expect(!validContext(ConfigureContext, abi_version, @offsetOf(ConfigureContext, "runnable_owner")));
+}
 
 test "linked inference ABI rejects mismatched context and function-table prefixes" {
     try std.testing.expectEqual(@as(u8, 0), @backingInt(ProcessMemoryLimitProvenance.automatic));

@@ -1061,3 +1061,32 @@ pass natively and with pinned Nix/glibc GNU AArch64; the
 pins source bytes and complete output. Cross-archive execution operations,
 inference/background callers and CPU-team enforcement remain pending, along
 with the full API/production gate for these bytes and automatic defaults.
+
+### Checked execution port (2026-10-07, native API gate passed)
+
+A process-local C execution port now keeps weighted capsules inside the API
+kernel owner. Foreign consumers receive checked start/checkpoint/park/enter/finish
+callbacks and stable statuses; consumer leases and every live capsule prevent
+owner destruction. Executor receivers, cancellation and clocks stay borrowed
+through finish. Each capsule charges its own metadata, preserves original
+deadlines and demand, and releases the owner only after retiring all state.
+The append-only optional API table capability checks the new tail before access.
+
+Five real scheduler capsule tests, 33 protocol/imported ABI tests, three
+API layout/prefix tests and two inference ABI checks pass on native macOS and pinned Nix/glibc GNU AArch64
+(43 per platform). The [execution port receipt](qualification/workload-pooling/receipts/2026-10-07/execution-port/README.md)
+pins source and full contract logs. The complete native API gate passes all
+50 steps and 84 tests (38 embedded, 46 coordinator), with no skips/leaks,
+including factory/getter/wrapper behavior. The initial restricted fixture
+failures are preserved alongside the unchanged authorized passing rerun. Production linkage,
+standalone startup/shutdown of these bytes, inference/background consumers and
+CPU team enforcement remain pending; automatic defaults are still disabled.
+
+Inference configure now optionally borrows the API execution port and retains
+a consumer lease through worker and node teardown. Failure during configuration
+returns that lease. Configure ABI version 28 rejects old layouts before touching
+the new field; standalone supplies the port only when its node owner exists.
+The lease primitive is qualified against the real scheduler, including refused
+destruction and shutdown retention rejection. Full inference configure/destroy
+integration and actual execution admission still require their complete gates.
+SQL parent grant inheritance/transfer must precede any nested inference admission.

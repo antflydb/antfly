@@ -55,6 +55,7 @@ pub const LinkedInferenceState = struct {
     owned_models_dir: ?[]u8,
     owned_ml_dir: ?[]u8,
     resource_budget_context: ?*LinkedResourceBudgetContext = null,
+    runnable_owner: ?inference_bridge.runnable_abi.Lease = null,
     routes: std.ArrayListUnmanaged(*RouteState) = .empty,
     route_manifest: std.ArrayListUnmanaged(inference_bridge.RouteManifestEntry) = .empty,
     route_validator: httpx.Router,
@@ -924,6 +925,11 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
         return error.UnsupportedVersion;
     if (state.resource_budget_context != null)
         return error.ExternalResourceBudgetsAlreadyConfigured;
+    var runnable_lease = if (context.runnable_owner) |owner|
+        try inference_bridge.runnable_abi.Lease.init(owner.*)
+    else
+        null;
+    errdefer if (runnable_lease) |*lease| lease.deinit();
     const resource_context = try LinkedResourceBudgetContext.create(
         state.alloc,
         context.resource_budget.*,
@@ -941,12 +947,14 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
     if (state.worker) |worker| {
         try worker.configure(context.resource_budget.*);
         state.node.startup_preloads_materialized = true;
+        state.runnable_owner = runnable_lease;
         return;
     }
     state.node.warmConfiguredModelsBeforeServing(state.alloc) catch |err| {
         std.log.err("standalone startup failed step=warm_inference_models err={}", .{err});
         return err;
     };
+    state.runnable_owner = runnable_lease;
 }
 
 pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void {
@@ -2152,6 +2160,7 @@ pub fn linkedInferenceDestroy(handle: *anyopaque) void {
     state.runtime_config.deinit();
     if (state.owned_models_dir) |path| alloc.free(path);
     if (state.owned_ml_dir) |path| alloc.free(path);
+    if (state.runnable_owner) |*lease| lease.deinit();
     alloc.destroy(state);
 }
 

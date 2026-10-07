@@ -69,6 +69,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const pooling_filters = [_][]const u8{
         "bounded admission",
         "runnable scheduler",
+        "runnable execution",
         "runnable metrics",
         "workload envelope",
         "workload deadline",

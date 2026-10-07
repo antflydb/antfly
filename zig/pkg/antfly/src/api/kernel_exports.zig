@@ -46,10 +46,7 @@ const ServerState = struct {
     runtime_io: RuntimeIoReceivers = .{},
 };
 
-const RunnableOwnerState = struct {
-    owner_alloc: std.mem.Allocator,
-    owner: server_mod.RunnableScheduler.NodeOwner,
-};
+const RunnableOwnerState = @import("runnable_owner_execution.zig").State;
 
 const RuntimeIoReceivers = struct {
     api: ?runtime_io_abi.Receiver = null,
@@ -159,8 +156,16 @@ pub fn runnableOwnerCreate(context: *const abi.RunnableOwnerCreateContext) callc
     const owner = server_mod.RunnableScheduler.NodeOwner.init(policy.*) catch return fail(error.InvalidArgument);
     const alloc = context.owner_alloc.asStd();
     const state = alloc.create(RunnableOwnerState) catch |err| return fail(err);
-    state.* = .{ .owner_alloc = alloc, .owner = owner };
+    state.* = .{ .owner_alloc = alloc, .owner = owner, .native_now_ns = @import("antfly_platform").time.monotonicNs };
     context.out_handle.* = &state.owner;
+    return .ok;
+}
+
+pub fn runnableOwnerExecutionPort(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(void, abi.runnable_abi.Owner, context)) |failure| return failure;
+    const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(context.handle));
+    const state: *RunnableOwnerState = @fieldParentPtr("owner", owner);
+    output(abi.runnable_abi.Owner, context).* = state.port();
     return .ok;
 }
 
@@ -208,6 +213,25 @@ test "runnable scheduler API kernel node owner rejects unsafe creation and destr
     try std.testing.expect(runnableOwnerCreate(&context).isOk());
     const owner: *server_mod.RunnableScheduler.NodeOwner = @ptrCast(@alignCast(handle.?));
     const call: CallContext = .{ .abi_version = abi.abi_version, .handle = handle.? };
+    // Reject the wrong output contract before touching an invalid output pointer.
+    try std.testing.expectEqual(error.InvalidArgument, abi.errorFromStatus(runnableOwnerExecutionPort(&.{
+        .abi_version = abi.abi_version,
+        .handle = handle.?,
+        .output = @ptrFromInt(8),
+        .output_contract = .of(u64),
+    })));
+    var port: abi.runnable_abi.Owner = undefined;
+    try std.testing.expect(runnableOwnerExecutionPort(&.{
+        .abi_version = abi.abi_version,
+        .handle = handle.?,
+        .output = &port,
+        .output_contract = .of(abi.runnable_abi.Owner),
+    }).isOk());
+    try std.testing.expect(port.valid());
+    try std.testing.expectEqual(handle.?, port.context);
+    try std.testing.expect(port.retain(port.context).isOk());
+    try std.testing.expectEqual(error.InvalidRunnableTransition, abi.errorFromStatus(runnableOwnerDestroy(&call)));
+    port.release(port.context);
     try owner.retain();
     try std.testing.expectEqual(error.InvalidRunnableTransition, abi.errorFromStatus(runnableOwnerDestroy(&call)));
     try std.testing.expect(!owner.closed);
@@ -660,7 +684,8 @@ const function_table: abi.FunctionTable = .{
         abi.Capability.route_manifest |
         abi.Capability.inference_admission_stats |
         abi.Capability.internal_service_ingress |
-        abi.Capability.node_runnable_owner,
+        abi.Capability.node_runnable_owner |
+        abi.Capability.node_runnable_execution,
     .create = &create,
     .destroy = &destroy,
     .request_stats = &requestStats,
@@ -691,6 +716,7 @@ const function_table: abi.FunctionTable = .{
     .runnable_owner_create = &runnableOwnerCreate,
     .runnable_owner_close = &runnableOwnerClose,
     .runnable_owner_destroy = &runnableOwnerDestroy,
+    .runnable_owner_execution_port = &runnableOwnerExecutionPort,
 };
 
 pub fn getFunctionTable() callconv(.c) *const abi.FunctionTable {

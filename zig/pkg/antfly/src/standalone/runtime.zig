@@ -5368,10 +5368,15 @@ pub fn runFromIterator(
         .observe_prompt_cache = observeInferencePromptCache,
         .observe_tokenizer_cache = observeInferenceTokenizerCache,
     };
+    var inference_runnable_port = if (runnable_node_owner) |*owner|
+        try owner.executionPort()
+    else
+        null;
     const configure_context = inference_bridge.ConfigureContext{
         .abi_version = inference_bridge.abi_version,
         .handle = antfly_node,
         .resource_budget = &inference_resource_budget,
+        .runnable_owner = if (inference_runnable_port) |*port| port else null,
     };
     if (comptime inline_inference_codegen) {
         try inference_host.linkedInferenceConfigure(&configure_context);
