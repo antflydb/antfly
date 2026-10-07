@@ -24,6 +24,7 @@ const host = @import("host.zig");
 const platform = @import("antfly_platform");
 const httpx = @import("httpx");
 const execution_control = @import("inference_server").execution_control;
+const ExecutionPhases = @import("worker_execution_phase.zig").For(execution_control, rpc);
 pub const EnvironmentEntry = struct { name: []const u8, value: []const u8 };
 
 const ForwardControl = struct {
@@ -34,31 +35,18 @@ const ForwardControl = struct {
     stream: http.StreamSink = .{},
     stream_started: bool = false,
     phase_handoff: bool = false,
-    resource_wait: ?execution_control.ResourceWait = null,
+    execution_phase: ExecutionPhases.Parent = .{},
 
     fn phase(raw: ?*anyopaque, value: rpc.Phase) !void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
         if (!self.phase_handoff) return error.UnsupportedWorkerPhase;
-        switch (value) {
-            .resource_wait => {
-                if (self.resource_wait != null) return error.InvalidWorkerPhase;
-                try check(self);
-                const wait = try execution_control.ResourceWait.init();
-                if (wait.checkpoint == null) return error.UnsupportedWorkerPhase;
-                self.resource_wait = wait;
-            },
-            .runnable => {
-                if (self.resource_wait == null) return error.InvalidWorkerPhase;
-                try self.finishResourceWait();
-                try check(self);
-            },
-        }
+        if (value == .resource_wait) try check(self);
+        try self.execution_phase.transition(value);
+        if (value == .runnable) try check(self);
     }
 
     fn finishResourceWait(self: *@This()) !void {
-        var wait = self.resource_wait orelse return;
-        self.resource_wait = null;
-        try wait.finish();
+        try self.execution_phase.finish();
     }
 
     fn check(raw: ?*anyopaque) !void {
@@ -137,7 +125,7 @@ pub fn invokeProvider(client: *Client, context: *const bridge.ProviderInvokeCont
         return err;
     };
     defer response.deinit();
-    if (control.resource_wait != null) {
+    if (control.execution_phase.wait != null) {
         try control.finishResourceWait();
         return error.InvalidWorkerPhase;
     }
@@ -782,29 +770,7 @@ const Child = struct {
         return @intFromBool(request.cancelled.load(.acquire));
     }
 
-    const ChildPhase = struct {
-        request: *rpc.Request,
-        failure: ?anyerror = null,
-        fn check(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.failure) |err| return err;
-            if (self.request.cancelled.load(.acquire)) return error.Cancelled;
-        }
-        fn transition(self: *@This(), value: rpc.Phase) !void {
-            self.request.transition(value) catch |err| {
-                self.failure = err;
-                return err;
-            };
-        }
-        fn park(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.transition(.resource_wait);
-        }
-        fn reenter(raw: *anyopaque) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            try self.transition(.runnable);
-        }
-    };
+    const ChildPhase = ExecutionPhases.Child;
 
     fn emit(request: *rpc.Request, event: wire.Event) !void {
         return emitBody(request, event, "");

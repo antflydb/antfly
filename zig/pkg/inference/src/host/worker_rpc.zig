@@ -730,7 +730,7 @@ pub const Endpoint = struct {
     }
 };
 
-const TestPair = struct {
+pub const TestPair = struct {
     parent: Endpoint,
     child: Endpoint,
     files: [4]std.Io.File,
@@ -740,7 +740,8 @@ const TestPair = struct {
     phase_resumed: std.atomic.Value(bool) = .init(false),
     phase_denied: std.Io.Event = .unset,
 
-    fn init(self: *TestPair) !void {
+    pub fn init(self: *TestPair) !void {
+        if (!@import("builtin").is_test) @compileError("worker pipe fixture is test-only");
         if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
         const up = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
         const down = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });

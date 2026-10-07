@@ -109,6 +109,36 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("antfly-inference-owner-handoff-test", "Run real shared-owner inference handoff and model-lock control progress contracts")
         .dependOn(&b.addRunArtifact(inference_owner_tests).step);
+    const worker_owner_rpc = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_rpc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    worker_owner_rpc.addImport("httpx", antfly_imports.httpx);
+    const worker_owner_phases = b.createModule(.{
+        .root_source_file = b.path("pkg/inference/src/host/worker_execution_phase.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const worker_owner_root = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api/runnable_worker_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    worker_owner_root.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    worker_owner_root.addImport("antfly_local_sources", inference_owner_sources);
+    worker_owner_root.addImport("inference_execution_control", inference_owner_control);
+    worker_owner_root.addImport("inference_worker_rpc", worker_owner_rpc);
+    worker_owner_root.addImport("inference_worker_phases", worker_owner_phases);
+    const worker_owner_tests = b.addTest(.{
+        .name = "inference-worker-owner-handoff-tests",
+        .root_module = worker_owner_root,
+        .filters = &.{"inference worker physical handoff"},
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    b.step("antfly-inference-worker-owner-handoff-test", "Run real owner capsules through the worker pipe phase transport")
+        .dependOn(&b.addRunArtifact(worker_owner_tests).step);
     const inference_phase_filters = [_][]const u8{ "runnable execution local provider", "runnable execution worker budget" };
     const inference_phase_tests = b.addTest(.{
         .name = "inference-parent-phase-tests",

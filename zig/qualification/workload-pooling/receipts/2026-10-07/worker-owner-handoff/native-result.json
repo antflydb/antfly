@@ -1,0 +1,38 @@
+{
+  "argv": [
+    "/Users/ajroetker/bin/zig-0.17.0/zig",
+    "build",
+    "antfly-inference-worker-owner-handoff-test",
+    "-Doptimize=ReleaseSafe",
+    "-j1",
+    "--maxrss",
+    "2147483648",
+    "--cache-dir",
+    "/private/tmp/antfly-parent-phase-focused-cache",
+    "--summary",
+    "all"
+  ],
+  "pid": 13375,
+  "state": "terminal",
+  "started": 1791410553.165824,
+  "source_sha256": {
+    "zig/pkg/inference/src/host/worker_rpc.zig": "cf7f6f04c69e7cd6e538403e04f1dd2ea97b363eaffbce4ae43545caf0789012",
+    "zig/pkg/inference/src/host/worker_execution_phase.zig": "5146215dd67d2a5eb374b27c3471d0f7cb236dcb58e55fc9bbed142c0c0e8b2a",
+    "zig/pkg/inference/src/host/worker.zig": "8fe2940440df32a48f77dad547c164c666caf757180d2ac6dbfd914fd5596c0f",
+    "zig/pkg/inference/src/execution_control.zig": "fa7887ea5963ed3557ef572ad8de8bc6ed7e609b7532094cba9e1b320d6a1512",
+    "zig/pkg/antfly/build/api_tests.zig": "4689df1fc18b0fd5bf5b9fbd5aaca089e2d13ac103f9446426178169fd7c03e2",
+    "zig/pkg/antfly/src/api/runnable_worker_test_root.zig": "2302f6340a189d9b6606ce3010aeca4bb57e892ac05913468be9768663b1b7e0",
+    "zig/pkg/antfly/src/api/runnable_owner_execution.zig": "15ac1ce6f5a058dd57d5e99d636e67ebd1def48cfad2ed2eb12322606fc9f2d3"
+  },
+  "compiler_pid": 13378,
+  "exit_code": 0,
+  "finished": 1791410560.9389682,
+  "compiled_source_sha256": {
+    "zig/pkg/inference/src/host/worker_rpc.zig": "cf7f6f04c69e7cd6e538403e04f1dd2ea97b363eaffbce4ae43545caf0789012",
+    "zig/pkg/inference/src/host/worker_execution_phase.zig": "5146215dd67d2a5eb374b27c3471d0f7cb236dcb58e55fc9bbed142c0c0e8b2a",
+    "zig/pkg/inference/src/execution_control.zig": "fa7887ea5963ed3557ef572ad8de8bc6ed7e609b7532094cba9e1b320d6a1512",
+    "zig/pkg/antfly/build/api_tests.zig": "4689df1fc18b0fd5bf5b9fbd5aaca089e2d13ac103f9446426178169fd7c03e2",
+    "zig/pkg/antfly/src/api/runnable_worker_test_root.zig": "2302f6340a189d9b6606ce3010aeca4bb57e892ac05913468be9768663b1b7e0",
+    "zig/pkg/antfly/src/api/runnable_owner_execution.zig": "15ac1ce6f5a058dd57d5e99d636e67ebd1def48cfad2ed2eb12322606fc9f2d3"
+  }
+}
