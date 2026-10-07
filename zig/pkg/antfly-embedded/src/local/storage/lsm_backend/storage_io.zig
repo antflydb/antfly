@@ -3428,6 +3428,66 @@ fn nativeColdSequentialReaderCapacity(state: *const NativeStorageState) usize {
     return cache.capacity -| unavailable;
 }
 
+/// Windows has no POSIX cold-cache hints, but backup WAL prefixes still need
+/// a stable handle and a retained executor instead of reopening their path.
+const WindowsStableReader = struct {
+    allocator: Allocator,
+    permit: NativeFdPermit,
+    file: std.Io.File,
+    const vtable: ColdSequentialReader.VTable = .{
+        .read_range_alloc = readRangeAlloc,
+        .read_range_into = readRangeInto,
+        .read_ranges_into = readRangesInto,
+        .release_scratch = releaseScratch,
+        .deinit = deinit,
+    };
+
+    fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState) !ColdSequentialReader {
+        var permit = try state.acquireFdPermit();
+        defer permit.release();
+        const file = if (std.fs.path.isAbsolute(path))
+            try std.Io.Dir.openFileAbsolute(permit.io, path, .{})
+        else
+            try std.Io.Dir.cwd().openFile(permit.io, path, .{});
+        errdefer file.close(permit.io);
+        const self = try allocator.create(WindowsStableReader);
+        self.* = .{ .allocator = allocator, .permit = permit.take(), .file = file };
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn readRangeAlloc(ptr: *anyopaque, allocator: Allocator, offset: u64, len: usize) ![]u8 {
+        const out = try allocator.alloc(u8, len);
+        errdefer allocator.free(out);
+        try readRangeInto(ptr, offset, out);
+        return out;
+    }
+
+    fn readRangeInto(ptr: *anyopaque, offset: u64, out: []u8) !void {
+        const self: *WindowsStableReader = @ptrCast(@alignCast(ptr));
+        if (try self.file.readPositionalAll(self.permit.io, out, offset) != out.len) return error.EndOfStream;
+    }
+
+    fn readRangesInto(ptr: *anyopaque, ranges: []const ColdReadRange) !ColdReadStats {
+        var stats: ColdReadStats = .{};
+        for (ranges) |range| {
+            try readRangeInto(ptr, range.offset, range.destination);
+            stats.logical_bytes += range.destination.len;
+            stats.physical_bytes += range.destination.len;
+            stats.physical_reads += @intFromBool(range.destination.len != 0);
+        }
+        return stats;
+    }
+
+    fn releaseScratch(_: *anyopaque) void {}
+
+    fn deinit(ptr: *anyopaque) void {
+        const self: *WindowsStableReader = @ptrCast(@alignCast(ptr));
+        self.file.close(self.permit.io);
+        self.permit.release();
+        self.allocator.destroy(self);
+    }
+};
+
 const NativeColdSequentialReader = struct {
     const direct_alignment: usize = 4096;
     const max_coalesced_gap: usize = 4096;
@@ -3478,6 +3538,7 @@ const NativeColdSequentialReader = struct {
     }
 
     fn create(allocator: Allocator, path: []const u8, state: *NativeStorageState, intent: Intent) !ColdSequentialReader {
+        if (comptime builtin.os.tag == .windows) return WindowsStableReader.create(allocator, path, state);
         if (comptime !supports_posix_fd_cache) return error.UnsupportedNativeStorageRuntime;
 
         var permit = try state.acquireFdPermit();
@@ -5570,6 +5631,39 @@ test "native streaming atomic abort removes staging despite pending cancellation
         std.testing.allocator.free(names);
     }
     try std.testing.expectEqual(@as(usize, 0), names.len);
+}
+
+test "Windows stable reader retains its file generation and executor after storage shutdown" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("stable_reader");
+    defer tmp.cleanup();
+    const path = tmp.path();
+    var native = try NativeStorage.init(alloc, .threaded);
+    var owner_active = true;
+    defer if (owner_active) native.deinit();
+    try native.storage().writeFileAbsolute(path, "committed-tail");
+    var reader = try native.storage().beginStableSequentialRead(alloc, path);
+    defer reader.deinit();
+    const retired = try std.fmt.allocPrint(alloc, "{s}.retired", .{path});
+    defer alloc.free(retired);
+    defer std.Io.Dir.cwd().deleteFile(std.testing.io, retired) catch {};
+    try native.storage().renameAbsolute(path, retired);
+    try native.storage().writeFileAbsolute(path, "replacement");
+    native.deinit();
+    owner_active = false;
+    const prefix = try reader.readRangeAlloc(alloc, 0, 9);
+    defer alloc.free(prefix);
+    try std.testing.expectEqualStrings("committed", prefix);
+    var tail: [5]u8 = undefined;
+    try reader.readRangeInto(9, &tail);
+    try std.testing.expectEqualStrings("-tail", &tail);
+    var first: [3]u8 = undefined;
+    const stats = try reader.readRangesInto(&.{ .{ .offset = 0, .destination = &first }, .{ .offset = 9, .destination = &tail } });
+    try std.testing.expectEqualStrings("com", &first);
+    try std.testing.expectEqual(@as(u64, 8), stats.logical_bytes);
+    try std.testing.expectError(error.EndOfStream, reader.readRangeAlloc(alloc, 0, 15));
+    reader.releaseScratch();
 }
 
 test "Windows borrowed executor atomic writes bound memory and preserve I/O authority" {

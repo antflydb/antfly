@@ -22,6 +22,7 @@ import tempfile
 from pathlib import Path
 
 COMPAT = Path(__file__).with_name("antfly_windows_compat.zig")
+HARDLINK = Path(__file__).with_name("threaded_windows_hardlink.zig")
 
 # (anchor, replacement) pairs applied once each to std/c.zig.
 EDITS = [
@@ -156,6 +157,14 @@ DYNLIB_EDITS = [
 # file's first byte, where Lite keeps its header and writer-lock marker. A
 # sentinel byte past any real data keeps lock-vs-lock semantics, like SQLite.
 THREADED_EDITS = [
+    (
+        ") Dir.HardLinkError!void {\n    if (is_windows) return error.OperationUnsupported;\n",
+        ") Dir.HardLinkError!void {\n    if (is_windows) return antflyDirHardLinkWindows(old_dir, old_sub_path, new_dir, new_sub_path, options);\n",
+    ),
+    (
+        ") File.HardLinkError!void {\n    _ = userdata;\n    if (native_os != .linux) return error.OperationUnsupported;\n",
+        ") File.HardLinkError!void {\n    _ = userdata;\n    if (is_windows) return antflyFileHardLinkWindows(file.handle, new_dir, new_sub_path);\n    if (native_os != .linux) return error.OperationUnsupported;\n",
+    ),
     (
         "    const addr_len = addressToPosix(address, &storage.Address);\n    switch ((try deviceIoControl(&.{\n        .file = .{ .handle = socket_handle, .flags = .{ .nonblocking = true } },\n        .code = windows.IOCTL.AFD.CONNECT,\n",
         (
@@ -327,6 +336,7 @@ def create_overlay(zig_lib: Path, out: Path) -> None:
                 close_call,
                 f'@import("../c/antfly_windows_compat.zig").closeSocket({handle})',
             )
+        source += "\n" + HARDLINK.read_text(encoding="utf-8")
         threaded.write_text(source, encoding="utf-8")
         shutil.copyfile(COMPAT, staged / "std" / "c" / "antfly_windows_compat.zig")
         if out.exists():

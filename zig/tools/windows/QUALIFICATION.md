@@ -304,6 +304,83 @@ identity and caller authority. A copy fallback or a direct Win32 bypass was
 not introduced. The focused root is `windows_backup_test.zig`; no backup test
 was skipped. The path fixes have not been rerun on native Windows.
 
+## Windows hardlink implementation
+
+The preceding backup blocker is resolved by the overlay's new owning
+`Io.Threaded` implementation. Both directory-relative and file-handle hardlinks
+use `NtSetInformationFile(FileLinkInformation)` inside the runtime, with its
+existing Unicode path conversion, directory handles, syscall cancellation and
+error mapping. `ReplaceIfExists` is false. Pins preserve file identity rather
+than copying bytes, and a borrowed I/O vtable retains authority over the call.
+The generator still requires exact Zig source anchors and stages changes
+before replacing an overlay.
+
+Once pin creation succeeded, the generation capture test exposed a second
+Windows gap: the stable WAL-prefix reader returned
+`UnsupportedNativeStorageRuntime`. Windows now retains one `Io.File` and its
+owning `NativeFdPermit`, reads only requested ranges and closes the handle
+before releasing the executor. A regression replaces the path and shuts down
+the storage owner, then verifies that the reader still observes the original
+file generation. Windows has no POSIX cache hints or coalescing in this reader.
+
+CrossOver Debug and ReleaseFast each pass all three direct hardlink tests,
+all 11 backup tests (zero skips/leaks, one expected error log), and 18 storage
+I/O tests (21 POSIX-only skips). The direct tests cover Unicode names, separate
+relative source/destination handles, inode/size/mtime identity, destination
+conflicts, file-handle links, source removal, caller authority and pending
+cancellation with no destination publication. macOS storage I/O passes 37
+tests with two Windows-only skips. Overlay safety tests pass 2/2; Zig formatting
+and whitespace checks pass.
+
+A private GCE Windows Server 2022 VM (image
+`windows-server-2022-dc-v20260909`, build `10.0.20348.0`, NTFS,
+`e2-standard-4`, 80 GB boot disk) ran all six focused executables. Both Debug
+and ReleaseFast passed: hardlinks 3/3; backups 11/11, zero skips/leaks and one
+expected error log; storage I/O 18 passes, 21 POSIX-only skips and zero failures.
+Every process exited 0 and its SHA-256 matched the prepared manifest.
+
+| Native executable | SHA-256 |
+| --- | --- |
+| `hardlink-debug.exe` | `065cff3f840c7ed955e403ad48bcf6dcb9881623406e1e58a10c6f86b3cec0f8` |
+| `hardlink-release.exe` | `4ac3c39c999dc886f95009403e4c797aecef665033f43a09a00b97f7c4cbe0ac` |
+| `backup-debug.exe` | `d26fc654db2c2ff26d1034959c401ab8af7fe9be2f84618708a2ef343a4ce5d0` |
+| `backup-release.exe` | `ccf69bef06e720555eedd43f890bc79ea8268109d8ea5f10a17bba382d6f62eb` |
+| `storage-debug.exe` | `c6f2179a885ede5a4fb728fabde8efe6eae4e07605aba4b7bcbabc0146695e95` |
+| `storage-release.exe` | `3db6a92ca8332e5041539e9893cbdb607b1ab47d8cc47c194b34006e7cc3ebf1` |
+
+Evidence is retained at
+`/private/tmp/antfly-pr987-hardlink-native-results/final-results.json` and
+`manifest.json`; source hashes are in `qualified-source.json`. These tests include the backup inventory path corrections and
+stable WAL reader. They do not qualify native object-store/vacuum replacement
+or backup recovery after cache loss. The four earlier Wine replacement
+failures remain outside this focused run.
+
+The initial PowerShell runner lost process exit codes and serialized enriched
+`Get-Content` strings into an unnecessarily large result. The corrected runner
+owns a .NET process, drains its two output pipes asynchronously and captures
+plain strings and reliable exit codes. The same six hashed binaries were rerun
+successfully before collecting the final evidence.
+
+The hardlink qualification VM `antfly-pr987-hardlinks`, its auto-delete boot
+disk, private artifact bucket `antfly-pr987-hardlinks-20261006`, service account,
+subnet and network were deleted. Independent resource listings verified their
+absence. No firewall rules or tunnels were created for this focused run.
+
+The full Windows ReleaseFast application rebuild passed 46/46 steps with
+`ZIG_LIB_DIR=/private/tmp/antfly-pr987-wine10-zig-lib`, ONNX disabled and BLAS off.
+All runtime archives and the executable used that same overlay. The executable
+at `/private/tmp/antfly-pr987-hardlink-release/bin/antfly.exe` has SHA-256
+`510c114a7c6fc333d6ea64e05d5b89e1d6f521b96419914461609484d09cce82`.
+
+Its CrossOver smoke test passed 64 concurrent queries across initial startup
+and reopening after forced termination. All 64 acknowledged 4 KiB documents
+and their full-text entries were verified after reopening. `lite check`
+reported `valid=true`, zero tail bytes and no issue. Logs and the database are
+retained at `/private/tmp/antfly-pr987-hardlink-app-smoke`; the build log is
+`/private/tmp/antfly-pr987-hardlink-build.log`. This application workload uses
+Lite under Wine; it does not extend the earlier native hard-reset results to
+this new binary.
+
 ## Cleanup
 
 The disposable VM, auto-delete boot disk, artifact bucket, service account,

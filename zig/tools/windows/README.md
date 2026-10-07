@@ -94,6 +94,7 @@ of patching every call site:
 | `std.DynLib` | `LoadLibraryW`, `GetProcAddress` |
 | `Io.Threaded` file lock range | sentinel byte at offset 2^62 instead of offset 0 |
 | `Io.Threaded` lock/unlock under Wine | synchronous lock ABI and contention status adapters |
+| `Io.Threaded` directory/file hardlinks | `NtSetInformationFile(FileLinkInformation)` through the owning runtime |
 | `Io.Threaded` secure entropy under Wine | `BCryptGenRandom` system-preferred RNG |
 | `Io.Threaded` TCP under Wine | Winsock initialization, creation, options, connect/accept, vectored send/receive, shutdown, and close |
 
@@ -384,7 +385,8 @@ Backup seal and generation inventory paths normalize Windows walker output to
 '/' before validating or matching portable manifests. Run the focused suite:
 
 ```sh
-zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
+ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay \
+  zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
   --test-runner pkg/antfly-embedded/src/local/test_runner.zig \
   --test-filter 'storage.db.native_backup' \
   -femit-bin=/path/to/backup-test.exe \
@@ -399,11 +401,39 @@ zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
   -Mantfly_test_error_logs=pkg/antfly-embedded/src/local/test_error_logs.zig
 ```
 
-The repository runner verifies expected error logs. Both new inventory
-regressions pass under CrossOver. Five other tests fail because this Zig
-version's Windows `Io.Threaded` hardlink operation returns
-`OperationUnsupported`; this blocks native backup capture requiring pins.
-All 11 tests pass on macOS (include the filesystem capacity C source as above).
+The repository runner verifies expected error logs. With the current overlay,
+all 11 tests pass under CrossOver in Debug and ReleaseFast, including the five
+previously blocked by hardlinks. All 11 also pass on native Windows NTFS in both configurations and on macOS
+(include the filesystem capacity C source as above).
+
+The overlay appends `threaded_windows_hardlink.zig` inside `std.Io.Threaded`.
+Directory and file hardlinks therefore retain the caller's I/O authority and
+use that runtime's directory handles, Unicode path conversion and cancellation
+checks. Existing destinations are rejected; backup pins retain the original
+file identity. Stock Zig's unsupported Windows operation still requires this
+overlay. Use the same overlay for every runtime archive and the executable.
+Windows backup WAL readers now retain a file handle and executor through
+storage shutdown, with memory proportional to requested ranges.
+
+The standalone hardlink checks need no Antfly module dependencies:
+
+```sh
+ZIG_LIB_DIR=/path/to/zig-lib-windows-overlay zig test -lc \
+  -target x86_64-windows-gnu -O Debug --test-no-exec \
+  -femit-bin=/path/to/hardlink-test.exe tools/windows/hardlink_test.zig
+```
+
+They check separate relative directory handles, Unicode paths, file identity,
+source removal, destination conflicts, caller I/O authority and cancellation.
+Use `-O ReleaseFast` to repeat with optimization.
+
+`gce_hardlink_qualify.ps1` runs a manifest of hashed test executables on a
+private disposable Windows VM. It fetches `tests.zip` from the bucket named by
+`antfly-artifact-bucket` metadata, requires NTFS, publishes status through guest
+attributes and uploads `results.json` to that bucket. Enable guest attributes
+and grant its service account access only to the temporary artifact bucket;
+delete the VM and its supporting resources after collecting results. See the
+qualification report for measured native results.
 
 ## Prior native Windows qualification
 
@@ -420,8 +450,8 @@ limited to Windows). After the cleanup it was only compile-checked for Windows
 ## Known gaps for supported Windows
 
 - No Windows CI. `zig build test` has not run on Windows.
-- Native backup pinning is blocked by Zig's unsupported Windows hardlinks.
-  Backup inventory tests pass; end-to-end backups remain unqualified.
+- Native backup pinning requires the Zig overlay. The focused backup tests
+  pass; LSM backup recovery across abrupt resets remains unqualified.
 - Untested: vector or hybrid search, enrichments, the distributed
   (Raft) runtime, TLS client calls (CryptoAPI trust store), and long-running
   or concurrent load.
