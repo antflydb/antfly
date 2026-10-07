@@ -325,3 +325,110 @@ test "broker submissions park their parent before independent admission and clea
         try std.testing.expectEqual(@as(usize, if (reject) 0 else 1), state.owner.scheduler.stats().runnable_slots);
     };
 }
+
+test "coalesced broker callers park separate real parents and share one execution grant" {
+    const controls = @import("inference_execution_control");
+    const Microbatch = inference.microbatch;
+    const Executor = struct {
+        state: *owner_module.State,
+        port: runtime.runnable_abi.Owner,
+        calls: std.atomic.Value(usize) = .init(0),
+        members: std.atomic.Value(usize) = .init(0),
+        fn now() u64 {
+            return 0;
+        }
+        fn observe(self: *@This(), items: []const Microbatch.ExecuteItem) !void {
+            const before = self.state.owner.scheduler.stats();
+            try std.testing.expectEqual(@as(usize, 1), before.runnable_slots);
+            try std.testing.expectEqual(@as(usize, 2), before.resource_blocked);
+            try std.testing.expectEqual(@as(usize, 3), before.operations);
+            try std.testing.expect(before.retained_bytes >= 142);
+            try (controls.InferenceExecutionControl{}).check();
+            const io = std.testing.io;
+            const borrow = runtime.native_abi.IoBorrow.init(&io);
+            var control: ?*anyopaque = null;
+            const status = self.port.start(self.port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.control), .out_handle = &control });
+            if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+            defer self.port.finish(control.?);
+            try std.testing.expectEqual(@as(usize, 1), self.state.owner.scheduler.stats().control_slots);
+            try std.testing.expectEqual(@as(usize, 2), self.state.owner.scheduler.stats().runnable_slots);
+            for (items) |item| item.slot.setValue(usize, item.payloadAs(usize).* * 2, .native_batch);
+        }
+        fn run(raw: *anyopaque, items: []const Microbatch.ExecuteItem) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            _ = self.members.fetchAdd(items.len, .monotonic);
+            self.observe(items) catch |err| for (items) |item| item.slot.fail(err);
+        }
+    };
+    const Caller = struct {
+        port: runtime.runnable_abi.Owner,
+        broker: *Microbatch.Broker,
+        executor: *Executor,
+        payload: usize,
+        parent: ?*anyopaque = null,
+        output: ?Microbatch.ItemResult(usize) = null,
+        err: ?anyerror = null,
+        fn checked(status: runtime.error_abi.Status) !void {
+            if (!status.isOk()) return runtime.error_abi.errorFromStatus(status);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.checkpoint(self.parent.?));
+        }
+        fn park(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.park(self.parent.?, @backingInt(runtime.runnable_abi.Wait.resource)));
+        }
+        fn reenter(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try checked(self.port.enter(self.parent.?, @backingInt(runtime.runnable_abi.Class.query)));
+        }
+        fn submit(self: *@This()) !void {
+            const io = std.testing.io;
+            const borrow = runtime.native_abi.IoBorrow.init(&io);
+            try checked(self.port.start(self.port.context, &.{ .io = &borrow, .class = @backingInt(runtime.runnable_abi.Class.query), .retained_bytes = 71, .out_handle = &self.parent }));
+            defer self.port.finish(self.parent.?);
+            var scope = controls.CheckpointScope.init(.{ .context = self, .check_fn = check, .wait_begin_fn = park, .wait_end_fn = reenter });
+            defer scope.deinit();
+            self.output = try self.broker.submit(usize, usize, io, std.testing.allocator, .{ .model = "cohort", .task = .embed, .resource_class = .cpu }, .{ .mode = .native, .preferred_items = 2, .max_items = 2, .max_wait_us = 2_000_000 }, .{}, .{}, null, null, &self.payload, self.executor, Executor.run);
+        }
+        fn run(self: *@This()) std.Io.Cancelable!void {
+            self.submit() catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var state: owner_module.State = .{ .owner_alloc = std.testing.allocator, .owner = try runnable.NodeOwner.init(.{ .slots = 3 }), .native_now_ns = Executor.now };
+    defer state.owner.tryDeinit() catch @panic("owner leaked");
+    const port = state.port();
+    var lease = try runtime.runnable_abi.Lease.init(port);
+    defer lease.deinit();
+    var provider = try inference.Provider.init(std.testing.allocator, port);
+    var broker = Microbatch.Broker.initWithAdmission(std.testing.allocator, provider.admission());
+    defer broker.deinit();
+    var executor = Executor{ .state = &state, .port = port };
+    var callers = [_]Caller{
+        .{ .port = port, .broker = &broker, .executor = &executor, .payload = 3 },
+        .{ .port = port, .broker = &broker, .executor = &executor, .payload = 7 },
+    };
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    for (&callers) |*caller| try group.concurrent(std.testing.io, Caller.run, .{caller});
+    try group.await(std.testing.io);
+    for (&callers) |*caller| {
+        if (caller.err) |err| return err;
+        const result = caller.output orelse return error.MissingMicrobatchResult;
+        switch (result.result) {
+            .item_error => |err| return err.cause,
+            .value => |value| try std.testing.expectEqual(caller.payload * 2, value),
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), executor.calls.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 2), executor.members.load(.monotonic));
+    try std.testing.expectEqual(callers[0].output.?.execution_id, callers[1].output.?.execution_id);
+    const drained = state.owner.scheduler.stats();
+    try std.testing.expectEqual(@as(usize, 0), drained.operations);
+    try std.testing.expectEqual(@as(usize, 0), drained.runnable_slots);
+    try std.testing.expectEqual(@as(u64, 0), drained.retained_bytes);
+}
