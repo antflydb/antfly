@@ -18791,6 +18791,7 @@ pub fn attachHighlightsWithIndexQueries(
             if (sources) |items| if (items[hit_index]) |source|
                 break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, source, .{}) catch continue;
             if (hit.source_value) |value| break :parsed value;
+            if (hit.column_source) |source| break :parsed try source.value(&hit_arena_state);
             const stored = hit.stored_data orelse continue;
             break :parsed std.json.parseFromSliceLeaky(std.json.Value, hit_arena, stored, .{}) catch continue;
         };

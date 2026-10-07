@@ -3610,6 +3610,73 @@ fn parseJsonNumberF32(value: []const u8) !f32 {
     return @floatFromInt(try std.fmt.parseInt(i64, value, 10));
 }
 
+fn hasColumnSources(hits: []const db_mod.types.SearchHit) bool {
+    for (hits) |hit| if (hit.column_source != null) return true;
+    return false;
+}
+
+// Preserve the generated response envelope while replacing only source delivery.
+// The serializer retains no per-hit source/projection trees across writes.
+fn ColumnWireResult(comptime T: type) type {
+    return struct {
+        base: T,
+        hits: []const db_mod.types.SearchHit,
+        req: db_mod.types.SearchRequest,
+        scratch: *std.heap.ArenaAllocator,
+        failure: *?anyerror,
+        pub fn jsonStringify(self: @This(), w: *std.json.Stringify) std.json.Stringify.Error!void {
+            try w.beginObject();
+            inline for (@typeInfo(T).@"struct".field_names) |name| {
+                if (comptime std.mem.eql(u8, name, "hits")) {
+                    try w.objectField(name);
+                    try w.beginObject();
+                    try w.objectField("total");
+                    try w.write(self.base.hits.?.total);
+                    try w.objectField("hits");
+                    try w.beginArray();
+                    for (self.base.hits.?.hits.?, self.hits) |api_hit, hit| {
+                        if (self.req.cancellation) |token| token.check() catch |err| {
+                            self.failure.* = err;
+                            return error.WriteFailed;
+                        };
+                        try w.beginObject();
+                        inline for (@typeInfo(@TypeOf(api_hit)).@"struct".field_names) |field| {
+                            if (comptime std.mem.eql(u8, field, "_source")) {
+                                if (hit.column_source) |source| {
+                                    if (self.req.include_stored) {
+                                        try w.objectField(field);
+                                        source.write(self.scratch, db_mod.types.LookupOptions{ .fields = self.req.fields, .include_all_fields = self.req.include_all_fields }, w) catch |err| {
+                                            if (err != error.WriteFailed) self.failure.* = err;
+                                            return error.WriteFailed;
+                                        };
+                                    }
+                                } else try writeWireField(w, field, @field(api_hit, field));
+                            } else try writeWireField(w, field, @field(api_hit, field));
+                        }
+                        try w.endObject();
+                    }
+                    try w.endArray();
+                    try writeWireField(w, "max_score", self.base.hits.?.max_score);
+                    try w.endObject();
+                } else try writeWireField(w, name, @field(self.base, name));
+            }
+            try w.endObject();
+        }
+    };
+}
+fn writeWireField(w: *std.json.Stringify, comptime name: []const u8, value: anytype) std.json.Stringify.Error!void {
+    if (@typeInfo(@TypeOf(value)) == .optional) if (value == null) return;
+    try w.objectField(name);
+    try w.write(value);
+}
+fn encodeColumnWire(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, base: anytype, hits: []const db_mod.types.SearchHit) ![]u8 {
+    var failure: ?anyerror = null;
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    const wrapped = ColumnWireResult(@TypeOf(base)){ .base = base, .hits = hits, .req = req, .scratch = &scratch, .failure = &failure };
+    return std.json.Stringify.valueAlloc(alloc, .{ .responses = &.{wrapped} }, .{ .emit_null_optional_fields = false }) catch |err| return failure orelse err;
+}
+
 pub fn encodeQueryResponses(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -3664,7 +3731,7 @@ pub fn encodeQueryResponses(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot,
             };
-            break :blk try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.QueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -3696,7 +3763,7 @@ pub fn encodeQueryResponses(
                 .table = req.response_table_name orelse table_name,
                 .remote_snapshot = meta.remote_snapshot,
             };
-            break :blk try std.json.Stringify.valueAlloc(
+            break :blk if (hasColumnSources(emitted_hits)) try encodeColumnWire(alloc, req, query_results[0], emitted_hits) else try std.json.Stringify.valueAlloc(
                 alloc,
                 metadata_openapi.StatefulQueryResponses{ .responses = query_results },
                 .{ .emit_null_optional_fields = false },
@@ -18519,4 +18586,76 @@ fn typedLakeSourceScenario(a: std.mem.Allocator) !void {
 test "external lake typed source preserves ownership highlights exact values and public projection" {
     try typedLakeSourceScenario(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, typedLakeSourceScenario, .{});
+}
+
+fn columnLakeSourceScenario(a: std.mem.Allocator) !void {
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "doc" }};
+    const columns = [_]rows.ColumnVector{
+        .{ .name = "body", .values = .{ .dictionary_bytes = .{ .values = &.{"a needle in the source"}, .indices = &.{0} } } },
+        .{ .name = "amount", .values = .{ .i64 = &.{9007199254740993} } },
+        .{ .name = "nested", .values = .{ .json = &.{"{\"visible\":\"yes\",\"private\":\"omit\"}"} } },
+        .{ .name = "_hierarchy_unit_revision_token", .values = .{ .bytes = &.{"internal"} } },
+    };
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "doc"), .column_source = page.row(0) };
+    defer hit.deinit(a);
+    var cloned = try hit.clone(a);
+    defer cloned.deinit(a);
+    try std.testing.expect(cloned.column_source.?.page == page);
+    const search_exec = @import("../storage/db/query/search_exec.zig");
+    const queries = [_]search_exec.HighlightQuery{.{ .query = .{ .match = .{ .field = "body", .text = "needle" } }, .text_analysis = .{}, .runtime_schema = null }};
+    try search_exec.attachHighlightsWithIndexQueries(a, .{ .fields = &.{"body"} }, &queries, @as(*[1]db_mod.types.SearchHit, @ptrCast(&cloned)), null);
+    try std.testing.expectEqual(@as(usize, 1), cloned.highlights.len);
+    try std.testing.expect(cloned.stored_data == null and cloned.source_value == null);
+    var hits = [_]db_mod.types.SearchHit{cloned};
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1 };
+    const cases = [_]db_mod.types.SearchRequest{
+        .{},
+        .{ .fields = &.{ "amount", "nested.*", "-nested.private" }, .include_all_fields = false },
+        .{ .include_stored = false },
+        .{ .fields = &.{"-body"} },
+        .{ .fields = &.{ "amount", "body", "amount", "*", "-nested" } },
+    };
+    for (cases) |request| {
+        var response = try encodeQueryResponses(a, "docs", request, .{ .remote_snapshot = "pinned" }, result);
+        defer response.deinit(a);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const value = try cloned.column_source.?.value(&arena);
+        var owned_hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "doc") };
+        defer owned_hit.deinit(a);
+        owned_hit.source_value = try db_mod.types.cloneJsonValue(a, value);
+        owned_hit.highlights = try db_mod.types.cloneHighlights(a, cloned.highlights);
+        var owned_hits = [_]db_mod.types.SearchHit{owned_hit};
+        var expected = try encodeQueryResponses(a, "docs", request, .{ .remote_snapshot = "pinned" }, .{ .alloc = a, .hits = &owned_hits, .total_hits = 1 });
+        defer expected.deinit(a);
+        try std.testing.expectEqualStrings(expected.json, response.json);
+    }
+}
+test "external lake column sources share pages and encode with typed source parity under allocation failures" {
+    try columnLakeSourceScenario(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, columnLakeSourceScenario, .{});
+}
+
+test "external lake column response delivery preserves cancellation and malformed source errors" {
+    const a = std.testing.allocator;
+    const rows = @import("../storage/rowsource/types.zig");
+    const refs = [_]rows.RowRef{.{ .relational_key = "doc" }};
+    const columns = [_]rows.ColumnVector{.{ .name = "nested", .values = .{ .json = &.{"{invalid}"} } }};
+    const page = try db_mod.types.ColumnSourcePage.copy(a, .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "one" }, .row_refs = &refs, .columns = &columns }, &.{0});
+    defer page.release();
+    var hit: db_mod.types.SearchHit = .{ .id = try a.dupe(u8, "doc"), .column_source = page.row(0) };
+    defer hit.deinit(a);
+    var hits = [_]db_mod.types.SearchHit{hit};
+    const result: db_mod.types.SearchResult = .{ .alloc = a, .hits = &hits, .total_hits = 1 };
+    const Canceled = struct {
+        fn check(_: *const anyopaque) bool {
+            return true;
+        }
+    };
+    const marker: u8 = 0;
+    try std.testing.expectError(error.Canceled, encodeQueryResponses(a, "docs", .{ .cancellation = .{ .ptr = &marker, .is_cancelled_fn = Canceled.check } }, .{}, result));
+    try std.testing.expectError(error.SyntaxError, encodeQueryResponses(a, "docs", .{}, .{}, result));
 }

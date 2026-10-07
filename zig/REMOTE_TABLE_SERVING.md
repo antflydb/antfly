@@ -732,16 +732,16 @@ census, using the same durable continuation and collection cutoff. Legacy
 nonce staging cleanup and private checkpoint reclamation run after the durable
 completion receipt; they cannot prevent a completed collection from advancing.
 
-Native text corpus version 5 publishes 1 MiB immutable packs containing
-independently authenticated 256 KiB ranges across the native segment. Readers use the shared native range codecs, retaining bounded
+Native text corpus version 6 publishes 1 MiB immutable packs containing
+independently authenticated 64 KiB ranges across the native segment. Readers use the shared native range codecs, retaining bounded
 navigation and decoder scratch instead of allocating and zeroing a segment-sized
 heap buffer. Term-frequency probes read dictionary addresses and posting headers;
 Required WAND reads fetch the document chunks they visit, while bounded lookahead
 may warm subsequent chunks. Scoped field views and both block-cache adapters
 forward advisory hints, translating section-relative offsets at the field boundary. Position records are decoded when phrase consumers
 request them. A block checksum may bring neighboring
-bytes into cache, so the minimum read unit is 256 KiB for new publications
-(64 KiB for legacy directories). Each query binds its
+bytes into cache, so the minimum read unit is 64 KiB for new publications
+(256 KiB for version 3 packed directories). Each query binds its
 current store capability, deadline, cancellation and reader lease to a private
 native reader. Query binding borrows the already admitted field navigation,
 collection statistics, and atomic page-validation states; it performs no metadata
@@ -754,8 +754,8 @@ mappings instead of allocating and copying an entire block for each small read.
 Pinned RAM remains charged and cannot be evicted until released; current deadline,
 cancellation and reader-lease checks still run on warm hits. Large contiguous
 segment leases keep their disk-first policy for clean-page reclamation. GC retains physical pack references rather than synthetic range cache identities,
-and still understands retained version 1–4 roots and unpacked directories.
-Reader/topology protocol 31 triggers automatic republication of
+and still understands retained version 1–5 roots and unpacked directories.
+Reader/topology protocol 32 triggers automatic republication of
 older corpora during rolling upgrades.
 
 Native text readers hint the next document chunk using its authenticated native
@@ -866,11 +866,11 @@ active leases are retired; active query mappings remain pinned. Cache shutdown
 flushes the worker before destroying the table borrowed by this hook.
 
 Source-independent remote retrieval, including named text/vector fusion, now
-hydrates the final hit page into owned typed source values. Physical hydration
+hydrates the final hit page into shared immutable selected column pages. Physical hydration
 still batches 256 identities and applies the same snapshot/delete/lease checks;
 key lookup uses a batch map rather than repeatedly scanning all requested keys.
-Shared highlighting borrows the typed source and public field projection
-operates on values directly. The public response is the first JSON encoding of
+Shared highlighting borrows one source row at a time and public field projection
+operates directly on vectors for flat patterns. The public response is the first JSON encoding of
 the document. Typed sources participate in hit cloning, release, and retained
 memory accounting. Source omitted from the response may still be retained for
 highlighting, without leaking dependency fields into `_source`.
@@ -884,15 +884,22 @@ highlight behavior while removing document encode/parse cycles from the common
 retrieval path.
 
 
-Packed text directory version 3 authenticates each range checksum, length and pack
+Packed text directory version 4 authenticates each range checksum, length and pack
 location through the corpus root. The provider returns only that range; the reader
 checks its exact length and SHA-256 before admitting it to the immutable RAM/disk
 cache. It never authenticates a sparse read by downloading the whole pack. Cache
 keys identify verified range contents within the publication scope, while GC marks
-the actual pack objects. A 1 MiB sequential read uses four range requests instead
-of sixteen, and publication uploads one pack instead of sixteen small objects.
-The tradeoff is up to 256 KiB transferred for a single uncached byte. This is a
-request-count improvement, not a claim of a measured wall-clock speedup.
+the actual pack objects. Adjacent required and speculative ranges in the same
+pack share a lazy bounded provider read. Up to four pack groups can warm in
+parallel under shared worker/byte admission; each worker owns at most one pack.
+A 1 MiB sequential read uses one range request instead of sixteen, while
+publication uploads one pack instead of sixteen small objects. A single cold byte
+fetches at most 64 KiB. Legacy directories retain their original geometry.
+Each unit is checked before cache admission; a warm read does not fetch a pack.
+Provider counters record physical coalesced requests and transferred bytes,
+rather than counting each logical cache fill as a separate GET.
+Denied cache admission serves required reads from the same bounded request.
+This is a request-count improvement, not a claim of a measured wall-clock speedup.
 
 Cold scoring gathers all requested term frequencies with one dictionary reader
 per segment. Up to four disjoint segment lanes share process scheduler admission;
@@ -909,10 +916,21 @@ query-bound page caches. Optional slabs participate in pressure reclamation and
 cache admission denial falls back to required uncached reads. Resource accounting
 outlives bound readers; current query authority remains separate from that owner.
 
-Final eligible search pages hydrate from selected Parquet column vectors directly,
-without constructing and cloning an intermediate JSON row. One owned result tree
-retains the values across subsequent cursor pulls. Public projection owns its
-containers but borrows immutable string and number lexemes from that result until
-response serialization completes. Nested inclusion/exclusion and highlighting
-retain the same behavior, and the view never mutates the source. This removes
-redundant payload copies; public JSON encoding and final response limits remain.
+Final eligible search pages retain selected Parquet vectors through response
+serialization, without constructing an owned JSON tree per hit. Reference-counted
+immutable pages gather only selected slots and retain shared dictionary entries
+once. Hit cloning within the same allocator retains a page lease; a clone into
+a different allocator gathers an independent row so it can outlive the original
+request arena. Deinitialization releases the owned lease. Cursor
+advancement and closure cannot invalidate a result. Scalar sources and flat include/exclude projections write directly
+from vectors into the generated public response envelope. Complex projections and
+JSON columns reuse scratch bounded to one hit, including with an arena backing
+allocator; highlighting likewise borrows one
+row at a time, including fields excluded from the public projection. Internal hit
+codecs serialize source values rather than owner pointers. Exact integers, source
+omission, nested inclusion/exclusion, and internal-field stripping retain their
+existing behavior. Final response-size limits and the owned response buffer remain.
+
+Boolean conjunctions check local required-term lookups before requesting global
+scoring frequencies, retaining successful navigation for iterator construction.
+An impossible conjunction therefore performs no corpus-wide scoring reads.

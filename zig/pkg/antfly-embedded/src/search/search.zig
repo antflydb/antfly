@@ -1767,17 +1767,32 @@ fn initFastTermStates(
     };
     const scoring_doc_count = snap.scoringDocCount();
 
+    // Reject impossible conjunctions before reading corpus-wide scoring metadata.
+    // Retain lookups so accepted terms do not repeat dictionary navigation.
+    const lookups = try alloc.alloc(?inverted.LookupResult, terms.len);
+    defer alloc.free(lookups);
+    for (terms, lookups) |term, *lookup| {
+        lookup.* = try inv_reader.lookup(term.term);
+        if (require_all_terms and lookup.* == null) return null;
+    }
     const names = try alloc.alloc([]const u8, terms.len);
     defer alloc.free(names);
     const frequencies = try alloc.alloc(u32, terms.len);
     defer alloc.free(frequencies);
-    for (terms, names) |term, *name| name.* = term.term;
-    try snap.termDocFreqs(alloc, field, names, frequencies);
-    for (terms, frequencies) |term, df| {
-        const lookup_result = (try inv_reader.lookup(term.term)) orelse {
+    var present: usize = 0;
+    for (terms, lookups) |term, found| if (found != null) {
+        names[present] = term.term;
+        present += 1;
+    };
+    if (present != 0) try snap.termDocFreqs(alloc, field, names[0..present], frequencies[0..present]);
+    var frequency_index: usize = 0;
+    for (terms, lookups) |term, found| {
+        const lookup_result = found orelse {
             if (require_all_terms) return null;
             continue;
         };
+        const df = frequencies[frequency_index];
+        frequency_index += 1;
         if (df == 0) {
             if (require_all_terms) return null;
             continue;
@@ -5619,4 +5634,29 @@ test "native ID filters and deletes never retain stable identity pages" {
     try std.testing.expectEqual(@as(usize, 1), deletes[0].local_ids.len);
     try std.testing.expectEqual(@as(usize, 0), entry.reader.native.?.identity_bytes);
     std.debug.print("LITE_ID_SCAN rows=2048 retained_growth={d} retained_ids=0\n", .{after - before});
+}
+
+test "external lake impossible Boolean conjunction skips global scoring reads" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "one", .data = "{}", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} },
+        .{ .id = "two", .data = "{}", .terms = &.{.{ .term = "common", .freq = 1, .norm = 1 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    try writer.addSegment(bytes);
+    const snap = writer.snapshot();
+    var reader = (try snap.segments[0].reader.invertedIndexScoped(a, "title")).?;
+    defer reader.deinit();
+    const terms = [_]SimpleTextTerm{
+        .{ .field = "title", .term = "absent", .boost = 1 },
+        .{ .field = "title", .term = "common", .boost = 1 },
+    };
+    try std.testing.expect((try initFastTermStates(a, snap, &reader, "title", &terms, true)) == null);
+    try std.testing.expectEqual(@as(u64, 0), snap.term_doc_freq_cache_misses);
+    const states = (try initFastTermStates(a, snap, &reader, "title", terms[1..], true)).?;
+    defer deinitFastTermStates(a, states);
+    try std.testing.expectEqual(@as(u32, 4), states[0].doc_freq);
 }

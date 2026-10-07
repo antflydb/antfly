@@ -186,7 +186,11 @@ pub const Cache = struct {
     pub const ImmutableLoader = struct {
         ptr: *anyopaque,
         load: *const fn (*anyopaque, Allocator) anyerror![]u8,
+        /// Coalesced loaders may fill several cache units with one provider
+        /// request. Report physical traffic for this load, not logical fills.
+        provider_read: ?*const fn (*anyopaque) ProviderRead = null,
     };
+    pub const ProviderRead = struct { requests: u64, bytes: u64 };
 
     /// The caller proves current authorization and coverage before this call.
     /// Credential/store scope and authenticated identity partition both tiers;
@@ -392,7 +396,11 @@ pub const Cache = struct {
         var actual: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
         if (bytes.len != length or !std.mem.eql(u8, &actual, &digest)) return error.ArtifactIntegrityMismatch;
-        self.recordRead(false, bytes.len);
+        const traffic: ProviderRead = if (loader.provider_read) |read| read(loader.ptr) else .{ .requests = 1, .bytes = bytes.len };
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        self.stats.provider_reads +|= traffic.requests;
+        self.stats.provider_bytes +|= traffic.bytes;
+        self.mutex.unlock();
         if (self.persistent) |*disk| _ = disk.enqueueWrite(key, bytes);
         self.store(key, bytes) catch {};
         return bytes;

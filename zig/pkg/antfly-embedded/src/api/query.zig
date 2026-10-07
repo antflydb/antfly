@@ -1402,6 +1402,9 @@ fn graphHitRetainedBytes(hit: db_mod.types.SearchHit) usize {
     for (hit.sort_values) |value| retainedAdd(&total, jsonValueRetainedBytes(value));
     if (hit.stored_data) |data| retainedAdd(&total, data.len);
     if (hit.source_value) |value| retainedAdd(&total, jsonValueRetainedBytes(value));
+    // Conservatively charge a full page per graph hit. Internal wire codecs
+    // serialize values, so a received hit owns an independent decoded page.
+    if (hit.column_source) |source| retainedAdd(&total, source.page.retainedBytes());
     if (hit.ancestor_source_data) |data| retainedAdd(&total, data.len);
     if (hit.ancestor_unit_data) |data| retainedAdd(&total, data.len);
     if (hit.artifact_ref) |artifact| retainedAdd(&total, artifactRefRetainedBytes(artifact));

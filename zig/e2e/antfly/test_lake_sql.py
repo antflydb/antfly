@@ -1030,6 +1030,21 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
         assert_typed_page(call("POST", "/tables/lake_text/query", typed_request))
         assert_typed_page(call("POST", "/tables/lake_text/query",
                               dict(mixed_request, fields=["label", "amount"], highlight={"fields": ["body"]})))
+        # Retained column pages must survive subsequent cursor pulls and
+        # hydration batches. Dictionary strings and exact integers stay paired
+        # with their hit after more than two 256-row batches have advanced.
+        broad = call("POST", "/tables/lake_text/query", {
+            "full_text_search": {"match": "filler", "field": "body"},
+            "full_text_index": "body_text", "fields": ["label", "amount", "body"],
+            "highlight": {"fields": ["body"]}, "limit": 600})
+        assert len(broad["hits"]["hits"]) == 600, broad
+        assert len({hit["_id"] for hit in broad["hits"]["hits"]}) == 600
+        for hit in broad["hits"]["hits"]:
+            source = hit["_source"]
+            assert set(source) == {"label", "amount", "body"}, hit
+            assert source["amount"] == base + int(source["label"].removeprefix("row-")), hit
+            assert source["body"] == "filler document", hit
+            assert hit["_highlights"]["body"], hit
         ordered_request = dict(request, order_by=[{"field": "_score", "desc": True}])
         ordered_first = call("POST", "/tables/lake_text/query", dict(ordered_request, limit=1))
         snapshot_token = ordered_first["remote_snapshot"]

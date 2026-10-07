@@ -92,7 +92,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.typed_delivery = canDeliverTypedSource(effective);
     var execution_req = effective;
     // Retrieval/ranking for these requests needs identities and scores only.
-    // Hydrate the final page once, after all result movement, into owned values.
+    // Hydrate the final page once, after all result movement, into retained column pages.
     if (owner.typed_delivery) execution_req.include_stored = false;
     const started = @import("antfly_platform").time.monotonicNs();
     var result = if (execution_req.full_text_queries.len != 0 or execution_req.sparse_queries.len != 0 or execution_req.dense_queries.len != 0)
@@ -239,14 +239,14 @@ const Execution = struct {
         const keys = try a.alloc([]const u8, hits.len);
         defer a.free(keys);
         for (hits, keys) |hit, *key| key.* = hit.id;
-        const values = try loadSelected(std.json.Value, self, a, keys, self.hydration_fields);
+        const values = try loadSelected(types.ColumnSource, self, a, keys, self.hydration_fields);
         defer {
-            for (values) |*value| if (value.*) |*owned| types.deinitJsonValue(a, owned);
+            for (values) |value| if (value) |owned| owned.deinit();
             a.free(values);
         }
         for (hits, values) |*hit, *value| {
-            std.debug.assert(hit.stored_data == null and hit.source_value == null);
-            hit.source_value = value.* orelse return error.StoredDocMissing;
+            std.debug.assert(hit.stored_data == null and hit.source_value == null and hit.column_source == null);
+            hit.column_source = value.* orelse return error.StoredDocMissing;
             value.* = null;
         }
     }
@@ -440,7 +440,7 @@ const Execution = struct {
         @memset(result, null);
         errdefer {
             for (result) |*value| if (value.*) |*owned| {
-                if (T == std.json.Value) types.deinitJsonValue(a, owned) else a.free(owned.*);
+                if (T == types.ColumnSource) owned.deinit() else if (T == std.json.Value) types.deinitJsonValue(a, owned) else a.free(owned.*);
             };
             a.free(result);
         }
@@ -475,19 +475,26 @@ const Execution = struct {
             request.cancellation = .{ .ptr = self, .is_cancelled_fn = canceled };
             const cursor = try local.sql_lake_cursor.openPinned(a, self.table, .{ .fields = fields, .row_refs = refs, .limit = 256 }, request, self.source);
             defer cursor.close(cursor.ptr);
-            if (T == std.json.Value) if (cursor.next_columns) |next_columns| {
+            if (T == std.json.Value or T == types.ColumnSource) if (cursor.next_columns) |next_columns| {
                 while (true) {
                     var page_arena = std.heap.ArenaAllocator.init(a);
                     defer page_arena.deinit();
                     const pa = page_arena.allocator();
                     const page = try next_columns(cursor.ptr, pa, 256);
                     try page.validate();
+                    if (T == types.ColumnSource and page.native != null) return error.UnsupportedSqlExecution;
+                    const retained = if (T == types.ColumnSource) try types.ColumnSourcePage.copy(a, page.batch, page.selection) else {};
+                    defer if (T == types.ColumnSource) retained.release();
                     for (0..page.selection.len) |row_index| {
                         const identity = try page.cell(pa, row_index, "_id");
                         if (identity.value != .string) return error.InvalidSqlBackendResponse;
                         const positions = by_key.get(identity.value.string) orelse return error.InvalidSqlBackendResponse;
                         for (positions.items) |position| {
                             if (result[position] != null) return error.InvalidSqlBackendResponse;
+                            if (T == types.ColumnSource) {
+                                result[position] = retained.row(row_index);
+                                continue;
+                            }
                             var value: std.json.Value = .{ .object = .empty };
                             errdefer types.deinitJsonValue(a, &value);
                             for (page.batch.columns) |column| {
@@ -505,6 +512,7 @@ const Execution = struct {
                 }
                 continue;
             };
+            if (T == types.ColumnSource) return error.UnsupportedSqlExecution;
             while (true) {
                 const page = try cursor.next(cursor.ptr, a, 256);
                 defer page.deinit();
@@ -562,7 +570,7 @@ const Execution = struct {
 
 /// Late hydration is an explicit dependency contract: source-dependent
 /// operators keep the encoded provider path. Independent native retrieval
-/// hands owned typed sources directly to highlights and the public encoder.
+/// hands leased column pages directly to highlights and the public encoder.
 fn canDeliverTypedSource(req: types.SearchRequest) bool {
     for (req.order_by) |order| if (!std.mem.eql(u8, order.field, "_score") and !std.mem.eql(u8, order.field, "_id")) return false;
     return !requiresEncodedSource(req) and req.search_after.len == 0 and req.search_before.len == 0 and
