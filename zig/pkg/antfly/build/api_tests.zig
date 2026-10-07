@@ -106,6 +106,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-workload-pooling-test", "Run bounded waiting and shared HTTP/SQL admission contracts")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, pooling_tests, &pooling_filters).step);
 
+    const read_authority_filters = [_][]const u8{"SQL pgwire credential snapshot"};
+    const read_authority_tests = b.addTest(.{
+        .name = "sql-read-authority-tests",
+        .root_module = options.api_http_runtime_test_mod,
+        .filters = &read_authority_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-read-authority-test", "Run current SQL credential and retained read-policy contracts")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, read_authority_tests, &read_authority_filters).step);
+
     const public_api_parity_default_filters = [_][]const u8{
         "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",

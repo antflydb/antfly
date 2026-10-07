@@ -530,11 +530,13 @@ const OwnedRead = struct {
             defer state.deinit(state_alloc);
             if (state.metadata.failed or state.terminal != null) return error.SqlTransactionNotActive;
         }
-        var fresh = try self.authority.credential.identity(alloc);
-        defer fresh.deinit(alloc);
-        try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
+        try self.validateCurrentPolicies(alloc);
         var page = try self.stream.next(limit);
         errdefer page.deinit();
+        // Building a page can yield or wait on private spill I/O. Buffered
+        // rows must not escape using the policy checked before that wait.
+        try request.check();
+        try self.validateCurrentPolicies(alloc);
         // Adapt only datetime cells; the page retains exact typed integers.
         for (self.columns, 0..) |column, index| if (column.type == .datetime) {
             for (page.output.rows) |row| @constCast(row)[index] = try datetimeResult(page.arena.allocator(), row[index]);
@@ -550,7 +552,17 @@ const OwnedRead = struct {
         } };
     }
 
+    fn validateCurrentPolicies(self: *OwnedRead, alloc: std.mem.Allocator) !void {
+        try self.authority.request.check();
+        var fresh = try self.authority.credential.identity(alloc);
+        defer fresh.deinit(alloc);
+        try validatePolicies(alloc, &fresh, self.identity.?, self.policies);
+    }
+
     fn validatePolicies(alloc: std.mem.Allocator, fresh: *http.AuthenticatedIdentity, admitted: http.AuthenticatedIdentity, policies: []const Policy) !void {
+        if (admitted.user_instance_id) |instance| {
+            if (fresh.user_instance_id == null or !std.mem.eql(u8, &instance, &fresh.user_instance_id.?)) return error.Forbidden;
+        }
         // The catalog resolves logical resources to private physical names.
         // Reapply only the pinned aliases to fresh authority, never its old
         // permissions or filters. Buffered operator rows need this check too:
@@ -705,32 +717,18 @@ const Credential = struct {
 
     fn identity(self: *Credential, alloc: std.mem.Allocator) !http.AuthenticatedIdentity {
         try self.validate();
-        var lease = try self.manager.acquireSnapshotLease();
-        // Copy credentials and policies under one lease without recursively
-        // acquiring the user-manager mutex or retaining a login-time grant.
-        const result = blk: {
-            defer lease.release();
-            var user = try lease.getUser(self.username);
-            defer user.deinit(self.manager.alloc);
-            const permissions = try self.manager.getPermissionsForUser(self.username);
-            defer http.freePermissions(self.manager.alloc, permissions);
-            const filters = try self.manager.getRowFilters(self.username);
-            defer http.freeRowFilters(self.manager.alloc, filters);
-            const roles = try self.manager.getRolesForUser(self.username);
-            defer {
-                for (roles) |role| self.manager.alloc.free(role);
-                self.manager.alloc.free(roles);
-            }
-            break :blk (try http.cloneCatalogIdentity(alloc, .{
-                .username = user.username,
-                .credential_principal = self.principal,
-                .permissions = permissions,
-                .row_filter = filters,
-                .metadata_json = user.metadata_json,
-                .roles = roles,
-                .live_user_manager = self.manager,
-            })).?;
-        };
+        var snapshot = try self.manager.snapshotCredentialPolicies(self.principal);
+        defer snapshot.deinit(self.manager.alloc);
+        const result = (try http.cloneCatalogIdentity(alloc, .{
+            .user_instance_id = snapshot.instance_id,
+            .username = snapshot.policy.username,
+            .credential_principal = self.principal,
+            .permissions = snapshot.policy.permissions,
+            .row_filter = snapshot.policy.row_filter,
+            .metadata_json = snapshot.policy.metadata_json,
+            .roles = snapshot.policy.roles,
+            .live_user_manager = self.manager,
+        })).?;
         var owned = result;
         errdefer owned.deinit(alloc);
         try self.validate();
@@ -1376,15 +1374,29 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     defer Credential.release(credential, alloc);
     var admitted = try credential.identity(alloc);
     defer admitted.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, admitted.user_instance_id.?);
     try std.testing.expect(try http.tablePermissionCurrentlyAllowed(admitted, "docs", .read));
     var projected = (try http.cloneCatalogIdentity(alloc, admitted)).?;
     defer projected.deinit(alloc);
+    try std.testing.expectEqual(user.instance_id, projected.user_instance_id.?);
     try http.projectCatalogIdentity(alloc, &projected, "docs", "private-table-17");
     const retained_policies = [_]OwnedRead.Policy{.{ .table = "private-table-17", .filter = null }};
     {
         var current = try credential.identity(alloc);
         defer current.deinit(alloc);
         try OwnedRead.validatePolicies(alloc, &current, projected, &retained_policies);
+        // A row-filter change during execution invalidates buffered rows even
+        // when table permission remains granted. Restoring it restores access.
+        try manager.setRowFilter("alice", "docs", "{\"term\":{\"tenant\":\"changed\"}}");
+        var after_wait = try credential.identity(alloc);
+        defer after_wait.deinit(alloc);
+        try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(alloc, &after_wait, projected, &retained_policies));
+        try manager.removeRowFilter("alice", "docs");
+        var restored = try credential.identity(alloc);
+        defer restored.deinit(alloc);
+        try OwnedRead.validatePolicies(alloc, &restored, projected, &retained_policies);
+        restored.user_instance_id = @splat(0);
+        try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(alloc, &restored, projected, &retained_policies));
     }
     const NativeCursor = struct {
         pages: usize = 0,

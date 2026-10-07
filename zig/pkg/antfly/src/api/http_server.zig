@@ -56087,6 +56087,7 @@ pub fn cloneCatalogIdentity(alloc: std.mem.Allocator, identity: ?AuthenticatedId
     const value = identity orelse return null;
     var owned = try cloneAuthenticatedIdentity(alloc, value.username, value.credential_principal, value.permissions, value.row_filter, value.metadata_json, value.roles);
     errdefer owned.deinit(alloc);
+    owned.user_instance_id = value.user_instance_id;
     owned.is_internal_service = value.is_internal_service;
     owned.live_user_manager = value.live_user_manager;
     for (value.catalog_aliases) |alias| try appendCatalogAlias(alloc, &owned, alias.logical, alias.physical);
