@@ -5869,7 +5869,7 @@ pub const AntflyApiHandler = struct {
 
         // Never run a blocking catalog/row operation on the network executor,
         // including when the backend executor is absent or saturated.
-        const runtime = self.api_server.cfg.backend_runtime orelse {
+        const runtime_io = http_server_mod.ApiHttpServer.configuredDurableIo(self.api_server.cfg) orelse {
             if (mode != .statement) return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
             // A missing execution lane is a capacity failure for supported
             // statements, but preserve the useful 501 syntax/shape contract
@@ -5888,7 +5888,6 @@ pub const AntflyApiHandler = struct {
                 else => ctx.status(501).json(sql_wire.SQLDiagnostic{ .code = "0A000", .message = "SQL statement is not supported by this endpoint" }),
             };
         };
-        var runtime_io = runtime.io() orelse return ctx.status(503).json(sql_wire.SQLDiagnostic{ .code = "53300", .message = "SQL execution capacity unavailable" });
         var job = SQLJob{
             .adapter = .{ .server = self.api_server, .identity = &identity, .context = tableMutationContext(ctx, &identity), .database = request.database orelse "default", .namespace = request.namespace orelse "public", .session_id = request.session_id, .connection_id = connection_id, .inherit_session_database = request.database == null, .inherit_session_namespace = request.namespace == null },
             .statement = statement,
@@ -5912,7 +5911,7 @@ pub const AntflyApiHandler = struct {
         // A canceled request must still join durable work, without repeatedly
         // hitting an already-canceled sleep and spinning until commit ends.
         job.done.waitUncancelable(ctx.io);
-        _ = future.await(runtime_io);
+        @import("protected_future.zig").wait(runtime_io, &future);
         if (job.failure) |err| {
             const diagnostic = sql_execution.diagnostic(err);
             if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("SQL execution internal failure err={s}", .{@errorName(err)});
@@ -12436,6 +12435,49 @@ test "httpx antfly routes require auth and enforce admin middleware" {
     var me_body = try std.json.parseFromSlice(struct { username: []const u8 }, alloc, me_resp.body.?, .{ .ignore_unknown_fields = true });
     defer me_body.deinit();
     try std.testing.expectEqualStrings("admin", me_body.value.username);
+}
+
+test "httpx SQL dispatch preserves imported executor authority including unavailable views" {
+    const Probe = struct {
+        attempts: usize = 0,
+        fn concurrent(raw: ?*anyopaque, _: usize, _: std.mem.Alignment, _: []const u8, _: std.mem.Alignment, _: *const fn (*const anyopaque, *anyopaque) void) std.Io.ConcurrentError!*std.Io.AnyFuture {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.attempts += 1;
+            return error.ConcurrencyUnavailable;
+        }
+    };
+    var raw_probe: Probe = .{};
+    var imported_probe: Probe = .{};
+    var vtable = std.Io.failing.vtable.*;
+    vtable.concurrent = Probe.concurrent;
+    const raw_io: std.Io = .{ .userdata = &raw_probe, .vtable = &vtable };
+    const imported_io: std.Io = .{ .userdata = &imported_probe, .vtable = &vtable };
+    const alloc = std.testing.allocator;
+    var runtime = try db_mod.background_runtime.BackendRuntimeHandle.init(alloc, .{
+        .backend = .manual,
+        .borrowed_io = .{ .general = raw_io },
+    });
+    defer runtime.deinit();
+    var source = AuthStatusSource{};
+    var server = ApiHttpServer.init(alloc, .{
+        .backend_runtime = runtime.ptr(),
+        .imported_runtime_io = .{ .api = std.testing.io },
+    }, source.iface(), null, null);
+    defer server.deinit();
+    var handler = AntflyApiHandler{ .api_server = &server };
+    for ([_]?std.Io{ null, imported_io }, 0..) |executor, i| {
+        server.cfg.imported_runtime_io.?.durable = executor;
+        var request = try httpx.Request.init(alloc, .POST, "http://127.0.0.1/db/v1/sql");
+        defer request.deinit();
+        request.body = "{\"statement\":\"SELECT id FROM docs\"}";
+        var ctx = httpx.Context.init(alloc, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try handler.executeSQL(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 503), response.status.code);
+        try std.testing.expectEqual(@as(usize, 0), raw_probe.attempts);
+        try std.testing.expectEqual(i, imported_probe.attempts);
+    }
 }
 
 test "httpx SQL rejects unsupported shapes and releases dynamic admission" {
