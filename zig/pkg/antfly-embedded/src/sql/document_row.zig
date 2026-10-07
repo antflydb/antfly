@@ -35,17 +35,22 @@ pub fn deriveColumns(alloc: std.mem.Allocator, schema: anytype) ![]const catalog
         for (document.properties) |property| {
             if (std.mem.eql(u8, property.name, "_id")) continue;
             const kind = propertyType(property);
+            const element_type = if (comptime @hasField(@TypeOf(property), "sql_type"))
+                if (property.sql_type) |identity| @import("../common/sql_builtin_type.zig").Type.fromWire(identity) else null
+            else
+                null;
             const required = for (document.required_fields) |name| {
                 if (std.mem.eql(u8, name, property.name)) break true;
             } else false;
             const nullable = !required or property.allows_null or property.field_type == null;
             const entry = try entries.getOrPut(alloc, property.name);
             if (!entry.found_existing) entry.value_ptr.* = .{
-                .column = .{ .name = property.name, .path = property.name, .type = kind, .nullable = nullable },
+                .column = .{ .name = property.name, .path = property.name, .type = kind, .element_type = element_type, .nullable = nullable },
                 .required_count = @intFromBool(!nullable),
             } else {
-                if (entry.value_ptr.column.type != kind) {
+                if (entry.value_ptr.column.type != kind or entry.value_ptr.column.element_type != element_type) {
                     entry.value_ptr.column.type = .json;
+                    entry.value_ptr.column.element_type = null;
                     entry.value_ptr.column.nullable = true;
                 }
                 entry.value_ptr.column.nullable = entry.value_ptr.column.nullable or nullable;
@@ -78,6 +83,7 @@ pub fn relationalType(schema: anytype, name: []const u8, physical: ast.ColumnTyp
 }
 
 fn propertyType(property: anytype) ast.ColumnType {
+    if (property.field_type) |name| if (std.mem.eql(u8, name, "sql_array")) return .array;
     if (comptime @hasField(@TypeOf(property), "sql_type")) {
         if (property.sql_type == .uuid) return .uuid;
     }
@@ -125,6 +131,7 @@ pub fn projectValue(alloc: std.mem.Allocator, table: catalog.Table, id: []const 
 /// width of the declared schema. The scan arena owns all names and slots.
 pub const Projection = struct {
     columns: []const catalog.Column,
+    has_arrays: bool = false,
 
     pub fn init(alloc: std.mem.Allocator, table: catalog.Table, fields: []const []const u8) !Projection {
         var declared: std.StringHashMapUnmanaged(catalog.Column) = .empty;
@@ -139,12 +146,71 @@ pub const Projection = struct {
             try selected.put(alloc, name, column);
         }
         const columns = try alloc.alloc(catalog.Column, selected.count());
+        var initialized: usize = 0;
+        errdefer {
+            for (columns[0..initialized]) |column| {
+                if (column.path.ptr != column.name.ptr) alloc.free(column.path);
+                alloc.free(column.name);
+            }
+            alloc.free(columns);
+        }
+        var has_arrays = false;
         for (selected.values(), columns) |column, *out| {
             out.* = column;
             out.name = try alloc.dupe(u8, column.name);
+            errdefer alloc.free(out.name);
             out.path = if (std.mem.eql(u8, column.name, column.path)) out.name else try alloc.dupe(u8, column.path);
+            initialized += 1;
+            has_arrays = has_arrays or column.type == .array;
         }
-        return .{ .columns = columns };
+        return .{ .columns = columns, .has_arrays = has_arrays };
+    }
+
+    pub fn deinit(self: Projection, alloc: std.mem.Allocator) void {
+        for (self.columns) |column| {
+            if (column.path.ptr != column.name.ptr) alloc.free(column.path);
+            alloc.free(column.name);
+        }
+        alloc.free(self.columns);
+    }
+
+    /// The returned directory belongs to the page, not this scan/cursor. Bind
+    /// once per page, and reuse across every row regardless of array length.
+    pub fn pageLayout(self: Projection, alloc: std.mem.Allocator) !?catalog.Row.TypedLayout {
+        if (!self.has_arrays) return null;
+        const names = try alloc.alloc([]const u8, self.columns.len);
+        for (self.columns, names) |column, *name| name.* = try alloc.dupe(u8, column.name);
+        return try catalog.Row.TypedLayout.init(alloc, names);
+    }
+
+    /// Adapt an already parsed native projection. Metadata is page-owned and
+    /// payloads borrow that same page's pinned JSON tree. No JSON reparsing or
+    /// nested JSONB/string cloning occurs. Legacy scalar-only pages stay cheap.
+    pub fn adaptBorrowed(self: Projection, alloc: std.mem.Allocator, layout: ?catalog.Row.TypedLayout, row: catalog.Row) !catalog.Row {
+        if (!self.has_arrays) return row;
+        const directory = layout orelse return error.InvalidSqlBackendResponse;
+        if (directory.names.len != self.columns.len) return error.InvalidSqlBackendResponse;
+        const cells = try alloc.alloc(catalog.Row.Cell, self.columns.len);
+        const presence = try alloc.alloc(bool, self.columns.len);
+        for (self.columns, cells, presence, directory.names) |column, *cell, *present, name| {
+            if (!std.mem.eql(u8, column.name, name)) return error.InvalidSqlBackendResponse;
+            present.* = try row.hasField(column.path);
+            const raw = try row.cell(column.path);
+            if (raw.sql_null and !column.nullable) return error.InvalidSqlBackendResponse;
+            if (column.type == .array and !raw.sql_null and raw.array == null) {
+                const kind = column.element_type orelse return error.InvalidSqlBackendResponse;
+                const decoded = try @import("array_wire.zig").decodeBorrowed(alloc, kind, raw.value, .{});
+                const array = try alloc.create(@import("array_value.zig").Value);
+                array.* = decoded.value;
+                cell.* = catalog.Row.Cell.typedArray(array);
+            } else cell.* = try @import("describe.zig").coerceDatum(alloc, raw, column.type, column.element_type);
+        }
+        var result = row;
+        result.value = .null;
+        result.sql_nulls = null;
+        result.pattern_sources = null;
+        result.typed_cells = .{ .layout = directory, .values = cells, .presence = presence };
+        return result;
     }
 
     pub fn decode(self: Projection, alloc: std.mem.Allocator, id: []const u8, version: u64, bytes: []const u8) !catalog.Row {
@@ -290,6 +356,44 @@ test "SQL document integer decoding is exact and bounded" {
     try std.testing.expectError(error.SqlTypeMismatch, exactInteger("1.0000000000000001"));
     try std.testing.expectError(error.SqlNumericOutOfRange, exactInteger("9223372036854775808"));
     try std.testing.expectError(error.SqlNumericOutOfRange, exactInteger("1e99999999999999999999999"));
+}
+
+test "SQL native array projection retains presence and page ownership" {
+    var source = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer source.deinit();
+    var retained = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer retained.deinit();
+    const a = source.allocator();
+    const table: catalog.Table = .{ .id = 1, .physical_name = "rows", .schema_version = 1, .columns = &.{
+        .{ .name = "a", .path = "a", .type = .array, .element_type = .int64 },
+        .{ .name = "j", .path = "j", .type = .json },
+        .{ .name = "missing", .path = "missing", .type = .string },
+    } };
+    const projection = try Projection.init(std.testing.allocator, table, &.{ "a", "j", "missing" });
+    defer projection.deinit(std.testing.allocator);
+    const layout = try projection.pageLayout(a);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"a":{"dimensions":[{"length":2,"lower_bound":-3}],"values":["9223372036854775807",null],"sql_nulls":[false,true]},"j":null}
+    , .{ .allocate = .alloc_always });
+    const row = try projection.adaptBorrowed(a, layout, .{ .id = "key", .version = 42, .value = parsed.value, .sql_nulls = &.{ false, false } });
+    const second = try projection.adaptBorrowed(a, layout, .{ .id = "other", .version = 43, .value = parsed.value, .sql_nulls = &.{ false, false } });
+    try std.testing.expect(row.typed_cells.?.layout.names.ptr == second.typed_cells.?.layout.names.ptr);
+    try std.testing.expect(try row.hasField("j"));
+    try std.testing.expect(!try row.hasField("missing"));
+    try std.testing.expect(!(try row.cell("j")).sql_null);
+    try std.testing.expect((try row.cell("missing")).sql_null);
+    const owned = try row.cloneOwned(retained.allocator());
+    _ = source.reset(.free_all);
+    try std.testing.expectEqualStrings("key", owned.id);
+    try std.testing.expectEqual(@as(u64, 42), owned.version);
+    try std.testing.expect(!try owned.hasField("missing"));
+    const array = (try owned.cell("a")).array.?;
+    try std.testing.expectEqual(@as(i32, -3), array.dimensions[0].lower);
+    try std.testing.expectEqual(std.math.maxInt(i64), array.elements[0].value.integer);
+    try std.testing.expect(array.elements[1].sql_null);
+    var malformed = owned;
+    malformed.typed_cells.?.presence = &.{false};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, malformed.hasField("a"));
 }
 
 test "SQL document declared shape and projection clean up allocation failures" {

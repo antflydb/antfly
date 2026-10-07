@@ -774,12 +774,7 @@ pub fn bindCandidates(alloc: Allocator, backend: catalog.Backend, target: catalo
 }
 
 fn retainPointRow(alloc: Allocator, row: catalog.Row) !catalog.Row {
-    var retained = row;
-    retained.id = try alloc.dupe(u8, row.id);
-    retained.value = try @import("runtime.zig").clone(alloc, row.value);
-    if (row.document) |document| retained.document = try @import("runtime.zig").clone(alloc, document);
-    if (row.sql_nulls) |flags| retained.sql_nulls = try alloc.dupe(bool, flags);
-    return retained;
+    return row.cloneOwned(alloc);
 }
 
 fn fullCandidates(context: anytype, bound: Candidates) !@import("runtime.zig").Output {

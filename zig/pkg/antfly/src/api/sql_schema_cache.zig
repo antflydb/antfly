@@ -194,6 +194,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
             .boolean => .boolean,
             .datetime => .datetime,
             .json => .json,
+            .sql_array => .array,
             else => return error.UnsupportedSqlExecution,
         }),
     };

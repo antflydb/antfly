@@ -203,6 +203,17 @@ existing int64 contract; integer literals infer int4/int8 and explicit casts
 carry their widths. No original disposition credit is granted by these
 supplemental contracts.
 
+Native relational scans now adapt declared SQL-array envelopes into complete
+typed cells without reparsing JSON or cloning nested payloads. Each output page
+owns one shared column-name directory; scalar-only projections keep their
+existing representation. Explicit presence flags distinguish omitted fields
+from present SQL NULLs. Ownership-copy helpers preserve typed arrays, JSON null
+provenance and mutation metadata when session overlays retire native pages or
+MERGE retains point-read rows. These are read/ownership foundations, not complete
+array-column SQL activation: SQL DDL, typed-array mutation serialization and
+ordered/constraint index keys still require their own end-to-end gates. Original
+case dispositions remain unchanged.
+
 Source commit: `79644dfa1605e8da0f486d021d1c1393577d6265`.
 Source path: `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`.
 Original source SHA-256: `52b61411fa93be84b523c109eb6f79ea9e2f8a83d4e3639a831f4b8a697892c6`.

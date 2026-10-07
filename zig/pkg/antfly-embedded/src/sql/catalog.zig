@@ -134,22 +134,31 @@ pub const Row = struct {
     /// Internal relation rows retain complete, owned Datums and share a single
     /// page-local name directory, without constructing per-row JSON objects.
     /// Legacy backend rows continue to use JSON and the null/pattern channels.
-    typed_cells: ?struct { layout: TypedLayout, values: []const Cell } = null,
+    typed_cells: ?struct { layout: TypedLayout, values: []const Cell, presence: ?[]const bool = null } = null,
 
     pub const Cell = @import("scalar.zig").Datum;
     pub const TypedLayout = struct {
+        names: []const []const u8 = &.{},
         ordinals: std.StringHashMapUnmanaged(usize) = .empty,
 
         /// Names borrow the immutable relation binding; entries belong to the
         /// page arena. Duplicate names must not silently overwrite an ordinal.
         pub fn init(arena: std.mem.Allocator, names: []const []const u8) !TypedLayout {
-            var result: TypedLayout = .{};
+            var result: TypedLayout = .{ .names = names };
             for (names, 0..) |name, index| {
                 const entry = try result.ordinals.getOrPut(arena, name);
                 if (entry.found_existing) return error.InvalidSqlBackendResponse;
                 entry.value_ptr.* = index;
             }
             return result;
+        }
+
+        /// Clone once per emitted page, not once per row. No names or directory
+        /// entries may borrow a cursor that can close before the page consumer.
+        pub fn clone(self: TypedLayout, alloc: std.mem.Allocator) !TypedLayout {
+            const names = try alloc.alloc([]const u8, self.names.len);
+            for (self.names, names) |name, *out| out.* = try alloc.dupe(u8, name);
+            return init(alloc, names);
         }
     };
 
@@ -168,10 +177,11 @@ pub const Row = struct {
     pub fn cell(self: Row, name: []const u8) !Cell {
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = self.id }, .sql_null = false };
         if (self.typed_cells) |cells| {
-            if (cells.values.len != cells.layout.ordinals.count() or self.value != .null or self.sql_nulls != null or self.pattern_sources != null) return error.InvalidSqlBackendResponse;
+            try self.validateTyped();
             const index = cells.layout.ordinals.get(name) orelse return .{};
             if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
             const result = cells.values[index];
+            if (cells.presence) |present| if (!present[index] and !result.sql_null) return error.InvalidSqlBackendResponse;
             if (result.array != null and (result.sql_null or result.value != .null or result.patterns != null)) return error.InvalidSqlBackendResponse;
             if (result.sql_null and result.value != .null) return error.InvalidSqlBackendResponse;
             return result;
@@ -183,6 +193,63 @@ pub const Row = struct {
         const sql_null = if (self.sql_nulls) |flags| flags[index] else value == .null;
         if (sql_null and value != .null) return error.InvalidSqlBackendResponse;
         return .{ .value = value, .sql_null = sql_null, .patterns = if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null };
+    }
+
+    fn validateTyped(self: Row) !void {
+        const cells = self.typed_cells orelse return error.InvalidSqlBackendResponse;
+        if (cells.values.len != cells.layout.ordinals.count() or cells.values.len != cells.layout.names.len or
+            self.value != .null or self.sql_nulls != null or self.pattern_sources != null)
+            return error.InvalidSqlBackendResponse;
+        if (cells.presence) |present| if (present.len != cells.values.len) return error.InvalidSqlBackendResponse;
+    }
+
+    pub fn fieldNames(self: Row) ![]const []const u8 {
+        if (self.typed_cells) |cells| {
+            try self.validateTyped();
+            return cells.layout.names;
+        }
+        if (self.value != .object) return error.InvalidSqlBackendResponse;
+        return self.value.object.keys();
+    }
+
+    pub fn hasField(self: Row, name: []const u8) !bool {
+        if (self.typed_cells) |cells| {
+            try self.validateTyped();
+            const index = cells.layout.ordinals.get(name) orelse return false;
+            if (index >= cells.values.len) return error.InvalidSqlBackendResponse;
+            return if (cells.presence) |present| present[index] else true;
+        }
+        if (self.value != .object) return error.InvalidSqlBackendResponse;
+        return self.value.object.contains(name);
+    }
+
+    pub fn cloneOwned(self: Row, alloc: std.mem.Allocator) !Row {
+        return self.cloneWithLayout(alloc, if (self.typed_cells) |cells| try cells.layout.clone(alloc) else null);
+    }
+
+    /// Payload ownership transfer with a page-shared, owned name directory.
+    /// Compiled pattern objects retain their existing statement-owner lifetime.
+    pub fn cloneWithLayout(self: Row, alloc: std.mem.Allocator, layout: ?TypedLayout) !Row {
+        var result = self;
+        result.id = try alloc.dupe(u8, self.id);
+        if (self.document) |document| result.document = try @import("../storage/typed_json.zig").clone(alloc, document);
+        if (self.typed_cells) |cells| {
+            try self.validateTyped();
+            const owned_layout = layout orelse return error.InvalidSqlBackendResponse;
+            if (owned_layout.names.len != cells.values.len) return error.InvalidSqlBackendResponse;
+            const values = try alloc.alloc(Cell, cells.values.len);
+            for (cells.values, values, cells.layout.names, owned_layout.names) |value, *out, old_name, new_name| {
+                if (!std.mem.eql(u8, old_name, new_name)) return error.InvalidSqlBackendResponse;
+                _ = try self.cell(old_name);
+                out.* = try @import("operators.zig").cloneDatum(alloc, value);
+            }
+            result.typed_cells = .{ .layout = owned_layout, .values = values, .presence = if (cells.presence) |present| try alloc.dupe(bool, present) else null };
+        } else {
+            result.value = try @import("../storage/typed_json.zig").clone(alloc, self.value);
+            if (self.sql_nulls) |flags| result.sql_nulls = try alloc.dupe(bool, flags);
+            if (self.pattern_sources) |sources| result.pattern_sources = try alloc.dupe(?*@import("scalar.zig").PatternSet, sources);
+        }
+        return result;
     }
 };
 pub const Page = struct {

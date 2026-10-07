@@ -34,15 +34,17 @@ pub fn cell(alloc: Allocator, row: catalog.Row, name: []const u8) !catalog.Row.C
     if (std.mem.eql(u8, name, metadata_fields[1])) return .{ .value = .{ .string = if (row.expected_content_digest) |digest| try alloc.dupe(u8, &std.fmt.bytesToHex(digest, .lower)) else "" }, .sql_null = false };
     if (std.mem.eql(u8, name, metadata_fields[2])) return .{ .value = row.document orelse .null, .sql_null = row.document == null };
     if (std.mem.eql(u8, name, metadata_fields[3])) {
-        if (row.value != .object) return error.InvalidSqlBackendResponse;
+        const names = try row.fieldNames();
         var size: usize = 0;
-        for (row.value.object.keys()) |key| {
+        for (names) |key| {
+            if (!try row.hasField(key)) continue;
             if (key.len > std.math.maxInt(u16)) return error.SqlProgramLimitExceeded;
             size = std.math.add(usize, size, key.len + 2) catch return error.SqlProgramLimitExceeded;
         }
         const encoded = try alloc.alloc(u8, size);
         var cursor: usize = 0;
-        for (row.value.object.keys()) |key| {
+        for (names) |key| {
+            if (!try row.hasField(key)) continue;
             encoded[cursor] = @truncate(key.len);
             encoded[cursor + 1] = @truncate(key.len >> 8);
             @memcpy(encoded[cursor + 2 ..][0..key.len], key);
@@ -80,6 +82,13 @@ test "joined mutation presence distinguishes omitted cells from present SQL null
     try std.testing.expect(try presenceContains(encoded.value.string, "nullable.extra"));
     try std.testing.expect(!try presenceContains(encoded.value.string, "missing"));
     try std.testing.expectError(error.InvalidSqlBackendResponse, presenceContains(&.{ 4, 0, 'x' }, "x"));
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const layout = try catalog.Row.TypedLayout.init(arena.allocator(), &.{ "nullable", "missing" });
+    const typed: catalog.Row = .{ .id = "r", .version = 1, .value = .null, .typed_cells = .{ .layout = layout, .values = &.{ .{}, .{} }, .presence = &.{ true, false } } };
+    const typed_encoded = try cell(arena.allocator(), typed, metadata_fields[3]);
+    try std.testing.expect(try presenceContains(typed_encoded.value.string, "nullable"));
+    try std.testing.expect(!try presenceContains(typed_encoded.value.string, "missing"));
 }
 
 pub const Bound = struct {

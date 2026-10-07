@@ -141,13 +141,17 @@ const Cursor = struct {
     fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
         const self: *Cursor = @ptrCast(@alignCast(ptr));
         var rows: std.ArrayList(catalog.Row) = .empty;
+        var layout: ?catalog.Row.TypedLayout = null;
         while (rows.items.len < limit) {
             const native = try self.peek();
             const staged: ?catalog.Row = if (self.staged_index < self.staged.len) self.staged[self.staged_index] else null;
             if (native == null and staged == null) break;
             const take_staged = staged != null and (native == null or std.mem.lessThan(u8, staged.?.id, native.?.id));
             const row = if (take_staged) staged.? else native.?;
-            try rows.append(alloc, .{ .id = try alloc.dupe(u8, row.id), .version = row.version, .value = try @import("antfly_local_sources").storage_typed_json.clone(alloc, row.value), .sql_nulls = if (row.sql_nulls) |flags| try alloc.dupe(bool, flags) else null, .expected_content_digest = row.expected_content_digest, .document = if (row.document) |document| try @import("antfly_local_sources").storage_typed_json.clone(alloc, document) else null });
+            if (row.typed_cells) |cells| if (layout == null) {
+                layout = try cells.layout.clone(alloc);
+            };
+            try rows.append(alloc, try row.cloneWithLayout(alloc, layout));
             if (take_staged) self.staged_index += 1 else self.page_index += 1;
         }
         const more = self.staged_index < self.staged.len or (try self.peek()) != null;
@@ -163,6 +167,44 @@ const Cursor = struct {
         self.alloc.destroy(self);
     }
 };
+
+test "SQL session overlay owns typed array rows after native pages and cursor close" {
+    const alloc = std.testing.allocator;
+    var output = std.heap.ArenaAllocator.init(alloc);
+    defer output.deinit();
+    const Test = struct {
+        delivered: bool = false,
+        fn next(ptr: *anyopaque, a: std.mem.Allocator, _: u32) !catalog.Page {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.delivered) return .{ .rows = &.{} };
+            self.delivered = true;
+            const arrays = @import("antfly_local_sources").sql_array_value;
+            const scalar = @import("antfly_local_sources").sql_scalar;
+            const dimensions = [_]arrays.Dimension{.{ .length = 1, .lower = -2 }};
+            const elements = [_]scalar.Datum{scalar.Datum.json(.{ .string = "retained" })};
+            const array = try arrays.Value.init(.text, &dimensions, &elements, .{});
+            const layout = try catalog.Row.TypedLayout.init(a, &.{ "a", "missing" });
+            const rows = try a.alloc(catalog.Row, 1);
+            rows[0] = try catalog.Row.fromDatums(a, "key", layout, &.{ scalar.Datum.typedArray(&array), .{} });
+            rows[0].typed_cells.?.presence = &.{ true, false };
+            return .{ .rows = rows };
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var native: Test = .{};
+    var staged = try transactions.parseCommitRequest(alloc, "{\"read_set\":[],\"tables\":{}}");
+    defer staged.deinit(alloc);
+    const cursor = try open(alloc, .{ .ptr = &native, .next = Test.next, .close = Test.close }, &staged, .{ .id = 1, .physical_name = "t", .schema_version = 1, .columns = &.{} }, .{ .fields = &.{ "a", "missing" }, .limit = 1 }, null);
+    const page = cursor.next(cursor.ptr, output.allocator(), 1) catch |err| {
+        cursor.close(cursor.ptr);
+        return err;
+    };
+    cursor.close(cursor.ptr);
+    try std.testing.expect(!try page.rows[0].hasField("missing"));
+    const array = (try page.rows[0].cell("a")).array.?;
+    try std.testing.expectEqual(@as(i32, -2), array.dimensions[0].lower);
+    try std.testing.expectEqualStrings("retained", array.elements[0].value.string);
+}
 
 test "SQL session overlay merges pages and suppresses replaced and deleted rows" {
     const alloc = std.testing.allocator;

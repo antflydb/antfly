@@ -220,13 +220,14 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
+                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .element_type = column.sql_element_type, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
                     .string => .string,
                     .integer => .integer,
                     .number => .number,
                     .boolean => .boolean,
                     .datetime => .datetime,
                     .json => .json,
+                    .sql_array => .array,
                     else => return error.UnsupportedSqlExecution,
                 }) };
             }
@@ -236,19 +237,22 @@ pub fn Adapter(comptime native: type) type {
         const Cursor = struct {
             session: *DB.RelationalReadSession,
             alloc: std.mem.Allocator,
+            projection: dependencies.sql_document_row.Projection,
             fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
                 var page = try self.session.nextTypedPage(alloc, null, .{ .rows = limit, .output_bytes = 16 * 1024 * 1024 });
                 errdefer page.deinit();
                 const owned = page.arena.allocator();
                 const rows = try owned.alloc(catalog.Row, page.rows.len);
-                for (page.rows, rows) |row, *out| out.* = .{ .id = row.key, .version = row.version, .value = row.typed orelse return error.InvalidSqlBackendResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest };
+                const layout = try self.projection.pageLayout(owned);
+                for (page.rows, rows) |row, *out| out.* = try self.projection.adaptBorrowed(owned, layout, .{ .id = row.key, .version = row.version, .value = row.typed orelse return error.InvalidSqlBackendResponse, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest });
                 const after = if (page.more) try owned.dupe(u8, self.session.reader.after.items) else null;
                 return .{ .rows = rows, .after = after, .owned_arena = page.arena };
             }
             fn close(ptr: *anyopaque) void {
                 const self: *Cursor = @ptrCast(@alignCast(ptr));
                 self.session.deinit();
+                self.projection.deinit(self.alloc);
                 self.alloc.destroy(self);
             }
         };
@@ -305,8 +309,10 @@ pub fn Adapter(comptime native: type) type {
                 .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order },
             });
             errdefer session.deinit();
+            const projection = try dependencies.sql_document_row.Projection.init(alloc, table, request.fields);
+            errdefer projection.deinit(alloc);
             const cursor = try alloc.create(Cursor);
-            cursor.* = .{ .session = session, .alloc = alloc };
+            cursor.* = .{ .session = session, .alloc = alloc, .projection = projection };
             return .{ .ptr = cursor, .next = Cursor.next, .close = Cursor.close };
         }
 

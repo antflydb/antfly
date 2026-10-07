@@ -736,6 +736,7 @@ pub const Adapter = struct {
         adapter: *Adapter,
         schema_version: u32,
         require_primary_digest: bool = false,
+        projection: @import("antfly_local_sources").sql_document_row.Projection,
         view: @import("antfly_local_sources").api_table_read_source.RelationalReadView,
 
         fn next(ptr: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.Page {
@@ -745,10 +746,11 @@ pub const Adapter = struct {
             errdefer page.deinit();
             if (page.rows.len > limit) return error.InvalidSqlBackendResponse;
             const rows = try page.arena.allocator().alloc(catalog.Row, page.rows.len);
+            const layout = try self.projection.pageLayout(page.arena.allocator());
             for (page.rows, rows) |row, *out| {
                 if (row.schema_version != self.schema_version) return error.CatalogGenerationChanged;
                 if (self.require_primary_digest and row.expected_content_digest == null) return error.InvalidSqlBackendResponse;
-                out.* = .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document };
+                out.* = try self.projection.adaptBorrowed(page.arena.allocator(), layout, .{ .id = row.id, .version = row.version, .value = row.value, .sql_nulls = row.sql_nulls, .expected_content_digest = row.expected_content_digest, .document = row.document });
             }
             return .{ .rows = rows, .after = page.after, .owned_arena = page.arena };
         }
@@ -756,6 +758,7 @@ pub const Adapter = struct {
         fn close(ptr: *anyopaque) void {
             const self: *ReadCursor = @ptrCast(@alignCast(ptr));
             self.view.deinit();
+            self.projection.deinit(self.alloc);
             self.alloc.destroy(self);
         }
     };
@@ -911,8 +914,10 @@ pub const Adapter = struct {
         // the provider's independently resolved routing fence. Replacement or
         // restore under the same physical name must fail before publication.
         try self.verify(scratch.allocator(), table);
+        const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
+        errdefer projection.deinit(alloc);
         const cursor = try alloc.create(ReadCursor);
-        cursor.* = .{ .alloc = alloc, .adapter = self, .schema_version = table.schema_version, .require_primary_digest = request.include_primary_digest, .view = view };
+        cursor.* = .{ .alloc = alloc, .adapter = self, .schema_version = table.schema_version, .require_primary_digest = request.include_primary_digest, .view = view, .projection = projection };
         return .{ .ptr = cursor, .next = ReadCursor.next, .close = ReadCursor.close };
     }
 
@@ -929,6 +934,7 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.overlays) for (self.cursors) |cursor| cursor.close(cursor.ptr);
             self.native.deinit();
+            for (self.wrappers) |wrapper| wrapper.projection.deinit(self.alloc);
             self.alloc.free(self.cursors);
             self.alloc.free(self.wrappers);
             self.alloc.destroy(self);
@@ -948,6 +954,7 @@ pub const Adapter = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (self.overlays) for (self.cursors[0..self.opened]) |cursor| cursor.close(cursor.ptr);
             for (self.views[0..self.view_count]) |view| view.deinit();
+            for (self.wrappers) |wrapper| wrapper.projection.deinit(self.alloc);
             self.alloc.free(self.cursors);
             self.alloc.free(self.wrappers);
             self.alloc.free(self.views);
@@ -966,6 +973,12 @@ pub const Adapter = struct {
         errdefer alloc.free(views);
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
+        var projected: usize = 0;
+        errdefer for (wrappers[0..projected]) |wrapper| wrapper.projection.deinit(alloc);
+        for (requests, wrappers) |request, *wrapper| {
+            wrapper.projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, request.table, request.request.fields);
+            projected += 1;
+        }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
         const overlay_staged = self.staged != null and self.staged.?.tables.len != 0;
@@ -1018,7 +1031,7 @@ pub const Adapter = struct {
             const scope = request.table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(temporary);
             try observed.observeRanges(self.server.alloc, logical, bound_table, request.table.schema_version, guarded.owner_proofs);
-            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view.* };
+            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view.*, .projection = wrapper.projection };
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try http_server.resolveEffectiveRowFilterJson(temporary, self.identity.*, bound_table);
@@ -1050,6 +1063,12 @@ pub const Adapter = struct {
         errdefer alloc.destroy(retained);
         const wrappers = try alloc.alloc(ReadCursor, requests.len);
         errdefer alloc.free(wrappers);
+        var projected: usize = 0;
+        errdefer for (wrappers[0..projected]) |wrapper| wrapper.projection.deinit(alloc);
+        for (requests, wrappers) |request, *wrapper| {
+            wrapper.projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, request.table, request.request.fields);
+            projected += 1;
+        }
         const cursors = try alloc.alloc(catalog.Cursor, requests.len);
         errdefer alloc.free(cursors);
         const native = read_source.openRelationalStatement(alloc, scans, .read_index) catch |err| blk: {
@@ -1094,7 +1113,7 @@ pub const Adapter = struct {
                 const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(temporary);
                 try observed.observeRanges(self.server.alloc, logical, request.table.physical_name, request.table.schema_version, proofs);
             }
-            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view };
+            wrapper.* = .{ .alloc = alloc, .adapter = self, .schema_version = request.table.schema_version, .require_primary_digest = request.request.include_primary_digest, .view = view, .projection = wrapper.projection };
             cursor.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
             if (if (overlay_staged) self.staged else null) |staged| {
                 const row_filter = try http_server.resolveEffectiveRowFilterJson(temporary, self.identity.*, request.table.physical_name);
@@ -1118,6 +1137,9 @@ pub const Adapter = struct {
         var response = (try source.scan(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index)) orelse return error.TableNotFound;
         defer response.deinit(alloc);
         var rows: std.ArrayList(catalog.Row) = .empty;
+        const projection = try @import("antfly_local_sources").sql_document_row.Projection.init(alloc, table, request.fields);
+        defer projection.deinit(alloc);
+        const layout = try projection.pageLayout(alloc);
         var lines = std.mem.splitScalar(u8, response.ndjson, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -1136,7 +1158,7 @@ pub const Adapter = struct {
                 if (!sql_nulls[index]) return error.InvalidSqlBackendResponse;
                 sql_nulls[index] = false;
             }
-            try rows.append(alloc, .{ .id = row._id, .version = try std.fmt.parseInt(u64, row.version, 10), .value = .{ .object = row.row.map }, .sql_nulls = sql_nulls });
+            try rows.append(alloc, try projection.adaptBorrowed(alloc, layout, .{ .id = row._id, .version = try std.fmt.parseInt(u64, row.version, 10), .value = .{ .object = row.row.map }, .sql_nulls = sql_nulls }));
         }
         return .{ .rows = rows.items, .after = if (request.primary_key == null and rows.items.len == request.limit) rows.items[rows.items.len - 1].id else null };
     }
