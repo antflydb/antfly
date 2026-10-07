@@ -257,7 +257,13 @@ checks their exact retirement boundary. Replay reader positions and decoded
 blocks are independent; closing the
 capture requires readers to have retired first. Rewind, array/null ownership,
 sort windows, cancellation, spill cleanup and allocation-failure tests cover
-the shared reader; MERGE integration remains unfinished.
+the shared reader. MERGE now shares these typed replay readers across arm
+classification, assignment preparation and RETURNING. Full-scan, point and
+index candidates retain complete Datums; saturated fast paths retire their
+source capture before starting the fallback. Decision pages own their selected
+inputs before another spill block can replace borrowed storage. Keys, storage
+images and DELETE preimages cross explicit owned boundaries, and all readers
+and the candidate capture retire before writer admission.
 RETURNING ambiguity is checked against the already-authorized join scope; this
 does not activate FROM/USING source-value RETURNING, which still needs captured
 source-image execution. MERGE arm binding now preserves source, target and
@@ -268,10 +274,14 @@ widening, exact bigint literals and parameters, bounds and NULL elements.
 Constant and parameter arms use the same owned storage encoder as ordinary
 mutations; prepared-image tests verify array envelopes rather than the scalar
 JSON placeholder. PostgreSQL independently checks the same assignment and error
-domains. This does not activate MERGE's still-JSON-only candidate and RETURNING
-handoffs.
-Those paths need a bounded lossless replay shared by full-scan, point and index
-candidates while preserving ordered lazy arms and native read/version fences.
+domains. MERGE RETURNING keeps source element identities alongside normalized
+target images. Presence metadata preserves physically absent columns, and
+DELETE preimages retain typed arrays, bounds, JSONB null flags and native
+version/digest fences without encoding a redundant storage image. Native
+document/relational regressions exercise matched updates, DELETE, source-array
+widening, parameters and SQL NULL through single-row pages. Broader typed
+point/index saturation and distributed fault evidence remain to be expanded;
+these implementation foundations do not grant original-case parity credit.
 SQL DDL and ordered/constraint index keys also still need end-to-end activation
 gates.
 Original case dispositions remain unchanged.

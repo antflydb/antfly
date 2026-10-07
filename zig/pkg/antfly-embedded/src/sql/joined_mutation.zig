@@ -71,7 +71,7 @@ fn presenceContains(encoded: []const u8, name: []const u8) !bool {
 
 /// Build once per source row, borrowing names from its pinned metadata. Wide
 /// replacement images must not rescan this variable-width directory per cell.
-fn presenceDirectory(alloc: Allocator, encoded: []const u8) !std.StringHashMapUnmanaged(void) {
+pub fn presenceDirectory(alloc: Allocator, encoded: []const u8) !std.StringHashMapUnmanaged(void) {
     var directory: std.StringHashMapUnmanaged(void) = .empty;
     errdefer directory.deinit(alloc);
     var offset: usize = 0;

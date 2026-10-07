@@ -777,6 +777,7 @@ test "SQL MERGE prepares generated insert identity and document postimage before
     try previous.put(alloc, "payload", .null);
     try previous.put(alloc, "unknown", .{ .integer = 42 });
     try Cell.put(update_plan, update_row, update_flags, "t\x00\x00mutation_document", .{ .object = previous });
+    try Cell.put(update_plan, update_row, update_flags, "t\x00\x00mutation_presence", .{ .string = "" });
     const updated = try update_plan.prepareMutations(alloc, probe.backend(), &.{update_row}, &.{update_flags}, &.{}, 1, 4096);
     try std.testing.expectEqual(@as(usize, 1), updated.len);
     try std.testing.expectEqual(@as(u64, 7), updated[0].expected_version);
@@ -796,6 +797,7 @@ test "SQL MERGE prepares generated insert identity and document postimage before
     try Cell.put(default_update_plan, default_update_row, default_update_flags, "t\x00\x00mutation_version", .{ .string = "7" });
     try Cell.put(default_update_plan, default_update_row, default_update_flags, "t\x00\x00mutation_digest", .{ .string = &digest });
     try Cell.put(default_update_plan, default_update_row, default_update_flags, "t\x00\x00mutation_document", .{ .object = previous });
+    try Cell.put(default_update_plan, default_update_row, default_update_flags, "t\x00\x00mutation_presence", .{ .string = "" });
     const default_updated = try default_update_plan.prepareMutations(alloc, probe.backend(), &.{default_update_row}, &.{default_update_flags}, &.{}, 1, 4096);
     try std.testing.expectEqual(@as(usize, 1), default_updated.len);
     try std.testing.expect(default_updated[0].row.?.object.get("n") == null);

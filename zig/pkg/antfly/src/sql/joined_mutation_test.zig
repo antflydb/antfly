@@ -227,11 +227,18 @@ test "SQL joined mutations retain arrays through coercion scratch retirement and
         .{ .sql = "UPDATE target t SET a=ARRAY[1::smallint,NULL],cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 1, .lower = 1 },
         .{ .sql = "UPDATE target t SET a=NULL,cold='new' FROM source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 0, .lower = 0, .whole_null = true },
         .{ .sql = "DELETE FROM target t USING source s WHERE t._id=s.id RETURNING t.a,t.j", .first = 9007199254740993, .lower = -1 },
+        .{ .sql = "MERGE INTO target t USING source s ON t._id=s.id WHEN MATCHED THEN UPDATE SET n=t.n+s.delta,cold='new' RETURNING t.a,t.j,s.a", .first = 9007199254740993, .lower = -1 },
+        .{ .sql = "MERGE INTO target t USING source s ON t._id=s.id WHEN MATCHED THEN UPDATE SET a=s.a,cold='new' RETURNING t.a,t.j,s.a", .first = 3, .lower = 3 },
+        .{ .sql = "MERGE INTO target t USING source s ON t._id=s.id WHEN MATCHED THEN UPDATE SET a=$1,cold='new' RETURNING t.a,t.j,s.a", .first = 9223372036854775807, .lower = 5, .parameters = &.{.{ .string = "[5:6]={9223372036854775807,NULL}" }} },
+        .{ .sql = "MERGE INTO target t USING source s ON t._id=s.id WHEN MATCHED THEN UPDATE SET a=NULL,cold='new' RETURNING t.a,t.j,s.a", .first = 0, .lower = 0, .whole_null = true },
+        .{ .sql = "MERGE INTO target t USING source s ON t._id=s.id WHEN MATCHED THEN DELETE RETURNING t.a,t.j,s.a", .first = 9007199254740993, .lower = -1 },
     }) |case| {
         var backend: Backend = .{ .document = document, .arrays = true, .array_first = case.first, .array_lower = case.lower, .array_null = case.whole_null };
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
         defer compiled.deinit();
-        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, case.parameters, .{ .page_rows = 1 });
+        var interface = backend.backend();
+        if (std.mem.startsWith(u8, case.sql, "MERGE")) interface.atomic_statement_read_set = true;
+        var result = try runtime.execute(std.testing.allocator, interface, &compiled, case.parameters, .{ .page_rows = 1 });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), backend.captures);
         try std.testing.expectEqual(@as(usize, 4), backend.rows_read);
@@ -252,6 +259,14 @@ test "SQL joined mutations retain arrays through coercion scratch retirement and
             defer json.deinit();
             try std.testing.expect(json.value.elements[0].value == .null);
             try std.testing.expect(!json.value.elements[0].sql_null and json.value.elements[1].sql_null);
+            if (row.len == 3) {
+                try std.testing.expectEqual(.int16, result.output.columns[2].element_type.?);
+                var source = try local.sql_array_wire.decode(std.testing.allocator, .int16, row[2], .{});
+                defer source.deinit();
+                try std.testing.expectEqual(@as(i32, 3), source.value.dimensions[0].lower);
+                try std.testing.expectEqual(@as(i64, 3), source.value.elements[0].value.integer);
+                try std.testing.expect(source.value.elements[1].sql_null);
+            }
         }
     };
 }
