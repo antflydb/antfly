@@ -101,7 +101,10 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // Keep the measured Linux profiles separate. The other macOS bumps
         // below are provisional 25% margins over claims reported as exceeded;
         // replace them with cold-build evidence before lowering them.
-        .storage_kernel => @as(usize, if (target.os.tag == .macos) 28 else 20) * 1024 * 1024 * 1024,
+        // The contextual-wait GNU ARM64 ReleaseSafe archive measured
+        // 21,815,246,848 bytes, above the previous 20 GiB reservation.
+        // Twenty-six GiB preserves >25% headroom for that measured profile.
+        .storage_kernel => @as(usize, if (target.os.tag == .macos) 28 else if (native_gnu_arm64_safe) 26 else 20) * 1024 * 1024 * 1024,
         // Latest-main aarch64-macOS ReleaseSafe reached 14.01 decimal GB,
         // exceeding 13 GiB. Reserve 17 GiB (>25% above that observed peak)
         // for this profile; preserve other hosts/modes and runtime limits.
@@ -132,7 +135,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
 test "native GNU ARM64 ReleaseSafe claims cover pinned Nix compiler peaks" {
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu });
     const profile: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .safe, .strip = false, .cpu_inference = true };
-    for ([_]RuntimeLibraryUnit{ .cli, .api_kernel, .distributed }, [_]usize{ 3_645_767_680, 12_550_221_824, 13_191_520_256 }) |unit, peak| {
+    for ([_]RuntimeLibraryUnit{ .cli, .api_kernel, .distributed, .storage_kernel }, [_]usize{ 3_645_767_680, 12_550_221_824, 13_191_520_256, 21_815_246_848 }) |unit, peak| {
         try std.testing.expect(runtimeCompileMaxRss(unit, profile) >= peak + peak / 4);
     }
     var other = profile;
@@ -140,6 +143,7 @@ test "native GNU ARM64 ReleaseSafe claims cover pinned Nix compiler peaks" {
     try std.testing.expectEqual(@as(usize, 3) << 30, runtimeCompileMaxRss(.cli, other));
     try std.testing.expectEqual(@as(usize, 10) << 30, runtimeCompileMaxRss(.api_kernel, other));
     try std.testing.expectEqual(@as(usize, 11) << 30, runtimeCompileMaxRss(.distributed, other));
+    try std.testing.expectEqual(@as(usize, 20) << 30, runtimeCompileMaxRss(.storage_kernel, other));
     other = profile;
     other.sanitize_thread = true;
     try std.testing.expectEqual(@as(usize, 10) << 30, runtimeCompileMaxRss(.api_kernel, other));

@@ -41,3 +41,14 @@ logs. `source-hashes.json` pins the current integration snapshot. Native SQL/rea
 400 named tests and 54 build steps, without skips or leaks. Actual DataServer
 owner-lock fixture execution remains pending. Its owner-lock fixture holds resumption after a real
 polling sleep; it does not simulate a complete quorum or apply delay.
+
+The live GNU ARM64 storage archive compiler subsequently reported a
+21,815,246,848-byte peak, above its previous 20 GiB production reservation.
+The native GNU ARM64 ReleaseSafe storage compile reservation is now 26 GiB,
+providing more than 25% measured headroom. Other profiles and all executor
+runtime limits remain unchanged. Four memory-profile tests pass on macOS and
+pinned Nix/glibc GNU AArch64. Adjacent claim logs and the separate source hash
+record this build-budget correction; they do not establish runtime qualification.
+The active fixture jobs still use the source-frozen pre-correction build policy
+and retain its overrun diagnostic. A corrected build graph must be verified
+separately after those jobs finish.
