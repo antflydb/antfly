@@ -1191,3 +1191,19 @@ Nix/glibc Linux; [worker budget receipts](qualification/workload-pooling/receipt
 pin source and output. Actual subprocess and production dispatcher/archive
 qualification are still pending, along with whole API/default overload gates.
 The separate local-parent ABI v29 gate does not qualify these worker bytes.
+
+### Native production worker handoff (2026-10-07, GNU production gates pending)
+
+The complete production inference archive and exported C probe pass all 23
+native build steps. The probe covers provider-tail rejection, demand validation,
+delegated scope, borrowed restoration and authority failure. A second 23-step
+gate re-execs an actual private worker through the production process ABI:
+CPU demand travels over real RPC, invalid demand is rejected by the child,
+parent ownership is restored and reaping clears resource-owner references.
+[Native production receipts](qualification/workload-pooling/receipts/2026-10-07/production-worker-native/README.md)
+pin source, commands and logs. These malformed-provider probes verify plumbing,
+not model team peaks or overload fairness. Corresponding Nix/glibc production
+gates are in progress; ABI v30 full API and combined startup/default gates
+remain required. Defaults are still disabled.
+
+The ABI30 production archive and subprocess probes now pass on both native macOS and pinned Nix/glibc aarch64-linux-gnu. The GNU run validates all seven recorded source hashes and retains its exit-0 result and full log beside the native production-worker receipts. Numerical model execution and combined overload/default qualification remain pending.

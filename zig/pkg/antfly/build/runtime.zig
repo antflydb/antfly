@@ -259,6 +259,22 @@ pub fn addRuntime(b: *std.Build, options: AddRuntimeOptions) AddRuntimeResult {
     );
     const run_linked_inference_abi_integration = b.addRunArtifact(linked_inference_abi_integration);
 
+    const worker_probe_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/inference_worker_abi_integration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    worker_probe_mod.addImport("antfly_inference_bridge", production_antfly_imports.inference_bridge);
+    worker_probe_mod.addImport("antfly_inference_host", production_antfly_imports.inference_host);
+    production_antfly_imports.build_info.link(worker_probe_mod);
+    worker_probe_mod.link_libc = link_libc;
+    addSharedSignalStackOwner(b, worker_probe_mod, target, link_libc);
+    addMacosSdkPaths(b, worker_probe_mod, target);
+    const worker_probe = b.addExecutable(.{ .name = "inference-worker-abi-integration", .root_module = worker_probe_mod });
+    worker_probe.root_module.linkLibrary(runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.inference)].?);
+    const run_worker_probe = b.addRunArtifact(worker_probe);
+    b.step("linked-inference-worker-integration-test", "Run actual worker CPU demand transport and parent ownership checks").dependOn(&run_worker_probe.step);
+
     for (runtime_library_link_order) |unit| {
         antfly_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
     }
