@@ -28226,7 +28226,7 @@ pub const DB = struct {
         errdefer alloc.free(segments);
         var total_bytes: u64 = 0;
         for (text_snapshot.segments, 0..) |*segment, i| {
-            const bytes: u64 = @intCast(segment.data.bytes().len);
+            const bytes: u64 = @intCast(segment.data.len());
             const live_doc_count = segment.liveDocCount();
             total_bytes +|= bytes;
             segments[i] = .{
@@ -133324,4 +133324,93 @@ test "artifact projection construction releases failures with real local resourc
     try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.asset, @as([]const u8, "{\"entities\":[{\"text\":\"Antfly\"}]}") });
     try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "{\"body\":\"hello\",\"_chunk_id\":0}") });
     try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ source, types.ArtifactKind.chunk, @as([]const u8, "plain chunk") });
+}
+
+test "lite bounded reader integration scans native relational dirty rows" {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-rows.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptions(&opts);
+    var db = try DB.open(a, path, opts);
+    defer db.close();
+    const columns = [_]schema_mod.RelationalColumn{
+        .{ .name = "n", .path = "n", .column_type = .integer },
+        .{ .name = "payload", .path = "payload", .column_type = .string },
+    };
+    try db.setSchema(.{ .version = 1, .storage_mode = .relational, .relational_columns = &columns });
+    const payload = try a.alloc(u8, 65536);
+    defer a.free(payload);
+    @memset(payload, 'p');
+    const json = try std.fmt.allocPrint(a, "{{\"n\":1,\"payload\":\"{s}\"}}", .{payload});
+    defer a.free(json);
+    try db.batch(.{ .writes = &.{ .{ .key = "a", .value = json }, .{ .key = "b", .value = json }, .{ .key = "c", .value = json } } });
+    var passes: usize = 0;
+    while (try db.rebuildRelationalColumns()) {
+        passes += 1;
+        try std.testing.expect(passes < 100);
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"n\":2,\"payload\":\"updated\"}" }} });
+    var stats: types.ColumnarScanStats = .{};
+    var result = try db.scan(a, "", "", .{ .include_documents = true, .columnar_stats = &stats });
+    defer result.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), result.documents.len);
+    try std.testing.expect(stats.primary_rows_read > 0);
+    try std.testing.expectEqualStrings("b", result.documents[1].id);
+    try std.testing.expect(std.mem.indexOf(u8, result.documents[1].json, "updated") != null);
+    // Both maintenance and dirty-row scan scopes must release their native pins.
+    try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).retained_readers);
+}
+
+test "lite bounded reader integration publishes full text mappings through db" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bounded-text.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var handle = try lite.Handle.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer handle.deinit();
+    var opts = OpenOptions{ .start_index_workers = false, .start_optional_runtimes = false, .ttl_cleanup = .{ .enabled = false } };
+    try handle.configureDbOpenOptions(&opts);
+    {
+        var db = try DB.open(a, path, opts);
+        defer db.close();
+        try db.batch(.{ .writes = &.{ .{ .key = "a", .value = "{\"body\":\"alpha first\"}" }, .{ .key = "b", .value = "{\"body\":\"beta second\"}" } } });
+        try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+        var result = try db.search(a, .{ .index_name = "text", .query = .{ .match = .{ .field = "body", .text = "alpha" } }, .limit = 10 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        const entry = db.core.index_manager.textIndexEntry("text").?;
+        try std.testing.expect(entry.persistent.supportsFileBackedSegmentArtifacts());
+        const scratch_directory = entry.persistent.privateScratchDirectory("virtual fallback").?;
+        try std.testing.expectEqualStrings(std.fs.path.dirname(path).?, scratch_directory);
+        // Force native typed staging through the production kernel builder.
+        // Virtual index names must never become host filesystem paths.
+        const payload: [40 * 1024]u8 = @splat('x');
+        const fields = [_]@import("../../introducer.zig").TypedFieldValue{.{ .field_name = "large", .value_type = .bytes_val, .value = .{ .bytes_val = &payload } }};
+        _ = try db.core.index_manager.indexTextKernelDocuments("text", &.{
+            .{ .id = "kernel-c", .stored_data = "{}", .text_fields = &.{}, .typed_fields = &fields, .doc_ordinal = 3 },
+            .{ .id = "kernel-d", .stored_data = "{}", .text_fields = &.{}, .typed_fields = &fields, .doc_ordinal = 4 },
+        });
+        const snapshot = entry.persistent.acquireSnapshot();
+        defer snapshot.release();
+        for (snapshot.segments) |segment| try std.testing.expect(segment.data == .native);
+        try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).artifact_file_bytes);
+    }
+    try std.testing.expectEqual(@as(u64, 0), (try handle.native_docstore.?.reclamationStatus()).artifact_file_bytes);
+    {
+        var db = try DB.open(a, path, opts);
+        defer db.close();
+        var result = try db.search(a, .{ .index_name = "text", .query = .{ .match = .{ .field = "body", .text = "beta" } }, .limit = 10 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+        try std.testing.expectEqualStrings("b", result.hits[0].id);
+    }
 }

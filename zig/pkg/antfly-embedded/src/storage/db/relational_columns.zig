@@ -20,6 +20,8 @@
 const std = @import("std");
 const store_mod = @import("../docstore.zig");
 const backend_erased = @import("../backend_erased.zig");
+const ReadScratch = @import("../../segment_source.zig").Scratch;
+const resource_manager_mod = @import("../resource_manager.zig");
 const keys = @import("../internal_keys.zig");
 const codec = @import("algebraic/relational_row_codec.zig");
 const schema = @import("../schema.zig");
@@ -661,15 +663,19 @@ fn ColumnBuilder(comptime DBType: type) type {
             var source_id: usize = 0;
             var selected: [max_rows]bool = @splat(false);
             var remap: [max_rows]u32 = undefined;
+            var row_scratch = ReadScratch.init(self.alloc, 256 * 1024);
+            defer row_scratch.deinit();
+            var row_scope: ?backend_erased.ReadScope = null;
+            defer if (row_scope) |*owned| owned.close();
             while (true) {
+                if (row_scope) |*owned| try owned.reset();
                 while (source_id < rows.len and std.mem.order(u8, rows[source_id].key, range.start) == .lt) : (source_id += 1) {}
                 if (source_id < rows.len and end.len != 0 and std.mem.order(u8, rows[source_id].key, end) != .lt) source_id = rows.len;
                 const delta: @TypeOf(pending) = if (pending) |entry| if (std.mem.startsWith(u8, entry.key, dirty_prefix) and (end.len == 0 or std.mem.order(u8, entry.key[dirty_prefix.len..], end) == .lt)) entry else null else null;
                 const take_delta = if (delta) |entry| source_id == rows.len or std.mem.order(u8, entry.key[dirty_prefix.len..], rows[source_id].key) != .gt else false;
                 if (!take_delta and source_id == rows.len) break;
-                var row_arena = std.heap.ArenaAllocator.init(self.alloc);
-                defer row_arena.deinit();
-                const row_alloc = row_arena.allocator();
+                defer row_scratch.reset();
+                const row_alloc = row_scratch.allocator();
                 const id = if (take_delta) delta.?.key[dirty_prefix.len..] else rows[source_id].key;
                 const key = try keys.relationalRowKeyAlloc(row_alloc, id);
                 if (try checkpoint(self, key) == .stop) break;
@@ -677,9 +683,8 @@ fn ColumnBuilder(comptime DBType: type) type {
                     const entry = delta.?;
                     if (entry.value.len != @sizeOf(keys.ColumnarDirtyRecord)) return error.InvalidColumnSegment;
                     if (std.mem.readInt(u64, entry.value[8..16], .little) != 0) {
-                        var row_scope = try read.openReadScope(row_alloc);
-                        defer row_scope.close();
-                        const bytes = try row_scope.get(key);
+                        if (row_scope == null) row_scope = try read.openReadScope(self.alloc);
+                        const bytes = try row_scope.?.get(key);
                         const incoming_version = try codec.rowSchemaVersion(bytes);
                         if (self.view != null and self.view.?.version() != incoming_version) try self.transposeSelected(&block, &selected, &remap);
                         if (!try self.prepareVersion(incoming_version, key)) break;
@@ -1601,6 +1606,25 @@ const DirtyRanges = struct {
     /// range end (exclusive). The cursor streams arbitrarily large deltas with
     /// one row arena/read scope; no dirty-range materialization is needed.
     fn emitThrough(self: *@This(), db: anytype, alloc: alloc_type, txn: *store_mod.DocStore.Txn, end: []const u8, inclusive: bool, from: []const u8, to: []const u8, byte_range: types.ByteRange, opts: types.ScanOptions, visitor: types.ScanVisitor, ttl_ns: u64, now_ns: u64, progress: *Progress, plans: *scan_plan.Cache, materializer: Materializer) !bool {
+        // Clean coverage and a future dirty key need no scope or budget work.
+        const pending = self.pending orelse return false;
+        if (!std.mem.startsWith(u8, pending, dirty_prefix)) return false;
+        if (end.len != 0 or inclusive) {
+            const order = std.mem.order(u8, pending[dirty_prefix.len..], end);
+            if (order == .gt or (order == .eq and !inclusive)) return false;
+        }
+        // Results may use a request arena. Temporary row storage must use
+        // the DB backing allocator so reset actually releases large rows.
+        var row_budget: ?resource_manager_mod.BudgetedAllocator = if (db.core.index_manager.resource_manager) |manager|
+            resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, db.alloc, 1)
+        else
+            null;
+        defer if (row_budget) |*budget| budget.deinit();
+        const temporary_alloc = if (row_budget) |*budget| budget.allocator() else db.alloc;
+        var row_scratch = ReadScratch.init(temporary_alloc, 256 * 1024);
+        defer row_scratch.deinit();
+        var scope: ?backend_erased.ReadScope = null;
+        defer if (scope) |*owned| owned.close();
         var replaced = false;
         while (self.pending) |key| {
             if (!std.mem.startsWith(u8, key, dirty_prefix)) break;
@@ -1619,9 +1643,9 @@ const DirtyRanges = struct {
             if (opts.cancellation) |token| if (token.isCancelled()) return error.Canceled;
             if (opts.execution_deadline_ns) |deadline| if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
             if (opts.limit > 0 and progress.delivered >= opts.limit) return replaced;
-            var arena = std.heap.ArenaAllocator.init(alloc);
-            defer arena.deinit();
-            const scratch = arena.allocator();
+            if (scope) |*owned| try owned.reset();
+            defer row_scratch.reset();
+            const scratch = row_scratch.allocator();
             const id = try scratch.dupe(u8, raw);
             const physical_bytes = self.pending_bytes;
             const next = try self.cursor.next();
@@ -1632,11 +1656,10 @@ const DirtyRanges = struct {
                 if (opts.columnar_stats) |stats| stats.overlay_tombstones_skipped += 1;
                 continue;
             }
-            var scope = try txn.openReadScope(scratch);
-            defer scope.close();
+            if (scope == null) scope = try txn.openReadScope(temporary_alloc);
             self.read_cost +|= 4096;
             const packed_key = try keys.relationalRowKeyAlloc(scratch, id);
-            const bytes = scope.get(packed_key) catch |err| switch (err) {
+            const bytes = scope.?.get(packed_key) catch |err| switch (err) {
                 error.NotFound => continue, // Tombstone still masks the base row.
                 else => return err,
             };
