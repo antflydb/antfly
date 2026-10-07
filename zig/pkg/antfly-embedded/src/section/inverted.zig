@@ -5939,6 +5939,11 @@ fn writeMappedInvertedSection(
         }
     }
 
+    // No more terms can reuse this capacity. Drop it before dictionary/norm
+    // finalization, whose output buffers otherwise overlap the last term.
+    workspace.deinit(alloc);
+    workspace = .{};
+
     if (file_maps) {
         const norms_data = FileNormStream{ .len = @as(usize, merged_doc_count) + 5, .readers = readers, .present = reader_present, .records = effective_maps[0].records, .maps = effective_maps };
         try finishStreamingMergedSectionToSink(alloc, sink, section_start, merged_doc_count, total_field_len, norms_data, &dict_builder, config);
@@ -5979,7 +5984,16 @@ fn sortPostingAccumulatorByDocIdWithWorkspace(alloc: Allocator, acc: *PostingAcc
     }
     if (ordered) return;
 
-    try workspace.sort_entries.resize(alloc, acc.doc_ids.items.len);
+    // Large reorder buffers must not overlap subsequent term serialization.
+    // Keep only bounded scratch for recurring small terms.
+    defer {
+        var remaining: usize = 64 * 1024;
+        resetMergeBuffers(&workspace.sort_entries, alloc, &remaining);
+        resetMergeBuffers(&workspace.sort_positions, alloc, &remaining);
+    }
+
+    try workspace.sort_entries.ensureTotalCapacityPrecise(alloc, acc.doc_ids.items.len);
+    workspace.sort_entries.items.len = acc.doc_ids.items.len;
     const entries = workspace.sort_entries.items;
     var positions_start: usize = 0;
     for (entries, 0..) |*entry, i| {
@@ -5993,7 +6007,8 @@ fn sortPostingAccumulatorByDocIdWithWorkspace(alloc: Allocator, acc: *PostingAcc
 
     std.mem.sort(PostingSortEntry, entries, {}, postingSortEntryLessThan);
 
-    try workspace.sort_positions.resize(alloc, acc.all_positions.items.len);
+    try workspace.sort_positions.ensureTotalCapacityPrecise(alloc, acc.all_positions.items.len);
+    workspace.sort_positions.items.len = acc.all_positions.items.len;
     const sorted_positions = workspace.sort_positions.items;
     var sorted_positions_len: usize = 0;
     for (entries, 0..) |entry, i| {
@@ -6375,10 +6390,13 @@ const PostingMergeWorkspace = struct {
     fn prepare(self: *PostingMergeWorkspace, alloc: Allocator, count: usize) !void {
         const old = self.iterators.items.len;
         if (count < old) for (self.iterators.items[count..]) |*slot| if (slot.*) |*iterator| iterator.deinit();
-        try self.iterators.resize(alloc, count);
+        try self.iterators.ensureTotalCapacityPrecise(alloc, count);
+        self.iterators.items.len = count;
         @memset(self.iterators.items[@min(old, count)..], null);
-        try self.head_views.resize(alloc, count);
-        try self.decoded_heads.resize(alloc, count);
+        try self.head_views.ensureTotalCapacityPrecise(alloc, count);
+        self.head_views.items.len = count;
+        try self.decoded_heads.ensureTotalCapacityPrecise(alloc, count);
+        self.decoded_heads.items.len = count;
     }
     fn releaseHeads(self: *PostingMergeWorkspace, alloc: Allocator) void {
         var remaining: usize = 256 * 1024;
