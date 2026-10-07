@@ -216,5 +216,52 @@
       "failures": []
     },
     "regression": "lite persistent mapped lease publication excludes cross-root marker sweeping"
+  },
+  "validation": {
+    "commit": "57bfb908e664210e2c63e3a072fd8438a431b73f",
+    "optimize": "ReleaseSafe",
+    "native_reader_merge": {
+      "passed": 328,
+      "failed": 0,
+      "leaked": 0
+    },
+    "lite_storage": {
+      "passed": 365,
+      "skipped": 5,
+      "failed": 0,
+      "leaked": 0
+    },
+    "persistent_artifact": {
+      "passed": 7,
+      "root_smoke_passed": true
+    },
+    "publication_runtime": {
+      "passed": 2
+    },
+    "bounded_db_integration": {
+      "passed": 5
+    },
+    "wasm_compatibility_passed": true,
+    "embedded_shared_smoke_passed": true,
+    "apache_boundary_source_files": 1900,
+    "format_and_license_checks_passed": true
+  },
+  "checksum_provider_memory": {
+    "commit": "57bfb908e664210e2c63e3a072fd8438a431b73f",
+    "duplicate_authentication_slab_removed_bytes": 65536,
+    "worker_stack_scratch_bytes": 8192,
+    "regression_allocator_limit_bytes": 4096,
+    "retained_payload_bytes": 0,
+    "crc_poisoning_and_io_retry_test_passed": true,
+    "note": "The timings above remain measurements of candidate_commit, before this additional provider-memory fix."
+  },
+  "scoped_reader_fixture": {
+    "documents": 4096,
+    "unscoped_provider_calls": 8195,
+    "scoped_provider_calls": 4,
+    "unscoped_native_page_reads": 31,
+    "scoped_native_page_reads": 38,
+    "scope_cache_bytes": 196608,
+    "note": "Provider caching already bounds physical reads. Scope reduces provider callbacks and locking, while aligned prefetch reads slightly more native pages in this fixture."
   }
 }
