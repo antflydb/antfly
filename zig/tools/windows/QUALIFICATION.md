@@ -187,6 +187,34 @@ allows existing readers to retain the replaced file. [Wine's implementation](htt
 rejects an open destination. These are observable Wine limitations; native
 Windows object-store snapshot/replacement behavior remains to be qualified.
 
+## Additional path and cancellation review
+
+The Windows vector/catalog path helper used a string join, which introduced a
+leading slash for an empty root and doubled a trailing root separator. A new
+checkpoint-path regression fails before the fix (`block-1-2.afvb` becomes
+`/block-1-2.afvb`). Both helpers now use a shared standard path join and convert
+Windows separators to '/'. Empty roots, trailing separators and Windows drive
+paths preserve the standard join's semantics. The shared helper regression
+passes on macOS and Windows Debug under CrossOver. The checkpoint-path and
+rejected-block cleanup tests pass on macOS and Windows Debug and ReleaseFast
+under CrossOver (three tests in each focused run, including the test root).
+
+Pending I/O cancellation could also prevent an atomic writer's abort from
+deleting its staging file. A controlled cancellation regression observes one
+orphaned file before the fix. The streaming writer now blocks cancellation
+only while deleting staging on abort or pre-publication failure, restoring
+protection before releasing any owned runtime. The full storage suite passes
+on macOS (37 passed, one Windows-only skip) and Windows Debug and ReleaseFast
+under CrossOver (17 passed, 21 POSIX skips). This includes the new cancellation
+regression and the existing bounded-memory, publication and executor-authority
+checks.
+
+These additional fixes have not been rerun through the native Windows
+application or hard-reset workload. The native results and binary hashes above
+remain evidence for their explicitly identified earlier builds. The two Wine
+open-reader replacement failures and remaining qualification limits are
+unchanged.
+
 ## Cleanup
 
 The disposable VM, auto-delete boot disk, artifact bucket, service account,

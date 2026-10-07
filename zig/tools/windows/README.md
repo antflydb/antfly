@@ -147,7 +147,8 @@ like `lib/generating` cannot import it today, or upstream them to Zig.
   writer covers both native storage and the runtime bridge's `IoStorage`.
   Owned native sinks retain the I/O runtime through finish/abort; borrowed
   executors must outlive their sinks. The writer closes the staging handle
-  before rename, and removes staging on abort or pre-publication failure. Memory
+  before rename, and removes staging on abort or pre-publication failure with
+  cancellation blocked during cleanup. Memory
   used by this writer no longer scales with compaction output size. Windows
   still lacks the POSIX cold-cache eviction hints and descriptor cache.
 - `storage_io.zig` fd cache, `vector_block_store` mmap, and `peer_disconnect_observer`
@@ -170,8 +171,8 @@ like `lib/generating` cannot import it today, or upstream them to Zig.
   the owning archive's thread-local and Windows parked-worker wakeup state.
 - Lite virtual index paths: `std.fs.path.join` uses `\` on Windows, which Lite's
   in-file path validation rejects (`InvalidNativeIndexPath`). On Windows the
-  vector-block paths now join with `/`. Other `std.fs.path.join` uses on virtual paths
-  probably need the same fix.
+  vector-block paths now join with `/` while preserving the standard join's
+  empty-component and separator-boundary rules.
 - Shutdown: console control events (Ctrl+C, close, logoff) replace SIGINT and SIGTERM.
 - `File.Permissions.fromMode` and signed Windows inode numbers are handled at
   each call site.
@@ -332,11 +333,12 @@ Nested listing and prefix download pass after object-key normalization.
 CrossOver still fails the two open-reader replacement tests with `AccessDenied`;
 see the qualification report. They need native Windows execution.
 
-The existing rejected vector-block cleanup regression has a focused root:
+Vector-block cleanup and empty/trailing-separator root regressions have a focused root:
 
 ```sh
 zig test -lc -target x86_64-windows-gnu -O Debug --test-no-exec \
   --test-filter 'owned staged base removes blocks after pre-CURRENT rejection' \
+  --test-filter 'checkpoint paths preserve' \
   -femit-bin=/path/to/vector-cleanup-test.exe \
   --dep antfly_source_root=root --dep antfly_hash --dep antfly_platform \
   --dep antfly_runtime_fs --dep antfly_vectorindex --dep antfly_test_error_logs \
