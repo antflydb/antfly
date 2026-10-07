@@ -17,6 +17,34 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 
+/// Join native or virtual storage paths with std's empty-component and
+/// separator-boundary rules. Windows also accepts '/', which Lite requires.
+pub fn joinStoragePathAlloc(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
+    const path = try std.fs.path.join(alloc, parts);
+    if (comptime builtin.os.tag == .windows) std.mem.replaceScalar(u8, path, '\\', '/');
+    return path;
+}
+
+test "storage path joins preserve boundaries and virtual separators" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { parts: []const []const u8, expected: []const u8 }{
+        .{ .parts = &.{ "", "CURRENT" }, .expected = "CURRENT" },
+        .{ .parts = &.{ "vectors/", "CURRENT" }, .expected = "vectors/CURRENT" },
+        .{ .parts = &.{ "", "vectors/", "/CURRENT", "" }, .expected = "vectors/CURRENT" },
+        .{ .parts = &.{ "vectors", "CURRENT" }, .expected = "vectors/CURRENT" },
+    };
+    for (cases) |case| {
+        const path = try joinStoragePathAlloc(alloc, case.parts);
+        defer alloc.free(path);
+        try std.testing.expectEqualStrings(case.expected, path);
+    }
+    if (comptime builtin.os.tag == .windows) {
+        const path = try joinStoragePathAlloc(alloc, &.{ "C:\\data\\", "vector-blocks", "CURRENT" });
+        defer alloc.free(path);
+        try std.testing.expectEqualStrings("C:/data/vector-blocks/CURRENT", path);
+    }
+}
+
 fn fsPathDebugEnabled() bool {
     if (builtin.os.tag == .freestanding) return false;
     return platform.env.getenv("ANTFLY_FS_PATH_DEBUG") != null;

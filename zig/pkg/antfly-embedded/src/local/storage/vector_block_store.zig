@@ -76,6 +76,23 @@ pub fn checkpointWalPathAlloc(alloc: Allocator, root_dir: []const u8, generation
     return try joinStoragePath(alloc, &.{ root_dir, name });
 }
 
+test "checkpoint paths preserve empty and trailing-separator root joins" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{ "", "vectors/" }) |root| {
+        const block = try checkpointBlockPathAlloc(alloc, root, 1, 2);
+        defer alloc.free(block);
+        const wal = try checkpointWalPathAlloc(alloc, root, 1);
+        defer alloc.free(wal);
+        const prefix = if (root.len == 0) "" else "vectors/";
+        const expected_block = try std.fmt.allocPrint(alloc, "{s}block-1-2.afvb", .{prefix});
+        defer alloc.free(expected_block);
+        const expected_wal = try std.fmt.allocPrint(alloc, "{s}wal-1.afvw", .{prefix});
+        defer alloc.free(expected_wal);
+        try std.testing.expectEqualStrings(expected_block, block);
+        try std.testing.expectEqualStrings(expected_wal, wal);
+    }
+}
+
 pub const RetainedBlock = struct {
     shared: *Shared,
 
@@ -6741,6 +6758,5 @@ test "storage.vector_block_store adaptive read cost and available work gate help
 /// Windows filesystem paths. Other targets keep std.fs.path.join, which also
 /// skips empty components and collapses a separator shared by adjacent parts.
 fn joinStoragePath(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
-    if (comptime builtin.os.tag == .windows) return std.mem.join(alloc, "/", parts);
-    return std.fs.path.join(alloc, parts);
+    return @import("antfly_runtime_fs").fs_paths.joinStoragePathAlloc(alloc, parts);
 }

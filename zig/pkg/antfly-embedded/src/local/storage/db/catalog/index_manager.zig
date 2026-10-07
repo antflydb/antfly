@@ -46508,6 +46508,5 @@ fn appendOwnedString(alloc: Allocator, out: *std.ArrayListUnmanaged([]u8), value
 /// Vector-block paths may live inside a Lite file, where only '/' is valid.
 /// Windows joins with '/'; other targets keep std.fs.path.join unchanged.
 fn joinStoragePath(alloc: std.mem.Allocator, parts: []const []const u8) ![]u8 {
-    if (comptime builtin.os.tag == .windows) return std.mem.join(alloc, "/", parts);
-    return std.fs.path.join(alloc, parts);
+    return fs_paths.joinStoragePathAlloc(alloc, parts);
 }
