@@ -69,9 +69,11 @@ python3 -m unittest discover -s tools/windows -p 'test_*.py'
 
 Use the same `zig test` command with `tools/windows/compat_test.zig` and a
 different output executable to check positional reads, EOF, clocks, and
-condition-variable timeout/lock behavior through the overlay. The file-lock
-test checks exclusion, header reads through a separate handle, explicit unlock,
-reacquisition, shared locks, and exclusive-to-shared downgrade.
+condition-variable timeout/lock behavior, secure entropy, and loopback TCP
+through the overlay. The file-lock test checks exclusion, header reads through
+a separate handle, explicit unlock, reacquisition, shared locks, and
+exclusive-to-shared downgrade. The TCP test checks connection, byte transfer,
+half-close, and EOF.
 
 ## What the overlay does
 
@@ -92,6 +94,8 @@ of patching every call site:
 | `std.DynLib` | `LoadLibraryW`, `GetProcAddress` |
 | `Io.Threaded` file lock range | sentinel byte at offset 2^62 instead of offset 0 |
 | `Io.Threaded` lock/unlock under Wine | synchronous lock ABI and contention status adapters |
+| `Io.Threaded` secure entropy under Wine | `BCryptGenRandom` system-preferred RNG |
+| `Io.Threaded` TCP under Wine | Winsock initialization, creation, options, connect/accept, vectored send/receive, shutdown, and close |
 
 The lock change matters most. Zig locks byte 0 of a file, and Windows byte-range
 locks are mandatory, so any other handle (even in the same process) that reads
@@ -104,6 +108,21 @@ instead of native Windows' `ULONG`. The overlay detects Wine through ntdll's
 `wine_get_version`, uses Wine's synchronous locking arguments, and normalizes
 contention to Zig's `WouldBlock`. It retains real byte-range locks and preserves
 native Windows calls. See [Wine's implementation](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/unix/file.c).
+
+Zig's direct `\\Device\\CNG` entropy source is unavailable under CrossOver.
+For Wine only, the overlay uses [`BCryptGenRandom`](https://learn.microsoft.com/en-us/windows/win32/api/bcrypt/nf-bcrypt-bcryptgenrandom)
+with the system-preferred cryptographic RNG. API errors remain
+`EntropyUnavailable`; there is no predictable entropy fallback. The native
+Windows CNG path and the I/O cancellation check are preserved.
+
+Wine does not implement all of the native AFD socket IOCTLs used by Zig.
+The overlay therefore uses Winsock for TCP operations under Wine, including
+balanced `WSASocketW`/`accept` and `closesocket` bookkeeping. Wine detection is
+cached so native Windows I/O does not repeatedly probe DLL exports. Wine's
+unsupported outbound `REUSE_UNICASTPORT` hint is omitted; normal ephemeral
+port allocation remains. Native Windows keeps the AFD path. These Wine calls
+are synchronous, so cancellation and timeout behavior needs separate
+qualification. UDP and Unix-domain sockets are not covered by this adapter.
 
 A supported port should move these behind `antfly_platform`, since modules
 like `lib/generating` cannot import it today, or upstream them to Zig.
@@ -139,7 +158,34 @@ like `lib/generating` cannot import it today, or upstream them to Zig.
 - `File.Permissions.fromMode` and signed Windows inode numbers are handled at
   each call site.
 
-## Verified
+## Verified after merging main
+
+PR #987 (`ce319462af8b`) was merged with `origin/main` (`e6d4ce9bbc71`).
+On Apple Silicon macOS with Rosetta, CrossOver 26.2.0, and Zig 0.17.0:
+
+- The final Windows Debug application build passed all 46 build steps.
+- The Windows argument round-trip test passed, including spaces, quotes,
+  trailing backslashes, Unicode, and an unpaired surrogate.
+- All five compatibility tests passed under both Debug and ReleaseFast:
+  loopback TCP with half-close/EOF, secure entropy, file-lock contention and
+  downgrade, positional reads, and clock/condition-variable behavior.
+- The Debug application passed the CrossOver HTTP smoke: table creation,
+  `full_index` batch synchronization, full-text results, 32 concurrent queries,
+  hard kill/reopen, another 32 concurrent queries, another hard kill, and
+  `lite check` (`valid: true`, no tail bytes). Database and runtime paths
+  contained spaces.
+- Native suites passed: platform 13 tests, httpx/objectstore 675 tests
+  (10 skipped), and Lite ReleaseSafe 341 tests (5 benchmark tests skipped).
+  Platform Python lifecycle suites (4 and 9 tests), overlay safety tests
+  (2 tests), Ruff checks, and Zig formatting checks also passed.
+
+The full application also compiled in ReleaseFast before the Wine adapters
+were added. The final adapters were exercised in ReleaseFast by the focused
+compatibility tests; the final full HTTP/recovery workload ran in Debug.
+This does not qualify native NTFS power-loss behavior or a supported Windows
+release.
+
+## Prior native Windows qualification
 
 On a GCE `windows-2022` VM: `lite init`, `lite serve`, table creation, batch
 insert, full-text query, `lite check`, and reopening after a hard kill. The

@@ -5,6 +5,39 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+test "Windows loopback sockets listen connect accept and transfer bytes" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const client = try server.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    const peer = try server.accept(io);
+    defer peer.close(io);
+    var writer = client.writer(io, &.{});
+    try writer.interface.writeAll("ping");
+    try writer.interface.flush();
+    var reader = peer.reader(io, &.{});
+    var bytes: [4]u8 = undefined;
+    try reader.interface.readSliceAll(&bytes);
+    try std.testing.expectEqualStrings("ping", &bytes);
+    try client.shutdown(io, .send);
+    var eof: [1]u8 = undefined;
+    try std.testing.expectError(error.EndOfStream, reader.interface.readSliceAll(&eof));
+}
+
+test "Windows secure entropy fills independent buffers" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    var first: [64]u8 = @splat(0);
+    var second: [64]u8 = @splat(0);
+    try std.testing.io.randomSecure(&first);
+    try std.testing.io.randomSecure(&second);
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
+    try std.testing.expect(!std.mem.allEqual(u8, &first, 0));
+    try std.testing.io.randomSecure(&.{});
+}
+
 test "Windows file locks exclude competing handles and allow header reads" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const io = std.testing.io;
@@ -15,6 +48,7 @@ test "Windows file locks exclude competing handles and allow header reads" {
     defer writer.close(io);
     try writer.writeStreamingAll(io, "header");
     try std.testing.expectError(error.WouldBlock, directory.dir.createFile(io, "locked.bin", options));
+    try std.testing.expectError(error.WouldBlock, directory.dir.openFile(io, "locked.bin", .{ .lock = .exclusive, .lock_nonblocking = true }));
     const reader = try directory.dir.openFile(io, "locked.bin", .{});
     defer reader.close(io);
     var bytes: [6]u8 = undefined;
@@ -24,9 +58,12 @@ test "Windows file locks exclude competing handles and allow header reads" {
     const next = try directory.dir.createFile(io, "locked.bin", options);
     defer next.close(io);
     try next.downgradeLock(io);
+    const shared = try directory.dir.openFile(io, "locked.bin", .{ .lock = .shared, .lock_nonblocking = true });
+    defer shared.close(io);
     try std.testing.expect(try reader.tryLock(io, .shared));
     try std.testing.expect(!try writer.tryLock(io, .exclusive));
     reader.unlock(io);
+    shared.unlock(io);
     next.unlock(io);
     try writer.lock(io, .exclusive);
     writer.unlock(io);

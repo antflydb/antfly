@@ -157,8 +157,121 @@ DYNLIB_EDITS = [
 # sentinel byte past any real data keeps lock-vs-lock semantics, like SQLite.
 THREADED_EDITS = [
     (
+        "    const addr_len = addressToPosix(address, &storage.Address);\n    switch ((try deviceIoControl(&.{\n        .file = .{ .handle = socket_handle, .flags = .{ .nonblocking = true } },\n        .code = windows.IOCTL.AFD.CONNECT,\n",
+        (
+            "    const addr_len = addressToPosix(address, &storage.Address);\n"
+            '    const compat = @import("../c/antfly_windows_compat.zig");\n'
+            "    if (compat.isWine()) {\n"
+            "        const syscall: Syscall = try .start();\n"
+            "        compat.connectSocket(socket_handle, @as([]const u8, @ptrCast(&storage.Address))[0..addr_len]) catch |err| return syscall.fail(err);\n"
+            "        syscall.finish();\n"
+            "        return .{ .handle = socket_handle, .address = bound_address };\n"
+            "    }\n"
+            "    switch ((try deviceIoControl(&.{\n"
+            "        .file = .{ .handle = socket_handle, .flags = .{ .nonblocking = true } },\n"
+            "        .code = windows.IOCTL.AFD.CONNECT,\n"
+        ),
+    ),
+    (
+        "fn netAcceptWindows(userdata: ?*anyopaque, listen_handle: net.Socket.Handle, options: net.Server.AcceptOptions) net.Server.AcceptError!net.Socket {\n",
+        (
+            "fn netAcceptWindows(userdata: ?*anyopaque, listen_handle: net.Socket.Handle, options: net.Server.AcceptOptions) net.Server.AcceptError!net.Socket {\n"
+            '    const compat = @import("../c/antfly_windows_compat.zig");\n'
+            "    if (compat.isWine()) {\n"
+            "        var address: PosixAddress = undefined;\n"
+            "        const syscall: Syscall = try .start();\n"
+            "        const socket = compat.acceptSocket(listen_handle, @as([]u8, @ptrCast(&address))) catch |err| return syscall.fail(err);\n"
+            "        syscall.finish();\n"
+            "        return .{ .handle = socket, .address = addressFromPosix(&address) };\n"
+            "    }\n"
+        ),
+    ),
+    (
+        "    const iosb = try deviceIoControl(&.{\n        .file = .{ .handle = socket_handle, .flags = .{ .nonblocking = true } },\n        .code = windows.IOCTL.AFD.RECEIVE,\n",
+        (
+            '    const compat = @import("../c/antfly_windows_compat.zig");\n'
+            "    if (compat.isWine()) {\n"
+            "        const syscall: Syscall = try .start();\n"
+            "        const received = compat.receiveBuffers(socket_handle, iovecs[0..len]) catch |err| return syscall.fail(err);\n"
+            "        syscall.finish();\n"
+            "        return received;\n"
+            "    }\n"
+            "    const iosb = try deviceIoControl(&.{\n"
+            "        .file = .{ .handle = socket_handle, .flags = .{ .nonblocking = true } },\n"
+            "        .code = windows.IOCTL.AFD.RECEIVE,\n"
+        ),
+    ),
+    (
+        "    const iosb = try deviceIoControl(&.{\n        .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },\n        .code = windows.IOCTL.AFD.SEND,\n",
+        (
+            '    const compat = @import("../c/antfly_windows_compat.zig");\n'
+            "    if (compat.isWine()) {\n"
+            "        const syscall: Syscall = try .start();\n"
+            "        const sent = compat.sendBuffers(handle, iovecs[0..len]) catch |err| return syscall.fail(err);\n"
+            "        syscall.finish();\n"
+            "        return sent;\n"
+            "    }\n"
+            "    const iosb = try deviceIoControl(&.{\n"
+            "        .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },\n"
+            "        .code = windows.IOCTL.AFD.SEND,\n"
+        ),
+    ),
+    (
+        "    // shutdown does not support apcs at all\n",
+        (
+            '    const compat = @import("../c/antfly_windows_compat.zig");\n'
+            "    if (compat.isWine()) {\n"
+            "        const syscall: Syscall = try .start();\n"
+            "        compat.shutdownSocket(handle, how) catch |err| return syscall.fail(err);\n"
+            "        return syscall.finish();\n"
+            "    }\n"
+            "    // shutdown does not support apcs at all\n"
+        ),
+    ),
+    (
+        (
+            "fn openSocketAfd(family: ws2_32.ADDRESS_FAMILY, options: IpAddress.BindOptions) !net.Socket.Handle {\n"
+            "    const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);\n"
+        ),
+        (
+            "fn openSocketAfd(family: ws2_32.ADDRESS_FAMILY, options: IpAddress.BindOptions) !net.Socket.Handle {\n"
+            "    const mode, const protocol = try posixSocketModeProtocol(family, options.mode, options.protocol);\n"
+            '    const compat = @import("../c/antfly_windows_compat.zig");\n'
+            "    if (compat.isWine()) {\n"
+            "        const syscall: Syscall = try .start();\n"
+            "        const socket = compat.openSocket(family, @bitCast(mode), @bitCast(protocol)) catch |err| return syscall.fail(err);\n"
+            "        syscall.finish();\n"
+            "        return socket;\n"
+            "    }\n"
+        ),
+    ),
+    (
+        "fn socketOptionAfd(socket: net.Socket.Handle, mode: windows.AFD.SOCKOPT_INFO.Mode, level: i32, opt_name: u32, opt_val: []u8) !void {\n",
+        (
+            "fn socketOptionAfd(socket: net.Socket.Handle, mode: windows.AFD.SOCKOPT_INFO.Mode, level: i32, opt_name: u32, opt_val: []u8) !void {\n"
+            '    const compat = @import("../c/antfly_windows_compat.zig");\n'
+            "    if (mode == .set and compat.isWine()) return compat.setSocketOption(socket, level, opt_name, opt_val);\n"
+        ),
+    ),
+    (
+        "        const cng_device = try getCngDevice(t);\n",
+        (
+            '        const compat = @import("../c/antfly_windows_compat.zig");\n'
+            "        if (compat.isWine()) {\n"
+            "            const syscall: Syscall = try .start();\n"
+            "            compat.randomSecure(buffer) catch |err| return syscall.fail(err);\n"
+            "            return syscall.finish();\n"
+            "        }\n"
+            "        const cng_device = try getCngDevice(t);\n"
+        ),
+    ),
+    (
         "const windows_lock_range_off: windows.LARGE_INTEGER = 0;\n",
         "const windows_lock_range_off: windows.LARGE_INTEGER = 1 << 62;\n",
+    ),
+    (
+        "w.ntdll.NtLockFile(",
+        '@import("../c/antfly_windows_compat.zig").NtLockFile(',
     ),
 ]
 
@@ -202,6 +315,18 @@ def create_overlay(zig_lib: Path, out: Path) -> None:
         source = source.replace(
             unlock_call, '@import("../c/antfly_windows_compat.zig").NtUnlockFile('
         )
+        for handle, count in (
+            ("socket_handle", 5),
+            ("accept_handle", 1),
+            ("socket.handle", 1),
+        ):
+            close_call = f"windows.CloseHandle({handle})"
+            if source.count(close_call) != count:
+                raise SystemExit(f"expected {count} socket close calls for {handle}")
+            source = source.replace(
+                close_call,
+                f'@import("../c/antfly_windows_compat.zig").closeSocket({handle})',
+            )
         threaded.write_text(source, encoding="utf-8")
         shutil.copyfile(COMPAT, staged / "std" / "c" / "antfly_windows_compat.zig")
         if out.exists():

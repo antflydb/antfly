@@ -24,6 +24,17 @@ extern "kernel32" fn FreeLibrary(module: *anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 extern "kernel32" fn UnmapViewOfFile(base: *const anyopaque) callconv(.winapi) BOOL;
 extern "kernel32" fn ReadFile(file: std.os.windows.HANDLE, buffer: [*]u8, len: u32, read: ?*u32, overlapped: ?*Overlapped) callconv(.winapi) BOOL;
+extern "bcrypt" fn BCryptGenRandom(algorithm: ?*anyopaque, buffer: [*]u8, len: u32, flags: u32) callconv(.winapi) windows.NTSTATUS;
+extern "ws2_32" fn setsockopt(socket: windows.HANDLE, level: i32, option: i32, value: [*]const u8, len: i32) callconv(.winapi) c_int;
+extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
+extern "ws2_32" fn WSAStartup(version: u16, data: *anyopaque) callconv(.winapi) c_int;
+extern "ws2_32" fn WSASocketW(family: i32, mode: i32, protocol: i32, info: ?*anyopaque, group: u32, flags: u32) callconv(.winapi) usize;
+extern "ws2_32" fn closesocket(socket: usize) callconv(.winapi) c_int;
+extern "ws2_32" fn connect(socket: usize, address: [*]const u8, len: i32) callconv(.winapi) c_int;
+extern "ws2_32" fn accept(socket: usize, address: [*]u8, len: *i32) callconv(.winapi) usize;
+extern "ws2_32" fn WSASend(socket: usize, buffers: *const anyopaque, count: u32, sent: *u32, flags: u32, overlapped: ?*anyopaque, completion: ?*anyopaque) callconv(.winapi) c_int;
+extern "ws2_32" fn WSARecv(socket: usize, buffers: *const anyopaque, count: u32, received: *u32, flags: *u32, overlapped: ?*anyopaque, completion: ?*anyopaque) callconv(.winapi) c_int;
+extern "ws2_32" fn shutdown(socket: usize, how: i32) callconv(.winapi) c_int;
 
 const Overlapped = extern struct {
     internal: usize = 0,
@@ -37,9 +48,136 @@ const windows = std.os.windows;
 const WineLockFn = *const fn (windows.HANDLE, ?windows.HANDLE, ?*align(2) const windows.IO_APC_ROUTINE, ?*anyopaque, ?*windows.IO_STATUS_BLOCK, *const windows.LARGE_INTEGER, *const windows.LARGE_INTEGER, ?*const windows.ULONG, windows.BOOLEAN, windows.BOOLEAN) callconv(.winapi) windows.NTSTATUS;
 const WineUnlockFn = *const fn (windows.HANDLE, *windows.IO_STATUS_BLOCK, *const windows.LARGE_INTEGER, *const windows.LARGE_INTEGER, ?*const windows.ULONG) callconv(.winapi) windows.NTSTATUS;
 
+var wine_status: std.atomic.Value(u8) = .init(0);
+
+pub fn isWine() bool {
+    const cached = wine_status.load(.monotonic);
+    if (cached != 0) return cached == 2;
+    const module = GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral("ntdll.dll"));
+    const wine = if (module) |handle| GetProcAddress(handle, "wine_get_version") != null else false;
+    // The result is immutable for the process. Concurrent first probes may
+    // repeat the lookup, then publish the same value without a lock.
+    wine_status.store(if (wine) 2 else 1, .monotonic);
+    return wine;
+}
+
 fn wineNtdll() ?*anyopaque {
-    const module = GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral("ntdll.dll")) orelse return null;
-    return if (GetProcAddress(module, "wine_get_version") != null) module else null;
+    if (!isWine()) return null;
+    return GetModuleHandleW(std.unicode.utf8ToUtf16LeStringLiteral("ntdll.dll"));
+}
+
+/// Use the system cryptographic RNG when Wine lacks Zig's CNG device path.
+/// Never substitute a predictable seed when the API fails.
+pub fn randomSecure(buffer: []u8) std.Io.RandomSecureError!void {
+    const system_preferred_rng = 0x00000002;
+    var remaining = buffer;
+    while (remaining.len != 0) {
+        const len = std.math.lossyCast(u32, remaining.len);
+        if (BCryptGenRandom(null, remaining.ptr, len, system_preferred_rng) != .SUCCESS) return error.EntropyUnavailable;
+        remaining = remaining[len..];
+    }
+}
+
+/// Wine's Winsock functions accept its AFD socket handles and translate
+/// options to Wine-specific IOCTLs. Native Windows must keep Zig's AFD path.
+pub fn setSocketOption(socket: windows.HANDLE, level: i32, option: u32, value: []const u8) !void {
+    const ws2 = windows.ws2_32;
+    // Wine has no REUSE_UNICASTPORT implementation. This is only a hint for
+    // sharing ephemeral outbound ports, so retain ordinary port allocation.
+    if (level == ws2.SOL.SOCKET and option == ws2.SO.REUSE_UNICASTPORT) return;
+    var boolean: u32 = if (value.len == 1 and value[0] != 0) 1 else 0;
+    const boolean_option = level == ws2.SOL.SOCKET and (option == ws2.SO.REUSEADDR or option == ws2.SO.BROADCAST);
+    const bytes = if (boolean_option and value.len == 1) std.mem.asBytes(&boolean) else value;
+    if (setsockopt(socket, level, @intCast(option), bytes.ptr, @intCast(bytes.len)) != 0) {
+        return socketError();
+    }
+}
+
+var winsock_ready: std.atomic.Value(bool) = .init(false);
+var winsock_init_lock: ?*anyopaque = null;
+
+fn socketError() error{ SystemResources, Unexpected } {
+    const code = WSAGetLastError();
+    if (code == 10055) return error.SystemResources;
+    return windows.unexpectedError(@fromBackingInt(@intCast(@as(u32, @intCast(code)))));
+}
+
+pub fn openSocket(family: i32, mode: i32, protocol: i32) !windows.HANDLE {
+    if (!winsock_ready.load(.acquire)) {
+        AcquireSRWLockExclusive(&winsock_init_lock);
+        defer ReleaseSRWLockExclusive(&winsock_init_lock);
+        if (!winsock_ready.load(.monotonic)) {
+            // WSADATA is at most 408 bytes on Win64 (400 on Win32). We only
+            // need the output storage; its fields are not used here.
+            var data: [512]u8 align(8) = undefined;
+            if (WSAStartup(0x0202, &data) != 0) return error.NetworkDown;
+            winsock_ready.store(true, .release);
+        }
+    }
+    const socket = WSASocketW(family, mode, protocol, null, 0, 0x01 | 0x80);
+    if (socket == std.math.maxInt(usize)) return socketError();
+    return @ptrFromInt(socket);
+}
+
+pub fn closeSocket(socket: windows.HANDLE) void {
+    if (isWine()) {
+        if (closesocket(@intFromPtr(socket)) != 0) windows.CloseHandle(socket);
+    } else windows.CloseHandle(socket);
+}
+
+pub fn connectSocket(socket: windows.HANDLE, address: []const u8) std.Io.net.IpAddress.ConnectError!void {
+    if (connect(@intFromPtr(socket), address.ptr, @intCast(address.len)) != 0) {
+        return switch (WSAGetLastError()) {
+            10004 => error.Canceled,
+            10061 => error.ConnectionRefused,
+            else => socketError(),
+        };
+    }
+}
+
+pub fn acceptSocket(socket: windows.HANDLE, address: []u8) std.Io.net.Server.AcceptError!windows.HANDLE {
+    var len: i32 = @intCast(address.len);
+    const accepted = accept(@intFromPtr(socket), address.ptr, &len);
+    if (accepted == std.math.maxInt(usize)) {
+        return if (WSAGetLastError() == 10004) error.Canceled else socketError();
+    }
+    return @ptrFromInt(accepted);
+}
+
+pub fn sendBuffers(socket: windows.HANDLE, buffers: []const windows.AFD.WSABUF(.@"const")) std.Io.net.Stream.Writer.Error!usize {
+    var sent: u32 = 0;
+    if (WSASend(@intFromPtr(socket), buffers.ptr, @intCast(buffers.len), &sent, 0, null, null) != 0) {
+        return switch (WSAGetLastError()) {
+            10004 => error.Canceled,
+            10053, 10054, 10058 => error.ConnectionResetByPeer,
+            10060 => error.ConnectionTimedOut,
+            else => socketError(),
+        };
+    }
+    return sent;
+}
+
+pub fn receiveBuffers(socket: windows.HANDLE, buffers: []const windows.AFD.WSABUF(.@"var")) std.Io.net.Stream.Reader.Error!usize {
+    var received: u32 = 0;
+    var flags: u32 = 0;
+    if (WSARecv(@intFromPtr(socket), buffers.ptr, @intCast(buffers.len), &received, &flags, null, null) != 0) {
+        return switch (WSAGetLastError()) {
+            10004 => error.Canceled,
+            10053, 10054, 10058 => error.ConnectionResetByPeer,
+            10060 => error.ConnectionTimedOut,
+            else => socketError(),
+        };
+    }
+    return received;
+}
+
+pub fn shutdownSocket(socket: windows.HANDLE, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
+    const direction: i32 = switch (how) {
+        .recv => 0,
+        .send => 1,
+        .both => 2,
+    };
+    if (shutdown(@intFromPtr(socket), direction) != 0) return socketError();
 }
 
 /// Wine implements synchronous byte-range locks with a null status block;
