@@ -5801,6 +5801,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lite-query-reader-test", "Verify native query reader reuse, exact sorting, and filtered text statistics")
         .dependOn(&addFilteredTestRunArtifact(b, lite_query_reader_tests).step);
 
+    const lite_merge_publication_runtime_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "db text merge descriptor admission failures retry without quarantine", "db text merge shutdown cancels a worker blocked on descriptor admission" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")
+        .dependOn(&addFilteredTestRunArtifact(b, lite_merge_publication_runtime_tests).step);
+
     const bounded_read_integration_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{

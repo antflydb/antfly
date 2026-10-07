@@ -30,9 +30,11 @@ const fst = @import("antfly_fst");
 const bloom = @import("bloom");
 const platform_time = @import("antfly_platform").time;
 
-// ============================================================================
+// =====================================================================}
+
 // Wire format versions
-// ============================================================================
+// =====================================================================}
+
 //
 //   v11: v10 postings + fixed-prefix blocked term dictionary
 //   v12: v11 + bit-packed position deltas
@@ -372,9 +374,10 @@ fn writeCurrentHeader(
     dst[29..33].* = @bitCast(@as(u32, norms_len));
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Varint helpers (LEB128)
-// ============================================================================
+// =====================================================================}
 
 fn writeVarintU32(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u32) !void {
     var v = value;
@@ -843,9 +846,10 @@ fn readVarintU64(data: []const u8, cursor: *usize) !u64 {
     return error.Truncated;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Index builder (write path)
-// ============================================================================
+// =====================================================================}
 
 /// Builds an inverted text index from documents.
 ///
@@ -1365,13 +1369,15 @@ fn decodePackedU32Into(data: []const u8, values: []u32, bits: u8) !void {
 /// per value for the common widths while still handling arbitrary contiguous
 /// ranges within a packed stream.
 fn decodePackedU32Range(data: []const u8, start_index: usize, values: []u32, bits: u8) !void {
+    return decodePackedU32BitRange(data, std.math.mul(usize, start_index, bits) catch return error.InvalidData, values, bits);
+}
+fn decodePackedU32BitRange(data: []const u8, start_bit: usize, values: []u32, bits: u8) !void {
     if (bits > 32) return error.InvalidData;
     if (bits == 0) {
         @memset(values, 0);
         return;
     }
     if (values.len == 0) return;
-    const start_bit = std.math.mul(usize, start_index, bits) catch return error.InvalidData;
     const value_bits = std.math.mul(usize, values.len, bits) catch return error.InvalidData;
     const end_bit = std.math.add(usize, start_bit, value_bits) catch return error.InvalidData;
     const rounded_end_bit = std.math.add(usize, end_bit, 7) catch return error.InvalidData;
@@ -2209,9 +2215,10 @@ const PostingAccumulator = struct {
     }
 };
 
-// ============================================================================
+// =====================================================================}
+
 // Index reader (query path)
-// ============================================================================
+// =====================================================================}
 
 /// Reads the origin/main v23 format and the current production format.
 pub const PostingsLoader = struct {
@@ -3215,27 +3222,86 @@ pub const TermPostings = struct {
 };
 
 pub const PackedPositionView = struct {
-    data: []const u8,
-    start_index: usize,
+    data: []const u8 = &.{},
+    range: ?@import("../segment_source.zig").View = null,
+    read_cache: ?*PackedReadCache = null,
+    unpacked: ?[]const u32 = null,
+    legacy: ?struct { result: *const LookupResult, doc: u32 } = null,
+    start_index: usize = 0,
+    encoded_width: ?u8 = null,
     count: usize,
     bits: u8,
 
+    fn decodeInto(self: PackedPositionView, allocator: Allocator, values: []u32, scratch: *std.ArrayListUnmanaged(u8)) !void {
+        if (values.len != self.count) return error.InvalidData;
+        if (self.unpacked) |positions| {
+            @memcpy(values, positions);
+            return;
+        }
+        if (self.legacy != null) {
+            var decoder = try self.cursorAlloc(allocator);
+            defer decoder.deinit();
+            for (values) |*value| value.* = (try decoder.next()) orelse return error.InvalidData;
+            return;
+        }
+        const start_bit = try std.math.mul(usize, self.start_index, self.bits);
+        const skip = start_bit % 8;
+        const value_bits = try std.math.mul(usize, values.len, self.bits);
+        const length = (try std.math.add(usize, value_bits, skip + 7)) / 8;
+        const offset = start_bit / 8;
+        const data = if (self.range) |range| blk: {
+            if (offset > range.length or length > range.length - offset) return error.InvalidData;
+            if (range.source == .contiguous) break :blk range.source.contiguous[@intCast(range.offset + offset)..][0..length];
+            try scratch.ensureTotalCapacityPrecise(allocator, length);
+            scratch.items.len = length;
+            if (self.read_cache) |cache| try cache.read(range, offset, scratch.items) else try range.readInto(offset, scratch.items);
+            break :blk scratch.items;
+        } else blk: {
+            if (offset > self.data.len or length > self.data.len - offset) return error.InvalidData;
+            break :blk self.data[offset..][0..length];
+        };
+        try decodePackedU32BitRange(data, skip, values, self.bits);
+        var previous: u32 = 0;
+        for (values) |*value| {
+            previous +%= value.*;
+            value.* = previous;
+        }
+    }
+    fn packedBytes(self: PackedPositionView) !PackedByteCursor {
+        if (self.unpacked != null or self.legacy != null) return error.InvalidData;
+        return .{ .reader = try self.cursor(), .position = try std.math.mul(usize, self.start_index, self.bits), .remaining = try std.math.mul(usize, self.count, self.bits) };
+    }
+    pub fn cursorAlloc(self: PackedPositionView, allocator: Allocator) !PackedPositionCursor {
+        if (self.legacy) |legacy| {
+            const iterator = try allocator.create(PostingsIterator);
+            errdefer allocator.destroy(iterator);
+            iterator.* = try legacy.result.iterator(allocator);
+            errdefer iterator.deinit();
+            const hit = (try iterator.advanceToWithPositions(legacy.doc)) orelse return error.InvalidData;
+            if (hit.doc_id != legacy.doc or hit.positions.len != self.count) return error.InvalidData;
+            return .{ .data = &.{}, .remaining = self.count, .bits = self.bits, .byte_index = 0, .unpacked = hit.positions, .owned_iterator = iterator, .owned_allocator = allocator };
+        }
+        return self.cursor();
+    }
     pub fn cursor(self: PackedPositionView) !PackedPositionCursor {
-        if (self.bits > 32) return error.InvalidData;
+        if (self.bits > 32 or self.legacy != null) return error.InvalidData;
+        if (self.unpacked) |values| return .{ .data = &.{}, .remaining = self.count, .bits = self.bits, .byte_index = 0, .unpacked = values };
         const start_bit = std.math.mul(usize, self.start_index, self.bits) catch return error.InvalidData;
         const value_bits = std.math.mul(usize, self.count, self.bits) catch return error.InvalidData;
         const end_bit = std.math.add(usize, start_bit, value_bits) catch return error.InvalidData;
-        if ((std.math.add(usize, end_bit, 7) catch return error.InvalidData) / 8 > self.data.len) return error.InvalidData;
+        if ((std.math.add(usize, end_bit, 7) catch return error.InvalidData) / 8 > if (self.range) |range| range.length else self.data.len) return error.InvalidData;
 
         var result_cursor = PackedPositionCursor{
             .data = self.data,
+            .range = self.range,
+            .read_cache = self.read_cache,
             .remaining = self.count,
             .bits = self.bits,
             .byte_index = start_bit / 8,
         };
         const initial_skip: u3 = @intCast(start_bit % 8);
         if (self.bits != 0 and initial_skip != 0) {
-            result_cursor.reservoir = @as(u64, self.data[result_cursor.byte_index]) >> initial_skip;
+            result_cursor.reservoir = @as(u64, try result_cursor.readByte(result_cursor.byte_index)) >> initial_skip;
             result_cursor.reservoir_bits = 8 - @as(u8, initial_skip);
             result_cursor.byte_index += 1;
         }
@@ -3251,14 +3317,50 @@ pub const PackedPositionCursor = struct {
     reservoir: u64 = 0,
     reservoir_bits: u8 = 0,
     previous: u32 = 0,
+    range: ?@import("../segment_source.zig").View = null,
+    read_cache: ?*PackedReadCache = null,
+    unpacked: ?[]const u32 = null,
+    unpacked_index: usize = 0,
+    owned_iterator: ?*PostingsIterator = null,
+    owned_allocator: ?Allocator = null,
+    read_buffer: [256]u8 = undefined,
+    read_start: usize = 0,
+    read_length: usize = 0,
+    pub fn deinit(self: *PackedPositionCursor) void {
+        if (self.owned_iterator) |iterator| {
+            iterator.deinit();
+            self.owned_allocator.?.destroy(iterator);
+        }
+    }
+    fn readByte(self: *PackedPositionCursor, offset: usize) !u8 {
+        if (self.range) |range| {
+            if (offset >= range.length) return error.InvalidData;
+            if (range.source == .contiguous) return range.source.contiguous[@intCast(range.offset + offset)];
+            if (self.read_cache) |cache| return cache.byte(range, offset);
+            if (self.read_length == 0 or offset < self.read_start or offset - self.read_start >= self.read_length) {
+                self.read_start = offset;
+                self.read_length = @intCast(@min(self.read_buffer.len, range.length - offset));
+                try range.readInto(offset, self.read_buffer[0..self.read_length]);
+            }
+            return self.read_buffer[offset - self.read_start];
+        }
+        if (offset >= self.data.len) return error.InvalidData;
+        return self.data[offset];
+    }
 
     pub inline fn next(self: *PackedPositionCursor) !?u32 {
         if (self.remaining == 0) return null;
+        if (self.unpacked) |values| {
+            if (self.unpacked_index >= values.len) return error.InvalidData;
+            const position = values[self.unpacked_index];
+            self.unpacked_index += 1;
+            self.remaining -= 1;
+            return position;
+        }
         var delta: u32 = 0;
         if (self.bits != 0) {
             while (self.reservoir_bits < self.bits) {
-                if (self.byte_index >= self.data.len) return error.InvalidData;
-                self.reservoir |= @as(u64, self.data[self.byte_index]) << @intCast(self.reservoir_bits);
+                self.reservoir |= @as(u64, try self.readByte(self.byte_index)) << @intCast(self.reservoir_bits);
                 self.reservoir_bits += 8;
                 self.byte_index += 1;
             }
@@ -3272,6 +3374,282 @@ pub const PackedPositionCursor = struct {
         return self.previous;
     }
 };
+
+const PackedReadCache = struct {
+    const Source = @import("../segment_source.zig").Source;
+    const Page = struct { source: ?Source = null, start: u64 = 0, length: usize = 0, bytes: [4096]u8 = undefined };
+    pages: [4]Page = @splat(.{}),
+    next: usize = 0,
+    fn same(a: Source, b: Source) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .contiguous => |bytes| bytes.ptr == b.contiguous.ptr and bytes.len == b.contiguous.len,
+            .ranges => |range| range.ptr == b.ranges.ptr and range.read_into == b.ranges.read_into and range.length == b.ranges.length,
+        };
+    }
+    fn pageFor(self: *@This(), view: @import("../segment_source.zig").View, relative: u64) !*Page {
+        if (relative >= view.length) return error.InvalidData;
+        const source = view.source;
+        const offset = view.offset + relative;
+        for (&self.pages) |*page| if (page.source) |current| {
+            if (same(current, source) and offset >= page.start and offset - page.start < page.length) return page;
+        };
+        const page = &self.pages[self.next];
+        page.source = null;
+        page.length = 0;
+        const start = @max(view.offset, offset / 4096 * 4096);
+        const length: usize = @intCast(@min(4096, view.offset + view.length - start));
+        try source.readInto(start, page.bytes[0..length]);
+        page.start = start;
+        page.length = length;
+        page.source = source;
+        self.next = (self.next + 1) % self.pages.len;
+        return page;
+    }
+    fn byte(self: *@This(), view: @import("../segment_source.zig").View, relative: u64) !u8 {
+        const page = try self.pageFor(view, relative);
+        return page.bytes[@intCast(view.offset + relative - page.start)];
+    }
+    fn read(self: *@This(), view: @import("../segment_source.zig").View, relative: u64, out: []u8) !void {
+        if (relative > view.length or out.len > view.length - relative) return error.InvalidData;
+        var copied: usize = 0;
+        while (copied < out.len) {
+            const page = try self.pageFor(view, relative + copied);
+            const within: usize = @intCast(view.offset + relative + copied - page.start);
+            const take = @min(out.len - copied, page.length - within);
+            @memcpy(out[copied..][0..take], page.bytes[within..][0..take]);
+            copied += take;
+        }
+    }
+};
+
+fn exactPositionWidth(view: PackedPositionView, allocator: Allocator) !u8 {
+    var maximum: u32 = 0;
+    if (view.bits <= 1 and view.legacy == null and view.unpacked == null) {
+        var bytes = try view.packedBytes();
+        while (try bytes.next()) |part| maximum |= part.value;
+        return if (maximum == 0) 0 else 1;
+    }
+    var cursor = try view.cursorAlloc(allocator);
+    defer cursor.deinit();
+    var previous: u32 = 0;
+    while (try cursor.next()) |position| {
+        maximum |= position -% previous;
+        previous = position;
+    }
+    return @intCast(32 - @clz(maximum));
+}
+
+const PackedByteCursor = struct {
+    reader: PackedPositionCursor,
+    position: usize,
+    remaining: usize,
+    fn next(self: *@This()) !?struct { value: u8, width: u8 } {
+        if (self.remaining == 0) return null;
+        const index = self.position / 8;
+        const shift: u3 = @intCast(self.position % 8);
+        const take: u8 = @intCast(@min(8, self.remaining));
+        var value: u16 = @as(u16, try self.reader.readByte(index)) >> shift;
+        if (@as(u8, shift) + take > 8) value |= @as(u16, try self.reader.readByte(index + 1)) << @intCast(8 - @as(u8, shift));
+        const mask: u16 = (@as(u16, 1) << @intCast(take)) - 1;
+        self.position += take;
+        self.remaining -= take;
+        return .{ .value = @intCast(value & mask), .width = take };
+    }
+};
+
+const PackedHit = struct { hit: PostingsIterator.Hit, positions: PackedPositionView };
+fn positionBits(positions: []const u32) u8 {
+    var maximum: u32 = 0;
+    var previous: u32 = 0;
+    for (positions) |position| {
+        maximum |= if (position >= previous) position - previous else 0;
+        previous = position;
+    }
+    return @intCast(32 - @clz(maximum));
+}
+fn nextPackedHit(iterator: *PostingsIterator, result: *const LookupResult, cache: *PackedReadCache) !?PackedHit {
+    if (iterator.is_one_hit or !usesContiguousPositionGroups(iterator.version) or (iterator.positions_range == null and iterator.positions_data == null)) {
+        const decoded = (try iterator.next()) orelse return null;
+        return .{ .hit = decoded, .positions = .{ .legacy = if (decoded.positions.len == 0) null else .{ .result = result, .doc = decoded.doc_id }, .count = decoded.positions.len, .bits = positionBits(decoded.positions) } };
+    }
+    if (iterator.current_chunk_index == std.math.maxInt(usize) or iterator.chunk_doc_pos >= iterator.doc_values.items.len) {
+        if (iterator.next_chunk_index >= iterator.chunkCount()) return null;
+        const index = iterator.next_chunk_index;
+        try iterator.loadChunk(index);
+        try iterator.enterPositionChunk(index);
+    }
+    const doc_pos = iterator.chunk_doc_pos;
+    const doc_id = iterator.doc_values.items[doc_pos];
+    const decoded = decodeFreqHasLocs(iterator.freq_values.items[doc_pos]);
+    const count: usize = if (decoded.has_locs) @intCast(decoded.freq) else 0;
+    const bits = try iterator.ensurePositionGroup(doc_pos);
+    const view = PackedPositionView{
+        .data = if (iterator.positions_data) |data| data[iterator.positions_group_data_start..iterator.positions_chunk_end] else &.{},
+        .range = if (iterator.positions_range) |range| try @import("../segment_source.zig").View.init(range.source, range.offset + iterator.positions_group_data_start, iterator.positions_chunk_end - iterator.positions_group_data_start) else null,
+        .start_index = iterator.positions_group_value_offset,
+        .count = count,
+        .bits = bits,
+        .read_cache = cache,
+    };
+    if (count <= 32) return .{ .hit = try iterator.takeCurrentWithPositions(), .positions = view };
+    const norm = try iterator.readNorm(doc_id);
+    try iterator.advanceContiguousPositionRecord(doc_pos, count);
+    iterator.chunk_doc_pos += 1;
+    iterator.position_records_decoded +|= 1;
+    iterator.noteReturnedDoc(doc_id);
+    return .{ .hit = .{ .doc_id = doc_id, .freq = @intCast(decoded.freq), .norm = norm }, .positions = view };
+}
+
+fn PositionByteWriter(comptime Sink: type) type {
+    return struct {
+        sink: Sink,
+        buffer: [4096]u8 = undefined,
+        used: usize = 0,
+        reservoir: u64 = 0,
+        bits: u8 = 0,
+        fn byte(self: *@This(), byte_value: u8) !void {
+            self.buffer[self.used] = byte_value;
+            self.used += 1;
+            if (self.used == self.buffer.len) try self.flush();
+        }
+        fn flush(self: *@This()) !void {
+            if (self.used > 0) try self.sink.appendSlice(self.buffer[0..self.used]);
+            self.used = 0;
+        }
+        fn value(self: *@This(), value_: u32, width: u8) !void {
+            self.reservoir |= @as(u64, value_) << @intCast(self.bits);
+            self.bits += width;
+            if (self.bits >= 32) {
+                if (self.buffer.len - self.used < 4) try self.flush();
+                std.mem.writeInt(u32, self.buffer[self.used..][0..4], @truncate(self.reservoir), .little);
+                self.used += 4;
+                self.reservoir >>= 32;
+                self.bits -= 32;
+                if (self.used == self.buffer.len) try self.flush();
+            }
+            while (self.bits >= 8) {
+                try self.byte(@truncate(self.reservoir));
+                self.reservoir >>= 8;
+                self.bits -= 8;
+            }
+        }
+        fn bytes(self: *@This(), data: []const u8) !void {
+            std.debug.assert(self.bits == 0);
+            var offset: usize = 0;
+            while (offset < data.len) {
+                const take = @min(data.len - offset, self.buffer.len - self.used);
+                @memcpy(self.buffer[self.used..][0..take], data[offset..][0..take]);
+                self.used += take;
+                offset += take;
+                if (self.used == self.buffer.len) try self.flush();
+            }
+        }
+        fn appendPacked(self: *@This(), view: PackedPositionView) !void {
+            // Validate even empty windows before reading their packed bytes.
+            _ = try view.cursor();
+            var position = try std.math.mul(usize, view.start_index, view.bits);
+            var remaining = try std.math.mul(usize, view.count, view.bits);
+            var input: [4096]u8 = undefined;
+            while (remaining != 0) {
+                const skip: usize = position % 8;
+                const take = @min(remaining, input.len * 8 - skip);
+                const length = (skip + take + 7) / 8;
+                const offset = position / 8;
+                if (view.range) |range| {
+                    if (view.read_cache) |cache| try cache.read(range, offset, input[0..length]) else try range.readInto(offset, input[0..length]);
+                } else @memcpy(input[0..length], view.data[offset..][0..length]);
+                if (self.bits == 0 and skip == 0) {
+                    const whole = take / 8;
+                    try self.bytes(input[0..whole]);
+                    const tail: u8 = @intCast(take % 8);
+                    if (tail != 0) try self.value(input[whole] & ((@as(u8, 1) << @intCast(tail)) - 1), tail);
+                } else {
+                    // Repackage up to 32 bits at once, including misaligned
+                    // starts and output tails, rather than per-byte cursors.
+                    var bit = skip;
+                    const end = skip + take;
+                    while (bit < end) {
+                        const width: u8 = @intCast(@min(32, end - bit));
+                        const byte_offset = bit / 8;
+                        const shift: u3 = @intCast(bit % 8);
+                        const needed = (@as(usize, shift) + width + 7) / 8;
+                        var word: u64 = 0;
+                        if (needed >= 4) {
+                            word = std.mem.readInt(u32, input[byte_offset..][0..4], .little);
+                            if (needed == 5) word |= @as(u64, input[byte_offset + 4]) << 32;
+                        } else {
+                            for (input[byte_offset..][0..needed], 0..) |part, i| word |= @as(u64, part) << @intCast(i * 8);
+                        }
+                        word >>= shift;
+                        const mask: u64 = if (width == 32) std.math.maxInt(u32) else (@as(u64, 1) << @intCast(width)) - 1;
+                        try self.value(@intCast(word & mask), width);
+                        bit += width;
+                    }
+                }
+                position += take;
+                remaining -= take;
+            }
+        }
+        fn alignByte(self: *@This()) !void {
+            if (self.bits > 0) try self.byte(@truncate(self.reservoir));
+            self.reservoir = 0;
+            self.bits = 0;
+        }
+    };
+}
+fn appendPackedPositionsToSink(allocator: Allocator, sink: anytype, views: []const PackedPositionView) !usize {
+    var length: usize = 0;
+    var start: usize = 0;
+    while (start < views.len) : (start += position_doc_group_size) {
+        const group = views[start..@min(views.len, start + position_doc_group_size)];
+        var bits: u8 = 0;
+        var count: usize = 0;
+        for (group) |view| {
+            bits = @max(bits, view.encoded_width orelse view.bits);
+            count = try std.math.add(usize, count, view.count);
+        }
+        const packed_bits = try std.math.mul(usize, count, bits);
+        const packed_bytes = (try std.math.add(usize, packed_bits, 7)) / 8;
+        length = try std.math.add(usize, length, try std.math.add(usize, 1, packed_bytes));
+    }
+    var frame: [5]u8 = undefined;
+    var value: u32 = std.math.cast(u32, length) orelse return error.Overflow;
+    var used: usize = 0;
+    while (value >= 128) {
+        frame[used] = @as(u8, @truncate(value)) | 128;
+        used += 1;
+        value >>= 7;
+    }
+    frame[used] = @intCast(value);
+    used += 1;
+    try sink.appendSlice(frame[0..used]);
+    var output = PositionByteWriter(@TypeOf(sink)){ .sink = sink };
+    start = 0;
+    while (start < views.len) : (start += position_doc_group_size) {
+        const group = views[start..@min(views.len, start + position_doc_group_size)];
+        var bits: u8 = 0;
+        for (group) |view| bits = @max(bits, view.encoded_width orelse view.bits);
+        try output.byte(bits);
+        for (group) |view| {
+            if (bits == 0) continue;
+            if (view.bits == bits and view.legacy == null and view.unpacked == null) {
+                try output.appendPacked(view);
+            } else {
+                var cursor = try view.cursorAlloc(allocator);
+                defer cursor.deinit();
+                var previous: u32 = 0;
+                while (try cursor.next()) |position| {
+                    try output.value(if (position >= previous) position - previous else 0, bits);
+                    previous = position;
+                }
+            }
+        }
+        try output.alignByte();
+    }
+    try output.flush();
+    return used + length;
+}
 
 /// Iterates over (doc_id, freq, norm, positions) for a term's posting list.
 pub const PostingsIterator = struct {
@@ -4194,28 +4572,30 @@ pub const PostingsIterator = struct {
     }
 
     pub fn canTakeDeferredPackedPositions(self: *const PostingsIterator) bool {
-        return !self.is_one_hit and self.positions_range == null and self.positions_data != null and usesContiguousPositionGroups(self.version);
+        return !self.is_one_hit and (self.positions_range != null or self.positions_data != null) and usesContiguousPositionGroups(self.version);
     }
 
     /// Consume a deferred v30+ positional record as a zero-copy packed view.
     /// The caller may stream its delta values after this iterator advances;
     /// the view references immutable segment bytes rather than iterator scratch.
-    pub fn takeDeferredPackedPositions(self: *PostingsIterator) !PackedPositionView {
+    fn peekDeferredPackedPositions(self: *PostingsIterator) !PackedPositionView {
         if (!self.deferred_position_pending or !self.canTakeDeferredPackedPositions()) return error.InvalidData;
         if (self.chunk_doc_pos >= self.freq_values.items.len) return error.InvalidData;
-        self.deferred_position_pending = false;
-        const doc_pos = self.chunk_doc_pos;
-        const doc_id = self.doc_values.items[doc_pos];
-        const decoded = decodeFreqHasLocs(self.freq_values.items[doc_pos]);
-        const bits = try self.ensurePositionGroup(doc_pos);
-        const count: usize = if (decoded.has_locs) @intCast(decoded.freq) else 0;
-        const view = PackedPositionView{
-            .data = self.positions_data.?[self.positions_group_data_start..self.positions_chunk_end],
+        const decoded = decodeFreqHasLocs(self.freq_values.items[self.chunk_doc_pos]);
+        const bits = try self.ensurePositionGroup(self.chunk_doc_pos);
+        return .{
+            .data = if (self.positions_data) |data| data[self.positions_group_data_start..self.positions_chunk_end] else &.{},
+            .range = if (self.positions_range) |range| try @import("../segment_source.zig").View.init(range.source, range.offset + self.positions_group_data_start, self.positions_chunk_end - self.positions_group_data_start) else null,
             .start_index = self.positions_group_value_offset,
-            .count = count,
+            .count = if (decoded.has_locs) @intCast(decoded.freq) else 0,
             .bits = bits,
         };
-        try self.advanceContiguousPositionRecord(doc_pos, count);
+    }
+    pub fn takeDeferredPackedPositions(self: *PostingsIterator) !PackedPositionView {
+        const view = try self.peekDeferredPackedPositions();
+        self.deferred_position_pending = false;
+        const doc_id = self.doc_values.items[self.chunk_doc_pos];
+        try self.advanceContiguousPositionRecord(self.chunk_doc_pos, view.count);
         self.chunk_doc_pos += 1;
         self.position_records_decoded +|= 1;
         self.noteReturnedDoc(doc_id);
@@ -4601,9 +4981,10 @@ pub const PostingsIterator = struct {
     }
 };
 
-// ============================================================================
+// =====================================================================}
+
 // BM25 Scoring
-// ============================================================================
+// =====================================================================}
 
 pub const BM25Config = struct {
     k1: f32 = 1.2,
@@ -4907,9 +5288,10 @@ fn rebuildShiftedBlockMax(
     return out;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // 1-Hit Encoding
-// ============================================================================
+// =====================================================================}
 
 /// Mask for the encoding type in FST values (bits 63-62).
 pub const fst_val_encoding_mask: u64 = 0xc000000000000000;
@@ -4940,9 +5322,10 @@ pub fn fstValIs1Hit(v: u64) bool {
     return (v & fst_val_encoding_mask) == fst_val_encoding_1hit;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // freqHasLocs Encoding
-// ============================================================================
+// =====================================================================}
 
 /// Encode frequency and hasLocs flag into a single value.
 /// Format: (freq << 1) | hasLocsBit
@@ -4958,9 +5341,10 @@ pub fn decodeFreqHasLocs(v: u64) struct { freq: u64, has_locs: bool } {
     };
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Configuration
-// ============================================================================
+// =====================================================================}
 
 const PostingsLayout = enum {
     /// Branch-only v27 writer retained solely to construct compatibility and
@@ -5014,9 +5398,10 @@ pub fn productionIndexConfig() IndexConfig {
     return config;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Segment merger
-// ============================================================================
+// =====================================================================}
 
 /// Merge multiple inverted index sections into one.
 /// Input: slice of serialized section bytes.
@@ -5108,12 +5493,23 @@ pub fn writeMergedInvertedSectionSlotsWithDeletes(
 ) !void {
     if (sections.len != doc_counts.len) return error.InvalidData;
     if (deleted_docs) |deleted| if (deleted.len != sections.len) return error.InvalidData;
-    const maps = try alloc.alloc(RankDocMap, sections.len);
+    const maps = try prepareRankDocMaps(alloc, doc_counts, deleted_docs);
+    defer deinitRankDocMaps(alloc, maps);
+    const last = if (maps.len > 0) maps[maps.len - 1] else RankDocMap{ .len = 0, .offset = 0 };
+    const count = last.offset + (last.len - @as(u32, @intCast(if (last.deleted) |d| d.cardinality() else 0)));
+    try writeMergedInvertedSectionSlotsWithRankMaps(alloc, sink, sections, doc_counts, maps, count, config);
+}
+
+pub fn deinitRankDocMaps(alloc: Allocator, maps: []RankDocMap) void {
+    for (maps) |*map| if (map.rank_index) |*rank| rank.deinit();
+    alloc.free(maps);
+}
+
+pub fn prepareRankDocMaps(alloc: Allocator, doc_counts: []const u32, deleted_docs: ?[]const ?roaring.RoaringBitmap) ![]RankDocMap {
+    if (deleted_docs) |deleted| if (deleted.len != doc_counts.len) return error.InvalidData;
+    const maps = try alloc.alloc(RankDocMap, doc_counts.len);
     for (maps) |*map| map.* = .{ .len = 0, .offset = 0 };
-    defer {
-        for (maps) |*map| if (map.rank_index) |*rank| rank.deinit();
-        alloc.free(maps);
-    }
+    errdefer deinitRankDocMaps(alloc, maps);
     var offset: u32 = 0;
     for (doc_counts, maps, 0..) |count, *map, i| {
         const deleted = if (deleted_docs) |d| d[i] else null;
@@ -5126,7 +5522,11 @@ pub fn writeMergedInvertedSectionSlotsWithDeletes(
         if (deleted) |d| map.rank_index = try roaring.FrozenRankIndex.init(alloc, d);
         offset = try std.math.add(u32, offset, count - @as(u32, @intCast(cardinality)));
     }
-    try writeMappedInvertedSection(alloc, sink, sections, doc_counts, maps, offset, config);
+    return maps;
+}
+
+pub fn writeMergedInvertedSectionSlotsWithRankMaps(alloc: Allocator, sink: anytype, sections: anytype, doc_counts: []const u32, maps: []const RankDocMap, doc_count: u32, config: IndexConfig) !void {
+    try writeMappedInvertedSection(alloc, sink, sections, doc_counts, maps, doc_count, config);
 }
 
 const StreamedNorms = struct { len: usize };
@@ -5189,6 +5589,8 @@ pub const FileDocMap = struct {
     len: u32,
     ids: @import("../segment_source.zig").View,
     records: @import("../segment_source.zig").View,
+    monotonic: bool = true,
+    scratch: ?@import("../spill_sort.zig").Options = null,
 };
 const FileNormStream = struct {
     len: usize,
@@ -5444,16 +5846,59 @@ fn writeMappedInvertedSection(
             continue;
         }
 
+        if (file_maps and !stream_postings and candidate_frequency >= 4096 and config.wireVersion() == wire_version_current and config.postings_layout == .posting_count_v35) {
+            var stream = try ExternalPostingStream.init(alloc, current_entries, merged_term.items, effective_maps);
+            defer stream.deinit();
+            const value = try appendPostingStreamToSink(alloc, sink, section_start, &stream, stream.has_positions, merged_norms, &total_field_len, config);
+            for (current_entries, 0..) |entry_opt, i| {
+                const entry = entry_opt orelse continue;
+                if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
+            }
+            if (value) |dict_value| try dict_builder.add(merged_term.items, dict_value);
+            continue;
+        }
+
         {
             var acc = PostingAccumulator.init();
             defer acc.deinit(alloc);
 
+            // Compact terms stay in memory. Cross over before appending a hit
+            // that would exceed the byte limit, including position payloads.
+            // Restarting reads only a bounded prefix and releases it before
+            // opening the external sorter. Norm maxima are idempotent; restore
+            // the frequency sum so the restarted stream counts each hit once.
+            const initial_field_len = total_field_len;
+            var spill = false;
+            const bounded = config.wireVersion() == wire_version_current and config.postings_layout == .posting_count_v35 and (stream_postings or file_maps);
             for (current_entries, 0..) |entry_opt, seg_idx| {
                 const entry = entry_opt orelse continue;
                 if (!std.mem.eql(u8, entry.term, merged_term.items)) continue;
-
-                try appendLookupResultToAccumulator(alloc, &acc, entry.result, effective_maps[seg_idx], merged_norms, &total_field_len);
-                current_entries[seg_idx] = try term_iters[seg_idx].next();
+                if (!try appendLookupResultToAccumulatorLimited(alloc, &acc, entry.result, effective_maps[seg_idx], merged_norms, &total_field_len, if (bounded) 256 * 1024 else null)) {
+                    spill = true;
+                    break;
+                }
+            }
+            if (spill) {
+                acc.deinit(alloc);
+                acc = PostingAccumulator.init();
+                total_field_len = initial_field_len;
+                const value = if (stream_postings)
+                    try appendStreamedMergedTermToSink(alloc, sink, section_start, current_entries, merged_term.items, stream_maps, merged_norms, &total_field_len, config)
+                else if (file_maps) blk: {
+                    var stream = try ExternalPostingStream.init(alloc, current_entries, merged_term.items, effective_maps);
+                    defer stream.deinit();
+                    break :blk try appendPostingStreamToSink(alloc, sink, section_start, &stream, stream.has_positions, merged_norms, &total_field_len, config);
+                } else return error.InvalidData;
+                for (current_entries, 0..) |entry_opt, i| {
+                    const entry = entry_opt orelse continue;
+                    if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
+                }
+                if (value) |dict_value| try dict_builder.add(merged_term.items, dict_value);
+                continue;
+            }
+            for (current_entries, 0..) |entry_opt, i| {
+                const entry = entry_opt orelse continue;
+                if (std.mem.eql(u8, entry.term, merged_term.items)) current_entries[i] = try term_iters[i].next();
             }
 
             if (acc.doc_ids.items.len == 0) continue;
@@ -5584,11 +6029,24 @@ fn appendLookupResultToAccumulator(
     doc_norms: anytype,
     total_field_len: *u64,
 ) !void {
+    _ = try appendLookupResultToAccumulatorLimited(alloc, acc, result, rmap, doc_norms, total_field_len, null);
+}
+
+fn appendLookupResultToAccumulatorLimited(
+    alloc: Allocator,
+    acc: *PostingAccumulator,
+    result: LookupResult,
+    rmap: anytype,
+    doc_norms: anytype,
+    total_field_len: *u64,
+    byte_limit: ?usize,
+) !bool {
     switch (result) {
         .one_hit => |hit| {
-            if (hit.doc_num >= mapLength(rmap)) return;
+            if (hit.doc_num >= mapLength(rmap)) return true;
             const remapped_doc = try mapDocument(rmap, hit.doc_num);
-            if (remapped_doc == std.math.maxInt(u32)) return;
+            if (remapped_doc == std.math.maxInt(u32)) return true;
+            if (postingAccumulatorWouldSpill(acc, 0, byte_limit)) return false;
             try updateMergedNorm(doc_norms, remapped_doc, hit.norm_bits);
             try acc.add(alloc, remapped_doc, 1, hit.norm_bits, &.{});
             total_field_len.* += 1;
@@ -5602,20 +6060,142 @@ fn appendLookupResultToAccumulator(
                 if (hit.doc_id >= mapLength(rmap)) continue;
                 const remapped_doc = try mapDocument(rmap, hit.doc_id);
                 if (remapped_doc == std.math.maxInt(u32)) continue;
+                if (postingAccumulatorWouldSpill(acc, hit.positions.len, byte_limit)) return false;
                 try updateMergedNorm(doc_norms, remapped_doc, hit.norm);
                 try acc.add(alloc, remapped_doc, hit.freq, hit.norm, hit.positions);
                 total_field_len.* += hit.freq;
             }
         },
     }
+    return true;
 }
+
+fn postingAccumulatorWouldSpill(acc: *const PostingAccumulator, positions: usize, byte_limit: ?usize) bool {
+    const limit = byte_limit orelse return false;
+    // Include the reorder copy and descriptors, not just compressed wire bytes.
+    const bytes = (acc.doc_ids.items.len +| 1) *| (@sizeOf(u32) + @sizeOf(PostingMeta) + @sizeOf(PostingSortEntry)) +|
+        (acc.all_positions.items.len +| positions) *| (2 * @sizeOf(u32));
+    return bytes > limit;
+}
+
+/// Historical nonmonotonic maps reorder bounded posting records on disk.
+/// Position lists are copied once into private runs, never accumulated for an
+/// entire high-frequency term or reread from its source during sort carries.
+const ExternalPostingStream = struct {
+    const Spill = @import("../spill_sort.zig");
+    allocator: Allocator,
+    sorter: Spill.Sorter,
+    cursor: ?Spill.Cursor = null,
+    positions: std.ArrayListUnmanaged(u32) = .empty,
+    read_cache: ?*PackedReadCache = null,
+    has_positions: bool = false,
+    previous: ?u32 = null,
+    fn init(alloc: Allocator, entries: []const ?TermIterator.Entry, term: []const u8, maps: []const FileDocMap) !@This() {
+        if (maps.len == 0) return error.InvalidData;
+        var self = @This(){ .allocator = alloc, .sorter = try Spill.Sorter.init(alloc, maps[0].scratch orelse return error.InvalidData) };
+        errdefer self.deinit();
+        self.read_cache = try alloc.create(PackedReadCache);
+        self.read_cache.?.* = .{};
+        var encoded = std.ArrayListUnmanaged(u8).empty;
+        defer encoded.deinit(alloc);
+        for (entries, maps) |entry_opt, map| {
+            const entry = entry_opt orelse continue;
+            if (!std.mem.eql(u8, entry.term, term)) continue;
+            var result = entry.result;
+            var iterator = try result.iterator(alloc);
+            defer iterator.deinit();
+            while (try nextPackedHit(&iterator, &result, self.read_cache.?)) |packed_hit| {
+                const hit = packed_hit.hit;
+                if (hit.doc_id >= map.len) return error.InvalidData;
+                const doc = try mapDocument(map, hit.doc_id);
+                if (doc == std.math.maxInt(u32)) continue;
+                encoded.clearRetainingCapacity();
+                var header: [13]u8 = undefined;
+                std.mem.writeInt(u32, header[0..4], hit.freq, .little);
+                std.mem.writeInt(u32, header[4..8], hit.norm, .little);
+                std.mem.writeInt(u32, header[8..12], @intCast(packed_hit.positions.count), .little);
+                const encoded_width = try exactPositionWidth(packed_hit.positions, alloc);
+                header[12] = encoded_width;
+                try encoded.appendSlice(alloc, &header);
+                if (encoded_width != 0) {
+                    if (packed_hit.positions.bits == encoded_width and packed_hit.positions.legacy == null and packed_hit.positions.unpacked == null) {
+                        var bytes = try packed_hit.positions.packedBytes();
+                        while (try bytes.next()) |part| try encoded.append(alloc, part.value);
+                    } else {
+                        var cursor = try packed_hit.positions.cursorAlloc(alloc);
+                        defer cursor.deinit();
+                        var reservoir: u64 = 0;
+                        var bits: u8 = 0;
+                        var previous: u32 = 0;
+                        while (try cursor.next()) |position| {
+                            reservoir |= @as(u64, if (position >= previous) position - previous else 0) << @intCast(bits);
+                            bits += encoded_width;
+                            previous = position;
+                            while (bits >= 8) {
+                                try encoded.append(alloc, @truncate(reservoir));
+                                reservoir >>= 8;
+                                bits -= 8;
+                            }
+                        }
+                        if (bits > 0) try encoded.append(alloc, @truncate(reservoir));
+                    }
+                }
+                self.has_positions = self.has_positions or packed_hit.positions.count != 0;
+                try self.sorter.add(doc, encoded.items);
+            }
+        }
+        if (try self.sorter.finish()) |range| self.cursor = Spill.Cursor.init(alloc, self.sorter.run, range);
+        return self;
+    }
+    fn deinit(self: *@This()) void {
+        if (self.cursor) |*cursor| cursor.deinit();
+        self.positions.deinit(self.allocator);
+        if (self.read_cache) |cache| self.allocator.destroy(cache);
+        self.sorter.deinit();
+    }
+    pub fn packedBlock(self: *@This(), acc: *PostingAccumulator, views: *std.ArrayListUnmanaged(PackedPositionView), count: u32) !bool {
+        acc.doc_ids.clearRetainingCapacity();
+        acc.metas.clearRetainingCapacity();
+        acc.all_positions.clearRetainingCapacity();
+        views.clearRetainingCapacity();
+        if (self.cursor == null) return false;
+        while (acc.doc_ids.items.len < count) {
+            const record = (try self.cursor.?.nextView()) orelse break;
+            if (record.key >= std.math.maxInt(u32) or record.payload.length < 13) return error.InvalidData;
+            const doc: u32 = @intCast(record.key);
+            if (self.previous) |previous| if (previous >= doc) return error.InvalidData;
+            self.previous = doc;
+            var header: [13]u8 = undefined;
+            try record.payload.readInto(0, &header);
+            const frequency = std.mem.readInt(u32, header[0..4], .little);
+            const norm = std.mem.readInt(u32, header[4..8], .little);
+            const length = std.mem.readInt(u32, header[8..12], .little);
+            if (header[12] > 32 or packedU32ByteLen(length, header[12]) != record.payload.length - 13) return error.InvalidData;
+            try acc.doc_ids.append(self.allocator, doc);
+            try acc.metas.append(self.allocator, .{ .freq = frequency, .norm = norm, .position_count = length });
+            try views.append(self.allocator, .{ .range = try @import("../segment_source.zig").View.init(record.payload.source, record.payload.offset + 13, record.payload.length - 13), .count = length, .bits = header[12], .encoded_width = header[12], .read_cache = self.read_cache });
+        }
+        return acc.doc_ids.items.len != 0;
+    }
+    fn block(self: *@This(), acc: *PostingAccumulator, count: u32) !bool {
+        var views = std.ArrayListUnmanaged(PackedPositionView).empty;
+        defer views.deinit(self.allocator);
+        if (!try self.packedBlock(acc, &views, count)) return false;
+        for (views.items) |view| {
+            var cursor = try view.cursorAlloc(self.allocator);
+            defer cursor.deinit();
+            while (try cursor.next()) |position| try acc.all_positions.append(self.allocator, position);
+        }
+        return true;
+    }
+};
 
 /// A heap contains one borrowed hit per source iterator. Each hit is copied
 /// into the output block before advancing its source, so positions never escape
 /// the iterator's bounded working buffer.
 fn MergedPostingStream(comptime Maps: type) type {
     return struct {
-        const Head = struct { source: usize, doc_id: u32, hit: PostingsIterator.Hit };
+        const Head = struct { source: usize, doc_id: u32, frequency: u32, norm: u32 };
         const Heap = std.PriorityQueue(Head, void, struct {
             fn compare(_: void, a: Head, b: Head) std.math.Order {
                 return std.math.order(a.doc_id, b.doc_id);
@@ -5624,16 +6204,37 @@ fn MergedPostingStream(comptime Maps: type) type {
         allocator: Allocator,
         iterators: []?PostingsIterator,
         maps: Maps,
+        results: []?LookupResult,
+        head_views: []PackedPositionView,
+        decoded_heads: [][]const u32,
+        dense_ready: bool = false,
+        read_cache: *PackedReadCache,
         heap: Heap = .empty,
 
         fn init(alloc: Allocator, entries: []const ?TermIterator.Entry, term: []const u8, maps: Maps) !@This() {
-            var self = @This(){ .allocator = alloc, .iterators = try alloc.alloc(?PostingsIterator, entries.len), .maps = maps };
-            @memset(self.iterators, null);
-            errdefer self.deinit();
+            const iterators = try alloc.alloc(?PostingsIterator, entries.len);
+            errdefer alloc.free(iterators);
+            const results = try alloc.alloc(?LookupResult, entries.len);
+            errdefer alloc.free(results);
+            const head_views = try alloc.alloc(PackedPositionView, entries.len);
+            errdefer alloc.free(head_views);
+            const decoded_heads = try alloc.alloc([]const u32, entries.len);
+            errdefer alloc.free(decoded_heads);
+            const cache = try alloc.create(PackedReadCache);
+            errdefer alloc.destroy(cache);
+            cache.* = .{};
+            @memset(iterators, null);
+            @memset(results, null);
+            var self = @This(){ .allocator = alloc, .iterators = iterators, .results = results, .maps = maps, .read_cache = cache, .head_views = head_views, .decoded_heads = decoded_heads };
+            errdefer {
+                for (self.iterators) |*iterator| if (iterator.*) |*present| present.deinit();
+                self.heap.deinit(alloc);
+            }
             for (entries, 0..) |entry_opt, i| {
                 const entry = entry_opt orelse continue;
                 if (!std.mem.eql(u8, entry.term, term)) continue;
                 var result = entry.result;
+                self.results[i] = result;
                 self.iterators[i] = try result.iterator(alloc);
                 try self.advance(i);
             }
@@ -5642,35 +6243,105 @@ fn MergedPostingStream(comptime Maps: type) type {
         fn deinit(self: *@This()) void {
             for (self.iterators) |*iterator| if (iterator.*) |*present| present.deinit();
             self.allocator.free(self.iterators);
+            self.allocator.free(self.results);
+            self.allocator.free(self.head_views);
+            self.allocator.free(self.decoded_heads);
+            self.allocator.destroy(self.read_cache);
             self.heap.deinit(self.allocator);
         }
-        fn advance(self: *@This(), source: usize) !void {
+        fn nextSourceHit(self: *@This(), source: usize) !?PostingsIterator.Hit {
             const iterator = &self.iterators[source].?;
-            while (try iterator.next()) |hit| {
+            if (!iterator.is_one_hit and usesContiguousPositionGroups(iterator.version) and (iterator.positions_range != null or iterator.positions_data != null)) {
+                if (iterator.current_chunk_index == std.math.maxInt(usize) or iterator.chunk_doc_pos >= iterator.doc_values.items.len) {
+                    if (iterator.next_chunk_index >= iterator.chunkCount()) return null;
+                    const index = iterator.next_chunk_index;
+                    try iterator.loadChunk(index);
+                    try iterator.enterPositionChunk(index);
+                }
+                const decoded = decodeFreqHasLocs(iterator.freq_values.items[iterator.chunk_doc_pos]);
+                if (!decoded.has_locs or decoded.freq <= 32) {
+                    const hit = try iterator.takeCurrentWithPositions();
+                    // No packed descriptor copy on the decoded fast path.
+                    // The iterator retains group coordinates until this head
+                    // is emitted, so a crossover can materialize its view.
+                    self.head_views[source].count = hit.positions.len;
+                    self.head_views[source].unpacked = hit.positions;
+                    self.decoded_heads[source] = hit.positions;
+                    return hit;
+                }
+            }
+            const packed_hit = (try nextPackedHit(iterator, &self.results[source].?, self.read_cache)) orelse return null;
+            self.head_views[source] = packed_hit.positions;
+            self.decoded_heads[source] = packed_hit.hit.positions;
+            return packed_hit.hit;
+        }
+        fn advance(self: *@This(), source: usize) !void {
+            while (try self.nextSourceHit(source)) |hit| {
                 if (hit.doc_id >= mapLength(self.maps[source])) return error.InvalidData;
                 const mapped = try mapDocument(self.maps[source], hit.doc_id);
                 if (mapped == std.math.maxInt(u32)) continue;
-                try self.heap.push(self.allocator, .{ .source = source, .doc_id = mapped, .hit = hit });
+                try self.heap.push(self.allocator, .{ .source = source, .doc_id = mapped, .frequency = hit.freq, .norm = hit.norm });
                 return;
             }
         }
-        fn block(self: *@This(), acc: *PostingAccumulator, count: u32) !bool {
+        fn packedHeadView(self: *@This(), source: usize) !PackedPositionView {
+            const head = self.head_views[source];
+            if (head.unpacked == null) return head;
+            const iterator = &self.iterators[source].?;
+            if (head.count > iterator.positions_group_value_offset) return error.InvalidData;
+            return .{
+                .data = if (iterator.positions_data) |data| data[iterator.positions_group_data_start..iterator.positions_chunk_end] else &.{},
+                .range = if (iterator.positions_range) |range| try @import("../segment_source.zig").View.init(range.source, range.offset + iterator.positions_group_data_start, iterator.positions_chunk_end - iterator.positions_group_data_start) else null,
+                .start_index = iterator.positions_group_value_offset - head.count,
+                .count = head.count,
+                .bits = iterator.positions_group_bits,
+                .read_cache = self.read_cache,
+            };
+        }
+        pub fn packedBlock(self: *@This(), acc: *PostingAccumulator, views: *std.ArrayListUnmanaged(PackedPositionView), count: u32) !bool {
             acc.doc_ids.clearRetainingCapacity();
             acc.metas.clearRetainingCapacity();
             acc.all_positions.clearRetainingCapacity();
+            views.clearRetainingCapacity();
+            self.dense_ready = true;
             while (acc.doc_ids.items.len < count) {
                 const head = self.heap.pop() orelse break;
                 if (acc.doc_ids.items.len > 0 and acc.doc_ids.items[acc.doc_ids.items.len - 1] >= head.doc_id) return error.InvalidData;
-                try acc.add(self.allocator, head.doc_id, head.hit.freq, head.hit.norm, head.hit.positions);
+                try acc.doc_ids.append(self.allocator, head.doc_id);
+                try acc.metas.append(self.allocator, .{ .freq = head.frequency, .norm = head.norm, .position_count = @intCast(self.head_views[head.source].count) });
+                const positions = self.decoded_heads[head.source];
+                if (self.dense_ready and positions.len == self.head_views[head.source].count and acc.all_positions.items.len + positions.len <= 32 * 1024) {
+                    try acc.all_positions.appendSlice(self.allocator, positions);
+                } else {
+                    if (self.dense_ready) {
+                        // The bounded decoded prefix stays immutable after the
+                        // crossover. Materialize its references only now.
+                        var offset: usize = 0;
+                        for (acc.metas.items[0 .. acc.metas.items.len - 1]) |meta| {
+                            const prefix = acc.all_positions.items[offset..][0..meta.position_count];
+                            try views.append(self.allocator, .{ .unpacked = prefix, .count = prefix.len, .bits = positionBits(prefix) });
+                            offset += prefix.len;
+                        }
+                        self.dense_ready = false;
+                    }
+                    try views.append(self.allocator, try self.packedHeadView(head.source));
+                }
                 try self.advance(head.source);
             }
             return acc.doc_ids.items.len > 0;
+        }
+        pub fn densePositionsReady(self: *@This()) bool {
+            return self.dense_ready;
         }
     };
 }
 
 fn monotonicDocMaps(maps: anytype) bool {
-    if (std.meta.Elem(@TypeOf(maps)) == AffineDocMap or std.meta.Elem(@TypeOf(maps)) == RankDocMap or std.meta.Elem(@TypeOf(maps)) == FileDocMap) return true;
+    if (std.meta.Elem(@TypeOf(maps)) == FileDocMap) {
+        for (maps) |map| if (!map.monotonic) return false;
+        return true;
+    }
+    if (std.meta.Elem(@TypeOf(maps)) == AffineDocMap or std.meta.Elem(@TypeOf(maps)) == RankDocMap) return true;
     for (maps) |map| {
         var previous: ?u32 = null;
         for (map) |id| {
@@ -5690,7 +6361,7 @@ fn monotonicDocMaps(maps: anytype) bool {
 /// (u64/u32), and position offset/length (u64/u32), all LE. Offsets in records are
 /// relative to the interleaved block span; descriptor offsets are section-local.
 /// Only directory/impact navigation scales with term frequency; document and
-/// position scratch contains at most one output block. Arbitrary non-monotonic
+/// position scratch streams large blocks and caps dense blocks at 128 KiB. Arbitrary non-monotonic
 /// remappings continue through the sorting fallback.
 fn appendStreamedMergedTermToSink(
     alloc: Allocator,
@@ -5727,6 +6398,23 @@ const AccumulatorStream = struct {
     doc: usize = 0,
     position: usize = 0,
 
+    pub fn packedBlock(self: *@This(), out: *PostingAccumulator, views: *std.ArrayListUnmanaged(PackedPositionView), count: u32) !bool {
+        out.doc_ids.clearRetainingCapacity();
+        out.metas.clearRetainingCapacity();
+        out.all_positions.clearRetainingCapacity();
+        views.clearRetainingCapacity();
+        const end = @min(self.source.doc_ids.items.len, self.doc + count);
+        if (self.doc == end) return false;
+        try out.doc_ids.appendSlice(self.alloc, self.source.doc_ids.items[self.doc..end]);
+        try out.metas.appendSlice(self.alloc, self.source.metas.items[self.doc..end]);
+        for (self.source.metas.items[self.doc..end]) |meta| {
+            const positions = self.source.all_positions.items[self.position..][0..meta.position_count];
+            try views.append(self.alloc, .{ .unpacked = positions, .count = positions.len, .bits = positionBits(positions) });
+            self.position += positions.len;
+        }
+        self.doc = end;
+        return true;
+    }
     fn block(self: *@This(), out: *PostingAccumulator, count: u32) !bool {
         if (self.doc == self.source.doc_ids.items.len) return false;
         out.doc_ids.clearRetainingCapacity();
@@ -5756,6 +6444,13 @@ fn appendPostingStreamToSink(
 ) !?u64 {
     var acc = PostingAccumulator.init();
     defer acc.deinit(alloc);
+    var position_bytes = std.ArrayListUnmanaged(u8).empty;
+    defer position_bytes.deinit(alloc);
+    var crossover_positions = std.ArrayListUnmanaged(u32).empty;
+    defer crossover_positions.deinit(alloc);
+    var position_views = std.ArrayListUnmanaged(PackedPositionView).empty;
+    defer position_views.deinit(alloc);
+    const packed_stream = @hasDecl(@TypeOf(stream.*), "packedBlock");
     var block_scratch = PostingSerializeScratch{};
     defer block_scratch.deinit(alloc);
     var navigation = PostingSerializeScratch{};
@@ -5771,7 +6466,7 @@ fn appendPostingStreamToSink(
     var impact_max: u16 = 0;
     var impact_min: u16 = std.math.maxInt(u16);
     if (config.chunk_size == 0) return error.InvalidData;
-    while (try stream.block(&acc, config.chunk_size)) {
+    while (if (comptime packed_stream) try stream.packedBlock(&acc, &position_views, config.chunk_size) else try stream.block(&acc, config.chunk_size)) {
         if (previous_doc) |last| if (last >= acc.doc_ids.items[0]) return error.InvalidData;
         previous_doc = acc.doc_ids.items[acc.doc_ids.items.len - 1];
         for (acc.doc_ids.items, acc.metas.items) |id, meta| {
@@ -5792,10 +6487,45 @@ fn appendPostingStreamToSink(
         }
         doc_freq = try std.math.add(u32, doc_freq, @intCast(acc.doc_ids.items.len));
         block_scratch.reset();
+        var small_position_block = false;
+        if (packed_stream and has_positions) {
+            const dense_ready = if (comptime @hasDecl(@TypeOf(stream.*), "densePositionsReady")) stream.densePositionsReady() else false;
+            var count: u64 = acc.all_positions.items.len;
+            if (!dense_ready) {
+                count = 0;
+                for (position_views.items) |view| count += view.count;
+            }
+            small_position_block = count <= 32 * 1024;
+            if (small_position_block and !dense_ready) {
+                if (acc.all_positions.items.len == 0) {
+                    try acc.all_positions.ensureTotalCapacityPrecise(alloc, @intCast(count));
+                    for (position_views.items) |view| {
+                        const begin = acc.all_positions.items.len;
+                        acc.all_positions.items.len += view.count;
+                        try view.decodeInto(alloc, acc.all_positions.items[begin..], &position_bytes);
+                    }
+                } else {
+                    // A crossover prefix borrows acc.all_positions. Decode
+                    // into bounded storage before replacing that array.
+                    crossover_positions.clearRetainingCapacity();
+                    try crossover_positions.ensureTotalCapacityPrecise(alloc, @intCast(count));
+                    for (position_views.items) |view| {
+                        const begin = crossover_positions.items.len;
+                        crossover_positions.items.len += view.count;
+                        try view.decodeInto(alloc, crossover_positions.items[begin..], &position_bytes);
+                    }
+                    std.mem.swap(std.ArrayListUnmanaged(u32), &acc.all_positions, &crossover_positions);
+                }
+            } else if (!small_position_block) {
+                for (position_views.items) |*view| if (view.encoded_width == null) {
+                    view.encoded_width = try exactPositionWidth(view.*, alloc);
+                };
+            }
+        }
         var position_offset: usize = 0;
         // Size all position frames, including empty-location groups. If the
         // entire term has no positions, the positions stream is omitted.
-        const encoded = try acc.appendEncodedChunk(alloc, &block_scratch, config, 0, acc.doc_ids.items.len, 0, &position_offset, has_positions);
+        const encoded = try acc.appendEncodedChunk(alloc, &block_scratch, config, 0, acc.doc_ids.items.len, 0, &position_offset, has_positions and (!packed_stream or small_position_block));
         var record: [streamed_record_size]u8 = undefined;
         std.mem.writeInt(u32, record[0..4], encoded.metadata.max_doc, .little);
         std.mem.writeInt(u32, record[4..8], encoded.metadata.doc_count, .little);
@@ -5803,12 +6533,15 @@ fn appendPostingStreamToSink(
         std.mem.writeInt(u32, record[16..20], @intCast(block_scratch.payload.items.len), .little);
         try sink.appendSlice(block_scratch.payload.items);
         std.mem.writeInt(u64, record[20..28], sink.len() - span_start, .little);
-        std.mem.writeInt(u32, record[28..32], @intCast(block_scratch.positions.items.len), .little);
-        try sink.appendSlice(block_scratch.positions.items);
+        const position_length = if (packed_stream and has_positions and !small_position_block) try appendPackedPositionsToSink(alloc, sink, position_views.items) else blk: {
+            try sink.appendSlice(block_scratch.positions.items);
+            break :blk block_scratch.positions.items.len;
+        };
+        std.mem.writeInt(u32, record[28..32], @intCast(position_length), .little);
         try records.appendSlice(alloc, &record);
         payload_length = try std.math.add(u64, payload_length, @intCast(block_scratch.payload.items.len));
         // A positions-bearing term also frames blocks with no locations.
-        positions_length = try std.math.add(u64, positions_length, @intCast(block_scratch.positions.items.len));
+        positions_length = try std.math.add(u64, positions_length, @intCast(position_length));
     }
     if (doc_freq == 0) return null;
     if (doc_freq > config.chunk_size) {
@@ -5919,9 +6652,10 @@ fn finishStreamingSectionProfile(
     if (profile) |p| p.final_assembly_ns +|= platform_time.monotonicNs() - assembly_start;
 }
 
-// ============================================================================
+// =====================================================================}
+
 // Tests
-// ============================================================================
+// =====================================================================}
 
 test "build and query inverted index" {
     const alloc = std.testing.allocator;
@@ -8987,6 +9721,197 @@ test "append merge uses fixed scratch for sparse document spaces and deletion ra
     }
     try std.testing.expectEqual(peaks[0], peaks[1]);
     std.debug.print("APPEND_MERGE sparse_spaces=2053,200005 scratch_peaks={d},{d}\n", .{ peaks[0], peaks[1] });
+}
+
+test "packed spill preserves legacy and current positional sources with bounded records" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer a.free(directory);
+    for ([_]bool{ true, false }) |legacy_header| {
+        var builder = InvertedIndexBuilder.init(a, .{});
+        defer builder.deinit();
+        var positions: [256]u32 = undefined;
+        for (&positions, 0..) |*position, i| position.* = @intCast(i);
+        for (0..64) |doc| try builder.addDocument(@intCast(doc), &.{.{ .term = "common", .freq = 256, .norm = 256, .positions = &positions }});
+        const bytes = try builder.build();
+        defer a.free(bytes);
+        if (legacy_header) bytes[4] = wire_version_compact_postings_header;
+        const reader = try InvertedIndexReader.init(a, bytes);
+        var mappings: [64 * 4]u8 = undefined;
+        for (0..64) |doc| std.mem.writeInt(u32, mappings[doc * 4 ..][0..4], @intCast(63 - doc), .little);
+        const View = @import("../segment_source.zig").View;
+        const maps = [_]FileDocMap{.{ .len = 64, .ids = try View.init(.{ .contiguous = &mappings }, 0, mappings.len), .records = try View.init(.{ .contiguous = &.{} }, 0, 0), .monotonic = false, .scratch = .{ .io = std.testing.io, .directory = directory, .chunk_records = 4 } }};
+        const entries = [_]?TermIterator.Entry{.{ .term = "common", .result = reader.lookup("common").? }};
+        var stream = try ExternalPostingStream.init(a, &entries, "common", &maps);
+        defer stream.deinit();
+        try std.testing.expect(stream.sorter.input_bytes < 64 * 256 * 4 / 8);
+        var acc = PostingAccumulator.init();
+        defer acc.deinit(a);
+        var docs: u32 = 0;
+        while (try stream.block(&acc, 7)) {
+            var offset: usize = 0;
+            for (acc.doc_ids.items, acc.metas.items) |doc, meta| {
+                try std.testing.expectEqual(docs, doc);
+                docs += 1;
+                try std.testing.expectEqual(@as(u32, 256), meta.position_count);
+                try std.testing.expectEqualSlices(u32, &positions, acc.all_positions.items[offset..][0..256]);
+                offset += 256;
+            }
+        }
+        try std.testing.expectEqual(@as(u32, 64), docs);
+        std.debug.print("LITE_PACKED_SPILL layout={s} docs=64 positions=16384 raw_position_bytes=65536 packed_run_bytes={d}\n", .{ if (legacy_header) "v38" else "current", stream.sorter.input_bytes });
+        const Harness = struct {
+            fn run(allocator: Allocator, input_entries: []const ?TermIterator.Entry, input_maps: []const FileDocMap) !void {
+                var current = try ExternalPostingStream.init(allocator, input_entries, "common", input_maps);
+                defer current.deinit();
+                var values = PostingAccumulator.init();
+                defer values.deinit(allocator);
+                var refs = std.ArrayListUnmanaged(PackedPositionView).empty;
+                defer refs.deinit(allocator);
+                while (try current.packedBlock(&values, &refs, 7)) for (refs.items) |view| {
+                    var cursor = try view.cursorAlloc(allocator);
+                    defer cursor.deinit();
+                    while (try cursor.next()) |_| {}
+                };
+            }
+        };
+        try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const FileDocMap, &maps) });
+    }
+}
+
+test "streamed inline positions replay ownership unwinds every allocation failure" {
+    const a = std.testing.allocator;
+    var builder = InvertedIndexBuilder.init(a, .{});
+    defer builder.deinit();
+    try builder.addDocument(0, &.{.{ .term = "inline", .freq = 3, .positions = &.{ 0, 2, 5 } }});
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const reader = try InvertedIndexReader.init(a, bytes);
+    const result = reader.lookup("inline").?;
+    const Harness = struct {
+        fn run(allocator: Allocator, source: LookupResult) !void {
+            var sink = MergeMemorySink{ .alloc = allocator };
+            defer sink.deinit();
+            const placeholder: [v7_header_size]u8 = @splat(0);
+            try sink.appendSlice(&placeholder);
+            const entries = [_]?TermIterator.Entry{.{ .term = "inline", .result = source }};
+            const ids = [_]u32{0};
+            const maps = [_][]const u32{&ids};
+            var norms = [_]u32{0};
+            var total: u64 = 0;
+            _ = (try appendStreamedMergedTermToSink(allocator, &sink, 0, &entries, "inline", &maps, &norms, &total, .{})) orelse return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(u64, 3), total);
+        }
+    };
+    try Harness.run(a, result);
+    try std.testing.checkAllAllocationFailures(a, Harness.run, .{result});
+}
+
+test "packed span writer preserves every width alignment and bounded range reads" {
+    const a = std.testing.allocator;
+    const RangeReader = struct {
+        data: []const u8,
+        calls: usize = 0,
+        fn read(raw: *anyopaque, offset: u64, output: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (offset > self.data.len or output.len > self.data.len - offset) return error.EndOfStream;
+            self.calls += 1;
+            @memcpy(output, self.data[@intCast(offset)..][0..output.len]);
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var input: [8256]u8 = undefined;
+    for (&input, 0..) |*byte_, i| byte_.* = @truncate(i * 73 + 19);
+    var cases: usize = 0;
+    var range_calls: usize = 0;
+    for (0..33) |width| for ([_]usize{ 0, 1, 7 }) |start| for (0..8) |prefix| for ([_]usize{ 7, 2053 }) |count| {
+        var expected = MergeMemorySink{ .alloc = a };
+        defer expected.deinit();
+        var reference = PositionByteWriter(*MergeMemorySink){ .sink = &expected };
+        try reference.value(0x55 & ((@as(u32, 1) << @intCast(prefix)) - 1), @intCast(prefix));
+        for (start * width..(start + count) * width) |bit| try reference.value((input[bit / 8] >> @as(u3, @intCast(bit % 8))) & 1, 1);
+        try reference.alignByte();
+        try reference.flush();
+        for ([_]bool{ false, true }) |ranged| {
+            var reader = RangeReader{ .data = &input };
+            var actual = MergeMemorySink{ .alloc = a };
+            defer actual.deinit();
+            var writer = PositionByteWriter(*MergeMemorySink){ .sink = &actual };
+            try writer.value(0x55 & ((@as(u32, 1) << @intCast(prefix)) - 1), @intCast(prefix));
+            const view = PackedPositionView{
+                .data = if (ranged) &.{} else &input,
+                .range = if (ranged) try @import("../segment_source.zig").View.init(.{ .ranges = .{ .ptr = &reader, .length = input.len, .read_into = RangeReader.read, .close = RangeReader.close } }, 0, input.len) else null,
+                .start_index = start,
+                .count = count,
+                .bits = @intCast(width),
+            };
+            try writer.appendPacked(view);
+            try writer.alignByte();
+            try writer.flush();
+            try std.testing.expectEqualSlices(u8, expected.output.items, actual.output.items);
+            try std.testing.expect(reader.calls <= 4);
+            range_calls += reader.calls;
+            cases += 1;
+        }
+    };
+    std.debug.print("LITE_PACKED_SPANS cases={d} range_calls={d}\n", .{ cases, range_calls });
+}
+
+test "streamed positions preserve decoded prefix across packed crossover" {
+    const a = std.testing.allocator;
+    var positions: [16384]u32 = undefined;
+    for (&positions, 0..) |*position, i| position.* = @intCast(i * 3);
+    for ([_]usize{ 40, 16384 }) |large| {
+        var input = InvertedIndexBuilder.init(a, .{});
+        defer input.deinit();
+        for (0..256) |doc| {
+            const count: usize = if (doc % 3 == 1) large else 3;
+            try input.addDocument(@intCast(doc), &.{.{ .term = "mixed", .freq = @intCast(count), .norm = 7, .positions = positions[0..count] }});
+        }
+        const bytes_ = try input.build();
+        defer a.free(bytes_);
+        const reader = try InvertedIndexReader.init(a, bytes_);
+        var ids: [256]u32 = undefined;
+        for (&ids, 0..) |*id, i| id.* = @intCast(i);
+        var output = MergeMemorySink{ .alloc = a };
+        defer output.deinit();
+        try output.output.appendNTimes(a, 0, v7_header_size);
+        var norms: [256]u32 = @splat(0);
+        var total: u64 = 0;
+        const entries = [_]?TermIterator.Entry{.{ .term = "mixed", .result = reader.lookup("mixed").? }};
+        const maps = [_][]const u32{&ids};
+        const value = (try appendStreamedMergedTermToSink(a, &output, 0, &entries, "mixed", &maps, &norms, &total, .{})).?;
+        var output_reader = reader;
+        output_reader.data = output.output.items;
+        const term = output_reader.readPostings(value);
+        var iterator = try term.iterator(a);
+        defer iterator.deinit();
+        var expected_total: u64 = 0;
+        for (0..256) |doc| {
+            const hit = (try iterator.next()).?;
+            const count: usize = if (doc % 3 == 1) large else 3;
+            try std.testing.expectEqual(@as(u32, @intCast(doc)), hit.doc_id);
+            try std.testing.expectEqualSlices(u32, positions[0..count], hit.positions);
+            expected_total += count;
+        }
+        try std.testing.expectEqual(expected_total, total);
+        try std.testing.expect((try iterator.next()) == null);
+        if (large == 40) {
+            const Harness = struct {
+                fn run(allocator: Allocator, input_entries: []const ?TermIterator.Entry, input_maps: []const []const u32) !void {
+                    var sink = MergeMemorySink{ .alloc = allocator };
+                    defer sink.deinit();
+                    try sink.output.appendNTimes(allocator, 0, v7_header_size);
+                    var output_norms: [256]u32 = @splat(0);
+                    var field_length: u64 = 0;
+                    _ = (try appendStreamedMergedTermToSink(allocator, &sink, 0, input_entries, "mixed", input_maps, &output_norms, &field_length, .{})) orelse return error.TestExpectedEqual;
+                }
+            };
+            try std.testing.checkAllAllocationFailures(a, Harness.run, .{ @as([]const ?TermIterator.Entry, &entries), @as([]const []const u32, &maps) });
+        }
+    }
 }
 
 test "native scoped postings preserve prefetch through caches and translate section offsets" {

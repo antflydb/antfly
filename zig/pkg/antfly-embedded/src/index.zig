@@ -1435,7 +1435,7 @@ pub const IndexSnapshot = struct {
             flight_hash.update(std.mem.asBytes(&term.len));
             flight_hash.update(term);
         }
-        const stripe = flight_hash.final() % mutable.term_doc_freq_flights.len;
+        const stripe: usize = @intCast(flight_hash.final() % mutable.term_doc_freq_flights.len);
         const flight = &mutable.term_doc_freq_flights[stripe];
         while (!flight.tryLock()) {
             try self.checkScoringReadContext();
