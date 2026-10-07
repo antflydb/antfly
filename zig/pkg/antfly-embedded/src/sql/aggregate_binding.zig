@@ -348,11 +348,17 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         const definition = try (table orelse return error.InvalidSqlBackendResponse).column(name);
         column.* = .{ .name = try std.fmt.allocPrint(alloc, "$constant_{d}", .{index}), .type = definition.type, .nullable = definition.nullable };
     }
-    for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| column.type = program.?.output_type.kind orelse .string;
+    for (columns[0..groups.len], input.projections[0..groups.len]) |*column, program| {
+        column.type = program.?.output_type.kind orelse .string;
+        column.element_type = program.?.output_type.element_type;
+    }
     const specs = try alloc.alloc(operators.AggregateSpec, builder.aggregates.items.len);
     for (builder.aggregates.items, builder.inputs.items, specs, columns[groups.len..grouped_width]) |node, index, *spec, *column| {
         const kind = if (node.call.within_group != null) operators.Aggregate.Kind.count else aggregateKind(node.call.name).?;
         const input_type = if (index) |slot| input.projections[slot].?.output_type.kind else null;
+        if (node.call.within_group != null and orderedKind(node.call.name).? == .continuous) if (input_type) |typed| {
+            if (typed != .integer and typed != .number) return error.UndefinedSqlFunction;
+        };
         try operators.Aggregate.validate(kind, input_type);
         spec.* = .{ .kind = kind, .input_type = input_type, .distinct = node.call.distinct };
         column.type = switch (kind) {

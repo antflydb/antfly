@@ -149,6 +149,7 @@ pub const Manager = struct {
     pub fn create(self: *Manager) !File {
         self.lock();
         defer self.mutex.unlock();
+        if (self.max_bytes == 0) return error.SqlProgramLimitExceeded;
         try self.open();
         if (self.files >= 64) return error.SqlProgramLimitExceeded;
         self.sequence += 1;
@@ -163,6 +164,12 @@ pub const Manager = struct {
         return .{ .manager = self, .file = file, .id = self.sequence };
     }
     pub fn deinit(self: *Manager) void {
+        // Memory-only callers need no cancellation-capable Io. No resources
+        // below this boundary can exist without a directory or pattern owner.
+        if (self.dir == null and self.pattern_file == null and self.patterns.items.len == 0) {
+            self.patterns.deinit(self.allocator());
+            return;
+        }
         const protection = self.io.swapCancelProtection(.blocked);
         defer _ = self.io.swapCancelProtection(protection);
         for (self.patterns.items) |pattern| pattern.close(pattern.ptr);

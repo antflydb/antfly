@@ -20,6 +20,7 @@ const std = @import("std");
 pub const OrderedAggregate = @import("ordered_aggregate.zig").State;
 test {
     _ = @import("ordered_aggregate.zig");
+    _ = @import("ordered_grouped.zig");
 }
 const scalar = @import("scalar.zig");
 const ast = @import("ast.zig");

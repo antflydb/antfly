@@ -117,6 +117,10 @@ class PostgresReferenceTest(unittest.TestCase):
                 "42803",
             ),
             ("SELECT mode() WITHIN GROUP (ORDER BY 1) OVER ()", "0A000"),
+            (
+                "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY true)",
+                "42883",
+            ),
         )
         for sql, code in cases:
             with self.subTest(sql=sql):
@@ -139,6 +143,57 @@ class PostgresReferenceTest(unittest.TestCase):
                 "FROM (SELECT 1 AS x UNION ALL SELECT 3) t"
             ).fetchall(),
         )
+
+    def test_ordered_set_grouped_execution_domains(self):
+        cases = (
+            (
+                "SELECT mode() WITHIN GROUP (ORDER BY t.x DESC) FILTER (WHERE t.x>0) FROM (SELECT 1 AS x UNION ALL SELECT 3) t",
+                [(3,)],
+            ),
+            (
+                "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x),percentile_disc(0.5) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x),COUNT(*) FROM (SELECT 1 AS x UNION ALL SELECT 3 UNION ALL SELECT 3 UNION ALL SELECT 7) t",
+                [(3.0, 3, 3, 4)],
+            ),
+            (
+                "SELECT g,percentile_disc(NULL) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g ORDER BY g",
+                [(1, None, 1), (2, None, 10)],
+            ),
+            (
+                "SELECT g,mode() WITHIN GROUP (ORDER BY x) FILTER (WHERE x>5),percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g HAVING COUNT(*)=2 ORDER BY g",
+                [(1, None, 2.0), (2, 10, 15.0)],
+            ),
+            (
+                "SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x),COUNT(*) FROM (SELECT 1 AS x) t WHERE false",
+                [(None, None, 0)],
+            ),
+            (
+                "SELECT array_length(percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x),1) FROM (SELECT 1 AS x UNION ALL SELECT 3) t",
+                [(3,)],
+            ),
+            (
+                "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM ARRAY[1.5,NULL,2.5]::float8[] FROM (SELECT 1 AS x UNION ALL SELECT 3) t",
+                [(True,)],
+            ),
+            (
+                "SELECT percentile_disc('[0:2]={0.25,NULL,0.75}'::float8[]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM '[0:2]={1,NULL,3}'::bigint[] FROM (SELECT 1::bigint AS x UNION ALL SELECT 3::bigint) t",
+                [(True,)],
+            ),
+            (
+                "SELECT percentile_cont('{}'::float8[]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM '{}'::float8[] FROM (SELECT 1 AS x UNION ALL SELECT 3) t",
+                [(True,)],
+            ),
+            (
+                "SELECT array_length(percentile_disc(ARRAY[[0.25,NULL],[0.75,1.0]]) WITHIN GROUP (ORDER BY x),2) FROM (SELECT 1 AS x UNION ALL SELECT 3) t",
+                [(2,)],
+            ),
+            (
+                "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FILTER(WHERE x>10),mode() WITHIN GROUP(ORDER BY x) FROM (SELECT 1 AS x UNION ALL SELECT 3) t",
+                [(None, 1)],
+            ),
+        )
+        for sql, rows in cases:
+            with self.subTest(sql=sql):
+                self.assertEqual(rows, self.db.execute(sql).fetchall())
 
     def test_original_grouped_output_labels_are_not_visible_to_having(self):
         import json

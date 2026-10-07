@@ -129,8 +129,17 @@ fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn
             .integer => if (cell == .string) {
                 value = .{ .integer = try std.fmt.parseInt(i64, cell.string, 10) };
             },
-            .number => if (cell == .string) {
-                value = .{ .float = try std.fmt.parseFloat(f64, cell.string) };
+            .number => {
+                if (cell == .string) value = .{ .float = try std.fmt.parseFloat(f64, cell.string) };
+                // JSON has one numeric domain: a number column's integral
+                // float can serialize without a decimal point. Normalize
+                // only an exactly representable integer, never JSON cells or
+                // integer wire columns, and never round away bigint bits.
+                if (cell == .integer) {
+                    const number: f64 = @floatFromInt(cell.integer);
+                    if (@as(i128, @intFromFloat(number)) != cell.integer) return false;
+                    value = .{ .float = number };
+                }
             },
             .boolean => if (want == .integer) {
                 if (cell != .bool or cell.bool != (want.integer != 0)) return false;
@@ -152,6 +161,16 @@ fn rowMatchesWithNulls(alloc: std.mem.Allocator, columns: []const wire.SQLColumn
         } else if (!equivalent(value, want)) return false;
     }
     return true;
+}
+
+pub fn runNumberWireContracts(alloc: std.mem.Allocator) !void {
+    const number = [_]wire.SQLColumn{.{ .name = "n", .type = .number }};
+    const integer = [_]wire.SQLColumn{.{ .name = "n", .type = .integer }};
+    const json = [_]wire.SQLColumn{.{ .name = "n", .type = .json }};
+    try std.testing.expect(try rowMatches(alloc, &number, &.{.{ .integer = 33 }}, &.{false}, &.{.{ .float = 33 }}));
+    try std.testing.expect(!try rowMatches(alloc, &number, &.{.{ .integer = 9007199254740993 }}, &.{false}, &.{.{ .float = 9007199254740992 }}));
+    try std.testing.expect(!try rowMatches(alloc, &integer, &.{.{ .string = "9007199254740993" }}, &.{false}, &.{.{ .integer = 9007199254740992 }}));
+    try std.testing.expect(!try rowMatches(alloc, &json, &.{.{ .integer = 33 }}, &.{false}, &.{.{ .float = 33 }}));
 }
 
 fn execute(alloc: std.mem.Allocator, handler: anytype, case: *const fixtures.Corpus.Case) !std.json.Parsed(wire.SQLResponse) {

@@ -81,13 +81,33 @@ pub const State = struct {
     }
 
     /// Returned cells belong to the caller's result arena, never to a spill
-    /// head or mutable transition buffer. Request count is a compiler-bound
-    /// limit independent of group size. Finalization is single-use on errors.
+    /// head or mutable transition buffer. Request admission is independent of
+    /// group size. Finalization is single-use on errors.
     pub fn finish(self: *State, result_arena: A, requests: []const Request) ![]const Datum {
         if (self.finished or self.failed) return error.InvalidSqlBackendResponse;
         self.finished = true;
-        if (requests.len > 256) return error.SqlProgramLimitExceeded;
-        const a = self.sort.manager.allocator();
+        const Reader = struct {
+            sort: *spill.Sort,
+            pub fn next(reader: *@This(), a: A) !?Datum {
+                const row = (try reader.sort.next(a)) orelse return null;
+                if (row.keys.len != 1 or row.values.len != 0) return error.InvalidSqlSpill;
+                return row.keys[0];
+            }
+        };
+        var reader: Reader = .{ .sort = &self.sort };
+        return finishSorted(self.sort.manager, self.count, &reader, result_arena, requests);
+    }
+
+    /// Consume exactly one known-size group segment from an already sorted
+    /// stream. The caller can share a global grouped sort without re-sorting
+    /// each group or buffering its values. Even NULL-only requests drain the
+    /// segment, so the next invocation starts at the next group's boundary.
+    pub fn finishSorted(manager: *spill.Manager, count: usize, reader: anytype, result_arena: A, requests: []const Request) ![]const Datum {
+        // Scalar slots are compiler-bounded; array fractions additionally
+        // share the statement's logical array and resident-memory admission.
+        const array_targets = requests.len -| 256;
+        if (array_targets > manager.array_limits.elements or array_targets > manager.array_limits.bytes / (2 * @sizeOf(Event) + @sizeOf(Datum)) or requests.len > std.math.maxInt(usize) / 2) return error.SqlProgramLimitExceeded;
+        const a = manager.allocator();
         const events = try a.alloc(Event, requests.len * 2);
         defer a.free(events);
         var length: usize = 0;
@@ -104,20 +124,20 @@ pub const State = struct {
             }) orelse continue;
             // PostgreSQL validates direct arguments even for an empty group.
             if (!std.math.isFinite(fraction) or fraction < 0 or fraction > 1) return error.SqlNumericOutOfRange;
-            if (self.count == 0) continue;
+            if (count == 0) continue;
             if (request == .continuous) {
-                const rank = fraction * @as(f64, @floatFromInt(self.count - 1));
+                const rank = fraction * @as(f64, @floatFromInt(count - 1));
                 const lower: usize = @intFromFloat(@floor(rank));
                 const upper: usize = @intFromFloat(@ceil(rank));
-                events[length] = .{ .rank = @min(lower, self.count - 1), .output = index };
+                events[length] = .{ .rank = @min(lower, count - 1), .output = index };
                 length += 1;
                 if (upper != lower) {
-                    events[length] = .{ .rank = @min(upper, self.count - 1), .output = index, .upper = true, .blend = rank - @floor(rank) };
+                    events[length] = .{ .rank = @min(upper, count - 1), .output = index, .upper = true, .blend = rank - @floor(rank) };
                     length += 1;
                 }
             } else {
-                const rank: usize = @intFromFloat(@ceil(fraction * @as(f64, @floatFromInt(self.count))));
-                events[length] = .{ .rank = @min(rank -| 1, self.count - 1), .output = index };
+                const rank: usize = @intFromFloat(@ceil(fraction * @as(f64, @floatFromInt(count))));
+                events[length] = .{ .rank = @min(rank -| 1, count - 1), .output = index };
                 length += 1;
             }
         }
@@ -136,12 +156,11 @@ pub const State = struct {
         var best_count: usize = 0;
         var event: usize = 0;
         var rank: usize = 0;
-        while (rank < self.count and (needs_mode or event < length)) : (rank += 1) {
-            try self.sort.manager.checkpoint(self.sort.manager.context);
+        while (rank < count) : (rank += 1) {
+            try manager.check();
             _ = scratch.reset(.retain_capacity);
-            const row = (try self.sort.next(scratch.allocator())) orelse return error.InvalidSqlSpill;
-            if (row.keys.len != 1 or row.values.len != 0) return error.InvalidSqlSpill;
-            const value = row.keys[0];
+            const value = (try reader.next(scratch.allocator())) orelse return error.InvalidSqlSpill;
+            if (value.sql_null) return error.InvalidSqlSpill;
             if (needs_mode) {
                 const different = if (previous) |prior| (try scalar.compareDatums(prior, value)) != .eq else true;
                 if (different) {
@@ -171,6 +190,35 @@ pub const State = struct {
         return output;
     }
 };
+
+test "SQL ordered-set array requests exceed scalar slot count within statement admission" {
+    const Fixture = struct {
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    var marker: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = .failing, .context = &marker, .checkpoint = Fixture.checkpoint, .max_bytes = 0, .async_writes = false };
+    defer manager.deinit();
+    // Reject a disabled spill before any failing Io operation or cleanup.
+    try std.testing.expectError(error.SqlProgramLimitExceeded, manager.create());
+    try std.testing.expect(manager.dir == null);
+    var state = try State.init(&manager, 1024 * 1024, .{});
+    defer state.deinit();
+    try state.add(Datum.json(.{ .integer = 1 }));
+    try state.add(Datum.json(.{ .integer = 3 }));
+    var result = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer result.deinit();
+    const requests: [257]Request = @splat(.{ .continuous = 0.25 });
+    const output = try state.finish(result.allocator(), &requests);
+    try std.testing.expectEqual(requests.len, output.len);
+    for (output) |value| try std.testing.expectEqual(@as(f64, 1.5), value.value.float);
+    // Disabling arrays must not disable compiler-bounded scalar aggregates.
+    manager.array_limits = .{ .elements = 0, .bytes = 0 };
+    var mode = try State.init(&manager, 1024 * 1024, .{});
+    defer mode.deinit();
+    try mode.add(Datum.json(.{ .integer = 7 }));
+    const scalar_output = try mode.finish(result.allocator(), &.{.mode});
+    try std.testing.expectEqual(@as(i64, 7), scalar_output[0].value.integer);
+}
 
 test "SQL ordered-set reducer shares one bounded sorted stream and preserves requested ranks" {
     const Fixture = struct {

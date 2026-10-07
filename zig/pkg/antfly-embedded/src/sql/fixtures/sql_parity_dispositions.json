@@ -5720,8 +5720,12 @@
     },
     {
       "id": "sql-0560",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original mode and text tie ordering query executes through mounted HTTP over native typed storage. PostgreSQL independently verifies complete values, labels, type OIDs and SQL NULL flags. Compatible ordered aggregates share bounded grouped sorted streams; forced-spill and allocation-fault regressions cover ownership and cleanup.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0561",
@@ -5730,28 +5734,48 @@
     },
     {
       "id": "sql-0562",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original continuous percentile with explicit NULLS LAST query executes through mounted HTTP over native typed storage. PostgreSQL independently verifies complete values, labels, type OIDs and SQL NULL flags. Compatible ordered aggregates share bounded grouped sorted streams; forced-spill and allocation-fault regressions cover ownership and cleanup.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0563",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original descending continuous percentile query executes through mounted HTTP over native typed storage. PostgreSQL independently verifies complete values, labels, type OIDs and SQL NULL flags. Compatible ordered aggregates share bounded grouped sorted streams; forced-spill and allocation-fault regressions cover ownership and cleanup.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0564",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original filtered descending percentile with output-alias ordering and LIMIT query executes through mounted HTTP over native typed storage. PostgreSQL independently verifies complete values, labels, type OIDs and SQL NULL flags. Compatible ordered aggregates share bounded grouped sorted streams; forced-spill and allocation-fault regressions cover ownership and cleanup.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0565",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original exact discrete percentile with integer result type query executes through mounted HTTP over native typed storage. PostgreSQL independently verifies complete values, labels, type OIDs and SQL NULL flags. Compatible ordered aggregates share bounded grouped sorted streams; forced-spill and allocation-fault regressions cover ownership and cleanup.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0566",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original continuous percentile with floating result type query executes through mounted HTTP over native typed storage. PostgreSQL independently verifies complete values, labels, type OIDs and SQL NULL flags. Compatible ordered aggregates share bounded grouped sorted streams; forced-spill and allocation-fault regressions cover ownership and cleanup.",
+      "evidence": [
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-mounted-read-shapes"},
+        {"path": "zig/pkg/antfly/src/api/httpx_handler.zig", "test": "httpx SQL executes one relational page with exact integer parameters", "gate": "sql-postgres-read-reference"}
+      ]
     },
     {
       "id": "sql-0567",

@@ -73,6 +73,7 @@ pub fn validateStatement(a: std.mem.Allocator, provider: ?decisions.DecisionProv
     }
     if (bound.aggregate) |aggregate| {
         try aggregate.input.validateDecisions(a, parameters, provider);
+        for (aggregate.ordered) |plan| if (plan.direct) |*program| try validate(a, provider, program, parameters);
         for (aggregate.outputs) |*program| try validate(a, provider, program, parameters);
         for (aggregate.orders) |*program| try validate(a, provider, program, parameters);
         if (aggregate.having) |*program| try validate(a, provider, program, parameters);
@@ -270,6 +271,19 @@ const Mock = struct {
 pub const testing = if (@import("builtin").is_test) struct {
     pub const Provider = Mock;
 } else struct {};
+
+test "SQL ordered-set direct arguments validate providers before input execution" {
+    var compiled = try @import("compiler.zig").compile(std.testing.allocator, "SELECT percentile_cont(ai_probability('refund','Refund?','local')) WITHIN GROUP(ORDER BY 1)", .{});
+    defer compiled.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const aggregate = try @import("aggregate_binding.zig").bind(arena.allocator(), null, compiled.statement.select, &.{});
+    const bound: @import("describe.zig").BoundStatement = .{ .table = null, .action = .read, .columns = &.{}, .parameter_types = &.{}, .json_literals = .empty, .aggregate = &aggregate, .scalars = aggregate.input };
+    try std.testing.expectError(error.DecisionProviderUnavailable, validateStatement(arena.allocator(), null, bound, &.{}));
+    var mock: Mock = .{};
+    try validateStatement(arena.allocator(), mock.provider(), bound, &.{});
+    try std.testing.expectEqual(@as(usize, 0), mock.calls);
+}
 
 test "SQL prepared statement frames preserve provider validation and lazy decisions" {
     const a = std.testing.allocator;

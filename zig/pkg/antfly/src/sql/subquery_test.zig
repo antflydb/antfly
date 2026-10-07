@@ -34,21 +34,37 @@ const Backend = struct {
     }
 };
 
-test "SQL ordered-set planning preserves derived namespaces and rejects incomplete execution" {
+test "SQL ordered-set execution preserves grouped namespaces and shares compatible streams" {
     var backend: Backend = .{};
-    for ([_]struct { sql: []const u8, err: anyerror = error.UnsupportedSqlExecution }{
-        .{ .sql = "SELECT g,percentile_cont(g/10.0) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS g,2 AS x UNION ALL SELECT 1,4) t GROUP BY g" },
-        // The public result-type contract independently rejects SQL arrays.
-        // Preserve that boundary; never expose a JSON-array approximation.
-        .{ .sql = "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .err = error.UnsupportedSqlShape },
-        .{ .sql = "SELECT mode() WITHIN GROUP (ORDER BY t.x DESC) FILTER (WHERE t.x>0) FROM (SELECT 1 AS x UNION ALL SELECT 3) t" },
+    for ([_]struct { sql: []const u8, rows: []const u8 }{
+        .{ .sql = "SELECT g,percentile_cont(g/10.0) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS g,2 AS x UNION ALL SELECT 1,4) t GROUP BY g", .rows = "[[\"1\",2.2]]" },
+        .{ .sql = "SELECT mode() WITHIN GROUP (ORDER BY t.x DESC) FILTER (WHERE t.x>0) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[\"3\"]]" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x),percentile_disc(0.5) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x),COUNT(*) FROM (SELECT 1 AS x UNION ALL SELECT 3 UNION ALL SELECT 3 UNION ALL SELECT 7) t", .rows = "[[3,\"3\",\"3\",\"4\"]]" },
+        .{ .sql = "SELECT g,percentile_disc(NULL) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g ORDER BY g", .rows = "[[\"1\",null,\"1\"],[\"2\",null,\"10\"]]" },
+        .{ .sql = "SELECT g,percentile_disc(NULL) WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g ORDER BY g", .rows = "[[\"1\",null],[\"2\",null]]" },
+        .{ .sql = "SELECT g,mode() WITHIN GROUP (ORDER BY x) FILTER (WHERE x>5),percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FROM (SELECT 2 AS g,10 AS x UNION ALL SELECT 1,3 UNION ALL SELECT 2,20 UNION ALL SELECT 1,1) t GROUP BY g HAVING COUNT(*)=2 ORDER BY g", .rows = "[[\"1\",null,2],[\"2\",\"10\",15]]" },
+        .{ .sql = "SELECT percentile_cont(NULL) WITHIN GROUP (ORDER BY x),mode() WITHIN GROUP (ORDER BY x),COUNT(*) FROM (SELECT 1 AS x) t WHERE false", .rows = "[[null,null,\"0\"]]" },
+        .{ .sql = "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM (SELECT 9007199254740993 AS x UNION ALL SELECT 9007199254740995) t", .rows = "[[\"9007199254740993\"]]" },
+        .{ .sql = "SELECT array_length(percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x),1) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[\"3\"]]" },
+        .{ .sql = "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM ARRAY[1.5,NULL,2.5]::float8[] FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[true]]" },
+        .{ .sql = "SELECT percentile_disc('[0:2]={0.25,NULL,0.75}'::float8[]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM '[0:2]={1,NULL,3}'::bigint[] FROM (SELECT 1::bigint AS x UNION ALL SELECT 3::bigint) t", .rows = "[[true]]" },
+        .{ .sql = "SELECT percentile_cont('{}'::float8[]) WITHIN GROUP (ORDER BY x) IS NOT DISTINCT FROM '{}'::float8[] FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[true]]" },
+        .{ .sql = "SELECT array_length(percentile_disc(ARRAY[[0.25,NULL],[0.75,1.0]]) WITHIN GROUP (ORDER BY x),2) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[\"2\"]]" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY x) FILTER(WHERE x>10),mode() WITHIN GROUP(ORDER BY x) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .rows = "[[null,\"1\"]]" },
     }) |case| {
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
         defer compiled.deinit();
-        // Parser/typed-planning support must not accidentally expose the
-        // internal COUNT state as a completed ordered-set SQL result.
-        try std.testing.expectError(case.err, runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{}));
+        var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+        defer result.deinit();
+        const actual = try std.json.Stringify.valueAlloc(std.testing.allocator, result.output.rows, .{});
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(case.rows, actual);
     }
+    // Public array results remain a separate typed protocol boundary, not a
+    // JSON-array approximation. Internal arrays can feed scalar SQL outputs.
+    var array = try compiler.compile(std.testing.allocator, "SELECT percentile_cont(ARRAY[0.25,NULL,0.75]) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x UNION ALL SELECT 3) t", .{});
+    defer array.deinit();
+    try std.testing.expectError(error.UnsupportedSqlShape, runtime.execute(std.testing.allocator, backend.backend(), &array, &.{}, .{}));
     const invalid = [_]struct { sql: []const u8, code: []const u8 }{
         .{ .sql = "SELECT COUNT(*) WITHIN GROUP (ORDER BY 1)", .code = "42809" },
         .{ .sql = "SELECT percentile_cont(0.5)", .code = "42883" },
@@ -58,6 +74,8 @@ test "SQL ordered-set planning preserves derived namespaces and rejects incomple
         .{ .sql = "SELECT percentile_cont(x) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x,2 AS g) t GROUP BY g", .code = "42803" },
         .{ .sql = "SELECT percentile_cont(SUM(x)) WITHIN GROUP (ORDER BY x) FROM (SELECT 1 AS x) t", .code = "42803" },
         .{ .sql = "SELECT mode() WITHIN GROUP (ORDER BY 1) OVER ()", .code = "0A000" },
+        .{ .sql = "SELECT percentile_cont(-1) WITHIN GROUP(ORDER BY x) FROM (SELECT 1 AS x) t WHERE false", .code = "22003" },
+        .{ .sql = "SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY true)", .code = "42883" },
     };
     for (invalid) |case| {
         var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});

@@ -4931,6 +4931,54 @@
       "affected": 0
     },
     {
+      "id": "sql-0560",
+      "columns": ["customer_id", "modal_status"],
+      "rows": [["c1", "ready"], ["c2", "ready"]],
+      "sql_nulls": [[false, false], [false, false]],
+      "column_oids": [25, 25],
+      "affected": 0
+    },
+    {
+      "id": "sql-0562",
+      "columns": ["customer_id", "median_amount"],
+      "rows": [["c1", 33.0], ["c2", 36.0]],
+      "sql_nulls": [[false, false], [false, false]],
+      "column_oids": [25, 701],
+      "affected": 0
+    },
+    {
+      "id": "sql-0563",
+      "columns": ["customer_id", "median_amount"],
+      "rows": [["c1", 33.0], ["c2", 36.0]],
+      "sql_nulls": [[false, false], [false, false]],
+      "column_oids": [25, 701],
+      "affected": 0
+    },
+    {
+      "id": "sql-0564",
+      "columns": ["customer_id", "open_median"],
+      "rows": [["c1", null], ["c2", 12.0]],
+      "sql_nulls": [[false, true], [false, false]],
+      "column_oids": [25, 701],
+      "affected": 0
+    },
+    {
+      "id": "sql-0565",
+      "columns": ["customer_id", "median_amount"],
+      "rows": [["c1", 33], ["c2", 36]],
+      "sql_nulls": [[false, false], [false, false]],
+      "column_oids": [25, 20],
+      "affected": 0
+    },
+    {
+      "id": "sql-0566",
+      "columns": ["customer_id", "median_amount"],
+      "rows": [["c1", 33.0], ["c2", 36.0]],
+      "sql_nulls": [[false, false], [false, false]],
+      "column_oids": [25, 701],
+      "affected": 0
+    },
+    {
       "id": "sql-1205",
       "columns": [
         "order_id",

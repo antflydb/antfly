@@ -56,6 +56,7 @@ fn boundDecisionFunctions(alloc: Allocator, bound: describe.BoundStatement, func
     try scalarDecisionFunctions(alloc, bound.scalars, functions);
     if (bound.aggregate) |aggregate| {
         try scalarDecisionFunctions(alloc, aggregate.input, functions);
+        for (aggregate.ordered) |plan| if (plan.direct) |*program| try decisionFunctions(alloc, program, functions);
         for (aggregate.outputs) |*program| try decisionFunctions(alloc, program, functions);
         for (aggregate.orders) |*program| try decisionFunctions(alloc, program, functions);
         if (aggregate.having) |*program| try decisionFunctions(alloc, program, functions);

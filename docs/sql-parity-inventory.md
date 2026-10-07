@@ -44,7 +44,7 @@ uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_
 uv run --no-project --with 'psycopg[binary]==3.3.6' python -m unittest discover -s scripts -p test_generate_sql_postgres_reference.py
 ```
 
-The fixed 251-case read and 211-case document campaign manifests still describe
+The 261-case read and 211-case document campaign manifests still describe
 the complete cohorts, not a claim that every case works. Oracle admission and
 discovery-mode native runs do not change dispositions; selected goldens must
 pass the non-discovery native endpoint gate before receiving completion credit.
@@ -205,8 +205,8 @@ original entry remains identifiable by its canonical hash (sorted JSON keys,
 compact separators, UTF-8 without ASCII escaping).
 
 The matching `sql_parity_dispositions.json` must account for every ID exactly once.
-The current branch records 352 implemented, 136 rejected and 73 superseded
-cases, with 1,025 still unresolved. The earlier batches add 77 exact compiler
+The current branch records 358 implemented, 136 rejected and 73 superseded
+cases, with 1,019 still unresolved. The earlier batches add 77 exact compiler
 rejection contracts, 115 mounted native reads, twelve native UPDATE/DELETE
 contracts and six independently referenced mutations
 contracts; they do not claim complete SQL
@@ -531,9 +531,9 @@ SUM, frame calculations and sort keys must still see all required input rows.
 
 General grouped/window scalar-subquery output staging, cross-level aggregate lifting and wildcard
 ORDER BY ordinal mapping remain unfinished. These shared execution regressions
-do not change the original-case dispositions or the 1,025 unresolved total.
+do not independently change the original-case dispositions.
 
-### Ordered-set execution core (SQL activation unfinished)
+### Shared streaming ordered-set execution
 
 `operators.OrderedAggregate` provides a statement-owned, bounded external-sort
 transition for compatible `mode`, continuous percentile and discrete percentile
@@ -560,15 +560,32 @@ to shared-sort classes. It rejects ungrouped direct arguments and aggregate
 nesting with 42803 and wrong aggregate clause kinds with 42809. Parser-owned
 nesting and allocation limits still cover the ordered expressions.
 
-This is **not** completed SQL support: grouped invocation ownership and sorted
-run delivery, execution-side FILTER integration, array-fraction dimension and
-NULL reconstruction, compatible-sort reuse across executed aggregate slots,
-and mounted exact-source execution still need integration. Execution rejects
-the staged ordered plans with 0A000 rather than returning internal COUNT states
-as percentile/mode values. Derived-name and array planning tests explicitly
-verify that boundary, alongside independent PostgreSQL namespace diagnostics.
-The seven original ordered-set cases `sql-0560`–`sql-0566` remain unresolved;
-no corpus disposition or coverage count changes from this core alone.
+The execution path now captures one group-key/value stream per compatible
+input/FILTER/order domain. It separately sorts compact group summaries, then
+merge-zips each summary with its known-size input segments. Finalization drains
+the complete segment even for NULL fractions, preserving the next group's
+boundary. Direct arguments evaluate in their grouped key/invocation-constant
+domain; final values replace internal count slots before HAVING, projection and
+final ordering. Row, decision-batch and column scan paths use the same collector.
+The existing ordinary parallel aggregate path remains unchanged; ordered-set
+input collection currently runs serially, without a false partial-merge claim.
+
+Array fractions share that same rank-event pass and retain dimensions, bounds,
+element types and SQL NULLs for internal SQL expressions. Requests additionally
+obey statement array/memory admission. Public typed-array result delivery is
+still unfinished and is rejected rather than approximated with JSON arrays.
+Backends without an Io execute within the in-memory budget and reject spill
+admission before filesystem access. Forced-spill grouped tests verify one
+512-value domain, not three duplicate streams, across 128 interleaved groups;
+allocation-fault enumeration verifies cleanup. PostgreSQL and native regressions
+cover grouped fractions, mixed ordinary/ordered aggregates, null-only requests,
+FILTER, empty input, exact discrete bigints and multidimensional fractions.
+
+Six unchanged originals (`sql-0560`, `sql-0562`–`sql-0566`) now pass the mounted
+HTTP/native-storage gate and the reproducible PostgreSQL golden gate, including
+labels, type OIDs, complete values, ordering and SQL NULL flags. The required-ID
+guard prevents regeneration from silently removing them. The array-result
+original `sql-0561` remains unresolved pending the public typed-array contract.
 
 ```sh
 uv run --no-project --with 'psycopg[binary]==3.3.6' python scripts/generate_sql_postgres_reference.py mutation --check zig/pkg/antfly-embedded/src/sql/fixtures/sql_mutation_postgres_reference.json
