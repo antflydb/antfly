@@ -1212,6 +1212,7 @@ pub const RuntimeIndexSourceReplayStatusReport = struct {
     published_sequence: u64 = 0,
     target_sequence: u64 = 0,
     failed: bool = false,
+    producer_complete: bool = false,
 };
 
 pub const max_schema_progress_batch = 64;
@@ -2714,6 +2715,7 @@ pub fn cloneRuntimeIndexStatusReport(alloc: std.mem.Allocator, record: RuntimeIn
             .published_sequence = source.published_sequence,
             .target_sequence = source.target_sequence,
             .failed = source.failed,
+            .producer_complete = source.producer_complete,
         };
         source_count += 1;
     }

@@ -1398,6 +1398,10 @@ pub const IndexManager = struct {
     vector_block_candidate_sequence: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     vector_block_candidate_since_ns: @import("antfly_platform").atomic.Value(u64) = @import("antfly_platform").atomic.Value(u64).init(0),
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
+    /// Serialize local receipt counter preparation through its physical commit.
+    /// Acquire after primary/graph/index guards; never acquire an index guard
+    /// while holding this mutex. Provider execution happens before acquisition.
+    local_coverage_mutex: std.atomic.Mutex = .unlocked,
     /// Bound by the physical DB before index load. Unpublished/shadow managers
     /// do not inherit the serving root's projection evidence authority.
     artifact_projection_root: u128 = 0,
@@ -3012,6 +3016,20 @@ pub const IndexManager = struct {
     pub fn beginGraphSourceReplay(self: *IndexManager) GraphPrimaryPublicationLease {
         self.graph_primary_publication.lockShared();
         return .{ .manager = self, .mode = .replay };
+    }
+
+    pub const LocalCoverageGuard = struct {
+        manager: ?*IndexManager = null,
+
+        pub fn release(self: *LocalCoverageGuard) void {
+            if (self.manager) |manager| manager.local_coverage_mutex.unlock();
+            self.manager = null;
+        }
+    };
+
+    pub fn lockLocalCoverage(self: *IndexManager) LocalCoverageGuard {
+        self.lockAtomicWithBackoff(&self.local_coverage_mutex);
+        return .{ .manager = self };
     }
 
     pub const ManagedIndexApplyGuard = struct {
@@ -14469,6 +14487,22 @@ pub const IndexManager = struct {
             request.requires_committed_graph = request.neighbor_context_json.len != 0 or
                 self.artifactRequiresCommittedGraph(request.upstream_artifact_name) or
                 (request.input_kind != .document and self.artifactRequiresCommittedGraph(request.artifact_name));
+            // External graph producers publish contender replacement after the
+            // primary commit, including cached outputs. Compile the dependency
+            // into the pinned template so per-row precommit planning stays cheap.
+            if (request.kind == .asset and request.producer_json.len != 0) {
+                var producer = try asset_producer_mod.parseProducerConfig(alloc, request.producer_json);
+                defer producer.deinit(alloc);
+                if (producer.type != .copy) {
+                    for (self.graph_indexes.items) |entry| {
+                        const name = if (request.artifact_name.len != 0) request.artifact_name else request.index_name;
+                        if (self.graphArtifactSourceForArtifact(entry.config.name, name) != null) {
+                            request.requires_committed_graph = true;
+                            break;
+                        }
+                    }
+                }
+            }
         }
         return try requests.toOwnedSlice(alloc);
     }

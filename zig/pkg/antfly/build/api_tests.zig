@@ -1441,6 +1441,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "derived coverage aggregation rejects mixed config observations",
             "derived coverage embedding activity aggregation is order independent and phase authoritative",
             "derived coverage ready full text status reports complete progress",
+            "derived coverage artifact projections use source readiness without vector counters",
             "readiness observation completion requires convergence and full topology",
             "late source target notification cannot revoke an already observed target",
             "late exact index notification preserves completed observation and reduction authority",

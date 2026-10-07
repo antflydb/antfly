@@ -3052,6 +3052,7 @@ pub const DB = struct {
     artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
+    local_source_completion_audit_pending: bool = true,
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
     /// no_progress_timeout_ns`); 0 disables it. Copied into `ReplayDrainOptions`
@@ -9376,11 +9377,24 @@ pub const DB = struct {
         return true;
     }
 
+    /// Public reprocessing acknowledges durable submission, not completion of
+    /// every enrichment/index on the source. Completion is observed through
+    /// artifact status; unrelated retrying providers must not fail submission.
     pub fn reprocessDocumentArtifact(
         self: *DB,
         alloc: Allocator,
         doc_key: []const u8,
         artifact_name: []const u8,
+    ) !bool {
+        return self.reprocessDocumentArtifactWithCompletionWait(alloc, doc_key, artifact_name, false);
+    }
+
+    fn reprocessDocumentArtifactWithCompletionWait(
+        self: *DB,
+        alloc: Allocator,
+        doc_key: []const u8,
+        artifact_name: []const u8,
+        wait_for_completion: bool,
     ) !bool {
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse return false;
         defer cfg.deinit(alloc);
@@ -9392,10 +9406,14 @@ pub const DB = struct {
 
         const writes = [_]types.BatchWrite{.{ .key = doc_key, .value = value }};
         const force_artifacts = [_][]const u8{artifact_name};
+        // Preserve forced generation's precommit planning. A write-only sync
+        // level would lose the force flag for unchanged cached asset outputs.
+        // Public acceptance only skips the postcommit, table-wide visibility wait.
         try self.batchInternal(.{
             .writes = &writes,
             .sync_level = .full_index,
         }, null, .{
+            .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
         });
         return true;
@@ -9412,7 +9430,7 @@ pub const DB = struct {
             .doc_key = doc_key,
             .artifact_name = artifact_name,
         };
-        return self.reprocessEmbeddingArtifactIssue(alloc, issue) catch |err| switch (err) {
+        return self.reprocessEmbeddingArtifactIssue(alloc, issue, false) catch |err| switch (err) {
             error.NotFound => false,
             else => return err,
         };
@@ -9422,6 +9440,7 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         issue: types.ArtifactRepairIssue,
+        wait_for_completion: bool,
     ) !bool {
         var cfg = (try self.getEnrichment(alloc, .embedding, issue.artifact_name)) orelse return false;
         defer cfg.deinit(alloc);
@@ -9436,6 +9455,7 @@ pub const DB = struct {
             .writes = &writes,
             .sync_level = .full_index,
         }, null, .{
+            .wait_for_sync_level = wait_for_completion,
             .force_generated_artifact_names = &force_artifacts,
         });
         return true;
@@ -11073,8 +11093,8 @@ pub const DB = struct {
         issue: types.ArtifactRepairIssue,
     ) !bool {
         return switch (issue.artifact_kind) {
-            .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue),
-            .asset => try self.reprocessDocumentArtifact(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name),
+            .embedding => try self.reprocessEmbeddingArtifactIssue(alloc, issue, true),
+            .asset => try self.reprocessDocumentArtifactWithCompletionWait(alloc, if (issue.parent_doc_key.len > 0) issue.parent_doc_key else issue.doc_key, issue.artifact_name, true),
             .chunk => try self.reprocessChunkArtifactIssue(alloc, issue),
             .graph, .full_text, .algebraic => false,
         };
@@ -11551,6 +11571,7 @@ pub const DB = struct {
         alloc: Allocator,
         intent: index_repair_state.IndexRepairIntent,
     ) !bool {
+        if (try self.localArtifactSourceRecoveryIsServiceable(alloc, intent)) return true;
         const minimum_replay = (try self.managedInitialBuildMinimumReplay(alloc, intent)) orelse return false;
         if (!initialBuildCanRetireBeforeActivation(intent) or intent.source_replay_state == .pending) return false;
         if (intent.candidate_relative_path) |candidate| {
@@ -11562,6 +11583,59 @@ pub const DB = struct {
             intent.config_hash,
             minimum_replay,
         );
+    }
+
+    /// Receipt migration reuses the published text/graph generation. Once its
+    /// bounded source pass, producer receipts and native checkpoint agree, a
+    /// shadow rebuild would only duplicate already published artifacts.
+    fn localArtifactSourceRecoveryIsServiceable(self: *DB, alloc: Allocator, intent: index_repair_state.IndexRepairIntent) !bool {
+        if ((intent.kind != .full_text and intent.kind != .graph) or
+            intent.work_class != .initial_build or
+            (intent.trigger != .replay_artifact_unavailable and intent.trigger != .catalog_admission) or
+            intent.source_replay_state == .pending or !initialBuildCanRetireBeforeActivation(intent) or
+            intent.root_generation != self.core.root_generation or intent.group_id != self.localRepairGroupId()) return false;
+        var minimum_replay = intent.target_sequence;
+        if (intent.trigger == .replay_artifact_unavailable and intent.source_replay_state != .complete) return false;
+        if (intent.trigger == .catalog_admission) {
+            const key = try internal_keys.managedIndexAdmissionKeyAlloc(alloc, intent.index_name);
+            defer alloc.free(key);
+            const raw = self.core.store.get(alloc, key) catch |err| if (err == error.NotFound) return false else return err;
+            defer alloc.free(raw);
+            const marker = try decodeManagedIndexAdmissionMarker(raw);
+            if (marker.disposition != .managed_rebuild or marker.config_hash != intent.config_hash) return false;
+            minimum_replay = @max(minimum_replay, marker.replay_target_sequence);
+        }
+        if (intent.candidate_relative_path) |candidate| {
+            if (try self.core.index_manager.isRepairCandidateActive(intent.index_name, candidate)) return false;
+        }
+        const cfg = self.core.index_manager.get(intent.index_name) orelse return false;
+        if (types.indexConfigHash(cfg.*) != intent.config_hash or self.core.index_manager.loadFailure(intent.index_name) != null) return false;
+        const checkpoint = try self.core.loadProjectionCheckpoint(alloc, intent.index_name);
+        const applied = try self.managedIndexAppliedSequence(alloc, intent.index_name);
+        const target = @max(minimum_replay, try self.projectionStatsTargetSequence(alloc, cfg.*, applied));
+        if (checkpoint.status != .clean or checkpoint.config_hash != intent.config_hash or
+            applied < target or checkpoint.applied_sequence < target) return false;
+        const generation = self.core.index_manager.coverageGenerationForIndex(intent.index_name) orelse return false;
+        var plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer plan.release();
+        const sources = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, intent.index_name);
+        defer {
+            for (sources) |source| alloc.free(source);
+            alloc.free(sources);
+        }
+        if (sources.len == 0) return false;
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        if (try @import("artifact_publication.zig").authority(&read) != null) return false;
+        for (sources) |source| {
+            const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, intent.index_name, source, plan.plan());
+            defer alloc.free(scope);
+            const counts = try DerivedCoverageCounters.load(alloc, &read, scope, generation);
+            const total = counts.source_total orelse return false;
+            if (counts.produced == null or counts.skipped == null or counts.terminal_failed != 0 or
+                counts.produced.? +| counts.skipped.? != total) return false;
+        }
+        return true;
     }
 
     /// Atomic managed admission normally defers the canonical derived worker
@@ -14931,6 +15005,10 @@ pub const DB = struct {
         // the head of a one-slot repair queue forever.
         if (try self.managedAdmissionGenerationIsServiceable(alloc, entry.intent)) {
             try self.ensureManagedAdmissionCanonicalWorker(alloc, entry.intent);
+            if (entry.intent.kind == .full_text) {
+                const text = self.core.textIndexEntry(entry.intent.index_name) orelse return error.IndexNotFound;
+                try self.core.index_manager.rebuildState(.full_text, text.rebuild_root_path, text.config).clearWithIo(self.core.index_manager.checkpointIo());
+            }
             if (entry.intent.candidate_relative_path != null) {
                 try self.discardInactiveIndexRepairCandidate(alloc, repair_id);
             }
@@ -29722,8 +29800,21 @@ pub const DB = struct {
     }
 
     fn advanceArtifactProducerWorkPageWithAllocator(self: *DB, scratch: Allocator) !bool {
+        const has_ordered_authority = blk: {
+            var read = try self.core.store.beginReadTxn();
+            defer read.abort();
+            break :blk try @import("artifact_publication.zig").authority(&read) != null;
+        };
+        if (!has_ordered_authority) {
+            if (self.local_source_completion_audit_pending) {
+                _ = try self.ensureGeneratedCoverageRecoveryIntents(scratch);
+                self.local_source_completion_audit_pending = false;
+            }
+            return false;
+        }
         var plan = try self.core.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
+        const readiness_progress = try @import("artifact_producer_readiness.zig").advance(scratch, self.core.store, self.root_incarnation, plan.plan());
         const obligations = @import("artifact_producer_obligations.zig");
         var page = blk: {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
@@ -29821,7 +29912,12 @@ pub const DB = struct {
             self.artifact_producer_scheduler.commitCursor(self.alloc, page.authority, next);
             processed += 1;
         }
+        const readiness_pending = try @import("artifact_producer_readiness.zig").pending(scratch, self.core.store, self.root_incarnation);
+        more_dispatch = more_dispatch or readiness_pending;
         self.artifact_producer_scheduler.completePage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, self.independentMaintenanceNowNs());
+        if (readiness_pending and !readiness_progress and processed == page.items.len and page.at_end) {
+            self.artifact_producer_scheduler.retry_after_ns.store(self.independentMaintenanceNowNs() +| @import("artifact_producer_scheduler.zig").Scheduler.poll_interval_ns, .release);
+        }
         return processed != 0;
     }
 
@@ -32954,6 +33050,11 @@ pub const DB = struct {
             for (names[initialized..]) |name| alloc.free(name);
             alloc.free(statuses);
         }
+        var producer_plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer producer_plan.release();
+        var producer_read = try self.core.store.beginReadTxn();
+        defer producer_read.abort();
+        const legacy = try @import("artifact_publication.zig").authority(&producer_read) == null;
         const repair_summary_ready = try self.artifactRepairSummaryReady(alloc);
         for (names) |name| {
             const source_repair = try self.artifactRepairSummarySourceSnapshot(
@@ -32962,6 +33063,15 @@ pub const DB = struct {
                 name,
                 repair_summary_ready,
             );
+            const local_scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_name, name, producer_plan.plan());
+            defer alloc.free(local_scope);
+            const legacy_complete = if (legacy) blk: {
+                const generation = self.core.index_manager.coverageGenerationForIndex(index_name) orelse break :blk false;
+                const counts = try DerivedCoverageCounters.load(alloc, &producer_read, if (item.kind == .dense_vector or item.kind == .sparse_vector) index_name else local_scope, generation);
+                const total = counts.source_total orelse break :blk false;
+                break :blk if (total == 0) true else counts.produced != null and counts.skipped != null and counts.terminal_failed == 0 and
+                    counts.produced.? +| counts.skipped.? == total;
+            } else false;
             statuses[initialized] = .{
                 .artifact_name = name,
                 .published_sequence = published_sequence,
@@ -32969,6 +33079,7 @@ pub const DB = struct {
                 .failed = source_repair.ready and source_repair.count != 0,
                 .repair_issue_count = source_repair.count,
                 .repair_summary_ready = source_repair.ready,
+                .producer_complete = legacy_complete or try @import("artifact_producer_readiness.zig").sourceComplete(alloc, &producer_read, producer_plan.plan(), self.root_incarnation, name),
             };
             initialized += 1;
         }
@@ -36808,13 +36919,41 @@ pub const DB = struct {
             for (configs.items) |*cfg| cfg.deinit(alloc);
             configs.deinit(alloc);
         }
+        var recovery_plan = try self.core.index_manager.acquireWritePlanSnapshot();
+        defer recovery_plan.release();
         for (managed_indexes) |index_ref| {
-            // Only vector replay maintains this per-index source-outcome
-            // tuple. Artifact-backed text/graph projections can require the
-            // same producers without emitting vector coverage counters. Their
-            // absence is not unfinished materialization: treating it as debt
-            // reprocesses healthy sibling artifacts and gates their queries.
-            if (index_ref.kind != .dense_vector and index_ref.kind != .sparse_vector) continue;
+            if (!try self.core.indexRequiresEnrichmentReplay(index_ref.name)) continue;
+            // Local text/graph producers maintain direct-source completion
+            // separately from vector outcomes. Missing historical receipts
+            // belong to the existing durable paged recovery owner.
+            if (index_ref.kind != .dense_vector and index_ref.kind != .sparse_vector) {
+                if (index_ref.kind != .full_text and index_ref.kind != .graph) continue;
+                const source_names = try self.core.index_manager.artifactSourceNamesForIndexAlloc(alloc, index_ref.name);
+                defer {
+                    for (source_names) |source_name| alloc.free(source_name);
+                    alloc.free(source_names);
+                }
+                if (source_names.len == 0) continue;
+                var read = try self.core.store.beginReadTxn();
+                defer read.abort();
+                if (try @import("artifact_publication.zig").authority(&read) != null) continue;
+                const generation = self.core.index_manager.coverageGenerationForIndex(index_ref.name) orelse continue;
+                var complete = primary_doc_count != null;
+                for (source_names) |source_name| {
+                    const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, index_ref.name, source_name, recovery_plan.plan());
+                    defer alloc.free(scope);
+                    const counts = try DerivedCoverageCounters.load(alloc, &read, scope, generation);
+                    // A retained terminal failure is known producer debt, not
+                    // missing migration evidence. Its repair/retry owner keeps
+                    // readiness unhealthy without reinvoking it on every open.
+                    complete = complete and counts.produced != null and counts.skipped != null and
+                        counts.produced.? +| counts.skipped.? +| (counts.terminal_failed orelse 0) == primary_doc_count.?;
+                }
+                if (complete) continue;
+                const cfg = self.core.index_manager.get(index_ref.name) orelse continue;
+                try configs.append(alloc, try types.IndexConfig.clone(alloc, cfg.*));
+                continue;
+            }
             if (!try self.core.indexRequiresEnrichmentReplay(index_ref.name)) continue;
             const cfg = self.core.index_manager.get(index_ref.name) orelse continue;
             var item = types.DBIndexStats{ .name = index_ref.name, .kind = index_ref.kind };
@@ -75403,6 +75542,45 @@ test "db graph artifact edges are visible to graph search queries" {
     try std.testing.expect(result.graph_results[0].hits[0].stored_data != null);
 }
 
+test "producer readiness cached graph relations survive metadata overwrite and reopen" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var fake = TestAssetProducer{ .extractor_output =
+        \\{"entities":[{"text":"Alice"},{"text":"doc:b"}],"relations":[{"type":"mentions","source":{"entity_index":0},"target":{"entity_index":1},"score":1.0}]}
+    };
+    const config: types.IndexConfig = .{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{"sources":[{"artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","nodes":{"model":"document","target":"{{ _item.target.text }}"},"edge":{"weight":"{{ _item.score }}"}}],"artifact":{"name":"relations_v1","kind":"asset","source":{"type":"field","value":"target_doc"},"content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}}
+        ,
+    };
+    {
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .enrichment = .{ .asset_producer = fake.producer() } });
+        defer db.close();
+        try db.addIndex(config);
+        for ([_][]const u8{
+            "{\"title\":\"before\",\"target_doc\":\"doc:b\"}",
+            "{\"title\":\"after\",\"target_doc\":\"doc:b\"}",
+        }) |value| {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = value }}, .sync_level = .full_index });
+            try db.runUntilIdle();
+            const edges = try db.getEdges(alloc, config.name, "doc:a", "mentions", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+    var reopened = try DB.open(alloc, std.mem.span(directory.path().ptr), .{ .enrichment = .{ .asset_producer = fake.producer() } });
+    defer reopened.close();
+    try reopened.runUntilIdle();
+    const edges = try reopened.getEdges(alloc, config.name, "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+}
+
 test "db graph artifact external node targets return ids without document hydration" {
     const alloc = std.testing.allocator;
 
@@ -79246,6 +79424,81 @@ test "db retries remote document child range dispatch from durable outbox" {
     const after = try db.core.scanStorePrefix(alloc, outbox_prefix);
     defer docstore_mod.DocStore.freeResults(alloc, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "db public artifact reprocess accepts durable work despite unrelated provider retries" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var gated = GateDenseEmbedder{};
+    gated.allowed_successes.store(100, .release);
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .start_optional_runtime_workers = false,
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = gated.interface(),
+            .inline_retry_max_attempts = 1,
+            .worker_retry_max_attempts = 10,
+        },
+    });
+    defer db.close();
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"dense_v1\"}}",
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:repair", .value = "{\"url\":\"data:text/plain;base64,YWxwaGE=\"}" },
+            .{ .key = "doc:embedding", .value = "{\"body\":\"healthy cached output\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    var before = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer before.deinit(alloc);
+    gated.allowed_successes.store(0, .release);
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:retry", .value = "{\"body\":\"provider unavailable\"}" }},
+        .sync_level = .write,
+    });
+    try std.testing.expectError(error.EnrichmentRetryInProgress, db.runEnrichmentUntil(db.core.nextEnrichmentSequence()));
+
+    // Both public endpoints acknowledge the committed request without waiting
+    // for the unrelated retry debt. The repair queue still uses full_index.
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:repair", "document_units_v1"));
+    // Permit only the requested embedding to succeed. The other document's
+    // provider debt remains retrying, so a table-wide completion wait still fails.
+    gated.allowed_successes.store(gated.successful_requests.load(.acquire) + 1, .release);
+    try std.testing.expect(try db.reprocessDocumentEmbeddingArtifact(alloc, "doc:embedding", "dense_v1"));
+    try std.testing.expectEqual(gated.allowed_successes.load(.acquire), gated.successful_requests.load(.acquire));
+    // A failure in the requested provider itself remains a real request error.
+    try std.testing.expectError(error.EmbedRateLimited, db.reprocessDocumentEmbeddingArtifact(alloc, "doc:embedding", "dense_v1"));
+    try std.testing.expectError(error.NotFound, db.reprocessDocumentArtifact(alloc, "missing", "document_units_v1"));
+    try std.testing.expect(!try db.reprocessDocumentArtifact(alloc, "doc:repair", "missing"));
+    try std.testing.expect(!try db.reprocessDocumentEmbeddingArtifact(alloc, "missing", "dense_v1"));
+
+    // Provider recovery lets the queued work finish; success did not discard it.
+    gated.allowed_successes.store(100, .release);
+    sleepNs(550 * std.time.ns_per_ms);
+    try db.runUntilIdle();
+    var after = (try db.getDocumentArtifactManifest(alloc, "doc:repair", "document_units_v1")) orelse return error.TestUnexpectedResult;
+    defer after.deinit(alloc);
+    try std.testing.expectEqual(before.generation + 1, after.generation);
+    const embedding_key = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:retry", "dense_v1");
+    defer alloc.free(embedding_key);
+    const embedding = try db.core.store.get(alloc, embedding_key);
+    defer alloc.free(embedding);
+    try std.testing.expect(embedding.len > 0);
 }
 
 test "db document extraction manifest inspection and reprocess API" {
@@ -102084,6 +102337,83 @@ fn testManagedGenerationRepairAdmission(mode: enum { quarantine, shadow_handoff,
         .query = .{ .dense_knn = .{ .vector = &.{ 1.0, 0.0, 0.0 }, .k = 1 } },
         .limit = 1,
     }));
+}
+
+test "producer readiness local receipt migration retires only after source and checkpoint proof" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+        .enrichment = .{ .enable_without_producers = true },
+    });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "copied", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"copy\"}" });
+    const cfg = types.IndexConfig{
+        .name = "text",
+        .kind = .full_text,
+        .config_json =
+        \\{"sources":[{"artifact":"copied"}]}
+        ,
+    };
+    try db.addIndex(cfg);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"silver submarine\"}" }}, .sync_level = .full_index });
+    const id = try db.createGenerationRepairIntentAtTarget(alloc, cfg, .replay_artifact_unavailable, 0, 0, null, null, .complete, .initial_build);
+    var entry = try db.loadIndexRepairEntryById(alloc, id);
+    defer entry.deinit(alloc);
+    try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    // Synchronous publication precedes its replay invalidation turn. The
+    // current revision's receipt must survive that turn after an overwrite.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .full_index });
+    try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    // An asynchronous overwrite keeps the identity's creation generation but
+    // advances its primary revision. Its previous receipt must reopen debt.
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"bronze submarine\"}" }}, .sync_level = .write });
+    try local_mutation.deleteDerivedCoverageForDocKeys(alloc, db.core.store, db.core.index_manager, cfg.name, &.{"doc"});
+    {
+        var proof = try db.core.index_manager.acquireWritePlanSnapshot();
+        defer proof.release();
+        const pending_scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, cfg.name, "copied", proof.plan());
+        defer alloc.free(pending_scope);
+        const marker = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, pending_scope, db.core.index_manager.coverageGenerationForIndex(cfg.name).?, "doc");
+        defer alloc.free(marker);
+        try std.testing.expectError(error.NotFound, db.core.store.get(alloc, marker));
+    }
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .full_index });
+    try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    // A repeated row must keep its producer revision even after another
+    // document has advanced the table's replay sequence.
+    var before_read = try db.core.store.beginReadTxn();
+    const primary_before = try @import("artifact_producer_readiness.zig").localPrimaryRevision(alloc, &before_read, "doc");
+    before_read.abort();
+    try db.batch(.{ .writes = &.{.{ .key = "other", .value = "{\"body\":\"other submarine\"}" }}, .sync_level = .full_index });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"gold submarine\"}" }}, .sync_level = .write });
+    var after_read = try db.core.store.beginReadTxn();
+    const primary_after = try @import("artifact_producer_readiness.zig").localPrimaryRevision(alloc, &after_read, "doc");
+    after_read.abort();
+    try std.testing.expectEqual(primary_before, primary_after);
+    try local_mutation.deleteDerivedCoverageForDocKeys(alloc, db.core.store, db.core.index_manager, cfg.name, &.{ "doc", "doc" });
+    try std.testing.expect(try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    const checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
+    try db.core.saveProjectionCheckpoint(cfg.name, .{
+        .applied_sequence = checkpoint.applied_sequence,
+        .generation = checkpoint.generation,
+        .config_hash = checkpoint.config_hash,
+        .status = .rebuilding,
+    });
+    try std.testing.expect(!try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
+    try db.core.saveProjectionCheckpoint(cfg.name, checkpoint);
+    var plan = try db.core.index_manager.acquireWritePlanSnapshot();
+    defer plan.release();
+    const scope = try @import("artifact_producer_readiness.zig").localScopeAlloc(alloc, cfg.name, "copied", plan.plan());
+    defer alloc.free(scope);
+    const generation = db.core.index_manager.coverageGenerationForIndex(cfg.name).?;
+    const key = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(alloc, scope, generation, "produced");
+    defer alloc.free(key);
+    try db.core.store.delete(key);
+    try std.testing.expect(!try db.localArtifactSourceRecoveryIsServiceable(alloc, entry.intent));
 }
 
 test "db empty managed index does not invent generated coverage recovery debt" {
