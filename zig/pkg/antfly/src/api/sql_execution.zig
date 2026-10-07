@@ -169,7 +169,7 @@ pub const Adapter = struct {
                         .resource_wait = .{ .begin = spillWaitBegin, .end = spillWaitEnd },
                     } else null,
                     .http = try self.server.embedding_provider_runtime.httpClient(),
-                    .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation },
+                    .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation, .runnable = self.providerRunnable() },
                     .secret_store = self.server.cfg.secret_store,
                     .antfly_provider = self.server.antfly_provider,
                     .antfly_url = config.inference.api_url,
@@ -729,6 +729,33 @@ pub const Adapter = struct {
         try self.context.ensureActive();
         const execution = self.runnable orelse return error.InvalidRunnableTransition;
         try execution.park(.resource_blocked);
+    }
+
+    fn providerRunnable(self: *Adapter) ?@import("antfly_runtime_abi").runnable_abi.Borrowed {
+        const execution = self.runnable orelse return null;
+        const entry = execution.entry orelse return null;
+        const Callback = struct {
+            const runtime = @import("antfly_runtime_abi");
+            fn check(raw: *anyopaque) callconv(.c) runtime.error_abi.Status {
+                checkpoint(raw) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn park(raw: *anyopaque, reason: c_int) callconv(.c) runtime.error_abi.Status {
+                if (reason != @backingInt(runtime.runnable_abi.Wait.resource)) return runtime.error_abi.statusFromError(error.InvalidArgument);
+                spillWaitBegin(raw) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+            fn enter(raw: *anyopaque, class: c_int) callconv(.c) runtime.error_abi.Status {
+                const adapter: *Adapter = @ptrCast(@alignCast(raw));
+                const next = std.enums.fromInt(@import("antfly_local_sources").common_request_admission.runnable_scheduler.Class, class) orelse return runtime.error_abi.statusFromError(error.InvalidArgument);
+                const current = adapter.runnable orelse return runtime.error_abi.statusFromError(error.InvalidRunnableTransition);
+                current.enter(next) catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.context.ensureActive() catch |err| return runtime.error_abi.statusFromError(err);
+                adapter.validateReadFence(false) catch |err| return runtime.error_abi.statusFromError(err);
+                return .ok;
+            }
+        };
+        return .{ .context = self, .cpu_slots = entry.slots, .parent_class = @intCast(@backingInt(entry.class)), .checkpoint = Callback.check, .park = Callback.park, .enter = Callback.enter };
     }
 
     fn spillWaitEnd(ptr: *anyopaque) !void {

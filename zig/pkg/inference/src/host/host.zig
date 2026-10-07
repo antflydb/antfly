@@ -958,6 +958,163 @@ pub fn linkedInferenceConfigure(context: *const inference_bridge.ConfigureContex
 }
 
 pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void {
+    const slots = try worker_runtime.wire.admittedCpuSlots(context);
+    if (context.runnable != null) return invokeBorrowedProvider(context, invokeProvider);
+    if (slots != 0) {
+        const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
+        // A delegated worker grant cannot be relayed to another process.
+        if (state.worker != null) return error.InvalidRunnableTransition;
+        return invokeScopedProvider(context, slots, invokeProvider);
+    }
+    return invokeProvider(context);
+}
+
+fn invokeScopedProvider(context: *const inference_bridge.ProviderInvokeContext, slots: usize, callback: *const fn (*const inference_bridge.ProviderInvokeContext) anyerror!void) !void {
+    if (slots == 0 or slots > 65535) return error.InvalidRunnableDemand;
+    var scope = try @import("inference_linalg").pool.WorkerScope.init(slots);
+    defer scope.deinit();
+    errdefer discardProviderResponse(context);
+    try callback(context);
+}
+
+fn discardProviderResponse(context: *const inference_bridge.ProviderInvokeContext) void {
+    if (context.out_response_handle.*) |response| {
+        linkedInferenceDestroyProviderResponse(response);
+        context.out_response_handle.* = null;
+        context.out_response_json.* = .init("");
+        if (context.out_numeric_result) |numeric| numeric.* = .{};
+    }
+}
+
+/// Borrowed scopes are OS-worker-local. Async task pipelines must fall back
+/// to inline execution; independently admitted children can use a separate Io.
+fn borrowedProviderExecutor(allocator: std.mem.Allocator) std.Io.Threaded {
+    return std.Io.Threaded.init(allocator, .{ .async_limit = .nothing, .concurrent_limit = .nothing });
+}
+
+test "runnable execution worker budget scopes execution and discards failed output" {
+    const Callback = struct {
+        fn run(context: *const inference_bridge.ProviderInvokeContext) !void {
+            try std.testing.expect(context.runnable == null);
+            try std.testing.expectEqual(@as(?usize, 2), @import("inference_linalg").pool.scopedWorkerLimit());
+            const vectors = try std.testing.allocator.alloc([]f32, 1);
+            errdefer std.testing.allocator.free(vectors);
+            vectors[0] = try std.testing.allocator.dupe(f32, &.{0.5});
+            errdefer std.testing.allocator.free(vectors[0]);
+            try publishNumericProviderResponse(context, std.testing.allocator, vectors, .dense_vectors);
+            // Ownership has transferred to the response before the error.
+        }
+        fn fail(context: *const inference_bridge.ProviderInvokeContext) !void {
+            try run(context);
+            return error.Canceled;
+        }
+    };
+    var response: ?*anyopaque = null;
+    var json = inference_bridge.String.init("");
+    var numeric = inference_bridge.NumericResult{};
+    const context = inference_bridge.ProviderInvokeContext{ .abi_version = inference_bridge.abi_version, .handle = undefined, .operation = @backingInt(inference_bridge.ProviderOperation.embed_dense_texts), .request_json = .init("{}"), .deadline_ns = 0, .has_deadline = 0, .out_response_handle = &response, .out_response_json = &json, .out_numeric_result = &numeric, .admitted_cpu_slots = 2 };
+    try std.testing.expectEqual(@as(u32, 2), try worker_runtime.wire.admittedCpuSlots(&context));
+    try std.testing.expectError(error.InvalidRunnableDemand, invokeScopedProvider(&context, 0, Callback.run));
+    try std.testing.expectError(error.InvalidRunnableDemand, invokeScopedProvider(&context, 65536, Callback.run));
+    try invokeScopedProvider(&context, 2, Callback.run);
+    linkedInferenceDestroyProviderResponse(response.?);
+    response = null;
+    numeric = .{};
+    try std.testing.expectError(error.Canceled, invokeScopedProvider(&context, 2, Callback.fail));
+    try std.testing.expect(response == null and numeric.kind == .absent);
+    try std.testing.expectEqual(@as(?usize, null), @import("inference_linalg").pool.scopedWorkerLimit());
+}
+
+fn invokeBorrowedProvider(context: *const inference_bridge.ProviderInvokeContext, callback: *const fn (*const inference_bridge.ProviderInvokeContext) anyerror!void) !void {
+    const borrow = context.runnable orelse return error.InvalidRunnableTransition;
+    var transfer = try inference_bridge.runnable_abi.Transfer.init(borrow.*, .inference);
+    var scope = @import("inference_linalg").pool.WorkerScope.init(borrow.cpu_slots) catch |err| {
+        try transfer.returnToParent();
+        return err;
+    };
+    const result = callback(context);
+    scope.deinit();
+    errdefer discardProviderResponse(context);
+    // Authority and original-deadline failures take precedence over a newly
+    // acquired provider response; owning cleanup cannot require another grant.
+    try transfer.returnToParent();
+    try result;
+}
+
+test "runnable execution local provider restores parent and discards output on failed authority return" {
+    const Parent = struct {
+        reject_return: bool = false,
+        class: c_int = @backingInt(inference_bridge.runnable_abi.Class.query),
+        parked: bool = false,
+        enters: usize = 0,
+        fn check(_: *anyopaque) callconv(.c) inference_bridge.Status {
+            return .ok;
+        }
+        fn park(raw: *anyopaque, _: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(!self.parked);
+            self.parked = true;
+            return .ok;
+        }
+        fn enter(raw: *anyopaque, class: c_int) callconv(.c) inference_bridge.Status {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.parked);
+            self.enters += 1;
+            self.parked = false;
+            self.class = class;
+            if (self.reject_return and class == @backingInt(inference_bridge.runnable_abi.Class.query))
+                return @import("antfly_runtime_abi").error_abi.statusFromError(error.Forbidden);
+            return .ok;
+        }
+        fn invoke(context: *const inference_bridge.ProviderInvokeContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(context.runnable.?.context));
+            try std.testing.expectEqual(@backingInt(inference_bridge.runnable_abi.Class.inference), self.class);
+            try std.testing.expectEqual(@as(?usize, 1), @import("inference_linalg").pool.scopedWorkerLimit());
+            var executor = borrowedProviderExecutor(std.testing.allocator);
+            defer executor.deinit();
+            const Task = struct {
+                fn run(thread: std.Thread.Id, calls: *usize) void {
+                    std.debug.assert(thread == std.Thread.getCurrentId());
+                    std.debug.assert(@import("inference_linalg").pool.scopedWorkerLimit() == 1);
+                    calls.* += 1;
+                }
+            };
+            var calls: usize = 0;
+            var jobs = std.Io.Group.init;
+            defer jobs.cancel(executor.io());
+            for (0..4) |_| jobs.async(executor.io(), Task.run, .{ std.Thread.getCurrentId(), &calls });
+            try jobs.await(executor.io());
+            try std.testing.expectEqual(@as(usize, 4), calls);
+            const vectors = try std.testing.allocator.alloc([]f32, 1);
+            errdefer std.testing.allocator.free(vectors);
+            vectors[0] = try std.testing.allocator.dupe(f32, &.{0.25});
+            errdefer std.testing.allocator.free(vectors[0]);
+            try publishNumericProviderResponse(context, std.testing.allocator, vectors, .dense_vectors);
+        }
+    };
+    for ([_]bool{ false, true }) |reject| {
+        var parent = Parent{ .reject_return = reject };
+        const borrowed = inference_bridge.runnable_abi.Borrowed{ .context = &parent, .cpu_slots = 1, .parent_class = @backingInt(inference_bridge.runnable_abi.Class.query), .checkpoint = Parent.check, .park = Parent.park, .enter = Parent.enter };
+        var response: ?*anyopaque = null;
+        var json = inference_bridge.String.init("");
+        var numeric = inference_bridge.NumericResult{};
+        const context = inference_bridge.ProviderInvokeContext{ .abi_version = inference_bridge.abi_version, .handle = undefined, .operation = @backingInt(inference_bridge.ProviderOperation.embed_dense_texts), .request_json = .init("{}"), .deadline_ns = 0, .has_deadline = 0, .out_response_handle = &response, .out_response_json = &json, .out_numeric_result = &numeric, .runnable = &borrowed };
+        if (reject) {
+            try std.testing.expectError(error.Forbidden, invokeBorrowedProvider(&context, Parent.invoke));
+            try std.testing.expect(response == null);
+            try std.testing.expectEqual((inference_bridge.NumericResult{}).kind, numeric.kind);
+        } else {
+            try invokeBorrowedProvider(&context, Parent.invoke);
+            try std.testing.expectEqual(@as(usize, 1), numeric.len);
+            linkedInferenceDestroyProviderResponse(response.?);
+        }
+        try std.testing.expectEqual(@as(usize, 2), parent.enters);
+        try std.testing.expectEqual(@backingInt(inference_bridge.runnable_abi.Class.query), parent.class);
+        try std.testing.expectEqual(@as(?usize, null), @import("inference_linalg").pool.scopedWorkerLimit());
+    }
+}
+
+fn invokeProvider(context: *const inference_bridge.ProviderInvokeContext) !void {
     try checkProviderInvokeControls(context);
     const state: *LinkedInferenceState = @ptrCast(@alignCast(context.handle));
     if (state.worker) |worker| {
@@ -996,6 +1153,12 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     const request_json = context.request_json.slice();
     const deadline_ns = if (context.has_deadline != 0) context.deadline_ns else null;
     const alloc = state.alloc;
+    var serial_executor: ?std.Io.Threaded = if (context.runnable != null or context.admitted_cpu_slots != 0)
+        borrowedProviderExecutor(alloc)
+    else
+        null;
+    defer if (serial_executor) |*executor| executor.deinit();
+    const call_io = if (serial_executor) |*executor| executor.io() else state.io;
     const CancellationAdapter = struct {
         view: http_abi.CancellationView,
 
@@ -1021,6 +1184,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
     };
     var progress_adapter = ProgressAdapter{ .view = context.progress };
     const execution_control = inference.InferenceExecutionControl{
+        .io = call_io,
         .deadline_ns = deadline_ns,
         // Give any model's current native call time to reach a safe boundary
         // before a cancelled request forces the supervisor to replace it.
@@ -1043,7 +1207,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             const result = if (operation == .embed_dense_texts_with_context)
                 try state.node.embedDenseTextsDirectWithExecutionControlAndTask(
                     state.alloc,
-                    state.io,
+                    call_io,
                     execution_control,
                     parsed.value.model,
                     parsed.value.texts,
@@ -1053,7 +1217,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             else
                 try state.node.embedDenseTextsDirectWithExecutionControl(
                     state.alloc,
-                    state.io,
+                    call_io,
                     execution_control,
                     parsed.value.model,
                     parsed.value.texts,
@@ -1100,7 +1264,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 alloc,
                 parsed.value.model,
                 parts,
-                state.io,
+                call_io,
                 execution_control,
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
                 if (operation == .embed_dense_parts_with_context) parsed.value.instruction else null,
@@ -1153,7 +1317,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             const converted = try rerankDocumentValuesAlloc(arena, documents);
             var http_request = try httpx.Request.init(alloc, .POST, "/ai/v1/rerank");
             defer http_request.deinit();
-            var http_context = httpx.Context.init(alloc, state.io, &http_request);
+            var http_context = httpx.Context.init(alloc, call_io, &http_request);
             defer http_context.deinit();
             var response = try state.node.rerankDocumentValues(
                 &http_context,
@@ -1191,10 +1355,10 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rerank_texts => blk: {
             var parsed = try std.json.parseFromSlice(RerankTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .rerank, parsed.value.documents, parsed.value.query.len, parsed.value.documents.len, 0);
+            try validateLinkedTextInvocation(&state.node, call_io, parsed.value.model, .rerank, parsed.value.documents, parsed.value.query.len, parsed.value.documents.len, 0);
             const result = try state.node.rerankTextsDirectWithContext(
                 alloc,
-                state.io,
+                call_io,
                 deadline_ns,
                 execution_control,
                 parsed.value.model,
@@ -1215,7 +1379,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .generate_text => blk: {
             var parsed = try std.json.parseFromSlice(GenerateTextRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .generate, parsed.value.contents, 0, 0, 0);
+            try validateLinkedTextInvocation(&state.node, call_io, parsed.value.model, .generate, parsed.value.contents, 0, 0, 0);
             const outcome = try state.node.generateTextDirectForProvider(
                 alloc,
                 parsed.value.model,
@@ -1233,7 +1397,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer parsed.deinit();
             const result = try localAntflyGenerateMessages(
                 &state.node,
-                state.io,
+                call_io,
                 alloc,
                 parsed.value.model,
                 parsed.value.messages,
@@ -1257,7 +1421,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer alloc.free(attachments);
             const result = try localAntflyGenerateMessagesWithAttachments(
                 &state.node,
-                state.io,
+                call_io,
                 alloc,
                 parsed.value.model,
                 parsed.value.messages,
@@ -1269,7 +1433,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .model_capabilities => blk: {
             var parsed = try std.json.parseFromSlice(ModelCapabilitiesRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const result = try localModelCapabilities(&state.node, state.io, parsed.value.model, parsed.value.task);
+            const result = try localModelCapabilities(&state.node, call_io, parsed.value.model, parsed.value.task);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .read_images => blk: {
@@ -1314,7 +1478,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             if (state.read_encoded_images_override == null) {
                 const read_capabilities = try localModelCapabilities(
                     &state.node,
-                    state.io,
+                    call_io,
                     decoded.metadata.value.model,
                     .read,
                 );
@@ -1386,7 +1550,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             if (state.read_raster_images_override == null) {
                 const capabilities = try localModelCapabilities(
                     &state.node,
-                    state.io,
+                    call_io,
                     decoded.metadata.value.model,
                     .read,
                 );
@@ -1440,7 +1604,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             defer decoded.deinit(alloc);
             const capabilities = try localModelCapabilities(
                 &state.node,
-                state.io,
+                call_io,
                 decoded.metadata.value.model,
                 .embed,
             );
@@ -1459,7 +1623,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             });
             const vectors = try state.node.embedDenseRastersDirectWithExecutionControl(
                 alloc,
-                state.io,
+                call_io,
                 execution_control,
                 decoded.metadata.value.model,
                 decoded.images,
@@ -1481,7 +1645,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .transcribe_audio => blk: {
             var parsed = try std.json.parseFromSlice(TranscribeAudioRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            const transcribe_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .transcribe);
+            const transcribe_capabilities = try localModelCapabilities(&state.node, call_io, parsed.value.model, .transcribe);
             try transcribe_capabilities.validateInvocation(.transcribe, .{
                 .item_count = 1,
                 .modalities = .{ .audio = true },
@@ -1517,7 +1681,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                     return error.InferenceTextBytesExceeded;
                 extract_shape.max_text_bytes_per_item = @max(extract_shape.max_text_bytes_per_item, input.content_json.len);
             }
-            const extract_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .extract);
+            const extract_capabilities = try localModelCapabilities(&state.node, call_io, parsed.value.model, .extract);
             for (attachments) |attachment| {
                 try extract_capabilities.validateMimeType(attachment.mime_type);
                 extract_shape.encoded_media_bytes = std.math.add(
@@ -1554,7 +1718,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 },
             }
             const cfg = parsed.value.config;
-            const chunk_capabilities = try localModelCapabilities(&state.node, state.io, parsed.value.model, .chunk);
+            const chunk_capabilities = try localModelCapabilities(&state.node, call_io, parsed.value.model, .chunk);
             var chunk_shape = inference_work.InvocationShape{ .item_count = 1 };
             switch (input) {
                 .text => |text_value| {
@@ -1618,7 +1782,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
         .rewrite_texts => blk: {
             var parsed = try std.json.parseFromSlice(RewriteTextsRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
             defer parsed.deinit();
-            try validateLinkedTextInvocation(&state.node, state.io, parsed.value.model, .rewrite, parsed.value.inputs, 0, 0, 0);
+            try validateLinkedTextInvocation(&state.node, call_io, parsed.value.model, .rewrite, parsed.value.inputs, 0, 0, 0);
             const result = try state.node.rewriteTextsDirect(alloc, parsed.value.model, parsed.value.inputs);
             defer {
                 for (result) |item| alloc.free(item);
@@ -1635,7 +1799,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             // enforcing the canonical extraction contract.
             try validateLinkedTextInvocationInScope(
                 &state.node,
-                state.io,
+                call_io,
                 parsed.value.model,
                 .extract,
                 "classifiers",
@@ -1659,7 +1823,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },
         .list_models_json => blk: {
-            const result = try state.node.listModelsJsonAlloc(alloc, state.io);
+            const result = try state.node.listModelsJsonAlloc(alloc, call_io);
             defer alloc.free(result);
             break :blk try std.json.Stringify.valueAlloc(alloc, result, .{});
         },

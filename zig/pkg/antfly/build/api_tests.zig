@@ -66,6 +66,23 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const antfly_test_mod = options.antfly_test_mod;
     const run_lib_usermgr_tests = options.run_lib_usermgr_tests;
+    const inference_phase_filters = [_][]const u8{ "runnable execution local provider", "runnable execution worker budget" };
+    const inference_phase_tests = b.addTest(.{
+        .name = "inference-parent-phase-tests",
+        .root_module = antfly_imports.inference_host,
+        .filters = &inference_phase_filters,
+        .max_rss = 4 * 1024 * 1024 * 1024,
+    });
+    const inference_phase_step = b.step("antfly-inference-parent-phase-test", "Run provider grant transfer, worker demand and owned-result cleanup contracts");
+    inference_phase_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, inference_phase_tests, &inference_phase_filters).step);
+    const inference_wire_filters = [_][]const u8{"inference worker"};
+    const inference_wire_tests = b.addTest(.{
+        .name = "inference-parent-wire-tests",
+        .root_module = antfly_imports.inference_worker_wire,
+        .filters = &inference_wire_filters,
+        .max_rss = 2 * 1024 * 1024 * 1024,
+    });
+    inference_phase_step.dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, inference_wire_tests, &inference_wire_filters).step);
     const pooling_filters = [_][]const u8{
         "bounded admission",
         "runnable scheduler",

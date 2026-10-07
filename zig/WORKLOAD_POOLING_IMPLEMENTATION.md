@@ -1179,3 +1179,15 @@ current embedded calls retain the SQL grant and nested admission could deadlock.
 Worker-process transfer, other backend teams, complete memory accounting and
 full production/default qualification are still required. The adapter is not
 installed by production yet.
+
+### Worker CPU budget handoff (2026-10-07, focused gates passed)
+
+Provider ABI v30/private worker protocol v6 now carry CPU demand while the
+parent keeps its checked operation. Callback pointers never enter IPC. The
+worker validates demand before payload preparation and installs its own native
+scope and non-fan-out executor. Conflicting/out-of-range demand and worker
+relays fail closed. All seven focused host/wire tests pass on native macOS and
+Nix/glibc Linux; [worker budget receipts](qualification/workload-pooling/receipts/2026-10-07/worker-cpu-budget-handoff/README.md)
+pin source and output. Actual subprocess and production dispatcher/archive
+qualification are still pending, along with whole API/default overload gates.
+The separate local-parent ABI v29 gate does not qualify these worker bytes.

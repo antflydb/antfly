@@ -24,7 +24,7 @@ const native_abi = @import("antfly_runtime_abi").native_abi;
 pub const runnable_abi = @import("antfly_runtime_abi").runnable_abi;
 const antfly_image = @import("antfly_image");
 
-pub const abi_version: u32 = 28;
+pub const abi_version: u32 = 30;
 pub const ai_api_prefix = "/ai/v1";
 pub const public_api_prefix = "/ml/v1";
 pub const Status = error_abi.Status;
@@ -292,6 +292,12 @@ pub const ProviderInvokeContext = extern struct {
     cancellation: http_abi.CancellationView = .{},
     /// Appended in ABI v19 and extended in v20 with model/backend detail.
     progress: ProgressView = .{},
+    /// Borrowed through this synchronous invocation only. The receiver copies
+    /// the descriptor and never publishes callbacks to cancellation monitors.
+    runnable: ?*const runnable_abi.Borrowed = null,
+    /// Private worker-protocol CPU demand. Zero means no delegated grant.
+    /// The parent keeps ownership; process-local callbacks never enter IPC.
+    admitted_cpu_slots: u32 = 0,
 };
 
 pub const RouteManifestEntry = extern struct {

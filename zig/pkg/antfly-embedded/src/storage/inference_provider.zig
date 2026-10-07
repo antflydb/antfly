@@ -679,6 +679,7 @@ pub fn invokeInferenceProviderWithBinaryContext(
         .handle = handle,
         .operation = @backingInt(operation),
         .request_json = inference_bridge.String.init(request_json),
+        .runnable = if (request_context) |*active| if (active.runnable) |*grant| grant else null else null,
         .deadline_ns = effective_deadline_ns,
         .has_deadline = 1,
         .out_response_handle = &response_handle,

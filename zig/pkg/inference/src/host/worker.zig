@@ -619,6 +619,7 @@ const Child = struct {
         switch (envelope.operation) {
             .provider => {
                 const provider = try std.json.parseFromSliceLeaky(wire.Provider, arena, envelope.options, .{});
+                try provider.validate();
                 diagnostic.operation = provider.operation;
                 diagnostic.has_deadline = provider.deadline_ns != null;
                 var limits = wire.provider_attachment_limits;
@@ -648,6 +649,7 @@ const Child = struct {
                     .abi_version = bridge.abi_version,
                     .handle = state,
                     .operation = provider.operation,
+                    .admitted_cpu_slots = provider.admitted_cpu_slots,
                     .request_json = .init(media.metadata),
                     .deadline_ns = provider.deadline_ns orelse 0,
                     .has_deadline = @intFromBool(provider.deadline_ns != null),

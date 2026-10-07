@@ -56,6 +56,9 @@ pub const RequestContext = struct {
     deadline_ns: ?u64,
     cancellation: ?CancellationToken = null,
     progress: ?ProgressSink = null,
+    /// Synchronous provider phases may borrow this caller's execution grant.
+    /// Never forward its callbacks to watchdogs or parallel children.
+    runnable: ?@import("antfly_runtime_abi").runnable_abi.Borrowed = null,
 
     pub fn check(self: RequestContext) !void {
         if (self.cancellation) |value| if (value.isCancelled()) return error.Cancelled;
