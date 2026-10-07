@@ -23,8 +23,11 @@ import pytest
 from antfly import (
     AntflyClient,
     AntflyException,
+    SQLArrayColumnSchema,
+    SQLArrayColumnSchemaType,
     SQLArrayElementType,
     SQLArrayValue,
+    SQLBuiltinType,
     SQLColumn,
     SQLExecutionError,
     SQLPreparedExecutionRequest,
@@ -32,6 +35,25 @@ from antfly import (
     SQLRequest,
     SQLResponse,
 )
+
+
+def test_array_column_schema_exports_explicit_element_identity_and_transport_constraints():
+    schema = SQLArrayColumnSchema(
+        type_=SQLArrayColumnSchemaType.SQL_ARRAY,
+        x_antfly_sql_type=SQLBuiltinType.INT64,
+        nullable=True,
+    )
+    schema.additional_properties["properties"] = {"values": {"minItems": 2}}
+    expected = {
+        "type": "sql_array",
+        "x-antfly-sql-type": "int64",
+        "nullable": True,
+        "properties": {"values": {"minItems": 2}},
+    }
+    assert schema.to_dict() == expected
+    assert SQLArrayColumnSchema.from_dict(expected).to_dict() == expected
+    with pytest.raises(ValueError):
+        SQLArrayColumnSchema.from_dict({"type": "array", "x-antfly-sql-type": "int64"})
 
 
 def test_array_result_models_preserve_exact_values_dimensions_and_null_flags():

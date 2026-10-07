@@ -1234,6 +1234,8 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .sql_array_column_schema import SQLArrayColumnSchema
+from .sql_array_column_schema_type import SQLArrayColumnSchemaType
 from .sql_array_dimension import SQLArrayDimension
 from .sql_array_element_type import SQLArrayElementType
 from .sql_array_value import SQLArrayValue
@@ -2649,6 +2651,8 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SQLArrayColumnSchema",
+    "SQLArrayColumnSchemaType",
     "SQLArrayDimension",
     "SQLArrayElementType",
     "SQLArrayValue",

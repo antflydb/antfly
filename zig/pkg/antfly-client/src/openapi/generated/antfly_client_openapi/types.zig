@@ -36661,6 +36661,47 @@ pub const RuntimeDecl = struct {
     }
 };
 
+/// JSON Schema property declaration for one typed SQL-array column in a relational table. Use it as a root property of DocumentSchema.schema. The element identity is mandatory; a JSON Schema `array` remains a JSON column and is never inferred to be a SQL array. Column values use the lossless SQLArrayValue envelope: dimensions with lower bounds, flat row-major values and explicit SQL NULL flags. Integer elements are decimal strings, even when small. JSONB null and SQL NULL are distinct. Float elements acquire their declared width before validation and storage. Outer null represents a SQL NULL array when nullable is true. Additional JSON Schema constraints apply to this envelope, not to PostgreSQL array subscripts. SQL array index keys and SQL DDL activation are not implied by accepting this storage schema.
+pub const SQLArrayColumnSchema = struct {
+    type: []const u8,
+    x_antfly_sql_type: SQLBuiltinType,
+    nullable: ?bool = null,
+    description: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "type", "type", false },
+        .{ "x-antfly-sql-type", "x_antfly_sql_type", false },
+        .{ "nullable", "nullable", true },
+        .{ "description", "description", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("type");
+        try jw.write(self.type);
+        try jw.objectField("x-antfly-sql-type");
+        try jw.write(self.x_antfly_sql_type);
+        if (self.nullable) |value| {
+            try jw.objectField("nullable");
+            try jw.write(value);
+        }
+        if (self.description) |value| {
+            try jw.objectField("description");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 pub const SQLArrayDimension = struct {
     length: i64,
     lower_bound: i64,
@@ -36721,7 +36762,7 @@ pub const SQLArrayValue = struct {
     sql_nulls: []const bool,
 };
 
-/// Exact PostgreSQL builtin identity for a relational root scalar column. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains.
+/// Exact PostgreSQL builtin identity for a relational root scalar column or the element identity of a `sql_array` column. Set the JSON Schema property's `x-antfly-sql-type` annotation to one of these values. The underlying property type must match. SQL array storage is not implied by this annotation. Existing unannotated schemas retain their original domains.
 pub const SQLBuiltinType = enum {
     text,
     int16,

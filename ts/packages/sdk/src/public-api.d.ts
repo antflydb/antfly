@@ -14111,7 +14111,8 @@ export interface components {
             };
         };
         /**
-         * @description Exact PostgreSQL builtin identity for a relational root scalar column.
+         * @description Exact PostgreSQL builtin identity for a relational root scalar column
+         *     or the element identity of a `sql_array` column.
          *     Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
          *     these values. The underlying property type must match. SQL array storage
          *     is not implied by this annotation. Existing unannotated schemas retain
@@ -14119,6 +14120,30 @@ export interface components {
          * @enum {string}
          */
         SQLBuiltinType: "text" | "int16" | "int32" | "int64" | "float32" | "float64" | "boolean" | "uuid" | "jsonb";
+        /**
+         * @description JSON Schema property declaration for one typed SQL-array column in a
+         *     relational table. Use it as a root property of DocumentSchema.schema.
+         *     The element identity is mandatory; a JSON Schema `array` remains a JSON
+         *     column and is never inferred to be a SQL array. Column values use the
+         *     lossless SQLArrayValue envelope: dimensions with lower bounds, flat
+         *     row-major values and explicit SQL NULL flags. Integer elements are
+         *     decimal strings, even when small. JSONB null and SQL NULL are distinct.
+         *     Float elements acquire their declared width before validation and
+         *     storage. Outer null represents a SQL NULL array when nullable is true.
+         *     Additional JSON Schema constraints apply to this envelope, not to
+         *     PostgreSQL array subscripts. SQL array index keys and SQL DDL activation
+         *     are not implied by accepting this storage schema.
+         */
+        SQLArrayColumnSchema: {
+            /** @enum {string} */
+            type: "sql_array";
+            "x-antfly-sql-type": components["schemas"]["SQLBuiltinType"];
+            /** @default false */
+            nullable?: boolean;
+            description?: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** @description Defines the structure of a document type */
         DocumentSchema: {
             /** @description A description of the document type. */

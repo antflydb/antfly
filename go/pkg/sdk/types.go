@@ -53,6 +53,12 @@ type (
 	SQLColumnType               = oapi.SQLColumnType
 	SQLDiagnostic               = oapi.SQLDiagnostic
 	SQLMutationOutcome          = oapi.SQLMutationOutcome
+	SQLArrayColumnSchema        = oapi.SQLArrayColumnSchema
+	SQLArrayColumnSchemaType    = oapi.SQLArrayColumnSchemaType
+	SQLBuiltinType              = oapi.SQLBuiltinType
+	SQLArrayDimension           = oapi.SQLArrayDimension
+	SQLArrayElementType         = oapi.SQLArrayElementType
+	SQLArrayValue               = oapi.SQLArrayValue
 	// Table and Index types
 	CreateTableRequest                    = oapi.CreateTableRequest
 	TableStatus                           = oapi.TableStatus

@@ -486,7 +486,11 @@ const SchemaContext = struct {
 /// Slice identities remain stable when schema/property structs are copied.
 pub const CompiledValidationPlan = struct {
     const PropertyMap = std.StringHashMapUnmanaged(usize);
-    const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool };
+    const SqlColumn = struct { name: []const u8, kind: @import("../common/sql_builtin_type.zig").Type, generated: bool, is_array: bool };
+    /// Borrowed immutable epoch identity, stable across owner struct moves.
+    schema_documents: []const DocumentSchema = &.{},
+    schema_version: u32 = 0,
+    schema_mode: StorageMode = .document,
     /// Names borrow the immutable schema. No schema traversal on row admission.
     sql_columns: []const SqlColumn = &.{},
     properties: std.AutoHashMapUnmanaged(usize, PropertyMap) = .empty,
@@ -495,7 +499,7 @@ pub const CompiledValidationPlan = struct {
     expressions: ?*@import("relational_expression.zig").Set = null,
 
     pub fn init(alloc: std.mem.Allocator, schema: TableSchema) !CompiledValidationPlan {
-        var plan: CompiledValidationPlan = .{};
+        var plan: CompiledValidationPlan = .{ .schema_documents = schema.document_schemas, .schema_version = schema.version, .schema_mode = schema.storage_mode };
         errdefer plan.deinit(alloc);
         var sql_columns: std.ArrayList(SqlColumn) = .empty;
         defer sql_columns.deinit(alloc);
@@ -508,7 +512,7 @@ pub const CompiledValidationPlan = struct {
                     };
                     break :generated false;
                 };
-                try sql_columns.append(alloc, .{ .name = property.name, .kind = @import("../common/sql_builtin_type.zig").Type.fromWire(kind), .generated = generated });
+                try sql_columns.append(alloc, .{ .name = property.name, .kind = @import("../common/sql_builtin_type.zig").Type.fromWire(kind), .generated = generated, .is_array = propertyIsSqlArray(property) });
             };
         };
         plan.sql_columns = try sql_columns.toOwnedSlice(alloc);
@@ -539,6 +543,13 @@ pub const CompiledValidationPlan = struct {
         self.* = undefined;
     }
 
+    fn requireSchema(self: *const CompiledValidationPlan, schema: TableSchema) !void {
+        if (self.schema_documents.ptr != schema.document_schemas.ptr or
+            self.schema_documents.len != schema.document_schemas.len or
+            self.schema_version != schema.version or self.schema_mode != schema.storage_mode)
+            return error.InvalidBatchRequest;
+    }
+
     fn normalizeSql(self: *const CompiledValidationPlan, alloc: std.mem.Allocator, root: *std.json.Value, preserve: bool, ignore_generated: bool) !void {
         if (root.* != .object) return;
         const casts = @import("../sql/builtin_cast.zig");
@@ -546,6 +557,10 @@ pub const CompiledValidationPlan = struct {
             if (ignore_generated and column.generated) continue;
             const cell = root.object.getPtr(column.name) orelse continue;
             if (cell.* == .null) continue;
+            if (column.is_array) {
+                _ = @import("../sql/array_wire.zig").normalize(column.kind, cell, preserve, .{}) catch return error.InvalidBatchRequest;
+                continue;
+            }
             switch (column.kind) {
                 .int16, .int32, .int64 => {
                     const integer = exactI64JsonNumber(cell.*) orelse return error.InvalidBatchRequest;
@@ -634,6 +649,9 @@ const RuntimeValidationContext = struct {
     defer_next_root_members: bool = false,
     root_property: ?*const DocumentProperty = null,
     require_physical_encoding: bool = false,
+    /// Only the compiled root-column normalization pass can discharge the
+    /// array domain walk. Field-local restore validation never asserts this.
+    validated_sql_arrays: bool = false,
     physical_numeric_kind: ?RelationalNumericKind = null,
     active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0, .pointer_stability = .{} },
 
@@ -1009,9 +1027,9 @@ pub fn validateDocumentValueWithPlan(
     if (compiled == null and schema.storage_mode == .relational) {
         var plan = try CompiledValidationPlan.init(alloc, schema);
         defer plan.deinit(alloc);
-        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{});
+        return validateDocumentValueInternal(alloc, schema, value, physical_fields, &plan, true, &.{}, false);
     }
-    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{});
+    return validateDocumentValueInternal(alloc, schema, value, physical_fields, compiled, true, &.{}, false);
 }
 
 /// The only boundary that skips verification owns both expression evaluation
@@ -1024,18 +1042,20 @@ pub fn prepareDocumentValueWithPlan(
     physical_fields: []const PhysicalFieldValidation,
     compiled: *const CompiledValidationPlan,
 ) !void {
+    try compiled.requireSchema(schema);
     try compiled.normalizeSql(owned_alloc, value, false, true);
     if (compiled.expressions) |expressions| {
         try expressions.applyJson(owned_alloc, value);
         try compiled.normalizeSql(owned_alloc, value, false, false);
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{});
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, false, &.{}, true);
 }
 
 /// Typed null metadata is schema-checked by the row preparer before entering
 /// this boundary. Pointer identity scopes the exception to the exact root
 /// datums; nested nulls and unrelated SQL NULLs retain ordinary validation.
 pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch: std.mem.Allocator, schema: TableSchema, value: *std.json.Value, physical_fields: []const PhysicalFieldValidation, compiled: *const CompiledValidationPlan, json_null_fields: []const []const u8, preserve: bool) !void {
+    try compiled.requireSchema(schema);
     if (value.* != .object) return error.InvalidBatchRequest;
     if (!preserve) {
         try compiled.normalizeSql(owned_alloc, value, false, true);
@@ -1050,7 +1070,7 @@ pub fn prepareTypedDocumentValueWithPlan(owned_alloc: std.mem.Allocator, scratch
         pointer.* = value.object.getPtr(name) orelse return error.InvalidBatchRequest;
         if (pointer.*.* != .null) return error.InvalidBatchRequest;
     }
-    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers);
+    return validateDocumentValueInternal(scratch, schema, value, physical_fields, compiled, preserve, pointers, !preserve);
 }
 
 fn validateDocumentValueInternal(
@@ -1061,7 +1081,11 @@ fn validateDocumentValueInternal(
     compiled: ?*const CompiledValidationPlan,
     verify_generated: bool,
     json_null_values: []const *const std.json.Value,
+    // Private proof owned by the preparation boundary above, never a caller
+    // assertion on restore or public validation. Expressions have already run.
+    sql_admitted: bool,
 ) !void {
+    if (compiled) |plan| try plan.requireSchema(schema);
     if (schema.document_schemas.len == 0 and !schema.enforce_types and schema.ttl_duration_ns == 0 and schema.dynamic_templates.len == 0 and physical_fields.len == 0) return;
 
     const root = switch (value.*) {
@@ -1070,7 +1094,7 @@ fn validateDocumentValueInternal(
     };
 
     const document_schema = try resolveDocumentSchema(schema, root);
-    if (compiled) |plan| try plan.normalizeSql(alloc, value, true, false);
+    if (!sql_admitted) if (compiled) |plan| try plan.normalizeSql(alloc, value, true, false);
     if (verify_generated) if (compiled) |plan| {
         if (plan.expressions) |expressions| try expressions.verifyJson(alloc, value.*);
     } else if (schema.generated_columns != null) {
@@ -1083,6 +1107,7 @@ fn validateDocumentValueInternal(
         .json_null_values = json_null_values,
         .compiled = compiled,
         .require_physical_encoding = schema.storage_mode == .relational,
+        .validated_sql_arrays = compiled != null,
     };
     defer validation_context.deinit();
     var root_property: ?DocumentProperty = null;
@@ -1912,6 +1937,7 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "geoshape") or
         std.mem.eql(u8, schema_type_name, "embedding") or
         std.mem.eql(u8, schema_type_name, "json") or
+        std.mem.eql(u8, schema_type_name, "sql_array") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))
     {
@@ -2857,7 +2883,7 @@ fn relationalPhysicalConstraintsAreExactForKind(property: DocumentProperty, inhe
     // A JSON-backed property is one lossless bytes column. Its descendants are
     // validated as JSON but never lowered into physical numeric cells, so their
     // constraints do not need to fit a relational scalar encoding.
-    if (documentPropertyUsesJsonEncoding(property)) return true;
+    if (documentPropertyUsesJsonEncoding(property) or propertyIsSqlArray(property)) return true;
 
     const kind = inherited_kind orelse relationalNumericKind(property);
     if (kind) |numeric_kind| {
@@ -2942,6 +2968,7 @@ fn isRelationalStorageProperty(property: DocumentProperty) bool {
             std.mem.eql(u8, field_type, "geoshape") or
             std.mem.eql(u8, field_type, "embedding") or
             std.mem.eql(u8, field_type, "json") or
+            std.mem.eql(u8, field_type, "sql_array") or
             std.mem.eql(u8, field_type, "object") or
             std.mem.eql(u8, field_type, "array");
     }
@@ -3161,7 +3188,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (value != .string) return error.InvalidSchemaUpdateRequest;
         const kind = std.meta.stringToEnum(relational_wire.SQLBuiltinType, value.string) orelse return error.InvalidSchemaUpdateRequest;
         const physical = field_type orelse return error.InvalidSchemaUpdateRequest;
-        const matches = switch (kind) {
+        const matches = std.mem.eql(u8, physical, "sql_array") or switch (kind) {
             .text, .uuid => std.mem.eql(u8, physical, "string") or std.mem.eql(u8, physical, "keyword") or std.mem.eql(u8, physical, "text"),
             .int16, .int32, .int64 => type_spec.integer_only or std.mem.eql(u8, physical, "integer"),
             .float32, .float64 => !type_spec.integer_only and (std.mem.eql(u8, physical, "numeric") or std.mem.eql(u8, physical, "number")),
@@ -3171,6 +3198,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         if (!matches) return error.InvalidSchemaUpdateRequest;
         break :blk kind;
     } else null;
+    if (field_type) |physical| if (std.mem.eql(u8, physical, "sql_array") and sql_type == null) return error.InvalidSchemaUpdateRequest;
     const format = if (object.get("format")) |format_value|
         switch (format_value) {
             .string => |format_string| try alloc.dupe(u8, format_string),
@@ -4265,7 +4293,7 @@ fn validateDocumentFieldValueWithContext(
     const require_physical_encoding = context.require_physical_encoding;
     const physical_numeric_kind = context.physical_numeric_kind;
     if (require_physical_encoding) {
-        if (documentPropertyUsesJsonEncoding(property)) {
+        if (documentPropertyUsesJsonEncoding(property) or propertyIsSqlArray(property)) {
             context.require_physical_encoding = false;
             context.physical_numeric_kind = null;
         } else if (context.physical_numeric_kind == null) {
@@ -4301,7 +4329,7 @@ fn validateDocumentFieldValueWithContext(
         if (property.antfly_field) |mapping| try validateMappedFieldValue(mapping, value.*);
     }
 
-    if (property.sql_type == .jsonb) {
+    if (property.sql_type == .jsonb and !propertyIsSqlArray(property)) {
         const json_order = @import("../sql/json_order.zig");
         var budget = json_order.Budget{ .remaining = 8 * 1024 * 1024 };
         json_order.validateTextDomain(value.*, &budget, 0) catch return error.InvalidBatchRequest;
@@ -4524,6 +4552,15 @@ fn validateDocumentFieldValueWithContext(
     try validateNumericKeywordsWithContext(context, property, value.*);
 
     const field_type = property.field_type orelse return;
+
+    if (propertyIsSqlArray(property)) {
+        if (!context.validated_sql_arrays) {
+            const kind = property.sql_type orelse return error.InvalidBatchRequest;
+            var envelope = value.*;
+            _ = @import("../sql/array_wire.zig").normalize(@import("../common/sql_builtin_type.zig").Type.fromWire(kind), &envelope, true, .{}) catch return error.InvalidBatchRequest;
+        }
+        return;
+    }
 
     if (std.mem.eql(u8, field_type, "text") or
         std.mem.eql(u8, field_type, "keyword") or
@@ -4801,6 +4838,10 @@ fn documentPropertyAllowsNullInternal(property: DocumentProperty, json_literal_n
     // With no explicit type, null is admitted unless another keyword above
     // excludes it, matching an unconstrained JSON Schema.
     return true;
+}
+
+fn propertyIsSqlArray(property: DocumentProperty) bool {
+    return if (property.field_type) |kind| std.mem.eql(u8, kind, "sql_array") else false;
 }
 
 /// Whether relational storage represents this property as one lossless JSON

@@ -59,12 +59,42 @@ components:
     SQLBuiltinType:
       type: string
       description: |
-        Exact PostgreSQL builtin identity for a relational root scalar column.
+        Exact PostgreSQL builtin identity for a relational root scalar column
+        or the element identity of a `sql_array` column.
         Set the JSON Schema property's `x-antfly-sql-type` annotation to one of
         these values. The underlying property type must match. SQL array storage
         is not implied by this annotation. Existing unannotated schemas retain
         their original domains.
       enum: [text, int16, int32, int64, float32, float64, boolean, uuid, jsonb]
+
+    SQLArrayColumnSchema:
+      type: object
+      additionalProperties: true
+      required: [type, x-antfly-sql-type]
+      description: |
+        JSON Schema property declaration for one typed SQL-array column in a
+        relational table. Use it as a root property of DocumentSchema.schema.
+        The element identity is mandatory; a JSON Schema `array` remains a JSON
+        column and is never inferred to be a SQL array. Column values use the
+        lossless SQLArrayValue envelope: dimensions with lower bounds, flat
+        row-major values and explicit SQL NULL flags. Integer elements are
+        decimal strings, even when small. JSONB null and SQL NULL are distinct.
+        Float elements acquire their declared width before validation and
+        storage. Outer null represents a SQL NULL array when nullable is true.
+        Additional JSON Schema constraints apply to this envelope, not to
+        PostgreSQL array subscripts. SQL array index keys and SQL DDL activation
+        are not implied by accepting this storage schema.
+      properties:
+        type:
+          type: string
+          enum: [sql_array]
+        x-antfly-sql-type:
+          $ref: "#/components/schemas/SQLBuiltinType"
+        nullable:
+          type: boolean
+          default: false
+        description:
+          type: string
 
     DocumentSchema:
       type: object
@@ -83,6 +113,8 @@ components:
             $ref: "#/components/schemas/DocumentFieldMapping"
           x-antfly-sql-type-schema:
             $ref: "#/components/schemas/SQLBuiltinType"
+          x-antfly-sql-array-column-schema:
+            $ref: "#/components/schemas/SQLArrayColumnSchema"
 
     TtlConfig:
       type: object

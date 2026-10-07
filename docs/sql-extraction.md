@@ -3980,8 +3980,9 @@ even when a noncanonical row has a valid physical checksum. Already admitted,
 authenticated rows instead inspect only addressing extents for targeted reads;
 shape projection and primitive cell lookup require no flat cell materialization.
 
-Stored-array public schema/SQL DDL activation and SQL scan/mutation adapters
-remain unfinished. Array ordered/unique/FK index keys remain explicitly guarded
+Stored-array public schema declarations are active; SQL DDL activation and SQL
+scan/mutation adapters remain unfinished. Array ordered/unique/FK index keys
+remain explicitly guarded
 until typed ordering is implemented; arrays are not silently indexed as blobs.
 These native contracts do not change the original-case disposition counts.
 
@@ -4015,7 +4016,7 @@ float spellings remain unchanged. Preservation mode rejects float4 values that
 would round; both failed admission and a late invalid cell leave the input
 unchanged. This is the reusable boundary needed for public schema preparation
 to make extraction and physical storage agree without extra vectors or JSON
-parsing. Public schema/DDL and SQL scan/mutation activation remain unfinished;
+parsing. SQL DDL and SQL scan/mutation activation remain unfinished;
 this change does not reclassify any original parity case.
 
 The local debug admission benchmark takes approximately 7 ms for four passes
@@ -4027,4 +4028,40 @@ larger envelope. Cardinality, bytes and work remain independent safeguards.
 Verification: 409 embedded and 175 hosted SQL tests, seven targeted native
 array/reopen/restore tests, 101 PostgreSQL oracle tests and 20 inventory verifier
 tests. The original inventory remains 365 implemented, 136 rejected,
+73 superseded and 1,012 unresolved.
+
+### Public typed-array column schemas
+
+Relational root properties can declare `{"type":"sql_array",
+"x-antfly-sql-type":"int64","nullable":true}`. All nine builtin element
+identities bind to ASCH 17 typed-array columns, never JSON columns. Missing
+identity, implicit JSON-array conversion, nested annotations and document-mode
+declarations are rejected. Generated `SQLArrayColumnSchema` and `SQLBuiltinType`
+contracts are available through public Python, TypeScript and Go SDK exports;
+the Rust SDK builds them from its synchronized public specification.
+
+Compiled preparation normalizes the existing parsed envelope before extraction
+and physical encoding. Its owned admission path discharges the subsequent
+array-domain walk, while ordinary schema constraints still run against the
+canonical envelope. No extra flat cell vector or JSON parsing is needed for
+schema preparation. Admission is bound in O(1) to the exact immutable parsed
+schema owner, version and storage mode; a different compiled plan is rejected
+before normalization can mutate input. Public validation and field-local
+restore cannot assert
+that a value was admitted; restore retains strict physical validation and
+canonical float4 verification.
+
+The native public-schema fixture covers batch atomicity, exact bigint strings,
+non-default lower bounds, JSONB-null/SQL-NULL element provenance, float4 coercion,
+LSM reopen and portable restore with the public schema retained. Schema changes
+cannot reinterpret retained array elements. Envelope schema constraints and
+exhaustive allocation failures are covered independently. These native storage
+and SDK contracts do not activate SQL DDL, SQL execution adapters or array
+index keys, and do not change any original parity-case disposition.
+
+Verification: 159 embedded and one hosted native relational-system tests;
+409 embedded and 175 hosted SQL tests; 101 PostgreSQL oracle tests;
+24 Python and 72 TypeScript SDK tests; Go SDK and generated-client package
+tests; TypeScript type checking; Rust SDK compilation; OpenAPI and Python
+generation checks. Inventory remains 365 implemented, 136 rejected,
 73 superseded and 1,012 unresolved.

@@ -12,9 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { AntflyClient, SQLExecutionError } from "../src/client.js";
+import type { SQLArrayColumnSchema, SQLBuiltinType } from "../src/index.js";
 import type { SQLPreparedResponse } from "../src/types.js";
+
+it("exports an explicit typed array column schema without losing envelope constraints", () => {
+  expectTypeOf<SQLArrayColumnSchema["x-antfly-sql-type"]>().toEqualTypeOf<SQLBuiltinType>();
+  const schema: SQLArrayColumnSchema = {
+    type: "sql_array",
+    "x-antfly-sql-type": "int64",
+    nullable: true,
+    properties: { values: { minItems: 2 } },
+  };
+  expect(JSON.parse(JSON.stringify(schema))).toEqual({
+    type: "sql_array",
+    "x-antfly-sql-type": "int64",
+    nullable: true,
+    properties: { values: { minItems: 2 } },
+  });
+});
 
 afterEach(() => vi.unstubAllGlobals());
 

@@ -769,6 +769,7 @@ pub const RouteType = types.RouteType;
 pub const RowFilterEntry = types.RowFilterEntry;
 pub const RuntimeConfigStatus = types.RuntimeConfigStatus;
 pub const RuntimeDecl = types.RuntimeDecl;
+pub const SQLArrayColumnSchema = types.SQLArrayColumnSchema;
 pub const SQLArrayDimension = types.SQLArrayDimension;
 pub const SQLArrayElementType = types.SQLArrayElementType;
 pub const SQLArrayValue = types.SQLArrayValue;
