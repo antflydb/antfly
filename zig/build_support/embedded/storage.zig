@@ -139,7 +139,7 @@ pub fn makeLmdbModule(
     }
     configureLmdb(b, mod, lmdb_engine_mod, true);
     mod.addImport("storage_sim_fixture", b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/storage/sim_fixture.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/storage/sim_fixture.zig"),
         .target = target,
         .optimize = optimize,
     }));

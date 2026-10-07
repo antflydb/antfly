@@ -515,12 +515,12 @@ These parts are good candidates to keep and build on.
 
 ### Query and Index Execution
 
-- `pkg/antfly-embedded/src/local/index.zig`
+- `pkg/antfly-embedded/src/index.zig`
 - `pkg/antfly/src/search/*`
 - `go/pkg/antfly/lib/vector/go/pkg/antfly/src/*`
 - `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/*`
 - `pkg/antfly/src/section/*`
-- `pkg/antfly-embedded/src/local/segment.zig`
+- `pkg/antfly-embedded/src/segment.zig`
 - `pkg/antfly/src/columnar.zig`
 
 These contain the core retrieval and indexing logic that can still be useful in
@@ -528,18 +528,18 @@ an immutable-artifact and cached-query-worker design.
 
 ### Vector Search and Quantization
 
-- `pkg/antfly-embedded/src/local/storage/hbc_adapter.zig`
+- `pkg/antfly-embedded/src/storage/hbc_adapter.zig`
 
 This is valuable as algorithmic code even if the surrounding persistence model
 changes.
 
 ### Backend Abstraction Work
 
-- `pkg/antfly-embedded/src/local/storage/backend_types.zig`
-- `pkg/antfly-embedded/src/local/storage/backend_adapter.zig`
-- `pkg/antfly-embedded/src/local/storage/backend_erased.zig`
+- `pkg/antfly-embedded/src/storage/backend_types.zig`
+- `pkg/antfly-embedded/src/storage/backend_adapter.zig`
+- `pkg/antfly-embedded/src/storage/backend_erased.zig`
 - `pkg/antfly/src/storage/backend_conformance_test.zig`
-- `pkg/antfly-embedded/src/local/storage/lsm_backend.zig`
+- `pkg/antfly-embedded/src/storage/lsm_backend.zig`
 - `pkg/antfly/src/storage/lsm/*`
 
 This work is a good base for local cache and build-time storage abstraction.
@@ -569,9 +569,9 @@ model.
 
 ### Local Ownership and Local Transaction Layers
 
-- `pkg/antfly-embedded/src/local/storage/docstore.zig`
-- `pkg/antfly-embedded/src/local/storage/shard.zig`
-- `pkg/antfly-embedded/src/local/storage/transactions.zig`
+- `pkg/antfly-embedded/src/storage/docstore.zig`
+- `pkg/antfly-embedded/src/storage/shard.zig`
+- `pkg/antfly-embedded/src/storage/transactions.zig`
 - `pkg/antfly/src/storage/db/*`
 
 These modules are still useful references, but they reflect:
@@ -1374,8 +1374,8 @@ The shared engine pieces remain reusable:
 - `pkg/antfly/src/search/*`
 - `go/pkg/antfly/lib/vector/go/pkg/antfly/src/*`
 - `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/*`
-- `pkg/antfly-embedded/src/local/index.zig`
-- `pkg/antfly-embedded/src/local/segment.zig`
+- `pkg/antfly-embedded/src/index.zig`
+- `pkg/antfly-embedded/src/segment.zig`
 - `pkg/antfly/src/section/*`
 - selected parts of `pkg/antfly/src/storage/lsm/*`
 
@@ -1566,7 +1566,7 @@ Encoding / decoding tests are deterministic.
 
 The query runtime reuses:
 
-- `pkg/antfly-embedded/src/local/index.zig`
+- `pkg/antfly-embedded/src/index.zig`
 - `pkg/antfly/src/search/*`
 - `go/pkg/antfly/lib/vector/go/pkg/antfly/src/*`
 - `go/pkg/antfly/lib/vectorindex/go/pkg/antfly/src/*`

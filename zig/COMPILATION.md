@@ -296,7 +296,7 @@ Final reservation qualification still requires fresh cold-build evidence.
 ### C API composition
 
 `libantfly` compiles its public C API and local DB from
-`pkg/antfly-embedded/src/local`. It links embedded-owned native inference and
+`pkg/antfly-embedded/src`. It links embedded-owned native inference and
 enrichment compute archives. It does not link the server storage archive,
 standalone runtime, Raft coordination, HTTP handlers, or private server C API.
 The server storage archive consumes the same local source through the

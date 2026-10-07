@@ -18,14 +18,14 @@ The common pattern was that dense derived apply was finalizing too often.
 
 Zig already has durable replay state in the derived log:
 
-- `pkg/antfly-embedded/src/local/storage/db/derived/derived_log.zig`
-- `pkg/antfly-embedded/src/local/storage/db/derived/derived_worker.zig`
+- `pkg/antfly-embedded/src/storage/db/derived/derived_log.zig`
+- `pkg/antfly-embedded/src/storage/db/derived/derived_worker.zig`
 
 So this work adds only microbatching on top of that log; it does not add a second per-index WAL layer. Some Go services combine durability and microbatch scheduling in one WAL-like component, which makes sense where a single per-index worker path owns both concerns. In Zig those two concerns are already separated by the derived log, so only the batching half needs a home.
 
 ## Placement
 
-The batching shell lives under storage/db (`pkg/antfly-embedded/src/local/storage/db/batcher.zig`) rather than in a shared cross-language library, because the batching rules are tightly coupled to the storage/db pipelines:
+The batching shell lives under storage/db (`pkg/antfly-embedded/src/storage/db/batcher.zig`) rather than in a shared cross-language library, because the batching rules are tightly coupled to the storage/db pipelines:
 
 - replay/catch-up batching depends on `DerivedBatch` semantics
 - enrichment batching depends on generated-enrichment request semantics

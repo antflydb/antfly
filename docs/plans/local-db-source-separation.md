@@ -24,7 +24,7 @@ behavior changes belong to #893.
   shared generated types live in embedded. Authored schemas stay in
   `specs/openapi`, with the generator importing shared type modules.
 - Local DB, API helpers, catalog/index reconciliation and portable lake execution
-  live under `zig/pkg/antfly-embedded/src/local`. Native embedded lake querying
+  live under `zig/pkg/antfly-embedded/src`. Native embedded lake querying
   includes Parquet/Iceberg readers and shared SQL cursors; server credential
   resolution and distributed publication are adapters. Server replica catalogs,
   provisioning DTOs and coordination remain with `zig/pkg/antfly`.
@@ -233,7 +233,7 @@ classification to the full embedded source closure.
 ## Physical separation
 
 The DB and its complete local dependency closure now live under
-`zig/pkg/antfly-embedded/src/local`. The logical `storage/db/` paths above refer
+`zig/pkg/antfly-embedded/src`. The logical `storage/db/` paths above refer
 to that owner. The execution resources, mutation families, retained reads, and
 maintenance owners extracted in #969 move together with their local consumers.
 Server upload recovery scheduling, TTL routing, query visibility routing,

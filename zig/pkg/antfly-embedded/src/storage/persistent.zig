@@ -5582,7 +5582,7 @@ fn runPersistentReplayCase(
 }
 
 fn replayPersistentFixtureFile(alloc: Allocator, name: []const u8) !void {
-    const path = try std.fmt.allocPrint(alloc, "pkg/antfly-embedded/src/local/storage/persistent_sim_fixtures/{s}", .{name});
+    const path = try std.fmt.allocPrint(alloc, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures/{s}", .{name});
     defer alloc.free(path);
 
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(64 * 1024));
@@ -5606,7 +5606,7 @@ fn replayPersistentFixtureFile(alloc: Allocator, name: []const u8) !void {
 }
 
 fn replayModeledPersistentFixtureFile(alloc: Allocator, name: []const u8) !void {
-    const path = try std.fmt.allocPrint(alloc, "pkg/antfly-embedded/src/local/storage/persistent_sim_fixtures/{s}", .{name});
+    const path = try std.fmt.allocPrint(alloc, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures/{s}", .{name});
     defer alloc.free(path);
 
     const contents = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(64 * 1024));
@@ -5665,7 +5665,7 @@ fn replayModeledPersistentCrashFixture(
 }
 
 fn runPersistentReplayFixtures(alloc: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/local/storage/persistent_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };
@@ -5696,7 +5696,7 @@ fn runPersistentReplayFixtures(alloc: Allocator) !void {
 }
 
 fn runModeledPersistentFixtures(alloc: Allocator) !void {
-    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/local/storage/persistent_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
+    var fixtures_dir = std.Io.Dir.cwd().openDir(std.testing.io, "pkg/antfly-embedded/src/storage/persistent_sim_fixtures", .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         else => return err,
     };

@@ -25,8 +25,8 @@ existed, the closest Antfly equivalents were split across:
 - metadata table records in `zig/pkg/antfly/src/metadata/table_manager.zig`
 - per-table index metadata in `TableRecord.indexes_json`
 - shard-local durable index, enrichment, and resolver catalogs in
-  `zig/pkg/antfly-embedded/src/local/storage/db/catalog/index_manager.zig`
-- provider registries in `zig/pkg/antfly-embedded/src/local/common/provider_registry.zig`
+  `zig/pkg/antfly-embedded/src/storage/db/catalog/index_manager.zig`
+- provider registries in `zig/pkg/antfly-embedded/src/common/provider_registry.zig`
 - embedded DB lifecycle APIs in `zig/pkg/antfly-embedded/src/engine/db.zig`
 
 That gave Antfly many extension-like object types but not a single extension

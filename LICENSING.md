@@ -93,7 +93,7 @@ include the Apache LICENSE, source map, asset manifest, and canonical third-part
 notices. The SciPy-derived assignment solver retains its BSD-3-Clause notice in
 source and in native and WASM distributions.
 
-The public C API lives under `zig/pkg/antfly-embedded/src/local/capi` and
+The public C API lives under `zig/pkg/antfly-embedded/src/capi` and
 uses the embedded package’s `public_capi_root.zig` and `capi_embedded_root.zig`. Private server operations use the ELv2
 `capi/server_owner.zig` and `storage/server_db_adapter.zig`. Borrowed read
 consistency is local storage code; quorum tracking and Raft snapshot protocol

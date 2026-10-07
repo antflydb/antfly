@@ -290,7 +290,7 @@ jobs:
             zig/lib/httpx \
             zig/lib/objectstore \
             zig/pkg/antfly/src/api/backups.zig \
-            zig/pkg/antfly-embedded/src/local/serverless/remote_uri.zig \
+            zig/pkg/antfly-embedded/src/serverless/remote_uri.zig \
             .github/workflows/zig-tests.yml
           then
             echo "backup_s3=false" >> "$GITHUB_OUTPUT"
@@ -316,7 +316,7 @@ jobs:
             ':(glob)scripts/tla-*.py' \
             ':(glob)zig/pkg/antfly/src/tracing/**' \
             ':(glob)zig/pkg/antfly/src/raft/**' \
-            ':(glob)zig/pkg/antfly-embedded/src/local/storage/db/**' \
+            ':(glob)zig/pkg/antfly-embedded/src/storage/db/**' \
             ':(glob)zig/lib/raft/**' \
             Makefile \
             zig/build.zig \
@@ -445,10 +445,10 @@ jobs:
       - name: Run StreamVByte codec tests
         run: |
           set -euo pipefail
-          zig test zig/pkg/antfly-embedded/src/local/encoding/streamvbyte.zig
-          zig test -O fast zig/pkg/antfly-embedded/src/local/encoding/streamvbyte.zig
-          zig test zig/pkg/antfly-embedded/src/local/encoding/chunked_coder.zig
-          zig test -O fast zig/pkg/antfly-embedded/src/local/encoding/chunked_coder.zig
+          zig test zig/pkg/antfly-embedded/src/encoding/streamvbyte.zig
+          zig test -O fast zig/pkg/antfly-embedded/src/encoding/streamvbyte.zig
+          zig test zig/pkg/antfly-embedded/src/encoding/chunked_coder.zig
+          zig test -O fast zig/pkg/antfly-embedded/src/encoding/chunked_coder.zig
 
       - name: Check shared checksum usage
         run: make zig-checksums-check

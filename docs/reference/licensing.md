@@ -33,7 +33,7 @@ remains Apache. It is distinct from the standalone database server.
 ## Implementation
 
 The local DB, native SQL/lake readers, file CLI and public C API live in
-`zig/pkg/antfly-embedded/src/local`. Model execution lives in `zig/pkg/inference`;
+`zig/pkg/antfly-embedded/src`. Model execution lives in `zig/pkg/inference`;
 AWS and Google authentication mechanics live in shared libraries. Server Raft,
 hot standby, provisioning, managed credential resolution and cluster publication
 remain in `zig/pkg/antfly`. There are no per-file Apache exceptions in the server

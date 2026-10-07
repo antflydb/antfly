@@ -36,8 +36,8 @@ Table-level dynamic templates may use:
 
 The runtime schema is the source of truth for execution.
 
-It is versioned and persisted in [go/pkg/antfly-embedded/src/local/storage/schema.zig](pkg/antfly-embedded/src/local/storage/schema.zig).
-Compilation lives in [go/pkg/antfly-embedded/src/local/schema/mod.zig](pkg/antfly-embedded/src/local/schema/mod.zig).
+It is versioned and persisted in [go/pkg/antfly-embedded/src/storage/schema.zig](pkg/antfly-embedded/src/storage/schema.zig).
+Compilation lives in [go/pkg/antfly-embedded/src/schema/mod.zig](pkg/antfly-embedded/src/schema/mod.zig).
 
 The compiled model currently carries:
 
@@ -136,7 +136,7 @@ Text indexing currently resolves dynamic fields in this order:
 4. schema-present `infer_types` fallback for opted-in open dynamic objects
 5. open `additionalProperties: true` text fallback
 
-This ordering is enforced in [go/pkg/antfly-embedded/src/local/storage/db/document_mapper.zig](pkg/antfly-embedded/src/local/storage/db/document_mapper.zig).
+This ordering is enforced in [go/pkg/antfly-embedded/src/storage/db/document_mapper.zig](pkg/antfly-embedded/src/storage/db/document_mapper.zig).
 
 Query-time analyzer resolution now uses the same compiled runtime schema for
 explicit fields and compiled dynamic rules when a `match` or `match_phrase`

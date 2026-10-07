@@ -6,7 +6,7 @@ Baseline: `e4d707de5634a8d758c606b4432037e1a1682052`. Design:
 
 ## Implemented scope
 
-- [Shared admission controller](pkg/antfly-embedded/src/local/common/bounded_admission.zig):
+- [Shared admission controller](pkg/antfly-embedded/src/common/bounded_admission.zig):
   allocation-free FIFO queue, count/input-byte/wait limits, original deadlines,
   cancellation/grant ownership, close/drain notification, and single-release
   operation leases. Legacy callers retain fail-fast acquisition and zero-capacity

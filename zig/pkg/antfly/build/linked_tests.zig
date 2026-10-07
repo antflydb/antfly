@@ -33,7 +33,7 @@ pub fn add(b: *std.Build, options: std.Build.TestOptions) Artifact {
     var object_options = options;
     object_options.emit_object = true;
     object_options.test_runner = options.test_runner orelse .{
-        .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+        .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
         .mode = .simple,
     };
     const module = b.createModule(.{

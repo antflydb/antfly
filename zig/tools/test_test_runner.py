@@ -27,7 +27,7 @@ ZIG_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestRunnerSelection(unittest.TestCase):
-    runner_path = ZIG_ROOT / "pkg/antfly-embedded/src/local/test_runner.zig"
+    runner_path = ZIG_ROOT / "pkg/antfly-embedded/src/test_runner.zig"
     progress_prefix = "test"
 
     @classmethod
@@ -58,7 +58,7 @@ class TestRunnerSelection(unittest.TestCase):
                 "antfly_test_error_logs",
                 f"-Mroot={source}",
                 f"-Mantfly_platform={ZIG_ROOT / 'lib/platform/src/root.zig'}",
-                f"-Mantfly_test_error_logs={ZIG_ROOT / 'pkg/antfly-embedded/src/local/test_error_logs.zig'}",
+                f"-Mantfly_test_error_logs={ZIG_ROOT / 'pkg/antfly-embedded/src/test_error_logs.zig'}",
                 "--test-runner",
                 str(cls.runner_path),
                 "--test-no-exec",

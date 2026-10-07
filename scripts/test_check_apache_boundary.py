@@ -51,9 +51,8 @@ class ApacheBoundaryTests(unittest.TestCase):
             root = Path(directory)
             path = root / boundary.SOURCE_ROOT / "lite_main.zig"
             path.parent.mkdir(parents=True)
-            source = source.replace('"main.zig"', '"../../../antfly/src/main.zig"')
-            source = source.replace("../antfarm/", "../../../antfly/antfarm/")
-            source = source.replace("../../../lib/", "../../../../lib/")
+            source = source.replace('"main.zig"', '"../../antfly/src/main.zig"')
+            source = source.replace("../antfarm/", "../../antfly/antfarm/")
             path.write_text(source)
             server = root / boundary.SERVER_SOURCE_ROOT / "main.zig"
             server.parent.mkdir(parents=True, exist_ok=True)

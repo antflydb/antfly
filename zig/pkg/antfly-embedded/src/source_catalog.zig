@@ -16,8 +16,10 @@
 //! Private module boundary for server consumers of local source contracts.
 const builtin = @import("builtin");
 const std = @import("std");
-const consumer = if (builtin.is_test) @import("antfly_test_source_root") else struct {};
-pub const antfly_sources = if (builtin.is_test and @hasDecl(consumer, "antfly_sources")) consumer.antfly_sources else @import("source_owner_storage.zig");
+// Every server profile binds its source owner, including non-test archives.
+// A physical fallback here would become a cache dependency of control owners.
+const consumer = @import("antfly_test_source_root");
+pub const antfly_sources = consumer.antfly_sources;
 pub const api_backup_contract = @import("api/backup_contract.zig");
 pub const api_batch = @import("api/batch.zig");
 pub const api_bounded_diagnostic_gate = @import("api/bounded_diagnostic_gate.zig");

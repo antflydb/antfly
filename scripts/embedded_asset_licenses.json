@@ -15,19 +15,19 @@
     "size_bytes": 515100,
     "source": "https://raw.githubusercontent.com/googlefonts/roboto-2/38062f4b4a0be4346d07a928408da21602545e9e/src/hinted/Roboto-Regular.ttf"
   },
-  "zig/pkg/antfly-embedded/src/local/sql/fixtures/sql_parity_inventory.json": {
+  "zig/pkg/antfly-embedded/src/sql/fixtures/sql_parity_inventory.json": {
     "license": "Apache-2.0",
     "sha256": "c203a4dcf0094b75e1d3764e90beebddaf844a9ce604543c0a4dbc0ffe8ae173",
     "size_bytes": 716374,
     "source": "First-party SQL compiler/runtime parity inventory"
   },
-  "zig/pkg/antfly-embedded/src/local/storage/testdata/cross_backend_v1.afb": {
+  "zig/pkg/antfly-embedded/src/storage/testdata/cross_backend_v1.afb": {
     "kind": "first-party test fixture",
     "license": "Apache-2.0",
     "sha256": "136bcf0a96f4d41798075f5a63674757ff14fd34db5a766c802fe24e03f2e4b4",
     "size_bytes": 2183
   },
-  "zig/pkg/antfly-embedded/src/local/storage/testdata/production_portable_v1.afb": {
+  "zig/pkg/antfly-embedded/src/storage/testdata/production_portable_v1.afb": {
     "kind": "first-party test fixture",
     "license": "Apache-2.0",
     "sha256": "5386fc9ad3e2798a4eb9ae97352514ffd1875170d9aaf775451c75154f2b15e9",

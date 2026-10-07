@@ -64,7 +64,7 @@ pub const Modules = struct {
 };
 
 pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) Modules {
-    const local_path = b.path("pkg/antfly-embedded/src/local");
+    const local_path = b.path("pkg/antfly-embedded/src");
     const test_error_logs = b.createModule(.{ .root_source_file = local_path.path(b, "test_error_logs.zig"), .target = target, .optimize = optimize });
     const memory = b.createModule(.{ .root_source_file = local_path.path(b, "runtime_memory_abi.zig"), .target = target, .optimize = optimize });
     const failure = b.createModule(.{ .root_source_file = local_path.path(b, "runtime_failure_abi.zig"), .target = target, .optimize = optimize });

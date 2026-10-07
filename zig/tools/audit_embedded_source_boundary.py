@@ -383,7 +383,7 @@ def audit_modules(
     """Resolve source imports against the actual target's Build.Module table."""
     project = project.resolve()
     source_root = project / "pkg/antfly/src"
-    local_root = project / "pkg/antfly-embedded/src/local"
+    local_root = project / "pkg/antfly-embedded/src"
     external_modules = external_modules or set()
     unknown = external_modules.difference(modules)
     if unknown:
@@ -465,7 +465,7 @@ def main() -> None:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "pkg/antfly-embedded/src/local",
+        default=Path(__file__).resolve().parents[1] / "pkg/antfly-embedded/src",
     )
     parser.add_argument("--entry", action="append")
     parser.add_argument("--json", type=Path)

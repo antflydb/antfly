@@ -111,7 +111,7 @@ class GraphIdentifierPolicyTest(unittest.TestCase):
             )
         )["components"]["schemas"]["GraphExecutionConfig"]["properties"]
         runtime = (
-            generator.ROOT / "zig/pkg/antfly-embedded/src/local/graph/work_budget.zig"
+            generator.ROOT / "zig/pkg/antfly-embedded/src/graph/work_budget.zig"
         ).read_text(encoding="utf-8")
 
         for name, schema in config.items():

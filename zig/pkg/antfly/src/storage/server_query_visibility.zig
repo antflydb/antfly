@@ -16,27 +16,28 @@
 //! Stable server routing for local visibility observations. The DB callback
 //! detachment barrier owns the lifetime of the binding and its borrowed route.
 const std = @import("std");
-const db = @import("antfly_local_sources").storage_db_db;
+const db = @import("antfly_source_root").antfly_sources.selected_db;
+const visibility = @import("antfly_local_sources").storage_db_query_visibility;
 pub const Binding = struct {
     pub const Route = struct {
         ptr: *anyopaque,
         table_name: []const u8,
         group_id: u64,
         owner: ?*db.DB,
-        notify: *const fn (*anyopaque, []const u8, u64, ?*db.DB, db.QueryVisibilityEvent) void,
+        notify: *const fn (*anyopaque, []const u8, u64, ?*db.DB, visibility.QueryVisibilityEvent) void,
     };
     mutex: std.atomic.Mutex = .unlocked,
     route: ?Route = null,
     fn lock(self: *Binding) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
-    pub fn bind(self: *Binding, route: Route) db.QueryVisibilityHook {
+    pub fn bind(self: *Binding, route: Route) visibility.QueryVisibilityHook {
         self.lock();
         self.route = route;
         self.mutex.unlock();
         return .{ .ptr = self, .on_change = changed };
     }
-    fn changed(ptr: *anyopaque, event: db.QueryVisibilityEvent) void {
+    fn changed(ptr: *anyopaque, event: visibility.QueryVisibilityEvent) void {
         const self: *Binding = @ptrCast(@alignCast(ptr));
         const route = blk: {
             self.lock();
@@ -51,7 +52,7 @@ test "server visibility binding attaches routing without holding its lock across
     const Capture = struct {
         binding: *Binding,
         calls: usize = 0,
-        fn changed(ptr: *anyopaque, table_name: []const u8, group_id: u64, _: ?*db.DB, event: db.QueryVisibilityEvent) void {
+        fn changed(ptr: *anyopaque, table_name: []const u8, group_id: u64, _: ?*db.DB, event: visibility.QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             std.debug.assert(self.binding.mutex.tryLock());
             self.binding.mutex.unlock();

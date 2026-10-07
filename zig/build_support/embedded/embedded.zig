@@ -133,7 +133,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const antfly_imports = options.antfly_imports;
     const antfly_mod = options.antfly_mod;
     const embedded_support_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/embedded_root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/embedded_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -203,7 +203,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     _ = lib;
 
     const capi_root_mod = b.createModule(.{
-        .root_source_file = b.path(if (options.server_integration_tests) "pkg/antfly/src/capi_test_root.zig" else "pkg/antfly-embedded/src/local/public_capi_root.zig"),
+        .root_source_file = b.path(if (options.server_integration_tests) "pkg/antfly/src/capi_test_root.zig" else "pkg/antfly-embedded/src/public_capi_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -223,7 +223,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     }
 
     const capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/public_capi_root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/public_capi_root.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
@@ -272,7 +272,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .max_rss = 12 * 1024 * 1024 * 1024,
     });
     const native_enrichment_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/enrichment_compute_root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/enrichment_compute_root.zig"),
         .target = target,
         .optimize = optimize,
         .pic = true,
@@ -359,7 +359,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // through the public header, so a case that fails here is an ABI bug
     // rather than a binding bug.
     const capi_conformance_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/capi/conformance_runner.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/capi/conformance_runner.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -550,13 +550,13 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .filters = selectTestFilters(b, &capi_default_filters),
         .test_runner = .{
-            .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
+            .path = b.path("pkg/antfly-embedded/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_capi_tests = addFilteredTestRunArtifact(b, capi_tests);
     const lake_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly-embedded/src/local/lake_test_root.zig"),
+        .root_source_file = b.path("pkg/antfly-embedded/src/lake_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -567,7 +567,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         // Compile reader/cursor regressions, not unrelated server fixture tests
         // reachable through shared schema and credential modules.
         .filters = selectTestFilters(b, &.{ "lake SQL", "Parquet ", "parquet ", "Iceberg ", "iceberg ", "external source inventory", "external lake identities", "external lake pruning", "lake host resolver" }),
-        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("embedded-lake-test", "Test lake readers and SQL cursors without the server")
         .dependOn(&addFilteredTestRunArtifact(b, lake_tests).step);

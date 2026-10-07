@@ -31,7 +31,7 @@ import license_headers as policy
 class LicenseHeaderTests(unittest.TestCase):
     def test_product_groups(self):
         self.assertEqual(
-            policy.group_for("zig/pkg/antfly-embedded/src/local/lite_main.zig", "all"),
+            policy.group_for("zig/pkg/antfly-embedded/src/lite_main.zig", "all"),
             "apache",
         )
         self.assertEqual(policy.group_for("zig/pkg/antfly/src/main.zig", "all"), "elv2")
@@ -49,8 +49,8 @@ class LicenseHeaderTests(unittest.TestCase):
         for name in policy.APACHE_FILES:
             self.assertFalse(name.startswith("zig/pkg/antfly/"), name)
         for name in (
-            "zig/pkg/antfly-embedded/src/local/storage/db/db.zig",
-            "zig/pkg/antfly-embedded/src/local/lake.zig",
+            "zig/pkg/antfly-embedded/src/storage/db/db.zig",
+            "zig/pkg/antfly-embedded/src/lake.zig",
             "zig/lib/credentials/src/aws.zig",
             "zig/build_support/antfly/dependencies.zig",
         ):

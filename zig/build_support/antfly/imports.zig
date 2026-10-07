@@ -368,7 +368,9 @@ pub const AntflyRootImports = struct {
         const options = b.addOptions();
         options.addOption(bool, "bench_minimal_deps", false);
         mod.addOptions("build_options", options);
-        self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
+        // Document/media compute has no physical storage handle, including in
+        // the independently compiled public embedded enrichment archive.
+        self.storage_boundary.configureProfile(mod, true, false, self.boundary_profile);
         mod.addImport("antfly_platform", self.platform);
         mod.addImport("antfly_cancellation", self.cancellation);
         mod.addImport("antfly_template_content", self.template_content);

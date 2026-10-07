@@ -425,7 +425,7 @@ explicit billing selection, and terminal-stream correctness.
 
 ## Implementation notes
 
-The implementation uses `zig/pkg/antfly-embedded/src/local/chatgpt/{protocol,manager,responses}.zig`.
+The implementation uses `zig/pkg/antfly-embedded/src/chatgpt/{protocol,manager,responses}.zig`.
 The protocol module implements public-client PKCE and pinned OIDC verification;
 the manager owns local registrations, callback listeners and token rotation;
 the Responses adapter implements inference and local tool continuation. The

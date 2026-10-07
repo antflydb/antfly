@@ -35644,7 +35644,7 @@ fn runIndexManagerCrashCase(
 }
 
 fn runIndexManagerReplayFixtures(alloc: Allocator) !void {
-    const root_dir = "pkg/antfly-embedded/src/local/storage/db/catalog/index_manager_sim_fixtures";
+    const root_dir = "pkg/antfly-embedded/src/storage/db/catalog/index_manager_sim_fixtures";
     var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
     defer fixture_dir.close(std.testing.io);
 
@@ -35698,7 +35698,7 @@ fn runIndexManagerReplayFixtures(alloc: Allocator) !void {
 }
 
 fn runModeledIndexManagerReplayFixtures(alloc: Allocator) !void {
-    const root_dir = "pkg/antfly-embedded/src/local/storage/db/catalog/index_manager_sim_fixtures/replay";
+    const root_dir = "pkg/antfly-embedded/src/storage/db/catalog/index_manager_sim_fixtures/replay";
     var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
     defer fixture_dir.close(std.testing.io);
 
@@ -35804,7 +35804,7 @@ fn replayModeledIndexManagerCrashFixture(
 }
 
 fn runModeledIndexManagerCrashFixtures(alloc: Allocator) !void {
-    const root_dir = "pkg/antfly-embedded/src/local/storage/db/catalog/index_manager_sim_fixtures/crash";
+    const root_dir = "pkg/antfly-embedded/src/storage/db/catalog/index_manager_sim_fixtures/crash";
     var fixture_dir = try std.Io.Dir.cwd().openDir(std.testing.io, root_dir, .{ .iterate = true });
     defer fixture_dir.close(std.testing.io);
 
