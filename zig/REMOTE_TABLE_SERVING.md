@@ -737,7 +737,8 @@ native segment. Readers use the shared native range codecs, retaining bounded
 navigation and decoder scratch instead of allocating and zeroing a segment-sized
 heap buffer. Term-frequency probes read dictionary addresses and posting headers;
 Required WAND reads fetch the document chunks they visit, while bounded lookahead
-may warm subsequent chunks. Position records are decoded when phrase consumers
+may warm subsequent chunks. Scoped field views and both block-cache adapters
+forward advisory hints, translating section-relative offsets at the field boundary. Position records are decoded when phrase consumers
 request them. A block checksum may bring neighboring
 bytes into cache, so the minimum read unit remains 64 KiB. Each query binds its
 current store capability, deadline, cancellation and reader lease to a private
@@ -782,6 +783,11 @@ Covering row-index windows preserve spill dictionary identities through their
 batch callbacks and selected lanes. Column-major residual evaluation memoizes each
 surviving dictionary identity per predicate, retaining separate SQL NULL and JSON
 null identities and exact integer values; only result delivery expands rows.
+Covering blocks use the shared bounded decoded-artifact cache: singleflight
+decoding retains validated wire buffers, dictionaries and column views under a
+lease. Candidate windows borrow these values across pagination and query reuse;
+no query arena owns a cached payload. Scope and authenticated identity fence
+reuse, while deadlines and cancellation remain query-local.
 Unknown residual selectivity costs the entire candidate range. Actual page clustering
 statistics remain a possible future refinement; explicit index requests retain
 their required semantics.
@@ -824,3 +830,21 @@ provenance. Highlight extraction shares the build projection path, including
 explicit field indexes that override general table text mapping. Vector-only requests do
 not synthesize text highlights. Real Parquet E2Es cover projected highlight fields
 and repeat the request after a cold restart.
+
+Small native disk blocks also share verified mapping owners under an independent
+8 MiB/128-entry LRU bound. Active leases prevent eviction and keep the disk inode
+pinned; saturated admission returns a private required-read lease. Mapping hits
+avoid reopening, remapping and rehashing the same immutable cache inode. New
+owners still validate the header, identity, length and complete payload digest;
+eviction/restart requires verification again. This does not change large
+contiguous segment reclamation. Mapping owners drain before the disk cache closes.
+
+Remote search compiles physical hydration dependencies once before retrieval:
+returned includes, field sorting and highlight source paths form one union.
+Default highlighting follows each index's selected-field or schema provenance,
+including document type discriminators and dynamic source prefixes. Deferred
+wire projection does not force decoding unrelated columns. Omitted source loads
+only highlight dependencies. Exclusion-only/full-source requests, schema-less
+or unrestricted dynamic highlighting, and consumers without a finite dependency
+contract (evaluation, reranking, hierarchy and residual filters) retain full
+source. Final public projection still controls the returned document.

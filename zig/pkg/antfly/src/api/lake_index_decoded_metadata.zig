@@ -101,3 +101,56 @@ test "external lake decoded metadata reuses owned values while fencing scope ver
     (try acquire(Value, cached, undefined, ref, .none, Loader.load)).release();
     try std.testing.expectEqual(@as(usize, 3), Loader.calls);
 }
+
+/// Covering blocks use the same bounded singleflight/lease owner as other
+/// decoded immutable artifacts. All wire buffers and decoded views share its arena.
+pub fn acquireColumnBlock(cached: artifacts.CachedRead, store: stores.ArtifactStore, ref: artifacts.ChunkRef, cancellation: @import("antfly_cancellation").CancellationToken) !Owned(local.sql_spill.ColumnarBlock) {
+    const Loader = struct {
+        fn load(a: std.mem.Allocator, source: stores.ArtifactStore, artifact: local.serverless_manifest_artifact_ref.ArtifactRef, token: @import("antfly_cancellation").CancellationToken, cache: ?artifacts.CachedRead) !local.sql_spill.ColumnarBlock {
+            if (artifact.byte_len > artifacts.max_block_bytes) return error.InvalidNativeLakeRowIndex;
+            const bytes = try artifacts.readArtifact(a, source, .{ .artifact_id = artifact.artifact_id, .checksum = artifact.checksum, .byte_len = artifact.byte_len }, token, cache);
+            return local.sql_spill.decodeColumnarBlockInArena(a, bytes, artifacts.max_block_bytes);
+        }
+    };
+    return acquire(local.sql_spill.ColumnarBlock, cached, store, .{ .kind = .ordered_row_index, .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, cancellation, Loader.load);
+}
+
+test "external lake decoded covering blocks share exact dictionaries and fence current readers" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("cover-decoded-cache");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    var store = fs.artifactStore();
+    store.upload_scope = try stores.UploadScope.forPublication(@splat(5), 1, std.testing.io);
+    var cells: [32][1]local.sql_scalar.Datum = undefined;
+    var rows: [32]local.sql_operators.Row = undefined;
+    for (&cells, &rows, 0..) |*cell, *row, i| {
+        cell[0] = if (i == 0) .{} else local.sql_scalar.Datum.json(.{ .integer = 9007199254740993 });
+        row.* = .{ .values = cell, .keys = &.{}, .ordinal = i };
+    }
+    const bytes = try local.sql_spill.encodeColumnarBlockAlloc(a, &rows, artifacts.max_block_bytes);
+    defer a.free(bytes);
+    const stored = try store.put(bytes);
+    defer a.free(stored.artifact_id);
+    defer a.free(stored.checksum);
+    const ref: artifacts.ChunkRef = .{ .artifact_id = stored.artifact_id, .checksum = stored.checksum, .byte_len = stored.byte_len };
+    var cache = local.serverless_query_lake_serving_cache.Cache.init(a);
+    defer cache.deinit();
+    var cached: artifacts.CachedRead = .{ .cache = &cache, .scope = @splat(1), .context = .{ .io = std.testing.io } };
+    const first = try acquireColumnBlock(cached, store, ref, .none);
+    defer first.release();
+    const second = try acquireColumnBlock(cached, store, ref, .none);
+    defer second.release();
+    try std.testing.expect(first.value == second.value);
+    try std.testing.expect((try second.value.cell(0, 0)).sql_null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try second.value.cell(31, 0)).value.integer);
+    try std.testing.expect((try second.value.dictionaryIdentity(31, 0, false)) != null);
+    cached.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, acquireColumnBlock(cached, store, ref, .none));
+    cached.context.deadline_ns = null;
+    cached.scope = @splat(2);
+    const isolated = try acquireColumnBlock(cached, store, ref, .none);
+    defer isolated.release();
+    try std.testing.expect(isolated.value != first.value);
+}

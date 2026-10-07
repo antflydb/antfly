@@ -27,6 +27,10 @@ pub const Cache = struct {
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.StringHashMapUnmanaged(*Entry) = .empty,
     flights: std.StringHashMapUnmanaged(*Flight) = .empty,
+    mappings: std.StringHashMapUnmanaged(*Mapping) = .empty,
+    mapped_bytes: usize = 0,
+    max_mapped_bytes: usize = 8 * 1024 * 1024,
+    max_mappings: usize = 128,
     max_bytes: usize = 64 * 1024 * 1024,
     max_entries: usize = 4096,
     stats: Stats = .{},
@@ -35,6 +39,26 @@ pub const Cache = struct {
     persistent_mutex: std.Io.Mutex = .init,
     persistent_attempted: bool = false,
     persistent_ready: std.atomic.Value(bool) = .init(false),
+
+    const Mapping = struct {
+        cache: *Cache,
+        key: []u8,
+        value: parquet.PersistentObjectRangeCache.MappedEntry,
+        refs: usize = 1,
+        touched: u64,
+        fn release(self: *Mapping) void {
+            while (!self.cache.mutex.tryLock()) std.atomic.spinLoopHint();
+            defer self.cache.mutex.unlock();
+            std.debug.assert(self.refs != 0);
+            self.refs -= 1;
+        }
+        fn destroy(self: *Mapping) void {
+            std.debug.assert(self.refs == 0);
+            self.value.deinit();
+            self.cache.alloc.free(self.key);
+            self.cache.alloc.destroy(self);
+        }
+    };
 
     /// Configure once before reads. The server owns the worker and drains it
     /// after cursors are quiescent; a request never owns cache I/O state.
@@ -108,6 +132,7 @@ pub const Cache = struct {
         evictions: u64 = 0,
         disk_unavailable: ?[]const u8 = null,
         disk_hits: u64 = 0,
+        mapping_hits: u64 = 0,
         disk_bytes: u64 = 0,
         provider_reads: u64 = 0,
         provider_bytes: u64 = 0,
@@ -130,6 +155,9 @@ pub const Cache = struct {
         return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
+        var mappings = self.mappings.valueIterator();
+        while (mappings.next()) |entry| entry.*.destroy();
+        self.mappings.deinit(self.alloc);
         if (self.persistent) |*disk| disk.deinit();
         self.decoded.deinit();
         std.debug.assert(self.flights.count() == 0);
@@ -178,11 +206,13 @@ pub const Cache = struct {
         return std.fmt.allocPrint(a, "{s}:purpose=sidecar_payload", .{std.fmt.bytesToHex(hash.finalResult(), .lower)});
     }
     pub const ImmutableLease = union(enum) {
+        mapping: *Mapping,
         shared: ranges.RangeLease,
         heap: struct { alloc: Allocator, bytes: []u8 },
         mapped: parquet.PersistentObjectRangeCache.MappedEntry,
         pub fn bytes(self: ImmutableLease) []const u8 {
             return switch (self) {
+                .mapping => |value| value.value.bytes,
                 .shared => |value| value.bytes,
                 .heap => |value| value.bytes,
                 .mapped => |value| value.bytes,
@@ -190,6 +220,7 @@ pub const Cache = struct {
         }
         pub fn deinit(self: *ImmutableLease) void {
             switch (self.*) {
+                .mapping => |value| value.release(),
                 .shared => |value| value.release(),
                 .heap => |value| value.alloc.free(value.bytes),
                 .mapped => |*value| value.deinit(),
@@ -223,6 +254,11 @@ pub const Cache = struct {
             try context.ensureActive();
             return .{ .shared = pinned };
         }
+        if (self.pinMapping(key)) |mapping| {
+            errdefer mapping.release();
+            try context.ensureActive();
+            return .{ .mapping = mapping };
+        }
         var lease = try self.readImmutableLease(a, scope, identity, length, digest, context, loader);
         errdefer lease.deinit();
         if (lease == .heap) if (self.pin(key)) |pinned| {
@@ -231,7 +267,58 @@ pub const Cache = struct {
             lease.deinit();
             return .{ .shared = pinned };
         };
+        if (lease == .mapped) return self.admitMapping(key, lease.mapped);
         return lease;
+    }
+    fn pinMapping(self: *Cache, key: []const u8) ?*Mapping {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        const mapping = self.mappings.get(key) orelse return null;
+        mapping.refs += 1;
+        self.tick +|= 1;
+        mapping.touched = self.tick;
+        self.stats.mapping_hits +|= 1;
+        return mapping;
+    }
+    // Only verified immutable cache inodes enter this owner. Replacement is
+    // atomic; pins keep the original mapping and disk eviction lease alive.
+    // Large contiguous artifacts keep their separate disk-first lifetime.
+    fn admitMapping(self: *Cache, key: []const u8, value: parquet.PersistentObjectRangeCache.MappedEntry) ImmutableLease {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.mappings.get(key)) |existing| {
+            existing.refs += 1;
+            var redundant = value;
+            redundant.deinit();
+            return .{ .mapping = existing };
+        }
+        if (value.mapping.len > self.max_mapped_bytes or self.max_mappings == 0) return .{ .mapped = value };
+        while (value.mapping.len > self.max_mapped_bytes -| self.mapped_bytes or self.mappings.count() >= self.max_mappings) {
+            var victim: ?*Mapping = null;
+            var entries = self.mappings.valueIterator();
+            while (entries.next()) |entry| {
+                if (entry.*.refs != 0) continue;
+                if (victim == null or entry.*.touched < victim.?.touched) victim = entry.*;
+            }
+            const retired = victim orelse return .{ .mapped = value };
+            _ = self.mappings.remove(retired.key);
+            self.mapped_bytes -= retired.value.mapping.len;
+            retired.destroy();
+        }
+        const mapping = self.alloc.create(Mapping) catch return .{ .mapped = value };
+        const owned = self.alloc.dupe(u8, key) catch {
+            self.alloc.destroy(mapping);
+            return .{ .mapped = value };
+        };
+        self.tick +|= 1;
+        mapping.* = .{ .cache = self, .key = owned, .value = value, .touched = self.tick };
+        self.mappings.put(self.alloc, owned, mapping) catch {
+            self.alloc.free(owned);
+            self.alloc.destroy(mapping);
+            return .{ .mapped = value };
+        };
+        self.mapped_bytes += value.mapping.len;
+        return .{ .mapping = mapping };
     }
 
     fn readImmutableKeyAlloc(self: *Cache, a: Allocator, key: []const u8, length: usize, digest: [32]u8, context: Context, loader: ImmutableLoader) ![]u8 {
@@ -959,4 +1046,54 @@ test "external lake immutable block leases borrow RAM and pin bytes through evic
     try std.testing.expectEqualStrings("immutable block", first.bytes());
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
     try std.testing.expectError(error.DeadlineExceeded, cache.readImmutableBlockLease(a, @splat(1), "block", 15, digest, .{ .deadline_ns = 0 }, loader));
+}
+
+test "external lake bounded verified mappings reuse owners and pin through pressure" {
+    if (comptime @import("builtin").os.tag == .freestanding or @import("builtin").os.tag == .wasi or @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/block-mappings", .{tmp.sub_path});
+    defer a.free(path);
+    var cache = Cache.initWithMemoryLimit(a, 0);
+    defer cache.deinit();
+    cache.max_mappings = 1;
+    try cache.ensurePersistent(io, path, .{}, .{});
+    const Provider = struct {
+        calls: usize = 0,
+        fn load(raw: *anyopaque, alloc: Allocator) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return alloc.dupe(u8, "verified block");
+        }
+    };
+    var provider: Provider = .{};
+    const loader: Cache.ImmutableLoader = .{ .ptr = &provider, .load = Provider.load };
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("verified block", &digest, .{});
+    var cold = try cache.readImmutableBlockLease(a, @splat(1), "block", 14, digest, .{ .io = io }, loader);
+    cold.deinit();
+    cache.persistent.?.flush();
+    var first = try cache.readImmutableBlockLease(a, @splat(1), "block", 14, digest, .{ .io = io }, loader);
+    defer first.deinit();
+    var second = try cache.readImmutableBlockLease(a, @splat(1), "block", 14, digest, .{ .io = io }, loader);
+    defer second.deinit();
+    try std.testing.expect(first == .mapping and second == .mapping);
+    try std.testing.expect(first.bytes().ptr == second.bytes().ptr);
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().mapping_hits);
+    try std.testing.expectEqual(@as(usize, 1), cache.persistentStats().?.read_hits);
+    try std.testing.expectError(error.DeadlineExceeded, cache.readImmutableBlockLease(a, @splat(1), "block", 14, digest, .{ .io = io, .deadline_ns = 0 }, loader));
+    var other_cold = try cache.readImmutableBlockLease(a, @splat(2), "block", 14, digest, .{ .io = io }, loader);
+    other_cold.deinit();
+    cache.persistent.?.flush();
+    var pressure = try cache.readImmutableBlockLease(a, @splat(2), "block", 14, digest, .{ .io = io }, loader);
+    defer pressure.deinit();
+    try std.testing.expect(pressure == .mapped);
+    try std.testing.expectEqualStrings("verified block", first.bytes());
+    try std.testing.expect(cache.mapped_bytes <= cache.max_mapped_bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.mappings.count());
+    try std.testing.expectEqual(@as(usize, 2), provider.calls);
 }

@@ -977,6 +977,9 @@ def test_native_remote_text_corpus_scores_filters_and_restart(tmp_path):
                     fragment["text"][span["start"]:span["end"]].lower() == "needle"
                     for fragment in fragments for span in fragment["spans"]), hit
         assert_highlights(call("POST", "/tables/lake_text/query", highlight_request))
+        assert_highlights(call("POST", "/tables/lake_text/query", dict(highlight_request, highlight={})))
+        assert_highlights(call("POST", "/tables/lake_text/query", dict(highlight_request, highlight={}, fields=[])),
+                          include_source=False)
         assert_highlights(call("POST", "/tables/lake_text/query",
                                dict(highlight_request, full_text_index="all_text")))
         assert_highlights(call("POST", "/tables/lake_text/query", dict(highlight_request, fields=[])),

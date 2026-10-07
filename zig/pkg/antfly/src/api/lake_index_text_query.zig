@@ -75,6 +75,7 @@ fn executePinned(a: A, server: *server_api.ApiHttpServer, table: local.common_to
     owner.private_digests = metadata.private_digests;
     var effective = req;
     effective.cancellation = .{ .ptr = &owner, .is_cancelled_fn = Execution.canceled };
+    owner.hydration_fields = try owner.planHydration(effective);
     const started = @import("antfly_platform").time.monotonicNs();
     var result = if (effective.full_text_queries.len != 0 or effective.sparse_queries.len != 0 or effective.dense_queries.len != 0)
         try search.searchComposed(a, effective, .{ .ctx = &owner, .search_text_query = Execution.searchText, .search_text = Execution.dispatchText, .search_dense = Execution.searchDense, .search_sparse = Execution.searchSparse, .clone_named_set = Execution.cloneSet, .fuse_named_sets = Execution.fuseSets, .attach_graph_results = Execution.attachGraph })
@@ -97,6 +98,7 @@ const Execution = struct {
     context: Context,
     request: local.api_operation.RequestContext,
     schema_json: []const u8,
+    hydration_fields: ?[]const []const u8 = null,
     arena: A,
     result_allocator: A = std.heap.page_allocator,
     files: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -204,10 +206,33 @@ const Execution = struct {
             const keys = try a.alloc([]const u8, result.hits.len);
             defer a.free(keys);
             for (result.hits, keys) |hit, *key| key.* = hit.id;
-            sources = try loadMany(self, a, keys);
+            sources = try loadManySelected(self, a, keys, self.hydration_fields);
         }
         try search.attachHighlightsWithIndexQueries(a, options, queries.items, result.hits, sources);
         try self.context.ensureActive();
+    }
+    fn planHydration(self: *Execution, req: types.SearchRequest) !?[]const []const u8 {
+        const projected = (try projectionColumns(self.arena, self.table, req)) orelse return null;
+        var fields: std.ArrayList([]const u8) = .empty;
+        try fields.appendSlice(self.arena, projected);
+        for (req.order_by) |order| try appendHydrationPath(self.arena, self.table, &fields, order.field);
+        const options = req.highlight orelse return fields.items;
+        if (req.full_text == null and req.full_text_queries.len == 0) return fields.items;
+        try appendHydrationPath(self.arena, self.table, &fields, "_type");
+        if (options.fields.len != 0) {
+            for (options.fields) |path| try appendHydrationPath(self.arena, self.table, &fields, path);
+        } else if (req.full_text_queries.len != 0) {
+            for (req.full_text_queries) |named| {
+                var pin = (try acquire(self, named.index_name)) orelse continue;
+                defer pin.deinit();
+                if (!try appendIndexHydration(self.arena, self.table, &fields, pin)) return null;
+            }
+        } else {
+            var pin = (try acquire(self, req.primary_text_index_name orelse req.index_name)) orelse return fields.items;
+            defer pin.deinit();
+            if (!try appendIndexHydration(self.arena, self.table, &fields, pin)) return null;
+        }
+        return fields.items;
     }
     fn noLocal(_: ?*anyopaque, _: ?[]const u8) !?*local.storage_db_catalog_index_manager.IndexManager.TextIndex {
         return null;
@@ -415,7 +440,7 @@ const Execution = struct {
     }
     fn loadProjected(raw: ?*anyopaque, a: A, req: types.SearchRequest, keys: []const []const u8) ![]?[]u8 {
         const self = from(raw);
-        const fields = try projectionColumns(self.arena, self.table, req);
+        const fields = self.hydration_fields;
         const result = try loadManySelected(raw, a, keys, fields);
         errdefer {
             for (result) |bytes| if (bytes) |value| a.free(value);
@@ -455,7 +480,14 @@ const Execution = struct {
 /// Compile public include patterns to physical dependencies once per hydration
 /// call. Exclusion-only projections still mean the complete source document.
 fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequest) !?[]const []const u8 {
-    if (req.defer_stored_projection) return null;
+    // Deferred wire projection does not require unrelated physical columns.
+    // Consumers without an explicit dependency contract retain full source.
+    if (req.hasHitEvaluation() or req.reranker != null or req.defer_hierarchy_child_hydration or
+        req.hierarchy_children != null or req.hierarchy_include_source or req.hierarchy_include_unit or
+        !req.hierarchy_match_include_all_fields or !req.hierarchy_source_include_all_fields or !req.hierarchy_unit_include_all_fields or
+        req.doc_filter_bindings.len != 0 or req.query != .match_all or req.filter_query_json.len != 0 or req.exclusion_query_json.len != 0 or req.authorization_filter_query_json.len != 0)
+        return null;
+    if (!req.include_stored) return &.{};
     if (req.fields.len == 0) return if (req.include_all_fields) null else &.{};
     var positive = false;
     for (req.fields) |field| if (field.len == 0 or field[0] != '-') {
@@ -472,6 +504,34 @@ fn projectionColumns(a: A, table: local.sql_catalog.Table, req: types.SearchRequ
     };
     return names.items;
 }
+fn appendHydrationPath(a: A, table: local.sql_catalog.Table, fields: *std.ArrayList([]const u8), path: []const u8) !void {
+    for (table.columns) |column| {
+        if (!projectionMayUse(path, column.path)) continue;
+        const present = for (fields.items) |field| {
+            if (std.mem.eql(u8, field, column.path)) break true;
+        } else false;
+        if (!present) try fields.append(a, column.path);
+    }
+}
+fn appendIndexHydration(a: A, table: local.sql_catalog.Table, fields: *std.ArrayList([]const u8), pin: search.PinnedTextSource) !bool {
+    if (pin.selected_field) |path| {
+        try appendHydrationPath(a, table, fields, path);
+        return true;
+    }
+    if (pin.runtime_schema) |schema| if (schema.full_text_documents.len != 0) {
+        if (schema.dynamic_templates.len != 0) return false;
+        for (schema.full_text_documents) |document| {
+            for (document.fields) |field| try appendHydrationPath(a, table, fields, field.path);
+            for (document.dynamic_rules) |rule| try appendHydrationPath(a, table, fields, rule.parent_path);
+            for (document.open_dynamic_paths) |path| try appendHydrationPath(a, table, fields, path);
+            for (document.infer_type_dynamic_paths) |path| try appendHydrationPath(a, table, fields, path);
+        }
+        return true;
+    };
+    // Schema-less text extraction can depend on any source field.
+    return false;
+}
+
 fn projectionMayUse(pattern: []const u8, path: []const u8) bool {
     var patterns = std.mem.tokenizeScalar(u8, pattern, '.');
     var parts = std.mem.tokenizeScalar(u8, path, '.');
@@ -496,7 +556,7 @@ test "external lake hydration projection narrows includes and retains exclusion 
     try std.testing.expect((try projectionColumns(arena.allocator(), table, .{ .fields = &.{"-body"} })) == null);
     try std.testing.expect((try projectionColumns(arena.allocator(), table, .{})) == null);
     try std.testing.expectEqual(@as(usize, 0), (try projectionColumns(arena.allocator(), table, .{ .include_all_fields = false })).?.len);
-    try std.testing.expect((try projectionColumns(arena.allocator(), table, .{ .fields = &.{"amount"}, .defer_stored_projection = true })) == null);
+    try std.testing.expectEqualSlices([]const u8, &.{"amount"}, (try projectionColumns(arena.allocator(), table, .{ .fields = &.{"amount"}, .defer_stored_projection = true })).?);
     try std.testing.expect(projectionMayUse("*", "body"));
     try std.testing.expect(projectionMayUse("nested", "nested.value"));
     try std.testing.expect(!projectionMayUse("different.*", "nested.value"));
@@ -516,4 +576,26 @@ test "external lake deferred search projection retains highlight fields until pu
     defer parsed.deinit();
     try std.testing.expectEqualStrings("row", parsed.value.object.get("label").?.string);
     try std.testing.expect(parsed.value.object.get("body") == null);
+}
+
+test "external lake hydration unions returned and highlight fields without unrelated columns" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var owner: Execution = undefined;
+    owner.arena = arena.allocator();
+    owner.table = .{ .id = 1, .physical_name = "lake", .schema_version = 1, .columns = &.{
+        .{ .name = "label", .path = "label", .type = .string },
+        .{ .name = "body", .path = "body", .type = .string },
+        .{ .name = "unrelated", .path = "unrelated", .type = .string },
+    } };
+    var req: types.SearchRequest = .{ .fields = &.{"label"}, .include_all_fields = false, .defer_stored_projection = true, .full_text = .{ .match = .{ .field = "body", .text = "needle" } }, .highlight = .{ .fields = &.{"body"} } };
+    try std.testing.expectEqualSlices([]const u8, &.{ "label", "body" }, (try owner.planHydration(req)).?);
+    req.include_stored = false;
+    try std.testing.expectEqualSlices([]const u8, &.{"body"}, (try owner.planHydration(req)).?);
+    req.include_stored = true;
+    req.highlight = null;
+    req.order_by = &.{.{ .field = "body" }};
+    try std.testing.expectEqualSlices([]const u8, &.{ "label", "body" }, (try owner.planHydration(req)).?);
+    req.filter_query_json = "{}";
+    try std.testing.expect((try owner.planHydration(req)) == null);
 }

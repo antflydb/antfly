@@ -232,9 +232,13 @@ pub const BlockCache = struct {
     /// Borrowed adapter for decoders. Closing it does not close the cache or
     /// parent source; the cache must remain at a stable address until use ends.
     pub fn borrowedSource(self: *BlockCache) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .resource_manager = self.source.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .prefetch = if (self.source == .ranges and self.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.source.resourceManager() } };
     }
 
+    fn prefetchAdapter(ptr: *anyopaque, offset: u64, length: u64) void {
+        const self: *BlockCache = @ptrCast(@alignCast(ptr));
+        self.source.prefetch(offset, length);
+    }
     fn readAdapter(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *BlockCache = @ptrCast(@alignCast(ptr));
         try self.readInto(offset, out);
@@ -354,7 +358,11 @@ pub const ConcurrentBlockCache = struct {
     }
 
     pub fn borrowedSource(self: *ConcurrentBlockCache) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .resource_manager = self.cache.source.resourceManager() } };
+        return .{ .ranges = .{ .ptr = self, .length = self.cache.source.len(), .read_into = readAdapter, .checksum = checksumAdapter, .close = closeAdapter, .prefetch = if (self.cache.source == .ranges and self.cache.source.ranges.prefetch != null) prefetchAdapter else null, .resource_manager = self.cache.source.resourceManager() } };
+    }
+    fn prefetchAdapter(ptr: *anyopaque, offset: u64, length: u64) void {
+        const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));
+        self.cache.source.prefetch(offset, length);
     }
     fn readAdapter(ptr: *anyopaque, offset: u64, out: []u8) !void {
         const self: *ConcurrentBlockCache = @ptrCast(@alignCast(ptr));

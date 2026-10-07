@@ -29,6 +29,7 @@ const Owner = struct {
     child_exhausted: bool = false,
     window: std.heap.ArenaAllocator,
     cover_arena: std.heap.ArenaAllocator,
+    cover_lease: ?@import("lake_index_decoded_metadata.zig").Owned(local.sql_spill.ColumnarBlock) = null,
     cover_candidates: []const ordered.Reader.Entry = &.{},
     cover_candidate_offset: usize = 0,
     cursor_header: ?[local.storage_db_relational_row_cursor.identity_len]u8 = null,
@@ -55,6 +56,7 @@ const Owner = struct {
         if (self.lease) |lease| lease.deinit();
         if (self.ordered_store) |*store| store.deinit();
         self.window.deinit();
+        if (self.cover_lease) |owned| owned.release();
         self.cover_arena.deinit();
         self.arena.deinit();
         self.store.deinit();
@@ -199,6 +201,8 @@ const Owner = struct {
                 self.cover_candidate_offset = 0;
                 if (self.cover_candidates.len == 0) return .{ .selection = &.{} };
             }
+            if (self.cover_lease) |owned| owned.release();
+            self.cover_lease = null;
             _ = self.cover_arena.reset(.retain_capacity);
             const a = self.cover_arena.allocator();
             const begin = self.cover_candidate_offset;
@@ -211,8 +215,14 @@ const Owner = struct {
             self.covered_entries = self.cover_candidates[begin..end];
             self.cover_candidate_offset = end;
             try @import("../serverless/artifacts/store.zig").chargeReadBudget(&self.reader.remaining_reads, cover.block.byte_len);
-            const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, self.reader.cached);
-            const block = try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            const block = if (self.reader.cached) |cached| cached_block: {
+                const owned = try @import("lake_index_decoded_metadata.zig").acquireColumnBlock(cached, self.artifacts, cover.block, self.reader.pages.cancellation);
+                self.cover_lease = owned;
+                break :cached_block owned.value.*;
+            } else uncached: {
+                const bytes = try @import("lake_index_aggregate_artifact.zig").readArtifact(a, self.artifacts, cover.block, self.reader.pages.cancellation, null);
+                break :uncached try local.sql_spill.decodeColumnarBlockInArena(a, bytes, @import("lake_index_aggregate_artifact.zig").max_block_bytes);
+            };
             if (block.values.len != self.reader.root.cover.len or block.keys.len != 1) return error.InvalidNativeLakeRowIndex;
             const covered = try a.alloc(@typeInfo(@TypeOf(self.covered_blocks)).pointer.child, self.covered_entries.len);
             for (self.covered_entries, covered) |entry, *position| {
