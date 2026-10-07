@@ -2062,8 +2062,14 @@ pub const Sort = struct {
         block: ?*Sequential.OwnedBlock = null,
         index: usize = 0,
         values: ?*const @import("typed_store.zig").Store = null,
+        keys: ?*const @import("typed_store.zig").Store = null,
         pub fn cell(self: RowLease, column: usize) !Datum {
             return if (self.block) |block| block.cell(self.index, column) else if (self.values) |values| values.cell(values.a, self.index, column) else self.row.values[column];
+        }
+        /// Merge consumers can inspect typed keys without reconstructing an
+        /// entire row or duplicating keys in the stored payload columns.
+        pub fn keyCell(self: RowLease, column: usize) !Datum {
+            return if (self.block) |block| block.keyCell(self.index, column) else if (self.keys) |keys| keys.cell(keys.a, self.index, column) else self.row.keys[column];
         }
         pub fn release(self: RowLease) void {
             if (self.block) |block| block.release();
@@ -2112,7 +2118,7 @@ pub const Sort = struct {
         if (self.offset < self.rows.items.len) {
             const entry = self.rows.items[@intCast(self.offset)];
             self.offset += 1;
-            return .{ .row = .{ .values = &.{}, .keys = &.{}, .ordinal = entry.ordinal }, .values = &self.values, .index = entry.position };
+            return .{ .row = .{ .values = &.{}, .keys = &.{}, .ordinal = entry.ordinal }, .values = &self.values, .keys = &self.keys, .index = entry.position };
         }
         return null;
     }

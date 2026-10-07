@@ -178,6 +178,39 @@ class CatalogReferenceTest(unittest.TestCase):
                     self.assertEqual(code, caught.exception.sqlstate)
 
 
+class SetSpillReferenceTest(unittest.TestCase):
+    def test_complete_high_cardinality_set_multiplicities(self):
+        import json
+        from collections import Counter
+
+        fixture = json.loads((FIXTURES / "sql_set_spill_reference.json").read_text())
+        self.assertEqual(1, fixture["format"])
+        self.assertEqual(16384, fixture["input_rows"])
+        self.assertEqual(5, len(fixture["entries"]))
+        with postgres() as db:
+            db.execute("CREATE TEMP TABLE items(n bigint)")
+            db.execute(
+                "INSERT INTO items SELECT i/2 FROM generate_series(0,16383) g(i)"
+            )
+            with db.transaction(force_rollback=True):
+                db.execute("SET TRANSACTION READ ONLY")
+                for case in fixture["entries"]:
+                    with self.subTest(sql=case["sql"]):
+                        cursor = db.execute(case["sql"])
+                        self.assertEqual(20, cursor.description[0].type_code)
+                        rows = cursor.fetchall()
+                        self.assertLessEqual(len(rows), fixture["input_rows"])
+                        expected = Counter(
+                            {
+                                n: case["multiplicity"]
+                                for n in range(case["maximum"] + 1)
+                            }
+                        )
+                        self.assertEqual(expected, Counter(row[0] for row in rows))
+                        self.assertEqual(case["expected"], str(len(rows)))
+                        self.assertEqual(case["sum"], str(sum(row[0] for row in rows)))
+
+
 class PostgresReferenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

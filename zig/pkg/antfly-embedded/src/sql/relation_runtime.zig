@@ -445,6 +445,148 @@ test "SQL set operations preserve multiplicities precedence and output ordering"
     }
 }
 
+test {
+    _ = @import("set_spill.zig");
+}
+
+test "SQL small sets preserve the hash and UNION ALL fast paths without temporary files" {
+    const a = std.testing.allocator;
+    var fixture: SetTestBackend = .{};
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &fixture, .checkpoint = SetTestBackend.checkpoint };
+    defer manager.deinit();
+    var backend = fixture.backend();
+    backend.spill_manager = &manager;
+    for ([_]struct { sql: []const u8, count: usize }{
+        .{ .sql = "SELECT 1 n UNION SELECT 1 UNION SELECT 2", .count = 2 },
+        .{ .sql = "SELECT 1 n UNION ALL SELECT 1 UNION ALL SELECT 2", .count = 3 },
+        .{ .sql = "SELECT 1 n INTERSECT SELECT 1", .count = 1 },
+        .{ .sql = "SELECT 1 n EXCEPT SELECT 2", .count = 1 },
+    }) |case| {
+        var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var result = try @import("runtime.zig").execute(a, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(case.count, result.output.rows.len);
+    }
+    try std.testing.expectEqual(@as(u64, 0), manager.written_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "SQL set promotion bounds high cardinality memory without replaying prior output" {
+    const Fixture = struct {
+        const count = 16384;
+        const Cursor = struct {
+            offset: usize = 0,
+            fn next(raw: *anyopaque, a: Allocator, limit: u32) !catalog.Page {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const length = @min(@as(usize, limit), count - self.offset);
+                const rows = try a.alloc(catalog.Row, length);
+                for (rows, 0..) |*row, i| {
+                    var object: std.json.ObjectMap = .empty;
+                    try object.put(a, "n", .{ .integer = @intCast((self.offset + i) / 2) });
+                    row.* = .{ .id = "row", .version = 1, .value = .{ .object = object } };
+                }
+                self.offset += length;
+                return .{ .rows = rows, .after = if (self.offset == count) null else "more" };
+            }
+        };
+        inputs: [2]Cursor = .{ .{}, .{} },
+        cursors: [2]catalog.Cursor = undefined,
+        captures: usize = 0,
+        closes: usize = 0,
+        fn resolve(_: *anyopaque, _: Allocator, name: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return .{ .id = 1, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
+        }
+        fn capture(raw: *anyopaque, _: Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 2), scans.len);
+            self.captures += 1;
+            for (&self.cursors, &self.inputs) |*cursor, *input| cursor.* = .{ .ptr = input, .next = Cursor.next, .close = undefined };
+            return .{ .ptr = self, .cursors = &self.cursors, .close = close };
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.closes += 1;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, expected: []const u8, sum: []const u8, maximum: usize, multiplicity: u16 };
+    const profile = try std.json.parseFromSlice(struct { format: u8, input_rows: usize, entries: []const Case }, a, @import("parity_fixtures.zig").set_spill_reference, .{});
+    defer profile.deinit();
+    try std.testing.expectEqual(@as(u8, 1), profile.value.format);
+    try std.testing.expectEqual(@as(usize, Fixture.count), profile.value.input_rows);
+    try std.testing.expectEqual(@as(usize, 5), profile.value.entries.len);
+    for (profile.value.entries) |case| {
+        for ([_]bool{ false, true }) |with_sum| {
+            for ([_]bool{ false, true }) |with_spill| {
+                if (!with_spill and with_sum) continue;
+                var fixture: Fixture = .{};
+                var quota: @import("memory_budget.zig") = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+                defer std.debug.assert(quota.live == 0);
+                var manager: @import("spill.zig").Manager = .{ .alloc = quota.allocator(), .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.checkpoint };
+                defer manager.deinit();
+                const backend: catalog.Backend = .{ .ptr = &fixture, .spill_manager = if (with_spill) &manager else null, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint, .open_statement = Fixture.capture } };
+                const sql = try std.fmt.allocPrint(a, "SELECT {s} FROM ({s}) q", .{ if (with_sum) "count(*),sum(n)" else "count(*)", case.sql });
+                defer a.free(sql);
+                var compiled = try @import("compiler.zig").compile(a, sql, .{});
+                defer compiled.deinit();
+                const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+                var result = @import("runtime.zig").execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 65536 }) catch |err| {
+                    if (!with_spill and err == error.SqlProgramLimitExceeded) {
+                        std.debug.print("SQL set no-spill baseline exceeded 2 MiB: {s}\n", .{case.sql});
+                        continue;
+                    }
+                    std.debug.print("SQL set load failure: {s} peak={} spilled={} consumed={}/{}\n", .{ case.sql, quota.peak, manager.written_bytes, fixture.inputs[0].offset, fixture.inputs[1].offset });
+                    return err;
+                };
+                defer result.deinit();
+                try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
+                if (with_sum) try std.testing.expectEqualStrings(case.sum, result.output.rows[0][1].string);
+                try std.testing.expectEqual(@as(usize, 1), fixture.captures);
+                try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+                try std.testing.expectEqual(with_spill, manager.written_bytes > 0);
+                try std.testing.expect(quota.peak <= 2 * 1024 * 1024);
+                try std.testing.expectEqual(@as(usize, 0), manager.files);
+                try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+                std.debug.print("SQL bounded set: spill={} input_rows=32768 output_rows={s} peak_memory={} spill_written={} elapsed_ns={}\n", .{ with_spill, case.expected, quota.peak, manager.written_bytes, std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start });
+            }
+        }
+        const Observer = struct {
+            counts: [8192]u16 = @splat(0),
+            fn append(raw: *anyopaque, values: []const Datum) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try std.testing.expectEqual(@as(usize, 1), values.len);
+                try std.testing.expect(!values[0].sql_null);
+                try std.testing.expect(values[0].value == .integer);
+                const n = std.math.cast(usize, values[0].value.integer) orelse return error.UnexpectedSetValue;
+                try std.testing.expect(n < self.counts.len);
+                self.counts[n] = std.math.add(u16, self.counts[n], 1) catch return error.UnexpectedSetMultiplicity;
+            }
+        };
+        var observer: Observer = .{};
+        var fixture: Fixture = .{};
+        var quota: @import("memory_budget.zig") = .{ .backing = a, .limit = 2 * 1024 * 1024 };
+        defer std.debug.assert(quota.live == 0);
+        var manager: @import("spill.zig").Manager = .{ .alloc = quota.allocator(), .io = std.testing.io, .context = &fixture, .checkpoint = Fixture.checkpoint };
+        defer manager.deinit();
+        const backend: catalog.Backend = .{ .ptr = &fixture, .spill_manager = &manager, .vtable = &.{ .resolve = Fixture.resolve, .scan = SetTestBackend.scan, .mutate = SetTestBackend.mutate, .checkpoint = Fixture.checkpoint, .open_statement = Fixture.capture } };
+        var compiled = try @import("compiler.zig").compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var arena = std.heap.ArenaAllocator.init(quota.allocator());
+        defer arena.deinit();
+        const bound = try @import("describe.zig").bind(arena.allocator(), backend, &compiled, &.{});
+        const context: @import("runtime.zig").Context = .{ .alloc = quota.allocator(), .arena = arena.allocator(), .backend = backend, .binding = bound, .parameters = &.{}, .spill = &manager, .limits = .{ .retained_bytes = 2 * 1024 * 1024, .scan_rows = 65536, .result_rows = 65536 } };
+        try context.selectInto(compiled.statement.select, .{ .ptr = &observer, .append = Observer.append });
+        for (observer.counts, 0..) |count, n| try std.testing.expectEqual(if (n <= case.maximum) case.multiplicity else @as(u16, 0), count);
+        try std.testing.expectEqual(@as(usize, 1), fixture.captures);
+        try std.testing.expectEqual(@as(usize, 1), fixture.closes);
+        try std.testing.expect(manager.written_bytes > 0);
+        try std.testing.expectEqual(@as(usize, 0), manager.files);
+        try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    }
+}
+
 test "SQL set inference respects pairwise and derived type boundaries" {
     const runtime = @import("runtime.zig");
     const compiler = @import("compiler.zig");
@@ -736,6 +878,8 @@ fn Engine(comptime Context: type) type {
             set_entries: std.ArrayList(SetEntry) = .empty,
             set_heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
             set_ready: bool = false,
+            set_external: ?*@import("set_spill.zig").State = null,
+            set_external_ready: bool = false,
             values_leaves: []const *const binding.Node = &.{},
             values_leaf_index: usize = 0,
             values_leaf: ?*Iterator = null,
@@ -801,6 +945,9 @@ fn Engine(comptime Context: type) type {
                 if (self.scan_filter) |filter| filter.close();
                 if (!self.borrowed_hash) if (self.hash_join) |join| join.deinit();
                 if (!self.borrowed_membership) if (self.membership_index) |index| index.deinit();
+                if (self.set_external) |state| state.deinit();
+                self.set_entries.deinit(self.engine.context.alloc);
+                self.set_heads.deinit(self.engine.context.alloc);
                 self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
@@ -1336,20 +1483,25 @@ fn Engine(comptime Context: type) type {
                 const copied = try owned.alloc(Datum, values.len);
                 for (values, copied) |value, *out| out.* = try operators.cloneDatum(owned, value);
                 const index = self.set_entries.items.len;
-                try self.set_entries.append(owned, .{ .values = copied, .count = 0, .next = self.set_heads.get(hash) });
-                try self.set_heads.put(owned, hash, index);
+                try self.set_entries.append(self.engine.context.alloc, .{ .values = copied, .count = 0, .next = self.set_heads.get(hash) });
+                try self.set_heads.put(self.engine.context.alloc, hash, index);
                 return index;
             }
             fn nextSet(self: *Iterator, alloc: Allocator, set: @FieldType(@FieldType(binding.Node, "operation"), "set")) anyerror!?[]const Datum {
-                var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
-                defer scratch.deinit();
+                if (self.set_external_ready) return self.set_external.?.next(alloc);
+                const scratch = &self.scratch;
                 if (!self.set_ready) {
                     if (set.kind != .@"union") {
                         while (try self.right.?.next(scratch.allocator())) |values| {
                             const normalized = try self.setValues(scratch.allocator(), values);
-                            const index = (try self.setSlot(normalized, true)).?;
-                            self.set_entries.items[index].count += 1;
-                            _ = scratch.reset(.free_all);
+                            try self.prepareSetCapacity(normalized, set);
+                            if (self.set_external) |state| {
+                                try state.add(normalized, true, 1);
+                            } else {
+                                const index = (try self.setSlot(normalized, true)).?;
+                                self.set_entries.items[index].count = std.math.add(usize, self.set_entries.items[index].count, 1) catch return error.SqlProgramLimitExceeded;
+                            }
+                            if (!scratch.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
                         }
                         // Retain only distinct keys/counts after the build side
                         // is consumed, not its materialized projection pages.
@@ -1359,7 +1511,7 @@ fn Engine(comptime Context: type) type {
                     self.set_ready = true;
                 }
                 while (true) {
-                    _ = scratch.reset(.free_all);
+                    if (!scratch.reset(.{ .retain_with_limit = 16 * 1024 })) return error.OutOfMemory;
                     const source = if (self.eof) self.right.? else self.left.?;
                     const input = try source.next(scratch.allocator()) orelse {
                         if (!self.eof and set.kind == .@"union") {
@@ -1368,28 +1520,69 @@ fn Engine(comptime Context: type) type {
                             self.eof = true;
                             continue;
                         }
+                        if (self.set_external) |state| {
+                            self.set_external_ready = true;
+                            return state.next(alloc);
+                        }
                         return null;
                     };
                     const values = try self.setValues(scratch.allocator(), input);
                     var emit = false;
                     if (set.kind == .@"union" and set.all) {
                         emit = true;
-                    } else if (set.kind == .@"union" or (set.kind == .except and !set.all)) {
-                        const index = (try self.setSlot(values, true)).?;
-                        const entry = &self.set_entries.items[index];
-                        emit = entry.count == 0;
-                        entry.count = 1;
-                    } else if (try self.setSlot(values, false)) |index| {
-                        const entry = &self.set_entries.items[index];
-                        emit = if (set.kind == .intersect) entry.count != 0 else entry.count == 0;
-                        if (entry.count != 0) entry.count = if (set.all) entry.count - 1 else 0;
-                    } else emit = set.kind == .except;
+                    } else {
+                        try self.prepareSetCapacity(values, set);
+                        if (self.set_external) |state| {
+                            try state.add(values, false, 1);
+                            continue;
+                        }
+                    }
+                    if (!(set.kind == .@"union" and set.all)) {
+                        if (set.kind == .@"union" or (set.kind == .except and !set.all)) {
+                            const index = (try self.setSlot(values, true)).?;
+                            const entry = &self.set_entries.items[index];
+                            emit = entry.count == 0;
+                            entry.count = 1;
+                        } else if (try self.setSlot(values, false)) |index| {
+                            const entry = &self.set_entries.items[index];
+                            emit = if (set.kind == .intersect) entry.count != 0 else entry.count == 0;
+                            if (entry.count != 0) entry.count = if (set.all) entry.count - 1 else 0;
+                        } else emit = set.kind == .except;
+                    }
                     if (emit) {
                         const result = try alloc.alloc(Datum, values.len);
                         for (values, result) |value, *out| out.* = try operators.cloneDatum(alloc, value);
                         return result;
                     }
                 }
+            }
+
+            fn prepareSetCapacity(self: *Iterator, values: []const Datum, set: @FieldType(@FieldType(binding.Node, "operation"), "set")) !void {
+                if (self.set_external != null) return;
+                const manager = self.engine.context.spill orelse return;
+                // Keep headroom for run construction while transferring the
+                // hash state. Account for actual arena capacity, not row count.
+                const limit = self.engine.context.limits.retained_bytes / 4;
+                var needed: usize = @sizeOf(SetEntry) + 128;
+                for (values) |value| needed +|= try operators.datumBytes(value);
+                const retained = self.arena.queryCapacity() +| (self.set_entries.capacity *| @sizeOf(SetEntry)) +| (self.set_heads.capacity() *| 32);
+                if (retained +| needed < limit) return;
+                const state = try @import("set_spill.zig").State.create(self.engine.context.alloc, manager, switch (set.kind) {
+                    .@"union" => .@"union",
+                    .intersect => .intersect,
+                    .except => .except,
+                }, set.all, self.node.columns.len, limit, self.engine.context.limits.scan_rows);
+                errdefer state.deinit();
+                for (self.set_entries.items) |entry| {
+                    try self.engine.checkpoint();
+                    try state.add(entry.values, true, entry.count);
+                }
+                self.set_entries.deinit(self.engine.context.alloc);
+                self.set_entries = .empty;
+                self.set_heads.deinit(self.engine.context.alloc);
+                self.set_heads = .empty;
+                _ = self.arena.reset(.free_all);
+                self.set_external = state;
             }
 
             fn keys(self: *Iterator, alloc: Allocator, programs: []const scalar.Program, values: []const Datum) ![]const Datum {
@@ -1768,14 +1961,17 @@ fn Engine(comptime Context: type) type {
             fn close(_: *anyopaque) void {}
             fn next(ptr: *anyopaque, alloc: Allocator, limit: u32) !catalog.Page {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
+                // Row adapters share the same memory-aware demand ceiling as
+                // typed pages; an aggregate does not need oversized row pages.
+                const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
                 var rows: std.ArrayList(catalog.Row) = .empty;
                 var bytes: usize = 0;
                 var stopped_for_bytes = false;
                 const names = try alloc.alloc([]const u8, self.iterator.node.columns.len);
                 for (self.iterator.node.columns, names) |column, *name| name.* = column.internal;
                 const layout = try catalog.Row.TypedLayout.init(alloc, names);
-                while (rows.items.len < limit) {
-                    const values = try self.iterator.nextDemand(alloc, limit - rows.items.len) orelse break;
+                while (rows.items.len < wanted) {
+                    const values = try self.iterator.nextDemand(alloc, wanted - rows.items.len) orelse break;
                     for (values) |value| bytes +|= try operators.datumBytes(value);
                     self.ordinal += 1;
                     const id = try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal});
@@ -1785,7 +1981,7 @@ fn Engine(comptime Context: type) type {
                         break;
                     }
                 }
-                const more = rows.items.len == limit or stopped_for_bytes;
+                const more = rows.items.len == wanted or stopped_for_bytes;
                 return .{ .rows = try rows.toOwnedSlice(alloc), .after = if (more) try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal}) else null };
             }
         };

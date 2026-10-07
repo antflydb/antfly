@@ -33,6 +33,7 @@ test {
     _ = @import("antfly_local_sources").sql_decision_eval;
     _ = @import("antfly_local_sources").sql_describe;
     _ = @import("antfly_local_sources").sql_runtime;
+    _ = @import("antfly_local_sources").sql_relation_runtime;
     _ = @import("insert_test.zig");
     _ = @import("returning_test.zig");
     _ = @import("conflict_test.zig");

@@ -78,6 +78,30 @@ This is single-owner durability evidence, not a distributed quorum or readiness
 fault campaign. It does not activate populated database retirement, CASCADE,
 routine/sequence/view catalogs, identity allocation or broader schema rewrites.
 
+Set execution retains a small hash table and streams UNION ALL without creating
+temporary files. Actual retained capacity triggers promotion to the shared
+external merge sorter before the statement loses spill headroom. Promotion
+carries residual right-side multiplicities and already-emitted markers, so it
+does not replay a delivered prefix. Replaced hash buffers are reclaimed rather
+than retained in an arena. Sorted block leases expose typed keys directly;
+only one owned group key and one lookahead lease survive reduction. Row and
+column adapters share a memory-aware pull ceiling, and reusable scratch has a
+bounded retained capacity.
+
+The shared `sql_set_spill_reference.json` fixture checks complete PostgreSQL
+multisets, native streamed values, COUNT and COUNT+SUM for UNION, INTERSECT and
+EXCEPT, including ALL multiplicities. The native load gate consumes 32,768
+rows under a single 2 MiB quota covering both execution and spill allocations.
+Aggregate totals are additional audit checksums, not activation of broader
+numeric aggregate result domains.
+The no-spill comparison exceeds that quota; spilled execution completes under
+it. Tests separately cover zero-file small sets, typed-array lower bounds and
+NULL elements across disk blocks, allocation faults, cancellation, disk quota
+and group caps. Debug timings are diagnostic measurements, not production
+throughput claims. This is shared executor evidence, not completion credit for
+the unresolved original set cohort: those unchanged queries still require a
+dedicated multi-table/duplicate-ID profile and mounted endpoint validation.
+
 The catalog boundary now tests 6,585 original-source request truncations, with
 bounded diagnostic positions and no missing-token dereferences. Targeted
 allocation-fault tests cover incomplete CREATE definitions. CREATE defaults,
