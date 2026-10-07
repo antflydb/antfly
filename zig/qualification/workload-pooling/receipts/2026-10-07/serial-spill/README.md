@@ -82,3 +82,11 @@ runtime rerun retains the original artifact and suite filters while providing
 a writable scratch mount. The current Linux compiler estimate is 26 GiB based
 on that observation; runtime limits remain 2/4 GiB. Compiler and runtime gates
 are recorded separately rather than treating the initial build as green.
+
+
+The later private-spill-wait qualification supersedes the 26 GiB scheduling
+estimate above with 23 GiB after the 26 GiB estimate was rejected before
+compilation because it exceeded available VM memory. The isolated wait-hook
+snapshot then passes the full Linux API target and both exact artifacts pass
+at the unchanged 2 GiB runtime limit. See the [spill-wait receipt](../spill-waits/README.md)
+for the rejection, successful build, and runtime logs.

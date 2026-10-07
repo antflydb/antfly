@@ -25,6 +25,13 @@ Post-resumption backend checkpoints retain the pgwire credential check. CPU spil
 children remain disabled with this single-worker wait capability. Native API
 qualification for these hooks passes all 33 local and 38 API contracts without
 skips, failures or leaks; all 50 build steps succeed. Full Linux API qualification
-for these new hooks remains pending. Storage/RPC and directory
+for these hooks now passes all 33 local and 38 API contracts, without skips,
+failures, or leaks, and all 47 build steps. The source was the isolated
+`d5baee40e5` snapshot with one build-only change: the GNU compiler RSS estimate
+was reduced from 26 to 23 GiB after 26 GiB was rejected before compilation
+because it exceeded available VM memory. This estimate remains above the
+previous measured 22.45 GiB compiler peak; runtime limits are unchanged. Both
+exact compiled artifacts subsequently passed again in two-CPU containers with
+2 GiB memory and no extra swap. The rejected scheduling log is preserved. Storage/RPC and directory
 waits, fresh policy/catalog fences, independent parallel child ownership, broader
 workload scheduling and automatic default qualification remain incomplete.

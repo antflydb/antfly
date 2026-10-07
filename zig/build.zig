@@ -154,7 +154,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const antfly_imports = shared.antfly_imports;
     const production_antfly_imports = shared.production_antfly_imports;
     production_antfly_imports.configureRuntimeContracts(usermgr_mod);
-    production_antfly_imports.storage_boundary.configureSources(usermgr_mod, false, false);
+    production_antfly_imports.storage_boundary.configureProfile(usermgr_mod, false, false, .common);
     const onnx_build = @import("onnx_graph").support;
     const apple_reader_enabled = b.option(bool, "apple-providers", "Enable native Apple OCR, generation, and transcription (macOS 27 SDK and Swift required)") orelse false;
     if (apple_reader_enabled and (target.result.os.tag != .macos or !link_libc))

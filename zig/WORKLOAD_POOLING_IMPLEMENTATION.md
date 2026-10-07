@@ -823,3 +823,23 @@ The private spill wait hooks now pass the complete native API pooling target:
 steps succeed. Full Linux API qualification of the new hooks is the next gate.
 The documented hard original cursor snapshot deadline is unchanged; buffered
 rows still need fresh policy/catalog validation after cooperative resumption.
+
+
+The private spill wait hooks also pass the complete Nix/glibc GNU AArch64 API
+target: 33 local and 38 API tests, no skips or leaks, and all 47 build steps.
+Both exact compiled artifacts pass again under a separate two-CPU, 2 GiB runtime
+limit without extra swap. The isolated `d5baee40e5` snapshot required only a
+build estimate adjustment from 26 to 23 GiB: 26 GiB exceeded available VM memory
+before compilation. The [spill-wait receipt](qualification/workload-pooling/receipts/2026-10-07/spill-waits/README.md)
+preserves that scheduling rejection, the successful build, and bounded runtime
+results. These checks do not enable scheduling by default.
+
+Current credential policy snapshots now capture permissions, layered row
+filters, transitive roles, metadata, and persistent user identity under one
+mutation lock. They carry no credential verifier and do not authenticate the
+caller. The standalone UserManager target passes on macOS and Nix/glibc GNU
+AArch64, including revocation, deleted/recreated account identity, key expiry,
+and exhaustive allocation-failure cleanup. The [policy-snapshot receipt](qualification/workload-pooling/receipts/2026-10-07/policy-snapshot/README.md)
+records the source and test evidence. Full HTTP/PG resume integration, fresh
+catalog fencing, broader backend waits, independent parallel-child ownership,
+all-workload scheduling, and automatic defaults remain required.
