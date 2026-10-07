@@ -936,3 +936,15 @@ runtime archive compiled successfully with the new wait hooks, but the complete
 CLI failed on those two configuration issues. Complete corrected production
 qualification remains pending. The Linux SQL compiler reservation reflects its
 observed 2.31 GB peak; executor runtime limits remain unchanged.
+
+
+Actual Linux DataServer qualification now passes all six read-safety contracts
+and all 86 build steps. The four scheduled owner-lock failures preserve the
+original deadline, allow ordinary/protected progress, and cancel the real tracker
+registration with zero remaining slots/operations/metadata. The exact artifact
+passes again under two CPUs and 2 GiB without extra swap or a compiler; the
+verifier requires every failure marker and six tests, with no skips/leaks and a
+zero exit status. The [read-index receipt](qualification/workload-pooling/receipts/2026-10-07/read-index-waits/README.md)
+preserves the exact artifact hash, commands and complete logs. Live stalled
+quorum/apply transport, native owner-lock execution and complete corrected
+production/API qualification remain separate requirements.

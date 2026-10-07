@@ -52,3 +52,22 @@ record this build-budget correction; they do not establish runtime qualification
 The active fixture jobs still use the source-frozen pre-correction build policy
 and retain its overrun diagnostic. A corrected build graph must be verified
 separately after those jobs finish.
+
+Actual DataServer read-safety qualification passes all six selected contracts
+and all 86 build steps on pinned Nix/glibc GNU AArch64. The four new owner-lock
+schedules cover cancellation, the original deadline, shutdown and rejected
+resumption authority. The real production polling sleep releases capacity;
+the fixture holds resumption while the Raft owner mutex remains occupied.
+Ordinary and protected work execute in the released slots. All schedules cancel
+the real ReadIndex tracker registration and retire operations/slots/metadata.
+Other contracts cover matching ReadState application, restart identity, frozen
+proof lock exclusion and persisted-but-uninstalled snapshot rejection.
+
+The exact artifact then passes again with two CPUs, 2 GiB memory and no extra
+swap, without invoking a compiler. Its verifier requires six passing tests and
+all four failure markers, checks the recorded artifact hash, and reports zero
+exit status. No tests skip or leak. The source-frozen integration manifest pins
+this evidence; the compiler reservation correction is recorded separately.
+This proves the owner-lock failure schedules, not a complete stalled quorum or
+apply schedule with live peer transport. Native execution of the new owner-lock
+fixture and the full corrected CLI/API graph remain separate gates.
